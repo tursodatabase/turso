@@ -1,0 +1,645 @@
+--
+-- Regular expression tests
+--
+-- Don't want to have to double backslashes in regexes
+set standard_conforming_strings = on;
+-- Test simple quantified backrefs
+select 'bbbbb' ~ '^([bc])\1*$' as t;
+ t 
+---
+ t
+(1 row)
+
+select 'ccc' ~ '^([bc])\1*$' as t;
+ t 
+---
+ t
+(1 row)
+
+select 'xxx' ~ '^([bc])\1*$' as f;
+ f 
+---
+ f
+(1 row)
+
+select 'bbc' ~ '^([bc])\1*$' as f;
+ f 
+---
+ f
+(1 row)
+
+select 'b' ~ '^([bc])\1*$' as t;
+ t 
+---
+ t
+(1 row)
+
+-- Test quantified backref within a larger expression
+select 'abc abc abc' ~ '^(\w+)( \1)+$' as t;
+ t 
+---
+ t
+(1 row)
+
+select 'abc abd abc' ~ '^(\w+)( \1)+$' as f;
+ f 
+---
+ f
+(1 row)
+
+select 'abc abc abd' ~ '^(\w+)( \1)+$' as f;
+ f 
+---
+ f
+(1 row)
+
+select 'abc abc abc' ~ '^(.+)( \1)+$' as t;
+ t 
+---
+ t
+(1 row)
+
+select 'abc abd abc' ~ '^(.+)( \1)+$' as f;
+ f 
+---
+ f
+(1 row)
+
+select 'abc abc abd' ~ '^(.+)( \1)+$' as f;
+ f 
+---
+ f
+(1 row)
+
+-- Test some cases that crashed in 9.2beta1 due to pmatch[] array overrun
+select substring('asd TO foo' from ' TO (([a-z0-9._]+|"([^"]+|"")+")+)');
+ substring 
+-----------
+ foo
+(1 row)
+
+select substring('a' from '((a))+');
+ substring 
+-----------
+ a
+(1 row)
+
+select substring('a' from '((a)+)');
+ substring 
+-----------
+ a
+(1 row)
+
+-- Test regexp_match()
+select regexp_match('abc', '');
+ regexp_match 
+--------------
+ {""}
+(1 row)
+
+select regexp_match('abc', 'bc');
+ regexp_match 
+--------------
+ {bc}
+(1 row)
+
+select regexp_match('abc', 'd') is null;
+ ?column? 
+----------
+ t
+(1 row)
+
+select regexp_match('abc', '(B)(c)', 'i');
+ regexp_match 
+--------------
+ {b,c}
+(1 row)
+
+select regexp_match('abc', 'Bd', 'ig'); -- error
+ERROR:  regexp_match() does not support the "global" option
+HINT:  Use the regexp_matches function instead.
+-- Test lookahead constraints
+select regexp_matches('ab', 'a(?=b)b*');
+ regexp_matches 
+----------------
+ {ab}
+(1 row)
+
+select regexp_matches('a', 'a(?=b)b*');
+ regexp_matches 
+----------------
+(0 rows)
+
+select regexp_matches('abc', 'a(?=b)b*(?=c)c*');
+ regexp_matches 
+----------------
+ {abc}
+(1 row)
+
+select regexp_matches('ab', 'a(?=b)b*(?=c)c*');
+ regexp_matches 
+----------------
+(0 rows)
+
+select regexp_matches('ab', 'a(?!b)b*');
+ regexp_matches 
+----------------
+(0 rows)
+
+select regexp_matches('a', 'a(?!b)b*');
+ regexp_matches 
+----------------
+ {a}
+(1 row)
+
+select regexp_matches('b', '(?=b)b');
+ regexp_matches 
+----------------
+ {b}
+(1 row)
+
+select regexp_matches('a', '(?=b)b');
+ regexp_matches 
+----------------
+(0 rows)
+
+-- Test lookbehind constraints
+select regexp_matches('abb', '(?<=a)b*');
+ regexp_matches 
+----------------
+ {bb}
+(1 row)
+
+select regexp_matches('a', 'a(?<=a)b*');
+ regexp_matches 
+----------------
+ {a}
+(1 row)
+
+select regexp_matches('abc', 'a(?<=a)b*(?<=b)c*');
+ regexp_matches 
+----------------
+ {abc}
+(1 row)
+
+select regexp_matches('ab', 'a(?<=a)b*(?<=b)c*');
+ regexp_matches 
+----------------
+ {ab}
+(1 row)
+
+select regexp_matches('ab', 'a*(?<!a)b*');
+ regexp_matches 
+----------------
+ {""}
+(1 row)
+
+select regexp_matches('ab', 'a*(?<!a)b+');
+ regexp_matches 
+----------------
+(0 rows)
+
+select regexp_matches('b', 'a*(?<!a)b+');
+ regexp_matches 
+----------------
+ {b}
+(1 row)
+
+select regexp_matches('a', 'a(?<!a)b*');
+ regexp_matches 
+----------------
+(0 rows)
+
+select regexp_matches('b', '(?<=b)b');
+ regexp_matches 
+----------------
+(0 rows)
+
+select regexp_matches('foobar', '(?<=f)b+');
+ regexp_matches 
+----------------
+(0 rows)
+
+select regexp_matches('foobar', '(?<=foo)b+');
+ regexp_matches 
+----------------
+ {b}
+(1 row)
+
+select regexp_matches('foobar', '(?<=oo)b+');
+ regexp_matches 
+----------------
+ {b}
+(1 row)
+
+-- Test optimization of single-chr-or-bracket-expression lookaround constraints
+select 'xz' ~ 'x(?=[xy])';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'xy' ~ 'x(?=[xy])';
+ ?column? 
+----------
+ t
+(1 row)
+
+select 'xz' ~ 'x(?![xy])';
+ ?column? 
+----------
+ t
+(1 row)
+
+select 'xy' ~ 'x(?![xy])';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'x'  ~ 'x(?![xy])';
+ ?column? 
+----------
+ t
+(1 row)
+
+select 'xyy' ~ '(?<=[xy])yy+';
+ ?column? 
+----------
+ t
+(1 row)
+
+select 'zyy' ~ '(?<=[xy])yy+';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'xyy' ~ '(?<![xy])yy+';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'zyy' ~ '(?<![xy])yy+';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Test conversion of regex patterns to indexable conditions
+explain (costs off) select * from pg_proc where proname ~ 'abc';
+            QUERY PLAN             
+-----------------------------------
+ Seq Scan on pg_proc
+   Filter: (proname ~ 'abc'::text)
+(2 rows)
+
+explain (costs off) select * from pg_proc where proname ~ '^abc';
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Index Scan using pg_proc_proname_args_nsp_index on pg_proc
+   Index Cond: ((proname >= 'abc'::text) AND (proname < 'abd'::text))
+   Filter: (proname ~ '^abc'::text)
+(3 rows)
+
+explain (costs off) select * from pg_proc where proname ~ '^abc$';
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Index Scan using pg_proc_proname_args_nsp_index on pg_proc
+   Index Cond: (proname = 'abc'::text)
+   Filter: (proname ~ '^abc$'::text)
+(3 rows)
+
+explain (costs off) select * from pg_proc where proname ~ '^abcd*e';
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Index Scan using pg_proc_proname_args_nsp_index on pg_proc
+   Index Cond: ((proname >= 'abc'::text) AND (proname < 'abd'::text))
+   Filter: (proname ~ '^abcd*e'::text)
+(3 rows)
+
+explain (costs off) select * from pg_proc where proname ~ '^abc+d';
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Index Scan using pg_proc_proname_args_nsp_index on pg_proc
+   Index Cond: ((proname >= 'abc'::text) AND (proname < 'abd'::text))
+   Filter: (proname ~ '^abc+d'::text)
+(3 rows)
+
+explain (costs off) select * from pg_proc where proname ~ '^(abc)(def)';
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Index Scan using pg_proc_proname_args_nsp_index on pg_proc
+   Index Cond: ((proname >= 'abcdef'::text) AND (proname < 'abcdeg'::text))
+   Filter: (proname ~ '^(abc)(def)'::text)
+(3 rows)
+
+explain (costs off) select * from pg_proc where proname ~ '^(abc)$';
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Index Scan using pg_proc_proname_args_nsp_index on pg_proc
+   Index Cond: (proname = 'abc'::text)
+   Filter: (proname ~ '^(abc)$'::text)
+(3 rows)
+
+explain (costs off) select * from pg_proc where proname ~ '^(abc)?d';
+               QUERY PLAN               
+----------------------------------------
+ Seq Scan on pg_proc
+   Filter: (proname ~ '^(abc)?d'::text)
+(2 rows)
+
+explain (costs off) select * from pg_proc where proname ~ '^abcd(x|(?=\w\w)q)';
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Index Scan using pg_proc_proname_args_nsp_index on pg_proc
+   Index Cond: ((proname >= 'abcd'::text) AND (proname < 'abce'::text))
+   Filter: (proname ~ '^abcd(x|(?=\w\w)q)'::text)
+(3 rows)
+
+-- Test for infinite loop in pullback() (CVE-2007-4772)
+select 'a' ~ '($|^)*';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- These cases expose a bug in the original fix for CVE-2007-4772
+select 'a' ~ '(^)+^';
+ ?column? 
+----------
+ t
+(1 row)
+
+select 'a' ~ '$($$)+';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- More cases of infinite loop in pullback(), not fixed by CVE-2007-4772 fix
+select 'a' ~ '($^)+';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'a' ~ '(^$)*';
+ ?column? 
+----------
+ t
+(1 row)
+
+select 'aa bb cc' ~ '(^(?!aa))+';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'aa x' ~ '(^(?!aa)(?!bb)(?!cc))+';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'bb x' ~ '(^(?!aa)(?!bb)(?!cc))+';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'cc x' ~ '(^(?!aa)(?!bb)(?!cc))+';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'dd x' ~ '(^(?!aa)(?!bb)(?!cc))+';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Test for infinite loop in fixempties() (Tcl bugs 3604074, 3606683)
+select 'a' ~ '((((((a)*)*)*)*)*)*';
+ ?column? 
+----------
+ t
+(1 row)
+
+select 'a' ~ '((((((a+|)+|)+|)+|)+|)+|)';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- These cases used to give too-many-states failures
+select 'x' ~ 'abcd(\m)+xyz';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'a' ~ '^abcd*(((((^(a c(e?d)a+|)+|)+|)+|)+|a)+|)';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'x' ~ 'a^(^)bcd*xy(((((($a+|)+|)+|)+$|)+|)+|)^$';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'x' ~ 'xyz(\Y\Y)+';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'x' ~ 'x|(?:\M)+';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- This generates O(N) states but O(N^2) arcs, so it causes problems
+-- if arc count is not constrained
+select 'x' ~ repeat('x*y*z*', 1000);
+ERROR:  invalid regular expression: regular expression is too complex
+-- Test backref in combination with non-greedy quantifier
+-- https://core.tcl.tk/tcl/tktview/6585b21ca8fa6f3678d442b97241fdd43dba2ec0
+select 'Programmer' ~ '(\w).*?\1' as t;
+ t 
+---
+ t
+(1 row)
+
+select regexp_matches('Programmer', '(\w)(.*?\1)', 'g');
+ regexp_matches 
+----------------
+ {r,ogr}
+ {m,m}
+(2 rows)
+
+-- Test for proper matching of non-greedy iteration (bug #11478)
+select regexp_matches('foo/bar/baz',
+                      '^([^/]+?)(?:/([^/]+?))(?:/([^/]+?))?$', '');
+ regexp_matches 
+----------------
+ {foo,bar,baz}
+(1 row)
+
+-- Test that greediness can be overridden by outer quantifier
+select regexp_matches('llmmmfff', '^(l*)(.*)(f*)$');
+ regexp_matches 
+----------------
+ {ll,mmmfff,""}
+(1 row)
+
+select regexp_matches('llmmmfff', '^(l*){1,1}(.*)(f*)$');
+ regexp_matches 
+----------------
+ {ll,mmmfff,""}
+(1 row)
+
+select regexp_matches('llmmmfff', '^(l*){1,1}?(.*)(f*)$');
+  regexp_matches  
+------------------
+ {"",llmmmfff,""}
+(1 row)
+
+select regexp_matches('llmmmfff', '^(l*){1,1}?(.*){1,1}?(f*)$');
+ regexp_matches 
+----------------
+ {"",llmmm,fff}
+(1 row)
+
+select regexp_matches('llmmmfff', '^(l*?)(.*)(f*)$');
+  regexp_matches  
+------------------
+ {"",llmmmfff,""}
+(1 row)
+
+select regexp_matches('llmmmfff', '^(l*?){1,1}(.*)(f*)$');
+ regexp_matches 
+----------------
+ {ll,mmmfff,""}
+(1 row)
+
+select regexp_matches('llmmmfff', '^(l*?){1,1}?(.*)(f*)$');
+  regexp_matches  
+------------------
+ {"",llmmmfff,""}
+(1 row)
+
+select regexp_matches('llmmmfff', '^(l*?){1,1}?(.*){1,1}?(f*)$');
+ regexp_matches 
+----------------
+ {"",llmmm,fff}
+(1 row)
+
+-- Test for infinite loop in cfindloop with zero-length possible match
+-- but no actual match (can only happen in the presence of backrefs)
+select 'a' ~ '$()|^\1';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'a' ~ '.. ()|\1';
+ ?column? 
+----------
+ f
+(1 row)
+
+select 'a' ~ '()*\1';
+ ?column? 
+----------
+ t
+(1 row)
+
+select 'a' ~ '()+\1';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Test incorrect removal of capture groups within {0}
+select 'xxx' ~ '(.){0}(\1)' as f;
+ f 
+---
+ f
+(1 row)
+
+select 'xxx' ~ '((.)){0}(\2)' as f;
+ f 
+---
+ f
+(1 row)
+
+select 'xyz' ~ '((.)){0}(\2){0}' as t;
+ t 
+---
+ t
+(1 row)
+
+-- Test ancient oversight in when to apply zaptreesubs
+select 'abcdef' ~ '^(.)\1|\1.' as f;
+ f 
+---
+ f
+(1 row)
+
+select 'abadef' ~ '^((.)\2|..)\2' as f;
+ f 
+---
+ f
+(1 row)
+
+-- Add coverage for some cases in checkmatchall
+select regexp_match('xy', '.|...');
+ regexp_match 
+--------------
+ {x}
+(1 row)
+
+select regexp_match('xyz', '.|...');
+ regexp_match 
+--------------
+ {xyz}
+(1 row)
+
+select regexp_match('xy', '.*');
+ regexp_match 
+--------------
+ {xy}
+(1 row)
+
+select regexp_match('fooba', '(?:..)*');
+ regexp_match 
+--------------
+ {foob}
+(1 row)
+
+select regexp_match('xyz', repeat('.', 260));
+ regexp_match 
+--------------
+ 
+(1 row)
+
+select regexp_match('foo', '(?:.|){99}');
+ regexp_match 
+--------------
+ {foo}
+(1 row)
+
+-- Error conditions
+select 'xyz' ~ 'x(\w)(?=\1)';  -- no backrefs in LACONs
+ERROR:  invalid regular expression: invalid backreference number
+select 'xyz' ~ 'x(\w)(?=(\1))';
+ERROR:  invalid regular expression: invalid backreference number
+select 'a' ~ '\x7fffffff';  -- invalid chr code
+ERROR:  invalid regular expression: invalid escape \ sequence
