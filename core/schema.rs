@@ -5221,7 +5221,7 @@ impl Column {
         self.explicit_notnull = old.explicit_notnull;
         self.notnull_conflict_clause = old.notnull_conflict_clause;
         if self.default.is_none() {
-            self.default = old.default.clone();
+            self.default.clone_from(&old.default);
         }
         if old.is_rowid_alias() && self.ty_str.eq_ignore_ascii_case("INTEGER") {
             self.raw |= F_ROWID_ALIAS;

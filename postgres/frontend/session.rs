@@ -772,7 +772,7 @@ fn copy_rows_into(conn: &Arc<Connection>, stmt: &PgCopyFromStmt, data: &str) -> 
         .unwrap_or('\t');
     let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
 
-    let mut rows = parse_copy_text_format(&data, delimiter, null_string, num_columns)?;
+    let mut rows = parse_copy_text_format(data, delimiter, null_string, num_columns)?;
     if stmt.header && !rows.is_empty() {
         rows.remove(0);
     }

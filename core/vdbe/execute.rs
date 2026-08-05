@@ -10712,7 +10712,7 @@ pub fn op_function(
                                                 // constraints are not part of the change and
                                                 // must survive in the stored DDL too.
                                                 column.col_name = column_def.col_name.clone();
-                                                column.col_type = column_def.col_type.clone();
+                                                column.col_type.clone_from(&column_def.col_type);
                                             } else {
                                                 *column = column_def.clone();
                                             }
