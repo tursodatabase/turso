@@ -1,5 +1,31 @@
 use crate::ext::register_scalar_function;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use turso_ext::{scalar, ExtensionApi, Value};
+
+/// Compiling a pattern dominates matching for catalog-style queries that
+/// apply `expr ~ 'pattern'` per row — the same pattern was rebuilt for
+/// every row, which in debug builds turned regex-filtered scans of a few
+/// hundred rows into minutes. Compiled regexes share their program on
+/// clone, so a small process-wide cache makes recompilation free.
+const REGEX_CACHE_CAP: usize = 64;
+static REGEX_CACHE: OnceLock<Mutex<HashMap<String, regex::Regex>>> = OnceLock::new();
+
+fn compile_cached(pattern: &str) -> Option<regex::Regex> {
+    let cache = REGEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    if let Some(re) = cache.get(pattern) {
+        return Some(re.clone());
+    }
+    let re = regex::Regex::new(pattern).ok()?;
+    if cache.len() >= REGEX_CACHE_CAP {
+        // Full: drop everything rather than tracking recency; the working
+        // set of live patterns is far below the capacity.
+        cache.clear();
+    }
+    cache.insert(pattern.to_string(), re.clone());
+    Some(re)
+}
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
     unsafe {
@@ -21,9 +47,8 @@ fn regexp(args: &[Value]) -> Value {
         return Value::null();
     };
 
-    let re = match regex::Regex::new(&pattern) {
-        Ok(re) => re,
-        Err(_) => return Value::null(),
+    let Some(re) = compile_cached(&pattern) else {
+        return Value::null();
     };
 
     Value::from_integer(re.is_match(&haystack) as i64)

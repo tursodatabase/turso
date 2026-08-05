@@ -157,12 +157,7 @@ STATUS = {
     "domain": "fail",
     "prepare": "fail",
     "truncate": "fail",
-    "alter_table": (
-        "skip",
-        "wedges against corpus fixture data (standalone it completes in "
-        "seconds), and the timeout kill can leave the database unopenable; "
-        "same hang class as arrays/subselect",
-    ),
+    "alter_table": "fail",
     "sequence": "fail",
     "rowtypes": "fail",
     "returning": "fail",
