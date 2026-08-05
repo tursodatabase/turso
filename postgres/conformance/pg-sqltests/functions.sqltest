@@ -168,3 +168,176 @@ test quote-ident-wrong-arity-errors {
     SELECT quote_ident();
 }
 expect error {}
+
+test md5-text {
+    SELECT md5('abc');
+}
+expect {
+    900150983cd24fb0d6963f7d28e17f72
+}
+
+test md5-empty-string {
+    SELECT md5('');
+}
+expect {
+    d41d8cd98f00b204e9800998ecf8427e
+}
+
+test split-part-basic {
+    SELECT split_part('abc~@~def~@~ghi', '~@~', 2);
+}
+expect {
+    def
+}
+
+test split-part-negative-counts-from-end {
+    SELECT split_part('abc,def,ghi', ',', -1);
+}
+expect {
+    ghi
+}
+
+test split-part-out-of-range-is-empty {
+    SELECT split_part('abc,def', ',', 5);
+}
+expect {
+}
+
+test split-part-zero-position-errors {
+    SELECT split_part('abc,def', ',', 0);
+}
+expect error {
+    field position must not be zero
+}
+
+test initcap-mixed-case-words {
+    SELECT initcap('hi THOMAS');
+}
+expect {
+    Hi Thomas
+}
+
+test initcap-word-boundary-is-non-alphanumeric {
+    SELECT initcap('foo-bar_baz 2nd');
+}
+expect {
+    Foo-Bar_Baz 2nd
+}
+
+test left-and-right-positive {
+    SELECT left('abcde', 2), right('abcde', 2);
+}
+expect {
+    ab|de
+}
+
+test left-and-right-negative-drop-from-other-end {
+    SELECT left('abcde', -2), right('abcde', -2);
+}
+expect {
+    abc|cde
+}
+
+test left-count-past-length-keeps-all {
+    SELECT left('ab', 5), right('ab', 5);
+}
+expect {
+    ab|ab
+}
+
+test regexp-replace-first-match-only-by-default {
+    SELECT regexp_replace('foobarbaz', 'b..', 'X');
+}
+expect {
+    fooXbaz
+}
+
+test regexp-replace-global-flag {
+    SELECT regexp_replace('foobarbaz', 'b..', 'X', 'g');
+}
+expect {
+    fooXX
+}
+
+test regexp-replace-backreference {
+    SELECT regexp_replace('foobarbaz', 'b(..)', 'X\1Y', 'g');
+}
+expect {
+    fooXarYXazY
+}
+
+test regexp-replace-case-insensitive-flag {
+    SELECT regexp_replace('ABC', 'a', 'x', 'i');
+}
+expect {
+    xBC
+}
+
+test regexp-replace-invalid-pattern-errors {
+    SELECT regexp_replace('x', '(', 'y');
+}
+expect error {
+    invalid regular expression
+}
+
+test regexp-replace-invalid-flag-errors {
+    SELECT regexp_replace('x', 'x', 'y', 'z');
+}
+expect error {
+    invalid regular expression option
+}
+
+test pg-typeof-integer-and-text {
+    SELECT pg_typeof(1), pg_typeof('x'::text);
+}
+expect {
+    integer|text
+}
+
+test encode-hex {
+    SELECT encode('abc', 'hex');
+}
+expect {
+    616263
+}
+
+test encode-base64 {
+    SELECT encode('abc', 'base64');
+}
+expect {
+    YWJj
+}
+
+test encode-decode-hex-roundtrip {
+    SELECT encode(decode('616263', 'hex'), 'hex');
+}
+expect {
+    616263
+}
+
+test encode-decode-base64-roundtrip {
+    SELECT encode(decode('YWJj', 'base64'), 'hex');
+}
+expect {
+    616263
+}
+
+test encode-unknown-format-errors {
+    SELECT encode('abc', 'bogus');
+}
+expect error {
+    unrecognized encoding
+}
+
+test decode-invalid-hex-errors {
+    SELECT decode('61626', 'hex');
+}
+expect error {}
+
+test scalar-functions-are-strict {
+    SELECT coalesce(md5(NULL), 'null'), coalesce(left(NULL, 1), 'null'),
+           coalesce(split_part(NULL, ',', 1), 'null'), coalesce(regexp_replace(NULL, 'x', 'y'), 'null');
+}
+expect {
+    null|null|null|null
+}

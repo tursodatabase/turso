@@ -20,6 +20,10 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "pg_relation_is_publishable"
         | "quote_ident"
         | "quote_literal" => &[1],
+        "md5" | "initcap" | "pg_typeof" => &[1],
+        "left" | "right" | "encode" | "decode" => &[2],
+        "split_part" => &[3],
+        "regexp_replace" => &[3, 4],
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
@@ -71,6 +75,40 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             ))),
         },
         "quote_literal" => Ok(exec_quote_literal(args.first().unwrap_or(&Value::Null))),
+        "md5" => Ok(exec_md5(args.first().unwrap_or(&Value::Null))),
+        "initcap" => Ok(match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            _ => Value::build_text(exec_initcap(&text_arg(0))),
+        }),
+        "left" | "right" => Ok(match (args.first(), args.get(1)) {
+            (Some(Value::Null), _) | (_, Some(Value::Null)) | (None, _) | (_, None) => Value::Null,
+            _ => Value::build_text(exec_left_right(&text_arg(0), int_arg(1, 0), name == "left")),
+        }),
+        "split_part" => match (args.first(), args.get(1), args.get(2)) {
+            (Some(Value::Null), _, _) | (_, Some(Value::Null), _) | (_, _, Some(Value::Null)) => {
+                Ok(Value::Null)
+            }
+            _ => exec_split_part(&text_arg(0), &text_arg(1), int_arg(2, 0)),
+        },
+        "regexp_replace" => match (args.first(), args.get(1), args.get(2)) {
+            (Some(Value::Null), _, _) | (_, Some(Value::Null), _) | (_, _, Some(Value::Null)) => {
+                Ok(Value::Null)
+            }
+            _ => exec_regexp_replace(&text_arg(0), &text_arg(1), &text_arg(2), &text_arg(3)),
+        },
+        "pg_typeof" => Ok(exec_pg_typeof(args.first().unwrap_or(&Value::Null))),
+        "encode" => match (args.first(), args.get(1)) {
+            (Some(Value::Null), _) | (_, Some(Value::Null)) | (None, _) | (_, None) => {
+                Ok(Value::Null)
+            }
+            (Some(data), _) => exec_encode(data, &text_arg(1)),
+        },
+        "decode" => match (args.first(), args.get(1)) {
+            (Some(Value::Null), _) | (_, Some(Value::Null)) | (None, _) | (_, None) => {
+                Ok(Value::Null)
+            }
+            _ => exec_decode(&text_arg(0), &text_arg(1)),
+        },
         // Catalog introspection stubs: accepted for compatibility, no output.
         // obj_description/col_description are NULL because COMMENT ON is not persisted.
         "pg_get_expr"
@@ -124,6 +162,232 @@ fn exec_quote_literal(value: &Value) -> Value {
         format!("'{}'", text.replace('\'', "''"))
     };
     Value::build_text(quoted)
+}
+
+/// md5() accepts text or bytea and returns the lowercase hex digest.
+fn exec_md5(value: &Value) -> Value {
+    let bytes: &[u8] = match value {
+        Value::Text(t) => t.as_str().as_bytes(),
+        Value::Blob(b) => b.as_ref(),
+        _ => return Value::Null,
+    };
+    Value::build_text(format!("{:x}", md5::compute(bytes)))
+}
+
+/// A word starts after any non-alphanumeric character, matching PostgreSQL's
+/// definition rather than whitespace-only splitting.
+fn exec_initcap(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_is_word = false;
+    for c in s.chars() {
+        if prev_is_word {
+            out.extend(c.to_lowercase());
+        } else {
+            out.extend(c.to_uppercase());
+        }
+        prev_is_word = c.is_alphanumeric();
+    }
+    out
+}
+
+/// left()/right() count characters, not bytes; a negative count drops that
+/// many characters from the other end instead.
+fn exec_left_right(s: &str, n: i64, from_left: bool) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let keep = if n >= 0 {
+        (n as usize).min(len)
+    } else {
+        len.saturating_sub(n.unsigned_abs() as usize)
+    };
+    if from_left {
+        chars[..keep].iter().collect()
+    } else {
+        chars[len - keep..].iter().collect()
+    }
+}
+
+fn exec_split_part(s: &str, delimiter: &str, n: i64) -> Result<Value> {
+    if n == 0 {
+        return Err(LimboError::ParseError(
+            "field position must not be zero".to_string(),
+        ));
+    }
+    // An empty delimiter means the whole string is one field.
+    let fields: Vec<&str> = if delimiter.is_empty() {
+        vec![s]
+    } else {
+        s.split(delimiter).collect()
+    };
+    // A negative position counts fields from the end.
+    let idx = if n > 0 {
+        (n - 1) as usize
+    } else {
+        match fields.len().checked_sub(n.unsigned_abs() as usize) {
+            Some(i) => i,
+            None => return Ok(Value::build_text("")),
+        }
+    };
+    Ok(Value::build_text(
+        fields.get(idx).copied().unwrap_or("").to_string(),
+    ))
+}
+
+fn exec_regexp_replace(
+    source: &str,
+    pattern: &str,
+    replacement: &str,
+    flags: &str,
+) -> Result<Value> {
+    let mut global = false;
+    let mut case_insensitive = false;
+    for c in flags.chars() {
+        match c {
+            'g' => global = true,
+            'i' => case_insensitive = true,
+            'c' => case_insensitive = false,
+            _ => {
+                return Err(LimboError::ParseError(format!(
+                    "invalid regular expression option: \"{c}\""
+                )))
+            }
+        }
+    }
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| LimboError::ParseError(format!("invalid regular expression: {e}")))?;
+    // PostgreSQL replacement text uses \1..\9 and \& for backreferences; the
+    // regex crate uses ${n}, treats $ as special, and backslash as literal.
+    let mut converted = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '$' => converted.push_str("$$"),
+            '\\' => match chars.next() {
+                Some(d @ '1'..='9') => converted.push_str(&format!("${{{d}}}")),
+                Some('&') => converted.push_str("${0}"),
+                Some(other) => converted.push(other),
+                None => {}
+            },
+            other => converted.push(other),
+        }
+    }
+    let result = if global {
+        re.replace_all(source, converted.as_str())
+    } else {
+        re.replace(source, converted.as_str())
+    };
+    Ok(Value::build_text(result.into_owned()))
+}
+
+/// The engine only knows the runtime storage class, so this reports the
+/// closest PostgreSQL type name rather than the statically inferred type.
+fn exec_pg_typeof(value: &Value) -> Value {
+    use turso_core::Numeric;
+    Value::build_text(match value {
+        Value::Null => "unknown",
+        Value::Numeric(Numeric::Integer(_)) => "integer",
+        Value::Numeric(_) => "double precision",
+        Value::Text(_) => "text",
+        Value::Blob(_) => "bytea",
+    })
+}
+
+fn exec_encode(data: &Value, format: &str) -> Result<Value> {
+    let bytes: &[u8] = match data {
+        Value::Text(t) => t.as_str().as_bytes(),
+        Value::Blob(b) => b.as_ref(),
+        _ => return Ok(Value::Null),
+    };
+    let out = match format {
+        "hex" => data_encoding::HEXLOWER.encode(bytes),
+        "base64" => {
+            // PostgreSQL wraps base64 output at 76 characters per RFC 2045.
+            let raw = data_encoding::BASE64.encode(bytes);
+            let mut wrapped = String::with_capacity(raw.len() + raw.len() / 76 + 1);
+            for (i, c) in raw.chars().enumerate() {
+                if i > 0 && i % 76 == 0 {
+                    wrapped.push('\n');
+                }
+                wrapped.push(c);
+            }
+            wrapped
+        }
+        "escape" => {
+            let mut out = String::with_capacity(bytes.len());
+            for &b in bytes {
+                match b {
+                    b'\\' => out.push_str("\\\\"),
+                    0x20..=0x7e => out.push(b as char),
+                    _ => out.push_str(&format!("\\{b:03o}")),
+                }
+            }
+            out
+        }
+        other => {
+            return Err(LimboError::ParseError(format!(
+                "unrecognized encoding: \"{other}\""
+            )))
+        }
+    };
+    Ok(Value::build_text(out))
+}
+
+fn exec_decode(text: &str, format: &str) -> Result<Value> {
+    let bytes = match format {
+        "hex" => {
+            let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            data_encoding::HEXLOWER_PERMISSIVE
+                .decode(compact.as_bytes())
+                .map_err(|_| LimboError::ParseError("invalid hexadecimal data".to_string()))?
+        }
+        "base64" => {
+            let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            data_encoding::BASE64
+                .decode(compact.as_bytes())
+                .map_err(|_| LimboError::ParseError("invalid base64 data".to_string()))?
+        }
+        "escape" => {
+            let mut out = Vec::with_capacity(text.len());
+            let mut input = text.bytes().peekable();
+            while let Some(b) = input.next() {
+                if b != b'\\' {
+                    out.push(b);
+                    continue;
+                }
+                match input.next() {
+                    Some(b'\\') => out.push(b'\\'),
+                    Some(d1 @ b'0'..=b'3') => {
+                        let d2 = input.next();
+                        let d3 = input.next();
+                        match (d2, d3) {
+                            (Some(d2 @ b'0'..=b'7'), Some(d3 @ b'0'..=b'7')) => {
+                                out.push((d1 - b'0') * 64 + (d2 - b'0') * 8 + (d3 - b'0'));
+                            }
+                            _ => {
+                                return Err(LimboError::ParseError(
+                                    "invalid input syntax for type bytea".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(LimboError::ParseError(
+                            "invalid input syntax for type bytea".to_string(),
+                        ))
+                    }
+                }
+            }
+            out
+        }
+        other => {
+            return Err(LimboError::ParseError(format!(
+                "unrecognized encoding: \"{other}\""
+            )))
+        }
+    };
+    Ok(Value::from_blob(bytes))
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {

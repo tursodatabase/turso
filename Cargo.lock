@@ -7458,7 +7458,10 @@ name = "turso_pg"
 version = "0.8.0-pre.2"
 dependencies = [
  "chrono",
+ "data-encoding",
+ "md5 0.7.0",
  "parking_lot",
+ "regex",
  "rustc-hash 2.1.1",
  "tempfile",
  "tracing",

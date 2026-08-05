@@ -12,7 +12,10 @@ path = "lib.rs"
 
 [dependencies]
 chrono = { workspace = true, default-features = false, features = ["clock"] }
+data-encoding = "2.7.0"
+md5 = "0.7.0"
 parking_lot = { workspace = true }
+regex = { workspace = true }
 tracing = { workspace = true }
 rustc-hash = "2.0"
 tempfile = { workspace = true }
