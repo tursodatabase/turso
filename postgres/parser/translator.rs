@@ -610,6 +610,13 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation);
 
+        // Applying only the first command of a multi-command ALTER silently
+        // skipped the rest.
+        if alter.cmds.len() > 1 {
+            return Err(ParseError::ParseError(
+                "multiple subcommands in ALTER TABLE are not supported".into(),
+            ));
+        }
         let cmd_node = alter
             .cmds
             .first()
@@ -972,7 +979,15 @@ impl PostgreSQLTranslator {
         &self,
         truncate: &pg_query::protobuf::TruncateStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        // TRUNCATE TABLE t → DELETE FROM t (first relation only)
+        check_truncate_options(truncate)?;
+        // Multi-table TRUNCATE is expanded by the session layer; this path
+        // sees single-relation statements only.
+        if truncate.relations.len() > 1 {
+            return Err(ParseError::ParseError(
+                "TRUNCATE of multiple tables is not supported in this form".into(),
+            ));
+        }
+        // TRUNCATE TABLE t → DELETE FROM t
         let relation = truncate
             .relations
             .first()
@@ -4962,6 +4977,111 @@ pub fn try_extract_copy_to_stdout(parse_result: &ParseResult) -> Option<PgCopyTo
         header,
         null_string,
     })
+}
+
+/// TRUNCATE options we cannot honor must fail rather than silently vanish:
+/// RESTART IDENTITY resets sequences and CASCADE truncates FK-referencing
+/// tables — dropping either leaves different data than PostgreSQL would.
+fn check_truncate_options(truncate: &pg_query::protobuf::TruncateStmt) -> Result<(), ParseError> {
+    if truncate.restart_seqs {
+        return Err(ParseError::ParseError(
+            "TRUNCATE ... RESTART IDENTITY is not supported".into(),
+        ));
+    }
+    if truncate.behavior() == pg_query::protobuf::DropBehavior::DropCascade {
+        return Err(ParseError::ParseError(
+            "TRUNCATE ... CASCADE is not supported".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A DROP or TRUNCATE naming several objects, expanded by the session layer
+/// into one statement per object so none are silently skipped.
+pub struct PgMultiObjectStmt {
+    /// Complete single-object statements in the PostgreSQL dialect.
+    pub statements: Vec<String>,
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Try to extract a DROP statement naming more than one object.
+pub fn try_extract_multi_drop(parse_result: &ParseResult) -> Option<PgMultiObjectStmt> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::ObjectType;
+
+    let nodes = parse_result.protobuf.nodes();
+    let pg_query::NodeRef::DropStmt(drop) = &nodes.first()?.0 else {
+        return None;
+    };
+    if drop.objects.len() < 2 {
+        return None;
+    }
+    let object_word = match ObjectType::try_from(drop.remove_type).ok()? {
+        ObjectType::ObjectTable => "TABLE",
+        ObjectType::ObjectView => "VIEW",
+        ObjectType::ObjectIndex => "INDEX",
+        ObjectType::ObjectSequence => "SEQUENCE",
+        ObjectType::ObjectMatview => "MATERIALIZED VIEW",
+        // Other kinds keep the single-object path (and its errors).
+        _ => return None,
+    };
+    let if_exists = if drop.missing_ok { "IF EXISTS " } else { "" };
+
+    let mut statements = Vec::new();
+    for obj in &drop.objects {
+        let Some(Node::List(list)) = &obj.node else {
+            return None;
+        };
+        let name: Vec<String> = list
+            .items
+            .iter()
+            .filter_map(|item| match &item.node {
+                Some(Node::String(s)) => Some(quote_ident(&s.sval)),
+                _ => None,
+            })
+            .collect();
+        if name.is_empty() {
+            return None;
+        }
+        statements.push(format!("DROP {object_word} {if_exists}{}", name.join(".")));
+    }
+    Some(PgMultiObjectStmt { statements })
+}
+
+/// Try to extract a TRUNCATE naming more than one table.
+pub fn try_extract_multi_truncate(parse_result: &ParseResult) -> Option<PgMultiObjectStmt> {
+    use pg_query::protobuf::node::Node;
+
+    let nodes = parse_result.protobuf.nodes();
+    let pg_query::NodeRef::TruncateStmt(truncate) = &nodes.first()?.0 else {
+        return None;
+    };
+    if truncate.relations.len() < 2 {
+        return None;
+    }
+    // Invalid options fall through to the single-statement path, whose
+    // translation raises the option error.
+    if check_truncate_options(truncate).is_err() {
+        return None;
+    }
+
+    let mut statements = Vec::new();
+    for rel in &truncate.relations {
+        let Some(Node::RangeVar(rv)) = &rel.node else {
+            return None;
+        };
+        let mut name = String::new();
+        if !rv.schemaname.is_empty() {
+            name.push_str(&quote_ident(&rv.schemaname));
+            name.push('.');
+        }
+        name.push_str(&quote_ident(&rv.relname));
+        statements.push(format!("TRUNCATE {name}"));
+    }
+    Some(PgMultiObjectStmt { statements })
 }
 
 /// Represents `CREATE TABLE name (LIKE source)`: the only supported form is

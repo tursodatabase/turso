@@ -169,6 +169,37 @@ fn unsupported_clauses_error_instead_of_silently_dropping() {
     );
 }
 
+/// DROP a, b and TRUNCATE a, b expand into per-object statements; the
+/// expansion must be atomic (PostgreSQL treats the original as one
+/// statement) and the option forms we cannot honor must error.
+#[test]
+fn multi_object_ddl_expands_atomically() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    exec(&mut conn, "CREATE TABLE atomic_a (x int)");
+    // The second name does not exist, so the whole DROP must roll back.
+    let fields = expect_error(&mut conn, "DROP TABLE atomic_a, no_such_zzz");
+    assert_eq!(fields.get(&b'C').map(String::as_str), Some("42P01"));
+    assert_eq!(
+        query_int(
+            &mut conn,
+            "SELECT count(*) FROM pg_tables WHERE tablename = 'atomic_a'"
+        ),
+        1,
+        "failed multi-DROP must not drop the first table"
+    );
+
+    exec(&mut conn, "CREATE TABLE ident_t (x int)");
+    assert_code(&mut conn, "TRUNCATE ident_t RESTART IDENTITY", "0A000");
+    assert_code(&mut conn, "TRUNCATE ident_t CASCADE", "0A000");
+    assert_code(
+        &mut conn,
+        "ALTER TABLE ident_t ADD COLUMN y int, ADD COLUMN z int",
+        "0A000",
+    );
+}
+
 /// Statements that used to panic the engine and take the whole server down.
 /// The contract is survival: whatever each statement returns, the session
 /// must still answer the next query.

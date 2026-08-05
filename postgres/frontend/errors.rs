@@ -88,8 +88,17 @@ fn parse_error(msg: &str, sql: &str) -> PgErrorInfo {
     if let Some(idx) = msg.find("unrecognized configuration parameter") {
         return PgErrorInfo::new("42704", msg[idx..].to_string());
     }
-    if let Some(name) = msg.strip_prefix("no such table: ") {
+    // The engine spells this both ways depending on the code path.
+    if let Some(name) = msg
+        .strip_prefix("no such table: ")
+        .or_else(|| msg.strip_prefix("No such table: "))
+    {
         return PgErrorInfo::new("42P01", format!("relation \"{name}\" does not exist"));
+    }
+    // DROP reports missing targets as objects; the kind (table, view, ...)
+    // is not in the message, so only the code is mapped.
+    if msg.strip_prefix("no such object: ").is_some() {
+        return PgErrorInfo::new("42P01", format!("Parse error: {msg}"));
     }
     if let Some(name) = msg.strip_prefix("no such column: ") {
         return PgErrorInfo::new("42703", format!("column \"{name}\" does not exist"));

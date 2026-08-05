@@ -71,3 +71,25 @@ test array-update-with-cast-where-completes {
 expect {
     1
 }
+
+test drop-multiple-tables {
+    CREATE TABLE mdrop_a (x int);
+    CREATE TABLE mdrop_b (x int);
+    DROP TABLE mdrop_a, mdrop_b;
+    SELECT count(*) FROM pg_tables WHERE tablename IN ('mdrop_a', 'mdrop_b');
+}
+expect {
+    0
+}
+
+test truncate-multiple-tables {
+    CREATE TABLE mtrunc_a (x int);
+    CREATE TABLE mtrunc_b (x int);
+    INSERT INTO mtrunc_a VALUES (1), (2);
+    INSERT INTO mtrunc_b VALUES (3);
+    TRUNCATE mtrunc_a, mtrunc_b;
+    SELECT (SELECT count(*) FROM mtrunc_a) + (SELECT count(*) FROM mtrunc_b);
+}
+expect {
+    0
+}

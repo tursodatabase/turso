@@ -9,8 +9,9 @@ use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_copy_stdin,
     try_extract_copy_to_stdout, try_extract_create_schema, try_extract_create_table_like,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgCreateTableLike, PgDropSchemaStmt, PgSetKind, PgSetStmt, PgSetValue, PostgreSQLTranslator,
+    try_extract_drop_schema, try_extract_multi_drop, try_extract_multi_truncate, try_extract_set,
+    try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt, PgCreateTableLike, PgDropSchemaStmt,
+    PgSetKind, PgSetStmt, PgSetValue, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -468,6 +469,15 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(handle_pg_create_table_like(pg_conn, &stmt)?));
     }
 
+    // DROP a, b, c and TRUNCATE a, b, c used to act on the first object
+    // only; expand them into one statement per object, atomically.
+    let multi =
+        try_extract_multi_drop(&parse_result).or_else(|| try_extract_multi_truncate(&parse_result));
+    if let Some(multi) = multi {
+        handle_pg_multi_statement(pg_conn, &multi.statements)?;
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
+
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
         handle_pg_create_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
@@ -797,6 +807,39 @@ fn copy_rows_into(conn: &Arc<Connection>, stmt: &PgCopyFromStmt, data: &str) -> 
         }
     }
 
+    result
+}
+
+/// Executes the expanded statements of a multi-object DROP or TRUNCATE.
+/// PostgreSQL treats the original as one statement, so when the session is
+/// not already inside a transaction the parts run in one of our own and a
+/// failure undoes the statements that already ran.
+fn handle_pg_multi_statement(
+    pg_conn: &Arc<PgConnectionInner>,
+    statements: &[String],
+) -> Result<()> {
+    let conn = &pg_conn.conn;
+    // Inside an explicit transaction BEGIN would error; the outer
+    // transaction then provides the rollback scope.
+    let own_txn = conn
+        .prepare_sqlite("BEGIN")
+        .and_then(|mut stmt| stmt.run_ignore_rows())
+        .is_ok();
+
+    let result = (|| {
+        for sql in statements {
+            let mut stmt = prepare_statement(pg_conn, sql)?;
+            stmt.run_ignore_rows()?;
+        }
+        Ok(())
+    })();
+
+    if own_txn {
+        let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
+        if let Ok(mut stmt) = conn.prepare_sqlite(end) {
+            let _ = stmt.run_ignore_rows();
+        }
+    }
     result
 }
 
