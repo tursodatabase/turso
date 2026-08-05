@@ -1,0 +1,51 @@
+@database :memory:
+
+# A qualified column reference whose table name doesn't match anything in
+# scope is reported by SQLite as "no such column: t.c" (with the original
+# spelling), not "no such table: t". The "no such table" wording is reserved
+# for FROM-clause references.
+
+test qualified-ref-unknown-table {
+    CREATE TABLE t(a int);
+    SELECT abc.a FROM t;
+}
+expect error {
+    no such column: abc.a
+}
+
+test qualified-ref-unknown-table-in-where {
+    CREATE TABLE t1(a int);
+    SELECT * FROM t1 WHERE abc.a = 1;
+}
+expect error {
+    no such column: abc.a
+}
+
+# The original spelling (case) of the reference is preserved in the message.
+test qualified-ref-preserves-case {
+    CREATE TABLE t2(a int);
+    SELECT AbC.xYz FROM t2;
+}
+expect error {
+    no such column: AbC.xYz
+}
+
+# SQLite ticket [4ef7e3cfca]: same wording inside a trigger body.
+test qualified-ref-unknown-table-in-trigger {
+    CREATE TABLE x(a int);
+    CREATE TRIGGER tr AFTER INSERT ON x BEGIN
+        SELECT * FROM x WHERE abc.a = 1;
+    END;
+    INSERT INTO x VALUES(1);
+}
+expect error {
+    no such column: abc.a
+}
+
+# FROM-clause references to missing tables still say "no such table".
+test from-clause-still-no-such-table {
+    SELECT * FROM nonexistent;
+}
+expect error {
+    no such table: nonexistent
+}
