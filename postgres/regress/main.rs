@@ -197,20 +197,62 @@ fn collect_scripts(path: &Path, scripts: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Runs one script and compares against its expected transcript.
+/// Finds the expected transcripts for a script: `<name>.out` plus any
+/// upstream alternates (`<name>_1.out`, `<name>_2.out`, ...). pg_regress
+/// accepts a match against any of them — alternates encode legitimate
+/// output variations (encoding, locale) that are all equally correct.
+fn expected_files(script: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut files = Vec::new();
+    let primary = script.with_extension("out");
+    files.push((
+        primary.clone(),
+        std::fs::read_to_string(&primary).with_context(|| {
+            format!(
+                "missing expected output {} for {}",
+                primary.display(),
+                script.display()
+            )
+        })?,
+    ));
+    let stem = script
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("bad test file name: {}", script.display()))?;
+    for n in 1..=9 {
+        let alt = script.with_file_name(format!("{stem}_{n}.out"));
+        // Upstream numbers alternates contiguously from _1.
+        let Ok(content) = std::fs::read_to_string(&alt) else {
+            break;
+        };
+        files.push((alt, content));
+    }
+    Ok(files)
+}
+
+/// Picks the expected file closest to the actual output (fewest changed
+/// lines), which is the one whose diff is worth showing — matching how
+/// pg_regress reports the best variant.
+fn closest_expected(files: &[(PathBuf, String)], actual: &str) -> (PathBuf, String) {
+    let best = files
+        .iter()
+        .min_by_key(|(_, expected)| {
+            similar::TextDiff::from_lines(expected.as_str(), actual)
+                .iter_all_changes()
+                .filter(|c| c.tag() != similar::ChangeTag::Equal)
+                .count()
+        })
+        .expect("expected_files returns at least the primary file");
+    best.clone()
+}
+
+/// Runs one script and compares against its expected transcripts; any
+/// match (primary or alternate) passes.
 fn run_script(args: &Args, params: &ConnParams, script: &Path) -> Result<TestResult> {
     let name = script
         .file_stem()
         .and_then(|s| s.to_str())
         .with_context(|| format!("bad test file name: {}", script.display()))?;
-    let expected_path = script.with_extension("out");
-    let expected = std::fs::read_to_string(&expected_path).with_context(|| {
-        format!(
-            "missing expected output {} for {}",
-            expected_path.display(),
-            script.display()
-        )
-    })?;
+    let expected = expected_files(script)?;
 
     print!("{name} ... ");
     std::io::stdout().flush()?;
@@ -234,11 +276,12 @@ fn run_script(args: &Args, params: &ConnParams, script: &Path) -> Result<TestRes
     std::fs::write(&actual_path, &actual)
         .with_context(|| format!("writing {}", actual_path.display()))?;
 
-    if actual == expected {
+    if expected.iter().any(|(_, e)| *e == actual) {
         println!("ok ({} ms)", elapsed.as_millis());
         return Ok(TestResult::Passed);
     }
 
+    let (expected_path, expected) = closest_expected(&expected, &actual);
     let diff = similar::TextDiff::from_lines(&expected, &actual)
         .unified_diff()
         .header(
@@ -1780,6 +1823,28 @@ mod tests {
             scanner.take_rest().as_deref(),
             Some("SELECT 1 /* trailing */")
         );
+    }
+
+    #[test]
+    fn expected_files_finds_contiguous_alternates() {
+        let dir = std::env::temp_dir().join(format!("pgregress-alt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("char.sql");
+        std::fs::write(&script, "").unwrap();
+        std::fs::write(dir.join("char.out"), "primary").unwrap();
+        std::fs::write(dir.join("char_1.out"), "alt one").unwrap();
+        std::fs::write(dir.join("char_2.out"), "alt two").unwrap();
+        // A gap ends the search: _4 must not be picked up without _3.
+        std::fs::write(dir.join("char_4.out"), "orphan").unwrap();
+
+        let files = expected_files(&script).unwrap();
+        let contents: Vec<&str> = files.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(contents, ["primary", "alt one", "alt two"]);
+
+        let (best, _) = closest_expected(&files, "alt two");
+        assert!(best.ends_with("char_2.out"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
