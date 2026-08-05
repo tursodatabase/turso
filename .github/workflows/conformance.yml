@@ -82,3 +82,28 @@ jobs:
         run: make -C bindings/tcl build
       - name: Run SQLite TCL conformance tests
         run: tclsh sqlite/conformance/upstream/all.test
+
+  postgres-upstream:
+    name: PostgreSQL upstream regress tests
+    timeout-minutes: 30
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: conformance-pg-upstream-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            conformance-pg-upstream-cargo-
+      # Exit 0 means every corpus test matched its status in run.py's
+      # STATUS table: blessed tests stayed byte-exact and no known-bad
+      # test went green without being blessed.
+      - name: Run PostgreSQL upstream regress tests
+        run: postgres/conformance/run.py
