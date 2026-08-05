@@ -282,6 +282,16 @@ impl PostgreSQLTranslator {
                         _ => {}
                     }
                 }
+                // LIKE needs the source table's schema, which only the
+                // session layer has; it expands supported forms before
+                // translation ever runs. Anything reaching this point
+                // (mixed with other elements, INCLUDING options) must fail
+                // loudly — dropping it once created zero-column tables.
+                Node::TableLikeClause(_) => {
+                    return Err(ParseError::ParseError(
+                        "CREATE TABLE ... (LIKE ...) is not supported in this form".into(),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -657,7 +667,12 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
-                let col = self.translate_column_def(col_def)?;
+                let mut col = self.translate_column_def(col_def)?;
+                // The ColumnDef of ALTER COLUMN TYPE carries only the new
+                // type; the column's name lives in cmd.name. Losing it
+                // persisted a column literally named "" into the table's
+                // stored DDL, making the database unopenable.
+                col.col_name = ast::Name::from_string(&cmd.name);
                 ast::AlterTableBody::AlterColumn {
                     old: ast::Name::from_string(&cmd.name),
                     new: col,
@@ -4841,6 +4856,57 @@ pub fn try_extract_copy_to_stdout(parse_result: &ParseResult) -> Option<PgCopyTo
         delimiter,
         header,
         null_string,
+    })
+}
+
+/// Represents `CREATE TABLE name (LIKE source)`: the only supported form is
+/// a single bare LIKE element, which the session layer expands using the
+/// source table's live schema.
+pub struct PgCreateTableLike {
+    pub table_name: String,
+    pub schema_name: Option<String>,
+    pub if_not_exists: bool,
+    pub source_table: String,
+    pub source_schema: Option<String>,
+    /// Any `INCLUDING ...` option was given; those forms are unsupported.
+    pub has_options: bool,
+}
+
+/// Try to extract a `CREATE TABLE ... (LIKE source)` statement whose element
+/// list is exactly the LIKE clause.
+pub fn try_extract_create_table_like(parse_result: &ParseResult) -> Option<PgCreateTableLike> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::CreateStmt(create) = &nodes[0].0 else {
+        return None;
+    };
+    let [elt] = create.table_elts.as_slice() else {
+        return None;
+    };
+    let Some(pg_query::protobuf::node::Node::TableLikeClause(like)) = &elt.node else {
+        return None;
+    };
+
+    let normalize_schema = |name: &str| {
+        if name.is_empty() || matches!(name.to_lowercase().as_str(), "public" | "pg_catalog") {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    };
+    let relation = create.relation.as_ref()?;
+    let source = like.relation.as_ref()?;
+    Some(PgCreateTableLike {
+        table_name: relation.relname.clone(),
+        schema_name: normalize_schema(&relation.schemaname),
+        if_not_exists: create.if_not_exists,
+        source_table: source.relname.clone(),
+        source_schema: normalize_schema(&source.schemaname),
+        has_options: like.options != 0,
     })
 }
 

@@ -1,0 +1,51 @@
+# CREATE TABLE ... (LIKE source): the bare form copies column names, types,
+# and not-null constraints. This clause used to be dropped silently,
+# creating a zero-column table whose next ALTER took the server down and
+# whose stored DDL corrupted the database file.
+
+@database :memory:
+
+test like-copies-columns {
+    CREATE TABLE like_src (a int NOT NULL, b text, c real);
+    CREATE TABLE like_dst (LIKE like_src);
+    INSERT INTO like_dst VALUES (1, 'x', 2.5);
+    SELECT a, b, c FROM like_dst;
+}
+expect {
+    1|x|2.5
+}
+
+test like-copies-not-null {
+    CREATE TABLE nn_src (a int NOT NULL, b text);
+    CREATE TABLE nn_dst (LIKE nn_src);
+    INSERT INTO nn_dst VALUES (NULL, 'x');
+}
+expect error {}
+
+test like-then-alter-column-dance {
+    CREATE TABLE dance_src (b int NOT NULL, v varchar);
+    CREATE TABLE dance_dst (LIKE dance_src);
+    ALTER TABLE dance_dst ADD a int;
+    ALTER TABLE dance_dst DROP a;
+    ALTER TABLE dance_dst ADD a int;
+    INSERT INTO dance_dst VALUES (1, 'x', 2);
+    SELECT count(*) FROM dance_dst;
+}
+expect {
+    1
+}
+
+test like-missing-source-errors {
+    CREATE TABLE oops (LIKE no_such_source);
+}
+expect error {}
+
+test like-if-not-exists {
+    CREATE TABLE ine_src (a int);
+    CREATE TABLE ine_dst (LIKE ine_src);
+    CREATE TABLE IF NOT EXISTS ine_dst (LIKE ine_src);
+    SELECT count(*) FROM ine_dst;
+}
+expect {
+    0
+}

@@ -1,6 +1,6 @@
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
-use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
+use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -913,8 +913,16 @@ pub fn translate_alter_table(
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
 
-            // Tables always have at least one column.
-            turso_assert_ne!(btree.columns().len(), 0);
+            // Tables always have at least one column; a zero-column entry
+            // can still exist in databases written before frontends were
+            // stopped from creating them (e.g. CREATE TABLE (LIKE ...)
+            // dropping its column source). Reject the statement instead of
+            // asserting the whole process away.
+            if btree.columns().is_empty() {
+                crate::bail_parse_error!(
+                    "cannot drop column \"{column_name}\": table has no columns"
+                );
+            }
 
             if btree.columns().len() == 1 {
                 return Err(LimboError::ParseError(format!(
@@ -1804,7 +1812,9 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            // Retyping a column in place keeps its name (ALTER COLUMN c
+            // TYPE t); only a name held by a *different* column collides.
+            if !col_name.eq_ignore_ascii_case(from) && btree.get_column(col_name).is_some() {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));

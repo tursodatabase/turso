@@ -8,9 +8,9 @@ use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Valu
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_copy_stdin,
-    try_extract_copy_to_stdout, try_extract_create_schema, try_extract_drop_schema,
-    try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgSetKind, PgSetStmt, PgSetValue, PostgreSQLTranslator,
+    try_extract_copy_to_stdout, try_extract_create_schema, try_extract_create_table_like,
+    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgCreateTableLike, PgDropSchemaStmt, PgSetKind, PgSetStmt, PgSetValue, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -464,6 +464,10 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(handle_pg_show(pg_conn, &show_stmt.name)?));
     }
 
+    if let Some(stmt) = try_extract_create_table_like(&parse_result) {
+        return Ok(Some(handle_pg_create_table_like(pg_conn, &stmt)?));
+    }
+
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
         handle_pg_create_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
@@ -794,6 +798,65 @@ fn copy_rows_into(conn: &Arc<Connection>, stmt: &PgCopyFromStmt, data: &str) -> 
     }
 
     result
+}
+
+/// Expands `CREATE TABLE name (LIKE source)` using the source table's live
+/// schema. PostgreSQL's bare LIKE copies column names, types, and not-null
+/// constraints; the INCLUDING forms (defaults, constraints, indexes) are
+/// not supported and fail rather than silently copying less than asked.
+fn handle_pg_create_table_like(
+    pg_conn: &Arc<PgConnectionInner>,
+    stmt: &PgCreateTableLike,
+) -> Result<Statement> {
+    if stmt.has_options {
+        return Err(LimboError::ParseError(
+            "CREATE TABLE ... (LIKE ... INCLUDING ...) is not supported".to_string(),
+        ));
+    }
+
+    let table_info_sql = match &stmt.source_schema {
+        Some(schema) => format!("PRAGMA \"{schema}\".table_info('{}')", stmt.source_table),
+        None => format!("PRAGMA table_info('{}')", stmt.source_table),
+    };
+    let mut info = pg_conn.conn.prepare_internal(&table_info_sql)?;
+    let rows = info.run_collect_rows()?;
+    if rows.is_empty() {
+        return Err(LimboError::ParseError(format!(
+            "no such table: {}",
+            stmt.source_table
+        )));
+    }
+
+    let mut columns = Vec::new();
+    for row in rows {
+        let Some(Value::Text(name)) = row.get(1) else {
+            continue;
+        };
+        let column_type = match row.get(2) {
+            Some(Value::Text(t)) if !t.as_str().is_empty() => format!(" {}", t.as_str()),
+            _ => String::new(),
+        };
+        let not_null = match row.get(3) {
+            Some(value) if value.as_int() == Some(1) => " NOT NULL",
+            _ => "",
+        };
+        columns.push(format!("\"{}\"{column_type}{not_null}", name.as_str()));
+    }
+
+    let qualified = match &stmt.schema_name {
+        Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
+        None => format!("\"{}\"", stmt.table_name),
+    };
+    let if_not_exists = if stmt.if_not_exists {
+        "IF NOT EXISTS "
+    } else {
+        ""
+    };
+    let create_sql = format!(
+        "CREATE TABLE {if_not_exists}{qualified} ({})",
+        columns.join(", ")
+    );
+    pg_conn.conn.prepare(&create_sql)
 }
 
 fn get_table_columns(
