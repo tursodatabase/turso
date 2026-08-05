@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 from collections import Counter
 
@@ -183,6 +184,62 @@ def check_pr_status(pr_number):
     return has_failing, has_pending
 
 
+def get_repo_nwo():
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if repo:
+        return repo
+    output, _, returncode = run_command("gh repo view --json nameWithOwner -q .nameWithOwner")
+    if returncode == 0 and output:
+        return output
+    print("Error: Could not determine repository. Set GITHUB_REPOSITORY or run from a git repo.")
+    sys.exit(1)
+
+
+def merge_rest_api(pr_number: int, commit_message: str, commit_title: str):
+    repo = get_repo_nwo()
+
+    payload = json.dumps({
+        "commit_title": commit_title,
+        "commit_message": commit_message,
+        "merge_method": "merge",
+    })
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write(payload)
+        payload_path = f.name
+
+    try:
+        cmd = f"gh api -X PUT repos/{repo}/pulls/{pr_number}/merge --input {shlex.quote(payload_path)}"
+        output, error, returncode = run_command(cmd)
+
+        if returncode != 0:
+            print(f"Error merging PR via REST API: {error}")
+            sys.exit(1)
+
+        result = json.loads(output) if output else {}
+        if result.get("merged"):
+            print(f"\nPull request #{pr_number} merged successfully!")
+            print(f"\nMerge commit message:\n{commit_title}\n\n{commit_message}")
+            return
+
+        print("Merge queued, waiting for completion...")
+        for _ in range(30):
+            time.sleep(2)
+            state_out, _, rc = run_command(
+                f"gh pr view {pr_number} -R {repo} --json state -q .state"
+            )
+            if rc == 0 and state_out == "MERGED":
+                print(f"\nPull request #{pr_number} merged successfully!")
+                print(f"\nMerge commit message:\n{commit_title}\n\n{commit_message}")
+                return
+
+        print("Warning: Merge was queued but hasn't completed within 60 seconds.")
+        print("Check the PR status manually.")
+        sys.exit(1)
+    finally:
+        os.unlink(payload_path)
+
+
 def merge_remote(pr_number: int, commit_message: str, commit_title: str):
     has_failing, has_pending = check_pr_status(pr_number)
 
@@ -212,11 +269,14 @@ def merge_remote(pr_number: int, commit_message: str, commit_title: str):
         # Use gh pr merge with the commit message file
         safe_title = shlex.quote(commit_title)
         cmd = f'gh pr merge {pr_number} --merge --subject {safe_title} --body-file "{temp_file_path}"'
-        output, error, returncode = run_command(cmd, capture_output=False)
+        output, error, returncode = run_command(cmd)
 
         if returncode == 0:
             print(f"\nPull request #{pr_number} merged successfully!")
             print(f"\nMerge commit message:\n{commit_message}")
+        elif "asynchronous merge REST API" in error:
+            print("PR is part of a stack, falling back to REST API...")
+            merge_rest_api(pr_number, commit_message, commit_title)
         else:
             print(f"Error merging PR: {error}")
             sys.exit(1)
