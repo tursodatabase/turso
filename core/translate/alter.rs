@@ -34,7 +34,7 @@ use crate::{
     LimboError, Numeric, Result, Value, ValueRef,
 };
 use either::Either;
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
     // Check if someone is trying to ALTER a system table
@@ -4013,6 +4013,7 @@ fn validate_trigger_columns_after_drop(
             if let Some(bad) = validate_expr_column_refs_after_drop(
                 when_expr,
                 &[],
+                &HashMap::default(),
                 &owning_table_columns,
                 allow_bare_owning_columns,
                 altered_table_norm,
@@ -4053,6 +4054,7 @@ fn validate_trigger_columns_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         &set.expr,
                         cmd_table_cols.as_deref().unwrap_or(&[]),
+                        &HashMap::default(),
                         &owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -4068,6 +4070,7 @@ fn validate_trigger_columns_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         where_expr,
                         cmd_table_cols.as_deref().unwrap_or(&[]),
+                        &HashMap::default(),
                         &owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -4087,6 +4090,7 @@ fn validate_trigger_columns_after_drop(
                 if let Some(bad) = validate_select_column_refs_after_drop(
                     select,
                     &[],
+                    &HashMap::default(),
                     &owning_table_columns,
                     allow_bare_owning_columns,
                     altered_table_norm,
@@ -4117,6 +4121,7 @@ fn validate_trigger_columns_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         where_expr,
                         cmd_table_cols.as_deref().unwrap_or(&[]),
+                        &HashMap::default(),
                         &owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -4133,6 +4138,7 @@ fn validate_trigger_columns_after_drop(
                 if let Some(bad) = validate_select_column_refs_after_drop(
                     select,
                     &[],
+                    &HashMap::default(),
                     &owning_table_columns,
                     allow_bare_owning_columns,
                     altered_table_norm,
@@ -4172,6 +4178,7 @@ fn validate_trigger_table_refs_after_rename(
         if let Some(missing_table) = validate_expr_table_refs_after_rename(
             when_expr,
             altered_table_norm,
+            &HashSet::default(),
             resolver,
             trigger_database_id,
             altered_database_id,
@@ -4225,6 +4232,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_from_clause_table_refs_after_rename(
                     from_clause,
                     altered_table_norm,
+                    &HashSet::default(),
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4237,6 +4245,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     &set.expr,
                     altered_table_norm,
+                    &HashSet::default(),
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4249,6 +4258,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     where_expr,
                     altered_table_norm,
+                    &HashSet::default(),
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4277,6 +4287,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
             if let Some(missing_table) = validate_select_table_refs_after_rename(
                 select,
                 altered_table_norm,
+                &HashSet::default(),
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4315,6 +4326,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     where_expr,
                     altered_table_norm,
+                    &HashSet::default(),
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4327,6 +4339,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
             if let Some(missing_table) = validate_select_table_refs_after_rename(
                 select,
                 altered_table_norm,
+                &HashSet::default(),
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4342,6 +4355,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
 fn validate_expr_table_refs_after_rename(
     expr: &ast::Expr,
     altered_table_norm: &str,
+    visible_ctes: &HashSet<String>,
     resolver: &Resolver,
     trigger_database_id: usize,
     altered_database_id: usize,
@@ -4351,6 +4365,7 @@ fn validate_expr_table_refs_after_rename(
             return validate_select_table_refs_after_rename(
                 select,
                 altered_table_norm,
+                visible_ctes,
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4360,6 +4375,7 @@ fn validate_expr_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 lhs,
                 altered_table_norm,
+                visible_ctes,
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4369,6 +4385,7 @@ fn validate_expr_table_refs_after_rename(
             return validate_select_table_refs_after_rename(
                 rhs,
                 altered_table_norm,
+                visible_ctes,
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4387,6 +4404,7 @@ fn validate_expr_table_refs_after_rename(
                 missing_table = validate_select_table_refs_after_rename(
                     select,
                     altered_table_norm,
+                    visible_ctes,
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4397,6 +4415,7 @@ fn validate_expr_table_refs_after_rename(
                 missing_table = validate_expr_table_refs_after_rename(
                     lhs,
                     altered_table_norm,
+                    visible_ctes,
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4405,6 +4424,7 @@ fn validate_expr_table_refs_after_rename(
                     missing_table = validate_select_table_refs_after_rename(
                         rhs,
                         altered_table_norm,
+                        visible_ctes,
                         resolver,
                         trigger_database_id,
                         altered_database_id,
@@ -4422,15 +4442,21 @@ fn validate_expr_table_refs_after_rename(
 fn validate_select_table_refs_after_rename(
     select: &ast::Select,
     altered_table_norm: &str,
+    inherited_ctes: &HashSet<String>,
     resolver: &Resolver,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
+    let mut visible_ctes = inherited_ctes.clone();
+
     if let Some(with_clause) = &select.with {
         for cte in &with_clause.ctes {
+            visible_ctes.insert(normalize_ident(cte.tbl_name.as_str()));
+
             if let Some(missing_table) = validate_select_table_refs_after_rename(
                 &cte.select,
                 altered_table_norm,
+                &visible_ctes,
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4442,6 +4468,7 @@ fn validate_select_table_refs_after_rename(
 
     if let Some(missing_table) = validate_one_select_table_refs_after_rename(
         &select.body.select,
+        &visible_ctes,
         altered_table_norm,
         resolver,
         trigger_database_id,
@@ -4453,6 +4480,7 @@ fn validate_select_table_refs_after_rename(
     for compound in &select.body.compounds {
         if let Some(missing_table) = validate_one_select_table_refs_after_rename(
             &compound.select,
+            &visible_ctes,
             altered_table_norm,
             resolver,
             trigger_database_id,
@@ -4466,6 +4494,7 @@ fn validate_select_table_refs_after_rename(
         if let Some(missing_table) = validate_expr_table_refs_after_rename(
             &sorted_col.expr,
             altered_table_norm,
+            &visible_ctes,
             resolver,
             trigger_database_id,
             altered_database_id,
@@ -4478,6 +4507,7 @@ fn validate_select_table_refs_after_rename(
         if let Some(missing_table) = validate_expr_table_refs_after_rename(
             &limit.expr,
             altered_table_norm,
+            &visible_ctes,
             resolver,
             trigger_database_id,
             altered_database_id,
@@ -4488,6 +4518,7 @@ fn validate_select_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 offset,
                 altered_table_norm,
+                &visible_ctes,
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4502,6 +4533,7 @@ fn validate_select_table_refs_after_rename(
 
 fn validate_one_select_table_refs_after_rename(
     one_select: &ast::OneSelect,
+    visible_ctes: &HashSet<String>,
     altered_table_norm: &str,
     resolver: &Resolver,
     trigger_database_id: usize,
@@ -4520,6 +4552,7 @@ fn validate_one_select_table_refs_after_rename(
                 if let Some(missing_table) = validate_from_clause_table_refs_after_rename(
                     from_clause,
                     altered_table_norm,
+                    visible_ctes,
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4533,6 +4566,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         expr,
                         altered_table_norm,
+                        visible_ctes,
                         resolver,
                         trigger_database_id,
                         altered_database_id,
@@ -4546,6 +4580,7 @@ fn validate_one_select_table_refs_after_rename(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     where_expr,
                     altered_table_norm,
+                    visible_ctes,
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4559,6 +4594,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         expr,
                         altered_table_norm,
+                        visible_ctes,
                         resolver,
                         trigger_database_id,
                         altered_database_id,
@@ -4570,6 +4606,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         having,
                         altered_table_norm,
+                        visible_ctes,
                         resolver,
                         trigger_database_id,
                         altered_database_id,
@@ -4584,6 +4621,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         partition,
                         altered_table_norm,
+                        visible_ctes,
                         resolver,
                         trigger_database_id,
                         altered_database_id,
@@ -4595,6 +4633,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         &order.expr,
                         altered_table_norm,
+                        visible_ctes,
                         resolver,
                         trigger_database_id,
                         altered_database_id,
@@ -4610,6 +4649,7 @@ fn validate_one_select_table_refs_after_rename(
                     if let Some(missing_table) = validate_expr_table_refs_after_rename(
                         expr,
                         altered_table_norm,
+                        visible_ctes,
                         resolver,
                         trigger_database_id,
                         altered_database_id,
@@ -4627,6 +4667,7 @@ fn validate_one_select_table_refs_after_rename(
 fn validate_from_clause_table_refs_after_rename(
     from_clause: &ast::FromClause,
     altered_table_norm: &str,
+    visible_ctes: &HashSet<String>,
     resolver: &Resolver,
     trigger_database_id: usize,
     altered_database_id: usize,
@@ -4634,6 +4675,7 @@ fn validate_from_clause_table_refs_after_rename(
     if let Some(missing_table) = validate_select_table_refs_after_rename_in_table(
         &from_clause.select,
         altered_table_norm,
+        visible_ctes,
         resolver,
         trigger_database_id,
         altered_database_id,
@@ -4645,6 +4687,7 @@ fn validate_from_clause_table_refs_after_rename(
         if let Some(missing_table) = validate_select_table_refs_after_rename_in_table(
             &join.table,
             altered_table_norm,
+            visible_ctes,
             resolver,
             trigger_database_id,
             altered_database_id,
@@ -4656,6 +4699,7 @@ fn validate_from_clause_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 expr,
                 altered_table_norm,
+                visible_ctes,
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4671,12 +4715,19 @@ fn validate_from_clause_table_refs_after_rename(
 fn validate_select_table_refs_after_rename_in_table(
     select_table: &ast::SelectTable,
     altered_table_norm: &str,
+    visible_ctes: &HashSet<String>,
     resolver: &Resolver,
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     match select_table {
         ast::SelectTable::Table(qualified_name, _, _) => {
+            let table_name_norm = normalize_ident(qualified_name.name.as_str());
+
+            if qualified_name.db_name.is_none() && visible_ctes.contains(&table_name_norm) {
+                return Ok(None);
+            }
+
             if table_reference_exists_after_rename(
                 qualified_name.name.as_str(),
                 qualified_name.db_name.as_ref().map(|db| db.as_str()),
@@ -4695,6 +4746,7 @@ fn validate_select_table_refs_after_rename_in_table(
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     arg,
                     altered_table_norm,
+                    visible_ctes,
                     resolver,
                     trigger_database_id,
                     altered_database_id,
@@ -4707,6 +4759,7 @@ fn validate_select_table_refs_after_rename_in_table(
         ast::SelectTable::Select(select, _) => validate_select_table_refs_after_rename(
             select,
             altered_table_norm,
+            visible_ctes,
             resolver,
             trigger_database_id,
             altered_database_id,
@@ -4714,6 +4767,7 @@ fn validate_select_table_refs_after_rename_in_table(
         ast::SelectTable::Sub(from_clause, _) => validate_from_clause_table_refs_after_rename(
             from_clause,
             altered_table_norm,
+            visible_ctes,
             resolver,
             trigger_database_id,
             altered_database_id,
@@ -4733,6 +4787,7 @@ fn validate_upsert_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 &target.expr,
                 altered_table_norm,
+                &HashSet::default(),
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4744,6 +4799,7 @@ fn validate_upsert_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 where_clause,
                 altered_table_norm,
+                &HashSet::default(),
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4758,6 +4814,7 @@ fn validate_upsert_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 &set.expr,
                 altered_table_norm,
+                &HashSet::default(),
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4769,6 +4826,7 @@ fn validate_upsert_table_refs_after_rename(
             if let Some(missing_table) = validate_expr_table_refs_after_rename(
                 expr,
                 altered_table_norm,
+                &HashSet::default(),
                 resolver,
                 trigger_database_id,
                 altered_database_id,
@@ -4840,6 +4898,7 @@ fn table_reference_exists_after_rename(
 fn validate_expr_column_refs_after_drop(
     expr: &ast::Expr,
     visible_columns: &[String],
+    visible_ctes: &HashMap<String, Vec<String>>,
     owning_table_columns: &Option<Vec<String>>,
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
@@ -4853,6 +4912,7 @@ fn validate_expr_column_refs_after_drop(
             return validate_select_column_refs_after_drop(
                 select,
                 visible_columns,
+                visible_ctes,
                 owning_table_columns,
                 allow_bare_owning_columns,
                 altered_table_norm,
@@ -4866,6 +4926,7 @@ fn validate_expr_column_refs_after_drop(
             let lhs_bad = validate_expr_column_refs_after_drop(
                 lhs,
                 visible_columns,
+                visible_ctes,
                 owning_table_columns,
                 allow_bare_owning_columns,
                 altered_table_norm,
@@ -4880,6 +4941,7 @@ fn validate_expr_column_refs_after_drop(
             return validate_select_column_refs_after_drop(
                 rhs,
                 visible_columns,
+                visible_ctes,
                 owning_table_columns,
                 allow_bare_owning_columns,
                 altered_table_norm,
@@ -4916,6 +4978,7 @@ fn validate_expr_column_refs_after_drop(
                 bad = validate_select_column_refs_after_drop(
                     select,
                     visible_columns,
+                    visible_ctes,
                     owning_table_columns,
                     allow_bare_owning_columns,
                     altered_table_norm,
@@ -4930,6 +4993,7 @@ fn validate_expr_column_refs_after_drop(
                 bad = validate_expr_column_refs_after_drop(
                     lhs,
                     visible_columns,
+                    visible_ctes,
                     owning_table_columns,
                     allow_bare_owning_columns,
                     altered_table_norm,
@@ -4942,6 +5006,7 @@ fn validate_expr_column_refs_after_drop(
                     bad = validate_select_column_refs_after_drop(
                         rhs,
                         visible_columns,
+                        visible_ctes,
                         owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -4980,6 +5045,7 @@ fn validate_expr_column_refs_after_drop(
 fn validate_select_column_refs_after_drop(
     select: &ast::Select,
     outer_visible_columns: &[String],
+    inherited_ctes: &HashMap<String, Vec<String>>,
     owning_table_columns: &Option<Vec<String>>,
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
@@ -4988,11 +5054,26 @@ fn validate_select_column_refs_after_drop(
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> Result<Option<String>> {
+    let mut visible_ctes = inherited_ctes.clone();
+
     if let Some(with_clause) = &select.with {
+        for cte in &with_clause.ctes {
+            let columns = if cte.columns.is_empty() {
+                collect_select_output_columns(&cte.select)
+            } else {
+                cte.columns
+                    .iter()
+                    .map(|column| normalize_ident(column.col_name.as_str()))
+                    .collect()
+            };
+            visible_ctes.insert(normalize_ident(cte.tbl_name.as_str()), columns);
+        }
+
         for cte in &with_clause.ctes {
             if let Some(bad) = validate_select_column_refs_after_drop(
                 &cte.select,
                 &[],
+                &visible_ctes,
                 owning_table_columns,
                 allow_bare_owning_columns,
                 altered_table_norm,
@@ -5009,6 +5090,7 @@ fn validate_select_column_refs_after_drop(
     if let Some(bad) = validate_one_select_column_refs_after_drop(
         &select.body.select,
         outer_visible_columns,
+        &visible_ctes,
         owning_table_columns,
         allow_bare_owning_columns,
         altered_table_norm,
@@ -5024,6 +5106,7 @@ fn validate_select_column_refs_after_drop(
         if let Some(bad) = validate_one_select_column_refs_after_drop(
             &compound.select,
             outer_visible_columns,
+            &visible_ctes,
             owning_table_columns,
             allow_bare_owning_columns,
             altered_table_norm,
@@ -5044,6 +5127,7 @@ fn validate_select_column_refs_after_drop(
                 .map(|from| {
                     collect_from_clause_visible_columns(
                         from,
+                        &visible_ctes,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -5060,6 +5144,7 @@ fn validate_select_column_refs_after_drop(
         if let Some(bad) = validate_expr_column_refs_after_drop(
             &sorted_col.expr,
             &body_visible_columns,
+            &visible_ctes,
             owning_table_columns,
             allow_bare_owning_columns,
             altered_table_norm,
@@ -5076,6 +5161,7 @@ fn validate_select_column_refs_after_drop(
         if let Some(bad) = validate_expr_column_refs_after_drop(
             &limit.expr,
             &body_visible_columns,
+            &visible_ctes,
             owning_table_columns,
             allow_bare_owning_columns,
             altered_table_norm,
@@ -5090,6 +5176,7 @@ fn validate_select_column_refs_after_drop(
             if let Some(bad) = validate_expr_column_refs_after_drop(
                 offset,
                 &body_visible_columns,
+                &visible_ctes,
                 owning_table_columns,
                 allow_bare_owning_columns,
                 altered_table_norm,
@@ -5110,6 +5197,7 @@ fn validate_select_column_refs_after_drop(
 fn validate_one_select_column_refs_after_drop(
     one_select: &ast::OneSelect,
     outer_visible_columns: &[String],
+    visible_ctes: &HashMap<String, Vec<String>>,
     owning_table_columns: &Option<Vec<String>>,
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
@@ -5134,6 +5222,7 @@ fn validate_one_select_column_refs_after_drop(
                     .map(|from| {
                         collect_from_clause_visible_columns(
                             from,
+                            visible_ctes,
                             altered_table_norm,
                             post_drop_table,
                             resolver,
@@ -5148,6 +5237,7 @@ fn validate_one_select_column_refs_after_drop(
                 if let Some(bad) = validate_from_clause_column_refs_after_drop(
                     from_clause,
                     outer_visible_columns,
+                    visible_ctes,
                     owning_table_columns,
                     allow_bare_owning_columns,
                     altered_table_norm,
@@ -5165,6 +5255,7 @@ fn validate_one_select_column_refs_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         expr,
                         &local_visible_columns,
+                        visible_ctes,
                         owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -5182,6 +5273,7 @@ fn validate_one_select_column_refs_after_drop(
                 if let Some(bad) = validate_expr_column_refs_after_drop(
                     where_clause,
                     &local_visible_columns,
+                    visible_ctes,
                     owning_table_columns,
                     allow_bare_owning_columns,
                     altered_table_norm,
@@ -5199,6 +5291,7 @@ fn validate_one_select_column_refs_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         expr,
                         &local_visible_columns,
+                        visible_ctes,
                         owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -5214,6 +5307,7 @@ fn validate_one_select_column_refs_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         having,
                         &local_visible_columns,
+                        visible_ctes,
                         owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -5232,6 +5326,7 @@ fn validate_one_select_column_refs_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         partition,
                         &local_visible_columns,
+                        visible_ctes,
                         owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -5247,6 +5342,7 @@ fn validate_one_select_column_refs_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         &order.expr,
                         &local_visible_columns,
+                        visible_ctes,
                         owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -5266,6 +5362,7 @@ fn validate_one_select_column_refs_after_drop(
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         expr,
                         outer_visible_columns,
+                        visible_ctes,
                         owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -5288,6 +5385,7 @@ fn validate_one_select_column_refs_after_drop(
 fn validate_from_clause_column_refs_after_drop(
     from_clause: &ast::FromClause,
     outer_visible_columns: &[String],
+    visible_ctes: &HashMap<String, Vec<String>>,
     owning_table_columns: &Option<Vec<String>>,
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
@@ -5300,6 +5398,7 @@ fn validate_from_clause_column_refs_after_drop(
 
     if let Some(bad) = validate_select_table_column_refs_after_drop(
         &from_clause.select,
+        visible_ctes,
         owning_table_columns,
         allow_bare_owning_columns,
         altered_table_norm,
@@ -5314,6 +5413,7 @@ fn validate_from_clause_column_refs_after_drop(
         &visible_columns,
         &collect_select_table_visible_columns(
             &from_clause.select,
+            visible_ctes,
             altered_table_norm,
             post_drop_table,
             resolver,
@@ -5325,6 +5425,7 @@ fn validate_from_clause_column_refs_after_drop(
     for join in &from_clause.joins {
         if let Some(bad) = validate_select_table_column_refs_after_drop(
             &join.table,
+            visible_ctes,
             owning_table_columns,
             allow_bare_owning_columns,
             altered_table_norm,
@@ -5337,6 +5438,7 @@ fn validate_from_clause_column_refs_after_drop(
         }
         let join_visible_columns = collect_select_table_visible_columns(
             &join.table,
+            visible_ctes,
             altered_table_norm,
             post_drop_table,
             resolver,
@@ -5348,6 +5450,7 @@ fn validate_from_clause_column_refs_after_drop(
             if let Some(bad) = validate_expr_column_refs_after_drop(
                 expr,
                 &on_visible_columns,
+                visible_ctes,
                 owning_table_columns,
                 allow_bare_owning_columns,
                 altered_table_norm,
@@ -5368,6 +5471,7 @@ fn validate_from_clause_column_refs_after_drop(
 #[allow(clippy::too_many_arguments)]
 fn validate_select_table_column_refs_after_drop(
     select_table: &ast::SelectTable,
+    visible_ctes: &HashMap<String, Vec<String>>,
     owning_table_columns: &Option<Vec<String>>,
     allow_bare_owning_columns: bool,
     altered_table_norm: &str,
@@ -5380,6 +5484,7 @@ fn validate_select_table_column_refs_after_drop(
         ast::SelectTable::Select(select, _) => validate_select_column_refs_after_drop(
             select,
             &[],
+            visible_ctes,
             owning_table_columns,
             allow_bare_owning_columns,
             altered_table_norm,
@@ -5391,6 +5496,7 @@ fn validate_select_table_column_refs_after_drop(
         ast::SelectTable::Sub(from_clause, _) => validate_from_clause_column_refs_after_drop(
             from_clause,
             &[],
+            visible_ctes,
             owning_table_columns,
             allow_bare_owning_columns,
             altered_table_norm,
@@ -5404,6 +5510,7 @@ fn validate_select_table_column_refs_after_drop(
                 if let Some(bad) = validate_expr_column_refs_after_drop(
                     arg,
                     &[],
+                    visible_ctes,
                     owning_table_columns,
                     allow_bare_owning_columns,
                     altered_table_norm,
@@ -5423,6 +5530,7 @@ fn validate_select_table_column_refs_after_drop(
 
 fn collect_from_clause_visible_columns(
     from_clause: &ast::FromClause,
+    visible_ctes: &HashMap<String, Vec<String>>,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
     resolver: &Resolver,
@@ -5431,6 +5539,7 @@ fn collect_from_clause_visible_columns(
 ) -> Vec<String> {
     let mut visible_columns = collect_select_table_visible_columns(
         &from_clause.select,
+        visible_ctes,
         altered_table_norm,
         post_drop_table,
         resolver,
@@ -5442,6 +5551,7 @@ fn collect_from_clause_visible_columns(
             &visible_columns,
             &collect_select_table_visible_columns(
                 &join.table,
+                visible_ctes,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5455,6 +5565,7 @@ fn collect_from_clause_visible_columns(
 
 fn collect_select_table_visible_columns(
     select_table: &ast::SelectTable,
+    visible_ctes: &HashMap<String, Vec<String>>,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
     resolver: &Resolver,
@@ -5462,8 +5573,25 @@ fn collect_select_table_visible_columns(
     altered_database_id: usize,
 ) -> Vec<String> {
     match select_table {
-        ast::SelectTable::Table(qualified_name, _, _)
-        | ast::SelectTable::TableCall(qualified_name, _, _) => get_table_columns(
+        ast::SelectTable::Table(qualified_name, _, _) => {
+            let table_name_norm = normalize_ident(qualified_name.name.as_str());
+            if qualified_name.db_name.is_none() {
+                if let Some(columns) = visible_ctes.get(&table_name_norm) {
+                    return columns.clone();
+                }
+            }
+            get_table_columns(
+                &table_name_norm,
+                altered_table_norm,
+                post_drop_table,
+                resolver,
+                trigger_database_id,
+                altered_database_id,
+                qualified_name.db_name.as_ref().map(|name| name.as_str()),
+            )
+            .unwrap_or_default()
+        }
+        ast::SelectTable::TableCall(qualified_name, _, _) => get_table_columns(
             &normalize_ident(qualified_name.name.as_str()),
             altered_table_norm,
             post_drop_table,
