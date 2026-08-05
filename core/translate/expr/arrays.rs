@@ -60,7 +60,12 @@ pub(super) fn emit_array_element_loop(
         dest: reg_offset,
     });
 
-    let loop_start = program.offset();
+    // The backward jump must go through a label: a raw offset captured here
+    // goes stale when later translation passes insert instructions before
+    // this point (the UPDATE path does), which made the Goto land past this
+    // exit test and spin the loop body forever.
+    let loop_start_label = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start_label);
     let loop_end_label = program.allocate_label();
 
     program.emit_insn(Insn::Gt {
@@ -105,7 +110,7 @@ pub(super) fn emit_array_element_loop(
         value: 1,
     });
     program.emit_insn(Insn::Goto {
-        target_pc: loop_start,
+        target_pc: loop_start_label,
     });
 
     program.preassign_label_to_next_insn(loop_end_label);

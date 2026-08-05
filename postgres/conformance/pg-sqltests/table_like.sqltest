@@ -57,3 +57,17 @@ test alter-column-type-keeps-constraints {
     INSERT INTO retype_t VALUES ('x');
 }
 expect error {}
+
+# Regression guard for a translator bug where this UPDATE's array-encode
+# loop jumped past its own exit test and spun forever. The count assertion
+# holds in PostgreSQL too; the slice's element-wise semantics are still
+# wrong here (the whole array is replaced) and are tracked separately.
+test array-update-with-cast-where-completes {
+    CREATE TABLE arr_upd (a int2[]);
+    INSERT INTO arr_upd VALUES ('{1,2,3,4,5}');
+    UPDATE arr_upd SET a[1:2] = '{16,25}' WHERE NOT a = '{}'::_int2;
+    SELECT count(*) FROM arr_upd;
+}
+expect {
+    1
+}
