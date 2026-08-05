@@ -139,3 +139,21 @@ expect {
     1
     5
 }
+
+test case-insensitive-regex-match {
+    CREATE TABLE ci_re (s text);
+    INSERT INTO ci_re VALUES ('Hello'), ('world');
+    SELECT count(*) FROM ci_re WHERE s ~* '^HELLO$';
+}
+expect {
+    1
+}
+
+test case-insensitive-regex-negated {
+    CREATE TABLE ci_re2 (s text);
+    INSERT INTO ci_re2 VALUES ('Hello'), ('world');
+    SELECT count(*) FROM ci_re2 WHERE s !~* 'HELLO';
+}
+expect {
+    1
+}

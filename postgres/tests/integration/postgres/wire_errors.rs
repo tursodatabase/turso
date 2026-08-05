@@ -200,6 +200,39 @@ fn multi_object_ddl_expands_atomically() {
     );
 }
 
+/// The remaining formerly-silent drops: each accepted form here executes
+/// with PostgreSQL semantics, each rejected form errors instead of running
+/// with different semantics.
+#[test]
+fn remaining_silent_drops_error_or_work() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    exec(&mut conn, "CREATE TABLE strag (x int)");
+    exec(&mut conn, "INSERT INTO strag VALUES (1), (2)");
+
+    for sql in [
+        "SELECT x FROM strag ORDER BY x FETCH FIRST 1 ROW WITH TIES",
+        "SELECT a.x FROM strag a, LATERAL (SELECT a.x) b",
+        "SELECT t.a FROM strag AS t(a)",
+        "CREATE INDEX strag_inc ON strag (x) INCLUDE (x)",
+    ] {
+        assert_code(&mut conn, sql, "0A000");
+    }
+
+    // CURRENT_USER agrees with the catalog's single role instead of ''.
+    let row = conn
+        .simple_query("SELECT CURRENT_USER")
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e {
+            turso_pg_client::BackendEvent::DataRow(r) => Some(r),
+            _ => None,
+        })
+        .expect("no row");
+    assert_eq!(row[0].as_deref(), Some("turso"));
+}
+
 /// Statements that used to panic the engine and take the whole server down.
 /// The contract is survival: whatever each statement returns, the session
 /// must still answer the next query.

@@ -830,6 +830,13 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::node::Node;
 
+        // INCLUDE columns are covering-index payload; an index silently
+        // created without them is a different index than asked for.
+        if !idx.index_including_params.is_empty() {
+            return Err(ParseError::ParseError(
+                "CREATE INDEX ... INCLUDE is not supported".into(),
+            ));
+        }
         let relation = idx
             .relation
             .as_ref()
@@ -1783,7 +1790,11 @@ impl PostgreSQLTranslator {
         let alias = range_var
             .alias
             .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+            .map(|a| {
+                check_alias_colnames(a)?;
+                Ok::<_, ParseError>(ast::As::Elided(ast::Name::from_string(a.aliasname.clone())))
+            })
+            .transpose()?;
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -1792,6 +1803,14 @@ impl PostgreSQLTranslator {
         &self,
         range_sub: &pg_query::protobuf::RangeSubselect,
     ) -> Result<ast::SelectTable, ParseError> {
+        // The subquery's columns would need renaming; dropping the list
+        // left references to the aliased names unresolvable.
+        if range_sub.lateral {
+            return Err(ParseError::ParseError("LATERAL is not supported".into()));
+        }
+        if let Some(alias) = &range_sub.alias {
+            check_alias_colnames(alias)?;
+        }
         let subquery_node = range_sub
             .subquery
             .as_ref()
@@ -2331,8 +2350,10 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopUser
                         | SqlValueFunctionOp::SvfopCurrentRole,
                     ) => {
-                        // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
+                        // The frontend has a single hardcoded role; agree
+                        // with pg_roles and pg_get_userbyid instead of
+                        // returning an empty string.
+                        Ok(ast::Expr::Literal(ast::Literal::String("'turso'".into())))
                     }
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
@@ -2732,14 +2753,16 @@ impl PostgreSQLTranslator {
                     escape: None,
                 });
             }
-            // Case-insensitive regex (~*, !~*) — treat same as case-sensitive
-            // since SQLite REGEXP is case-insensitive by default
+            // Case-insensitive regex (~*, !~*): REGEXP matching is
+            // case-sensitive, so prepend the inline (?i) flag to the
+            // pattern. Treating these as case-sensitive silently changed
+            // which rows matched.
             "~*" => {
                 return Ok(ast::Expr::Like {
                     lhs: left,
                     not: false,
                     op: ast::LikeOperator::Regexp,
-                    rhs: right,
+                    rhs: case_insensitive_pattern(right),
                     escape: None,
                 });
             }
@@ -2748,7 +2771,7 @@ impl PostgreSQLTranslator {
                     lhs: left,
                     not: true,
                     op: ast::LikeOperator::Regexp,
-                    rhs: right,
+                    rhs: case_insensitive_pattern(right),
                     escape: None,
                 });
             }
@@ -3112,6 +3135,12 @@ impl PostgreSQLTranslator {
         if select.distinct_clause.iter().any(|n| n.node.is_some()) {
             return Err(ParseError::ParseError(
                 "DISTINCT ON is not supported".into(),
+            ));
+        }
+        // WITH TIES returns extra peer rows; a plain LIMIT does not.
+        if select.limit_option() == pg_query::protobuf::LimitOption::WithTies {
+            return Err(ParseError::ParseError(
+                "FETCH FIRST ... WITH TIES is not supported".into(),
             ));
         }
         for lock in &select.locking_clause {
@@ -5005,6 +5034,31 @@ pub struct PgMultiObjectStmt {
 
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Column lists on table aliases (`t AS x(a, b)`) rename the columns;
+/// dropping the list left references to the aliased names unresolvable, so
+/// queries failed with confusing missing-column errors — or worse, matched
+/// same-named real columns.
+fn check_alias_colnames(alias: &pg_query::protobuf::Alias) -> Result<(), ParseError> {
+    if alias.colnames.is_empty() {
+        Ok(())
+    } else {
+        Err(ParseError::ParseError(
+            "column aliases in a table alias are not supported".into(),
+        ))
+    }
+}
+
+/// Wraps a regex pattern expression so it matches case-insensitively:
+/// `'(?i)' || pattern`. Works for any pattern expression, not just
+/// literals.
+fn case_insensitive_pattern(pattern: Box<ast::Expr>) -> Box<ast::Expr> {
+    Box::new(ast::Expr::Binary(
+        Box::new(ast::Expr::Literal(ast::Literal::String("'(?i)'".into()))),
+        ast::Operator::Concat,
+        pattern,
+    ))
 }
 
 /// Try to extract a DROP statement naming more than one object.
