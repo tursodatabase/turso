@@ -285,3 +285,7 @@ harness = false
 [[bench]]
 name = "record_recycling"
 harness = false
+
+[[bench]]
+name = "column_fetch_benchmark"
+harness = false

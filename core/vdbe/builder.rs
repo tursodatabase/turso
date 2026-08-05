@@ -2012,6 +2012,8 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
+        let cursors_wanting_record_cache = pick_cursors_worth_caching(&self.insns)?;
+
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2032,6 +2034,7 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            cursors_wanting_record_cache,
         };
         Ok(prepared)
     }
@@ -2046,5 +2049,175 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+}
+
+/// What filling one cache entry costs, relative to decoding one serial type.
+///
+/// The cached walk does everything the uncached walk does — read the varint,
+/// work out the value's width — and then also stores an entry, which every
+/// later read pays to look up again.
+///
+/// This constant and [`RECORD_CACHE_SLACK`] are fitted to where the crossover
+/// actually sits, measured by instruction count (wall-clock noise on a small
+/// machine is larger than the effect). `SELECT *` costs, per row:
+///
+/// | columns | uncached decodes | measured |
+/// |---------|------------------|----------|
+/// | 10      | 55               | no gain  |
+/// | 21      | 231              | −9%      |
+/// | 106     | 5671             | −50%     |
+///
+/// So the crossover is between 10 and 21 columns, and these two constants are
+/// chosen to put it there. Serial types for narrow rows are single-byte
+/// varints, which makes decoding them nearly free — that is why a cache needs
+/// a genuinely wide row before it earns its keep.
+const FILL_COST_PER_COLUMN: usize = 4;
+
+/// Extra margin, in decodes, on top of the modelled cached cost. Covers the
+/// first row's allocation and the per-read branch, and keeps the cache away
+/// from queries that would only break even.
+const RECORD_CACHE_SLACK: usize = 16;
+
+/// Decides which cursors should remember where their columns start.
+///
+/// Reading column `c` without a cache decodes `c + 1` serial types, because
+/// every `Column` walks the header from the front. So for one cursor:
+///
+/// - uncached, a row costs `sum(c + 1)` over every `Column` on that cursor
+/// - cached, it costs `max(c) + 1` decodes — one walk out to the furthest
+///   column read, with every read after that a lookup — but each of those
+///   columns also gets stored, which [`FILL_COST_PER_COLUMN`] accounts for
+///
+/// Caching is worth it when the first number beats the second by more than
+/// [`RECORD_CACHE_SLACK`]. That test is what keeps this off the access patterns
+/// where a cache loses: one narrow read of a wide row
+/// (`SELECT c90 FROM wide`), and a handful of far-apart columns
+/// (`SELECT c90, c2, c50, c7 FROM wide`), where walking out to c90 and storing
+/// 91 entries costs more than just walking to each column in turn.
+///
+/// Note this counts `Column` instructions, not executions. A cursor read in two
+/// different loops looks the same as one read twice in a single loop. Guessing
+/// wrong costs a `Vec` and some pushes, not correctness.
+fn pick_cursors_worth_caching(insns: &[(Insn, usize)]) -> crate::Result<BitSet> {
+    // Per cursor: running sum of uncached decodes, and the furthest column read.
+    let mut uncached_cost: HashMap<usize, (usize, usize)> = HashMap::default();
+    for (insn, _) in insns {
+        if let Insn::Column {
+            cursor_id, column, ..
+        } = insn
+        {
+            let entry = uncached_cost.entry(*cursor_id).or_insert((0, 0));
+            entry.0 += *column + 1;
+            entry.1 = entry.1.max(*column + 1);
+        }
+    }
+
+    let mut wanted = BitSet::default();
+    for (cursor_id, (uncached, furthest)) in uncached_cost {
+        let cached = furthest * FILL_COST_PER_COLUMN + RECORD_CACHE_SLACK;
+        if uncached > cached {
+            wanted.set(cursor_id)?;
+        }
+    }
+    Ok(wanted)
+}
+
+#[cfg(test)]
+mod record_cache_gating_tests {
+    use super::*;
+
+    fn column(cursor_id: usize, column: usize) -> (Insn, usize) {
+        (
+            Insn::Column {
+                cursor_id,
+                column,
+                dest: 0,
+                default: None,
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn one_read_of_a_late_column_is_not_worth_caching() {
+        // `SELECT c9 FROM t10`: the cache would walk exactly as far as the
+        // uncached path and then never get a second lookup out of it.
+        let wanted = pick_cursors_worth_caching(&[column(0, 9)]).unwrap();
+        assert!(!wanted.get(0));
+    }
+
+    #[test]
+    fn two_early_columns_are_not_worth_caching() {
+        // Walking to c0 and c1 is 3 decodes. A cache cannot save enough of that
+        // to pay for its own allocation.
+        let wanted = pick_cursors_worth_caching(&[column(0, 0), column(0, 1)]).unwrap();
+        assert!(!wanted.get(0));
+    }
+
+    #[test]
+    fn select_star_over_a_wide_table_is_worth_caching() {
+        let insns: Vec<_> = (0..106).map(|c| column(0, c)).collect();
+        let wanted = pick_cursors_worth_caching(&insns).unwrap();
+        assert!(wanted.get(0));
+    }
+
+    #[test]
+    fn select_star_over_a_narrow_table_is_not_worth_caching() {
+        // Measured: a 10-column `SELECT *` gains nothing from the cache, because
+        // its serial types are single-byte varints that cost almost nothing to
+        // decode. The crossover sits between 10 and 21 columns.
+        let insns: Vec<_> = (0..10).map(|c| column(0, c)).collect();
+        let wanted = pick_cursors_worth_caching(&insns).unwrap();
+        assert!(!wanted.get(0));
+    }
+
+    #[test]
+    fn select_star_over_a_mid_width_table_is_worth_caching() {
+        let insns: Vec<_> = (0..21).map(|c| column(0, c)).collect();
+        let wanted = pick_cursors_worth_caching(&insns).unwrap();
+        assert!(wanted.get(0));
+    }
+
+    #[test]
+    fn reading_one_column_many_times_is_worth_caching() {
+        // The ClickBench shape: SUM(c4), SUM(c4 + 1), ... reads one column
+        // under many aggregates, so the header gets walked once per aggregate.
+        let insns: Vec<_> = (0..32).map(|_| column(0, 4)).collect();
+        let wanted = pick_cursors_worth_caching(&insns).unwrap();
+        assert!(wanted.get(0));
+    }
+
+    #[test]
+    fn a_few_far_apart_columns_are_not_worth_caching() {
+        // `SELECT c90, c2, c50, c7 FROM wide`: 153 decodes uncached, against a
+        // 91-column walk that also has to store 91 entries. Measured on the
+        // `column_fetch` benchmark this shape is slower with the cache on, so
+        // the model has to reject it.
+        let insns = [column(0, 90), column(0, 2), column(0, 50), column(0, 7)];
+        let wanted = pick_cursors_worth_caching(&insns).unwrap();
+        assert!(!wanted.get(0));
+    }
+
+    #[test]
+    fn many_columns_read_out_of_order_are_worth_caching() {
+        // Same disregard for order, but now enough reads that one shared walk
+        // clearly wins. Instruction fusion cannot touch this shape at all;
+        // the indices descend as often as they ascend.
+        let insns: Vec<_> = (0..40)
+            .map(|i| column(0, if i % 2 == 0 { 39 - i } else { i }))
+            .collect();
+        let wanted = pick_cursors_worth_caching(&insns).unwrap();
+        assert!(wanted.get(0));
+    }
+
+    #[test]
+    fn each_cursor_is_judged_on_its_own_columns() {
+        // Cursor 0 scans wide, cursor 1 reads a single early column.
+        let mut insns: Vec<_> = (0..40).map(|c| column(0, c)).collect();
+        insns.push(column(1, 1));
+        let wanted = pick_cursors_worth_caching(&insns).unwrap();
+        assert!(wanted.get(0));
+        assert!(!wanted.get(1));
     }
 }

@@ -25,8 +25,9 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
-    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef,
+    ColumnPosition, Extendable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult,
+    Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
@@ -1943,7 +1944,45 @@ fn op_column_fetch(
                 // Use nth_into_register to write directly to the register without
                 // creating intermediate ValueRef allocations
 
-                match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                // On cursors the compiler judged worth it, ask the record where
+                // this column starts instead of walking to it. The walk is
+                // shared with every other column read from the same row, which
+                // is what turns an O(N^2) `SELECT *` into an O(N) one.
+                let cached = if program.cursor_wants_record_cache(cursor_id) {
+                    let header = payload_iterator.header_section_ref();
+                    record.cached_column_position(header, column)?
+                } else {
+                    ColumnPosition::Unusable
+                };
+
+                let found = match cached {
+                    ColumnPosition::Found {
+                        header_offset,
+                        data_offset,
+                    } => {
+                        let header = payload_iterator.header_section_ref();
+                        let data = payload_iterator.data_section_ref();
+                        if unlikely(data_offset > data.len()) {
+                            return Err(LimboError::Corrupt(
+                                "Data section too small for indicated serial type size".into(),
+                            ));
+                        }
+                        payload_iterator.set_header_section(&header[header_offset..]);
+                        payload_iterator.set_data_section(&data[data_offset..]);
+                        // Already sitting on the target column, so this skips
+                        // nothing and only decodes.
+                        payload_iterator.nth_into_register(0, &mut state.registers[dest])
+                    }
+                    // No such column, or a record the cache cannot index. Both
+                    // are handled correctly by walking the header: the walk
+                    // reports the missing column the same way, and it has no
+                    // size limit.
+                    ColumnPosition::NoSuchColumn | ColumnPosition::Unusable => {
+                        payload_iterator.nth_into_register(column, &mut state.registers[dest])
+                    }
+                };
+
+                match found {
                     Some(result) => {
                         result?;
                         return Ok(InsnFunctionStepResult::Step);
