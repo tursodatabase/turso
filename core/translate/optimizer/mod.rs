@@ -748,20 +748,6 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
     }
 }
 
-/// The table plan chosen for one SELECT.
-struct OptimizeTableAccessResult {
-    /// Tables in the order they will be read.
-    join_order: Vec<JoinOrderMember>,
-    /// Rows expected from the full join.
-    output_rows: f64,
-    /// Work expected from the full join.
-    cost: Cost,
-    /// Expected calls to each correlated subquery.
-    subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
-    /// Whether `min` or `max` can stop after the first row.
-    min_max_fast_path: bool,
-}
-
 /// The table reads chosen by the join search.
 struct TableAccessPlan {
     access_methods: Vec<AccessMethod>,
@@ -786,23 +772,27 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         return optimize_select_plan_form(plan, resolver);
     }
 
-    // TODO: Keep both forms in one optimizer run instead of copying the full
-    // plan. Query parts that do not change should be shared, and the join
-    // planner must compare choices with different table lists.
+    // TODO: Let join search run a correlated subquery as soon as all columns
+    // that it needs are ready. It can then compare that step with the added
+    // join tables in one search. Until then, both forms need their own search.
     let mut rewritten = plan.clone();
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
         return optimize_select_plan_form(plan, resolver);
     }
 
-    optimize_select_plan_form(plan, resolver)?;
-    optimize_select_plan_form(&mut rewritten, resolver)?;
+    let original_table_plan = find_select_plan_form(plan, resolver)?;
+    let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver)?;
 
-    if matches!(
+    let use_rewritten = matches!(
         (plan.estimated_cost, rewritten.estimated_cost),
         (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
-    ) {
+    );
+    if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;
+        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
+    } else {
+        apply_select_table_plan(plan, original_table_plan, resolver)?;
     }
 
     Ok(())
@@ -810,6 +800,15 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
 
 /// Choose table reads for one version of a query.
 fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    let table_plan = find_select_plan_form(plan, resolver)?;
+    apply_select_table_plan(plan, table_plan, resolver)
+}
+
+/// Find the table reads for one version of a query.
+fn find_select_plan_form(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+) -> Result<Option<TableAccessPlan>> {
     let schema = resolver.schema();
     #[cfg(feature = "optimizer_params")]
     let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
@@ -853,13 +852,12 @@ fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
         plan.estimated_output_rows = Some(0.0);
         plan.estimated_cost = Some(0.0);
         plan_correlated_subqueries(plan, resolver, &[])?;
-        return Ok(());
+        return Ok(None);
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan);
-    let best_join_order = optimize_table_access(
+    let table_plan = find_table_access_plan(
         schema,
-        resolver,
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -874,27 +872,22 @@ fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
-        && !best_join_order
+        && !table_plan
             .as_ref()
-            .is_some_and(|result| result.min_max_fast_path)
+            .is_some_and(|table_plan| table_plan.sort_eliminated)
     {
         plan.simple_aggregate = None;
     }
 
-    let table_cost = best_join_order.as_ref().map(|result| result.cost);
-    let subquery_calls = best_join_order
+    let table_cost = table_plan.as_ref().map(|table_plan| table_plan.join.cost);
+    let subquery_calls = table_plan
         .as_ref()
-        .map(|result| result.subquery_calls.clone())
+        .map(|table_plan| table_plan.join.subquery_calls.clone())
         .unwrap_or_default();
 
-    if let Some(OptimizeTableAccessResult {
-        join_order,
-        output_rows,
-        ..
-    }) = best_join_order
-    {
-        plan.join_order = join_order;
-        let mut rows = estimate_select_output_rows(plan, output_rows, schema);
+    if let Some(table_plan) = table_plan.as_ref() {
+        let mut rows =
+            estimate_select_output_rows(plan, table_plan.join.output_cardinality, schema);
         // Clamp to LIMIT when it's a literal non-negative number.
         // Negative LIMIT means "no limit" in SQLite, so we skip those.
         if let Some(limit) = &plan.limit {
@@ -959,6 +952,26 @@ fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
         }
     }
 
+    Ok(table_plan)
+}
+
+/// Write the winning table plan into one version of a query.
+fn apply_select_table_plan(
+    plan: &mut SelectPlan,
+    table_plan: Option<TableAccessPlan>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(table_plan) = table_plan else {
+        return Ok(());
+    };
+    plan.join_order = apply_table_access_plan(
+        resolver,
+        &mut plan.table_references,
+        &mut plan.where_clause,
+        &mut plan.order_by,
+        &mut plan.group_by,
+        table_plan,
+    )?;
     Ok(())
 }
 
@@ -1072,9 +1085,7 @@ fn optimize_update_plan(
         return Ok(());
     }
 
-    let join_order = optimize_result
-        .map(|result| result.join_order)
-        .unwrap_or_else(|| default_join_order(&target_tables));
+    let join_order = optimize_result.unwrap_or_else(|| default_join_order(&target_tables));
 
     build_update_write_set_plan(program, plan, Vec::new())?;
     plan.write_set_plan
@@ -1960,7 +1971,7 @@ fn optimize_table_access(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
-) -> Result<Option<OptimizeTableAccessResult>> {
+) -> Result<Option<Vec<JoinOrderMember>>> {
     let Some(plan) = find_table_access_plan(
         schema,
         result_columns,
@@ -1985,7 +1996,6 @@ fn optimize_table_access(
         where_clause,
         order_by,
         group_by,
-        simple_aggregate,
         plan,
     )?))
 }
@@ -2250,9 +2260,8 @@ fn apply_table_access_plan(
         Option<turso_parser::ast::NullsOrder>,
     )>,
     group_by: &mut Option<GroupBy>,
-    simple_aggregate: Option<&SimpleAggregate>,
     plan: TableAccessPlan,
-) -> Result<OptimizeTableAccessResult> {
+) -> Result<Vec<JoinOrderMember>> {
     let TableAccessPlan {
         access_methods: mut access_methods_arena,
         constraints: constraints_per_table,
@@ -2260,7 +2269,6 @@ fn apply_table_access_plan(
         order_target: maybe_order_target,
         sort_eliminated,
     } = plan;
-    let final_output_cardinality = best_plan.output_cardinality;
 
     if sort_eliminated {
         let order_target = maybe_order_target
@@ -2822,14 +2830,7 @@ fn apply_table_access_plan(
         }
     }
 
-    Ok(OptimizeTableAccessResult {
-        join_order: best_join_order,
-        output_rows: final_output_cardinality,
-        cost: best_plan.cost,
-        subquery_calls: best_plan.subquery_calls,
-        min_max_fast_path: matches!(simple_aggregate, Some(SimpleAggregate::MinMax(_)))
-            && sort_eliminated,
-    })
+    Ok(best_join_order)
 }
 
 fn build_vtab_scan_op(
