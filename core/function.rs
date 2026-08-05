@@ -911,6 +911,8 @@ pub enum ScalarFunc {
     ArrayToString,
     ArrayOverlap,
     ArrayContainsAll,
+    RegexpMatch,
+    RegexpSplitToArray,
     // Struct/Union construction and access
     StructPack,
     StructExtractFunc,
@@ -1036,7 +1038,9 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::StringToArray
             | ScalarFunc::ArrayToString
             | ScalarFunc::ArrayOverlap
-            | ScalarFunc::ArrayContainsAll => true,
+            | ScalarFunc::ArrayContainsAll
+            | ScalarFunc::RegexpMatch
+            | ScalarFunc::RegexpSplitToArray => true,
             ScalarFunc::StructPack
             | ScalarFunc::StructExtractFunc
             | ScalarFunc::UnionValueFunc
@@ -1066,6 +1070,8 @@ impl ScalarFunc {
                 | Self::ArrayRemove
                 | Self::ArraySlice
                 | Self::StringToArray
+                | Self::RegexpMatch
+                | Self::RegexpSplitToArray
         )
     }
 }
@@ -1181,6 +1187,8 @@ impl Display for ScalarFunc {
             Self::ArrayPosition => "array_position",
             Self::ArraySlice => "array_slice",
             Self::StringToArray => "string_to_array",
+            Self::RegexpMatch => "regexp_match",
+            Self::RegexpSplitToArray => "regexp_split_to_array",
             Self::ArrayToString => "array_to_string",
             Self::ArrayOverlap => "array_overlap",
             Self::ArrayContainsAll => "array_contains_all",
@@ -1334,6 +1342,7 @@ impl ScalarFunc {
             Self::ArraySlice => &[3],
             Self::StringToArray => &[2, 3],
             Self::ArrayToString => &[2, 3],
+            Self::RegexpMatch | Self::RegexpSplitToArray => &[2, 3],
             // Struct/Union functions
             // struct_pack is intentionally variable-arity: field count validation
             // happens at INSERT time when the value is stored into a typed column.

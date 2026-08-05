@@ -546,6 +546,8 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "array_position" => Ok(Some(Func::Scalar(ScalarFunc::ArrayPosition))),
         "array_slice" => Ok(Some(Func::Scalar(ScalarFunc::ArraySlice))),
         "string_to_array" => Ok(Some(Func::Scalar(ScalarFunc::StringToArray))),
+        "regexp_match" => Ok(Some(Func::Scalar(ScalarFunc::RegexpMatch))),
+        "regexp_split_to_array" => Ok(Some(Func::Scalar(ScalarFunc::RegexpSplitToArray))),
         "array_to_string" => Ok(Some(Func::Scalar(ScalarFunc::ArrayToString))),
         "array_overlap" | "array_overlaps" => Ok(Some(Func::Scalar(ScalarFunc::ArrayOverlap))),
         "array_contains_all" => Ok(Some(Func::Scalar(ScalarFunc::ArrayContainsAll))),

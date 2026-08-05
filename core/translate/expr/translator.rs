@@ -1864,7 +1864,9 @@ pub fn translate_expr(
                         | ScalarFunc::StringToArray
                         | ScalarFunc::ArrayToString
                         | ScalarFunc::ArrayOverlap
-                        | ScalarFunc::ArrayContainsAll => translate_function(
+                        | ScalarFunc::ArrayContainsAll
+                        | ScalarFunc::RegexpMatch
+                        | ScalarFunc::RegexpSplitToArray => translate_function(
                             program,
                             args,
                             referenced_tables,

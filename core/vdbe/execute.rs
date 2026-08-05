@@ -126,8 +126,9 @@ use super::{
         array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
         exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
         exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
-        exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
-        parse_text_array, serialize_array_from_blob, values_to_record_blob,
+        exec_array_slice, exec_array_to_string, exec_regexp_match, exec_regexp_split_to_array,
+        exec_string_to_array, make_array_from_registers, parse_text_array,
+        serialize_array_from_blob, values_to_record_blob,
     },
     insn::{Cookie, RegisterOrLiteral, SortComparatorType},
     CommitState,
@@ -10074,6 +10075,21 @@ pub fn op_function(
                     &delimiter,
                     null_str.as_ref(),
                 )?);
+            }
+            ScalarFunc::RegexpMatch | ScalarFunc::RegexpSplitToArray => {
+                let source = state.registers[*start_reg].get_value().clone();
+                let pattern = state.registers[*start_reg + 1].get_value().clone();
+                let flags = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value().clone())
+                } else {
+                    None
+                };
+                let result = if matches!(scalar_func, ScalarFunc::RegexpMatch) {
+                    exec_regexp_match(&source, &pattern, flags.as_ref())?
+                } else {
+                    exec_regexp_split_to_array(&source, &pattern, flags.as_ref())?
+                };
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::ArrayToString => {
                 let arr_val = state.registers[*start_reg].get_value().clone();

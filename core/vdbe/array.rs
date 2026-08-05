@@ -614,6 +614,110 @@ pub(crate) fn compare_arrays(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
     Ok(len_a.cmp(&len_b))
 }
 
+/// Compile a PostgreSQL regexp-function pattern with its flags argument.
+/// Only the `i` and `c` flags are supported; `g` gets PostgreSQL's own
+/// rejection because these functions look at the first match only.
+fn build_pg_regex(
+    pattern: &str,
+    flags: Option<&str>,
+    func_name: &str,
+) -> crate::Result<regex::Regex> {
+    let mut case_insensitive = false;
+    for c in flags.unwrap_or("").chars() {
+        match c {
+            'i' => case_insensitive = true,
+            'c' => case_insensitive = false,
+            'g' => {
+                return Err(crate::LimboError::ParseError(format!(
+                    "{func_name}() does not support the \"global\" option"
+                )))
+            }
+            other => {
+                return Err(crate::LimboError::ParseError(format!(
+                    "invalid regular expression option: \"{other}\""
+                )))
+            }
+        }
+    }
+    let full = if case_insensitive {
+        format!("(?i){pattern}")
+    } else {
+        pattern.to_string()
+    };
+    crate::regexp::compile_cached(&full)
+        .map_err(|e| crate::LimboError::ParseError(format!("invalid regular expression: {e}")))
+}
+
+/// Text of a regexp-function argument. `None` means the argument is NULL,
+/// which makes the whole (strict) function return NULL.
+fn regexp_arg_text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Text(t)) => Some(t.as_str().to_string()),
+        Some(Value::Null) | None => None,
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// PostgreSQL's regexp_match(): NULL when there is no match, otherwise an
+/// array of the capture groups, or of the whole match if the pattern has
+/// no groups.
+pub(crate) fn exec_regexp_match(
+    source: &Value,
+    pattern: &Value,
+    flags: Option<&Value>,
+) -> Result<Value> {
+    let (Some(source), Some(pattern)) = (
+        regexp_arg_text(Some(source)),
+        regexp_arg_text(Some(pattern)),
+    ) else {
+        return Ok(Value::Null);
+    };
+    if matches!(flags, Some(Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let flags = regexp_arg_text(flags);
+    let re = build_pg_regex(&pattern, flags.as_deref(), "regexp_match")?;
+    let Some(caps) = re.captures(&source) else {
+        return Ok(Value::Null);
+    };
+    let values: Vec<Value> = if caps.len() > 1 {
+        (1..caps.len())
+            .map(|i| match caps.get(i) {
+                Some(m) => Value::build_text(m.as_str().to_string()),
+                None => Value::Null,
+            })
+            .collect()
+    } else {
+        vec![Value::build_text(caps[0].to_string())]
+    };
+    values_to_record_blob(&values)
+}
+
+/// PostgreSQL's regexp_split_to_array(): split on every match, keeping
+/// empty fields, like the wire-visible behavior of a stock server.
+pub(crate) fn exec_regexp_split_to_array(
+    source: &Value,
+    pattern: &Value,
+    flags: Option<&Value>,
+) -> Result<Value> {
+    let (Some(source), Some(pattern)) = (
+        regexp_arg_text(Some(source)),
+        regexp_arg_text(Some(pattern)),
+    ) else {
+        return Ok(Value::Null);
+    };
+    if matches!(flags, Some(Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let flags = regexp_arg_text(flags);
+    let re = build_pg_regex(&pattern, flags.as_deref(), "regexp_split_to_array")?;
+    let values: Vec<Value> = re
+        .split(&source)
+        .map(|field| Value::build_text(field.to_string()))
+        .collect();
+    values_to_record_blob(&values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

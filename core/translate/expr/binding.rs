@@ -1024,10 +1024,23 @@ pub(super) fn validate_custom_type_function_call(
     let normalized = crate::util::normalize_ident(name);
     match normalized.as_str() {
         // Arrays
-        "array" | "array_element" | "array_set_element" | "array_length" | "array_append"
-        | "array_prepend" | "array_cat" | "array_remove" | "array_contains" | "array_position"
-        | "array_slice" | "string_to_array" | "array_to_string" | "array_overlap"
-        | "array_contains_all" => {
+        "array"
+        | "array_element"
+        | "array_set_element"
+        | "array_length"
+        | "array_append"
+        | "array_prepend"
+        | "array_cat"
+        | "array_remove"
+        | "array_contains"
+        | "array_position"
+        | "array_slice"
+        | "string_to_array"
+        | "array_to_string"
+        | "array_overlap"
+        | "array_contains_all"
+        | "regexp_match"
+        | "regexp_split_to_array" => {
             resolver.require_custom_types("Array features")?;
         }
         // Structs

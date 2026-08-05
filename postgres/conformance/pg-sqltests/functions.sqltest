@@ -341,3 +341,73 @@ test scalar-functions-are-strict {
 expect {
     null|null|null|null
 }
+
+test regexp-match-whole-match-when-no-groups {
+    SELECT regexp_match('foobarbequebaz', 'bar.*que');
+}
+expect {
+    {barbeque}
+}
+
+test regexp-match-returns-capture-groups {
+    SELECT regexp_match('foobarbequebaz', '(b[^b]+)(b[^b]+)');
+}
+expect {
+    {bar,beque}
+}
+
+test regexp-match-no-match-is-null {
+    SELECT coalesce(regexp_match('foo', 'z')::text, 'null');
+}
+expect {
+    null
+}
+
+test regexp-match-case-insensitive-flag {
+    SELECT regexp_match('FOO', 'o+', 'i');
+}
+expect {
+    {OO}
+}
+
+test regexp-match-global-flag-errors {
+    SELECT regexp_match('foo', 'o', 'g');
+}
+expect error {
+    does not support the "global" option
+}
+
+test regexp-split-to-array-basic {
+    SELECT regexp_split_to_array('hello world foo', '\s+');
+}
+expect {
+    {hello,world,foo}
+}
+
+test regexp-split-to-array-no-match-keeps-whole {
+    SELECT regexp_split_to_array('abc', ',');
+}
+expect {
+    {abc}
+}
+
+test regexp-split-to-array-element-access {
+    SELECT (regexp_split_to_array('a,b,c', ','))[2];
+}
+expect {
+    b
+}
+
+test regexp-split-to-array-case-insensitive {
+    SELECT regexp_split_to_array('aXbxc', 'x', 'i');
+}
+expect {
+    {a,b,c}
+}
+
+test regexp-match-invalid-pattern-errors {
+    SELECT regexp_match('x', '(');
+}
+expect error {
+    invalid regular expression
+}

@@ -11,20 +11,20 @@ use turso_ext::{scalar, ExtensionApi, Value};
 const REGEX_CACHE_CAP: usize = 64;
 static REGEX_CACHE: OnceLock<Mutex<HashMap<String, regex::Regex>>> = OnceLock::new();
 
-fn compile_cached(pattern: &str) -> Option<regex::Regex> {
+pub(crate) fn compile_cached(pattern: &str) -> Result<regex::Regex, regex::Error> {
     let cache = REGEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().unwrap();
     if let Some(re) = cache.get(pattern) {
-        return Some(re.clone());
+        return Ok(re.clone());
     }
-    let re = regex::Regex::new(pattern).ok()?;
+    let re = regex::Regex::new(pattern)?;
     if cache.len() >= REGEX_CACHE_CAP {
         // Full: drop everything rather than tracking recency; the working
         // set of live patterns is far below the capacity.
         cache.clear();
     }
     cache.insert(pattern.to_string(), re.clone());
-    Some(re)
+    Ok(re)
 }
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
@@ -47,7 +47,7 @@ fn regexp(args: &[Value]) -> Value {
         return Value::null();
     };
 
-    let Some(re) = compile_cached(&pattern) else {
+    let Ok(re) = compile_cached(&pattern) else {
         return Value::null();
     };
 
