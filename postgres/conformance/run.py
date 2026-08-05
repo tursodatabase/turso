@@ -159,8 +159,9 @@ STATUS = {
     "truncate": "fail",
     "alter_table": (
         "skip",
-        "panics the server and corrupts the database file "
-        "(core/translate/alter.rs:917); re-enable when fixed",
+        "all statements now survive, but reopening the written database "
+        "panics (core/schema.rs:1897, unconsumed automatic index); "
+        "re-enable when fixed",
     ),
     "sequence": "fail",
     "rowtypes": "fail",

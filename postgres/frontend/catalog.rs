@@ -56,19 +56,17 @@ impl Dialect for PostgresDialect {
             return BTreeTable::from_sql(sql, root_page);
         };
 
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
-        match stmt {
-            turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
+        match parse_marked_create_table(raw_sql) {
+            Ok(turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. }) => {
                 BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
             }
-            _ => Err(LimboError::ParseError(
+            Ok(_) => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
             )),
+            // Databases written before format_rewritten_table_sql existed
+            // carry engine-dialect DDL under the marker; read it with the
+            // engine parser rather than refusing to open the database.
+            Err(_) => BTreeTable::from_sql(raw_sql, root_page),
         }
     }
 
@@ -79,17 +77,14 @@ impl Dialect for PostgresDialect {
             return turso_core::dialect::sqlite::parse_table_sql_ast(sql);
         };
 
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
-        match stmt {
-            stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
-            _ => Err(LimboError::ParseError(
+        match parse_marked_create_table(raw_sql) {
+            Ok(stmt @ turso_parser::ast::Stmt::CreateTable { .. }) => Ok(stmt),
+            Ok(_) => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
             )),
+            // See parse_table_sql: tolerate engine-dialect DDL under the
+            // marker from databases written before the rewrite fix.
+            Err(_) => turso_core::dialect::sqlite::parse_table_sql_ast(raw_sql),
         }
     }
 
@@ -134,6 +129,15 @@ impl Dialect for PostgresDialect {
         _body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
         Ok(encode_pg_schema_sql(input))
+    }
+
+    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
+        // Rewritten DDL (ALTER TABLE column rebuilds) is canonical engine
+        // text, not PostgreSQL SQL. Storing it under the PostgreSQL marker
+        // made the schema loader parse engine text with the PostgreSQL
+        // grammar, leaving the database unopenable. Store it unmarked so
+        // the loader reads it with the engine dialect.
+        Ok(stmt.to_string())
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -194,6 +198,17 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
     format!("{STORED_PG_SCHEMA_PREFIX}{sql}")
+}
+
+/// Parses a marker-carrying schema row as PostgreSQL SQL translated to the
+/// engine AST.
+fn parse_marked_create_table(raw_sql: &str) -> Result<turso_parser::ast::Stmt> {
+    let parse_result =
+        turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+    translator
+        .translate(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))
 }
 
 pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
