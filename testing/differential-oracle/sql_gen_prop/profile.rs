@@ -6,6 +6,7 @@
 use strum::IntoEnumIterator;
 
 use crate::alter_table::AlterTableOpWeights;
+use crate::spelling::TableSpellingProfile;
 use crate::statement::StatementKind;
 
 // Re-export profiles from their respective modules
@@ -90,6 +91,8 @@ pub struct GenerationProfile {
     pub expression: ExtendedExpressionProfile,
     /// Extended function profile.
     pub function: ExtendedFunctionProfile,
+    /// How DML statements write the name of their table.
+    pub table_spelling: TableSpellingProfile,
 }
 
 impl GenerationProfile {
@@ -99,6 +102,7 @@ impl GenerationProfile {
             value: self.value.minimal(),
             expression: self.expression.simple(),
             function: self.function.minimal(),
+            table_spelling: self.table_spelling,
         }
     }
 
@@ -108,6 +112,7 @@ impl GenerationProfile {
             value: self.value.large(),
             expression: self.expression.complex(),
             function: self.function,
+            table_spelling: self.table_spelling,
         }
     }
 

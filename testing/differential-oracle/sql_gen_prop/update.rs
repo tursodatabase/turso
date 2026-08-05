@@ -8,6 +8,7 @@ use crate::function::builtin_functions;
 use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, Schema, TableRef};
 use crate::select::optional_where_clause;
+use crate::spelling::{table_name_spelling, target_alias};
 
 // =============================================================================
 // UPDATE STATEMENT PROFILE
@@ -61,6 +62,7 @@ impl UpdateProfile {
 #[derive(Debug, Clone)]
 pub struct UpdateStatement {
     pub table: String,
+    pub alias: Option<String>,
     /// Column assignments as (column_name, expression) pairs.
     pub assignments: Vec<(String, Expression)>,
     pub where_clause: Option<Expression>,
@@ -68,7 +70,11 @@ pub struct UpdateStatement {
 
 impl fmt::Display for UpdateStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UPDATE {} SET ", self.table)?;
+        write!(f, "UPDATE {}", self.table)?;
+        if let Some(alias) = &self.alias {
+            write!(f, " AS {alias}")?;
+        }
+        write!(f, " SET ")?;
 
         let sets: Vec<String> = self
             .assignments
@@ -91,7 +97,8 @@ pub fn update_for_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<UpdateStatement> {
-    let table_name = table.qualified_name();
+    let spelling = &profile.generation.table_spelling;
+    let table_name = (table_name_spelling(table, spelling), target_alias(spelling));
     let updatable: Vec<ColumnDef> = table.updatable_columns().cloned().collect();
     let is_strict = table.strict;
     let functions = builtin_functions();
@@ -105,9 +112,13 @@ pub fn update_for_table(
     let schema_clone = schema.clone();
     let profile_clone = profile.clone();
     if updatable.is_empty() {
-        return optional_where_clause(&table_clone, &schema_clone, &profile_clone)
-            .prop_map(move |where_clause| UpdateStatement {
-                table: table_name.clone(),
+        return (
+            optional_where_clause(&table_clone, &schema_clone, &profile_clone),
+            table_name,
+        )
+            .prop_map(|(where_clause, (table, alias))| UpdateStatement {
+                table,
+                alias,
                 assignments: vec![],
                 where_clause,
             })
@@ -158,12 +169,13 @@ pub fn update_for_table(
                 })
                 .collect();
 
-            let table_name = table_name.clone();
-            assignment_strategies
-                .into_iter()
-                .collect::<Vec<_>>()
-                .prop_map(move |assignments| UpdateStatement {
-                    table: table_name.clone(),
+            (
+                assignment_strategies.into_iter().collect::<Vec<_>>(),
+                table_name.clone(),
+            )
+                .prop_map(move |(assignments, (table, alias))| UpdateStatement {
+                    table,
+                    alias,
                     assignments,
                     where_clause: where_clause.clone(),
                 })
@@ -184,6 +196,7 @@ mod tests {
     fn test_update_display() {
         let stmt = UpdateStatement {
             table: "users".to_string(),
+            alias: None,
             assignments: vec![
                 (
                     "name".to_string(),
@@ -203,9 +216,22 @@ mod tests {
     }
 
     #[test]
+    fn an_update_with_an_alias_names_it_after_the_table() {
+        let stmt = UpdateStatement {
+            table: "USERS".to_string(),
+            alias: Some("tgt".to_string()),
+            assignments: vec![("age".to_string(), Expression::Value(SqlValue::Integer(30)))],
+            where_clause: None,
+        };
+
+        assert_eq!(stmt.to_string(), "UPDATE USERS AS tgt SET age = 30");
+    }
+
+    #[test]
     fn test_update_with_expression() {
         let stmt = UpdateStatement {
             table: "users".to_string(),
+            alias: None,
             assignments: vec![(
                 "name".to_string(),
                 Expression::function_call("UPPER", vec![Expression::Column("name".to_string())]),

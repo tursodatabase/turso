@@ -1,0 +1,185 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# SQL identifiers are ASCII-case-insensitive. A materialized view must see the
+# same rows no matter how its source table, columns or CTEs are spelled.
+
+test matview-source-table-name-is-case-insensitive {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW mv_upper AS SELECT id, body FROM MSG;
+    SELECT count(*) FROM mv_upper;
+}
+expect {
+    2
+}
+
+test matview-case-mismatched-source-receives-deltas {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW mv_upper AS SELECT id, body FROM MSG;
+    INSERT INTO msg VALUES (3,'c');
+    DELETE FROM msg WHERE id = 1;
+    SELECT id, body FROM mv_upper ORDER BY 1;
+}
+expect {
+    2|b
+    3|c
+}
+
+# The stored table name is folded to lower case, so even an exact spelling
+# match against a mixed-case declaration must resolve.
+test matview-source-name-declared-mixed-case {
+    CREATE TABLE MiXeD (id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO MiXeD VALUES (1,'a');
+    CREATE MATERIALIZED VIEW v_exact AS SELECT id FROM MiXeD;
+    SELECT count(*) FROM v_exact;
+}
+expect {
+    1
+}
+
+test matview-case-insensitive-column-qualifier {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v_qual AS SELECT MSG.ID FROM msg;
+    SELECT count(*) FROM v_qual;
+}
+expect {
+    2
+}
+
+# A `db.table.column` reference names the same column as `table.column`, and a
+# view may only name its own database, so the plan keys the column on the table
+# alone.
+test matview-schema-qualified-column {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v_dbqual AS SELECT main.msg.id AS id FROM main.msg;
+    SELECT id FROM v_dbqual ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test matview-schema-qualified-column-is-case-insensitive {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v_dbqual_case AS SELECT MAIN.MSG.ID AS id FROM msg;
+    INSERT INTO msg VALUES (3,'c');
+    SELECT id FROM v_dbqual_case ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+test matview-case-insensitive-group-by {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b'),(3,'a');
+    CREATE MATERIALIZED VIEW v_group AS SELECT body, count(*) AS c FROM msg GROUP BY BODY;
+    SELECT body, c FROM v_group ORDER BY 1;
+}
+expect {
+    a|2
+    b|1
+}
+
+test matview-case-insensitive-table-alias {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b'),(3,'c');
+    CREATE MATERIALIZED VIEW v_alias_ref AS SELECT M.id FROM msg AS m WHERE M.id > 1;
+    SELECT id FROM v_alias_ref ORDER BY 1;
+}
+expect {
+    2
+    3
+}
+
+# The alias a view projects keeps the spelling the user wrote.
+test matview-output-alias-keeps-user-casing {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a');
+    CREATE MATERIALIZED VIEW v_alias AS SELECT id AS MyId FROM MSG;
+    SELECT name FROM pragma_table_info('v_alias');
+}
+expect {
+    MyId
+}
+
+test matview-output-alias-is-readable {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v_alias AS SELECT id AS MyId FROM MSG;
+    SELECT MyId FROM v_alias ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+# Maintenance must key off the table, not off how the DML statement spelled it.
+test matview-maintained-by-case-mismatched-insert {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a');
+    CREATE MATERIALIZED VIEW v AS SELECT id, body FROM msg;
+    INSERT INTO MSG VALUES (2,'b');
+    SELECT id, body FROM v ORDER BY 1;
+}
+expect {
+    1|a
+    2|b
+}
+
+test matview-maintained-by-case-mismatched-update {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v AS SELECT id, body FROM msg;
+    UPDATE MSG SET body = 'Z' WHERE id = 2;
+    SELECT id, body FROM v ORDER BY 1;
+}
+expect {
+    1|a
+    2|Z
+}
+
+# The delta is published under the table's own name, not under the alias the
+# UPDATE happened to bind.
+test matview-maintained-by-aliased-update {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v AS SELECT id, body FROM msg;
+    UPDATE msg AS m SET body = 'Q' WHERE m.id = 2;
+    SELECT id, body FROM v ORDER BY 1;
+}
+expect {
+    1|a
+    2|Q
+}
+
+# The stored name is folded, so a table declared mixed-case must still route.
+test matview-maintained-on-mixed-case-declared-table {
+    CREATE TABLE MiXeD (id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO MiXeD VALUES (1,'a');
+    CREATE MATERIALIZED VIEW v AS SELECT id, b FROM MiXeD;
+    INSERT INTO MiXeD VALUES (2,'b');
+    SELECT id, b FROM v ORDER BY 1;
+}
+expect {
+    1|a
+    2|b
+}
+
+test matview-maintained-by-case-mismatched-delete {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v AS SELECT id, body FROM msg;
+    DELETE FROM MSG WHERE id = 1;
+    SELECT id, body FROM v ORDER BY 1;
+}
+expect {
+    2|b
+}
