@@ -7582,6 +7582,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 Self::collect_referenced_txids(&versions, referenced_tx_ids);
                 if remove_empty_slots && versions.is_empty() {
                     self.bump_index_rows_epoch();
+                    // Inner key only — the outer per-index map stays (bounded by index count).
                     inner_entry.remove();
                 }
             }
@@ -7861,6 +7862,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Same drain-retry as `insert_version`.
         loop {
             let entry = self.get_or_create_index_key_entry(index, key.clone())?;
+            // SkipMap may keep our Arc (miss) or a pre-existing one (hit); return that
+            // canonical Arc so savepoint tracking and the map stay in sync.
             let canonical_key = entry.key().clone();
             let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
@@ -8027,17 +8030,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.table_versions_still_mapped(&rowid, &row_versions) {
                 continue;
             }
-            // End-stamp the live committed version, if any.
+            // End-stamp the live committed version, if any — collection then
+            // materializes the B-tree delete (begin <= durable_max => exists_in_db_file).
             if let Some(rv) = versions.iter_mut().find(|rv| {
                 matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
             }) {
                 rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
                 return;
             }
+            // Already tombstoned / no live version: nothing to delete again.
             if versions.iter().any(|rv| rv.end().is_some()) {
                 return;
             }
-            // B-tree-only row: insert a btree-resident tombstone.
+            // B-tree-only row: btree-resident tombstone so collection materializes the delete.
             let version_id = self.get_version_id();
             let row = Row::new_table_row_in(rowid, &[], num_cols, self.alloc.clone())
                 .expect("empty tombstone row");

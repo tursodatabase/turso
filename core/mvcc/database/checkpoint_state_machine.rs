@@ -1762,6 +1762,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let ckpt_max = self.durable_txid_max_new;
         // Includes pager/WAL-pinned readers not yet in `txs` (begin-tx publish window).
         let min_reader_mark = self.gc_floor_reader_mark();
+        // WAL pos this checkpoint made durable; stamp just-materialized versions with it
+        // (unchanged since CommitPagerTxn — single orchestrator).
         let materialized_frame = WalPos::from_pair(self.pager.wal_pos());
         let snapshot_ts = self.snapshot_ts;
         let CheckpointState::GcTableRows { next_index, lwm } = self.state else {
@@ -1825,8 +1827,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn gc_checkpointed_index_versions(&mut self) -> Option<IOCompletions> {
+        // Same as table GC: keep empty SkipMap slots; Truncate Finalize unlinks later.
         let ckpt_max = self.durable_txid_max_new;
         let min_reader_mark = self.gc_floor_reader_mark();
+        // Same stamp as table GC (unchanged since CommitPagerTxn).
         let materialized_frame = WalPos::from_pair(self.pager.wal_pos());
         let snapshot_ts = self.snapshot_ts;
         let CheckpointState::GcIndexRows { next_index, lwm } = self.state else {
@@ -2871,7 +2875,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::SyncDbFile => {
-                // Sync before publish_backfill (pager PublishBackfill order).
+                // Fsync DB before WAL truncate / publish_backfill (pager PublishBackfill order).
+                // Crash after truncate but before fsync would lose checkpointed data.
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
                     self.publish_wal_backfill_if_needed();
