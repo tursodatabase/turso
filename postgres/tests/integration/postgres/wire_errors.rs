@@ -5,7 +5,7 @@
 //! upsert, 42P01 to create a missing table, 40001 to retry a transaction),
 //! so the codes are load-bearing far beyond transcript fidelity.
 
-use super::wire::{exec, expect_error, start_server};
+use super::wire::{exec, expect_error, query_int, start_server};
 use turso_pg_client::{error_message, PgConn};
 
 /// Asserts the SQLSTATE (field 'C') of a failing statement.
@@ -127,6 +127,37 @@ fn assert_error_at(conn: &mut PgConn, sql: &str, code: &str, message: &str, posi
         Some(position),
         "wrong position for `{sql}`"
     );
+}
+
+/// Statements that used to panic the engine and take the whole server down.
+/// The contract is survival: whatever each statement returns, the session
+/// must still answer the next query.
+#[test]
+fn server_survives_formerly_panicking_statements() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    exec(
+        &mut conn,
+        "CREATE TABLE panic_probe (col1 int, col2 int, col3 int)",
+    );
+    let killers = [
+        // unreachable!() in the engine's numeric literal parser
+        "SELECT 0b10000000000000000000000000000000",
+        // i32::MIN - 1 overflow in date month arithmetic
+        "SELECT make_date(-2147483648, 1, 1)",
+        // empty VALUES row list after DEFAULT-entry translation
+        "INSERT INTO panic_probe (col1, col2, col3) VALUES (DEFAULT, DEFAULT)",
+    ];
+    for sql in killers {
+        // Any outcome is acceptable here; reaching ReadyForQuery is not.
+        let _ = conn.simple_query(sql).unwrap();
+        assert_eq!(
+            query_int(&mut conn, "SELECT 41 + 1"),
+            42,
+            "server no longer answers after: {sql}"
+        );
+    }
 }
 
 #[test]

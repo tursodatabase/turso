@@ -1,0 +1,54 @@
+# PostgreSQL 16+ numeric literal syntaxes: binary, octal, hexadecimal, and
+# underscore digit separators. These previously either misparsed or took
+# the whole server down (a binary literal over i32 range hit an
+# unreachable!() in the engine's numeric parser).
+
+@database :memory:
+
+test literal-binary-small {
+    SELECT 0b101;
+}
+expect {
+    5
+}
+
+test literal-binary-over-i32 {
+    SELECT 0b10000000000000000000000000000000;
+}
+expect {
+    2147483648
+}
+
+test literal-octal {
+    SELECT 0o273;
+}
+expect {
+    187
+}
+
+test literal-hex-large {
+    SELECT 0x1FFFFFFFFFFFFF;
+}
+expect {
+    9007199254740991
+}
+
+test literal-underscore-separators {
+    SELECT 1_000_000;
+}
+expect {
+    1000000
+}
+
+test literal-underscores-in-large-decimal {
+    SELECT 9_223_372_036_854_775_807;
+}
+expect {
+    9223372036854775807
+}
+
+test insert-fewer-values-than-columns-errors {
+    CREATE TABLE deftest (col1 int, col2 int, col3 int);
+    INSERT INTO deftest (col1, col2, col3) VALUES (DEFAULT, DEFAULT);
+}
+expect error {}

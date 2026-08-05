@@ -1434,10 +1434,13 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
         return Ok(Value::from_i64(int_value));
     }
 
+    // Reachable with literal syntaxes our lexer never produces but a
+    // frontend dialect can hand through (e.g. PostgreSQL binary/octal
+    // literals): fail the statement instead of the process.
     let Some(StrToF64::Fractional(float) | StrToF64::Decimal(float)) =
-        crate::numeric::str_to_f64(text)
+        crate::numeric::str_to_f64(&text)
     else {
-        unreachable!();
+        return Err(LimboError::ParseError(format!("malformed number: {text}")));
     };
     Ok(Value::Numeric(crate::numeric::Numeric::Float(float)))
 }

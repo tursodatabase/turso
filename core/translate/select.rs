@@ -845,6 +845,12 @@ fn prepare_one_select_plan(
             if limit.is_some() {
                 crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
             }
+            // Our own parser guarantees at least one row, but a frontend
+            // dialect can produce an empty VALUES list (e.g. rows whose
+            // every entry was dropped in translation).
+            if values.is_empty() || values[0].is_empty() {
+                crate::bail_parse_error!("VALUES requires at least one expression");
+            }
             let len = values[0].len();
             if len > SQLITE_MAX_COLUMN {
                 crate::bail_parse_error!("too many columns in result set");

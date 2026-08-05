@@ -205,7 +205,13 @@ impl Time {
 
         match year.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                let months = match (year - 1).unsigned_abs().checked_mul(12) {
+                // year - 1 cannot overflow here, but keep both branches
+                // symmetric and overflow-free.
+                let months = match year
+                    .checked_sub(1)
+                    .map(i32::unsigned_abs)
+                    .and_then(|y| y.checked_mul(12))
+                {
                     Some(m) => m,
                     None => return Ok(None),
                 };
@@ -216,7 +222,13 @@ impl Time {
                 };
             }
             std::cmp::Ordering::Less => {
-                let months = match (year - 1).unsigned_abs().checked_mul(12) {
+                // year can be i32::MIN (e.g. make_date(-2147483648, 1, 1));
+                // a bare `year - 1` overflows.
+                let months = match year
+                    .checked_sub(1)
+                    .map(i32::unsigned_abs)
+                    .and_then(|y| y.checked_mul(12))
+                {
                     Some(m) => m,
                     None => return Ok(None),
                 };

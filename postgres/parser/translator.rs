@@ -2456,9 +2456,9 @@ impl PostgreSQLTranslator {
                     let quoted = format!("'{}'", s.sval.replace('\'', "''"));
                     Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
-                pg_query::protobuf::a_const::Val::Fval(f) => {
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
-                }
+                pg_query::protobuf::a_const::Val::Fval(f) => Ok(ast::Expr::Literal(
+                    ast::Literal::Numeric(normalize_numeric_literal(&f.fval)),
+                )),
                 pg_query::protobuf::a_const::Val::Boolval(b) => {
                     // SQLite uses 0/1 for booleans
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(
@@ -4842,6 +4842,26 @@ pub fn try_extract_copy_to_stdout(parse_result: &ParseResult) -> Option<PgCopyTo
         header,
         null_string,
     })
+}
+
+/// Rewrites PostgreSQL literal syntaxes the engine's numeric parser does
+/// not know into plain decimal: underscore digit separators and binary,
+/// octal, or large hexadecimal integers. Small integers never get here —
+/// the PostgreSQL parser pre-computes those — only literals too large for
+/// i32 arrive as raw text. Malformed or out-of-range text passes through
+/// for the engine to report.
+fn normalize_numeric_literal(text: &str) -> String {
+    let cleaned: String = text.chars().filter(|c| *c != '_').collect();
+    let (radix, digits) = match cleaned.get(..2).map(str::to_ascii_lowercase).as_deref() {
+        Some("0b") => (2, &cleaned[2..]),
+        Some("0o") => (8, &cleaned[2..]),
+        Some("0x") => (16, &cleaned[2..]),
+        _ => return cleaned,
+    };
+    match u64::from_str_radix(digits, radix) {
+        Ok(value) => value.to_string(),
+        Err(_) => cleaned,
+    }
 }
 
 /// Parse a SQL referential action string to an AST RefAct.
