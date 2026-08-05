@@ -1489,9 +1489,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return;
         }
         let max_frame = result.wal_total_backfilled;
-        let Some(wal) = self.pager.wal.as_ref() else {
-            panic!("No WAL to publish backfill");
-        };
+        turso_assert!(self.pager.wal.is_some(), "No WAL to publish backfill");
+        let wal = self.pager.wal.as_ref().unwrap();
         tracing::debug!(
             max_frame,
             backfilled = result.wal_checkpoint_backfilled,

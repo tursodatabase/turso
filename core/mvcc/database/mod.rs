@@ -3938,8 +3938,10 @@ impl RootEntry {
 }
 
 /// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
+/// Test-only harness data, not part of the public MVCC API.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GcDebugSnapshot {
+pub(crate) struct GcDebugSnapshot {
     pub rows_slots: usize,
     pub rows_empty_slots: usize,
     pub rows_versions: usize,
@@ -7099,7 +7101,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Debug SkipMap / GC counters. Walks every chain; not for hot paths.
-    pub fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
+    #[cfg(test)]
+    pub(crate) fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
         let mut rows_empty_slots = 0;
         let mut rows_versions = 0;
         for entry in self.rows.iter() {
