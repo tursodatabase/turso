@@ -30,7 +30,22 @@ pub const DEFAULT_MEM_BUDGET: usize = 32 * 1024;
 /// TODO: make configurable via PRAGMA
 #[cfg(not(debug_assertions))]
 pub const DEFAULT_MEM_BUDGET: usize = 64 * 1024 * 1024;
+
 const DEFAULT_BUCKETS: usize = 1024;
+/// Grow the hash table before any bucket holds too many DISTINCT values.
+const MAX_DISTINCT_ENTRIES_PER_BUCKET: usize = 16;
+/// Marks a slot that does not point to a DISTINCT value.
+const EMPTY_DISTINCT_SET_SLOT: u32 = u32::MAX;
+/// Grow a DISTINCT value set when 75 percent of its slots are in use.
+const DISTINCT_SET_FULL_PERCENT: usize = 75;
+/// Give the bitmap at most one quarter of the query memory limit.
+const COUNT_BITMAP_MEMORY_DIVISOR: usize = 4;
+/// Stop one COUNT(DISTINCT) bitmap from using more than 16 MiB.
+const MAX_COUNT_BITMAP_BYTES: usize = 16 * 1024 * 1024;
+/// Small number ranges may use a bitmap even before they have many values.
+const COUNT_BITMAP_SMALL_RANGE_BITS: u128 = 4096;
+/// A larger bitmap range must use no more than eight bits per saved value.
+const COUNT_BITMAP_MAX_BITS_PER_VALUE: u128 = 8;
 /// Minimum number of partitions for grace hash join.
 pub const MIN_PARTITIONS: usize = 16;
 /// Maximum number of partitions for adaptive partitioning.
@@ -115,6 +130,20 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
     hasher.finish()
 }
 
+/// Return the integer form of a value when SQL sees it as an exact integer.
+///
+/// This lets `10` and `10.0` use the same bit in a COUNT(DISTINCT) bitmap.
+fn count_distinct_integer(value: ValueRef) -> Option<i64> {
+    match value {
+        ValueRef::Numeric(Numeric::Integer(value)) => Some(value),
+        ValueRef::Numeric(Numeric::Float(value)) => {
+            let integer = f64::from(value) as i64;
+            (Numeric::Integer(integer) == Numeric::Float(value)).then_some(integer)
+        }
+        ValueRef::Null | ValueRef::Text(_) | ValueRef::Blob(_) => None,
+    }
+}
+
 /// Normalize signed zero so 0.0 and -0.0 hash the same.
 #[inline]
 const fn normalized_f64_bits(f: f64) -> u64 {
@@ -190,6 +219,20 @@ fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[Collatio
     true
 }
 
+/// Compare two owned DISTINCT keys with SQL value and text rules.
+fn owned_distinct_keys_equal(key1: &[Value], key2: &[Value], collations: &[CollationSeq]) -> bool {
+    if key1.len() != key2.len() {
+        return false;
+    }
+    for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
+        let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
+        if !values_equal_distinct(v1.as_ref(), v2.as_ref(), collation) {
+            return false;
+        }
+    }
+    true
+}
+
 /// State machine states for hash table operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashTableState {
@@ -209,6 +252,18 @@ pub struct GraceProbeEntry {
 }
 
 /// A single entry in a hash table bucket.
+/// Says why a hash entry exists and whether its DISTINCT value was used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum HashEntryKind {
+    /// A normal hash join entry.
+    HashJoin = 0,
+    /// A DISTINCT value that still must be sent to its aggregate.
+    DistinctWaiting = 1,
+    /// A DISTINCT value that was already sent to its aggregate.
+    DistinctSent = 2,
+}
+
 #[derive(Debug, Clone)]
 pub struct HashEntry {
     /// Hash value of the join keys.
@@ -224,6 +279,8 @@ pub struct HashEntry {
     /// When populated, these are the result columns needed from the build table,
     /// stored in column index order as specified during hash table construction.
     pub payload_values: Vec<Value>,
+    /// Says whether this is a hash join entry or a DISTINCT value.
+    kind: HashEntryKind,
 }
 
 #[derive(Debug)]
@@ -249,10 +306,11 @@ impl HashEntry {
             key_values,
             rowid,
             payload_values: vec![],
+            kind: HashEntryKind::HashJoin,
         }
     }
 
-    const fn new_with_payload(
+    fn new_with_payload(
         hash: u64,
         key_values: Vec<Value>,
         rowid: i64,
@@ -263,6 +321,22 @@ impl HashEntry {
             key_values,
             rowid,
             payload_values,
+            kind: HashEntryKind::HashJoin,
+        }
+    }
+
+    /// Build an entry for one aggregate DISTINCT value.
+    fn new_distinct(hash: u64, key_values: Vec<Value>, kind: HashEntryKind) -> Self {
+        turso_assert!(
+            kind != HashEntryKind::HashJoin,
+            "a DISTINCT entry needs a DISTINCT kind"
+        );
+        Self {
+            hash,
+            key_values,
+            rowid: 0,
+            payload_values: vec![],
+            kind,
         }
     }
 
@@ -274,7 +348,11 @@ impl HashEntry {
     /// Get the size of this entry in bytes (approximate).
     /// This is a lightweight estimate for memory budgeting, not a precise measurement.
     fn size_bytes(&self) -> usize {
-        Self::size_from_values(&self.key_values, &self.payload_values)
+        if self.kind == HashEntryKind::HashJoin {
+            Self::size_from_values(&self.key_values, &self.payload_values)
+        } else {
+            Self::distinct_size_from_values(&self.key_values)
+        }
     }
 
     fn size_from_values(key_values: &[Value], payload_values: &[Value]) -> usize {
@@ -286,7 +364,22 @@ impl HashEntry {
         };
         let key_size: usize = key_values.iter().map(value_size).sum();
         let payload_size: usize = payload_values.iter().map(value_size).sum();
-        key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
+        key_size + payload_size + 8 + 8 + 1 // hash, rowid, and entry kind
+    }
+
+    /// Estimate the memory used by one DISTINCT entry.
+    fn distinct_size_from_values(key_values: &[Value]) -> usize {
+        let value_heap_size = |value: &Value| match value {
+            Value::Text(text) => text.as_str().len(),
+            Value::Blob(blob) => blob.len(),
+            Value::Null | Value::Numeric(_) => 0,
+        };
+        std::mem::size_of::<Self>()
+            + key_values.iter().map(value_heap_size).sum::<usize>()
+            + key_values
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(std::mem::size_of::<Value>())
     }
 
     /// Calculate the serialized size of a single Value.
@@ -305,11 +398,65 @@ impl HashEntry {
 
     /// Calculate the exact serialized size of this entry.
     fn serialized_size(&self) -> usize {
-        8 + 8 // hash + rowid
+        8 + 8 + 1 // hash + rowid + entry kind
             + varint_len(self.key_values.len() as u64)
             + self.key_values.iter().map(Self::value_serialized_size).sum::<usize>()
             + varint_len(self.payload_values.len() as u64)
             + self.payload_values.iter().map(Self::value_serialized_size).sum::<usize>()
+    }
+
+    /// Return the bytes needed by the small DISTINCT disk form.
+    fn distinct_disk_size(&self) -> usize {
+        turso_assert!(
+            self.key_values.len() == 1 && self.payload_values.is_empty(),
+            "aggregate DISTINCT spill entries have one key and no payload"
+        );
+        8 + 1 + Self::value_serialized_size(&self.key_values[0])
+    }
+
+    /// Write one entry in the small DISTINCT disk form.
+    fn write_distinct_to_slice(&self, buf: &mut [u8]) -> usize {
+        turso_assert!(
+            self.kind != HashEntryKind::HashJoin,
+            "a DISTINCT spill entry needs a DISTINCT kind"
+        );
+        let mut offset = 0;
+        buf[..8].copy_from_slice(&self.hash.to_le_bytes());
+        offset += 8;
+        buf[offset] = self.kind as u8;
+        offset += 1;
+        offset += Self::serialize_value_to_slice(&self.key_values[0], &mut buf[offset..]);
+        offset
+    }
+
+    /// Read one entry from the small DISTINCT disk form.
+    fn read_distinct(buf: &[u8]) -> Result<(Self, usize)> {
+        if unlikely(buf.len() < 10) {
+            return Err(LimboError::Corrupt(
+                "DISTINCT spill entry is too short".to_string(),
+            ));
+        }
+        let hash = u64::from_le_bytes(buf[..8].try_into().expect("hash has eight bytes"));
+        let kind = match buf[8] {
+            1 => HashEntryKind::DistinctWaiting,
+            2 => HashEntryKind::DistinctSent,
+            value => {
+                return Err(LimboError::Corrupt(format!(
+                    "bad DISTINCT spill state {value}"
+                )))
+            }
+        };
+        let (value, value_len) = Self::deserialize_value(&buf[9..])?;
+        Ok((
+            Self {
+                hash,
+                key_values: vec![value],
+                rowid: 0,
+                payload_values: vec![],
+                kind,
+            },
+            9 + value_len,
+        ))
     }
 
     /// Serialize this entry directly to a slice, returns bytes written.
@@ -317,11 +464,13 @@ impl HashEntry {
     fn serialize_to_slice(&self, buf: &mut [u8]) -> usize {
         let mut offset = 0;
 
-        // Write hash and rowid
+        // Write the hash, rowid, and entry kind.
         buf[offset..offset + 8].copy_from_slice(&self.hash.to_le_bytes());
         offset += 8;
         buf[offset..offset + 8].copy_from_slice(&self.rowid.to_le_bytes());
         offset += 8;
+        buf[offset] = self.kind as u8;
+        offset += 1;
 
         // Write number of keys and key values
         offset += write_varint(&mut buf[offset..], self.key_values.len() as u64);
@@ -379,12 +528,13 @@ impl HashEntry {
     }
 
     /// Serialize this entry to bytes for disk storage.
-    /// Format: [hash:8][rowid:8][num_keys:varint][keys...][num_payload:varint][payload...]
+    /// Format: [hash:8][rowid:8][kind:1][num_keys:varint][keys...][num_payload:varint][payload...]
     /// Each value is: [type:1][len:varint (for text/blob)][data]
     fn serialize(&self, buf: &mut Vec<u8>) -> Result<()> {
         buf.try_reserve(self.serialized_size())?;
         buf.extend_from_slice(&self.hash.to_le_bytes());
         buf.extend_from_slice(&self.rowid.to_le_bytes());
+        buf.push(self.kind as u8);
 
         // Write number of keys and key values
         let varint_buf = &mut [0u8; 9];
@@ -435,7 +585,7 @@ impl HashEntry {
 
     /// Deserialize an entry from bytes, returning (entry, bytes_consumed) or error.
     fn deserialize(buf: &[u8]) -> Result<(Self, usize)> {
-        if unlikely(buf.len() < 16) {
+        if unlikely(buf.len() < 17) {
             return Err(LimboError::Corrupt(
                 "HashEntry: buffer too small for header".to_string(),
             ));
@@ -444,7 +594,17 @@ impl HashEntry {
         // buffer len checked above
         let hash = u64::from_le_bytes(buf[0..8].try_into().expect("expect 8 bytes"));
         let rowid = i64::from_le_bytes(buf[8..16].try_into().expect("expect 8 bytes"));
-        let mut offset = 16;
+        let kind = match buf[16] {
+            0 => HashEntryKind::HashJoin,
+            1 => HashEntryKind::DistinctWaiting,
+            2 => HashEntryKind::DistinctSent,
+            value => {
+                return Err(LimboError::Corrupt(format!(
+                    "HashEntry: bad DISTINCT state {value}"
+                )))
+            }
+        };
+        let mut offset = 17;
 
         // Read number of keys and key values
         let (num_keys, varint_len) = read_varint(&buf[offset..])?;
@@ -478,6 +638,7 @@ impl HashEntry {
                 key_values,
                 rowid,
                 payload_values,
+                kind,
             },
             offset,
         ))
@@ -610,6 +771,550 @@ impl HashBucket {
     }
 }
 
+/// Stores each aggregate DISTINCT value once.
+///
+/// `slots` holds indexes into one flat `entries` list. This avoids a separate
+/// list for each hash bucket and keeps each lookup short.
+struct DistinctValueSet {
+    entries: Vec<HashEntry>,
+    slots: Vec<u32>,
+}
+
+impl DistinctValueSet {
+    /// Make an empty set with at least `min_slot_count` lookup slots.
+    fn new(min_slot_count: usize) -> Result<Self> {
+        let slot_count = min_slot_count.max(16).next_power_of_two();
+        Ok(Self {
+            entries: vec![],
+            slots: (0..slot_count)
+                .map(|_| EMPTY_DISTINCT_SET_SLOT)
+                .try_collect()?,
+        })
+    }
+
+    /// Make an empty set large enough for the given number of values.
+    fn with_expected_entries(expected_entries: usize) -> Result<Self> {
+        let min_slots = expected_entries
+            .saturating_mul(100)
+            .div_ceil(DISTINCT_SET_FULL_PERCENT);
+        Self::new(min_slots)
+    }
+
+    /// Return true when the set has no values.
+    const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Return the bytes used by lookup slots.
+    fn index_bytes(&self) -> usize {
+        self.slots.len().saturating_mul(std::mem::size_of::<u32>())
+    }
+
+    /// Estimate all memory held by this set, including unused list space.
+    fn memory_bytes(&self) -> usize {
+        self.index_bytes()
+            .saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<HashEntry>()),
+            )
+            .saturating_add(
+                self.entries
+                    .iter()
+                    .map(|entry| {
+                        HashEntry::distinct_size_from_values(&entry.key_values)
+                            .saturating_sub(std::mem::size_of::<HashEntry>())
+                    })
+                    .sum(),
+            )
+    }
+
+    /// Return the lookup memory needed after one more value is added.
+    fn index_bytes_after_insert(&self) -> usize {
+        if self.needs_grow() {
+            self.index_bytes().saturating_mul(2)
+        } else {
+            self.index_bytes()
+        }
+    }
+
+    /// Return true when one more value would make 75 percent of slots full.
+    fn needs_grow(&self) -> bool {
+        self.entries.len().saturating_add(1).saturating_mul(100)
+            > self.slots.len().saturating_mul(DISTINCT_SET_FULL_PERCENT)
+    }
+
+    /// Find a value without copying it from the SQL register.
+    fn find(&self, hash: u64, key_refs: &[ValueRef], collations: &[CollationSeq]) -> Option<usize> {
+        let mask = self.slots.len() - 1;
+        let mut slot = hash as usize & mask;
+        loop {
+            let entry_idx = self.slots[slot];
+            if entry_idx == EMPTY_DISTINCT_SET_SLOT {
+                return None;
+            }
+            let entry = &self.entries[entry_idx as usize];
+            if entry.hash == hash && keys_equal_distinct(&entry.key_values, key_refs, collations) {
+                return Some(entry_idx as usize);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Find a value that is already owned by a hash entry.
+    fn find_owned(
+        &self,
+        hash: u64,
+        key_values: &[Value],
+        collations: &[CollationSeq],
+    ) -> Option<usize> {
+        let mask = self.slots.len() - 1;
+        let mut slot = hash as usize & mask;
+        loop {
+            let entry_idx = self.slots[slot];
+            if entry_idx == EMPTY_DISTINCT_SET_SLOT {
+                return None;
+            }
+            let entry = &self.entries[entry_idx as usize];
+            if entry.hash == hash
+                && owned_distinct_keys_equal(&entry.key_values, key_values, collations)
+            {
+                return Some(entry_idx as usize);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Double the lookup list and place each old value in its new slot.
+    fn grow(&mut self) -> Result<()> {
+        let new_count = self
+            .slots
+            .len()
+            .checked_mul(2)
+            .ok_or(LimboError::OutOfMemory)?;
+        let mut new_slots: Vec<u32> = (0..new_count)
+            .map(|_| EMPTY_DISTINCT_SET_SLOT)
+            .try_collect()?;
+        let mask = new_count - 1;
+        for (entry_idx, entry) in self.entries.iter().enumerate() {
+            let mut slot = entry.hash as usize & mask;
+            while new_slots[slot] != EMPTY_DISTINCT_SET_SLOT {
+                slot = (slot + 1) & mask;
+            }
+            new_slots[slot] = u32::try_from(entry_idx).map_err(|_| LimboError::OutOfMemory)?;
+        }
+        self.slots = new_slots;
+        Ok(())
+    }
+
+    /// Add a value that the caller has already shown is new.
+    fn insert_new(&mut self, entry: HashEntry) -> Result<()> {
+        if self.needs_grow() {
+            self.grow()?;
+        }
+        let entry_idx = u32::try_from(self.entries.len()).map_err(|_| LimboError::OutOfMemory)?;
+        let mask = self.slots.len() - 1;
+        let mut slot = entry.hash as usize & mask;
+        while self.slots[slot] != EMPTY_DISTINCT_SET_SLOT {
+            slot = (slot + 1) & mask;
+        }
+        self.entries.try_push(entry)?;
+        self.slots[slot] = entry_idx;
+        Ok(())
+    }
+
+    /// Add a value, or mark the old copy as sent when either copy was sent.
+    fn insert_or_update(&mut self, entry: HashEntry, collations: &[CollationSeq]) -> Result<()> {
+        if let Some(old_idx) = self.find_owned(entry.hash, &entry.key_values, collations) {
+            let old = &mut self.entries[old_idx];
+            turso_assert!(
+                old.kind != HashEntryKind::HashJoin && entry.kind != HashEntryKind::HashJoin,
+                "only DISTINCT entries can be joined"
+            );
+            if entry.kind == HashEntryKind::DistinctSent {
+                old.kind = HashEntryKind::DistinctSent;
+            }
+            return Ok(());
+        }
+        self.insert_new(entry)?;
+        Ok(())
+    }
+
+    /// Take all values and leave a new empty set with the requested size.
+    fn take_entries(&mut self, min_slots: usize) -> Result<Vec<HashEntry>> {
+        let entries = std::mem::replace(&mut self.entries, vec![]);
+        *self = Self::new(min_slots)?;
+        Ok(entries)
+    }
+}
+
+/// Tells the caller where one COUNT(DISTINCT) integer was stored.
+enum BitmapInsertResult {
+    /// The bitmap holds the value. `is_new` is false for a repeat.
+    Stored { is_new: bool },
+    /// The bitmap stopped growing, so the normal value set must hold this value.
+    UseValueSet,
+}
+
+/// Stores COUNT(DISTINCT) integers as one bit per value.
+///
+/// The bitmap stops growing when its number range is too wide or uses too much
+/// memory. Values inside the old range still use the bitmap. Other values use
+/// the normal value set, so one value cannot be in both places.
+struct CountDistinctBitmap {
+    /// Bits for all values from `first_word * 64` through the end of the list.
+    words: Vec<u64>,
+    /// The signed group of 64 integers stored in `words[0]`.
+    first_word: i64,
+    /// Smallest value that the bitmap has seen.
+    min_value: Option<i64>,
+    /// Largest value that the bitmap has seen.
+    max_value: Option<i64>,
+    /// Number of set bits.
+    value_count: u64,
+    /// True after the bitmap has stopped growing.
+    stopped_growing: bool,
+}
+
+impl CountDistinctBitmap {
+    /// Make an empty bitmap that may grow in either direction.
+    fn new() -> Self {
+        Self {
+            words: vec![],
+            first_word: 0,
+            min_value: None,
+            max_value: None,
+            value_count: 0,
+            stopped_growing: false,
+        }
+    }
+
+    /// Return the bytes held by the bitmap list.
+    fn memory_bytes(&self) -> usize {
+        self.words
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>())
+    }
+
+    /// Return the number of different integers in the bitmap.
+    const fn count(&self) -> u64 {
+        self.value_count
+    }
+
+    /// Return true when new values outside the old range must use the value set.
+    const fn stopped_growing(&self) -> bool {
+        self.stopped_growing
+    }
+
+    /// Add one integer without letting the bitmap pass `byte_limit`.
+    fn insert(&mut self, value: i64, byte_limit: usize) -> Result<BitmapInsertResult> {
+        let word = value.div_euclid(64);
+        let bit = value.rem_euclid(64) as u32;
+
+        let Some(old_min) = self.min_value else {
+            if byte_limit < std::mem::size_of::<u64>() {
+                self.stopped_growing = true;
+                return Ok(BitmapInsertResult::UseValueSet);
+            }
+            let mut words = Vec::try_with_capacity_ext(1)?;
+            words
+                .push_within_capacity(1u64 << bit)
+                .expect("one bitmap word was reserved");
+            self.words = words;
+            self.first_word = word;
+            self.min_value = Some(value);
+            self.max_value = Some(value);
+            self.value_count = 1;
+            return Ok(BitmapInsertResult::Stored { is_new: true });
+        };
+        let old_max = self
+            .max_value
+            .expect("bitmap minimum and maximum are set together");
+
+        if value >= old_min && value <= old_max {
+            let word_offset = usize::try_from(word - self.first_word)
+                .expect("observed bitmap value is inside the allocated words");
+            let mask = 1u64 << bit;
+            let inserted = self.words[word_offset] & mask == 0;
+            if inserted {
+                self.words[word_offset] |= mask;
+                self.value_count = self
+                    .value_count
+                    .checked_add(1)
+                    .ok_or(LimboError::IntegerOverflow)?;
+            }
+            return Ok(BitmapInsertResult::Stored { is_new: inserted });
+        }
+
+        if self.stopped_growing {
+            return Ok(BitmapInsertResult::UseValueSet);
+        }
+
+        let new_min = old_min.min(value);
+        let new_max = old_max.max(value);
+        let range_bits = (i128::from(new_max) - i128::from(new_min) + 1) as u128;
+        let new_count = u128::from(self.value_count)
+            .checked_add(1)
+            .ok_or(LimboError::IntegerOverflow)?;
+        if range_bits > COUNT_BITMAP_SMALL_RANGE_BITS
+            && range_bits > new_count.saturating_mul(COUNT_BITMAP_MAX_BITS_PER_VALUE)
+        {
+            self.stopped_growing = true;
+            return Ok(BitmapInsertResult::UseValueSet);
+        }
+
+        let old_end_word = self
+            .first_word
+            .checked_add(self.words.len() as i64 - 1)
+            .expect("bounded bitmap word range fits in i64");
+        if word < self.first_word || word > old_end_word {
+            let missing_words = if word < self.first_word {
+                usize::try_from(i128::from(self.first_word) - i128::from(word))
+                    .map_err(|_| LimboError::OutOfMemory)?
+            } else {
+                usize::try_from(i128::from(word) - i128::from(old_end_word))
+                    .map_err(|_| LimboError::OutOfMemory)?
+            };
+            let required_words = self
+                .words
+                .len()
+                .checked_add(missing_words)
+                .ok_or(LimboError::OutOfMemory)?;
+            let max_words = byte_limit / std::mem::size_of::<u64>();
+            if required_words > max_words {
+                self.stopped_growing = true;
+                return Ok(BitmapInsertResult::UseValueSet);
+            }
+            let doubled = self.words.len().saturating_mul(2);
+            let new_len = required_words.max(doubled).min(max_words);
+            let mut new_words = Vec::try_with_capacity_ext(new_len)?;
+            new_words.resize(new_len, 0);
+            if word < self.first_word {
+                let prefix = new_len - self.words.len();
+                new_words[prefix..].copy_from_slice(&self.words);
+                self.first_word = self
+                    .first_word
+                    .checked_sub(prefix as i64)
+                    .expect("bounded bitmap word range fits in i64");
+            } else {
+                new_words[..self.words.len()].copy_from_slice(&self.words);
+            }
+            self.words = new_words;
+        }
+
+        let word_offset =
+            usize::try_from(word - self.first_word).expect("grown bitmap contains the new word");
+        let mask = 1u64 << bit;
+        turso_assert!(
+            self.words[word_offset] & mask == 0,
+            "value outside the old bitmap range cannot already be set"
+        );
+        self.words[word_offset] |= mask;
+        self.min_value = Some(new_min);
+        self.max_value = Some(new_max);
+        self.value_count = u64::try_from(new_count).map_err(|_| LimboError::IntegerOverflow)?;
+        Ok(BitmapInsertResult::Stored { is_new: true })
+    }
+}
+
+/// One integer in a loaded DISTINCT spill part.
+#[derive(Clone, Copy)]
+struct IntegerSetEntry {
+    /// Hash used to find this value in the slot list.
+    hash: u64,
+    /// Integer stored by this entry.
+    value: i64,
+    /// Says whether the aggregate has already seen this value.
+    kind: HashEntryKind,
+}
+
+/// Stores integer-only spill parts without building full SQL values.
+struct IntegerValueSet {
+    entries: Vec<IntegerSetEntry>,
+    slots: Vec<u32>,
+}
+
+impl IntegerValueSet {
+    /// Make an empty integer set large enough for the expected values.
+    fn with_expected_entries(expected_entries: usize) -> Result<Self> {
+        let min_slots = expected_entries
+            .saturating_mul(100)
+            .div_ceil(DISTINCT_SET_FULL_PERCENT)
+            .max(16)
+            .next_power_of_two();
+        Ok(Self {
+            entries: vec![],
+            slots: (0..min_slots)
+                .map(|_| EMPTY_DISTINCT_SET_SLOT)
+                .try_collect()?,
+        })
+    }
+
+    /// Estimate all memory held by the entry and slot lists.
+    fn memory_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<IntegerSetEntry>())
+            .saturating_add(self.slots.len().saturating_mul(std::mem::size_of::<u32>()))
+    }
+
+    /// Return true when one more value would make 75 percent of slots full.
+    fn needs_grow(&self) -> bool {
+        self.entries.len().saturating_add(1).saturating_mul(100)
+            > self.slots.len().saturating_mul(DISTINCT_SET_FULL_PERCENT)
+    }
+
+    /// Double the slot list and place each old integer in its new slot.
+    fn grow(&mut self) -> Result<()> {
+        let new_count = self
+            .slots
+            .len()
+            .checked_mul(2)
+            .ok_or(LimboError::OutOfMemory)?;
+        let mut new_slots: Vec<u32> = (0..new_count)
+            .map(|_| EMPTY_DISTINCT_SET_SLOT)
+            .try_collect()?;
+        let mask = new_count - 1;
+        for (entry_idx, entry) in self.entries.iter().enumerate() {
+            let mut slot = entry.hash as usize & mask;
+            while new_slots[slot] != EMPTY_DISTINCT_SET_SLOT {
+                slot = (slot + 1) & mask;
+            }
+            new_slots[slot] = u32::try_from(entry_idx).map_err(|_| LimboError::OutOfMemory)?;
+        }
+        self.slots = new_slots;
+        Ok(())
+    }
+
+    /// Add an integer, or mark the old copy as sent when either copy was sent.
+    fn insert(&mut self, entry: IntegerSetEntry) -> Result<()> {
+        let mask = self.slots.len() - 1;
+        let mut slot = entry.hash as usize & mask;
+        loop {
+            let old_idx = self.slots[slot];
+            if old_idx == EMPTY_DISTINCT_SET_SLOT {
+                break;
+            }
+            let old = &mut self.entries[old_idx as usize];
+            if old.hash == entry.hash && old.value == entry.value {
+                if entry.kind == HashEntryKind::DistinctSent {
+                    old.kind = HashEntryKind::DistinctSent;
+                }
+                return Ok(());
+            }
+            slot = (slot + 1) & mask;
+        }
+
+        if self.needs_grow() {
+            self.grow()?;
+            return self.insert(entry);
+        }
+        let entry_idx = u32::try_from(self.entries.len()).map_err(|_| LimboError::OutOfMemory)?;
+        self.entries.try_push(entry)?;
+        self.slots[slot] = entry_idx;
+        Ok(())
+    }
+
+    /// Change this small integer set into a set that can hold any SQL value.
+    fn into_value_set(self, collations: &[CollationSeq]) -> Result<DistinctValueSet> {
+        let mut values = DistinctValueSet::with_expected_entries(self.entries.len())?;
+        for entry in self.entries {
+            values.insert_or_update(
+                HashEntry::new_distinct(entry.hash, vec![Value::from_i64(entry.value)], entry.kind),
+                collations,
+            )?;
+        }
+        Ok(values)
+    }
+}
+
+/// Holds the different values read from one DISTINCT spill part.
+enum LoadedDistinctSet {
+    /// Short-lived state used while an integer set changes into a value set.
+    Empty,
+    /// Fast form used while every value is an integer.
+    Integers(IntegerValueSet),
+    /// Form used when the part contains any other SQL value.
+    Values(DistinctValueSet),
+}
+
+impl LoadedDistinctSet {
+    /// Start with the smaller integer form and room for the expected values.
+    fn with_expected_entries(expected_entries: usize) -> Result<Self> {
+        Ok(Self::Integers(IntegerValueSet::with_expected_entries(
+            expected_entries,
+        )?))
+    }
+
+    /// Estimate all memory held by the loaded set.
+    fn memory_bytes(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Integers(set) => set.memory_bytes(),
+            Self::Values(set) => set.memory_bytes(),
+        }
+    }
+
+    /// Read one spill entry and add its value to this set.
+    fn insert_spill_entry(
+        &mut self,
+        entry_bytes: &[u8],
+        collations: &[CollationSeq],
+    ) -> Result<()> {
+        if unlikely(entry_bytes.len() < 10) {
+            return Err(LimboError::Corrupt(
+                "DISTINCT spill entry is too short".to_string(),
+            ));
+        }
+        let kind = match entry_bytes[8] {
+            1 => HashEntryKind::DistinctWaiting,
+            2 => HashEntryKind::DistinctSent,
+            value => {
+                return Err(LimboError::Corrupt(format!(
+                    "bad DISTINCT spill state {value}"
+                )))
+            }
+        };
+
+        if entry_bytes[9] == INT_HASH && matches!(self, Self::Integers(_)) {
+            if unlikely(entry_bytes.len() != 18) {
+                return Err(LimboError::Corrupt(
+                    "integer DISTINCT spill entry has a bad size".to_string(),
+                ));
+            }
+            let hash =
+                u64::from_le_bytes(entry_bytes[..8].try_into().expect("hash has eight bytes"));
+            let value = i64::from_le_bytes(
+                entry_bytes[10..18]
+                    .try_into()
+                    .expect("integer has eight bytes"),
+            );
+            let Self::Integers(set) = self else {
+                unreachable!("integer DISTINCT set was checked above")
+            };
+            return set.insert(IntegerSetEntry { hash, value, kind });
+        }
+
+        if matches!(self, Self::Integers(_)) {
+            let old = std::mem::replace(self, Self::Empty);
+            let Self::Integers(integer_set) = old else {
+                unreachable!("integer DISTINCT set was checked above")
+            };
+            *self = Self::Values(integer_set.into_value_set(collations)?);
+        }
+
+        let Self::Values(set) = self else {
+            unreachable!("DISTINCT set was changed to the value form")
+        };
+        let (entry, consumed) = HashEntry::read_distinct(entry_bytes)?;
+        turso_assert!(
+            consumed == entry_bytes.len(),
+            "expected to consume entire entry"
+        );
+        set.insert_or_update(entry, collations)
+    }
+}
+
 /// I/O state for spilled partition operations
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SpillIOState {
@@ -656,12 +1361,14 @@ pub struct SpilledPartition {
     state: PartitionState,
     /// I/O state for async operations
     io_state: Arc<AtomicSpillIOState>,
-    /// Read buffer for loading partition back
-    read_buffer: Arc<RwLock<Vec<u8>>>,
+    /// Buffer used while one spill part is read from disk.
+    read_buffer: Arc<RwLock<Option<Arc<Buffer>>>>,
     /// Length of data in read buffer
     buffer_len: Arc<AtomicUsize>,
     /// Hash buckets for this partition (populated after loading)
     buckets: Vec<HashBucket>,
+    /// Different values read from an aggregate DISTINCT spill part.
+    loaded_distinct_values: Option<LoadedDistinctSet>,
     /// Current chunk being loaded (for multi-chunk reads)
     current_chunk_idx: usize,
     /// Approximate memory used by the resident buckets for this partition
@@ -681,9 +1388,10 @@ impl SpilledPartition {
             chunks: vec![],
             state: PartitionState::OnDisk,
             io_state: Arc::new(AtomicSpillIOState::new(SpillIOState::None)),
-            read_buffer: Arc::new(RwLock::new(vec![])),
+            read_buffer: Arc::new(RwLock::new(None)),
             buffer_len: Arc::new(atomic::AtomicUsize::new(0)),
             buckets: vec![],
+            loaded_distinct_values: None,
             current_chunk_idx: 0,
             resident_mem: 0,
             matched_bits: vec![],
@@ -740,6 +1448,10 @@ impl SpilledPartition {
 struct PartitionBuffer {
     /// Entries in this partition
     entries: Vec<HashEntry>,
+    /// Aggregate DISTINCT entries that are already in their disk form.
+    distinct_disk_entries: Vec<u8>,
+    /// Number of entries in `distinct_disk_entries`.
+    distinct_disk_entry_count: usize,
     /// Total memory used by entries in this partition
     mem_used: usize,
 }
@@ -748,6 +1460,8 @@ impl PartitionBuffer {
     fn new() -> Self {
         Self {
             entries: vec![],
+            distinct_disk_entries: vec![],
+            distinct_disk_entry_count: 0,
             mem_used: 0,
         }
     }
@@ -758,13 +1472,65 @@ impl PartitionBuffer {
         Ok(())
     }
 
+    /// Add one small aggregate DISTINCT entry in its final disk form.
+    fn add_distinct_disk_entry(
+        &mut self,
+        hash: u64,
+        key_values: &[Value],
+        kind: HashEntryKind,
+    ) -> Result<usize> {
+        turso_assert!(
+            key_values.len() == 1,
+            "aggregate DISTINCT spill records have one key"
+        );
+        let entry_size = 8 + 1 + HashEntry::value_serialized_size(&key_values[0]);
+        let record_size = varint_len(entry_size as u64) + entry_size;
+        let old_len = self.distinct_disk_entries.len();
+        self.distinct_disk_entries.try_reserve(record_size)?;
+        self.distinct_disk_entries.resize(old_len + record_size, 0);
+        let buf = &mut self.distinct_disk_entries[old_len..];
+        let mut offset = write_varint(buf, entry_size as u64);
+        buf[offset..offset + 8].copy_from_slice(&hash.to_le_bytes());
+        offset += 8;
+        turso_assert!(
+            kind != HashEntryKind::HashJoin,
+            "a DISTINCT spill entry needs a DISTINCT kind"
+        );
+        buf[offset] = kind as u8;
+        offset += 1;
+        offset += HashEntry::serialize_value_to_slice(&key_values[0], &mut buf[offset..]);
+        turso_assert!(offset == record_size, "DISTINCT spill record size mismatch");
+        self.distinct_disk_entry_count += 1;
+        self.mem_used += record_size;
+        Ok(record_size)
+    }
+
+    /// Return the number of normal entries and entries already in disk form.
+    fn entry_count(&self) -> usize {
+        self.entries
+            .len()
+            .saturating_add(self.distinct_disk_entry_count)
+    }
+
+    /// Remove all entries but keep their allocated memory for later use.
     fn clear(&mut self) {
         self.entries.clear();
+        self.distinct_disk_entries.clear();
+        self.distinct_disk_entry_count = 0;
         self.mem_used = 0;
     }
 
+    /// Free entry memory after a DISTINCT part is written to disk.
+    fn free_all_memory(&mut self) {
+        self.entries = vec![];
+        self.distinct_disk_entries = vec![];
+        self.distinct_disk_entry_count = 0;
+        self.mem_used = 0;
+    }
+
+    /// Return true when this part has no entries in either form.
     const fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.distinct_disk_entry_count == 0
     }
 }
 
@@ -912,6 +1678,79 @@ struct GraceState {
     load_state: GracePartitionLoadState,
 }
 
+/// Selects how one aggregate handles its DISTINCT values.
+enum AggregateDistinctMode {
+    /// Return saved values to SUM, AVG, or another aggregate.
+    ReturnValues,
+    /// Count saved values, with a bitmap for close integer values.
+    Count { bitmap: CountDistinctBitmap },
+}
+
+/// Keeps the work needed to finish one aggregate DISTINCT operation.
+struct AggregateDistinctState {
+    /// Next entry to read from the current spill part.
+    next_entry: usize,
+    /// Different values seen since the last write to spill parts.
+    current_values: DistinctValueSet,
+    /// Input rows checked against `current_values`.
+    rows_in_current_set: usize,
+    /// Write each input row at once when local repeat checks save little work.
+    write_each_row_to_parts: bool,
+    /// Number of saved values counted before an I/O wait.
+    saved_value_count: u64,
+    /// Work mode for this aggregate.
+    mode: AggregateDistinctMode,
+}
+
+impl AggregateDistinctState {
+    /// Make state for an aggregate that must receive each saved value.
+    fn for_values(initial_slots: usize) -> Result<Self> {
+        Ok(Self {
+            next_entry: 0,
+            current_values: DistinctValueSet::new(initial_slots)?,
+            rows_in_current_set: 0,
+            write_each_row_to_parts: false,
+            saved_value_count: 0,
+            mode: AggregateDistinctMode::ReturnValues,
+        })
+    }
+
+    /// Make state for COUNT(DISTINCT), including its integer bitmap.
+    fn for_count(initial_slots: usize) -> Result<Self> {
+        Ok(Self {
+            next_entry: 0,
+            current_values: DistinctValueSet::new(initial_slots)?,
+            rows_in_current_set: 0,
+            write_each_row_to_parts: false,
+            saved_value_count: 0,
+            mode: AggregateDistinctMode::Count {
+                bitmap: CountDistinctBitmap::new(),
+            },
+        })
+    }
+
+    /// Return true when this state belongs to COUNT(DISTINCT).
+    const fn is_count(&self) -> bool {
+        matches!(self.mode, AggregateDistinctMode::Count { .. })
+    }
+
+    /// Return the integer bitmap for COUNT(DISTINCT).
+    fn count_bitmap(&self) -> &CountDistinctBitmap {
+        let AggregateDistinctMode::Count { bitmap } = &self.mode else {
+            unreachable!("COUNT bitmap requested from a value DISTINCT table")
+        };
+        bitmap
+    }
+
+    /// Return the integer bitmap so a new value can be added.
+    fn count_bitmap_mut(&mut self) -> &mut CountDistinctBitmap {
+        let AggregateDistinctMode::Count { bitmap } = &mut self.mode else {
+            unreachable!("COUNT bitmap requested from a value DISTINCT table")
+        };
+        bitmap
+    }
+}
+
 impl GraceState {
     fn current_partition_idx(&self) -> Option<usize> {
         self.partitions_to_process
@@ -1000,6 +1839,8 @@ pub struct HashTable {
     probe_spill_state: Option<ProbeSpillState>,
     /// Grace processing state machine.
     grace_state: Option<GraceState>,
+    /// State used only by aggregate DISTINCT.
+    aggregate_distinct: Option<AggregateDistinctState>,
 }
 
 crate::assert::assert_send!(HashTable);
@@ -1016,7 +1857,7 @@ enum SpillAction {
         file_offset: u64,
         io_state: Arc<AtomicSpillIOState>,
         buffer_len: Arc<AtomicUsize>,
-        read_buffer_ref: Arc<RwLock<Vec<u8>>>,
+        read_buffer_ref: Arc<RwLock<Option<Arc<Buffer>>>>,
     },
     Restart,
     NotFound,
@@ -1032,7 +1873,7 @@ enum GraceProbeChunkAction {
         file_offset: u64,
         io_state: Arc<AtomicSpillIOState>,
         buffer_len: Arc<AtomicUsize>,
-        read_buffer_ref: Arc<RwLock<Vec<u8>>>,
+        read_buffer_ref: Arc<RwLock<Option<Arc<Buffer>>>>,
     },
     Restart,
     NoMoreChunks,
@@ -1092,6 +1933,7 @@ impl HashTable {
             partition_count_override: config.partition_count,
             probe_spill_state: None,
             grace_state: None,
+            aggregate_distinct: None,
         })
     }
 
@@ -1124,11 +1966,75 @@ impl HashTable {
         partitions.next_power_of_two()
     }
 
+    /// Use many spill parts for DISTINCT so each final value set stays small.
+    fn choose_distinct_partition_count(&self, entry_size: usize) -> usize {
+        if self.partition_count_override.is_some() {
+            self.choose_partition_count(entry_size)
+        } else {
+            MAX_PARTITIONS
+        }
+    }
+
     /// For a given hash value, get the partition index.
     /// SAFETY: only call this when spill_state is Some.
     fn partition_index(&self, hash: u64) -> usize {
         let spill_state = self.spill_state.as_ref().expect("spill state must exist");
         spill_state.partitioning.index(hash)
+    }
+
+    /// Double the SELECT DISTINCT hash table and move each entry once.
+    fn grow_distinct_hash_table(&mut self) -> Result<()> {
+        turso_assert!(
+            !self.track_matched,
+            "DISTINCT hash tables do not track matched entries"
+        );
+
+        let new_bucket_count = self
+            .buckets
+            .len()
+            .checked_mul(2)
+            .ok_or(LimboError::OutOfMemory)?;
+        let mut entry_counts: Vec<usize> = (0..new_bucket_count).map(|_| 0).try_collect()?;
+        for bucket in &self.buckets {
+            for entry in &bucket.entries {
+                let bucket_idx = (entry.hash as usize) % new_bucket_count;
+                entry_counts[bucket_idx] += 1;
+            }
+        }
+
+        let mut new_buckets: Vec<HashBucket> = (0..new_bucket_count)
+            .map(|_| HashBucket::new())
+            .try_collect()?;
+        for (bucket, entry_count) in new_buckets.iter_mut().zip(&entry_counts) {
+            bucket.entries.try_reserve(*entry_count)?;
+        }
+
+        let max_non_empty = self
+            .non_empty_buckets
+            .len()
+            .saturating_mul(2)
+            .min(new_bucket_count);
+        let mut new_non_empty_buckets = Vec::try_with_capacity_ext(max_non_empty)?;
+        for bucket in &mut self.buckets {
+            for entry in bucket.entries.drain(..) {
+                let bucket_idx = (entry.hash as usize) % new_bucket_count;
+                new_buckets[bucket_idx]
+                    .entries
+                    .push_within_capacity(entry)
+                    .expect("new hash buckets were preallocated");
+            }
+        }
+        for (bucket_idx, bucket) in new_buckets.iter().enumerate() {
+            if !bucket.is_empty() {
+                new_non_empty_buckets
+                    .push_within_capacity(bucket_idx)
+                    .expect("non-empty bucket list was preallocated");
+            }
+        }
+
+        self.buckets = new_buckets;
+        self.non_empty_buckets = new_non_empty_buckets;
+        Ok(())
     }
 
     fn record_probe_call(&mut self, metrics: Option<&mut HashJoinMetrics>) {
@@ -1255,10 +2161,136 @@ impl HashTable {
         Ok(HashInsertResult::Done)
     }
 
-    /// Insert keys into the hash table if not already present.
-    /// Returns true if inserted, false if duplicate found.
-    /// Unlike hash join inserts, DISTINCT keeps NULLs and treats NULL==NULL.
+    /// Add a key for SELECT DISTINCT.
     pub fn insert_distinct(
+        &mut self,
+        key_values: &[Value],
+        key_refs: &[ValueRef],
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<bool>> {
+        turso_assert!(
+            self.aggregate_distinct.is_none(),
+            "cannot mix SELECT DISTINCT and aggregate DISTINCT"
+        );
+        self.insert_select_distinct(key_values, key_refs, metrics)
+    }
+
+    /// Add one value for SUM(DISTINCT), AVG(DISTINCT), or a similar aggregate.
+    ///
+    /// Before the first spill, a new value goes to the aggregate at once. After
+    /// a spill, values are saved in small sets. `next_saved_distinct_value`
+    /// returns them after all input rows have been read. This keeps disk reads
+    /// out of the input loop.
+    pub fn insert_aggregate_distinct(
+        &mut self,
+        key_values: &[Value],
+        key_refs: &[ValueRef],
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<bool>> {
+        if self.aggregate_distinct.is_none() {
+            self.aggregate_distinct =
+                Some(AggregateDistinctState::for_values(self.initial_buckets)?);
+        }
+        turso_assert!(
+            !self
+                .aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .is_count(),
+            "value DISTINCT and COUNT DISTINCT cannot share a hash table"
+        );
+        self.insert_aggregate_distinct_value(key_values, key_refs, metrics)
+    }
+
+    /// Add one value for COUNT(DISTINCT).
+    ///
+    /// Exact integer values use a bitmap with a fixed memory limit. Other values
+    /// use the normal value set. All values are counted after the input loop.
+    pub fn insert_count_distinct(
+        &mut self,
+        key_values: &[Value],
+        key_refs: &[ValueRef],
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<bool>> {
+        turso_assert!(
+            key_values.len() == 1 && key_refs.len() == 1,
+            "COUNT(DISTINCT) has one key"
+        );
+        if self.aggregate_distinct.is_none() {
+            self.aggregate_distinct =
+                Some(AggregateDistinctState::for_count(self.initial_buckets)?);
+        }
+        turso_assert!(
+            self.aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .is_count(),
+            "value DISTINCT and COUNT DISTINCT cannot share a hash table"
+        );
+
+        if matches!(key_refs[0], ValueRef::Null) {
+            return Ok(IOResult::Done(false));
+        }
+
+        if let Some(integer) = count_distinct_integer(key_refs[0]) {
+            match self.insert_count_bitmap_integer(integer)? {
+                BitmapInsertResult::Stored { .. } => return Ok(IOResult::Done(false)),
+                BitmapInsertResult::UseValueSet => {
+                    let integer_value = [Value::from_i64(integer)];
+                    let integer_ref = [integer_value[0].as_ref()];
+                    return self.insert_aggregate_distinct_value(
+                        &integer_value,
+                        &integer_ref,
+                        metrics,
+                    );
+                }
+            }
+        }
+
+        self.insert_aggregate_distinct_value(key_values, key_refs, metrics)
+    }
+
+    /// Add one exact integer to the COUNT(DISTINCT) bitmap when it still fits.
+    fn insert_count_bitmap_integer(&mut self, value: i64) -> Result<BitmapInsertResult> {
+        let old_bitmap_bytes = self
+            .aggregate_distinct
+            .as_ref()
+            .expect("aggregate DISTINCT state exists")
+            .count_bitmap()
+            .memory_bytes();
+        turso_assert!(
+            self.mem_used >= old_bitmap_bytes,
+            "bitmap memory is part of hash table memory"
+        );
+        let other_mem = self.mem_used - old_bitmap_bytes;
+        let available = self.mem_budget.saturating_sub(other_mem);
+        let bitmap_limit = self
+            .mem_budget
+            .checked_div(COUNT_BITMAP_MEMORY_DIVISOR)
+            .unwrap_or(0)
+            .min(MAX_COUNT_BITMAP_BYTES)
+            .min(available);
+        let result = self
+            .aggregate_distinct
+            .as_mut()
+            .expect("aggregate DISTINCT state exists")
+            .count_bitmap_mut()
+            .insert(value, bitmap_limit)?;
+        let new_bitmap_bytes = self
+            .aggregate_distinct
+            .as_ref()
+            .expect("aggregate DISTINCT state exists")
+            .count_bitmap()
+            .memory_bytes();
+        self.mem_used = other_mem.saturating_add(new_bitmap_bytes);
+        if matches!(result, BitmapInsertResult::Stored { is_new: true }) {
+            self.num_entries = self.num_entries.saturating_add(1);
+        }
+        Ok(result)
+    }
+
+    /// Add one aggregate DISTINCT value to memory or a spill part.
+    fn insert_aggregate_distinct_value(
         &mut self,
         key_values: &[Value],
         key_refs: &[ValueRef],
@@ -1266,7 +2298,155 @@ impl HashTable {
     ) -> Result<IOResult<bool>> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
-            "Cannot insert_distinct into hash table in unexpected state",
+            "cannot add a DISTINCT key in this state",
+            { "state": format!("{:?}", self.state) }
+        );
+
+        let hash = hash_join_key(key_refs, &self.collations);
+        if self.spill_state.is_some()
+            && self
+                .aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .write_each_row_to_parts
+        {
+            return self.save_distinct_value_in_spill_part(hash, key_values, metrics);
+        }
+        let state = self
+            .aggregate_distinct
+            .as_ref()
+            .expect("aggregate DISTINCT state exists");
+        if state
+            .current_values
+            .find(hash, key_refs, &self.collations)
+            .is_some()
+        {
+            self.aggregate_distinct
+                .as_mut()
+                .expect("aggregate DISTINCT state exists")
+                .rows_in_current_set += 1;
+            return Ok(IOResult::Done(false));
+        }
+
+        let entry_size = HashEntry::distinct_size_from_values(key_values);
+        let index_bytes_after_insert = state.current_values.index_bytes_after_insert();
+        let would_exceed = self
+            .mem_used
+            .saturating_add(entry_size)
+            .saturating_add(index_bytes_after_insert)
+            > self.mem_budget;
+
+        if would_exceed && !state.current_values.is_empty() {
+            if self.spill_state.is_none() {
+                let state = self
+                    .aggregate_distinct
+                    .as_mut()
+                    .expect("aggregate DISTINCT state exists");
+                // Skip the local set when it removed no more than one row in four.
+                state.write_each_row_to_parts =
+                    state.current_values.entries.len().saturating_mul(4)
+                        >= state.rows_in_current_set.saturating_mul(3);
+                let partition_count = self.choose_distinct_partition_count(entry_size);
+                let partitioning = Partitioning::new(partition_count);
+                self.spill_state = Some(SpillState::new(&self.io, self.temp_store, partitioning)?);
+                self.state = HashTableState::Spilled;
+            }
+            self.move_distinct_values_to_spill_parts()?;
+        }
+
+        if self.spill_state.is_some()
+            && self
+                .mem_used
+                .saturating_add(entry_size)
+                .saturating_add(index_bytes_after_insert)
+                > self.mem_budget
+        {
+            if let Some(completion) = self.spill_all_parts(metrics.as_deref_mut())? {
+                if !completion.succeeded() {
+                    return Ok(IOResult::IO(IOCompletions(completion)));
+                }
+            }
+        }
+
+        if self.spill_state.is_some()
+            && self
+                .aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .write_each_row_to_parts
+        {
+            return self.save_distinct_value_in_spill_part(hash, key_values, metrics);
+        }
+
+        let sent_now = self.spill_state.is_none()
+            && !self
+                .aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .is_count();
+        let kind = if sent_now {
+            HashEntryKind::DistinctSent
+        } else {
+            HashEntryKind::DistinctWaiting
+        };
+        let entry = HashEntry::new_distinct(hash, key_values.iter().cloned().try_collect()?, kind);
+        self.aggregate_distinct
+            .as_mut()
+            .expect("aggregate DISTINCT state exists")
+            .current_values
+            .insert_new(entry)?;
+        self.aggregate_distinct
+            .as_mut()
+            .expect("aggregate DISTINCT state exists")
+            .rows_in_current_set += 1;
+        self.num_entries += 1;
+        self.mem_used += entry_size;
+        Ok(IOResult::Done(sent_now))
+    }
+
+    /// Save one value in its spill part without first checking the local set.
+    fn save_distinct_value_in_spill_part(
+        &mut self,
+        hash: u64,
+        key_values: &[Value],
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<bool>> {
+        turso_assert!(
+            key_values.len() == 1,
+            "aggregate DISTINCT spill records have one key"
+        );
+        let entry_size = 8 + 1 + HashEntry::value_serialized_size(&key_values[0]);
+        let record_size = varint_len(entry_size as u64) + entry_size;
+        if self.mem_used.saturating_add(record_size) > self.mem_budget {
+            if let Some(completion) = self.spill_all_parts(metrics)? {
+                if !completion.succeeded() {
+                    return Ok(IOResult::IO(IOCompletions(completion)));
+                }
+            }
+        }
+
+        let partition_idx = self.partition_index(hash);
+        let added = self
+            .spill_state
+            .as_mut()
+            .expect("spill state exists")
+            .partition_buffers[partition_idx]
+            .add_distinct_disk_entry(hash, key_values, HashEntryKind::DistinctWaiting)?;
+        self.num_entries += 1;
+        self.mem_used += added;
+        Ok(IOResult::Done(false))
+    }
+
+    /// Add one SELECT DISTINCT key and return false when it was already present.
+    fn insert_select_distinct(
+        &mut self,
+        key_values: &[Value],
+        key_refs: &[ValueRef],
+        mut metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<bool>> {
+        turso_assert!(
+            self.state == HashTableState::Building || self.state == HashTableState::Spilled,
+            "cannot add a DISTINCT key in this state",
             { "state": format!("{:?}", self.state) }
         );
 
@@ -1274,7 +2454,6 @@ impl HashTable {
 
         if self.spill_state.is_some() {
             let partition_idx = self.partition_index(hash);
-            // Check partition buffer for duplicates
             let has_buffer_dup = {
                 let spill_state = self.spill_state.as_ref().expect("spill state exists");
                 let buffer = &spill_state.partition_buffers[partition_idx];
@@ -1287,16 +2466,16 @@ impl HashTable {
                 return Ok(IOResult::Done(false));
             }
 
-            // Ensure spilled partition is loaded before checking
-            let has_partition = {
-                let spill_state = self.spill_state.as_ref().expect("spill state exists");
-                spill_state.find_partition(partition_idx).is_some()
-            };
+            let has_partition = self
+                .spill_state
+                .as_ref()
+                .expect("spill state exists")
+                .find_partition(partition_idx)
+                .is_some();
             if has_partition && !self.is_partition_loaded(partition_idx) {
                 return_if_io!(self.load_spilled_partition(partition_idx, metrics.as_deref_mut()));
             }
 
-            // Check loaded partition for duplicates
             let has_spilled_dup = 'has_spilled_dup: {
                 let spill_state = self.spill_state.as_ref().expect("spill state exists");
                 let Some(partition) = spill_state.find_partition(partition_idx) else {
@@ -1306,8 +2485,7 @@ impl HashTable {
                     break 'has_spilled_dup false;
                 }
                 let bucket_idx = (hash as usize) % partition.buckets.len();
-                let bucket = &partition.buckets[bucket_idx];
-                bucket.entries.iter().any(|entry| {
+                partition.buckets[bucket_idx].entries.iter().any(|entry| {
                     entry.hash == hash
                         && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
                 })
@@ -1316,7 +2494,7 @@ impl HashTable {
                 return Ok(IOResult::Done(false));
             }
 
-            let entry_size = HashEntry::size_from_values(key_values, &[]);
+            let entry_size = HashEntry::distinct_size_from_values(key_values);
             if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics.as_deref_mut())? {
                 if !c.succeeded() {
                     return Ok(IOResult::IO(IOCompletions(c)));
@@ -1325,10 +2503,10 @@ impl HashTable {
 
             {
                 let spill_state = self.spill_state.as_mut().expect("spill state exists");
-                spill_state.partition_buffers[partition_idx].insert(HashEntry::new(
+                spill_state.partition_buffers[partition_idx].insert(HashEntry::new_distinct(
                     hash,
                     key_values.iter().cloned().try_collect()?,
-                    0,
+                    HashEntryKind::DistinctSent,
                 ))?;
             }
             self.num_entries += 1;
@@ -1347,7 +2525,7 @@ impl HashTable {
             }
         }
 
-        let entry_size = HashEntry::size_from_values(key_values, &[]);
+        let entry_size = HashEntry::distinct_size_from_values(key_values);
         if self.mem_used + entry_size > self.mem_budget {
             if self.spill_state.is_none() {
                 let partition_count = self.choose_partition_count(entry_size);
@@ -1356,17 +2534,28 @@ impl HashTable {
                 self.redistribute_to_partitions()?;
                 self.state = HashTableState::Spilled;
             }
-            return self.insert_distinct(key_values, key_refs, metrics);
+            return self.insert_select_distinct(key_values, key_refs, metrics);
         }
 
+        if self.num_entries.saturating_add(1)
+            > self
+                .buckets
+                .len()
+                .saturating_mul(MAX_DISTINCT_ENTRIES_PER_BUCKET)
+        {
+            self.grow_distinct_hash_table()?;
+        }
+
+        let bucket_idx = (hash as usize) % self.buckets.len();
         if self.buckets[bucket_idx].entries.is_empty() {
             self.non_empty_buckets.try_push(bucket_idx)?;
         }
-        self.buckets[bucket_idx].insert(HashEntry::new(
+        let entry = HashEntry::new_distinct(
             hash,
             key_values.iter().cloned().try_collect()?,
-            0,
-        ))?;
+            HashEntryKind::DistinctSent,
+        );
+        self.buckets[bucket_idx].insert(entry)?;
         self.num_entries += 1;
         self.mem_used += entry_size;
         Ok(IOResult::Done(true))
@@ -1386,6 +2575,7 @@ impl HashTable {
             self.non_empty_buckets.clear();
             self.probe_spill_state = None;
             self.grace_state = None;
+            self.aggregate_distinct = None;
             return Ok(());
         }
 
@@ -1412,6 +2602,7 @@ impl HashTable {
         self.current_spill_partition_idx = 0;
         self.loaded_partitions_lru.borrow_mut().clear();
         self.loaded_partitions_mem = 0;
+        self.aggregate_distinct = None;
         Ok(())
     }
 
@@ -1433,6 +2624,48 @@ impl HashTable {
         }
         // Clear in-memory matched bits; spilled partitions will have their own.
         self.matched_bits.clear();
+        self.non_empty_buckets.clear();
+        Ok(())
+    }
+
+    /// Move the current aggregate DISTINCT values into their spill parts.
+    fn move_distinct_values_to_spill_parts(&mut self) -> Result<()> {
+        let partitioning = self
+            .spill_state
+            .as_ref()
+            .expect("spill state must exist")
+            .partitioning;
+        let aggregate_state = self
+            .aggregate_distinct
+            .as_mut()
+            .expect("aggregate DISTINCT state exists");
+        let write_small_entries = aggregate_state.write_each_row_to_parts;
+        let entries = aggregate_state
+            .current_values
+            .take_entries(self.initial_buckets)?;
+        aggregate_state.rows_in_current_set = 0;
+        let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+        if write_small_entries {
+            let old_mem: usize = entries.iter().map(HashEntry::size_bytes).sum();
+            let mut new_mem = 0;
+            for entry in entries {
+                let partition_idx = partitioning.index(entry.hash);
+                new_mem += spill_state.partition_buffers[partition_idx].add_distinct_disk_entry(
+                    entry.hash,
+                    &entry.key_values,
+                    entry.kind,
+                )?;
+            }
+            self.mem_used = self
+                .mem_used
+                .saturating_sub(old_mem)
+                .saturating_add(new_mem);
+        } else {
+            for entry in entries {
+                let partition_idx = partitioning.index(entry.hash);
+                spill_state.partition_buffers[partition_idx].insert(entry)?;
+            }
+        }
         Ok(())
     }
 
@@ -1457,6 +2690,7 @@ impl HashTable {
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<Option<Completion>> {
         let mut metrics = metrics;
+        let use_small_distinct_entries = self.aggregate_distinct.is_some();
         let spill_state = self.spill_state.as_mut().expect("Spill state must exist");
         let partition = &spill_state.partition_buffers[partition_idx];
         if partition.is_empty() {
@@ -1464,11 +2698,14 @@ impl HashTable {
         }
 
         // Phase 1: Calculate sizes and cache them to avoid recomputation
-        let num_entries = partition.entries.len();
-        let mut entry_sizes = Vec::try_with_capacity_ext(num_entries)?;
-        let mut total_size = 0usize;
+        let mut entry_sizes = Vec::try_with_capacity_ext(partition.entries.len())?;
+        let mut total_size = partition.distinct_disk_entries.len();
         for entry in &partition.entries {
-            let entry_size = entry.serialized_size();
+            let entry_size = if use_small_distinct_entries {
+                entry.distinct_disk_size()
+            } else {
+                entry.serialized_size()
+            };
             entry_sizes
                 .push_within_capacity(entry_size)
                 .expect("entry sizes vector was preallocated");
@@ -1482,17 +2719,28 @@ impl HashTable {
 
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
             offset += write_varint(&mut buf[offset..], entry_size as u64);
-            offset += entry.serialize_to_slice(&mut buf[offset..]);
+            offset += if use_small_distinct_entries {
+                entry.write_distinct_to_slice(&mut buf[offset..])
+            } else {
+                entry.serialize_to_slice(&mut buf[offset..])
+            };
         }
+        buf[offset..offset + partition.distinct_disk_entries.len()]
+            .copy_from_slice(&partition.distinct_disk_entries);
+        offset += partition.distinct_disk_entries.len();
 
         turso_assert!(offset == total_size, "serialized size mismatch");
 
         let file_offset = spill_state.next_spill_offset;
         let data_size = total_size;
-        let num_entries = spill_state.partition_buffers[partition_idx].entries.len();
+        let num_entries = spill_state.partition_buffers[partition_idx].entry_count();
         let mem_freed = spill_state.partition_buffers[partition_idx].mem_used;
 
-        spill_state.partition_buffers[partition_idx].clear();
+        if use_small_distinct_entries {
+            spill_state.partition_buffers[partition_idx].free_all_memory();
+        } else {
+            spill_state.partition_buffers[partition_idx].clear();
+        }
 
         // Find existing partition or create new one
         let io_state = if let Some(existing) = spill_state.find_partition_mut(partition_idx) {
@@ -1569,6 +2817,7 @@ impl HashTable {
             return self.spill_partition(partition_indices[0], metrics);
         }
 
+        let use_small_distinct_entries = self.aggregate_distinct.is_some();
         let spill_state = self.spill_state.as_mut().expect("Spill state must exist");
 
         // Phase 1: Calculate total size and per-partition metadata
@@ -1590,9 +2839,13 @@ impl HashTable {
             }
 
             let mut entry_sizes = Vec::try_with_capacity_ext(partition.entries.len())?;
-            let mut partition_size = 0usize;
+            let mut partition_size = partition.distinct_disk_entries.len();
             for entry in &partition.entries {
-                let entry_size = entry.serialized_size();
+                let entry_size = if use_small_distinct_entries {
+                    entry.distinct_disk_size()
+                } else {
+                    entry.serialized_size()
+                };
                 entry_sizes
                     .push_within_capacity(entry_size)
                     .expect("entry sizes vector was preallocated");
@@ -1601,7 +2854,7 @@ impl HashTable {
 
             metas.try_push(PartitionMeta {
                 idx: partition_idx,
-                num_entries: partition.entries.len(),
+                num_entries: partition.entry_count(),
                 data_size: partition_size,
                 mem_freed: partition.mem_used,
                 entry_sizes,
@@ -1630,8 +2883,15 @@ impl HashTable {
 
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
                 offset += write_varint(&mut buf[offset..], entry_size as u64);
-                offset += entry.serialize_to_slice(&mut buf[offset..]);
+                offset += if use_small_distinct_entries {
+                    entry.write_distinct_to_slice(&mut buf[offset..])
+                } else {
+                    entry.serialize_to_slice(&mut buf[offset..])
+                };
             }
+            buf[offset..offset + partition.distinct_disk_entries.len()]
+                .copy_from_slice(&partition.distinct_disk_entries);
+            offset += partition.distinct_disk_entries.len();
         }
 
         turso_assert!(offset == total_size, "serialized size mismatch");
@@ -1643,7 +2903,11 @@ impl HashTable {
         for (meta, &partition_offset) in metas.iter().zip(partition_offsets.iter()) {
             let file_offset = base_file_offset + partition_offset as u64;
 
-            spill_state.partition_buffers[meta.idx].clear();
+            if use_small_distinct_entries {
+                spill_state.partition_buffers[meta.idx].free_all_memory();
+            } else {
+                spill_state.partition_buffers[meta.idx].clear();
+            }
             total_mem_freed += meta.mem_freed;
 
             // Find existing partition or create new one
@@ -1760,7 +3024,23 @@ impl HashTable {
         self.spill_multiple_partitions(&partitions_to_spill, metrics)
     }
 
-    /// Convert a never-spilled partition buffer into in-memory buckets for probing.
+    /// Write every non-empty aggregate DISTINCT part in one I/O request.
+    fn spill_all_parts(
+        &mut self,
+        metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<Option<Completion>> {
+        let spill_state = self.spill_state.as_ref().expect("spill state must exist");
+        let partition_ids: Vec<usize> = spill_state
+            .partition_buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, partition)| !partition.is_empty())
+            .map(|(idx, _)| idx)
+            .try_collect()?;
+        self.spill_multiple_partitions(&partition_ids, metrics)
+    }
+
+    /// Change a part that stayed in memory into the form used for final reads.
     fn materialize_partition_in_memory(&mut self, partition_idx: usize) -> Result<()> {
         let spill_state = self.spill_state.as_mut().expect("spill state must exist");
         if spill_state.find_partition(partition_idx).is_some() {
@@ -1773,15 +3053,24 @@ impl HashTable {
         }
 
         let entries = std::mem::replace(&mut partition_buffer.entries, vec![]);
-        // we don't change self.mem_used here, as these entries
-        // were always in memory. we’re just changing their layout
+        // These entries were already counted. Only their layout changes here.
         partition_buffer.mem_used = 0;
 
-        let bucket_count = entries.len().next_power_of_two().max(64);
-        let mut buckets: Vec<_> = (0..bucket_count).map(|_| HashBucket::new()).try_collect()?;
-        for entry in entries {
-            let bucket_idx = (entry.hash as usize) % bucket_count;
-            buckets[bucket_idx].insert(entry)?;
+        let mut buckets = vec![];
+        let mut loaded_distinct_values = None;
+        if self.aggregate_distinct.is_some() {
+            let mut set = DistinctValueSet::with_expected_entries(entries.len())?;
+            for entry in entries {
+                set.insert_or_update(entry, &self.collations)?;
+            }
+            loaded_distinct_values = Some(LoadedDistinctSet::Values(set));
+        } else {
+            let bucket_count = entries.len().next_power_of_two().max(64);
+            buckets = (0..bucket_count).map(|_| HashBucket::new()).try_collect()?;
+            for entry in entries {
+                let bucket_idx = (entry.hash as usize) % bucket_count;
+                buckets[bucket_idx].insert(entry)?;
+            }
         }
 
         let matched_bits = if self.track_matched {
@@ -1795,6 +3084,7 @@ impl HashTable {
         let mut partition = SpilledPartition::new(partition_idx);
         partition.state = PartitionState::InMemory;
         partition.buckets = buckets;
+        partition.loaded_distinct_values = loaded_distinct_values;
         partition.matched_bits = matched_bits;
         partition.resident_mem = 0;
         spill_state.partitions.try_push(partition)?;
@@ -1815,6 +3105,13 @@ impl HashTable {
         );
 
         if self.spill_state.is_some() {
+            if self
+                .aggregate_distinct
+                .as_ref()
+                .is_some_and(|state| !state.current_values.is_empty())
+            {
+                self.move_distinct_values_to_spill_parts()?;
+            }
             {
                 // Check for pending writes from previous call
                 let spill_state = self.spill_state.as_ref().expect("spill state must exist");
@@ -1835,20 +3132,32 @@ impl HashTable {
                     if partition.is_empty() {
                         continue;
                     }
-                    if spill_state.find_partition(partition_idx).is_some() {
+                    if self.aggregate_distinct.is_some()
+                        || spill_state.find_partition(partition_idx).is_some()
+                    {
                         spill_targets.try_push(partition_idx)?;
                     } else {
                         materialize_targets.try_push(partition_idx)?;
                     }
                 }
             }
-            for partition_idx in spill_targets {
+            if self.aggregate_distinct.is_some() {
                 if let Some(completion) =
-                    self.spill_partition(partition_idx, metrics.as_deref_mut())?
+                    self.spill_multiple_partitions(&spill_targets, metrics.as_deref_mut())?
                 {
-                    // Return I/O completion to caller, they will re-enter after completion
                     if !completion.finished() {
                         io_yield_one!(completion);
+                    }
+                }
+            } else {
+                for partition_idx in spill_targets {
+                    if let Some(completion) =
+                        self.spill_partition(partition_idx, metrics.as_deref_mut())?
+                    {
+                        // The caller waits for this write, then calls this function again.
+                        if !completion.finished() {
+                            io_yield_one!(completion);
+                        }
                     }
                 }
             }
@@ -1857,8 +3166,207 @@ impl HashTable {
             }
         }
         self.current_spill_partition_idx = 0;
+        if let Some(state) = self.aggregate_distinct.as_mut() {
+            state.next_entry = 0;
+        }
         self.state = HashTableState::Probing;
         Ok(IOResult::Done(()))
+    }
+
+    /// Return the next saved DISTINCT value that its aggregate has not seen.
+    pub fn next_saved_distinct_value(
+        &mut self,
+        mut metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<Option<Value>>> {
+        turso_assert!(
+            self.aggregate_distinct.is_some(),
+            "final DISTINCT scan needs an aggregate DISTINCT table"
+        );
+
+        if matches!(
+            self.state,
+            HashTableState::Building | HashTableState::Spilled
+        ) {
+            return_if_io!(self.finalize_build(metrics.as_deref_mut()));
+        }
+        turso_assert!(
+            self.state == HashTableState::Probing,
+            "cannot scan DISTINCT keys in this state",
+            { "state": format!("{:?}", self.state) }
+        );
+
+        loop {
+            let Some(spill_state) = self.spill_state.as_ref() else {
+                return Ok(IOResult::Done(None));
+            };
+            let Some(partition) = spill_state.partitions.get(self.current_spill_partition_idx)
+            else {
+                return Ok(IOResult::Done(None));
+            };
+            let partition_idx = partition.partition_idx;
+
+            if !partition.is_loaded() {
+                return_if_io!(self.load_spilled_partition(partition_idx, metrics.as_deref_mut()));
+            }
+
+            let mut next_entry = self
+                .aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .next_entry;
+            let next_value = {
+                let spill_state = self.spill_state.as_mut().expect("spill state exists");
+                let partition = spill_state
+                    .find_partition_mut(partition_idx)
+                    .expect("DISTINCT partition exists");
+                let distinct_values = partition
+                    .loaded_distinct_values
+                    .as_mut()
+                    .expect("loaded DISTINCT part has a value set");
+                let mut value = None;
+                match distinct_values {
+                    LoadedDistinctSet::Integers(set) => {
+                        while next_entry < set.entries.len() {
+                            let entry = &mut set.entries[next_entry];
+                            next_entry += 1;
+                            if entry.kind == HashEntryKind::DistinctWaiting {
+                                entry.kind = HashEntryKind::DistinctSent;
+                                value = Some(Value::from_i64(entry.value));
+                                break;
+                            }
+                        }
+                    }
+                    LoadedDistinctSet::Values(set) => {
+                        while next_entry < set.entries.len() {
+                            let entry = &mut set.entries[next_entry];
+                            next_entry += 1;
+                            if entry.kind == HashEntryKind::DistinctWaiting {
+                                entry.kind = HashEntryKind::DistinctSent;
+                                let key = entry.key_values.first().ok_or_else(|| {
+                                    LimboError::InternalError(
+                                        "aggregate DISTINCT entry has no key".to_string(),
+                                    )
+                                })?;
+                                value = Some(key.try_clone()?);
+                                break;
+                            }
+                        }
+                    }
+                    LoadedDistinctSet::Empty => {
+                        unreachable!("loaded DISTINCT part has a value set")
+                    }
+                }
+                value
+            };
+            {
+                let state = self
+                    .aggregate_distinct
+                    .as_mut()
+                    .expect("aggregate DISTINCT state exists");
+                state.next_entry = next_entry;
+            }
+            if next_value.is_some() {
+                return Ok(IOResult::Done(next_value));
+            }
+
+            let (resident_mem, has_file_data) = {
+                let spill_state = self.spill_state.as_mut().expect("spill state exists");
+                let partition = spill_state
+                    .find_partition_mut(partition_idx)
+                    .expect("DISTINCT partition exists");
+                let result = (partition.resident_mem, !partition.chunks.is_empty());
+                partition.loaded_distinct_values = None;
+                partition.resident_mem = 0;
+                result
+            };
+            turso_assert!(has_file_data, "aggregate DISTINCT partitions are spilled");
+            self.loaded_partitions_mem = self.loaded_partitions_mem.saturating_sub(resident_mem);
+            self.loaded_partitions_lru
+                .borrow_mut()
+                .retain(|idx| *idx != partition_idx);
+            self.current_spill_partition_idx += 1;
+            let state = self
+                .aggregate_distinct
+                .as_mut()
+                .expect("aggregate DISTINCT state exists");
+            state.next_entry = 0;
+        }
+    }
+
+    /// Count saved non-NULL values in one call, even when disk reads must wait.
+    pub fn count_saved_distinct_values(
+        &mut self,
+        mut metrics: Option<&mut HashJoinMetrics>,
+    ) -> Result<IOResult<u64>> {
+        turso_assert!(
+            self.aggregate_distinct.is_some(),
+            "bulk DISTINCT count needs an aggregate DISTINCT table"
+        );
+        if matches!(
+            self.state,
+            HashTableState::Building | HashTableState::Spilled
+        ) {
+            return_if_io!(self.finalize_build(metrics.as_deref_mut()));
+        }
+
+        let count_mode = self
+            .aggregate_distinct
+            .as_ref()
+            .expect("aggregate DISTINCT state exists")
+            .is_count();
+        let bitmap_count = if count_mode {
+            self.aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .count_bitmap()
+                .count()
+        } else {
+            0
+        };
+        if count_mode && self.spill_state.is_none() {
+            let saved_count = self
+                .aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .current_values
+                .entries
+                .iter()
+                .filter(|entry| !matches!(entry.key_values.first(), Some(Value::Null) | None))
+                .count() as u64;
+            let count = bitmap_count
+                .checked_add(saved_count)
+                .ok_or(LimboError::IntegerOverflow)?;
+            return Ok(IOResult::Done(count));
+        }
+
+        loop {
+            match self.next_saved_distinct_value(metrics.as_deref_mut())? {
+                IOResult::Done(Some(value)) => {
+                    if !matches!(value, Value::Null) {
+                        let state = self
+                            .aggregate_distinct
+                            .as_mut()
+                            .expect("aggregate DISTINCT state exists");
+                        state.saved_value_count = state
+                            .saved_value_count
+                            .checked_add(1)
+                            .ok_or(LimboError::IntegerOverflow)?;
+                    }
+                }
+                IOResult::Done(None) => {
+                    let saved_count = self
+                        .aggregate_distinct
+                        .as_ref()
+                        .expect("aggregate DISTINCT state exists")
+                        .saved_value_count;
+                    let count = bitmap_count
+                        .checked_add(saved_count)
+                        .ok_or(LimboError::IntegerOverflow)?;
+                    return Ok(IOResult::Done(count));
+                }
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
     }
 
     /// Probe the hash table with the given keys, returns the first matching entry if found.
@@ -2268,7 +3776,10 @@ impl HashTable {
             .is_some_and(|p| p.is_loaded())
     }
 
-    /// Re-entrantly load spilled partitions from disk
+    /// Load one spilled part from disk.
+    ///
+    /// A caller may call this again after an I/O wait. The saved state resumes
+    /// at the read or parse step that still needs work.
     pub fn load_spilled_partition(
         &mut self,
         partition_idx: usize,
@@ -2310,9 +3821,24 @@ impl HashTable {
                                 && spilled.current_chunk_idx == 0;
                             if is_first_load {
                                 let total_entries = spilled.total_num_entries();
-                                let bucket_count = total_entries.next_power_of_two().max(64);
-                                spilled.buckets =
-                                    (0..bucket_count).map(|_| HashBucket::new()).try_collect()?;
+                                if self.aggregate_distinct.is_some() {
+                                    let max_expected = self
+                                        .mem_budget
+                                        .checked_div(std::mem::size_of::<IntegerSetEntry>())
+                                        .unwrap_or(0)
+                                        .max(1);
+                                    spilled.loaded_distinct_values =
+                                        Some(LoadedDistinctSet::with_expected_entries(
+                                            total_entries.min(max_expected),
+                                        )?);
+                                    spilled.buckets.clear();
+                                } else {
+                                    let bucket_count = total_entries.next_power_of_two().max(64);
+                                    spilled.buckets = (0..bucket_count)
+                                        .map(|_| HashBucket::new())
+                                        .try_collect()?;
+                                    spilled.loaded_distinct_values = None;
+                                }
                                 spilled.parsed_entries = 0;
                                 spilled.partial_entry.clear();
                             }
@@ -2399,10 +3925,7 @@ impl HashTable {
                                     "Completed read of spilled partition chunk: bytes_read={}",
                                     bytes_read
                                 );
-                                let mut persistent_buf = read_buffer_ref.write();
-                                persistent_buf.clear();
-                                persistent_buf
-                                    .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                                *read_buffer_ref.write() = Some(buf);
                                 buffer_len.store(bytes_read as usize, atomic::Ordering::Release);
                                 io_state.set(SpillIOState::ReadComplete);
                                 None
@@ -2425,7 +3948,7 @@ impl HashTable {
         }
     }
 
-    /// Parse entries from the current chunk buffer into buckets for a partition.
+    /// Read complete entries from the current buffer into the loaded part.
     fn parse_partition_chunk(
         &mut self,
         partition_idx: usize,
@@ -2442,22 +3965,26 @@ impl HashTable {
                 metrics.load_bytes_read = metrics.load_bytes_read.saturating_add(data_len as u64);
             }
 
-            let data_guard = partition.read_buffer.read();
-            let data = &data_guard[..data_len];
+            let read_buffer = partition
+                .read_buffer
+                .write()
+                .take()
+                .expect("completed partition read has a buffer");
+            let data = &read_buffer.as_slice()[..data_len];
+            let combined;
             let parse_buf = if partition.partial_entry.is_empty() {
-                data.iter().copied().try_collect()?
+                data
             } else {
-                let mut combined =
+                let mut bytes =
                     Vec::try_with_capacity_ext(partition.partial_entry.len() + data.len())?;
-                combined.extend_from_slice(&partition.partial_entry);
-                combined.extend_from_slice(data);
-                combined
+                bytes.extend_from_slice(&partition.partial_entry);
+                bytes.extend_from_slice(data);
+                combined = bytes;
+                &combined
             };
-            drop(data_guard);
 
             partition.partial_entry.clear();
             partition.buffer_len.store(0, atomic::Ordering::Release);
-            partition.read_buffer.write().clear();
             partition.io_state.set(SpillIOState::None);
 
             let mut offset = 0;
@@ -2486,14 +4013,21 @@ impl HashTable {
 
                 let start = offset + varint_size;
                 let end = start + entry_len as usize;
-                let (entry, consumed) = HashEntry::deserialize(&parse_buf[start..end])?;
-                turso_assert!(
-                    consumed == entry_len as usize,
-                    "expected to consume entire entry"
-                );
-
-                let bucket_idx = (entry.hash as usize) % partition.buckets.len();
-                partition.buckets[bucket_idx].insert(entry)?;
+                if self.aggregate_distinct.is_some() {
+                    partition
+                        .loaded_distinct_values
+                        .as_mut()
+                        .expect("loaded DISTINCT part has a value set")
+                        .insert_spill_entry(&parse_buf[start..end], &self.collations)?;
+                } else {
+                    let (entry, consumed) = HashEntry::deserialize(&parse_buf[start..end])?;
+                    turso_assert!(
+                        consumed == entry_len as usize,
+                        "expected to consume entire entry"
+                    );
+                    let bucket_idx = (entry.hash as usize) % partition.buckets.len();
+                    partition.buckets[bucket_idx].insert(entry)?;
+                }
                 partition.parsed_entries += 1;
                 offset += total_needed;
             }
@@ -2522,10 +4056,15 @@ impl HashTable {
                         .try_collect()?;
                 }
                 partition.state = PartitionState::Loaded;
-                partition.resident_mem = Self::partition_bucket_mem(&partition.buckets);
-                // Release staging buffer to free memory now that buckets are built.
+                partition.resident_mem =
+                    if let Some(distinct_values) = &partition.loaded_distinct_values {
+                        distinct_values.memory_bytes()
+                    } else {
+                        Self::loaded_join_row_mem(&partition.buckets)
+                    };
+                // The final set now owns the data, so the read buffer can go away.
                 partition.buffer_len.store(0, atomic::Ordering::SeqCst);
-                partition.read_buffer.write().clear();
+                *partition.read_buffer.write() = None;
                 (false, partition.resident_mem)
             }
         };
@@ -2604,9 +4143,13 @@ impl HashTable {
         self.spill_state.is_some()
     }
 
-    /// Approximate memory used by a partition's buckets.
-    fn partition_bucket_mem(buckets: &[HashBucket]) -> usize {
-        buckets.iter().map(|b| b.size_bytes()).sum()
+    /// Estimate the row memory kept for one loaded hash-join part.
+    ///
+    /// Empty bucket headers are lookup space, not row data. Charging them here
+    /// can remove a part as soon as it loads and read it again for the next row.
+    /// Aggregate DISTINCT uses its own value set and counts all of its memory.
+    fn loaded_join_row_mem(buckets: &[HashBucket]) -> usize {
+        buckets.iter().map(|bucket| bucket.size_bytes()).sum()
     }
 
     /// Touch a resident spilled partition for LRU ordering without changing its
@@ -2646,11 +4189,12 @@ impl HashTable {
                     if matches!(victim.state, PartitionState::Loaded) {
                         freed = victim.resident_mem;
                         victim.buckets.clear();
+                        victim.loaded_distinct_values = None;
                         victim.state = PartitionState::OnDisk;
                         victim.resident_mem = 0;
                         victim.current_chunk_idx = 0;
                         victim.buffer_len.store(0, atomic::Ordering::Release);
-                        victim.read_buffer.write().clear();
+                        *victim.read_buffer.write() = None;
                         victim.partial_entry.clear();
                         victim.parsed_entries = 0;
                         victim.io_state.set(SpillIOState::None);
@@ -2927,7 +4471,7 @@ impl HashTable {
             for partition in &mut probe_state.partitions {
                 partition.current_chunk_idx = 0;
                 partition.buffer_len.store(0, atomic::Ordering::Release);
-                partition.read_buffer.write().clear();
+                *partition.read_buffer.write() = None;
                 partition.partial_entry.clear();
                 partition.parsed_entries = 0;
                 partition.io_state.set(SpillIOState::None);
@@ -3049,6 +4593,7 @@ impl HashTable {
             for partition in &mut spill_state.partitions {
                 if matches!(partition.state, PartitionState::InMemory) {
                     partition.buckets.clear();
+                    partition.loaded_distinct_values = None;
                     partition.state = PartitionState::OnDisk;
                     partition.resident_mem = 0;
                 }
@@ -3067,11 +4612,12 @@ impl HashTable {
                 if matches!(partition.state, PartitionState::Loaded) && !partition.chunks.is_empty()
                 {
                     partition.buckets.clear();
+                    partition.loaded_distinct_values = None;
                     partition.state = PartitionState::OnDisk;
                     partition.resident_mem = 0;
                     partition.current_chunk_idx = 0;
                     partition.buffer_len.store(0, atomic::Ordering::Release);
-                    partition.read_buffer.write().clear();
+                    *partition.read_buffer.write() = None;
                     partition.partial_entry.clear();
                     partition.parsed_entries = 0;
                     partition.io_state.set(SpillIOState::None);
@@ -3174,10 +4720,7 @@ impl HashTable {
                     let read_complete = Box::new(
                         move |res: Result<(Arc<Buffer>, i32), CompletionError>| match res {
                             Ok((buf, bytes_read)) => {
-                                let mut persistent_buf = read_buffer_ref.write();
-                                persistent_buf.clear();
-                                persistent_buf
-                                    .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                                *read_buffer_ref.write() = Some(buf);
                                 buffer_len.store(bytes_read as usize, atomic::Ordering::Release);
                                 io_state.set(SpillIOState::ReadComplete);
                                 None
@@ -3216,8 +4759,12 @@ impl HashTable {
             let expected_entries = chunk.num_entries;
             let data_len = partition.buffer_len();
 
-            let data_guard = partition.read_buffer.read();
-            let data = &data_guard[..data_len];
+            let read_buffer = partition
+                .read_buffer
+                .write()
+                .take()
+                .expect("completed probe read has a buffer");
+            let data = &read_buffer.as_slice()[..data_len];
             let mut entries = Vec::try_with_capacity_ext(expected_entries)?;
             let mut offset = 0;
             while offset < data_len {
@@ -3238,8 +4785,6 @@ impl HashTable {
                 entries.try_push(entry)?;
                 offset += total_needed;
             }
-            drop(data_guard);
-
             if unlikely(entries.len() != expected_entries) {
                 return Err(LimboError::InternalError(format!(
                     "grace probe spill chunk entry count mismatch: expected {expected_entries}, got {}",
@@ -3248,7 +4793,6 @@ impl HashTable {
             }
 
             partition.buffer_len.store(0, atomic::Ordering::Release);
-            partition.read_buffer.write().clear();
             partition.io_state.set(SpillIOState::None);
             partition.current_chunk_idx += 1;
             entries
@@ -3276,6 +4820,7 @@ impl HashTable {
         let _ = self.spill_state.take();
         self.probe_spill_state = None;
         self.grace_state = None;
+        self.aggregate_distinct = None;
     }
 }
 
@@ -3285,6 +4830,8 @@ mod hashtests {
     use crate::alloc::vec;
     use crate::io::Buffer;
     use crate::MemoryIO;
+    #[cfg(feature = "io_memory_yield")]
+    use crate::MemoryYieldIO;
 
     #[test]
     fn test_hash_table_rejects_custom_collations() {
@@ -3423,6 +4970,522 @@ mod hashtests {
         // Probe for non-existent key
         let result = ht.probe(vec![Value::from_i64(999)], None).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn distinct_hash_table_grows_before_one_bucket_gets_too_many_values() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: usize::MAX,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Memory,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut hash_table = HashTable::new(config, io).unwrap();
+
+        for value in 0..100 {
+            let key = vec![Value::from_i64(value)];
+            let key_refs = vec![key[0].as_ref()];
+            assert!(matches!(
+                hash_table.insert_distinct(&key, &key_refs, None).unwrap(),
+                IOResult::Done(true)
+            ));
+        }
+
+        assert_eq!(hash_table.buckets.len(), 8);
+
+        let duplicate = vec![Value::from_i64(42)];
+        let duplicate_refs = vec![duplicate[0].as_ref()];
+        assert!(matches!(
+            hash_table
+                .insert_distinct(&duplicate, &duplicate_refs, None)
+                .unwrap(),
+            IOResult::Done(false)
+        ));
+    }
+
+    #[test]
+    fn aggregate_distinct_does_not_read_spill_files_while_rows_are_added() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 2 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(128),
+        };
+        let mut hash_table = HashTable::new(config, io).unwrap();
+        let mut metrics = HashJoinMetrics::default();
+        let mut sent_to_aggregate = std::collections::BTreeSet::new();
+
+        for value in (0..400).chain(0..400).chain(200..600) {
+            let key = vec![Value::from_i64(value)];
+            let key_refs = vec![key[0].as_ref()];
+            loop {
+                match hash_table
+                    .insert_aggregate_distinct(&key, &key_refs, Some(&mut metrics))
+                    .unwrap()
+                {
+                    IOResult::Done(send_now) => {
+                        if send_now {
+                            sent_to_aggregate.insert(value);
+                        }
+                        assert!(hash_table.mem_used <= hash_table.mem_budget);
+                        break;
+                    }
+                    IOResult::IO(_) => continue,
+                }
+            }
+        }
+
+        assert!(hash_table.has_spilled());
+        assert_eq!(metrics.load_bytes_read, 0);
+        assert!(
+            hash_table
+                .aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .write_each_row_to_parts,
+            "mostly new input must write each row to its spill part"
+        );
+
+        let mut read_after_spill = std::collections::BTreeSet::new();
+        loop {
+            match hash_table
+                .next_saved_distinct_value(Some(&mut metrics))
+                .unwrap()
+            {
+                IOResult::Done(Some(Value::Numeric(Numeric::Integer(value)))) => {
+                    assert!(read_after_spill.insert(value), "saved value returned twice");
+                    assert!(
+                        hash_table.mem_used + hash_table.loaded_partitions_mem
+                            <= hash_table.mem_budget
+                    );
+                }
+                IOResult::Done(Some(value)) => panic!("wrong saved value: {value:?}"),
+                IOResult::Done(None) => break,
+                IOResult::IO(_) => continue,
+            }
+        }
+
+        assert!(metrics.load_bytes_read > 0);
+        assert!(sent_to_aggregate.is_disjoint(&read_after_spill));
+        sent_to_aggregate.append(&mut read_after_spill);
+        assert_eq!(sent_to_aggregate, (0..600).collect());
+    }
+
+    #[test]
+    fn aggregate_distinct_keeps_a_local_set_when_rows_repeat() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 2 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(128),
+        };
+        let mut hash_table = HashTable::new(config, io).unwrap();
+        let mut sent_to_aggregate = 0u64;
+
+        for value in 0..200 {
+            for _ in 0..2 {
+                let key = vec![Value::from_i64(value)];
+                let key_refs = [key[0].as_ref()];
+                loop {
+                    match hash_table
+                        .insert_aggregate_distinct(&key, &key_refs, None)
+                        .unwrap()
+                    {
+                        IOResult::Done(send_now) => {
+                            sent_to_aggregate += u64::from(send_now);
+                            break;
+                        }
+                        IOResult::IO(_) => continue,
+                    }
+                }
+            }
+        }
+
+        assert!(hash_table.has_spilled());
+        assert!(
+            !hash_table
+                .aggregate_distinct
+                .as_ref()
+                .expect("aggregate DISTINCT state exists")
+                .write_each_row_to_parts,
+            "repeated input must keep the local value set"
+        );
+        let saved_value_count = loop {
+            match hash_table.count_saved_distinct_values(None).unwrap() {
+                IOResult::Done(count) => break count,
+                IOResult::IO(_) => continue,
+            }
+        };
+        assert_eq!(sent_to_aggregate + saved_value_count, 200);
+    }
+
+    #[test]
+    fn count_distinct_skips_null_after_spill() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 2 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(128),
+        };
+        let mut hash_table = HashTable::new(config, io).unwrap();
+        for value in (0..200)
+            .map(|value| Value::from_i64(value * 10_000))
+            .chain([Value::Null])
+        {
+            let key = vec![value];
+            let key_refs = [key[0].as_ref()];
+            loop {
+                match hash_table
+                    .insert_count_distinct(&key, &key_refs, None)
+                    .unwrap()
+                {
+                    IOResult::Done(send_now) => {
+                        assert!(!send_now, "COUNT values are added in one final step");
+                        break;
+                    }
+                    IOResult::IO(_) => continue,
+                }
+            }
+        }
+
+        assert!(hash_table.has_spilled());
+        let count = loop {
+            match hash_table.count_saved_distinct_values(None).unwrap() {
+                IOResult::Done(count) => break count,
+                IOResult::IO(_) => continue,
+            }
+        };
+        assert_eq!(count, 200);
+    }
+
+    #[test]
+    fn count_bitmap_grows_both_ways_and_stops_for_a_wide_range() {
+        let mut bitmap = CountDistinctBitmap::new();
+        let byte_limit = 64 * 1024;
+
+        for value in [0, 128, -128] {
+            assert!(matches!(
+                bitmap.insert(value, byte_limit).unwrap(),
+                BitmapInsertResult::Stored { is_new: true }
+            ));
+        }
+        assert!(matches!(
+            bitmap.insert(1_000_000, byte_limit).unwrap(),
+            BitmapInsertResult::UseValueSet
+        ));
+        assert!(bitmap.stopped_growing());
+        assert!(matches!(
+            bitmap.insert(64, byte_limit).unwrap(),
+            BitmapInsertResult::Stored { is_new: true }
+        ));
+        assert!(matches!(
+            bitmap.insert(128, byte_limit).unwrap(),
+            BitmapInsertResult::Stored { is_new: false }
+        ));
+        assert!(matches!(
+            bitmap.insert(1_000_000, byte_limit).unwrap(),
+            BitmapInsertResult::UseValueSet
+        ));
+        assert_eq!(bitmap.count(), 4);
+        assert!(bitmap.memory_bytes() <= byte_limit);
+    }
+
+    #[test]
+    fn count_bitmap_handles_i64_edges_without_growing_the_range() {
+        let mut bitmap = CountDistinctBitmap::new();
+        assert!(matches!(
+            bitmap.insert(i64::MIN, 1024).unwrap(),
+            BitmapInsertResult::Stored { is_new: true }
+        ));
+        assert!(matches!(
+            bitmap.insert(i64::MAX, 1024).unwrap(),
+            BitmapInsertResult::UseValueSet
+        ));
+        assert!(bitmap.stopped_growing());
+        assert_eq!(bitmap.count(), 1);
+    }
+
+    #[test]
+    fn count_bitmap_avoids_spill_for_a_repeated_integer_range() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 64 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(128),
+        };
+        let mut hash_table = HashTable::new(config, io).unwrap();
+
+        for value in (0..100_000).chain(0..100_000) {
+            let key = [Value::from_i64(value)];
+            let key_refs = [key[0].as_ref()];
+            let IOResult::Done(send_now) = hash_table
+                .insert_count_distinct(&key, &key_refs, None)
+                .unwrap()
+            else {
+                panic!("integer bitmap must not perform I/O");
+            };
+            assert!(!send_now);
+        }
+
+        let IOResult::Done(count) = hash_table.count_saved_distinct_values(None).unwrap() else {
+            panic!("integer bitmap final count must not perform I/O");
+        };
+        let bitmap = hash_table
+            .aggregate_distinct
+            .as_ref()
+            .expect("aggregate DISTINCT state exists")
+            .count_bitmap();
+        assert_eq!(count, 100_000);
+        assert_eq!(bitmap.count(), 100_000);
+        assert!(!bitmap.stopped_growing());
+        assert!(!hash_table.has_spilled());
+        assert!(hash_table.mem_used <= hash_table.mem_budget);
+        assert!(bitmap.memory_bytes() <= 16 * 1024);
+    }
+
+    #[test]
+    fn count_distinct_combines_a_bitmap_with_spill_parts() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 2 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(128),
+        };
+        let mut hash_table = HashTable::new(config, io).unwrap();
+        let mut values = vec![];
+        for value in -100..=100 {
+            values.push(Value::from_i64(value));
+        }
+        values.extend([
+            Value::from_f64(10.0),
+            Value::Null,
+            Value::from_f64(10.5),
+            Value::from_f64(10.5),
+            Value::Text("10".into()),
+            Value::Text("10".into()),
+            Value::from_slice(&[1, 2, 3]).unwrap(),
+            Value::from_slice(&[1, 2, 3]).unwrap(),
+        ]);
+        for value in 0..200 {
+            values.push(Value::from_i64(1_000_000 + value * 10_000));
+        }
+        values.push(Value::from_f64(1_000_000.0));
+
+        for value in values {
+            let key = [value];
+            let key_refs = [key[0].as_ref()];
+            loop {
+                match hash_table
+                    .insert_count_distinct(&key, &key_refs, None)
+                    .unwrap()
+                {
+                    IOResult::Done(send_now) => {
+                        assert!(!send_now);
+                        break;
+                    }
+                    IOResult::IO(_) => continue,
+                }
+            }
+        }
+
+        assert!(hash_table.has_spilled());
+        let count = loop {
+            match hash_table.count_saved_distinct_values(None).unwrap() {
+                IOResult::Done(count) => break count,
+                IOResult::IO(_) => continue,
+            }
+        };
+        let bitmap = hash_table
+            .aggregate_distinct
+            .as_ref()
+            .expect("aggregate DISTINCT state exists")
+            .count_bitmap();
+        assert_eq!(bitmap.count(), 201);
+        assert!(bitmap.stopped_growing());
+        assert_eq!(count, 404);
+        assert!(hash_table.mem_used <= hash_table.mem_budget);
+    }
+
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn aggregate_distinct_resumes_every_spill_read_and_write() {
+        let io = Arc::new(MemoryYieldIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 2 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(128),
+        };
+        let io_for_table: Arc<dyn IO> = io.clone();
+        let mut hash_table = HashTable::new(config, io_for_table).unwrap();
+        let mut count = 0;
+        let mut io_waits = 0;
+
+        for value in (0..300).chain(0..300) {
+            let key = vec![Value::from_i64(value)];
+            let key_refs = [key[0].as_ref()];
+            loop {
+                match hash_table
+                    .insert_aggregate_distinct(&key, &key_refs, None)
+                    .unwrap()
+                {
+                    IOResult::Done(send_now) => {
+                        count += usize::from(send_now);
+                        break;
+                    }
+                    IOResult::IO(completions) => {
+                        io_waits += 1;
+                        completions.wait(io.as_ref()).unwrap();
+                    }
+                }
+            }
+        }
+
+        loop {
+            match hash_table.count_saved_distinct_values(None).unwrap() {
+                IOResult::Done(saved) => {
+                    count += saved as usize;
+                    break;
+                }
+                IOResult::IO(completions) => {
+                    io_waits += 1;
+                    completions.wait(io.as_ref()).unwrap();
+                }
+            }
+        }
+
+        assert_eq!(count, 300);
+        assert!(io_waits > 2, "test must wait during writes and reads");
+    }
+
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn count_distinct_bitmap_and_spill_parts_resume_every_read_and_write() {
+        let io = Arc::new(MemoryYieldIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 2 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(128),
+        };
+        let io_for_table: Arc<dyn IO> = io.clone();
+        let mut hash_table = HashTable::new(config, io_for_table).unwrap();
+        let mut io_waits = 0;
+
+        for value in (0..100).chain((0..300).map(|value| 1_000_000 + value * 10_000)) {
+            let key = [Value::from_i64(value)];
+            let key_refs = [key[0].as_ref()];
+            loop {
+                match hash_table
+                    .insert_count_distinct(&key, &key_refs, None)
+                    .unwrap()
+                {
+                    IOResult::Done(send_now) => {
+                        assert!(!send_now);
+                        break;
+                    }
+                    IOResult::IO(completions) => {
+                        io_waits += 1;
+                        completions.wait(io.as_ref()).unwrap();
+                    }
+                }
+            }
+        }
+
+        let count = loop {
+            match hash_table.count_saved_distinct_values(None).unwrap() {
+                IOResult::Done(count) => break count,
+                IOResult::IO(completions) => {
+                    io_waits += 1;
+                    completions.wait(io.as_ref()).unwrap();
+                }
+            }
+        };
+
+        assert_eq!(count, 400);
+        assert!(io_waits > 2, "test must wait during writes and reads");
+    }
+
+    #[test]
+    fn aggregate_distinct_merges_null_numbers_text_and_blob_after_spill() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 128,
+            num_keys: 1,
+            collations: vec![CollationSeq::NoCase],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(16),
+        };
+        let mut hash_table = HashTable::new(config, io).unwrap();
+        let values = vec![
+            Value::Null,
+            Value::from_i64(10),
+            Value::from_f64(10.0),
+            Value::Text("Hello".into()),
+            Value::Text("hello".into()),
+            Value::from_slice(&[1, 2, 3]).unwrap(),
+        ];
+        let mut count = 0;
+
+        for _ in 0..20 {
+            for key_value in &values {
+                let key = vec![key_value.try_clone().unwrap()];
+                let key_refs = vec![key[0].as_ref()];
+                loop {
+                    match hash_table
+                        .insert_aggregate_distinct(&key, &key_refs, None)
+                        .unwrap()
+                    {
+                        IOResult::Done(send_now) => {
+                            count += usize::from(send_now);
+                            break;
+                        }
+                        IOResult::IO(_) => continue,
+                    }
+                }
+            }
+        }
+
+        loop {
+            match hash_table.next_saved_distinct_value(None).unwrap() {
+                IOResult::Done(Some(_)) => count += 1,
+                IOResult::Done(None) => break,
+                IOResult::IO(_) => continue,
+            }
+        }
+        assert_eq!(count, 4);
     }
 
     #[test]
@@ -3951,10 +6014,10 @@ mod hashtests {
         entry.serialize(&mut buf).unwrap();
 
         // Compute the exact offset of the *first* type tag.
-        // Layout: [0..8] hash | [8..16] rowid | varint(num_keys) | type | payload...
+        // Layout: hash | rowid | entry kind | key count | type | value bytes.
         let mut corrupted = buf.clone();
 
-        let mut offset = 16;
+        let mut offset = 17;
         let (_num_keys, varint_len) = read_varint(&corrupted[offset..]).unwrap();
         offset += varint_len;
         corrupted[offset] = 0xFF;
