@@ -708,6 +708,11 @@ fn update_pragma(
             connection.set_dml_require_where(enabled);
             Ok(TransactionMode::None)
         }
+        PragmaName::CountChanges => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_count_changes(enabled);
+            Ok(TransactionMode::None)
+        }
         PragmaName::IgnoreCheckConstraints => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_check_constraints_ignored(enabled);
@@ -1638,6 +1643,14 @@ fn query_pragma(
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
             let register = program.alloc_register();
             let enabled = connection.get_dml_require_where();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CountChanges => {
+            let register = program.alloc_register();
+            let enabled = connection.get_count_changes();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());

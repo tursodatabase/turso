@@ -908,6 +908,13 @@ pub enum Insn {
     /// `total_changes()` observe the just-completed statement without leaking into the next one.
     ResetCount,
 
+    /// Write the number of rows the current statement has changed so far into a register.
+    /// Emitted at the end of INSERT/UPDATE/DELETE programs when PRAGMA count_changes is on,
+    /// followed by a ResultRow that returns the count to the caller.
+    ChangeCount {
+        dest: usize,
+    },
+
     /// Write an integer value into a register.
     Integer {
         value: i64,
@@ -2099,6 +2106,7 @@ impl InsnVariants {
             InsnVariants::Integer => execute::op_integer,
             InsnVariants::Program => execute::op_program,
             InsnVariants::ResetCount => execute::op_reset_count,
+            InsnVariants::ChangeCount => execute::op_change_count,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,

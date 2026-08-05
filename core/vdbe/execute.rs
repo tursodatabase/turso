@@ -4916,6 +4916,19 @@ pub fn op_reset_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_change_count(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ChangeCount { dest }, insn);
+    let nchange = state.n_change.load(Ordering::SeqCst);
+    state.registers[*dest].set_int(nchange);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Execute a subprogram (Program opcode).
 /// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
 pub fn op_program(
