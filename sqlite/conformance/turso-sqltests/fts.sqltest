@@ -960,3 +960,24 @@ expect {
     alice|hello world
 }
 
+@backend cli
+test fts-create-index-batch-flush-returns-each-rowid-once {
+    CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);
+    WITH RECURSIVE seq(id) AS (
+        VALUES (1)
+        UNION ALL
+        SELECT id + 1 FROM seq WHERE id < 20000
+    )
+    INSERT INTO docs
+    SELECT id, 'needle document ' || id FROM seq;
+    CREATE INDEX docs_fts ON docs USING fts (body);
+    SELECT
+        (SELECT count(*) FROM docs),
+        count(*),
+        count(DISTINCT id)
+    FROM docs
+    WHERE fts_match(body, 'needle');
+}
+expect {
+    20000|20000|20000
+}

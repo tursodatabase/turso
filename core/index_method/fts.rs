@@ -1955,6 +1955,22 @@ enum FtsState {
     },
 }
 
+impl FtsState {
+    fn is_flushing(&self) -> bool {
+        matches!(
+            self,
+            Self::FlushingWrites { .. }
+                | Self::SeekingOldChunks { .. }
+                | Self::AdvancingAfterSeek { .. }
+                | Self::CheckingChunkPath { .. }
+                | Self::DeletingChunk { .. }
+                | Self::AdvancingAfterDelete { .. }
+                | Self::SeekingWrite { .. }
+                | Self::InsertingWrite { .. }
+        )
+    }
+}
+
 struct FtsStreamingSegment {
     scorer: Box<dyn Scorer>,
     rowids: Column<i64>,
@@ -2587,18 +2603,8 @@ impl FtsCursor {
     /// If `force_flush` is true, flushes directory writes even when no pending docs.
     fn commit_and_flush_inner(&mut self, force_flush: bool) -> Result<IOResult<()>> {
         // Handle flush state machine if already in progress
-        match &self.state {
-            FtsState::FlushingWrites { .. }
-            | FtsState::SeekingOldChunks { .. }
-            | FtsState::AdvancingAfterSeek { .. }
-            | FtsState::CheckingChunkPath { .. }
-            | FtsState::DeletingChunk { .. }
-            | FtsState::AdvancingAfterDelete { .. }
-            | FtsState::SeekingWrite { .. }
-            | FtsState::InsertingWrite { .. } => {
-                return self.flush_writes_internal();
-            }
-            _ => {}
+        if self.state.is_flushing() {
+            return self.flush_writes_internal();
         }
 
         if self.pending_docs_count == 0 && !force_flush {
@@ -2663,6 +2669,29 @@ impl FtsCursor {
     /// Commit pending documents to Tantivy and flush to BTree.
     pub fn commit_and_flush(&mut self) -> Result<IOResult<()>> {
         self.commit_and_flush_inner(false)
+    }
+
+    // The VDBE retries the current instruction when an operation returns
+    // `IOResult::IO`, so complete such work before mutating Tantivy.
+    fn flush_full_batch_before_mutation(&mut self) -> Result<IOResult<()>> {
+        if self.state.is_flushing() {
+            return_if_io!(self.flush_writes_internal());
+        }
+
+        turso_assert!(
+            self.pending_docs_count <= BATCH_COMMIT_SIZE,
+            "FTS pending operation count exceeded its batch size",
+            {
+                "pending_docs_count": self.pending_docs_count,
+                "batch_size": BATCH_COMMIT_SIZE
+            }
+        );
+
+        if self.pending_docs_count == BATCH_COMMIT_SIZE {
+            return_if_io!(self.commit_and_flush());
+        }
+
+        Ok(IOResult::Done(()))
     }
 
     /// Build the tiered policy used to identify automatic merge candidates.
@@ -2814,19 +2843,7 @@ impl Drop for FtsCursor {
         // Check if we're already in a flushing state (from commit_and_flush)
         // This can happen when commit_and_flush started a flush but yielded for IO
         // and the cursor is being dropped before the flush completed
-        let is_flushing = matches!(
-            &self.state,
-            FtsState::FlushingWrites { .. }
-                | FtsState::SeekingOldChunks { .. }
-                | FtsState::AdvancingAfterSeek { .. }
-                | FtsState::CheckingChunkPath { .. }
-                | FtsState::DeletingChunk { .. }
-                | FtsState::AdvancingAfterDelete { .. }
-                | FtsState::SeekingWrite { .. }
-                | FtsState::InsertingWrite { .. }
-        );
-
-        if is_flushing {
+        if self.state.is_flushing() {
             turso_assert!(
                 conn.is_in_write_tx(),
                 "FTS Drop: in-progress flush abandoned (transaction already committed). pre_commit should have completed the flush."
@@ -3434,22 +3451,7 @@ impl IndexMethodCursor for FtsCursor {
     /// Inserts a document into the FTS index.
     /// Values are text columns followed by rowid. Batches commits for efficiency.
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>> {
-        // Handle flush state machine if in progress
-        while matches!(
-            &self.state,
-            FtsState::FlushingWrites { .. }
-                | FtsState::SeekingOldChunks { .. }
-                | FtsState::AdvancingAfterSeek { .. }
-                | FtsState::CheckingChunkPath { .. }
-                | FtsState::DeletingChunk { .. }
-                | FtsState::AdvancingAfterDelete { .. }
-                | FtsState::SeekingWrite { .. }
-                | FtsState::InsertingWrite { .. }
-        ) {
-            if let IOResult::IO(io) = self.flush_writes_internal()? {
-                return Ok(IOResult::IO(io));
-            }
-        }
+        return_if_io!(self.flush_full_batch_before_mutation());
 
         let Some(ref mut writer) = self.writer else {
             return Err(LimboError::InternalError(
@@ -3489,17 +3491,13 @@ impl IndexMethodCursor for FtsCursor {
 
         self.pending_docs_count += 1;
 
-        // Batch commits: only commit every BATCH_COMMIT_SIZE documents
-        // This dramatically improves bulk insert performance for CREATE INDEX
-        if self.pending_docs_count >= BATCH_COMMIT_SIZE {
-            return self.commit_and_flush();
-        }
-
         Ok(IOResult::Done(()))
     }
 
     /// Deletes a document from the FTS index by rowid.
     fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+        return_if_io!(self.flush_full_batch_before_mutation());
+
         let Some(ref mut writer) = self.writer else {
             return Err(LimboError::InternalError(
                 "FTS writer not initialized - call open_write first".into(),
@@ -3524,9 +3522,6 @@ impl IndexMethodCursor for FtsCursor {
         // Track delete as a pending operation so commit_and_flush() will run
         // and invalidate cached read state.
         self.pending_docs_count += 1;
-        if self.pending_docs_count >= BATCH_COMMIT_SIZE {
-            return self.commit_and_flush();
-        }
 
         Ok(IOResult::Done(()))
     }
@@ -3795,18 +3790,8 @@ impl IndexMethodCursor for FtsCursor {
         // First, check if we're in the middle of a flush operation that needs to continue
         // This handles the case where commit_and_flush() returned IOResult::IO and we need
         // to continue the flush after IO completes
-        match &self.state {
-            FtsState::FlushingWrites { .. }
-            | FtsState::SeekingOldChunks { .. }
-            | FtsState::AdvancingAfterSeek { .. }
-            | FtsState::CheckingChunkPath { .. }
-            | FtsState::DeletingChunk { .. }
-            | FtsState::AdvancingAfterDelete { .. }
-            | FtsState::SeekingWrite { .. }
-            | FtsState::InsertingWrite { .. } => {
-                return self.flush_writes_internal();
-            }
-            _ => {}
+        if self.state.is_flushing() {
+            return self.flush_writes_internal();
         }
 
         if self.pending_docs_count > 0 {
