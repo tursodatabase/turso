@@ -24,7 +24,7 @@ use crate::{
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
-            access_method::AccessMethodParams,
+            access_method::{AccessMethod, AccessMethodParams},
             constraints::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
             },
@@ -56,7 +56,7 @@ use constraints::{
     partial_index_predicate_terms, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
 use cost::Cost;
-use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinPlanningContext};
+use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinN, JoinPlanningContext};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
@@ -760,6 +760,15 @@ struct OptimizeTableAccessResult {
     subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
     /// Whether `min` or `max` can stop after the first row.
     min_max_fast_path: bool,
+}
+
+/// The table reads chosen by the join search.
+struct TableAccessPlan {
+    access_methods: Vec<AccessMethod>,
+    constraints: Vec<TableConstraints>,
+    join: JoinN,
+    order_target: Option<OrderTarget>,
+    sort_eliminated: bool,
 }
 
 /**
@@ -1931,17 +1940,7 @@ fn enforce_indexed_by_hints(
     Ok(())
 }
 
-/// Optimize the join order and index selection for a query.
-///
-/// This function does the following:
-/// - Computes a set of [Constraint]s for each table.
-/// - Using those constraints, computes the best join order for the list of [TableReference]s
-///   and selects the best [crate::translate::optimizer::access_method::AccessMethod] for each table in the join order.
-/// - Mutates the [Operation]s in `joined_tables` to use the selected access methods.
-/// - Removes predicates from the `where_clause` that are now redundant due to the selected access methods.
-/// - Removes sorting operations if the selected join order and access methods satisfy the [crate::translate::optimizer::order::OrderTarget].
-///
-/// Returns the join order if it was optimized, or None if the default join order was considered best.
+/// Choose table reads and write them into the query plan.
 #[allow(clippy::too_many_arguments)]
 fn optimize_table_access(
     schema: &Schema,
@@ -1962,6 +1961,55 @@ fn optimize_table_access(
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
 ) -> Result<Option<OptimizeTableAccessResult>> {
+    let Some(plan) = find_table_access_plan(
+        schema,
+        result_columns,
+        table_references,
+        available_indexes,
+        where_clause,
+        order_by,
+        group_by,
+        simple_aggregate,
+        subqueries,
+        limit,
+        offset,
+        initial_input_cardinality,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(apply_table_access_plan(
+        resolver,
+        table_references,
+        where_clause,
+        order_by,
+        group_by,
+        simple_aggregate,
+        plan,
+    )?))
+}
+
+/// Find the best table reads without writing them into table operations.
+#[allow(clippy::too_many_arguments)]
+fn find_table_access_plan(
+    schema: &Schema,
+    result_columns: &mut [ResultSetColumn],
+    table_references: &mut TableReferences,
+    available_indexes: &AvailableIndexes,
+    where_clause: &mut [WhereTerm],
+    order_by: &mut Vec<(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
+    group_by: &mut Option<GroupBy>,
+    simple_aggregate: Option<&SimpleAggregate>,
+    subqueries: &[NonFromClauseSubquery],
+    limit: &mut Option<Box<Expr>>,
+    offset: &mut Option<Box<Expr>>,
+    initial_input_cardinality: f64,
+) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
     #[cfg(feature = "optimizer_params")]
@@ -2172,39 +2220,69 @@ fn optimize_table_access(
         best_plan
     };
 
-    let final_output_cardinality = best_plan.output_cardinality;
-
-    let mut sort_eliminated = false;
-
-    // Eliminate sorting if possible.
-    if let Some(order_target) = maybe_order_target.as_ref() {
-        let satisfies_order_target = plan_satisfies_order_target(
+    let sort_eliminated = maybe_order_target.as_ref().is_some_and(|order_target| {
+        plan_satisfies_order_target(
             &best_plan,
             &access_methods_arena,
-            table_references.joined_tables_mut(),
+            table_references.joined_tables(),
             order_target,
             schema,
-        );
-        if satisfies_order_target {
-            match &order_target.purpose {
-                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group) => {
-                    if let Some(g) = group_by.as_mut() {
-                        g.sort_elided = true;
-                    }
+        )
+    });
+
+    Ok(Some(TableAccessPlan {
+        access_methods: access_methods_arena,
+        constraints: constraints_per_table,
+        join: best_plan,
+        order_target: maybe_order_target,
+        sort_eliminated,
+    }))
+}
+
+/// Write chosen table reads into the query plan.
+fn apply_table_access_plan(
+    resolver: &Resolver,
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+    order_by: &mut Vec<(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
+    group_by: &mut Option<GroupBy>,
+    simple_aggregate: Option<&SimpleAggregate>,
+    plan: TableAccessPlan,
+) -> Result<OptimizeTableAccessResult> {
+    let TableAccessPlan {
+        access_methods: mut access_methods_arena,
+        constraints: constraints_per_table,
+        join: best_plan,
+        order_target: maybe_order_target,
+        sort_eliminated,
+    } = plan;
+    let final_output_cardinality = best_plan.output_cardinality;
+
+    if sort_eliminated {
+        let order_target = maybe_order_target
+            .as_ref()
+            .expect("a sort can only be removed when the query has an order target");
+        match &order_target.purpose {
+            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group) => {
+                if let Some(group) = group_by.as_mut() {
+                    group.sort_elided = true;
                 }
-                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order) => {
-                    order_by.clear();
-                }
-                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder) => {
-                    if let Some(g) = group_by.as_mut() {
-                        g.sort_elided = true;
-                    }
-                    order_by.clear();
-                }
-                OrderTargetPurpose::Extremum => {}
             }
+            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order) => {
+                order_by.clear();
+            }
+            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder) => {
+                if let Some(group) = group_by.as_mut() {
+                    group.sort_elided = true;
+                }
+                order_by.clear();
+            }
+            OrderTargetPurpose::Extremum => {}
         }
-        sort_eliminated = satisfies_order_target;
     }
 
     let (best_access_methods, best_table_numbers) = (
@@ -2744,14 +2822,14 @@ fn optimize_table_access(
         }
     }
 
-    Ok(Some(OptimizeTableAccessResult {
+    Ok(OptimizeTableAccessResult {
         join_order: best_join_order,
         output_rows: final_output_cardinality,
         cost: best_plan.cost,
         subquery_calls: best_plan.subquery_calls,
         min_max_fast_path: matches!(simple_aggregate, Some(SimpleAggregate::MinMax(_)))
             && sort_eliminated,
-    }))
+    })
 }
 
 fn build_vtab_scan_op(
