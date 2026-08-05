@@ -2330,7 +2330,9 @@ fn emit_update_insns<'a>(
                 } else {
                     InsertFlags::new().skip_last_rowid()
                 },
-                table_name: target_table.identifier.clone(),
+                // The identifier may be an alias, and materialized view maintenance
+                // routes on the table's own name, as the sibling Delete does.
+                table_name: table_name.to_string(),
             });
 
             // MVCC AUTOINCREMENT: an UPDATE that moves the rowid forward
