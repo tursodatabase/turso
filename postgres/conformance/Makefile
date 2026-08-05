@@ -25,7 +25,7 @@ SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CA
 # Test corpora (relative to this directory)
 PG_TESTS := pg-sqltests
 
-.PHONY: all build build-tursopg build-runner check run test run-one clean
+.PHONY: all build build-tursopg build-runner check run test run-one run-upstream clean
 
 # Build everything
 all: build
@@ -55,6 +55,12 @@ test: run
 # Run a single test file: make run-one FILE=pg-sqltests/select.sqltest
 run-one: build
 	$(SQLTEST) run $(FILE) --backend pg --binary $(TURSOPG)
+
+# Run the upstream PostgreSQL regress corpus with pass/fail statuses.
+# Exit 0 means every test matched its status in run.py's STATUS table;
+# regressions in blessed tests or unblessed new passes fail the run.
+run-upstream:
+	./run.py
 
 # Clean build artifacts
 clean:

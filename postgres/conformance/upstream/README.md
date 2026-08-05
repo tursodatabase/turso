@@ -65,7 +65,27 @@ judge it against that principle and update this list.
 ```
 postgres/conformance/run.py            # whole corpus
 postgres/conformance/run.py boolean    # one test
+make -C postgres/conformance run-upstream
 ```
+
+## Blessed and known-bad tests
+
+`run.py` runs every corpus test on every full invocation. Each test is
+listed in the `STATUS` table at the top of `run.py` with one of three
+statuses:
+
+- `pass` — blessed: output must match byte-exact. Any diff or crash is a
+  regression and fails the run.
+- `fail` — known-bad: the test runs and its diff is reported, but does
+  not fail the run. If it becomes byte-exact the run fails with a
+  request to bless it, so the known-bad list only ever shrinks.
+- `skip` — not run at all; reserved for tests that cannot run, with the
+  reason noted next to the entry.
+
+To bless a test after fixing its remaining diffs, change its status from
+`fail` to `pass`. A test that crashes or wedges the server fails on a
+timeout and the server is restarted automatically, so one bad test
+cannot poison the rest of the run.
 
 ## Re-syncing to a newer PostgreSQL release
 
