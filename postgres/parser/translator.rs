@@ -1411,6 +1411,14 @@ impl PostgreSQLTranslator {
             None
         };
 
+        // USING joins other tables into the deletion condition; dropping it
+        // deleted a different set of rows than asked.
+        if !delete.using_clause.is_empty() {
+            return Err(ParseError::ParseError(
+                "DELETE ... USING is not supported".into(),
+            ));
+        }
+
         let returning = self.translate_returning(&delete.returning_list)?;
         let with = self.translate_with_clause(&delete.with_clause)?;
 
@@ -1499,6 +1507,7 @@ impl PostgreSQLTranslator {
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
 
+        self.check_select_unsupported(select)?;
         let distinctness = if !select.distinct_clause.is_empty() {
             Some(ast::Distinctness::Distinct)
         } else {
@@ -1653,6 +1662,7 @@ impl PostgreSQLTranslator {
             None
         };
 
+        self.check_select_unsupported(select)?;
         let distinctness = if !select.distinct_clause.is_empty() {
             Some(ast::Distinctness::Distinct)
         } else {
@@ -3073,6 +3083,40 @@ impl PostgreSQLTranslator {
         })
     }
 
+    /// Rejects SELECT-level clauses whose semantics we cannot honor; both
+    /// select-translation paths call this so nothing is silently dropped.
+    /// Plain FOR UPDATE/SHARE is accepted: under the engine's single-writer
+    /// transactions it locks nothing the transaction does not already hold.
+    fn check_select_unsupported(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<(), ParseError> {
+        // Plain DISTINCT arrives as a single empty node; DISTINCT ON (...)
+        // carries the expressions. Degrading it to DISTINCT changed which
+        // rows a query returned.
+        if select.distinct_clause.iter().any(|n| n.node.is_some()) {
+            return Err(ParseError::ParseError(
+                "DISTINCT ON is not supported".into(),
+            ));
+        }
+        for lock in &select.locking_clause {
+            if let Some(pg_query::protobuf::node::Node::LockingClause(lc)) = &lock.node {
+                match lc.wait_policy() {
+                    pg_query::protobuf::LockWaitPolicy::LockWaitSkip => {
+                        return Err(ParseError::ParseError(
+                            "SKIP LOCKED is not supported".into(),
+                        ));
+                    }
+                    pg_query::protobuf::LockWaitPolicy::LockWaitError => {
+                        return Err(ParseError::ParseError("NOWAIT is not supported".into()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn translate_func_call(
         &self,
         func_call: &pg_query::protobuf::FuncCall,
@@ -3090,6 +3134,20 @@ impl PostgreSQLTranslator {
             })
             .next_back()
             .ok_or_else(|| ParseError::ParseError("Missing function name".to_string()))?;
+
+        // The engine has no ordered-set aggregates, and an aggregate's
+        // internal ORDER BY determines its result for string_agg and
+        // friends — dropping either returned differently-ordered values.
+        if func_call.agg_within_group {
+            return Err(ParseError::ParseError(format!(
+                "WITHIN GROUP for {func_name} is not supported"
+            )));
+        }
+        if !func_call.agg_order.is_empty() {
+            return Err(ParseError::ParseError(format!(
+                "ORDER BY inside aggregate {func_name} is not supported"
+            )));
+        }
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
@@ -3475,7 +3533,23 @@ impl PostgreSQLTranslator {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
             SubLinkType::AnySublink => {
-                // ANY/IN subquery: testexpr IN (SELECT ...)
+                // Only `= ANY (SELECT ...)` is IN; any other operator has
+                // different semantics and used to be silently discarded,
+                // executing `x > ANY (...)` as `x IN (...)`.
+                let op: Vec<&str> = sub_link
+                    .oper_name
+                    .iter()
+                    .filter_map(|n| match &n.node {
+                        Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !(op.is_empty() || op == ["="]) {
+                    return Err(ParseError::ParseError(format!(
+                        "{} ANY (SELECT ...) is not supported",
+                        op.join(".")
+                    )));
+                }
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
                     ParseError::ParseError("ANY SubLink missing testexpr".to_string())
                 })?;

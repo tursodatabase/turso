@@ -129,6 +129,46 @@ fn assert_error_at(conn: &mut PgConn, sql: &str, code: &str, message: &str, posi
     );
 }
 
+/// Clauses whose semantics the engine cannot honor must error instead of
+/// being silently dropped: each of these statements previously executed
+/// with different semantics than PostgreSQL (`> ANY` ran as `IN`,
+/// `DISTINCT ON` degraded to `DISTINCT`, aggregate-internal `ORDER BY`
+/// vanished, `DELETE USING` deleted the wrong row set, `SKIP LOCKED`
+/// queues handed out duplicate jobs).
+#[test]
+fn unsupported_clauses_error_instead_of_silently_dropping() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    exec(&mut conn, "CREATE TABLE sd (x int, y int)");
+    exec(&mut conn, "INSERT INTO sd VALUES (1, 2)");
+
+    for sql in [
+        "SELECT x FROM sd WHERE x > ANY (SELECT y FROM sd)",
+        "SELECT DISTINCT ON (x) x, y FROM sd",
+        "SELECT string_agg(x::text, ',' ORDER BY x) FROM sd",
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM sd",
+        "DELETE FROM sd USING sd other WHERE sd.x = other.y",
+        "SELECT x FROM sd FOR UPDATE SKIP LOCKED",
+        "SELECT x FROM sd FOR UPDATE NOWAIT",
+    ] {
+        assert_code(&mut conn, sql, "0A000");
+    }
+
+    // Plain FOR UPDATE stays accepted: the engine's single-writer
+    // transactions already hold what it would lock.
+    assert_eq!(query_int(&mut conn, "SELECT x FROM sd FOR UPDATE"), 1);
+
+    // `= ANY (SELECT ...)` is IN and keeps working.
+    assert_eq!(
+        query_int(
+            &mut conn,
+            "SELECT count(*) FROM sd WHERE y = ANY (SELECT y FROM sd)"
+        ),
+        1
+    );
+}
+
 /// Statements that used to panic the engine and take the whole server down.
 /// The contract is survival: whatever each statement returns, the session
 /// must still answer the next query.
