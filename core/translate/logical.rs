@@ -2377,6 +2377,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                 AggFunc::Count | AggFunc::Count0 => Ok(Type::Integer),
                 AggFunc::BoolAnd | AggFunc::BoolOr => Ok(Type::Integer),
                 AggFunc::Sum | AggFunc::Avg | AggFunc::Total => Ok(Type::Real),
+                AggFunc::VarPop | AggFunc::VarSamp | AggFunc::StddevPop | AggFunc::StddevSamp => {
+                    Ok(Type::Real)
+                }
                 AggFunc::Min | AggFunc::Max => Ok(Type::Text),
                 AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
                 AggFunc::ArrayAgg => Ok(Type::Blob),

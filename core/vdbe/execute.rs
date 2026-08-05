@@ -6290,6 +6290,13 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
         }
+        // [count, sum, sum of squares] — the textbook form rather than
+        // Welford, because window frames must be able to subtract a row.
+        AggFunc::VarPop | AggFunc::VarSamp | AggFunc::StddevPop | AggFunc::StddevSamp => {
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_f64(0.0));
+            payload.push(Value::from_f64(0.0));
+        }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             // Use Null as sentinel to distinguish "no values yet" from an
             // accumulated empty string. SQLite normally remembers one
@@ -6420,6 +6427,28 @@ fn update_agg_payload(
                     .checked_add(1)
                     .ok_or(LimboError::IntegerOverflow)?;
             }
+        }
+        AggFunc::VarPop | AggFunc::VarSamp | AggFunc::StddevPop | AggFunc::StddevSamp => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let x = arg.to_float_or_zero();
+            // invariant as per init_agg_payload: [count, sum, sum_sq]
+            let [count_val, sum_val, sum_sq_val, ..] = payload.as_mut_slice() else {
+                mark_unlikely();
+                return Err(LimboError::InternalError(
+                    "variance: payload too short".to_string(),
+                ));
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                mark_unlikely();
+                return Err(LimboError::InternalError(
+                    "variance: count is not an integer".to_string(),
+                ));
+            };
+            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            *sum_val = Value::from_f64(sum_val.to_float_or_zero() + x);
+            *sum_sq_val = Value::from_f64(sum_sq_val.to_float_or_zero() + x * x);
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
@@ -6773,6 +6802,26 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 Value::from_i64((count_true == count_nonnull) as i64)
             } else {
                 Value::from_i64((count_true > 0) as i64)
+            }
+        }
+        AggFunc::VarPop | AggFunc::VarSamp | AggFunc::StddevPop | AggFunc::StddevSamp => {
+            // Payload: [count, sum, sum_sq]
+            let count = payload[0].as_int().unwrap_or(0);
+            let sample = matches!(func, AggFunc::VarSamp | AggFunc::StddevSamp);
+            if count == 0 || (sample && count < 2) {
+                Value::Null
+            } else {
+                let n = count as f64;
+                let sum = payload[1].to_float_or_zero();
+                let sum_sq = payload[2].to_float_or_zero();
+                let divisor = if sample { n - 1.0 } else { n };
+                // Rounding can push the numerator a hair below zero.
+                let variance = ((sum_sq - sum * sum / n) / divisor).max(0.0);
+                if matches!(func, AggFunc::StddevPop | AggFunc::StddevSamp) {
+                    Value::from_f64(variance.sqrt())
+                } else {
+                    Value::from_f64(variance)
+                }
             }
         }
         AggFunc::Avg => {
@@ -7696,6 +7745,22 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
                 debug_assert!(*count_true > 0, "bool agg xInverse without matching xStep");
                 *count_true -= 1;
             }
+        }
+        AggFunc::VarPop | AggFunc::VarSamp | AggFunc::StddevPop | AggFunc::StddevSamp => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let x = arg.to_float_or_zero();
+            let [count_val, sum_val, sum_sq_val, ..] = payload else {
+                unreachable!("variance payload is [count, sum, sum_sq] per init_agg_payload");
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                unreachable!("variance count is Integer per init_agg_payload");
+            };
+            debug_assert!(*count > 0, "variance xInverse without matching xStep");
+            *count -= 1;
+            *sum_val = Value::from_f64(sum_val.to_float_or_zero() - x);
+            *sum_sq_val = Value::from_f64(sum_sq_val.to_float_or_zero() - x * x);
         }
         AggFunc::Sum | AggFunc::Total => {
             let parsed = classify_numeric_arg(&arg);

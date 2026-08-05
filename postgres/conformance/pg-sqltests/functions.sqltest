@@ -468,3 +468,70 @@ test bool-and-wrong-arity-errors {
     SELECT bool_and(x, x) FROM boolagg;
 }
 expect error {}
+
+# Variance/stddev tests pick inputs with terminating-decimal answers so the
+# expectations do not depend on float formatting width, which still differs
+# from PostgreSQL (extra_float_digits handling is a separate work item).
+test var-samp-and-var-pop {
+    CREATE TABLE vartab (x float8);
+    INSERT INTO vartab VALUES (1), (2);
+    SELECT var_samp(x), var_pop(x), stddev_pop(x) FROM vartab;
+}
+expect {
+    0.5|0.25|0.5
+}
+
+test stddev-samp-rounded {
+    CREATE TABLE vartab (x float8);
+    INSERT INTO vartab VALUES (1), (2);
+    SELECT round(stddev_samp(x) * 1000)::int FROM vartab;
+}
+expect {
+    707
+}
+
+test variance-and-stddev-are-sample-aliases {
+    CREATE TABLE vartab (x float8);
+    INSERT INTO vartab VALUES (3), (5), (9);
+    SELECT (variance(x) = var_samp(x))::int, (stddev(x) = stddev_samp(x))::int FROM vartab;
+}
+expect {
+    1|1
+}
+
+test var-samp-single-row-is-null-var-pop-zero {
+    CREATE TABLE vartab (x float8);
+    INSERT INTO vartab VALUES (7);
+    SELECT coalesce(var_samp(x)::text, 'null'), var_pop(x)::int FROM vartab;
+}
+expect {
+    null|0
+}
+
+test variance-empty-input-is-null {
+    CREATE TABLE vartab (x float8);
+    SELECT coalesce(variance(x)::text, 'null') FROM vartab;
+}
+expect {
+    null
+}
+
+test variance-skips-nulls {
+    CREATE TABLE vartab (x float8);
+    INSERT INTO vartab VALUES (1), (2), (NULL);
+    SELECT var_samp(x), var_pop(x) FROM vartab;
+}
+expect {
+    0.5|0.25
+}
+
+test stddev-pop-as-window-function {
+    CREATE TABLE vartab (g int, x float8);
+    INSERT INTO vartab VALUES (1, 1), (1, 2), (2, 5);
+    SELECT g, stddev_pop(x) OVER (PARTITION BY g) FROM vartab ORDER BY g, x;
+}
+expect {
+    1|0.5
+    1|0.5
+    2|0
+}

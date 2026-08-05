@@ -439,6 +439,14 @@ pub enum AggFunc {
     BoolAnd,
     /// PostgreSQL bool_or(): true when any non-NULL input is true.
     BoolOr,
+    /// PostgreSQL var_pop(): population variance.
+    VarPop,
+    /// PostgreSQL var_samp()/variance(): sample variance.
+    VarSamp,
+    /// PostgreSQL stddev_pop(): population standard deviation.
+    StddevPop,
+    /// PostgreSQL stddev_samp()/stddev(): sample standard deviation.
+    StddevSamp,
     #[cfg(feature = "json")]
     JsonbGroupArray,
     #[cfg(feature = "json")]
@@ -726,6 +734,7 @@ impl AggFunc {
             Self::Sum => 1,
             Self::Total => 1,
             Self::BoolAnd | Self::BoolOr => 1,
+            Self::VarPop | Self::VarSamp | Self::StddevPop | Self::StddevSamp => 1,
             Self::ArrayAgg => 1,
             // Ordered-set aggregates: args are rewritten by the planner to
             // `[value]` (mode) or `[value, fraction]` (percentiles).
@@ -756,6 +765,7 @@ impl AggFunc {
             Self::Sum => &[1],
             Self::Total => &[1],
             Self::BoolAnd | Self::BoolOr => &[1],
+            Self::VarPop | Self::VarSamp | Self::StddevPop | Self::StddevSamp => &[1],
             Self::ArrayAgg => &[1],
             Self::Mode => &[1],
             Self::PercentileCont | Self::PercentileDisc => &[2],
@@ -780,6 +790,10 @@ impl AggFunc {
             Self::Total => "total",
             Self::BoolAnd => "bool_and",
             Self::BoolOr => "bool_or",
+            Self::VarPop => "var_pop",
+            Self::VarSamp => "var_samp",
+            Self::StddevPop => "stddev_pop",
+            Self::StddevSamp => "stddev_samp",
             Self::ArrayAgg => "array_agg",
             Self::Mode => "mode",
             Self::PercentileCont => "percentile_cont",

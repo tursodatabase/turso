@@ -545,6 +545,22 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
+        AggFunc::VarPop | AggFunc::VarSamp | AggFunc::StddevPop | AggFunc::StddevSamp => {
+            if num_args != 1 {
+                crate::bail_parse_error!("{} bad number of arguments", func.as_str());
+            }
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: expr_reg,
+                delimiter: 0,
+                func: AccumulatorFunc::Agg(func.clone()),
+                comparator: None,
+                collation: None,
+            });
+            target_register
+        }
         AggFunc::BoolAnd | AggFunc::BoolOr => {
             if num_args != 1 {
                 crate::bail_parse_error!("{} bad number of arguments", func.as_str());

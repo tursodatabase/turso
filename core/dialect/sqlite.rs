@@ -322,6 +322,12 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         // "every" is PostgreSQL's SQL-standard spelling of bool_and.
         "bool_and" | "every" => Ok(Some(Func::Agg(AggFunc::BoolAnd))),
         "bool_or" => Ok(Some(Func::Agg(AggFunc::BoolOr))),
+        "var_pop" => Ok(Some(Func::Agg(AggFunc::VarPop))),
+        // The bare names are PostgreSQL's historical aliases for the
+        // sample variants.
+        "var_samp" | "variance" => Ok(Some(Func::Agg(AggFunc::VarSamp))),
+        "stddev_pop" => Ok(Some(Func::Agg(AggFunc::StddevPop))),
+        "stddev_samp" | "stddev" => Ok(Some(Func::Agg(AggFunc::StddevSamp))),
         #[cfg(feature = "json")]
         "jsonb_group_array" => Ok(Some(Func::Agg(AggFunc::JsonbGroupArray))),
         #[cfg(feature = "json")]
