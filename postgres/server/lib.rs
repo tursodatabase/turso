@@ -196,13 +196,13 @@ impl SimpleQueryHandler for TursoPgHandler {
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
         let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, query))))?;
 
         let mut responses = Vec::new();
         for sql in &statements {
             let mut stmt = conn
                 .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
+                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, sql))))?;
 
             self.cleanup_dropped_schema_file(sql);
 
@@ -241,7 +241,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
         let mut stmt = conn
             .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, query))))?;
 
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
@@ -268,7 +268,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, &target.statement))))?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -289,9 +289,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
+        let stmt = conn.prepare(&portal.statement.statement).map_err(|e| {
+            PgWireError::UserError(Box::new(error_info(&e, &portal.statement.statement)))
+        })?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -415,7 +415,7 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
+    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, ""))))?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
@@ -424,7 +424,7 @@ fn execute_query(
 /// Execute a non-SELECT statement and build an Execution response.
 fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
     stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, query))))?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -770,9 +770,11 @@ fn is_create_table_as(upper: &str) -> bool {
 }
 
 /// Maps an engine error to a PostgreSQL error response with its SQLSTATE.
-fn error_info(e: &LimboError) -> ErrorInfo {
-    let info = pg_error(e);
-    ErrorInfo::new("ERROR".to_owned(), info.code.to_owned(), info.message)
+fn error_info(e: &LimboError, sql: &str) -> ErrorInfo {
+    let info = pg_error(e, sql);
+    let mut error = ErrorInfo::new("ERROR".to_owned(), info.code.to_owned(), info.message);
+    error.position = info.position.map(|p| p.to_string());
+    error
 }
 
 /// A malformed extended-protocol parameter value: invalid_text_representation.

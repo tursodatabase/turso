@@ -107,3 +107,58 @@ fn foreign_key_and_syntax_errors_carry_sqlstates() {
     // feature_not_supported for parsed-but-unimplemented statements.
     assert_code(&mut conn, "CREATE PUBLICATION pub1", "0A000");
 }
+
+/// Asserts SQLSTATE, exact message, and the error position field ('P'),
+/// which clients render as a `LINE n:` marker with a caret.
+fn assert_error_at(conn: &mut PgConn, sql: &str, code: &str, message: &str, position: &str) {
+    let fields = expect_error(conn, sql);
+    assert_eq!(
+        fields.get(&b'C').map(String::as_str),
+        Some(code),
+        "wrong SQLSTATE for `{sql}`"
+    );
+    assert_eq!(
+        fields.get(&b'M').map(String::as_str),
+        Some(message),
+        "wrong message for `{sql}`"
+    );
+    assert_eq!(
+        fields.get(&b'P').map(String::as_str),
+        Some(position),
+        "wrong position for `{sql}`"
+    );
+}
+
+#[test]
+fn syntax_errors_carry_postgres_wording_and_positions() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    // The reported token occurs once, so the position is exact: PostgreSQL
+    // points at the misspelled keyword and at the stray semicolon.
+    assert_error_at(
+        &mut conn,
+        "SELEC 1",
+        "42601",
+        "syntax error at or near \"SELEC\"",
+        "1",
+    );
+    // A truncated statement errors at end of input; the position points
+    // one past the last character, like PostgreSQL.
+    assert_error_at(
+        &mut conn,
+        "SELECT 1 +",
+        "42601",
+        "syntax error at end of input",
+        "11",
+    );
+
+    // An ambiguous token (several occurrences) must not produce a guessed
+    // position — a wrong caret is worse than none.
+    let fields = expect_error(&mut conn, "SELECT 1 + + SELECT");
+    assert_eq!(fields.get(&b'C').map(String::as_str), Some("42601"));
+    assert_eq!(
+        fields.get(&b'M').map(String::as_str),
+        Some("syntax error at or near \"SELECT\""),
+    );
+}

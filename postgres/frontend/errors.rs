@@ -14,10 +14,12 @@
 
 use turso_core::LimboError;
 
-/// A PostgreSQL-facing error: SQLSTATE plus message.
+/// A PostgreSQL-facing error: SQLSTATE, message, and optionally the
+/// 1-based character position clients render as a `LINE n:` caret.
 pub struct PgErrorInfo {
     pub code: &'static str,
     pub message: String,
+    pub position: Option<usize>,
 }
 
 impl PgErrorInfo {
@@ -25,14 +27,16 @@ impl PgErrorInfo {
         Self {
             code,
             message: message.into(),
+            position: None,
         }
     }
 }
 
-/// Maps an engine error to its SQLSTATE and message.
-pub fn pg_error(e: &LimboError) -> PgErrorInfo {
+/// Maps an engine error to its SQLSTATE and message. `sql` is the statement
+/// that failed; syntax errors use it to locate the reported token.
+pub fn pg_error(e: &LimboError, sql: &str) -> PgErrorInfo {
     match e {
-        LimboError::ParseError(msg) => parse_error(msg),
+        LimboError::ParseError(msg) => parse_error(msg, sql),
         LimboError::Constraint(msg) => constraint_error(msg),
         LimboError::ForeignKeyConstraint(msg) => {
             PgErrorInfo::new("23503", format!("Runtime error: {msg}"))
@@ -58,7 +62,29 @@ pub fn pg_error(e: &LimboError) -> PgErrorInfo {
 /// Translator and name-resolution failures. The engine reports them all as
 /// parse errors; PostgreSQL distinguishes syntax from missing objects and
 /// unimplemented features, and clients rely on that distinction.
-fn parse_error(msg: &str) -> PgErrorInfo {
+fn parse_error(msg: &str, sql: &str) -> PgErrorInfo {
+    // Grammar-level failures come from the real PostgreSQL parser
+    // (libpg_query) wrapped in engine prefixes; surface its own wording.
+    if let Some(rest) = msg
+        .find("syntax error at or near \"")
+        .map(|i| &msg[i + "syntax error at or near \"".len()..])
+    {
+        if let Some(token) = rest.rsplit_once('"').map(|(t, _)| t) {
+            return PgErrorInfo {
+                code: "42601",
+                message: format!("syntax error at or near \"{token}\""),
+                position: unique_position(sql, token),
+            };
+        }
+    }
+    if msg.contains("syntax error at end of input") {
+        return PgErrorInfo {
+            code: "42601",
+            message: "syntax error at end of input".to_string(),
+            // PostgreSQL points one past the last character.
+            position: Some(sql.chars().count() + 1),
+        };
+    }
     if let Some(name) = msg.strip_prefix("no such table: ") {
         return PgErrorInfo::new("42P01", format!("relation \"{name}\" does not exist"));
     }
@@ -110,6 +136,20 @@ fn constraint_error(msg: &str) -> PgErrorInfo {
         return PgErrorInfo::new("22012", "division by zero".to_string());
     }
     PgErrorInfo::new("23000", format!("Runtime error: {msg}"))
+}
+
+/// 1-based character position of `token` in `sql`, only when it occurs
+/// exactly once — a wrong caret is worse than none.
+fn unique_position(sql: &str, token: &str) -> Option<usize> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut occurrences = sql.match_indices(token);
+    let (byte_offset, _) = occurrences.next()?;
+    if occurrences.next().is_some() {
+        return None;
+    }
+    Some(1 + sql[..byte_offset].chars().count())
 }
 
 fn tx_error(msg: &str) -> PgErrorInfo {
