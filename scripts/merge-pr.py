@@ -184,7 +184,7 @@ def check_pr_status(pr_number):
     return has_failing, has_pending
 
 
-def get_repo_nwo():
+def get_repo_full_name():
     repo = os.environ.get("GITHUB_REPOSITORY")
     if repo:
         return repo
@@ -196,7 +196,7 @@ def get_repo_nwo():
 
 
 def merge_rest_api(pr_number: int, commit_message: str, commit_title: str):
-    repo = get_repo_nwo()
+    repo = get_repo_full_name()
 
     payload = json.dumps({
         "commit_title": commit_title,
@@ -258,31 +258,8 @@ def merge_remote(pr_number: int, commit_message: str, commit_title: str):
         if input("Do you want to proceed with the merge? (y/N): ").strip().lower() != "y":
             exit(0)
 
-    # Create a temporary file for the commit message
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as temp_file:
-        temp_file.write(commit_message)
-        temp_file_path = temp_file.name
-
-    try:
-        print(f"\nMerging PR #{pr_number} with custom commit message...")
-
-        # Use gh pr merge with the commit message file
-        safe_title = shlex.quote(commit_title)
-        cmd = f'gh pr merge {pr_number} --merge --subject {safe_title} --body-file "{temp_file_path}"'
-        output, error, returncode = run_command(cmd)
-
-        if returncode == 0:
-            print(f"\nPull request #{pr_number} merged successfully!")
-            print(f"\nMerge commit message:\n{commit_message}")
-        elif "asynchronous merge REST API" in error:
-            print("PR is part of a stack, falling back to REST API...")
-            merge_rest_api(pr_number, commit_message, commit_title)
-        else:
-            print(f"Error merging PR: {error}")
-            sys.exit(1)
-    finally:
-        # Clean up the temporary file
-        os.unlink(temp_file_path)
+    print(f"\nMerging PR #{pr_number} with custom commit message...")
+    merge_rest_api(pr_number, commit_message, commit_title)
 
 
 def merge_local(pr_number: int, commit_message: str):
