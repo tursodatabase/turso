@@ -204,40 +204,36 @@ def merge_rest_api(pr_number: int, commit_message: str, commit_title: str):
         "merge_method": "merge",
     })
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as f:
         f.write(payload)
-        payload_path = f.name
-
-    try:
-        cmd = f"gh api -X PUT repos/{repo}/pulls/{pr_number}/merge --input {shlex.quote(payload_path)}"
+        f.flush()
+        cmd = f"gh api -X PUT repos/{repo}/pulls/{pr_number}/merge --input {shlex.quote(f.name)}"
         output, error, returncode = run_command(cmd)
 
-        if returncode != 0:
-            print(f"Error merging PR via REST API: {error}")
-            sys.exit(1)
+    if returncode != 0:
+        print(f"Error merging PR via REST API: {error}")
+        sys.exit(1)
 
-        result = json.loads(output) if output else {}
-        if result.get("merged"):
+    result = json.loads(output) if output else {}
+    if result.get("merged"):
+        print(f"\nPull request #{pr_number} merged successfully!")
+        print(f"\nMerge commit message:\n{commit_title}\n\n{commit_message}")
+        return
+
+    print("Merge queued, waiting for completion...")
+    for _ in range(30):
+        time.sleep(2)
+        state_out, _, rc = run_command(
+            f"gh pr view {pr_number} -R {repo} --json state -q .state"
+        )
+        if rc == 0 and state_out == "MERGED":
             print(f"\nPull request #{pr_number} merged successfully!")
             print(f"\nMerge commit message:\n{commit_title}\n\n{commit_message}")
             return
 
-        print("Merge queued, waiting for completion...")
-        for _ in range(30):
-            time.sleep(2)
-            state_out, _, rc = run_command(
-                f"gh pr view {pr_number} -R {repo} --json state -q .state"
-            )
-            if rc == 0 and state_out == "MERGED":
-                print(f"\nPull request #{pr_number} merged successfully!")
-                print(f"\nMerge commit message:\n{commit_title}\n\n{commit_message}")
-                return
-
-        print("Warning: Merge was queued but hasn't completed within 60 seconds.")
-        print("Check the PR status manually.")
-        sys.exit(1)
-    finally:
-        os.unlink(payload_path)
+    print("Warning: Merge was queued but hasn't completed within 60 seconds.")
+    print("Check the PR status manually.")
+    sys.exit(1)
 
 
 def merge_remote(pr_number: int, commit_message: str, commit_title: str):
