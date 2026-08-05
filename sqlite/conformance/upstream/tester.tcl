@@ -141,6 +141,14 @@ proc catchsql {sql {db db}} {
   }
 }
 
+# Compare two doubles, tolerating formatting noise. The tolerance is
+# relative, not absolute: TCL 8.6 and 9 print the same double differently
+# (15 significant digits vs shortest round-trip), so two renderings of one
+# value can differ in their last digits at any magnitude.
+proc floats_equal {a b} {
+  expr {abs($a - $b) <= 1e-12 * (abs($a) + abs($b) + 1.0)}
+}
+
 # Main test execution function
 proc do_test {name cmd expected} {
   global TC testprefix
@@ -185,7 +193,7 @@ proc do_test {name cmd expected} {
           if {$r ne $e} {
             if {[string is double -strict $r] && [string is double -strict $e]} {
               # True mathematical comparison for floating point noise
-              if {[expr {abs($r - $e) > 1e-12}]} {
+              if {![floats_equal $r $e]} {
                 set ok 0; break
               }
             } else {
@@ -201,7 +209,7 @@ proc do_test {name cmd expected} {
       if {$r ne $e} {
         if {[string is double -strict $r] && [string is double -strict $e]} {
           # True mathematical comparison for floating point noise
-          set ok [expr {abs($r - $e) < 1e-12}]
+          set ok [floats_equal $r $e]
         } else {
           set ok 0
         }

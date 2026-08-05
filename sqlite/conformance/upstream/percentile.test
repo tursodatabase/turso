@@ -1,0 +1,596 @@
+# 2013-05-28
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# This file implements regression tests for SQLite library.  The
+# focus of this file is percentile.c extension.  This also tests
+# the SQLITE_ENABLE_ORDERED_SET_AGGREGATES compile-time option.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Basic test of the percentile() function.
+#
+do_test percentile-1.0 {
+  load_static_extension db percentile
+  execsql {
+    CREATE TABLE t1(x);
+    INSERT INTO t1 VALUES(1),(4),(6),(7),(8),(9),(11),(11),(11);
+  }
+  execsql {SELECT percentile(x,0) FROM t1}
+} {1.0}
+foreach {in out disc} {
+  100    11.0  11.0
+   50     8.0   8.0
+   12.5   4.0   4.0
+   15     4.4   4.0
+   20     5.2   4.0
+   80    11.0  11.0
+   89    11.0  11.0
+} {
+  do_test percentile-1.1.$in.1 {
+    execsql {SELECT percentile(x,$in) FROM t1}
+  } $out
+  do_test percentile-1.1.$in.2 {
+    execsql {SELECT percentile_cont(x,$in*0.01) FROM t1}
+  } $out
+  do_test percentile-1.1.$in.3 {
+    execsql {SELECT percentile_disc(x,$in*0.01) FROM t1}
+  } $disc
+  if {$in==50} {
+    do_test percentile-1.1.$in.4 {
+      execsql {SELECT median(x) FROM t1}
+    } $out
+  }
+  ifcapable ordered_set_aggregates {
+    do_test percentile-1.1.$in.5 {
+      execsql {SELECT percentile($in)WITHIN GROUP(ORDER BY x) FROM t1}
+    } $out
+    do_test percentile-1.1.$in.6 {
+      execsql {SELECT percentile_cont($in*0.01) WITHIN GROUP(ORDER BY x)
+                 FROM t1}
+    } $out
+    do_test percentile-1.1.$in.7 {
+      execsql {SELECT percentile_disc($in*0.01) WITHIN GROUP(ORDER BY x)
+                 FROM t1}
+    } $disc
+    if {$in==50} {
+      do_test percentile-1.1.$in.8 {
+        execsql {SELECT median() WITHIN GROUP (ORDER BY x) FROM t1}
+      } $out
+    }
+  }
+}
+do_execsql_test percentile-1.1.median {
+  SELECT median(x) FROM t1;
+} 8.0
+ifcapable ordered_set_aggregates {
+  do_execsql_test percentile-1.1.median {
+    SELECT median() WITHIN GROUP (ORDER BY x) FROM t1;
+  } 8.0
+  do_execsql_test percentile-1.1.distinct.1 {
+    SELECT median(DISTINCT x) FROM t1;
+  } 7.0
+  do_catchsql_test percentile-1.1.distinct.2 {
+    SELECT percentile(DISTINCT 50) WITHIN GROUP (ORDER BY x) FROM t1;
+  } {1 {DISTINCT not allowed on ordered-set aggregate percentile()}}
+} else {
+  do_catchsql_test percentile-1.1.median {
+    SELECT median() WITHIN GROUP (ORDER BY x) FROM t1;
+  } {1 {near "(": syntax error}}
+}
+
+# Add some NULL values.
+#
+do_test percentile-1.2 {
+  execsql {INSERT INTO t1 VALUES(NULL),(NULL);}
+} {}
+foreach {in out disc} {
+  100    11.0  11.0
+   50     8.0   8.0
+   12.5   4.0   4.0
+   15     4.4   4.0
+   20     5.2   4.0
+   80    11.0  11.0
+   89    11.0  11.0
+} {
+  do_test percentile-1.3.$in.1 {
+    execsql {SELECT percentile(x,$in) FROM t1}
+  } $out
+  do_test percentile-1.3.$in.2 {
+    execsql {SELECT percentile_cont(x,$in*0.01) FROM t1}
+  } $out
+  do_test percentile-1.3.$in.3 {
+    execsql {SELECT percentile_disc(x,$in*0.01) FROM t1}
+  } $disc
+  if {$in==50} {
+    do_test percentile-1.3.$in.4 {
+      execsql {SELECT median(x) FROM t1}
+    } $out
+  }
+  ifcapable ordered_set_aggregates {
+    do_test percentile-1.3.$in.5 {
+      execsql {SELECT percentile($in)WITHIN GROUP(ORDER BY x) FROM t1}
+    } $out
+    do_test percentile-1.3.$in.6 {
+      execsql {SELECT percentile_cont($in*0.01) WITHIN GROUP(ORDER BY x)
+                 FROM t1}
+    } $out
+    do_test percentile-1.3.$in.7 {
+      execsql {SELECT percentile_disc($in*0.01) WITHIN GROUP(ORDER BY x)
+                 FROM t1}
+    } $disc
+    if {$in==50} {
+      do_test percentile-1.3.$in.8 {
+        execsql {SELECT median() WITHIN GROUP (ORDER BY x) FROM t1}
+      } $out
+    }
+  }
+}
+
+# The second argument to percentile can change some, but not much.
+#
+do_test percentile-1.4.1 {
+  catchsql {SELECT round(percentile(x, 15+0.000001*rowid),1) FROM t1}
+} {0 4.4}
+do_test percentile-1.4.2 {
+  catchsql {SELECT round(percentile_cont(x,(15+0.000001*rowid)*0.01),1) FROM t1}
+} {0 4.4}
+do_test percentile-1.4.3 {
+  catchsql {SELECT percentile_disc(x, (15+0.000001*rowid)*0.01) FROM t1}
+} {0 4.0}
+do_test percentile-1.5.1 {
+  catchsql {SELECT percentile(x, 15+0.1*rowid) FROM t1}
+} {1 {the fraction argument to percentile() is not the same for all input rows}}
+do_test percentile-1.5.2 {
+  catchsql {SELECT percentile_cont(x, (15+0.1*rowid)*0.01) FROM t1}
+} {1 {the fraction argument to percentile_cont() is not the same for all input rows}}
+do_test percentile-1.5.3 {
+  catchsql {SELECT percentile_disc(x, (15+0.1*rowid)*0.01) FROM t1}
+} {1 {the fraction argument to percentile_disc() is not the same for all input rows}}
+
+# Input values in a random order
+#
+do_test percentile-1.6 {
+  execsql {
+    CREATE TABLE t2(x);
+    INSERT INTO t2 SELECT x+0.0 FROM t1 ORDER BY random();
+  }
+} {}
+foreach {in out disc} {
+  100    11.0  11.0
+   50     8.0   8.0
+   12.5   4.0   4.0
+   15     4.4   4.0
+   20     5.2   4.0
+   80    11.0  11.0
+   89    11.0  11.0
+} {
+  do_test percentile-1.7.$in.1 {
+    execsql {SELECT percentile(x,$in) FROM t2}
+  } $out
+  do_test percentile-1.7.$in.2 {
+    execsql {SELECT percentile_cont(x,$in*0.01) FROM t2}
+  } $out
+  do_test percentile-1.7.$in.3 {
+    execsql {SELECT percentile_disc(x,$in*0.01) FROM t2}
+  } $disc
+  if {$in==50} {
+    do_test percentile-1.7.$in.4 {
+      execsql {SELECT median(x) FROM t2}
+    } $out
+  }
+  ifcapable ordered_set_aggregates {
+    do_test percentile-1.7.$in.5 {
+      execsql {SELECT percentile($in)WITHIN GROUP(ORDER BY x) FROM t2}
+    } $out
+    do_test percentile-1.7.$in.6 {
+      execsql {SELECT percentile_cont($in*0.01) WITHIN GROUP(ORDER BY x)
+                 FROM t2}
+    } $out
+    do_test percentile-1.7.$in.7 {
+      execsql {SELECT percentile_disc($in*0.01) WITHIN GROUP(ORDER BY x)
+                 FROM t2}
+    } $disc
+    if {$in==50} {
+      do_test percentile-1.7.$in.8 {
+        execsql {SELECT median() WITHIN GROUP (ORDER BY x) FROM t2}
+      } $out
+    }
+  }
+}
+
+# Wrong number of arguments
+#
+do_test percentile-1.8.1 {
+  catchsql {SELECT percentile(x,0,1) FROM t1}
+} {1 {wrong number of arguments to function percentile()}}
+do_test percentile-1.8.2 {
+  catchsql {SELECT percentile_cont(x,0,1) FROM t1}
+} {1 {wrong number of arguments to function percentile_cont()}}
+do_test percentile-1.8.3 {
+  catchsql {SELECT percentile_disc(x,0,1) FROM t1}
+} {1 {wrong number of arguments to function percentile_disc()}}
+do_test percentile-1.8.4 {
+  catchsql {SELECT median(x,0) FROM t1}
+} {1 {wrong number of arguments to function median()}}
+ifcapable ordered_set_aggregates {
+  do_test percentile-1.8.5 {
+    catchsql {SELECT percentile(0,1) WITHIN GROUP(ORDER BY x) FROM t1}
+  } {1 {wrong number of arguments to function percentile()}}
+  do_test percentile-1.8.2 {
+    catchsql {SELECT percentile_cont(0,1)WITHIN GROUP (ORDER BY x) FROM t1}
+  } {1 {wrong number of arguments to function percentile_cont()}}
+  do_test percentile-1.8.3 {
+    catchsql {SELECT percentile_disc(0,1)WITHIN GROUP (ORDER BY x) FROM t1}
+  } {1 {wrong number of arguments to function percentile_disc()}}
+  do_test percentile-1.8.4 {
+    catchsql {SELECT median(x) WITHIN GROUP (ORDER BY x) FROM t1}
+  } {1 {wrong number of arguments to function median()}}
+}
+do_test percentile-1.9.1 {
+  catchsql {SELECT percentile(x) FROM t1}
+} {1 {wrong number of arguments to function percentile()}}
+do_test percentile-1.9.2 {
+  catchsql {SELECT percentile_cont(x) FROM t1}
+} {1 {wrong number of arguments to function percentile_cont()}}
+do_test percentile-1.9.3 {
+  catchsql {SELECT percentile_disc(x) FROM t1}
+} {1 {wrong number of arguments to function percentile_disc()}}
+do_test percentile-1.9.4 {
+  catchsql {SELECT median() FROM t1}
+} {1 {wrong number of arguments to function median()}}
+ifcapable ordered_set_aggregates {
+  do_test percentile-1.9.5 {
+    catchsql {SELECT percentile() WITHIN GROUP(ORDER BY x) FROM t1}
+  } {1 {wrong number of arguments to function percentile()}}
+  do_test percentile-1.9.6 {
+    catchsql {SELECT percentile_cont()WITHIN GROUP (ORDER BY x) FROM t1}
+  } {1 {wrong number of arguments to function percentile_cont()}}
+  do_test percentile-1.9.7 {
+    catchsql {SELECT percentile_disc()WITHIN GROUP (ORDER BY x) FROM t1}
+  } {1 {wrong number of arguments to function percentile_disc()}}
+}
+
+# Second argument must be numeric
+#
+do_test percentile-1.10 {
+  catchsql {SELECT percentile(x,null) FROM t1}
+} {1 {the fraction argument to percentile() is not between 0.0 and 100.0}}
+do_test percentile-1.11 {
+  catchsql {SELECT percentile(x,'fifty') FROM t1}
+} {1 {the fraction argument to percentile() is not between 0.0 and 100.0}}
+do_test percentile-1.12 {
+  catchsql {SELECT percentile(x,x'3530') FROM t1}
+} {1 {the fraction argument to percentile() is not between 0.0 and 100.0}}
+
+# Second argument is out of range
+#
+do_test percentile-1.13 {
+  catchsql {SELECT percentile(x,-0.0000001) FROM t1}
+} {1 {the fraction argument to percentile() is not between 0.0 and 100.0}}
+do_test percentile-1.14 {
+  catchsql {SELECT percentile(x,100.0000001) FROM t1}
+} {1 {the fraction argument to percentile() is not between 0.0 and 100.0}}
+do_test percentile-1.14.2 {
+  catchsql {SELECT percentile_cont(x,1.0000001) FROM t1}
+} {1 {the fraction argument to percentile_cont() is not between 0.0 and 1.0}}
+do_test percentile-1.14.3 {
+  catchsql {SELECT percentile_disc(x,1.0000001) FROM t1}
+} {1 {the fraction argument to percentile_disc() is not between 0.0 and 1.0}}
+
+# First argument is not NULL and is not NUMERIC
+#
+do_test percentile-1.15.1 {
+  catchsql {
+    BEGIN;
+    UPDATE t1 SET x='50' WHERE x IS NULL;
+    SELECT percentile(x, 50) FROM t1;
+  }
+} {1 {input to percentile() is not numeric}}
+do_test percentile-1.15.2 {
+  catchsql {
+    SELECT percentile_cont(x, 0.50) FROM t1;
+  }
+} {1 {input to percentile_cont() is not numeric}}
+do_test percentile-1.15.3 {
+  catchsql {
+    SELECT percentile_disc(x, 0.50) FROM t1;
+  }
+} {1 {input to percentile_disc() is not numeric}}
+do_test percentile-1.15.4 {
+  catchsql {
+    SELECT median(x) FROM t1;
+  }
+} {1 {input to median() is not numeric}}
+do_test percentile-1.16 {
+  catchsql {
+    ROLLBACK;
+    BEGIN;
+    UPDATE t1 SET x=x'3530' WHERE x IS NULL;
+    SELECT percentile(x, 50) FROM t1;
+  }
+} {1 {input to percentile() is not numeric}}
+do_test percentile-1.17 {
+  catchsql {
+    ROLLBACK;
+    SELECT percentile(x, 50) FROM t1;
+  }
+} {0 8.0}
+
+# No non-NULL entries.
+#
+do_test percentile-1.18 {
+  execsql {
+    UPDATE t1 SET x=NULL;
+    SELECT ifnull(percentile(x, 50),'NULL') FROM t1
+  } 
+} {NULL}
+
+# Exactly one non-NULL entry
+#
+do_test percentile-1.19 {
+  execsql {
+    UPDATE t1 SET x=12345 WHERE rowid=5;
+    SELECT percentile(x, 0), percentile(x, 50), percentile(x,100) FROM t1
+  } 
+} {12345.0 12345.0 12345.0}
+
+# Infinity as an input
+#
+do_test percentile-1.20.1 {
+  catchsql {
+    DELETE FROM t1;
+    INSERT INTO t1 SELECT x+0.0 FROM t2;
+    UPDATE t1 SET x=1.0e300*1.0e300 WHERE rowid=5;
+    SELECT percentile(x,50) from t1;
+  }
+} {1 {Inf input to percentile()}}
+do_test percentile-1.20.2 {
+  catchsql {
+    SELECT percentile_cont(x,0.50) from t1;
+  }
+} {1 {Inf input to percentile_cont()}}
+do_test percentile-1.20.3 {
+  catchsql {
+    SELECT percentile_disc(x,0.50) from t1;
+  }
+} {1 {Inf input to percentile_disc()}}
+do_test percentile-1.20.4 {
+  catchsql {
+    SELECT median(x) from t1;
+  }
+} {1 {Inf input to median()}}
+ifcapable ordered_set_aggregates {
+  do_test percentile-1.20.5 {
+    catchsql {
+      SELECT percentile(50) WITHIN GROUP (ORDER BY x) from t1;
+    }
+  } {1 {Inf input to percentile()}}
+  do_test percentile-1.20.6 {
+    catchsql {
+      SELECT percentile_cont(0.50) WITHIN GROUP (ORDER BY x) from t1;
+    }
+  } {1 {Inf input to percentile_cont()}}
+  do_test percentile-1.20.7 {
+    catchsql {
+      SELECT percentile_disc(0.50) WITHIN GROUP(ORDER BY X) from t1;
+    }
+  } {1 {Inf input to percentile_disc()}}
+  do_test percentile-1.20.8 {
+    catchsql {
+      SELECT median() WITHIN GROUP (ORDER BY x) from t1;
+    }
+  } {1 {Inf input to median()}}
+}
+do_test percentile-1.21 {
+  catchsql {
+    UPDATE t1 SET x=-1.0e300*1.0e300 WHERE rowid=5;
+    SELECT percentile(x,50) from t1;
+  }
+} {1 {Inf input to percentile()}}
+
+# Million-row Inputs
+#
+ifcapable vtab {
+  do_test percentile-2.0 {
+    load_static_extension db wholenumber
+    execsql {
+      CREATE VIRTUAL TABLE nums USING wholenumber;
+      CREATE TABLE t3(x);
+      INSERT INTO t3 SELECT value-1 FROM nums WHERE value BETWEEN 1 AND 500000;
+      INSERT INTO t3 SELECT value*10 FROM nums
+                      WHERE value BETWEEN 500000 AND 999999;
+      SELECT count(*) FROM t3;
+    }
+  } {1000000}
+  foreach {in out} {
+      0          0.0
+    100    9999990.0
+     50    2749999.5
+     10      99999.9
+  } {
+    do_test percentile-2.1.$in {
+      execsql {
+        SELECT round(percentile(x, $in),1) from t3;
+      }
+    } $out
+  }
+}
+
+# median() as a window function.  (2024-08-31)
+#
+do_execsql_test percentile-3.0 {
+  DROP TABLE IF EXISTS t1;
+  CREATE TABLE t1(a INTEGER PRIMARY KEY, b, c, d);
+  INSERT INTO t1 VALUES (1, 'A', 'one',   8.4),
+                        (2, 'B', 'two',   7.1),
+                        (3, 'C', 'three', 5.9),
+                        (4, 'D', 'one',  11.0),
+                        (5, 'E', 'two',  12.5),
+                        (6, 'F', 'three', 0.0),
+                        (7, 'G', 'one',   2.7);
+}
+foreach {id oba expr} {
+  1 0 "median(d)"
+  2 0 "percentile(d,50)"
+  3 0 "percentile_cont(d,0.5)"
+  4 1 "median() WITHIN GROUP (ORDER BY d)"
+  5 1 "percentile(50) WITHIN GROUP (ORDER BY d)"
+  6 1 "percentile_cont(0.5) WITHIN GROUP (ORDER BY d)"
+} {
+  if {$oba} {
+    ifcapable !ordered_set_aggregates break
+  }
+  set sql "SELECT a, b, c, d, \
+                  group_concat(b,'.') OVER w1 AS 'elements', \
+                  $expr OVER w1 AS 'median' \
+            FROM t1 \
+          WINDOW w1 AS (ORDER BY c, a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"
+  do_execsql_test percentile-3.$id.1 $sql {
+    1  A  one    8.4   A.D       9.7   
+    4  D  one    11.0  A.D.G     8.4   
+    7  G  one    2.7   D.G.C     5.9   
+    3  C  three  5.9   G.C.F     2.7   
+    6  F  three  0.0   C.F.B     5.9   
+    2  B  two    7.1   F.B.E     7.1   
+    5  E  two    12.5  B.E       9.8   
+  }
+
+  set sql "SELECT a, b, c, d, \
+                  group_concat(b,'.') OVER w1 AS 'elements', \
+                  $expr OVER w1 AS 'median' \
+            FROM t1 \
+           WINDOW w1 AS (ORDER BY c, a \
+               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING)"
+  do_execsql_test percentile-3.$id.2 $sql {
+    1  A  one    8.4   A.D            9.7   
+    4  D  one    11.0  A.D.G          8.4   
+    7  G  one    2.7   A.D.G.C        7.15  
+    3  C  three  5.9   A.D.G.C.F      5.9   
+    6  F  three  0.0   A.D.G.C.F.B    6.5   
+    2  B  two    7.1   A.D.G.C.F.B.E  7.1   
+    5  E  two    12.5  A.D.G.C.F.B.E  7.1   
+  }
+
+  set sql "SELECT a, b, c, d, \
+                  group_concat(b,'.') OVER w1 AS 'elements', \
+                  $expr OVER w1 AS 'median' \
+            FROM t1 \
+           WINDOW w1 AS (ORDER BY c, a \
+               ROWS BETWEEN 1 PRECEDING AND UNBOUNDED FOLLOWING)"
+  do_execsql_test percentile-3.$id.3 $sql {
+    1  A  one    8.4   A.D.G.C.F.B.E  7.1   
+    4  D  one    11.0  A.D.G.C.F.B.E  7.1   
+    7  G  one    2.7   D.G.C.F.B.E    6.5   
+    3  C  three  5.9   G.C.F.B.E      5.9   
+    6  F  three  0.0   C.F.B.E        6.5   
+    2  B  two    7.1   F.B.E          7.1   
+    5  E  two    12.5  B.E            9.8   
+  }
+}
+
+# Test case adapted from examples shown at
+# https://database.guide/3-functions-to-calculate-the-median-in-sql/
+#
+do_execsql_test percential-4.0 {
+  CREATE TABLE products(
+    vendorId INT,
+    productId INTEGER PRIMARY KEY,
+    productName REAL,
+    price REAL
+  );
+  INSERT INTO products VALUES
+    (1001, 17,  'Left-handed screwdriver', 25.99),
+    (1001, 49,  'Right-handed screwdriver', 25.99),
+    (1001, 216, 'Long weight (blue)', 14.75),
+    (1001, 31,  'Long weight (green)', 11.99),
+    (1002, 37,  'Sledge hammer', 33.49),
+    (1003, 7,   'Chainsaw', 245.00),
+    (1003, 8,   'Straw dog box', 55.99),
+    (1003, 12,  'Hammock', 11.01),
+    (1004, 113, 'Teapot', 12.45),
+    (1004, 117, 'Bottomless coffee mug', 9.99);
+}
+do_execsql_test percentile-4.1 {
+  SELECT VendorId, ProductId, /* ProductName,*/ Price,
+         avg(price) OVER (PARTITION BY vendorId) AS "Average",
+         median(price) OVER (PARTITION BY vendorId) AS "Median"
+    FROM products
+   ORDER BY vendorId, productId;
+} {
+  1001      17         25.99  19.68    20.37 
+  1001      31         11.99  19.68    20.37 
+  1001      49         25.99  19.68    20.37 
+  1001      216        14.75  19.68    20.37 
+  1002      37         33.49  33.49    33.49 
+  1003      7          245.0  104.0    55.99 
+  1003      8          55.99  104.0    55.99 
+  1003      12         11.01  104.0    55.99 
+  1004      113        12.45  11.22    11.22 
+  1004      117        9.99   11.22    11.22 
+}
+do_execsql_test percentile-4.2 {
+  SELECT vendorId, median(price) FROM products
+   GROUP BY 1 ORDER BY 1;
+} {1001 20.37 1002 33.49 1003 55.99 1004 11.22}
+
+do_execsql_test percentile-5.0 {
+  CREATE TABLE user(name TEXT, class TEXT, cost REAL);
+  INSERT INTO user VALUES
+    ('Alice', 'Y',  3578.27),
+    ('Bob',   'X',  3399.99),
+    ('Cindy', 'Z',  699.10),
+    ('Dave',  'Y',  3078.27),
+    ('Emma',  'Z',  2319.99),
+    ('Fred',  'Y',  539.99),
+    ('Gina',  'X',  2320.49),
+    ('Hank',  'W',  24.99),
+    ('Irma',  'W',  24.99),
+    ('Jake',  'X',  2234.99),
+    ('Kim',   'Y',  4319.99),
+    ('Liam',  'X',  4968.59),
+    ('Mia',   'W',  59.53),
+    ('Nate',  'W',  23.50);
+}
+do_execsql_test percentile-5.1 {
+  SELECT name, class, cost,
+    percentile(cost,   0) OVER w1 AS 'P0',
+    percentile(cost,  25) OVER w1 AS 'P1',
+    percentile(cost,  50) OVER w1 AS 'P2',
+    percentile(cost,  75) OVER w1 AS 'P3',
+    percentile(cost, 100) OVER w1 AS 'P4'
+  FROM user
+  WINDOW w1 AS (PARTITION BY class)
+  ORDER BY class, cost;
+} {
+  Nate   W  23.5     23.5     24.6175    24.99     33.625     59.53  
+  Hank   W  24.99    23.5     24.6175    24.99     33.625     59.53  
+  Irma   W  24.99    23.5     24.6175    24.99     33.625     59.53  
+  Mia    W  59.53    23.5     24.6175    24.99     33.625     59.53  
+  Jake   X  2234.99  2234.99  2299.115   2860.24   3792.14    4968.59
+  Gina   X  2320.49  2234.99  2299.115   2860.24   3792.14    4968.59
+  Bob    X  3399.99  2234.99  2299.115   2860.24   3792.14    4968.59
+  Liam   X  4968.59  2234.99  2299.115   2860.24   3792.14    4968.59
+  Fred   Y  539.99   539.99   2443.7     3328.27   3763.7     4319.99
+  Dave   Y  3078.27  539.99   2443.7     3328.27   3763.7     4319.99
+  Alice  Y  3578.27  539.99   2443.7     3328.27   3763.7     4319.99
+  Kim    Y  4319.99  539.99   2443.7     3328.27   3763.7     4319.99
+  Cindy  Z  699.1    699.1    1104.3225  1509.545  1914.7675  2319.99
+  Emma   Z  2319.99  699.1    1104.3225  1509.545  1914.7675  2319.99
+}
+
+# Fuzzer find.
+do_execsql_test percentile-6.0 {
+  WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM c WHERE n<12)
+  SELECT median(iif(n%2,0.1,1.0)) FROM c;
+} 0.55
+
+finish_test
