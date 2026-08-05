@@ -270,7 +270,9 @@ pub struct HashBuildData {
     pub track_matched: bool,
 }
 
-/// Data for HashDistinct instruction (boxed to keep Insn small).
+/// Values used by the `HashDistinct` instruction.
+///
+/// This is stored behind a box so the main instruction enum stays small.
 #[derive(Debug, Clone)]
 pub struct HashDistinctData {
     pub hash_table_id: usize,
@@ -278,6 +280,10 @@ pub struct HashDistinctData {
     pub num_keys: usize,
     pub collations: Vec<CollationSeq>,
     pub target_pc: BranchOffset,
+    /// Save new values after a spill so an aggregate can use them at the end.
+    pub save_after_spill: bool,
+    /// True for COUNT(DISTINCT), which may store close integers in a bitmap.
+    pub is_count: bool,
 }
 
 // There are currently 190 opcodes in sqlite
@@ -1841,6 +1847,20 @@ pub enum Insn {
         data: Box<HashDistinctData>,
     },
 
+    /// Write the next saved aggregate DISTINCT value to a register.
+    /// Jump to `target_pc` after all saved values have been read.
+    HashDistinctNext {
+        hash_table_id: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+    },
+
+    /// Add the number of saved COUNT(DISTINCT) values to its running count.
+    HashDistinctCount {
+        hash_table_id: usize,
+        acc_reg: usize,
+    },
+
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
     /// Should be called after the HashBuild loop completes.
     HashBuildFinalize {
@@ -2214,6 +2234,8 @@ impl InsnVariants {
             InsnVariants::Filter => execute::op_filter,
             InsnVariants::HashBuild => execute::op_hash_build,
             InsnVariants::HashDistinct => execute::op_hash_distinct,
+            InsnVariants::HashDistinctNext => execute::op_hash_distinct_next,
+            InsnVariants::HashDistinctCount => execute::op_hash_distinct_count,
             InsnVariants::HashBuildFinalize => execute::op_hash_build_finalize,
             InsnVariants::HashProbe => execute::op_hash_probe,
             InsnVariants::HashNext => execute::op_hash_next,

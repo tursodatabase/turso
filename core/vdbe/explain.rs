@@ -2499,7 +2499,37 @@ pub fn insn_to_row(
             data.hash_table_id as i64,
             data.key_start_reg as i64,
             data.num_keys as i64,
-            Value::build_text(format!("jmp={}", data.target_pc.as_debug_int())),
+            Value::build_text(format!(
+                "jmp={} save={} count={}",
+                data.target_pc.as_debug_int(),
+                data.save_after_spill,
+                data.is_count
+            )),
+            0,
+            String::new(),
+        ),
+        Insn::HashDistinctNext {
+            hash_table_id,
+            dest_reg,
+            target_pc,
+        } => (
+            "HashDistinctNext",
+            *hash_table_id as i64,
+            *dest_reg as i64,
+            target_pc.as_debug_int() as i64,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::HashDistinctCount {
+            hash_table_id,
+            acc_reg,
+        } => (
+            "HashDistinctCount",
+            *hash_table_id as i64,
+            *acc_reg as i64,
+            0,
+            Value::build_text(""),
             0,
             String::new(),
         ),

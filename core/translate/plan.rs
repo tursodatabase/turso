@@ -696,6 +696,8 @@ impl DistinctCtx {
                 num_keys: num_regs,
                 collations: self.collations.clone(),
                 target_pc: self.label_on_conflict,
+                save_after_spill: false,
+                is_count: false,
             }),
         });
     }
