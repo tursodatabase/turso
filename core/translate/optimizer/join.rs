@@ -131,11 +131,9 @@ fn count_subquery_calls_after_join(
     new_table_mask: TableMask,
     where_clause: &[WhereTerm],
     params: &CostModelParams,
-) -> SmallVec<[(TableInternalId, f64); 2]> {
+) -> Result<SmallVec<[(TableInternalId, f64); 2]>> {
     let mut current_tables = prior_tables.clone();
-    current_tables
-        .set(new_table_number)
-        .expect("the joined table count was checked before join planning");
+    current_tables.set(new_table_number)?;
 
     let rows_before_filters = outer_rows * method.estimated_rows_per_outer_row;
     let mut subquery_calls = SmallVec::new();
@@ -155,9 +153,7 @@ fn count_subquery_calls_after_join(
             else {
                 continue;
             };
-            required_tables
-                .set(table_number)
-                .expect("the joined table count was checked before join planning");
+            required_tables.set(table_number)?;
         }
         if required_tables.is_empty()
             || !current_tables.contains_all_set_bits_of(&required_tables)
@@ -193,7 +189,7 @@ fn count_subquery_calls_after_join(
         subquery_calls.push((subquery.internal_id, rows.max(1.0)));
     }
 
-    subquery_calls
+    Ok(subquery_calls)
 }
 
 /// Represents an n-ary join, anywhere from 1 table to N tables.
@@ -845,7 +841,7 @@ pub fn join_lhs_and_rhs<'a>(
         rhs_self_mask,
         where_clause,
         params,
-    ));
+    )?);
 
     access_methods_arena.push(best_access_method);
 
