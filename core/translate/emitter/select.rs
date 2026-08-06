@@ -4,7 +4,10 @@ use crate::{
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
-        aggregation::emit_ungrouped_aggregation,
+        aggregation::{
+            collect_bare_columns_read_in_loop, emit_ungrouped_aggregation,
+            init_ungrouped_aggregation,
+        },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -112,12 +115,31 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
+    // HAVING without GROUP BY sets group_by to Some with an empty exprs list. That
+    // is still ungrouped aggregation, so key the ungrouped paths below off the
+    // GROUP BY expressions rather than off group_by being None.
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+    let is_ungrouped_aggregation = !plan.aggregates.is_empty() && !has_group_by_exprs;
+
+    // Bare columns that the loop must read for the code emitted after it (HAVING
+    // predicates, result columns that also contain an aggregate).
+    let bare_columns_read_in_loop = if is_ungrouped_aggregation {
+        collect_bare_columns_read_in_loop(plan)?
+    } else {
+        Vec::new()
+    };
+
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
-    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+    // The bare columns above are read under the same flag, so that they hold the
+    // first row's values like SQLite, instead of the last row's.
+    let has_ungrouped_nonagg_cols = is_ungrouped_aggregation
+        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+            || !bare_columns_read_in_loop.is_empty());
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
@@ -143,11 +165,6 @@ pub fn emit_query<'a>(
             }
         }
     }
-
-    let has_group_by_exprs = plan
-        .group_by
-        .as_ref()
-        .is_some_and(|gb| !gb.exprs.is_empty());
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
@@ -175,10 +192,10 @@ pub fn emit_query<'a>(
             )?;
         }
     } else if !plan.aggregates.is_empty() {
-        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
-        // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
-        // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
-        t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
+        // Handle aggregation without GROUP BY (or HAVING without GROUP BY):
+        // null the aggregate accumulators and the registers for bare columns
+        // read during the loop, before the loop starts.
+        init_ungrouped_aggregation(program, t_ctx, plan, bare_columns_read_in_loop);
     } else if let Some(window) = &plan.window {
         EmitWindow::init(
             program,
