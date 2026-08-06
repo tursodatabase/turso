@@ -322,7 +322,8 @@ impl SimpleQueryHandler for TursoPgHandler {
                 responses.push(execute_non_query(&mut stmt, sql)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                responses.push(execute_query(&mut stmt, header)?);
+                let extra_float_digits = conn.extra_float_digits();
+                responses.push(execute_query(&mut stmt, header, extra_float_digits)?);
             }
         }
 
@@ -366,7 +367,8 @@ impl ExtendedQueryHandler for TursoPgHandler {
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        execute_query(&mut stmt, header)
+        let extra_float_digits = conn.extra_float_digits();
+        execute_query(&mut stmt, header, extra_float_digits)
     }
 
     async fn do_describe_statement<C>(
@@ -511,6 +513,7 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 fn execute_query(
     stmt: &mut turso_core::Statement,
     header: Arc<Vec<FieldInfo>>,
+    extra_float_digits: i32,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
@@ -518,11 +521,17 @@ fn execute_query(
     stmt.run_with_row_callback(|row| {
         let mut encoder = DataRowEncoder::new(header_clone.clone());
         for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
+            let (pg_type, field_format) = header_clone
                 .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+                .map(|fi| (fi.datatype().clone(), fi.format()))
+                .unwrap_or((Type::TEXT, FieldFormat::Text));
+            encode_value(
+                &mut encoder,
+                val,
+                &pg_type,
+                field_format,
+                extra_float_digits,
+            )?;
         }
         rows.push(encoder.finish());
         Ok(())
@@ -716,10 +725,88 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// Render a float8 the way PostgreSQL's float8out does.
+///
+/// extra_float_digits >= 1 (the default) selects shortest-roundtrip
+/// digits; 0 and below selects the legacy fixed-precision form with
+/// 15 + extra_float_digits significant digits. Scientific notation kicks
+/// in below 1e-4 or at 1e15 (legacy: at 10^precision), the exponent is
+/// signed and zero-padded to two digits, and the specials use
+/// PostgreSQL's spellings.
+fn format_float8(value: f64, extra_float_digits: i32) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+
+    let (digits, exp10, sci_at) = if extra_float_digits >= 1 {
+        // "{:e}" renders the shortest-roundtrip mantissa, e.g. "1.5e-7".
+        let sci = format!("{:e}", value.abs());
+        let (mantissa, exp) = sci.split_once('e').expect("{:e} always has an exponent");
+        (
+            mantissa.replace('.', ""),
+            exp.parse::<i32>().expect("float exponent is an integer"),
+            15,
+        )
+    } else {
+        let precision = (15 + extra_float_digits).max(1) as usize;
+        let sci = format!("{:.*e}", precision - 1, value.abs());
+        let (mantissa, exp) = sci.split_once('e').expect("{:e} always has an exponent");
+        let mut digits = mantissa.replace('.', "");
+        // %g strips trailing zeros after rounding.
+        while digits.len() > 1 && digits.ends_with('0') {
+            digits.pop();
+        }
+        let exp = exp.parse::<i32>().expect("float exponent is an integer");
+        (digits, exp, precision as i32)
+    };
+
+    let sign = if value < 0.0 { "-" } else { "" };
+    let mut out = String::with_capacity(digits.len() + 8);
+    out.push_str(sign);
+    if exp10 < -4 || exp10 >= sci_at {
+        // Scientific: d[.ddd]e±NN with the exponent padded to two digits.
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if exp10 < 0 { '-' } else { '+' });
+        out.push_str(&format!("{:02}", exp10.abs()));
+    } else if exp10 < 0 {
+        out.push_str("0.");
+        for _ in 0..(-exp10 - 1) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else {
+        let int_len = exp10 as usize + 1;
+        if digits.len() <= int_len {
+            out.push_str(&digits);
+            for _ in 0..(int_len - digits.len()) {
+                out.push('0');
+            }
+        } else {
+            out.push_str(&digits[..int_len]);
+            out.push('.');
+            out.push_str(&digits[int_len..]);
+        }
+    }
+    out
+}
+
 fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
     pg_type: &Type,
+    field_format: FieldFormat,
+    extra_float_digits: i32,
 ) -> turso_core::Result<()> {
     match val {
         Value::Null => encoder
@@ -737,9 +824,22 @@ fn encode_value(
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
-        Value::Numeric(turso_core::Numeric::Float(f)) => encoder
-            .encode_field(&f64::from(*f))
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+        Value::Numeric(turso_core::Numeric::Float(f)) => {
+            if field_format == FieldFormat::Text {
+                encoder
+                    .encode_field_with_type_and_format(
+                        &format_float8(f64::from(*f), extra_float_digits).as_str(),
+                        &Type::TEXT,
+                        FieldFormat::Text,
+                        &FormatOptions::default(),
+                    )
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else {
+                encoder
+                    .encode_field(&f64::from(*f))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            }
+        }
         Value::Text(t) => {
             let text = t.value.as_ref();
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients

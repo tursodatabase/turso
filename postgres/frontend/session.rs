@@ -164,6 +164,17 @@ impl PgConnection {
         &self.inner.conn
     }
 
+    /// Current extra_float_digits setting; drives float8 text output.
+    /// PostgreSQL's default of 1 means shortest-roundtrip formatting.
+    pub fn extra_float_digits(&self) -> i32 {
+        let state = self.inner.session_state.lock().unwrap();
+        state
+            .gucs
+            .get("extra_float_digits")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    }
+
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
         prepare_statement(&self.inner, sql.as_ref())
     }
