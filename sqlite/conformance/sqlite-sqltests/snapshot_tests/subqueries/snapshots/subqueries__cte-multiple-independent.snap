@@ -44,7 +44,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode              p1  p2  p3  p4            p5  comment
-   0  Init                 0  68   0                 0  Start at 68
+   0  Init                 0  69   0                 0  Start at 69
    1  InitCoroutine        1  34   2                 0
    2  Once                23   0   0                 0  goto 23
    3  OpenEphemeral        0   0   0                 0  cursor=0 is_table=false
@@ -78,41 +78,42 @@ addr  opcode              p1  p2  p3  p4            p5  comment
   31    Yield              1   0   0                 0
   32  Next                 0  26   0                 0
   33  EndCoroutine         1   0   0                 0
-  34  OpenEphemeral        3   0   0                 0  cursor=3 is_table=false
-  35  OpenRead             4   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
-  36  Rewind               4  51   0                 0  Rewind table orders
-  37    Column             4   3  21                 0  r[21]=orders.total_amount
-  38    RealAffinity      21   0   0                 0
-  39    Le                21  22  50  Binary         0  if r[21]<=r[22] goto 50
-  40    RowId              4  17   0                 0  r[17]=orders.rowid
-  41    Column             4   1  18                 0  r[18]=orders.customer_id
-  42    Column             4   3  19                 0  r[19]=orders.total_amount
-  43    RealAffinity      19   0   0                 0
-  44    Copy              18  24   0                 0  r[24]=r[18]
-  45    Copy              17  25   0                 0  r[25]=r[17]
-  46    Copy              19  26   0                 0  r[26]=r[19]
-  47    Sequence           3  27   0                 0
-  48    MakeRecord        24   4  23                 0  r[23]=mkrec(r[24..27]); for ephemeral_subquery_t8
-  49    IdxInsert          3  23   0                 8  key=r[23]
-  50  Next                 4  37   0                 0
-  51  InitCoroutine        1   0   2                 0
-  52    Yield              1  67   0                 0
-  53    Copy              11  30   0                 0  r[30]=r[11]
-  54    IsNull            30  66   0                 0  if (r[30]==NULL) goto 66
-  55    Affinity          30   1   0                 0  r[30..31] = C
-  56    SeekGE             3  66  30                 0  key=[30..30]
-  57      IdxGT            3  66  30                 0  key=[30..30]
-  58      Column           3   1  14                 0  r[14]=ephemeral(ephemeral_subquery_t8).id
-  59      Column           3   0  15                 0  r[15]=ephemeral(ephemeral_subquery_t8).customer_id
-  60      Column           3   2  16                 0  r[16]=ephemeral(ephemeral_subquery_t8).total_amount
-  61      Copy            12  28   0                 0  r[28]=r[12]
-  62      Column           3   2  29                 0  r[29]=ephemeral(ephemeral_subquery_t8).total_amount
-  63      RealAffinity    29   0   0                 0
-  64      ResultRow       28   2   0                 0  output=r[28..29]
-  65    Next               3  57   0                 0
-  66  Goto                 0  52   0                 0
-  67  Halt                 0   0   0                 0
-  68  Transaction          0   1  11                 0  iDb=0 tx_mode=Read
-  69  Integer           1000   8   0                 0  r[8]=1000
-  70  Integer           1000  22   0                 0  r[22]=1000
-  71  Goto                 0   1   0                 0
+  34  Once                52   0   0                 0  goto 52
+  35  OpenEphemeral        3   0   0                 0  cursor=3 is_table=false
+  36  OpenRead             4   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+  37  Rewind               4  52   0                 0  Rewind table orders
+  38    Column             4   3  21                 0  r[21]=orders.total_amount
+  39    RealAffinity      21   0   0                 0
+  40    Le                21  22  51  Binary         0  if r[21]<=r[22] goto 51
+  41    RowId              4  17   0                 0  r[17]=orders.rowid
+  42    Column             4   1  18                 0  r[18]=orders.customer_id
+  43    Column             4   3  19                 0  r[19]=orders.total_amount
+  44    RealAffinity      19   0   0                 0
+  45    Copy              18  24   0                 0  r[24]=r[18]
+  46    Copy              17  25   0                 0  r[25]=r[17]
+  47    Copy              19  26   0                 0  r[26]=r[19]
+  48    Sequence           3  27   0                 0
+  49    MakeRecord        24   4  23                 0  r[23]=mkrec(r[24..27]); for ephemeral_subquery_t8
+  50    IdxInsert          3  23   0                 8  key=r[23]
+  51  Next                 4  38   0                 0
+  52  InitCoroutine        1   0   2                 0
+  53    Yield              1  68   0                 0
+  54    Copy              11  30   0                 0  r[30]=r[11]
+  55    IsNull            30  67   0                 0  if (r[30]==NULL) goto 67
+  56    Affinity          30   1   0                 0  r[30..31] = C
+  57    SeekGE             3  67  30                 0  key=[30..30]
+  58      IdxGT            3  67  30                 0  key=[30..30]
+  59      Column           3   1  14                 0  r[14]=ephemeral(ephemeral_subquery_t8).id
+  60      Column           3   0  15                 0  r[15]=ephemeral(ephemeral_subquery_t8).customer_id
+  61      Column           3   2  16                 0  r[16]=ephemeral(ephemeral_subquery_t8).total_amount
+  62      Copy            12  28   0                 0  r[28]=r[12]
+  63      Column           3   2  29                 0  r[29]=ephemeral(ephemeral_subquery_t8).total_amount
+  64      RealAffinity    29   0   0                 0
+  65      ResultRow       28   2   0                 0  output=r[28..29]
+  66    Next               3  58   0                 0
+  67  Goto                 0  53   0                 0
+  68  Halt                 0   0   0                 0
+  69  Transaction          0   1  11                 0  iDb=0 tx_mode=Read
+  70  Integer           1000   8   0                 0  r[8]=1000
+  71  Integer           1000  22   0                 0  r[22]=1000
+  72  Goto                 0   1   0                 0

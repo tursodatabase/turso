@@ -1760,6 +1760,15 @@ fn emit_indexed_materialized_subquery(
         };
     }
 
+    let build_end = if plan_is_correlated(plan) {
+        None
+    } else {
+        let label = program.allocate_label();
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: label,
+        });
+        Some(label)
+    };
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id,
         is_table: false,
@@ -1812,6 +1821,10 @@ fn emit_indexed_materialized_subquery(
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
         }
+    }
+
+    if let Some(build_end) = build_end {
+        program.preassign_label_to_next_insn(build_end);
     }
 
     Ok(result_columns_start_reg)

@@ -35,85 +35,86 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                  p1  p2  p3  p4                                     p5  comment
-   0          Init             0  77   0                                          0  Start at 77
-   1          OpenEphemeral    0   0   0                                          0  cursor=0 is_table=false
-   2          Null             0  11   0                                          0  r[11]=NULL
-   3          SorterOpen       1   2   0  k(1,B)                                  0  cursor=1
-   4          Integer          0   8   0                                          0  r[8]=0; clear group by abort flag
-   5          Null             0   9   0                                          0  r[9]=NULL; initialize group by comparison registers to NULL
-   6          Gosub           15  47   0                                          0  ; go to clear accumulator subroutine
-   7          OpenRead         3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   8          Rewind           3  14   0                                          0  Rewind table lineitem
-   9            Column         3   1  13                                          0  r[13]=lineitem.L_PARTKEY
-  10            Column         3   4  14                                          0  r[14]=lineitem.L_QUANTITY
-  11            MakeRecord    13   2  12                                          0  r[12]=mkrec(r[13..14])
-  12            SorterInsert   1  12   0  0                                       0  key=r[12]
-  13          Next             3   9   0                                          0
-  14          OpenPseudo       2  12   2                                          0  2 columns in r[12]
-  15          SorterSort       1  30   0                                          0
-  16            SorterData     1  12   2                                          0  r[12]=data
-  17            Column         2   0  16                                          0  r[16]=pseudo.column 0
-  18            Compare        9  16   1  k(1, Binary)                            0  r[9..9]==r[16..16]
-  19            Jump          20  24  20                                          0  ; start new group if comparison is not equal
-  20            Gosub          6  34   0                                          0  ; check if ended group had data, and output if so
-  21            Move          16   9   1                                          0  r[9..9]=r[16..16]
-  22            IfPos          8  50   0                                          0  r[8]>0 -> r[8]-=0, goto 50; check abort flag
-  23            Gosub         15  47   0                                          0  ; goto clear accumulator subroutine
-  24            Column         2   1  17                                          0  r[17]=pseudo.column 1
-  25            AggStep        0  17  11  avg                                     0  accum=r[11] step(r[17])
-  26            If             7  28   0                                          0  if r[7] goto 28; don't emit group columns if continuing existing group
-  27            Column         2   0  10                                          0  r[10]=pseudo.column 0
-  28            Integer        1   7   0                                          0  r[7]=1; indicate data in accumulator
-  29          SorterNext       1  16   0                                          0
-  30          Gosub            6  34   0                                          0  ; emit row for final group
-  31          Goto             0  50   0                                          0  ; group by finished
-  32          Integer          1   8   0                                          0  r[8]=1
-  33        Return             6   0   0                                          0
-  34        IfPos              7  36   0                                          0  r[7]>0 -> r[7]-=0, goto 36; output group by row subroutine start
-  35      Return               6   0   0                                          0
-  36      AggFinal             0  11   0  avg                                     0  accum=r[11]
-  37      Real                 0  18   0  0.2                                     0  r[18]=0.2
-  38      Copy                11  19   0                                          0  r[19]=r[11]
-  39      Multiply            18  19   4                                          0  r[4]=r[18]*r[19]
-  40      Copy                10   5   0                                          0  r[5]=r[10]
-  41      Copy                 5  21   0                                          0  r[21]=r[5]
-  42      Copy                 4  22   0                                          0  r[22]=r[4]
-  43      Sequence             0  23   0                                          0
-  44      MakeRecord          21   3  20                                          0  r[20]=mkrec(r[21..23]); for ephemeral_subquery_t3
-  45      IdxInsert            0  20   0                                          8  key=r[20]
-  46    Return                 6   0   0                                          0
-  47    Null                   0  10  11                                          0  r[10..11]=NULL; clear accumulator subroutine start
-  48    Integer                0   7   0                                          0  r[7]=0
-  49  Return                  15   0   0                                          0
-  50  Null                     0  25   0                                          0  r[25]=NULL
-  51  OpenRead                 4  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-  52  OpenRead                 5   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
-  53  Rewind                   4  72   0                                          0  Rewind table lineitem
-  54    Column                 4   1  26                                          0  r[26]=lineitem.L_PARTKEY
-  55    SeekRowid              5  26  71                                          0  if (r[26]!=cursor 5 for table part.rowid) goto 71
-  56    Column                 5   3  28                                          0  r[28]=part.P_BRAND
-  57    Ne                    28  29  71  Binary                                  0  if r[28]!=r[29] goto 71
-  58    Column                 5   6  31                                          0  r[31]=part.P_CONTAINER
-  59    Ne                    31  32  71  Binary                                  0  if r[31]!=r[32] goto 71
-  60    RowId                  5  33   0                                          0  r[33]=part.rowid
-  61    SeekGE                 0  71  33                                          0  key=[33..33]
-  62      IdxGT                0  71  33                                          0  key=[33..33]
-  63      Column               0   1   2                                          0  r[2]=ephemeral(ephemeral_subquery_t3).0.2 * avg(l_quantity)
-  64      Column               0   0   3                                          0  r[3]=ephemeral(ephemeral_subquery_t3).correlation_key_0
-  65      Column               4   4  35                                          0  r[35]=lineitem.L_QUANTITY
-  66      Column               0   1  36                                          0  r[36]=ephemeral(ephemeral_subquery_t3).0.2 * avg(l_quantity)
-  67      Ge                  35  36  70  Binary                                  0  if r[35]>=r[36] goto 70
-  68      Column               4   5  37                                          0  r[37]=lineitem.L_EXTENDEDPRICE
-  69      AggStep              0  37  25  sum                                     0  accum=r[25] step(r[37])
-  70    Next                   0  62   0                                          0
-  71  Next                     4  54   0                                          0
-  72  AggFinal                 0  25   0  sum                                     0  accum=r[25]
-  73  Copy                    25  38   0                                          0  r[38]=r[25]
-  74  Divide                  38  39  24                                          0  r[24]=r[38]/r[39]
-  75  ResultRow               24   1   0                                          0  output=r[24]
-  76  Halt                     0   0   0                                          0
-  77  Transaction              0   1   8                                          0  iDb=0 tx_mode=Read
-  78  String8                  0  29   0  Brand#52                                0  r[29]='Brand#52'
-  79  String8                  0  32   0  LG CAN                                  0  r[32]='LG CAN'
-  80  Real                     0  39   0  7.0                                     0  r[39]=7
-  81  Goto                     0   1   0                                          0
+   0          Init             0  78   0                                          0  Start at 78
+   1          Once            51   0   0                                          0  goto 51
+   2          OpenEphemeral    0   0   0                                          0  cursor=0 is_table=false
+   3          Null             0  11   0                                          0  r[11]=NULL
+   4          SorterOpen       1   2   0  k(1,B)                                  0  cursor=1
+   5          Integer          0   8   0                                          0  r[8]=0; clear group by abort flag
+   6          Null             0   9   0                                          0  r[9]=NULL; initialize group by comparison registers to NULL
+   7          Gosub           15  48   0                                          0  ; go to clear accumulator subroutine
+   8          OpenRead         3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+   9          Rewind           3  15   0                                          0  Rewind table lineitem
+  10            Column         3   1  13                                          0  r[13]=lineitem.L_PARTKEY
+  11            Column         3   4  14                                          0  r[14]=lineitem.L_QUANTITY
+  12            MakeRecord    13   2  12                                          0  r[12]=mkrec(r[13..14])
+  13            SorterInsert   1  12   0  0                                       0  key=r[12]
+  14          Next             3  10   0                                          0
+  15          OpenPseudo       2  12   2                                          0  2 columns in r[12]
+  16          SorterSort       1  31   0                                          0
+  17            SorterData     1  12   2                                          0  r[12]=data
+  18            Column         2   0  16                                          0  r[16]=pseudo.column 0
+  19            Compare        9  16   1  k(1, Binary)                            0  r[9..9]==r[16..16]
+  20            Jump          21  25  21                                          0  ; start new group if comparison is not equal
+  21            Gosub          6  35   0                                          0  ; check if ended group had data, and output if so
+  22            Move          16   9   1                                          0  r[9..9]=r[16..16]
+  23            IfPos          8  51   0                                          0  r[8]>0 -> r[8]-=0, goto 51; check abort flag
+  24            Gosub         15  48   0                                          0  ; goto clear accumulator subroutine
+  25            Column         2   1  17                                          0  r[17]=pseudo.column 1
+  26            AggStep        0  17  11  avg                                     0  accum=r[11] step(r[17])
+  27            If             7  29   0                                          0  if r[7] goto 29; don't emit group columns if continuing existing group
+  28            Column         2   0  10                                          0  r[10]=pseudo.column 0
+  29            Integer        1   7   0                                          0  r[7]=1; indicate data in accumulator
+  30          SorterNext       1  17   0                                          0
+  31          Gosub            6  35   0                                          0  ; emit row for final group
+  32          Goto             0  51   0                                          0  ; group by finished
+  33          Integer          1   8   0                                          0  r[8]=1
+  34        Return             6   0   0                                          0
+  35        IfPos              7  37   0                                          0  r[7]>0 -> r[7]-=0, goto 37; output group by row subroutine start
+  36      Return               6   0   0                                          0
+  37      AggFinal             0  11   0  avg                                     0  accum=r[11]
+  38      Real                 0  18   0  0.2                                     0  r[18]=0.2
+  39      Copy                11  19   0                                          0  r[19]=r[11]
+  40      Multiply            18  19   4                                          0  r[4]=r[18]*r[19]
+  41      Copy                10   5   0                                          0  r[5]=r[10]
+  42      Copy                 5  21   0                                          0  r[21]=r[5]
+  43      Copy                 4  22   0                                          0  r[22]=r[4]
+  44      Sequence             0  23   0                                          0
+  45      MakeRecord          21   3  20                                          0  r[20]=mkrec(r[21..23]); for ephemeral_subquery_t3
+  46      IdxInsert            0  20   0                                          8  key=r[20]
+  47    Return                 6   0   0                                          0
+  48    Null                   0  10  11                                          0  r[10..11]=NULL; clear accumulator subroutine start
+  49    Integer                0   7   0                                          0  r[7]=0
+  50  Return                  15   0   0                                          0
+  51  Null                     0  25   0                                          0  r[25]=NULL
+  52  OpenRead                 4  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+  53  OpenRead                 5   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
+  54  Rewind                   4  73   0                                          0  Rewind table lineitem
+  55    Column                 4   1  26                                          0  r[26]=lineitem.L_PARTKEY
+  56    SeekRowid              5  26  72                                          0  if (r[26]!=cursor 5 for table part.rowid) goto 72
+  57    Column                 5   3  28                                          0  r[28]=part.P_BRAND
+  58    Ne                    28  29  72  Binary                                  0  if r[28]!=r[29] goto 72
+  59    Column                 5   6  31                                          0  r[31]=part.P_CONTAINER
+  60    Ne                    31  32  72  Binary                                  0  if r[31]!=r[32] goto 72
+  61    RowId                  5  33   0                                          0  r[33]=part.rowid
+  62    SeekGE                 0  72  33                                          0  key=[33..33]
+  63      IdxGT                0  72  33                                          0  key=[33..33]
+  64      Column               0   1   2                                          0  r[2]=ephemeral(ephemeral_subquery_t3).0.2 * avg(l_quantity)
+  65      Column               0   0   3                                          0  r[3]=ephemeral(ephemeral_subquery_t3).correlation_key_0
+  66      Column               4   4  35                                          0  r[35]=lineitem.L_QUANTITY
+  67      Column               0   1  36                                          0  r[36]=ephemeral(ephemeral_subquery_t3).0.2 * avg(l_quantity)
+  68      Ge                  35  36  71  Binary                                  0  if r[35]>=r[36] goto 71
+  69      Column               4   5  37                                          0  r[37]=lineitem.L_EXTENDEDPRICE
+  70      AggStep              0  37  25  sum                                     0  accum=r[25] step(r[37])
+  71    Next                   0  63   0                                          0
+  72  Next                     4  55   0                                          0
+  73  AggFinal                 0  25   0  sum                                     0  accum=r[25]
+  74  Copy                    25  38   0                                          0  r[38]=r[25]
+  75  Divide                  38  39  24                                          0  r[24]=r[38]/r[39]
+  76  ResultRow               24   1   0                                          0  output=r[24]
+  77  Halt                     0   0   0                                          0
+  78  Transaction              0   1   8                                          0  iDb=0 tx_mode=Read
+  79  String8                  0  29   0  Brand#52                                0  r[29]='Brand#52'
+  80  String8                  0  32   0  LG CAN                                  0  r[32]='LG CAN'
+  81  Real                     0  39   0  7.0                                     0  r[39]=7
+  82  Goto                     0   1   0                                          0
