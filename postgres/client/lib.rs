@@ -386,6 +386,56 @@ impl PgConn {
         }
     }
 
+    /// Runs one statement with a sequence of Execute phases against a
+    /// single named portal — one per entry in `row_limits` (0 means no
+    /// limit) — then Sync. Exercises portal suspension the way cursor
+    /// drivers do (pgJDBC and asyncpg bind named portals for fetch-size
+    /// cursors): a limited Execute that has more rows to give ends with
+    /// PortalSuspended instead of CommandComplete, and the next Execute
+    /// resumes where it stopped.
+    pub fn extended_query_row_limits(
+        &mut self,
+        sql: &str,
+        row_limits: &[u32],
+    ) -> Result<Vec<BackendEvent>> {
+        const PORTAL: &[u8] = b"c1\0";
+
+        // Parse: unnamed statement, no declared parameter types.
+        let mut body = vec![0u8];
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0u16.to_be_bytes());
+        self.write_message(b'P', &body)?;
+
+        // Bind: named portal, no parameters, text results.
+        let mut body = Vec::from(PORTAL);
+        body.push(0); // unnamed statement
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        self.write_message(b'B', &body)?;
+
+        for limit in row_limits {
+            let mut body = Vec::from(PORTAL);
+            body.extend_from_slice(&limit.to_be_bytes());
+            self.write_message(b'E', &body)?;
+        }
+        // Close the portal, then Sync.
+        self.write_message(b'C', &[&[b'P'][..], PORTAL].concat())?;
+        self.write_message(b'S', &[])?;
+
+        let mut events = Vec::new();
+        loop {
+            let event = self.read_event()?;
+            let done = matches!(event, BackendEvent::ReadyForQuery(_));
+            events.push(event);
+            if done {
+                return Ok(events);
+            }
+        }
+    }
+
     /// Sends one CopyData frame during an active `COPY ... FROM STDIN`.
     pub fn send_copy_data(&mut self, data: &[u8]) -> Result<()> {
         self.write_message(b'd', data)

@@ -377,6 +377,15 @@ impl ExtendedQueryHandler for TursoPgHandler {
         self.query_parser.clone()
     }
 
+    /// Execute row limits (portal suspension) are handled by pgwire's
+    /// on_execute around this method: it slices the returned row stream,
+    /// sends PortalSuspended when a limit is reached, and resumes a
+    /// suspended portal without calling here again — which is why
+    /// max_rows goes unused. Two knowing gaps: pgwire drops the *unnamed*
+    /// portal after every Execute, so suspend-then-resume works on named
+    /// portals only (what cursor drivers use; fixing the unnamed case
+    /// means forking pgwire's whole on_execute), and the row stream is
+    /// buffered here rather than pulled from the engine on demand.
     async fn do_query<C>(
         &self,
         _client: &mut C,
