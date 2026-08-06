@@ -1,20 +1,18 @@
-use crate::alloc::ALLOC_ERR_MSG;
 use crate::sync::{Arc, Weak};
-use crate::turso_assert;
-use crate::turso_debug_assert;
 use crate::{
     index_method::{
-        parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
-        IndexMethodCursor, IndexMethodDefinition,
+        open_index_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
+        IndexMethodConfiguration, IndexMethodContext, IndexMethodCursor, IndexMethodDefinition,
     },
     return_if_io,
     schema::IndexColumn,
     storage::{
-        btree::{BTreeCursor, BTreeKey, CursorTrait},
+        btree::{BTreeKey, CursorTrait},
         pager::Pager,
     },
     translate::collate::CollationSeq,
-    types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
+    turso_assert,
+    types::{IOResult, ImmutableRecord, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
     util::quote_identifier,
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -24,7 +22,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::{cell::RefCell, sync::atomic::Ordering};
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 use tantivy::{
     directory::{
         error::{DeleteError, OpenReadError, OpenWriteError},
@@ -50,7 +51,7 @@ pub const FTS_INDEX_METHOD_NAME: &str = "fts";
 /// Controls how much memory Tantivy uses for in-memory indexing before flushing to disk.
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Default chunk size (152KB) for splitting large files when storing in BTree.
+/// Default chunk size (512 KiB) for splitting large files when storing in BTree.
 /// Files larger than this are split into multiple chunks for efficient storage and retrieval.
 pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
 
@@ -89,6 +90,38 @@ const FTS_MAX_CACHED_CONNECTIONS: usize = 4;
 
 /// Aggregate resident file-cache budget across retained connection snapshots.
 const FTS_MAX_RETAINED_CACHE_BYTES: usize = DEFAULT_HOT_CACHE_BYTES + DEFAULT_CHUNK_CACHE_BYTES;
+
+#[cfg(feature = "test_helper")]
+crate::thread::thread_local! {
+    static FTS_RETAINED_CACHE_BYTES_OVERRIDE: core::cell::Cell<Option<usize>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Override the retained-cache budget for tests on the current thread, so
+/// budget-admission rejection is reachable without multi-hundred-MiB indexes.
+/// Pass `None` to restore the default.
+#[cfg(feature = "test_helper")]
+pub fn set_fts_retained_cache_bytes_for_test(bytes: Option<usize>) {
+    FTS_RETAINED_CACHE_BYTES_OVERRIDE.with(|cell| cell.set(bytes));
+}
+
+fn fts_max_retained_cache_bytes() -> usize {
+    #[cfg(feature = "test_helper")]
+    if let Some(bytes) = FTS_RETAINED_CACHE_BYTES_OVERRIDE.with(|cell| cell.get()) {
+        return bytes;
+    }
+    FTS_MAX_RETAINED_CACHE_BYTES
+}
+
+const FTS_CONTROL_PATH: &str = "__turso_fts_control_v1";
+const FTS_CONTROL_MAGIC: &[u8; 8] = b"TFTSCTL1";
+const FTS_CONTROL_FORMAT_VERSION: u32 = 1;
+/// Placeholder incarnation for an index with no persisted control record yet
+/// (an empty catalog). Deterministic, so every connection opening a
+/// never-written index agrees on it; the real incarnation is minted when the
+/// first control record is staged and is never this value.
+const FTS_EMPTY_INDEX_INCARNATION: u64 = 0;
+static NEXT_FTS_INDEX_INCARNATION: AtomicU64 = AtomicU64::new(1);
 
 const ROWID_FIELD: &str = "rowid";
 
@@ -218,83 +251,224 @@ pub fn fts_match(text: &str, query: &str) -> bool {
     })
 }
 
-/// File classification for hybrid caching strategy.
-/// Determines which files are kept hot in memory vs lazy-loaded on demand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileCategory {
-    /// Always in memory: meta.json, .managed.json, .lock (typically < 64KB)
-    Metadata,
-    /// Hot files: .term dictionaries - loaded on first access, kept in LRU
-    TermDictionary,
-    /// Fast fields and field norms - small, frequently accessed
-    FastFields,
-    /// Cold files: .idx, .pos, .store - lazy-loaded on demand
-    SegmentData,
-}
-
-impl FileCategory {
-    const METADATA_FILES: [&'static str; 3] = [TANTIVY_META_FILE, ".managed.json", ".lock"];
-    /// Classify a file based on its path/extension.
-    /// https://fulmicoton.gitbooks.io/tantivy-doc/content/index-files.html
-    fn from_path(path: &Path) -> Self {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-        // Check for known Tantivy metadata files first
-        if Self::METADATA_FILES.contains(&name) {
-            return FileCategory::Metadata;
-        }
-
-        match ext {
-            // Term dictionary - hot for queries
-            "term" => FileCategory::TermDictionary,
-            // Fast fields and field norms - small, frequently accessed
-            "fast" | "fieldnorm" => FileCategory::FastFields,
-            // Segment data - large, lazy-loaded
-            "idx" | "pos" | "store" => FileCategory::SegmentData,
-            "lock" | "info" => FileCategory::Metadata,
-            // Default to segment data (lazy-loaded)
-            _ => FileCategory::SegmentData,
-        }
-    }
-
-    /// Returns true if files in this category should be preloaded at startup.
-    const fn should_preload(&self) -> bool {
-        matches!(self, FileCategory::Metadata)
-    }
-
-    /// Returns true if files in this category should be kept in the hot cache.
-    const fn is_hot(&self) -> bool {
-        matches!(
-            self,
-            FileCategory::Metadata | FileCategory::TermDictionary | FileCategory::FastFields
-        )
-    }
-}
-
 /// Metadata about a file stored in the FTS directory.
-/// Used for catalog-first loading where we build file metadata without loading content.
+/// Used for merge-budget accounting.
 #[derive(Debug, Clone)]
 struct FileMetadata {
     /// Total file size in bytes
     size: usize,
-    /// Number of chunks this file is split into
-    num_chunks: usize,
-    /// File category for caching decisions
-    category: FileCategory,
+    chunks: u64,
 }
 
 impl FileMetadata {
-    fn new(path: &Path, size: usize, num_chunks: usize) -> Self {
+    fn new(_path: &Path, size: usize, num_chunks: usize) -> Self {
         Self {
             size,
-            num_chunks,
-            category: FileCategory::from_path(path),
+            chunks: num_chunks as u64,
         }
     }
 }
 
-type ChunkKey = (PathBuf, i64);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FtsManifestFile {
+    size: u64,
+    chunks: u64,
+}
+
+#[derive(Debug, Clone)]
+struct FtsControlRecord {
+    index_incarnation: u64,
+    manifest_generation: u64,
+    files: HashMap<PathBuf, FtsManifestFile>,
+}
+
+impl FtsControlRecord {
+    fn new(index_incarnation: u64) -> Self {
+        Self {
+            index_incarnation,
+            manifest_generation: 0,
+            files: HashMap::default(),
+        }
+    }
+
+    fn from_catalog(
+        previous: Option<&Self>,
+        index_incarnation: u64,
+        catalog: &Catalog,
+    ) -> Result<Self> {
+        let manifest_generation = match previous {
+            Some(control) => control.manifest_generation.checked_add(1).ok_or_else(|| {
+                LimboError::InternalError("FTS manifest generation is exhausted".to_string())
+            })?,
+            None => 1,
+        };
+        let mut files = HashMap::default();
+        for (path, metadata) in catalog {
+            let path_text = path.to_str().ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "FTS manifest path is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+            let _ = path_text;
+            files.insert(
+                path.clone(),
+                FtsManifestFile {
+                    size: metadata.size as u64,
+                    chunks: metadata.chunks,
+                },
+            );
+        }
+        Ok(Self {
+            index_incarnation,
+            manifest_generation,
+            files,
+        })
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FTS_CONTROL_MAGIC);
+        bytes.extend_from_slice(&FTS_CONTROL_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.index_incarnation.to_le_bytes());
+        bytes.extend_from_slice(&self.manifest_generation.to_le_bytes());
+        let mut files = self.files.iter().collect::<Vec<_>>();
+        files.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let file_count = u32::try_from(files.len())
+            .map_err(|_| LimboError::InternalError("FTS manifest has too many files".into()))?;
+        bytes.extend_from_slice(&file_count.to_le_bytes());
+        for (path, metadata) in files {
+            let path = path.to_str().ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "FTS manifest path is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+            let path_len = u32::try_from(path.len())
+                .map_err(|_| LimboError::InternalError("FTS manifest path is too long".into()))?;
+            bytes.extend_from_slice(&path_len.to_le_bytes());
+            bytes.extend_from_slice(path.as_bytes());
+            bytes.extend_from_slice(&metadata.size.to_le_bytes());
+            bytes.extend_from_slice(&metadata.chunks.to_le_bytes());
+        }
+        let checksum = fts_control_checksum(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        fn take<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N]> {
+            let end = offset
+                .checked_add(N)
+                .ok_or_else(|| LimboError::Corrupt("FTS control record offset overflow".into()))?;
+            let value = bytes
+                .get(*offset..end)
+                .ok_or_else(|| LimboError::Corrupt("truncated FTS control record".into()))?;
+            *offset = end;
+            Ok(value.try_into().expect("slice length checked"))
+        }
+
+        if bytes.len() < FTS_CONTROL_MAGIC.len() + 4 + 8 + 8 + 4 + 8 {
+            return Err(LimboError::Corrupt("truncated FTS control record".into()));
+        }
+        let payload_len = bytes.len() - 8;
+        let expected_checksum = u64::from_le_bytes(
+            bytes[payload_len..]
+                .try_into()
+                .expect("checksum length checked"),
+        );
+        if fts_control_checksum(&bytes[..payload_len]) != expected_checksum {
+            return Err(LimboError::Corrupt(
+                "FTS control record checksum mismatch".into(),
+            ));
+        }
+
+        let mut offset = 0;
+        if take::<8>(bytes, &mut offset)? != *FTS_CONTROL_MAGIC {
+            return Err(LimboError::Corrupt(
+                "unrecognized FTS control record".into(),
+            ));
+        }
+        let version = u32::from_le_bytes(take(bytes, &mut offset)?);
+        if version != FTS_CONTROL_FORMAT_VERSION {
+            return Err(LimboError::Corrupt(format!(
+                "unsupported FTS control format version {version}"
+            )));
+        }
+        let index_incarnation = u64::from_le_bytes(take(bytes, &mut offset)?);
+        let manifest_generation = u64::from_le_bytes(take(bytes, &mut offset)?);
+        let file_count = u32::from_le_bytes(take(bytes, &mut offset)?) as usize;
+        let mut files = HashMap::default();
+        for _ in 0..file_count {
+            let path_len = u32::from_le_bytes(take(bytes, &mut offset)?) as usize;
+            let path_end = offset
+                .checked_add(path_len)
+                .ok_or_else(|| LimboError::Corrupt("FTS manifest path offset overflow".into()))?;
+            let path_bytes = bytes
+                .get(offset..path_end)
+                .ok_or_else(|| LimboError::Corrupt("truncated FTS manifest path".into()))?;
+            offset = path_end;
+            let path = std::str::from_utf8(path_bytes)
+                .map_err(|_| LimboError::Corrupt("FTS manifest path is not UTF-8".into()))?;
+            let size = u64::from_le_bytes(take(bytes, &mut offset)?);
+            let chunks = u64::from_le_bytes(take(bytes, &mut offset)?);
+            if chunks == 0 {
+                return Err(LimboError::Corrupt(format!(
+                    "FTS manifest file {path} has zero chunks"
+                )));
+            }
+            if files
+                .insert(PathBuf::from(path), FtsManifestFile { size, chunks })
+                .is_some()
+            {
+                return Err(LimboError::Corrupt(format!(
+                    "duplicate FTS manifest entry for {path}"
+                )));
+            }
+        }
+        if offset != payload_len {
+            return Err(LimboError::Corrupt(
+                "FTS control record has trailing payload bytes".into(),
+            ));
+        }
+        Ok(Self {
+            index_incarnation,
+            manifest_generation,
+            files,
+        })
+    }
+
+    fn validate_catalog(&self, catalog: &Catalog) -> Result<()> {
+        if self.files.len() != catalog.len() {
+            return Err(LimboError::Corrupt(format!(
+                "FTS manifest contains {} files but storage contains {}",
+                self.files.len(),
+                catalog.len()
+            )));
+        }
+        for (path, metadata) in catalog {
+            let manifest = self.files.get(path).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "FTS storage file {} is absent from the manifest",
+                    path.display()
+                ))
+            })?;
+            if manifest.size != metadata.size as u64 || manifest.chunks != metadata.chunks {
+                return Err(LimboError::Corrupt(format!(
+                    "FTS manifest metadata mismatch for {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn fts_control_checksum(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+    })
+}
 
 /// Eviction samples per put
 const EVICTION_SAMPLES: usize = 8;
@@ -330,18 +504,6 @@ impl<K: std::fmt::Debug> std::fmt::Debug for LruCache<K> {
 }
 
 impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
-    /// Creates a new empty cache with the specified capacity in bytes.
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            inner: RwLock::new(LruCacheInner {
-                current_size: 0,
-                clock: 0,
-                entries: HashMap::default(),
-            }),
-        }
-    }
-
     /// Lookup entry, updating access timestamp. Returns Arc-cloned data.
     fn get<Q>(&self, key: &Q) -> Option<Arc<[u8]>>
     where
@@ -447,30 +609,10 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
     }
 }
 
-/// Specialized methods for ChunkKey (PathBuf, i64) caches.
-impl LruCache<ChunkKey> {
-    /// Invalidate all chunks for a file path.
-    /// Called when a file is deleted or overwritten.
-    fn invalidate(&self, path: &Path) {
-        let mut inner = self.inner.write();
-        let mut freed = 0usize;
-        inner.entries.retain(|(p, _), e| {
-            if p == path {
-                freed += e.data.len();
-                false
-            } else {
-                true
-            }
-        });
-        inner.current_size -= freed;
-    }
-}
-
 /// Specialized methods for PathBuf caches (hot files).
 impl LruCache<PathBuf> {
-    /// Create from preloaded files (used during initialization).
-    fn with_preloaded(capacity: usize, files: HashMap<PathBuf, Vec<u8>>) -> Self {
-        let current_size: usize = files.values().map(|v| v.len()).sum();
+    fn with_preloaded_arcs(capacity: usize, files: HashMap<PathBuf, Arc<[u8]>>) -> Self {
+        let current_size: usize = files.values().map(|data| data.len()).sum();
         let entries: HashMap<PathBuf, LruCacheEntry> = files
             .into_iter()
             .enumerate()
@@ -478,7 +620,7 @@ impl LruCache<PathBuf> {
                 (
                     path,
                     LruCacheEntry {
-                        data: Arc::from(data),
+                        data,
                         accessed: i as u64,
                     },
                 )
@@ -493,6 +635,15 @@ impl LruCache<PathBuf> {
                 entries,
             }),
         }
+    }
+
+    fn arc_snapshot(&self) -> HashMap<PathBuf, Arc<[u8]>> {
+        self.inner
+            .read()
+            .entries
+            .iter()
+            .map(|(path, entry)| (path.clone(), Arc::clone(&entry.data)))
+            .collect()
     }
 }
 
@@ -532,35 +683,21 @@ impl PendingFileMutations {
     }
 }
 
-/// Tantivy Directory implementation backed by Turso's BTree storage.
+/// Tantivy Directory implementation backed by a complete in-memory snapshot.
 ///
 /// Tantivy stores its index as a collection of files (segments, metadata, term dictionaries, etc.).
-/// The `Directory` trait is Tantivy's storage abstraction for reading, writing, and managing
-/// these files. Tantivy's Directory methods are synchronous, so we must do blocking IO to back
-/// these operations and cache data in memory for performance.
+/// The `Directory` trait is synchronous, while Turso storage is asynchronous. The FTS cursor
+/// therefore loads the complete directory through its resumable state machine before constructing
+/// Tantivy objects. Directory callbacks only read this snapshot or cursor-local pending writes;
+/// they must never open a B-tree cursor or drive the pager.
 ///
 /// FTS index files are stored in a BTree with the schema `(path TEXT, chunk_no INTEGER, bytes BLOB)`.
-/// Large files are split into chunks of `DEFAULT_CHUNK_SIZE` (1MB) to enable efficient
+/// Large files are split into chunks of `DEFAULT_CHUNK_SIZE` (512 KiB) to enable efficient
 /// partial reads and bounded memory usage during loading.
-///
-/// We use a two-tier caching strategy to optimize for Tantivy's access patterns:
-///
-/// 1. `hot_cache` (keyed by `PathBuf`): Caches entire files for small,
-///    frequently-accessed files that benefit from being fully resident in memory:
-///    - Metadata files (meta.json, .managed.json, .lock)
-///    - Term dictionaries (.term) - critical for query performance
-///    - Fast fields and field norms (.fast, .fieldnorm)
-///
-/// 2. `chunk_cache` (keyed by `(PathBuf, chunk_no)`): Caches individual 1MB chunks
-///    of large segment files. Large files like posting lists (.idx), positions (.pos),
-///    and document store (.store) are split into 1MB chunks when stored in the BTree.
-///    When Tantivy reads a byte range, we load only the chunks covering that range,
-///    allowing partial file access without loading entire multi-MB files into memory.
 ///
 /// File mutations are buffered in memory and flushed to the BTree when:
 /// - A Tantivy commit occurs (via `commit_and_flush`)
-/// - The cursor is dropped with pending documents
-/// - The transaction is about to commit (via `pre_commit`)
+/// - The statement is finalized (via `prepare_statement_commit`)
 ///
 /// During flush, writes are moved to `flushing_writes` so they remain readable while
 /// the async BTree write completes.
@@ -569,12 +706,15 @@ struct HybridBTreeDirectory {
     /// File catalog: path -> metadata (always in memory, no content)
     catalog: Arc<RwLock<Catalog>>,
 
-    /// Hot cache: LRU cache for frequently accessed files (metadata, term dictionaries)
-    /// Bounded to DEFAULT_HOT_CACHE_BYTES (64MB) to prevent unbounded memory growth
+    /// Complete file snapshot loaded before Tantivy is invoked.
+    ///
+    /// The capacity is deliberately unbounded: eviction would turn a synchronous Tantivy
+    /// callback into a storage read. Connection-level cache pruning bounds retained snapshots.
     hot_cache: Arc<LruCache<PathBuf>>,
 
-    /// Chunk cache: LRU cache for lazy-loaded segment chunks
-    chunk_cache: Arc<LruCache<ChunkKey>>,
+    /// Storage view at cursor checkout, kept separate from Tantivy's mutable
+    /// in-memory view so unchanged rewrites can be elided.
+    base_files: Arc<RwLock<HashMap<PathBuf, Arc<[u8]>>>>,
 
     /// Latest pending mutation for each path.
     pending_mutations: Arc<RwLock<PendingFileMutations>>,
@@ -596,7 +736,6 @@ impl std::fmt::Debug for HybridBTreeDirectory {
             .field("catalog_size", &self.catalog.read().len())
             .field("hot_cache_size", &self.hot_cache.len())
             .field("hot_cache_bytes", &self.hot_cache.size())
-            .field("chunk_cache_size", &self.chunk_cache.size())
             .field("btree_root_page", &self.btree_root_page)
             .finish()
     }
@@ -609,10 +748,14 @@ impl HybridBTreeDirectory {
     /// This prevents the bug where writes from one cursor affect the Drop behavior
     /// of another cursor.
     fn clone_with_fresh_pending(&self) -> Self {
+        let files = self.hot_cache.arc_snapshot();
         Self {
-            catalog: Arc::clone(&self.catalog),
-            hot_cache: Arc::clone(&self.hot_cache),
-            chunk_cache: Arc::clone(&self.chunk_cache),
+            catalog: Arc::new(RwLock::new(self.catalog.read().clone())),
+            hot_cache: Arc::new(LruCache::<PathBuf>::with_preloaded_arcs(
+                usize::MAX,
+                files.clone(),
+            )),
+            base_files: Arc::new(RwLock::new(files)),
             // Fresh pending state - not shared with cache
             pending_mutations: Arc::new(RwLock::new(PendingFileMutations::default())),
             flushing_writes: Arc::new(RwLock::new(HashMap::default())),
@@ -622,27 +765,25 @@ impl HybridBTreeDirectory {
     }
 }
 
-fn io_not_found<M: Into<Box<dyn std::error::Error + Send + Sync>>>(msg: M) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::NotFound, msg)
-}
-
 impl HybridBTreeDirectory {
-    /// Create from preloaded catalog and hot cache files.
+    /// Create from a complete, asynchronously preloaded snapshot.
     fn with_preloaded(
         pager: Arc<Pager>,
         btree_root_page: i64,
         catalog: HashMap<PathBuf, FileMetadata>,
-        hot_files: HashMap<PathBuf, Vec<u8>>,
-        hot_cache_capacity: usize,
-        chunk_cache_capacity: usize,
+        files: HashMap<PathBuf, Vec<u8>>,
     ) -> Self {
+        let base_files = files
+            .into_iter()
+            .map(|(path, data)| (path, Arc::<[u8]>::from(data)))
+            .collect::<HashMap<_, _>>();
         Self {
             catalog: Arc::new(RwLock::new(catalog)),
-            hot_cache: Arc::new(LruCache::<PathBuf>::with_preloaded(
-                hot_cache_capacity,
-                hot_files,
+            hot_cache: Arc::new(LruCache::<PathBuf>::with_preloaded_arcs(
+                usize::MAX,
+                base_files.clone(),
             )),
-            chunk_cache: Arc::new(LruCache::<ChunkKey>::new(chunk_cache_capacity)),
+            base_files: Arc::new(RwLock::new(base_files)),
             pending_mutations: Arc::new(RwLock::new(PendingFileMutations::default())),
             flushing_writes: Arc::new(RwLock::new(HashMap::default())),
             pager,
@@ -664,7 +805,20 @@ impl HybridBTreeDirectory {
     /// while the resumable BTree flush is in progress. `None` is an explicit
     /// delete; `Some(Vec::new())` is an empty file.
     fn take_pending_flushes(&self) -> PendingFlushes {
-        let flushes = self.pending_mutations.write().take_flushes();
+        let base_files = self.base_files.read();
+        let flushes = self
+            .pending_mutations
+            .write()
+            .take_flushes()
+            .into_iter()
+            .filter(|(path, data)| match data {
+                Some(data) => base_files
+                    .get(path)
+                    .is_none_or(|base| base.as_ref() != data.as_slice()),
+                None => base_files.contains_key(path),
+            })
+            .collect::<Vec<_>>();
+        drop(base_files);
 
         {
             let mut flushing = self.flushing_writes.write();
@@ -688,6 +842,7 @@ impl HybridBTreeDirectory {
             flushing.len()
         );
         flushing.clear();
+        *self.base_files.write() = self.hot_cache.arc_snapshot();
     }
 
     /// Find file data in pending or flushing writes.
@@ -710,352 +865,6 @@ impl HybridBTreeDirectory {
         }
 
         None
-    }
-
-    const CHUNK_LEN: usize = 3;
-
-    /// Blocking read of a range of chunks from BTree using a single cursor.
-    /// Efficient for both single and multiple chunk reads, as it only seeks once
-    /// and advances sequentially.
-    fn get_chunks_range_blocking(
-        &self,
-        path: &Path,
-        start_chunk: usize,
-        end_chunk: usize,
-    ) -> std::io::Result<Vec<Arc<[u8]>>> {
-        if start_chunk > end_chunk {
-            return Ok(Vec::new());
-        }
-
-        let mut chunks = Vec::with_capacity(end_chunk - start_chunk + 1);
-        let path_str = path.to_string_lossy().to_string();
-
-        // Check cache for all requested chunks first
-        let mut uncached_start = None;
-        for chunk_no in start_chunk..=end_chunk {
-            let cache_key = (path.to_path_buf(), chunk_no as i64);
-            if let Some(chunk) = self.chunk_cache.get(&cache_key) {
-                chunks.push(chunk);
-            } else {
-                // Found first uncached chunk
-                uncached_start = Some(chunk_no);
-                break;
-            }
-        }
-
-        // If all chunks were cached, return them
-        if uncached_start.is_none() {
-            return Ok(chunks);
-        }
-
-        let uncached_start = uncached_start.unwrap();
-
-        // Create cursor and seek to first uncached chunk
-        let mut cursor =
-            BTreeCursor::new(self.pager.clone(), self.btree_root_page, Self::CHUNK_LEN);
-        cursor.index_info = Some(Arc::new(
-            IndexInfo::new(
-                [key_info(), key_info(), key_info()],
-                false,
-                Self::CHUNK_LEN,
-                false,
-            )
-            .expect(ALLOC_ERR_MSG),
-        ));
-
-        let seek_key = ImmutableRecord::from_values(
-            &[
-                Value::Text(Text::new(path_str.clone())),
-                Value::from_i64(uncached_start as i64),
-                Value::Blob(crate::alloc::vec![]),
-            ],
-            Self::CHUNK_LEN,
-        )
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        // Blocking seek to first chunk
-        loop {
-            match cursor.seek(
-                SeekKey::IndexKey(seek_key.as_record_ref()),
-                SeekOp::GE { eq_only: false },
-            ) {
-                Ok(IOResult::Done(SeekResult::Found)) => break,
-                Ok(IOResult::Done(SeekResult::TryAdvance)) => {
-                    loop {
-                        match cursor.next() {
-                            Ok(IOResult::Done(_)) => {
-                                if !cursor.has_record() {
-                                    return Err(io_not_found(format!(
-                                        "chunk {}:{} not found",
-                                        path.display(),
-                                        uncached_start
-                                    )));
-                                }
-                                break;
-                            }
-                            Ok(IOResult::IO(_)) => {
-                                self.pager
-                                    .io
-                                    .step()
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                            }
-                            Err(e) => return Err(std::io::Error::other(e.to_string())),
-                        }
-                    }
-                    break;
-                }
-                Ok(IOResult::Done(SeekResult::NotFound)) => {
-                    return Err(io_not_found(format!(
-                        "chunk {}:{} not found",
-                        path.display(),
-                        uncached_start
-                    )));
-                }
-                Ok(IOResult::IO(_)) => {
-                    self.pager
-                        .io
-                        .step()
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                }
-                Err(e) => return Err(std::io::Error::other(e.to_string())),
-            }
-        }
-
-        // Read remaining chunks sequentially
-        for expected_chunk_no in uncached_start..=end_chunk {
-            // Check if cursor has a record
-            if !cursor.has_record() {
-                return Err(io_not_found(format!(
-                    "chunk {}:{} not found (cursor exhausted)",
-                    path.display(),
-                    expected_chunk_no
-                )));
-            }
-
-            // Read current record
-            let record = loop {
-                match cursor.record() {
-                    Ok(IOResult::Done(r)) => break r,
-                    Ok(IOResult::IO(_)) => {
-                        self.pager
-                            .io
-                            .step()
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    }
-                    Err(e) => return Err(std::io::Error::other(e.to_string())),
-                }
-            };
-
-            let record = record.ok_or_else(|| io_not_found("no record at cursor"))?;
-
-            // Extract and validate
-            let found_path = record.get_value_opt(0).and_then(|v| match v {
-                crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
-                _ => None,
-            });
-            let found_chunk = record.get_value_opt(1).and_then(|v| match v {
-                crate::types::ValueRef::Numeric(crate::numeric::Numeric::Integer(i)) => Some(i),
-                _ => None,
-            });
-            let bytes = record.get_value_opt(2).and_then(|v| match v {
-                crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
-                _ => None,
-            });
-
-            let (found_path_str, found_chunk_no, bytes) = match (found_path, found_chunk, bytes) {
-                (Some(p), Some(c), Some(b)) => (p, c, b),
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "malformed chunk record",
-                    ));
-                }
-            };
-
-            if found_path_str != path_str || found_chunk_no != expected_chunk_no as i64 {
-                return Err(io_not_found(format!(
-                    "wrong chunk: expected {path_str}:{expected_chunk_no}, got {found_path_str}:{found_chunk_no}",
-                )));
-            }
-
-            // Cache and collect the chunk
-            if can_cache_chunks(path) {
-                let cache_key = (path.to_path_buf(), expected_chunk_no as i64);
-                self.chunk_cache.put(cache_key, bytes.clone());
-            }
-            chunks.push(Arc::from(bytes));
-
-            // Advance cursor to next record (unless this is the last chunk we need)
-            if expected_chunk_no < end_chunk {
-                loop {
-                    match cursor.next() {
-                        Ok(IOResult::Done(_)) => break,
-                        Ok(IOResult::IO(_)) => {
-                            self.pager
-                                .io
-                                .step()
-                                .map_err(|e| std::io::Error::other(e.to_string()))?;
-                        }
-                        Err(e) => return Err(std::io::Error::other(e.to_string())),
-                    }
-                }
-            }
-        }
-
-        Ok(chunks)
-    }
-
-    /// Load an entire file by concatenating all its chunks (blocking).
-    /// Uses efficient bulk read with a single cursor seek.
-    fn load_file_blocking(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        let catalog = self.catalog.read();
-        let metadata = catalog
-            .get(path)
-            .ok_or_else(|| io_not_found(format!("file not in catalog: {}", path.display())))?;
-
-        if metadata.num_chunks == 0 {
-            return Ok(Vec::new());
-        }
-
-        let chunks =
-            self.get_chunks_range_blocking(path, 0, metadata.num_chunks.saturating_sub(1))?;
-
-        let mut result = Vec::with_capacity(metadata.size);
-        for chunk in chunks {
-            result.extend_from_slice(&chunk);
-        }
-
-        Ok(result)
-    }
-
-    /// Read a file's full contents straight from the BTree, bypassing the
-    /// catalog and every cache layer. Returns `None` when the BTree holds no
-    /// rows for the path. Used to validate cached read state.
-    /// against durable state at cursor checkout.
-    fn read_file_from_btree_uncached(&self, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-        let path_str = path.to_string_lossy().to_string();
-        let mut cursor =
-            BTreeCursor::new(self.pager.clone(), self.btree_root_page, Self::CHUNK_LEN);
-        cursor.index_info = Some(Arc::new(
-            IndexInfo::new(
-                [key_info(), key_info(), key_info()],
-                false,
-                Self::CHUNK_LEN,
-                false,
-            )
-            .expect(ALLOC_ERR_MSG),
-        ));
-
-        let seek_key = ImmutableRecord::from_values(
-            &[
-                Value::Text(Text::new(path_str.clone())),
-                Value::from_i64(0),
-                Value::Blob(crate::alloc::vec![]),
-            ],
-            Self::CHUNK_LEN,
-        )
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        loop {
-            match cursor.seek(
-                SeekKey::IndexKey(seek_key.as_record_ref()),
-                SeekOp::GE { eq_only: false },
-            ) {
-                Ok(IOResult::Done(SeekResult::Found)) => break,
-                Ok(IOResult::Done(SeekResult::TryAdvance)) => {
-                    loop {
-                        match cursor.next() {
-                            Ok(IOResult::Done(_)) => break,
-                            Ok(IOResult::IO(_)) => {
-                                self.pager
-                                    .io
-                                    .step()
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                            }
-                            Err(e) => return Err(std::io::Error::other(e.to_string())),
-                        }
-                    }
-                    break;
-                }
-                Ok(IOResult::Done(SeekResult::NotFound)) => return Ok(None),
-                Ok(IOResult::IO(_)) => {
-                    self.pager
-                        .io
-                        .step()
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                }
-                Err(e) => return Err(std::io::Error::other(e.to_string())),
-            }
-        }
-
-        let mut result: Option<Vec<u8>> = None;
-        loop {
-            if !cursor.has_record() {
-                return Ok(result);
-            }
-            let record = loop {
-                match cursor.record() {
-                    Ok(IOResult::Done(r)) => break r,
-                    Ok(IOResult::IO(_)) => {
-                        self.pager
-                            .io
-                            .step()
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    }
-                    Err(e) => return Err(std::io::Error::other(e.to_string())),
-                }
-            };
-            let Some(record) = record else {
-                return Ok(result);
-            };
-            let matches_path = record.get_value_opt(0).is_some_and(|v| match v {
-                crate::types::ValueRef::Text(t) => t.value == path_str.as_str(),
-                _ => false,
-            });
-            if !matches_path {
-                return Ok(result);
-            }
-            let bytes = record.get_value_opt(2).and_then(|v| match v {
-                crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
-                _ => None,
-            });
-            let Some(bytes) = bytes else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "malformed chunk record",
-                ));
-            };
-            result
-                .get_or_insert_with(Vec::new)
-                .extend_from_slice(&bytes);
-            loop {
-                match cursor.next() {
-                    Ok(IOResult::Done(_)) => break,
-                    Ok(IOResult::IO(_)) => {
-                        self.pager
-                            .io
-                            .step()
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    }
-                    Err(e) => return Err(std::io::Error::other(e.to_string())),
-                }
-            }
-        }
-    }
-
-    /// True when this directory's in-memory view of the Tantivy metadata file
-    /// matches what the BTree currently holds. Cached read state can
-    /// go stale without any notification — a rolled-back transaction (or
-    /// savepoint) reverts the BTree while the cache keeps the state published
-    /// mid-transaction (issue 7522) — so cursors verify before trusting it.
-    fn is_consistent_with_btree(&self) -> std::io::Result<bool> {
-        let meta_path = Path::new(TANTIVY_META_FILE);
-        let Some(cached_meta) = self.hot_cache.get(meta_path) else {
-            // No in-memory metadata to compare — cannot vouch for the cache.
-            return Ok(false);
-        };
-        let btree_meta = self.read_file_from_btree_uncached(meta_path)?;
-        Ok(btree_meta.as_deref() == Some(&cached_meta[..]))
     }
 
     /// Add a file to the hot cache.
@@ -1105,99 +914,6 @@ impl FileHandle for InMemoryFileHandle {
     }
 }
 
-/// Lazy file handle that fetches chunks on demand.
-struct LazyFileHandle {
-    path: PathBuf,
-    size: usize,
-    directory: HybridBTreeDirectory,
-}
-
-impl std::fmt::Debug for LazyFileHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LazyFileHandle")
-            .field("path", &self.path)
-            .field("size", &self.size)
-            .finish()
-    }
-}
-
-impl HasLen for LazyFileHandle {
-    fn len(&self) -> usize {
-        self.size
-    }
-}
-
-impl FileHandle for LazyFileHandle {
-    fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
-        if range.end > self.size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "range {:?} exceeds file size {} for {}",
-                    range,
-                    self.size,
-                    self.path.display()
-                ),
-            ));
-        }
-        if range.start >= range.end {
-            return Ok(OwnedBytes::new(Vec::new()));
-        }
-
-        // Check hot cache first
-        if let Some(data) = self.directory.hot_cache.get(&self.path) {
-            return Ok(OwnedBytes::new(data).slice(range));
-        }
-
-        // Check pending/flushing writes (data not yet persisted to BTree)
-        if let Some(data) = self.directory.find_in_pending_writes(&self.path) {
-            return Ok(OwnedBytes::new(data[range].to_vec()));
-        }
-
-        // Calculate required chunks
-        let chunk_size = DEFAULT_CHUNK_SIZE;
-        let start_chunk = range.start / chunk_size;
-        let end_chunk = range.end.saturating_sub(1) / chunk_size;
-
-        // Use efficient bulk read when multiple chunks are needed
-        let chunks =
-            self.directory
-                .get_chunks_range_blocking(&self.path, start_chunk, end_chunk)?;
-
-        // Collect result from chunks
-        let mut result = Vec::with_capacity(range.len());
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let chunk_no = start_chunk + i;
-            let chunk_start = chunk_no * chunk_size;
-
-            // Calculate slice within this chunk
-            let local_start = if chunk_no == start_chunk {
-                range.start - chunk_start
-            } else {
-                0
-            };
-            let local_end = if chunk_no == end_chunk {
-                range.end - chunk_start
-            } else {
-                chunk.len()
-            };
-
-            // Defensive bounds check - should not be needed if logic is correct
-            turso_debug_assert!(
-                local_start <= chunk.len() && local_end <= chunk.len(),
-                "chunk slice out of bounds",
-                { "local_start": local_start, "local_end": local_end, "chunk_len": chunk.len() }
-            );
-            let local_end = local_end.min(chunk.len());
-            let local_start = local_start.min(local_end);
-
-            result.extend_from_slice(&chunk[local_start..local_end]);
-        }
-
-        Ok(OwnedBytes::new(result))
-    }
-}
-
 /// In-memory writer for HybridBTreeDirectory.
 struct HybridWriter {
     path: PathBuf,
@@ -1224,14 +940,10 @@ impl Drop for HybridWriter {
             // Update catalog
             let num_chunks = data.len().div_ceil(DEFAULT_CHUNK_SIZE);
             let metadata = FileMetadata::new(&self.path, data.len(), num_chunks);
-            self.directory
-                .update_catalog(self.path.clone(), metadata.clone());
+            self.directory.update_catalog(self.path.clone(), metadata);
 
-            // If it's a hot file category, add to hot cache
-            if metadata.category.is_hot() {
-                self.directory
-                    .add_to_hot_cache(self.path.clone(), data.clone());
-            }
+            self.directory
+                .add_to_hot_cache(self.path.clone(), data.clone());
 
             self.directory.queue_write(self.path.clone(), data);
         }
@@ -1246,14 +958,10 @@ impl TerminatingWrite for HybridWriter {
 
         // Update catalog - even empty files should exist in the catalog
         let metadata = FileMetadata::new(&self.path, data.len(), num_chunks);
-        self.directory
-            .update_catalog(self.path.clone(), metadata.clone());
+        self.directory.update_catalog(self.path.clone(), metadata);
 
-        // If it's a hot file category, add to hot cache (even if empty)
-        if metadata.category.is_hot() {
-            self.directory
-                .add_to_hot_cache(self.path.clone(), data.clone());
-        }
+        self.directory
+            .add_to_hot_cache(self.path.clone(), data.clone());
 
         self.directory.queue_write(self.path.clone(), data);
         Ok(())
@@ -1277,17 +985,17 @@ impl Directory for HybridBTreeDirectory {
             }));
         }
 
-        // Check catalog for file metadata
-        let catalog = self.catalog.read();
-        let metadata = catalog
-            .get(path)
-            .ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))?;
+        if !self.catalog.read().contains_key(path) {
+            return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
+        }
 
-        Ok(Arc::new(LazyFileHandle {
-            path: path.to_path_buf(),
-            size: metadata.size,
-            directory: self.clone(),
-        }))
+        Err(OpenReadError::IoError {
+            io_error: Arc::new(std::io::Error::other(format!(
+                "FTS snapshot invariant violated: {} is cataloged but was not preloaded",
+                path.display()
+            ))),
+            filepath: path.to_path_buf(),
+        })
     }
 
     fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
@@ -1308,10 +1016,6 @@ impl Directory for HybridBTreeDirectory {
             let mut catalog = self.catalog.write();
             catalog.remove(path);
         }
-        if can_cache_chunks(path) {
-            // Invalidate chunk cache
-            self.chunk_cache.invalidate(path);
-        }
         self.queue_delete(path.to_path_buf());
         Ok(())
     }
@@ -1329,12 +1033,11 @@ impl Directory for HybridBTreeDirectory {
         // existing file first. The error is ignored because:
         // 1. If the file doesn't exist, delete() succeeds (no-op on missing files)
         // 2. Our delete() implementation always returns Ok(()) - it only removes entries
-        //    from in-memory structures (hot_cache, catalog, chunk_cache) and queues the
+        //    from in-memory structures and queues the
         //    BTree deletion, none of which can fail.
         //
         // Skip delete for the meta lock file: Tantivy calls open_write on it for every
-        // search query, but it's never cached (can_cache_chunks returns false), never in
-        // hot_cache, and doesn't need BTree deletion, so delete() is pure overhead.
+        // search query and it does not need BTree deletion.
         if path != Path::new(TANTIVY_META_LOCK_FILE) {
             let _ = self.delete(path);
         }
@@ -1365,24 +1068,22 @@ impl Directory for HybridBTreeDirectory {
             }
         }
 
-        // Load file blocking from BTree
-        self.load_file_blocking(path)
-            .map_err(|e| OpenReadError::IoError {
-                io_error: Arc::new(e),
-                filepath: path.to_path_buf(),
-            })
+        Err(OpenReadError::IoError {
+            io_error: Arc::new(std::io::Error::other(format!(
+                "FTS snapshot invariant violated: {} is cataloged but was not preloaded",
+                path.display()
+            ))),
+            filepath: path.to_path_buf(),
+        })
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
         // Update catalog
         let num_chunks = data.len().div_ceil(DEFAULT_CHUNK_SIZE).max(1);
         let metadata = FileMetadata::new(path, data.len(), num_chunks);
-        self.update_catalog(path.to_path_buf(), metadata.clone());
+        self.update_catalog(path.to_path_buf(), metadata);
 
-        // If it's a hot file category, add to hot cache
-        if metadata.category.is_hot() {
-            self.add_to_hot_cache(path.to_path_buf(), data.to_vec());
-        }
+        self.add_to_hot_cache(path.to_path_buf(), data.to_vec());
 
         self.queue_write(path.to_path_buf(), data.to_vec());
         Ok(())
@@ -1488,11 +1189,14 @@ impl IndexMethod for FtsIndexMethod {
 /// pending-write state.
 pub struct CachedFtsState {
     connection: Weak<Connection>,
+    /// MVCC transaction that owns this snapshot. `None` denotes a WAL entry.
+    transaction_id: Option<u64>,
     /// WAL snapshot at which the cached Tantivy metadata was loaded.
     ///
     /// `None` means the pager has no WAL identity and requires the slower
     /// metadata-byte comparison before reuse.
     snapshot_wal_pos: Option<(u32, u64)>,
+    control: FtsControlRecord,
     directory: HybridBTreeDirectory,
     index: Index,
     reader: IndexReader,
@@ -1507,6 +1211,11 @@ pub struct CachedFtsState {
 /// stale Tantivy segments.
 struct CachedFtsWriter {
     connection: Weak<Connection>,
+    /// MVCC transaction that exclusively owns this writer. `None` denotes a
+    /// WAL writer whose visibility remains connection-local until commit.
+    transaction_id: Option<u64>,
+    snapshot_wal_pos: Option<(u32, u64)>,
+    control: FtsControlRecord,
     directory: HybridBTreeDirectory,
     index: Index,
     writer: IndexWriter,
@@ -1528,10 +1237,7 @@ struct CachedFtsStates {
 
 impl CachedFtsState {
     fn resident_cache_bytes(&self) -> usize {
-        self.directory
-            .hot_cache
-            .size()
-            .saturating_add(self.directory.chunk_cache.size())
+        self.directory.hot_cache.size()
     }
 }
 
@@ -1547,7 +1253,7 @@ impl CachedFtsStates {
             .retain(|cached| cached.connection.strong_count() > 0);
         while self.entries.len() > FTS_MAX_CACHED_CONNECTIONS
             || (self.entries.len() > 1
-                && self.resident_cache_bytes() > FTS_MAX_RETAINED_CACHE_BYTES)
+                && self.resident_cache_bytes() > fts_max_retained_cache_bytes())
         {
             self.entries.remove(0);
         }
@@ -1568,11 +1274,18 @@ impl CachedFtsStates {
         }
     }
 
-    fn insert(&mut self, state: CachedFtsState) {
+    fn insert(&mut self, state: CachedFtsState, byte_budget: usize) -> bool {
         self.entries
             .retain(|cached| !Weak::ptr_eq(&cached.connection, &state.connection));
+        if state.resident_cache_bytes() > byte_budget {
+            return false;
+        }
         self.entries.push(state);
         self.prune();
+        while self.entries.len() > 1 && self.resident_cache_bytes() > byte_budget {
+            self.entries.remove(0);
+        }
+        true
     }
 
     fn clear(&mut self) {
@@ -1619,6 +1332,26 @@ pub struct FtsIndexAttachment {
     /// `Mutex` provides exclusive access without requiring `IndexWriter` to be
     /// `Sync`; SQLite transaction rules already serialize writers.
     cached_writer: Arc<Mutex<Option<CachedFtsWriter>>>,
+    runtime_stats: Arc<FtsRuntimeStats>,
+}
+
+#[derive(Debug, Default)]
+struct FtsRuntimeStats {
+    tantivy_writer_constructions: AtomicUsize,
+    writer_cache_lookups: AtomicUsize,
+    writer_cache_hits: AtomicUsize,
+    writer_cache_validation_failures: AtomicUsize,
+    writer_cache_rollback_discards: AtomicUsize,
+    writer_cache_misses: AtomicUsize,
+    read_cache_lookups: AtomicUsize,
+    read_cache_hits: AtomicUsize,
+    read_cache_misses: AtomicUsize,
+    cache_admission_rejections: AtomicUsize,
+    full_snapshot_loads: AtomicUsize,
+    manifest_validation_hits: AtomicUsize,
+    manifest_validation_misses: AtomicUsize,
+    write_lease_acquisitions: AtomicUsize,
+    write_lease_rejections: AtomicUsize,
 }
 
 /// Supported tokenizer names for FTS indexes
@@ -1830,6 +1563,7 @@ impl FtsIndexAttachment {
             ngram_window,
             cached_state: Arc::new(RwLock::new(CachedFtsStates::default())),
             cached_writer: Arc::new(Mutex::new(None)),
+            runtime_stats: Arc::new(FtsRuntimeStats::default()),
         })
     }
 }
@@ -1838,13 +1572,14 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: FTS_INDEX_METHOD_NAME,
+            table_name: &self.cfg.table_name,
             index_name: &self.cfg.index_name,
             patterns: &self.patterns,
             backing_btree: false,
             // Unordered match queries stream directly from Tantivy scorers.
             // UPDATE/DELETE must therefore collect stable rowids before writes.
             results_materialized: false,
-            mvcc_support: super::IndexMethodMvccSupport::Unsupported,
+            mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
         }
     }
 
@@ -1925,17 +1660,41 @@ fn bounded_query_limit(limit: Option<i64>, live_docs: u64) -> usize {
     }
 }
 
-/// Check if a file's chunks should be cached.
-///
-/// The meta lock file is excluded because Tantivy calls `open_write` on it for every search query.
-/// Since `open_write` calls `delete` first, caching the lock file would trigger a full chunk cache
-/// scan on every query, causing significant overhead.
-fn can_cache_chunks(path: &Path) -> bool {
-    path.as_os_str().to_str() != Some(TANTIVY_META_LOCK_FILE)
-}
-
 /// Accumulated file metadata: path -> (chunk_no -> (blob_size, Option<blob_data>))
 type CatalogBuilder = HashMap<i64, (usize, Option<Vec<u8>>)>;
+type CachedFtsCheckout = (
+    HybridBTreeDirectory,
+    Index,
+    IndexReader,
+    Arc<tantivy::query::QueryParser>,
+    FtsControlRecord,
+);
+
+fn assemble_catalog_file(path: &Path, chunks: &CatalogBuilder) -> Result<Vec<u8>> {
+    let max_chunk =
+        chunks.keys().max().copied().ok_or_else(|| {
+            LimboError::Corrupt(format!("FTS file {} has no chunks", path.display()))
+        })?;
+    if max_chunk < 0 {
+        return Err(LimboError::Corrupt(format!(
+            "FTS file {} has a negative chunk number",
+            path.display()
+        )));
+    }
+    let total_size = chunks.values().map(|(size, _)| size).sum();
+    let mut assembled = Vec::with_capacity(total_size);
+    for chunk_no in 0..=max_chunk {
+        let Some((_, Some(data))) = chunks.get(&chunk_no) else {
+            return Err(LimboError::Corrupt(format!(
+                "FTS directory file {} is missing chunk {}",
+                path.display(),
+                chunk_no
+            )));
+        };
+        assembled.extend_from_slice(data);
+    }
+    Ok(assembled)
+}
 
 /// State machine for FTS cursor async operations
 #[derive(Debug)]
@@ -1944,23 +1703,24 @@ enum FtsState {
     Init,
     /// Rewinding cursor to start
     Rewinding,
+    /// Seeking the small control record for cross-transaction cache validation.
+    SeekingControl,
+    /// Advancing after the control-record seek returned `TryAdvance`.
+    AdvancingToControl,
+    /// Reading the control record's chunks without scanning directory files.
+    LoadingControl {
+        chunks: CatalogBuilder,
+        advance_pending: bool,
+    },
     /// Loading file catalog from BTree (metadata only, not content)
     /// This is the new catalog-first approach for HybridBTreeDirectory
     LoadingCatalog {
-        /// Hot files capture blob data during scan to avoid a second pass.
         catalog_builder: HashMap<PathBuf, CatalogBuilder>,
+        control_builder: CatalogBuilder,
         current_path: Option<PathBuf>,
-    },
-    /// Preloading essential files (meta.json and other hot files)
-    PreloadingEssentials {
-        /// Files that need to be preloaded
-        files_to_load: Vec<PathBuf>,
-        /// Files already loaded
-        loaded_files: HashMap<PathBuf, Vec<u8>>,
-        /// Current file being loaded
-        current_loading: Option<PathBuf>,
-        /// Current chunks being accumulated for the file being loaded
-        current_chunks: Vec<(i64, Vec<u8>)>,
+        /// The current record was captured and `cursor.next()` must finish
+        /// before it can be observed again.
+        advance_pending: bool,
     },
     /// Creating/opening Tantivy index
     CreatingIndex,
@@ -1986,12 +1746,6 @@ enum FtsState {
     },
     /// Performing the actual delete of a chunk
     DeletingChunk {
-        writes: PendingFlushes,
-        write_idx: usize,
-        path_str: String,
-    },
-    /// Advancing cursor after delete to check next record
-    AdvancingAfterDelete {
         writes: PendingFlushes,
         write_idx: usize,
         path_str: String,
@@ -2028,7 +1782,6 @@ impl FtsState {
                 | Self::AdvancingAfterSeek { .. }
                 | Self::CheckingChunkPath { .. }
                 | Self::DeletingChunk { .. }
-                | Self::AdvancingAfterDelete { .. }
                 | Self::SeekingWrite { .. }
                 | Self::InsertingWrite { .. }
         )
@@ -2109,8 +1862,9 @@ pub struct FtsCursor {
     shared_writer: Arc<Mutex<Option<CachedFtsWriter>>>,
     connection: Option<Arc<Connection>>,
     database_id: Option<usize>,
-    fts_dir_cursor: Option<BTreeCursor>,
+    fts_dir_cursor: Option<Box<dyn CursorTrait>>,
     btree_root_page: Option<i64>,
+    control: Option<FtsControlRecord>,
     hybrid_directory: Option<HybridBTreeDirectory>,
     index: Option<Index>,
     reader: Option<IndexReader>,
@@ -2125,10 +1879,11 @@ pub struct FtsCursor {
     /// True while `open_write` is driving the shared open state machine.
     /// Read state is never published or reused in this mode.
     opening_for_write: bool,
+    runtime_stats: Arc<FtsRuntimeStats>,
 }
 
 impl FtsCursor {
-    /// Creates a new FTS cursor from the attachment's configuration.
+    /// Creates a new FTS cursor with the given configuration.
     fn new(attachment: &FtsIndexAttachment) -> Self {
         let dir_table_name = format!(
             "{}fts_dir_{}",
@@ -2155,12 +1910,13 @@ impl FtsCursor {
             field_boosts,
             ngram_window: attachment.ngram_window,
             cached_parser: None,
-            shared_cache: attachment.cached_state.clone(),
-            shared_writer: attachment.cached_writer.clone(),
+            shared_cache: Arc::clone(&attachment.cached_state),
+            shared_writer: Arc::clone(&attachment.cached_writer),
             connection: None,
             database_id: None,
             fts_dir_cursor: None,
             btree_root_page: None,
+            control: None,
             hybrid_directory: None,
             index: None,
             reader: None,
@@ -2173,6 +1929,7 @@ impl FtsCursor {
             hit_pos: 0,
             current_pattern: FTS_PATTERN_SCORE,
             opening_for_write: false,
+            runtime_stats: Arc::clone(&attachment.runtime_stats),
         }
     }
 
@@ -2187,7 +1944,6 @@ impl FtsCursor {
         let index_name = format!("{}_key", self.dir_table_name);
 
         // Get root page for HybridBTreeDirectory
-        let pager = conn.get_pager_from_database_index(&database_id)?;
         let scratch = conn
             .with_schema(database_id, |schema| {
                 schema.get_index(&self.dir_table_name, &index_name).cloned()
@@ -2202,14 +1958,13 @@ impl FtsCursor {
 
         self.btree_root_page = Some(root_page);
 
-        let mut cursor = BTreeCursor::new(pager, root_page, 3);
-        cursor.index_info = Some(Arc::new(IndexInfo::new(
+        self.fts_dir_cursor = Some(open_index_cursor(
+            conn,
+            database_id,
+            &self.dir_table_name,
+            &index_name,
             [key_info(), key_info(), key_info()],
-            false,
-            3,
-            false,
-        )?));
-        self.fts_dir_cursor = Some(cursor);
+        )?);
         Ok(())
     }
 
@@ -2249,11 +2004,84 @@ impl FtsCursor {
         Arc::new(parser)
     }
 
+    fn checkout_cached_state(
+        &self,
+        context: &IndexMethodContext,
+        visible_control: Option<&FtsControlRecord>,
+    ) -> Option<CachedFtsCheckout> {
+        let conn = context.connection();
+        if conn.is_in_write_tx() {
+            return None;
+        }
+        let mut cache = self.shared_cache.write();
+        cache.prune();
+        let position = cache.connection_position(conn)?;
+        let cached = &cache.entries[position];
+        let same_snapshot = match (context.transaction_id(), cached.transaction_id) {
+            (Some(current), Some(cached)) => current == cached,
+            (None, None) => cached.snapshot_wal_pos.is_some_and(|snapshot_wal_pos| {
+                cached.directory.pager.wal_pos() == snapshot_wal_pos
+            }),
+            _ => false,
+        };
+        let same_manifest = visible_control.is_some_and(|control| {
+            control.index_incarnation == cached.control.index_incarnation
+                && control.manifest_generation == cached.control.manifest_generation
+        });
+        if !same_snapshot && !same_manifest {
+            if visible_control.is_some() {
+                cache.entries.remove(position);
+            }
+            return None;
+        }
+
+        let cached = cache.entries.remove(position);
+        let checkout = (
+            cached.directory.clone_with_fresh_pending(),
+            cached.index.clone(),
+            cached.reader.clone(),
+            Arc::clone(&cached.query_parser),
+            cached.control.clone(),
+        );
+        cache.entries.push(cached);
+        Some(checkout)
+    }
+
+    fn has_cached_state(&self, context: &IndexMethodContext) -> bool {
+        let conn = context.connection();
+        !conn.is_in_write_tx() && self.shared_cache.read().connection_position(conn).is_some()
+    }
+
+    fn install_cached_checkout(&mut self, checkout: CachedFtsCheckout) {
+        let (directory, index, reader, query_parser, control) = checkout;
+        self.runtime_stats
+            .read_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("FTS open_read: using cached state (skipping catalog load)");
+        self.hybrid_directory = Some(directory);
+        self.control = Some(control);
+        self.index = Some(index);
+        self.searcher = Some(reader.searcher());
+        self.reader = Some(reader);
+        self.cached_parser = Some(query_parser);
+        self.state = FtsState::Ready;
+    }
+
     /// Restore a writer retained by the previous statement when its committed
     /// metadata still matches this transaction's backing B-tree view.
-    fn restore_cached_writer(&mut self, conn: &Arc<Connection>) -> Result<bool> {
-        let cached = self.shared_writer.lock().take();
-        let Some(cached) = cached else {
+    fn restore_cached_writer(&mut self, context: &IndexMethodContext) -> Result<bool> {
+        let conn = context.connection();
+        self.runtime_stats
+            .writer_cache_lookups
+            .fetch_add(1, Ordering::Relaxed);
+        let database_id = self.database_id.ok_or_else(|| {
+            LimboError::InternalError("FTS database id is not initialized".to_string())
+        })?;
+        let mut cached_writer = self.shared_writer.lock();
+        let Some(cached) = cached_writer.as_ref() else {
+            self.runtime_stats
+                .writer_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         };
 
@@ -2261,15 +2089,54 @@ impl FtsCursor {
             .connection
             .upgrade()
             .is_some_and(|owner| Arc::ptr_eq(&owner, conn));
-        let metadata_matches = same_connection
-            && cached.directory.is_consistent_with_btree().map_err(|e| {
-                LimboError::InternalError(format!("FTS writer cache validation failed: {e}"))
-            })?;
+        let metadata_matches = if conn.mv_store_for_db(database_id).is_some() {
+            same_connection
+                && context.transaction_id().is_some()
+                && context.transaction_id() == cached.transaction_id
+        } else {
+            same_connection
+                && cached.transaction_id.is_none()
+                && cached
+                    .snapshot_wal_pos
+                    .is_some_and(|position| cached.directory.pager.wal_pos() == position)
+        };
         if !metadata_matches {
+            // A committed MVCC writer is retained until its small control
+            // record can be validated asynchronously by open_read().
+            if conn.mv_store_for_db(database_id).is_some()
+                && same_connection
+                && cached.transaction_id.is_none()
+            {
+                return Ok(false);
+            }
+            // The slot is shared by every connection. Only remove an entry
+            // this connection owns, or one whose owner is gone; a live writer
+            // owned by another connection stays cached for its owner.
+            let stale = if same_connection || cached.connection.strong_count() == 0 {
+                cached_writer.take()
+            } else {
+                None
+            };
+            drop(cached_writer);
+            self.runtime_stats
+                .writer_cache_validation_failures
+                .fetch_add(1, Ordering::Relaxed);
+            self.runtime_stats
+                .writer_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            drop(stale);
             return Ok(false);
         }
 
+        let cached = cached_writer
+            .take()
+            .expect("validated cached writer must still be present");
+        drop(cached_writer);
+        self.runtime_stats
+            .writer_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
         tracing::debug!("FTS open_write: reusing committed writer state");
+        self.control = Some(cached.control);
         self.hybrid_directory = Some(cached.directory);
         self.index = Some(cached.index);
         self.writer = Some(cached.writer);
@@ -2280,25 +2147,150 @@ impl FtsCursor {
         Ok(true)
     }
 
+    fn has_deferred_cached_writer(&self, context: &IndexMethodContext) -> bool {
+        let conn = context.connection();
+        self.shared_writer.lock().as_ref().is_some_and(|cached| {
+            cached.transaction_id.is_none()
+                && cached
+                    .connection
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, conn))
+        })
+    }
+
+    fn checkout_validated_cached_writer(
+        &mut self,
+        context: &IndexMethodContext,
+        visible_control: &FtsControlRecord,
+    ) -> bool {
+        let conn = context.connection();
+        let mut cached_writer = self.shared_writer.lock();
+        let Some(cached) = cached_writer.as_ref() else {
+            return false;
+        };
+        let owner = cached.connection.upgrade();
+        let same_connection = owner.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, conn));
+        let deferred = cached.transaction_id.is_none();
+        let matches_control = cached.control.index_incarnation == visible_control.index_incarnation
+            && cached.control.manifest_generation == visible_control.manifest_generation;
+        if !(same_connection && deferred && matches_control) {
+            // A dead owner, or a committed writer the committed control record
+            // has moved past, can never be reused by anyone: remove it. A live
+            // writer owned by another connection stays cached for its owner.
+            let stale = if owner.is_none() || (deferred && !matches_control) {
+                cached_writer.take()
+            } else {
+                None
+            };
+            drop(cached_writer);
+            self.runtime_stats
+                .writer_cache_validation_failures
+                .fetch_add(1, Ordering::Relaxed);
+            self.runtime_stats
+                .writer_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            drop(stale);
+            return false;
+        }
+
+        let cached = cached_writer
+            .take()
+            .expect("validated cached writer must still be present");
+        drop(cached_writer);
+        self.runtime_stats
+            .writer_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+        self.control = Some(cached.control);
+        self.hybrid_directory = Some(cached.directory);
+        self.index = Some(cached.index);
+        self.writer = Some(cached.writer);
+        self.reader = None;
+        self.searcher = None;
+        self.cached_parser = None;
+        self.state = FtsState::Ready;
+        true
+    }
+
+    fn discard_deferred_cached_writer(&self, context: &IndexMethodContext) {
+        let conn = context.connection();
+        let mut cached_writer = self.shared_writer.lock();
+        // A missing control record proves this connection's deferred writer is
+        // stale. The slot is shared by every connection, so a live writer
+        // owned by another connection stays cached for its owner.
+        let discard =
+            cached_writer
+                .as_ref()
+                .is_some_and(|cached| match cached.connection.upgrade() {
+                    None => true,
+                    Some(owner) => Arc::ptr_eq(&owner, conn) && cached.transaction_id.is_none(),
+                });
+        if !discard {
+            return;
+        }
+        let stale = cached_writer.take();
+        drop(cached_writer);
+        self.runtime_stats
+            .writer_cache_validation_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.runtime_stats
+            .writer_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+        drop(stale);
+    }
+
     /// Retain a fully flushed writer for the next statement on this connection.
-    fn cache_writer(&mut self, conn: &Arc<Connection>) {
+    fn cache_writer(&mut self, context: &IndexMethodContext) {
+        let conn = context.connection();
         if self.pending_docs_count != 0 || !matches!(self.state, FtsState::Ready) {
+            tracing::trace!(
+                pending_documents = self.pending_docs_count,
+                state = ?self.state,
+                "FTS writer cache: cursor is not fully prepared"
+            );
             return;
         }
         let Some(directory) = self.hybrid_directory.as_ref() else {
+            tracing::trace!("FTS writer cache: directory is not initialized");
             return;
         };
+        let retained_read_bytes = self.shared_cache.read().resident_cache_bytes();
+        if directory
+            .hot_cache
+            .size()
+            .saturating_add(retained_read_bytes)
+            > fts_max_retained_cache_bytes()
+        {
+            self.runtime_stats
+                .cache_admission_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                resident_bytes = directory.hot_cache.size(),
+                budget_bytes = fts_max_retained_cache_bytes(),
+                "FTS writer cache: snapshot exceeds retention budget"
+            );
+            return;
+        }
         // Index creation and failed statements can close a cursor before all
         // directory mutations enter the normal document flush state machine.
         // Such a writer is not reusable.
         if !directory.pending_mutations.read().by_path.is_empty()
             || !directory.flushing_writes.read().is_empty()
         {
+            tracing::trace!("FTS writer cache: directory still has pending mutations");
             return;
         }
-        let Some(writer) = self.writer.take() else {
+        if self.writer.is_none() {
+            tracing::trace!("FTS writer cache: cursor has no writer");
+            return;
+        }
+        // Keep `self.control` set: `transaction_committed` compares it against
+        // the cached writer's control record before re-stamping the WAL
+        // position.
+        let Some(control) = self.control.clone() else {
+            tracing::error!("FTS writer cache: control record is not initialized");
             return;
         };
+        let writer = self.writer.take().expect("writer checked above");
         let index = self
             .index
             .take()
@@ -2307,9 +2299,14 @@ impl FtsCursor {
             .hybrid_directory
             .take()
             .expect("FTS writer must have an initialized directory");
+        let wal_pos = directory.pager.wal_pos();
+        let snapshot_wal_pos = (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos);
 
         let previous = self.shared_writer.lock().replace(CachedFtsWriter {
             connection: Arc::downgrade(conn),
+            transaction_id: context.transaction_id(),
+            snapshot_wal_pos,
+            control,
             directory,
             index,
             writer,
@@ -2553,41 +2550,18 @@ impl FtsCursor {
                     // Perform the delete - if IO is needed, we'll come back to this state
                     return_if_io!(cursor.delete());
 
-                    // Delete completed, advance cursor to next record before checking again
-                    self.state = FtsState::AdvancingAfterDelete {
+                    // Re-seek from the logical prefix after every delete.
+                    // B-tree deletion may retreat, preserve, or advance the
+                    // physical cursor depending on balancing; calling next()
+                    // can therefore skip a sibling value for the same
+                    // (path, chunk_no) prefix. Re-seeking is unambiguous and
+                    // enforces one logical value even though bytes remain a
+                    // physical key column.
+                    self.state = FtsState::SeekingOldChunks {
                         writes: std::mem::take(writes),
                         write_idx: *write_idx,
                         path_str: std::mem::take(path_str),
                     };
-                }
-                FtsState::AdvancingAfterDelete {
-                    writes,
-                    write_idx,
-                    path_str,
-                } => {
-                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
-                        LimboError::InternalError("cursor not initialized".into())
-                    })?;
-
-                    // Advance cursor to next record after delete
-                    return_if_io!(cursor.next());
-                    let has_next = cursor.has_record();
-
-                    if has_next {
-                        // Check the next record in CheckingChunkPath state
-                        self.state = FtsState::CheckingChunkPath {
-                            writes: std::mem::take(writes),
-                            write_idx: *write_idx,
-                            path_str: std::mem::take(path_str),
-                        };
-                    } else {
-                        // No more records, start writing
-                        self.state = FtsState::FlushingWrites {
-                            writes: std::mem::take(writes),
-                            write_idx: *write_idx,
-                            chunk_idx: None, // Ready to start from chunk 0
-                        };
-                    }
                 }
                 FtsState::SeekingWrite {
                     writes,
@@ -2627,18 +2601,58 @@ impl FtsCursor {
 
                     // Seek to find the correct position using GE (not eq_only)
                     // This positions the cursor at or after where the record should be inserted
-                    let _result = return_if_io!(cursor.seek(
+                    let seek_result = return_if_io!(cursor.seek(
                         SeekKey::IndexKey(record.as_record_ref()),
                         SeekOp::GE { eq_only: false },
                     ));
 
-                    // don't do insert in same state to avoid re-seeking on IO
-                    self.state = FtsState::InsertingWrite {
-                        writes: std::mem::take(writes),
-                        write_idx: *write_idx,
-                        chunk_idx: actual_chunk_idx,
-                        record,
-                    };
+                    let exact_key_exists =
+                        if matches!(seek_result, SeekResult::Found) && cursor.has_record() {
+                            return_if_io!(cursor.record()).is_some_and(|existing| {
+                                let existing_path =
+                                    existing.get_value_opt(0).and_then(|value| match value {
+                                        crate::types::ValueRef::Text(text) => Some(text.value),
+                                        _ => None,
+                                    });
+                                let existing_chunk =
+                                    existing.get_value_opt(1).and_then(|value| match value {
+                                        crate::types::ValueRef::Numeric(
+                                            crate::numeric::Numeric::Integer(value),
+                                        ) => Some(value),
+                                        _ => None,
+                                    });
+                                let existing_bytes =
+                                    existing.get_value_opt(2).and_then(|value| match value {
+                                        crate::types::ValueRef::Blob(bytes) => Some(bytes),
+                                        _ => None,
+                                    });
+                                existing_path == Some(path_str.as_str())
+                                    && existing_chunk == Some(actual_chunk_idx as i64)
+                                    && existing_bytes == Some(chunk_data)
+                            })
+                        } else {
+                            false
+                        };
+
+                    if exact_key_exists {
+                        // Resumption or a previously duplicated physical row
+                        // may leave the exact full key present. Treat the
+                        // logical write as idempotent instead of inserting a
+                        // second identical `(path, chunk_no, bytes)` key.
+                        self.state = FtsState::FlushingWrites {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            chunk_idx: Some(actual_chunk_idx + 1),
+                        };
+                    } else {
+                        // Don't do insert in the same state to avoid re-seeking on I/O.
+                        self.state = FtsState::InsertingWrite {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            chunk_idx: actual_chunk_idx,
+                            record,
+                        };
+                    }
                 }
                 FtsState::InsertingWrite {
                     writes,
@@ -2685,6 +2699,7 @@ impl FtsCursor {
         }
 
         // Commit Tantivy to make documents visible
+        let mut committed_writer = false;
         if let Some(ref mut writer) = self.writer {
             tracing::debug!(
                 "FTS commit_and_flush: committing {} documents",
@@ -2697,6 +2712,7 @@ impl FtsCursor {
                 LimboError::InternalError("FTS directory not initialized".to_string())
             })?;
             Self::commit_writer_with_maintenance(index, writer, directory)?;
+            committed_writer = true;
 
             // The cached reader belongs to the previous index snapshot.
             if let Some(conn) = &self.connection {
@@ -2706,6 +2722,9 @@ impl FtsCursor {
                     cache.remove_connection(conn);
                 }
             }
+        }
+        if committed_writer {
+            self.stage_control_record()?;
         }
         if let Some(ref reader) = self.reader {
             reader
@@ -2888,161 +2907,71 @@ impl FtsCursor {
             .map_err(|e| LimboError::InternalError(format!("FTS maintenance merge commit: {e}")))?;
         Ok(())
     }
+
+    fn stage_control_record(&mut self) -> Result<()> {
+        let directory = self.hybrid_directory.as_ref().ok_or_else(|| {
+            LimboError::InternalError("FTS directory not initialized".to_string())
+        })?;
+        let index_incarnation = self
+            .control
+            .as_ref()
+            .map(|control| control.index_incarnation)
+            // A never-written index carries the placeholder incarnation; the
+            // first staged control record mints the real one.
+            .filter(|&incarnation| incarnation != FTS_EMPTY_INDEX_INCARNATION)
+            .or_else(|| {
+                self.btree_root_page.map(|root_page| {
+                    let nonce = NEXT_FTS_INDEX_INCARNATION.fetch_add(1, Ordering::Relaxed);
+                    // The placeholder value marks "never written": never mint it.
+                    ((root_page as u64).rotate_left(32) ^ nonce).max(1)
+                })
+            })
+            .ok_or_else(|| {
+                LimboError::InternalError("FTS backing root is not initialized".to_string())
+            })?;
+        let control = FtsControlRecord::from_catalog(
+            self.control.as_ref(),
+            index_incarnation,
+            &directory.catalog.read(),
+        )?;
+        directory.queue_write(PathBuf::from(FTS_CONTROL_PATH), control.encode()?);
+        self.control = Some(control);
+        Ok(())
+    }
 }
 
 impl Drop for FtsCursor {
     fn drop(&mut self) {
-        // Skip cleanup if we're already panicking
-        if crate::thread::panicking() {
-            return;
-        }
-
-        // Get connection reference for transaction check and pager access
-        let conn = match &self.connection {
-            Some(conn) => conn.clone(),
-            None => {
-                if self.pending_docs_count > 0 {
-                    tracing::warn!(
-                        "FTS Drop: {} pending documents lost (no connection)",
-                        self.pending_docs_count
-                    );
-                }
-                return;
-            }
-        };
-
-        let pager = conn.pager.load().clone();
-
-        // Check if we're already in a flushing state (from commit_and_flush)
-        // This can happen when commit_and_flush started a flush but yielded for IO
-        // and the cursor is being dropped before the flush completed
-        if self.state.is_flushing() {
-            turso_assert!(
-                conn.is_in_write_tx(),
-                "FTS Drop: in-progress flush abandoned (transaction already committed). pre_commit should have completed the flush."
+        let is_flushing = self.state.is_flushing();
+        if self.pending_docs_count != 0 || is_flushing {
+            tracing::error!(
+                pending_documents = self.pending_docs_count,
+                is_flushing,
+                "FTS cursor dropped before explicit statement finalization"
             );
-
-            tracing::debug!("FTS Drop: completing in-progress flush");
-            loop {
-                match self.flush_writes_internal() {
-                    Ok(IOResult::Done(())) => {
-                        self.cache_writer(&conn);
-                        break;
-                    }
-                    Ok(IOResult::IO(_)) => {
-                        if let Err(e) = pager.io.step() {
-                            tracing::error!("FTS Drop: IO error during flush: {}", e);
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("FTS Drop: error during flush: {}", e);
-                        return;
-                    }
-                }
-            }
-            return;
-        }
-
-        // Only flush new pending documents if we have any
-        if self.pending_docs_count == 0 {
-            self.cache_writer(&conn);
-            // Query execution may have populated file caches after checkout.
-            // Enforce the aggregate retention budget when the cursor releases
-            // its snapshot.
-            self.shared_cache.write().prune();
-            return;
-        }
-
-        // If the transaction has already committed (auto-commit), flushing to BTree
-        // would create dirty pages outside of any transaction, causing the
-        // "dirty pages must be empty for read txn" panic on the next read.
-        turso_assert!(
-            conn.is_in_write_tx(),
-            "FTS Drop: transaction already committed, cannot flush",
-            { "pending_docs_count": self.pending_docs_count }
-        );
-
-        // Commit any pending writes to Tantivy
-        if let Some(ref mut writer) = self.writer {
-            let Some(ref index) = self.index else {
-                tracing::error!("FTS Drop: index not initialized");
-                return;
-            };
-            let Some(ref directory) = self.hybrid_directory else {
-                tracing::error!("FTS Drop: directory not initialized");
-                return;
-            };
-            if let Err(e) = Self::commit_writer_with_maintenance(index, writer, directory) {
-                tracing::error!("FTS Drop: failed to commit writer: {}", e);
-                return;
-            }
-
-            // Invalidate the read state for the previous index snapshot.
-            // This MUST happen after commit but before we check for pending writes
-            // to ensure the next cursor loads fresh data from BTree
-            {
-                let mut cache = self.shared_cache.write();
-                if cache.connection_position(&conn).is_some() {
-                    tracing::debug!("FTS Drop: invalidating cached read state");
-                    cache.remove_connection(&conn);
-                }
-            }
-        }
-
-        let Some(ref dir) = self.hybrid_directory else {
-            return;
-        };
-        let writes = dir.take_pending_flushes();
-
-        if writes.is_empty() {
-            return;
-        }
-
-        tracing::debug!(
-            "FTS Drop: blocking flush of {} files to BTree",
-            writes.len()
-        );
-
-        // Set up flush state machine
-        self.state = FtsState::FlushingWrites {
-            writes,
-            write_idx: 0,
-            chunk_idx: Some(0),
-        };
-
-        // Run blocking flush
-        loop {
-            match self.flush_writes_internal() {
-                Ok(IOResult::Done(())) => {
-                    self.cache_writer(&conn);
-                    break;
-                }
-                Ok(IOResult::IO(_)) => {
-                    if let Err(e) = pager.io.step() {
-                        tracing::error!("FTS Drop: IO error during flush: {}", e);
-                        return;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("FTS Drop: error during flush: {}", e);
-                    return;
-                }
-            }
+            debug_assert!(
+                crate::thread::panicking(),
+                "FTS cursor dropped with pending persistence work"
+            );
         }
     }
 }
 
 impl IndexMethodCursor for FtsCursor {
     /// Creates the FTS index storage (internal BTree table for Tantivy files).
-    fn create(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+    fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+        let conn = context.connection();
+        let database_id = context.database().id;
         self.database_id = Some(database_id);
         initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
-        Ok(IOResult::Done(()))
+        return_if_io!(self.open_write(context));
+        self.commit_and_flush_inner(true)
     }
 
     /// Destroys the FTS index, dropping all storage and clearing caches.
-    fn destroy(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+    fn destroy(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+        let conn = context.connection();
+        let database_id = context.database().id;
         self.database_id = Some(database_id);
         tracing::debug!(
             "FTS destroy: dropping internal storage {}",
@@ -3056,6 +2985,7 @@ impl IndexMethodCursor for FtsCursor {
         self.index = None;
         self.hybrid_directory = None;
         self.fts_dir_cursor = None;
+        self.control = None;
 
         // Invalidate cached read state.
         {
@@ -3095,90 +3025,198 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Opens the index for reading, loading the catalog and creating a searcher.
     /// Uses async state machine for non-blocking IO during catalog/file loading.
-    fn open_read(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+    fn open_read(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+        let conn = context.connection();
+        let database_id = context.database().id;
         self.database_id = Some(database_id);
         loop {
             match &mut self.state {
                 FtsState::Init => {
+                    if !self.opening_for_write {
+                        self.runtime_stats
+                            .read_cache_lookups
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     self.connection = Some(conn.clone());
                     // Ensure storage table exists
                     initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
                     // Open BTree cursor (needed for btree_root_page)
                     self.open_cursor(conn, database_id)?;
 
-                    // Check for cached read state. Caches are never published
-                    // or consumed during a write transaction, so rollback and
-                    // savepoint rollback cannot leave uncommitted Tantivy
-                    // state reusable. For committed snapshots, the pager's WAL
-                    // position is an O(1) cache identity. Pagers without a WAL
-                    // identity fall back to comparing meta.json bytes.
-                    let cached_hit = {
-                        let mut cache = self.shared_cache.write();
-                        cache.prune();
-                        if let Some(position) = cache.connection_position(conn) {
-                            if conn.is_in_write_tx() {
-                                tracing::debug!(
-                                    "FTS open_read: bypassing shared cache in write transaction"
-                                );
-                                None
-                            } else {
-                                let cached = &cache.entries[position];
-                                let snapshot_matches = if let Some(snapshot_wal_pos) =
-                                    cached.snapshot_wal_pos
-                                {
-                                    cached.directory.pager.wal_pos() == snapshot_wal_pos
-                                } else {
-                                    cached.directory.is_consistent_with_btree().map_err(|e| {
-                                        LimboError::InternalError(format!(
-                                            "FTS cache validation failed: {e}"
-                                        ))
-                                    })?
-                                };
-                                if snapshot_matches {
-                                    let cached = cache.entries.remove(position);
-                                    let hit = (
-                                        cached.directory.clone_with_fresh_pending(),
-                                        cached.index.clone(),
-                                        cached.reader.clone(),
-                                        Arc::clone(&cached.query_parser),
-                                    );
-                                    // Move the successful checkout to the MRU end.
-                                    cache.entries.push(cached);
-                                    Some(hit)
-                                } else {
-                                    tracing::debug!(
-                                    "FTS open_read: cached directory is stale (snapshot diverged), reloading"
-                                );
-                                    cache.entries.remove(position);
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some((directory, index, reader, query_parser)) = cached_hit {
-                        tracing::debug!(
-                            "FTS open_read: using cached state (skipping catalog load)"
-                        );
-                        self.hybrid_directory = Some(directory);
-                        if self.opening_for_write {
-                            // A writer needs an Index whose Directory owns
-                            // cursor-local pending state.
-                            self.state = FtsState::CreatingIndex;
-                            continue;
-                        }
-
-                        self.index = Some(index);
-                        self.searcher = Some(reader.searcher());
-                        self.reader = Some(reader);
-                        self.cached_parser = Some(query_parser);
-                        self.state = FtsState::Ready;
+                    // A cache entry from the exact same snapshot can be used
+                    // immediately. A cache from an older snapshot is retained
+                    // until the small transactional control record has been
+                    // read asynchronously and its identity validated.
+                    if let Some(checkout) = self.checkout_cached_state(context, None) {
+                        self.install_cached_checkout(checkout);
                         return Ok(IOResult::Done(()));
                     }
 
-                    // No cache available, proceed with full catalog loading
-                    self.state = FtsState::Rewinding;
+                    self.state = if self.has_cached_state(context)
+                        || (self.opening_for_write && self.has_deferred_cached_writer(context))
+                    {
+                        FtsState::SeekingControl
+                    } else {
+                        if !self.opening_for_write {
+                            self.runtime_stats
+                                .read_cache_misses
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        FtsState::Rewinding
+                    };
+                }
+                FtsState::SeekingControl => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+                    let seek_key = ImmutableRecord::from_values(
+                        &[
+                            Value::Text(Text::new(FTS_CONTROL_PATH.to_string())),
+                            Value::from_i64(0),
+                            Value::Blob(crate::alloc::vec![]),
+                        ],
+                        3,
+                    )?;
+                    let seek_result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(seek_key.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
+                    self.state = match seek_result {
+                        SeekResult::NotFound => {
+                            if self.opening_for_write {
+                                self.discard_deferred_cached_writer(context);
+                            }
+                            FtsState::Rewinding
+                        }
+                        SeekResult::TryAdvance => FtsState::AdvancingToControl,
+                        SeekResult::Found => FtsState::LoadingControl {
+                            chunks: HashMap::default(),
+                            advance_pending: false,
+                        },
+                    };
+                }
+                FtsState::AdvancingToControl => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+                    return_if_io!(cursor.next());
+                    self.state = if cursor.has_record() {
+                        FtsState::LoadingControl {
+                            chunks: HashMap::default(),
+                            advance_pending: false,
+                        }
+                    } else {
+                        if self.opening_for_write {
+                            self.discard_deferred_cached_writer(context);
+                        }
+                        FtsState::Rewinding
+                    };
+                }
+                FtsState::LoadingControl {
+                    chunks,
+                    advance_pending,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+                    if *advance_pending {
+                        return_if_io!(cursor.next());
+                        *advance_pending = false;
+                        continue;
+                    }
+
+                    let mut finished = !cursor.has_record();
+                    if !finished {
+                        let record = return_if_io!(cursor.record()).ok_or_else(|| {
+                            LimboError::Corrupt("FTS cursor has no record payload".into())
+                        })?;
+                        let path = record
+                            .get_value_opt(0)
+                            .and_then(|value| match value {
+                                crate::types::ValueRef::Text(text) => Some(text.value),
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                LimboError::Corrupt("FTS chunk path is not text".into())
+                            })?;
+                        finished = path != FTS_CONTROL_PATH;
+                        if !finished {
+                            let chunk_no = record
+                                .get_value_opt(1)
+                                .and_then(|value| match value {
+                                    crate::types::ValueRef::Numeric(
+                                        crate::numeric::Numeric::Integer(value),
+                                    ) => Some(value),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "FTS control chunk number is not an integer".into(),
+                                    )
+                                })?;
+                            let blob = record
+                                .get_value_opt(2)
+                                .and_then(|value| match value {
+                                    crate::types::ValueRef::Blob(blob) => Some(blob.to_vec()),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "FTS control chunk payload is not a blob".into(),
+                                    )
+                                })?;
+                            if chunks.insert(chunk_no, (blob.len(), Some(blob))).is_some() {
+                                return Err(LimboError::Corrupt(format!(
+                                    "duplicate FTS control chunk {chunk_no}"
+                                )));
+                            }
+                            *advance_pending = true;
+                        }
+                    }
+
+                    if finished {
+                        if chunks.is_empty() {
+                            if self.opening_for_write {
+                                self.discard_deferred_cached_writer(context);
+                            }
+                            self.runtime_stats
+                                .manifest_validation_misses
+                                .fetch_add(1, Ordering::Relaxed);
+                            if !self.opening_for_write {
+                                self.runtime_stats
+                                    .read_cache_misses
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            self.state = FtsState::Rewinding;
+                            continue;
+                        }
+                        let control_chunks = std::mem::take(chunks);
+                        let control_bytes =
+                            assemble_catalog_file(Path::new(FTS_CONTROL_PATH), &control_chunks)?;
+                        let control = FtsControlRecord::decode(&control_bytes)?;
+                        if self.opening_for_write
+                            && self.checkout_validated_cached_writer(context, &control)
+                        {
+                            return Ok(IOResult::Done(()));
+                        }
+                        if let Some(checkout) = self.checkout_cached_state(context, Some(&control))
+                        {
+                            self.runtime_stats
+                                .manifest_validation_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.install_cached_checkout(checkout);
+                            return Ok(IOResult::Done(()));
+                        }
+                        self.runtime_stats
+                            .manifest_validation_misses
+                            .fetch_add(1, Ordering::Relaxed);
+                        if !self.opening_for_write {
+                            self.runtime_stats
+                                .read_cache_misses
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.state = FtsState::Rewinding;
+                    }
                 }
                 FtsState::Rewinding => {
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
@@ -3188,225 +3226,150 @@ impl IndexMethodCursor for FtsCursor {
                     // Use catalog-first loading for HybridBTreeDirectory
                     self.state = FtsState::LoadingCatalog {
                         catalog_builder: HashMap::default(),
+                        control_builder: HashMap::default(),
                         current_path: None,
+                        advance_pending: false,
                     };
                 }
                 FtsState::LoadingCatalog {
                     catalog_builder,
+                    control_builder,
                     current_path,
+                    advance_pending,
                 } => {
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
 
+                    if *advance_pending {
+                        return_if_io!(cursor.next());
+                        *advance_pending = false;
+                        continue;
+                    }
+
                     if !cursor.has_record() {
-                        // Done scanning: build catalog and assemble hot files in single pass
+                        self.runtime_stats
+                            .full_snapshot_loads
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Done scanning: build a complete file snapshot before Tantivy can run.
                         let mut catalog = HashMap::default();
-                        let mut hot_files: HashMap<PathBuf, Vec<u8>> = HashMap::default();
-                        let mut files_to_load = Vec::new();
+                        let mut files: HashMap<PathBuf, Vec<u8>> = HashMap::default();
 
                         for (path, chunks) in catalog_builder.drain() {
-                            let max_chunk = chunks.keys().max().copied().unwrap_or(0);
+                            let max_chunk = chunks
+                                .keys()
+                                .max()
+                                .copied()
+                                .expect("catalog builder entries have chunks");
                             let total_size: usize = chunks.values().map(|(size, _)| size).sum();
                             let num_chunks = (max_chunk + 1) as usize;
                             let metadata = FileMetadata::new(&path, total_size, num_chunks);
-
-                            if metadata.category.is_hot() {
-                                // Try to assemble from captured blob data
-                                let mut all_captured = true;
-                                let mut assembled = Vec::with_capacity(total_size);
-                                for chunk_no in 0..=(max_chunk) {
-                                    if let Some((_, Some(data))) = chunks.get(&chunk_no) {
-                                        assembled.extend_from_slice(data);
-                                    } else {
-                                        all_captured = false;
-                                        break;
-                                    }
-                                }
-                                if all_captured {
-                                    hot_files.insert(path.clone(), assembled);
-                                } else {
-                                    files_to_load.push(path.clone());
-                                }
-                            } else if metadata.category.should_preload() {
-                                files_to_load.push(path.clone());
-                            }
-
+                            let assembled = assemble_catalog_file(&path, &chunks)?;
+                            files.insert(path.clone(), assembled);
                             catalog.insert(path, metadata);
                         }
 
+                        let control = if control_builder.is_empty() {
+                            if catalog.is_empty() {
+                                Some(FtsControlRecord::new(FTS_EMPTY_INDEX_INCARNATION))
+                            } else {
+                                return Err(LimboError::Corrupt(
+                                    "FTS storage predates control-record format v1; rebuild the index"
+                                        .into(),
+                                ));
+                            }
+                        } else {
+                            let control_bytes = assemble_catalog_file(
+                                Path::new(FTS_CONTROL_PATH),
+                                control_builder,
+                            )?;
+                            let control = FtsControlRecord::decode(&control_bytes)?;
+                            control.validate_catalog(&catalog)?;
+                            Some(control)
+                        };
+                        self.control = control;
+
                         tracing::debug!(
-                            "FTS LoadingCatalog: found {} files, {} hot assembled, {} to preload",
+                            "FTS LoadingCatalog: preloaded {} files ({} bytes)",
                             catalog.len(),
-                            hot_files.len(),
-                            files_to_load.len()
+                            files.values().map(Vec::len).sum::<usize>()
                         );
 
-                        // Create HybridBTreeDirectory with catalog and pre-assembled hot files
                         let pager = conn.get_pager_from_database_index(&database_id)?;
                         let root_page = self.btree_root_page.ok_or_else(|| {
                             LimboError::InternalError("btree_root_page not set".into())
                         })?;
 
-                        let hybrid_dir = HybridBTreeDirectory::with_preloaded(
-                            pager,
-                            root_page,
-                            catalog,
-                            hot_files,
-                            DEFAULT_HOT_CACHE_BYTES,
-                            DEFAULT_CHUNK_CACHE_BYTES,
-                        );
+                        let hybrid_dir =
+                            HybridBTreeDirectory::with_preloaded(pager, root_page, catalog, files);
                         self.hybrid_directory = Some(hybrid_dir);
-
-                        if files_to_load.is_empty() {
-                            // All hot files assembled in single pass, skip PreloadingEssentials
-                            self.state = FtsState::CreatingIndex;
-                        } else {
-                            self.state = FtsState::PreloadingEssentials {
-                                files_to_load,
-                                loaded_files: HashMap::default(),
-                                current_loading: None,
-                                current_chunks: Vec::new(),
-                            };
-                        }
+                        self.state = FtsState::CreatingIndex;
                         continue;
                     }
 
-                    // Read record metadata and capture hot file blobs in single pass
+                    // Capture every blob while storage I/O is under the cursor state machine.
                     let record = return_if_io!(cursor.record());
-                    if let Some(record) = record {
-                        let path_str = record.get_value_opt(0).and_then(|v| match v {
+                    let record = record.ok_or_else(|| {
+                        LimboError::Corrupt("FTS cursor has no record payload".into())
+                    })?;
+                    let path_str = record
+                        .get_value_opt(0)
+                        .and_then(|v| match v {
                             crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
                             _ => None,
-                        });
-                        let chunk_no = record.get_value_opt(1).and_then(|v| match v {
+                        })
+                        .ok_or_else(|| LimboError::Corrupt("FTS chunk path is not text".into()))?;
+                    let chunk_no = record
+                        .get_value_opt(1)
+                        .and_then(|v| match v {
                             crate::types::ValueRef::Numeric(crate::numeric::Numeric::Integer(
                                 i,
                             )) => Some(i),
                             _ => None,
-                        });
+                        })
+                        .ok_or_else(|| {
+                            LimboError::Corrupt("FTS chunk number is not an integer".into())
+                        })?;
+                    let blob = record
+                        .get_value_opt(2)
+                        .and_then(|v| match v {
+                            crate::types::ValueRef::Blob(blob) => Some(blob.to_vec()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            LimboError::Corrupt("FTS chunk payload is not a blob".into())
+                        })?;
 
-                        if let (Some(path_str), Some(chunk_no)) = (path_str, chunk_no) {
-                            // Reuse PathBuf when path hasn't changed (records are BTree-ordered)
-                            let path_buf = if current_path.as_ref().map(|p| p.as_os_str().to_str())
-                                == Some(Some(&path_str))
-                            {
-                                current_path.clone().unwrap()
-                            } else {
-                                let p = PathBuf::from(&path_str);
-                                *current_path = Some(p.clone());
-                                p
-                            };
+                    // Reuse PathBuf when path hasn't changed (records are BTree-ordered).
+                    let path_buf = if current_path.as_ref().map(|p| p.as_os_str().to_str())
+                        == Some(Some(&path_str))
+                    {
+                        current_path.clone().unwrap()
+                    } else {
+                        let path = PathBuf::from(&path_str);
+                        *current_path = Some(path.clone());
+                        path
+                    };
 
-                            // Classify file to decide whether to capture blob data
-                            let category = FileCategory::from_path(&path_buf);
-                            let (blob_size, blob_data) = record
-                                .get_value_opt(2)
-                                .map(|v| match v {
-                                    crate::types::ValueRef::Blob(b) => {
-                                        let size = b.len();
-                                        if category.is_hot() {
-                                            (size, Some(b.to_vec()))
-                                        } else {
-                                            (size, None)
-                                        }
-                                    }
-                                    _ => (0, None),
-                                })
-                                .unwrap_or((0, None));
-
-                            let chunks = catalog_builder.entry(path_buf).or_default();
-                            chunks.insert(chunk_no, (blob_size, blob_data));
-                        }
+                    let chunks = if path_buf == Path::new(FTS_CONTROL_PATH) {
+                        control_builder
+                    } else {
+                        catalog_builder.entry(path_buf.clone()).or_default()
+                    };
+                    if let Some((existing_size, existing_blob)) =
+                        chunks.insert(chunk_no, (blob.len(), Some(blob.clone())))
+                    {
+                        return Err(LimboError::Corrupt(format!(
+                            "duplicate FTS chunk {}:{} (existing_size={}, new_size={}, equal={})",
+                            path_buf.display(),
+                            chunk_no,
+                            existing_size,
+                            blob.len(),
+                            existing_blob.as_deref() == Some(blob.as_slice())
+                        )));
                     }
 
-                    return_if_io!(cursor.next());
-                }
-                FtsState::PreloadingEssentials {
-                    files_to_load,
-                    loaded_files,
-                    current_loading,
-                    current_chunks,
-                } => {
-                    // Use blocking file load from HybridBTreeDirectory
-                    let hybrid_dir = self.hybrid_directory.as_ref().ok_or_else(|| {
-                        LimboError::InternalError("hybrid_directory not initialized".into())
-                    })?;
-
-                    // If we're loading a file, continue with it
-                    if let Some(path) = current_loading.take() {
-                        // We loaded chunks, finalize the file
-                        if !current_chunks.is_empty() {
-                            current_chunks.sort_by_key(|(chunk_no, _)| *chunk_no);
-
-                            // Deduplicate
-                            let mut deduped: Vec<(i64, Vec<u8>)> = Vec::new();
-                            for (chunk_no, bytes) in current_chunks.drain(..) {
-                                if let Some(last) = deduped.last_mut() {
-                                    if last.0 == chunk_no {
-                                        *last = (chunk_no, bytes);
-                                    } else {
-                                        deduped.push((chunk_no, bytes));
-                                    }
-                                } else {
-                                    deduped.push((chunk_no, bytes));
-                                }
-                            }
-
-                            let data: Vec<u8> =
-                                deduped.iter().flat_map(|(_, b)| b.clone()).collect();
-                            loaded_files.insert(path.clone(), data.clone());
-
-                            // Add to hot cache
-                            hybrid_dir.add_to_hot_cache(path, data);
-                        }
-                    }
-
-                    // Check if we have more files to load
-                    if let Some(next_path) = files_to_load.pop() {
-                        // Load this file using blocking IO
-                        match hybrid_dir.load_file_blocking(&next_path) {
-                            Ok(data) => {
-                                loaded_files.insert(next_path.clone(), data.clone());
-                                hybrid_dir.add_to_hot_cache(next_path, data);
-                            }
-                            Err(e) => {
-                                let category = FileCategory::from_path(&next_path);
-                                // NotFound is expected for new empty indexes
-                                if e.kind() == std::io::ErrorKind::NotFound {
-                                    // Expected for new index, just log at debug level
-                                    tracing::debug!(
-                                        "FTS: preload skipped (not found): {}",
-                                        next_path.display()
-                                    );
-                                } else if category == FileCategory::Metadata {
-                                    // Metadata files are critical - propagate error
-                                    return Err(LimboError::InternalError(format!(
-                                        "FTS: failed to preload metadata file {}: {}",
-                                        next_path.display(),
-                                        e
-                                    )));
-                                } else {
-                                    // Non-critical file, warn but continue
-                                    tracing::warn!(
-                                        "FTS: could not preload {} ({:?}): {}",
-                                        next_path.display(),
-                                        category,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    // All files loaded
-                    tracing::debug!(
-                        "FTS PreloadingEssentials: loaded {} files into hot cache",
-                        loaded_files.len()
-                    );
-                    self.state = FtsState::CreatingIndex;
-                    continue;
+                    *advance_pending = true;
                 }
                 FtsState::CreatingIndex => {
                     // Log loaded files for debugging
@@ -3445,15 +3408,36 @@ impl IndexMethodCursor for FtsCursor {
                         let snapshot_wal_pos = (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos);
 
                         let mut cache = self.shared_cache.write();
-                        cache.insert(CachedFtsState {
-                            connection: Arc::downgrade(conn),
-                            snapshot_wal_pos,
-                            directory: dir.clone(),
-                            index: index.clone(),
-                            reader: reader.clone(),
-                            query_parser,
-                        });
+                        let control = self.control.clone().ok_or_else(|| {
+                            LimboError::InternalError("FTS control record not initialized".into())
+                        })?;
+                        let writer_bytes = self
+                            .shared_writer
+                            .lock()
+                            .as_ref()
+                            .map_or(0, |cached| cached.directory.hot_cache.size());
+                        let cache_budget =
+                            fts_max_retained_cache_bytes().saturating_sub(writer_bytes);
+                        let retained = cache.insert(
+                            CachedFtsState {
+                                connection: Arc::downgrade(conn),
+                                transaction_id: context.transaction_id(),
+                                snapshot_wal_pos,
+                                control,
+                                directory: dir.clone(),
+                                index: index.clone(),
+                                reader: reader.clone(),
+                                query_parser,
+                            },
+                            cache_budget,
+                        );
+                        if !retained {
+                            self.runtime_stats
+                                .cache_admission_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         tracing::debug!(
+                            retained,
                             cached_connections = cache.entries.len(),
                             "FTS CreatingIndex: cached read state for future queries"
                         );
@@ -3476,7 +3460,9 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Opens the index for writing, creating the IndexWriter.
     /// Calls `open_read` first if not already initialized.
-    fn open_write(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+    fn open_write(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+        let conn = context.connection();
+        let database_id = context.database().id;
         self.database_id = Some(database_id);
         self.opening_for_write = true;
         if self.connection.is_none() {
@@ -3490,7 +3476,33 @@ impl IndexMethodCursor for FtsCursor {
 
         initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
         self.open_cursor(conn, database_id)?;
-        if self.restore_cached_writer(conn)? {
+        if let Some(mv_store) = conn.mv_store_for_db(database_id) {
+            let tx_id = conn.get_mv_tx_id_for_db(database_id).ok_or_else(|| {
+                LimboError::InternalError(
+                    "FTS write opened without an active MVCC transaction".to_string(),
+                )
+            })?;
+            let root_page = self.btree_root_page.ok_or_else(|| {
+                LimboError::InternalError("FTS backing root is not initialized".to_string())
+            })?;
+            let snapshot_ts = mv_store.read_snapshot_ts(tx_id);
+            let index_id = mv_store.get_table_id_from_root_page_at(root_page, snapshot_ts);
+            match mv_store.acquire_index_method_write_lease(tx_id, index_id) {
+                Ok(()) => {
+                    self.runtime_stats
+                        .write_lease_acquisitions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err @ LimboError::WriteWriteConflict) => {
+                    self.runtime_stats
+                        .write_lease_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if self.restore_cached_writer(context)? {
             self.opening_for_write = false;
             return Ok(IOResult::Done(()));
         }
@@ -3499,11 +3511,15 @@ impl IndexMethodCursor for FtsCursor {
         match &self.state {
             FtsState::Ready => {}
             _ => {
-                let result = self.open_read(conn, database_id)?;
+                let result = self.open_read(context)?;
                 if let IOResult::IO(io) = result {
                     return Ok(IOResult::IO(io));
                 }
             }
+        }
+        if self.writer.is_some() {
+            self.opening_for_write = false;
+            return Ok(IOResult::Done(()));
         }
 
         let index = self
@@ -3511,6 +3527,9 @@ impl IndexMethodCursor for FtsCursor {
             .as_ref()
             .ok_or_else(|| LimboError::InternalError("FTS index not initialized".into()))?;
         // Use single-threaded mode to avoid concurrent access.
+        self.runtime_stats
+            .tantivy_writer_constructions
+            .fetch_add(1, Ordering::Relaxed);
         let writer = index
             .writer_with_num_threads(1, DEFAULT_MEMORY_BUDGET_BYTES)
             .map_err(|e| LimboError::InternalError(e.to_string()))?;
@@ -3859,7 +3878,7 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Flushes pending writes before transaction commit.
     /// This ensures FTS writes are persisted as part of the transaction.
-    fn pre_commit(&mut self) -> Result<IOResult<()>> {
+    fn prepare_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
         // First, check if we're in the middle of a flush operation that needs to continue
         // This handles the case where commit_and_flush() returned IOResult::IO and we need
         // to continue the flush after IO completes
@@ -3877,13 +3896,139 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
+    fn abort_statement(&mut self, context: &IndexMethodContext) {
+        self.pending_docs_count = 0;
+        self.writer = None;
+        self.reader = None;
+        self.searcher = None;
+        self.index = None;
+        self.hybrid_directory = None;
+        self.fts_dir_cursor = None;
+        self.control = None;
+        self.cached_parser = None;
+        self.current_hits.clear();
+        self.streaming_hits = None;
+        self.shared_cache
+            .write()
+            .remove_connection(context.connection());
+        // The slot is shared by every connection: a failed statement here
+        // (e.g. the losing side of a lease conflict) must not evict another
+        // connection's writer. Only remove what this connection's failed
+        // statement could have produced: its own writer tagged with this
+        // transaction (both `None` in WAL mode). An MVCC deferred writer
+        // (`transaction_id == None`) predates this transaction, so it stays
+        // valid across this rollback. Entries with a dead owner are removed
+        // opportunistically.
+        let mut cached_writer = self.shared_writer.lock();
+        let (dead_owner, owned) = match cached_writer.as_ref() {
+            None => (false, false),
+            Some(cached) => match cached.connection.upgrade() {
+                None => (true, false),
+                Some(owner) => (
+                    false,
+                    Arc::ptr_eq(&owner, context.connection())
+                        && cached.transaction_id == context.transaction_id(),
+                ),
+            },
+        };
+        let stale = if dead_owner || owned {
+            cached_writer.take()
+        } else {
+            None
+        };
+        drop(cached_writer);
+        if owned {
+            self.runtime_stats
+                .writer_cache_rollback_discards
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        drop(stale);
+        self.state = FtsState::Init;
+    }
+
+    fn statement_committed(&mut self, context: &IndexMethodContext) {
+        self.cache_writer(context);
+    }
+
+    fn transaction_committed(&mut self, context: &IndexMethodContext) {
+        tracing::trace!(
+            index = context.index().index_name,
+            pending_documents = self.pending_docs_count,
+            state = ?self.state,
+            has_writer = self.writer.is_some(),
+            "FTS transaction outcome: committed"
+        );
+        self.cache_writer(context);
+        if let Some(transaction_id) = context.transaction_id() {
+            // The backing transaction is now committed, so its private writer
+            // may be considered by a future transaction only after validating
+            // the transactional control record.
+            if let Some(cached) = self.shared_writer.lock().as_mut() {
+                let same_connection = cached
+                    .connection
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, context.connection()));
+                if same_connection && cached.transaction_id == Some(transaction_id) {
+                    cached.transaction_id = None;
+                    cached.snapshot_wal_pos = None;
+                }
+            }
+        } else if let Some(cached) = self.shared_writer.lock().as_mut() {
+            // This hook also runs for read-only FTS cursors, and the shared
+            // slot can still hold an older writer (e.g. one a later statement
+            // failed to replace under the retention budget). Re-stamping a
+            // writer this commit did not produce or validate would make its
+            // stale segments pass WAL-position validation, losing documents
+            // committed since. Stamp only when this connection owns the writer
+            // and this cursor's control record matches it.
+            let same_connection = cached
+                .connection
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, context.connection()));
+            let matches_cursor_control = self.control.as_ref().is_some_and(|control| {
+                control.index_incarnation == cached.control.index_incarnation
+                    && control.manifest_generation == cached.control.manifest_generation
+            });
+            if same_connection && matches_cursor_control {
+                let wal_pos = cached.directory.pager.wal_pos();
+                cached.snapshot_wal_pos = (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos);
+            }
+        }
+        self.shared_cache.write().prune();
+    }
+
+    fn transaction_rolled_back(&mut self, context: &IndexMethodContext) {
+        self.abort_statement(context);
+    }
+
+    fn savepoint_rolled_back(&mut self, context: &IndexMethodContext) {
+        self.abort_statement(context);
+    }
+
+    fn close(&mut self, context: &IndexMethodContext) {
+        if self.pending_docs_count != 0 {
+            tracing::error!(
+                pending_documents = self.pending_docs_count,
+                "closing FTS cursor with unprepared writes"
+            );
+        }
+        self.writer = None;
+        self.reader = None;
+        self.searcher = None;
+        self.index = None;
+        self.hybrid_directory = None;
+        self.fts_dir_cursor = None;
+        self.cached_parser = None;
+        self.current_hits.clear();
+        self.streaming_hits = None;
+        let _ = context;
+        self.shared_cache.write().prune();
+    }
+
     /// Optimizes the FTS index by merging all segments into one.
     /// Call via `OPTIMIZE INDEX idx_name` SQL command.
-    fn optimize(
-        &mut self,
-        connection: &Arc<Connection>,
-        database_id: usize,
-    ) -> Result<IOResult<()>> {
+    fn optimize(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+        let database_id = context.database().id;
         self.database_id = Some(database_id);
         // First ensure any pending documents are flushed
         if self.pending_docs_count > 0 {
@@ -3896,7 +4041,7 @@ impl IndexMethodCursor for FtsCursor {
 
         // If we're not open for writing, open it
         if self.writer.is_none() {
-            return_if_io!(self.open_write(connection, database_id));
+            return_if_io!(self.open_write(context));
         }
 
         let index = self
@@ -4062,12 +4207,91 @@ impl IndexMethodCursor for FtsCursor {
             .len();
 
         let cache = self.shared_cache.read();
+        let cached_writer_bytes = self
+            .shared_writer
+            .lock()
+            .as_ref()
+            .map_or(0, |cached| cached.directory.hot_cache.size());
+        let control = self.control.as_ref().ok_or_else(|| {
+            LimboError::InternalError("FTS control record not initialized".to_string())
+        })?;
         Ok(Some(super::IndexMethodTestStats {
+            storage_format_version: Some(FTS_CONTROL_FORMAT_VERSION),
+            index_incarnation: Some(control.index_incarnation),
+            manifest_generation: Some(control.manifest_generation),
+            manifest_file_count: Some(control.files.len()),
             storage_file_count: directory.catalog.read().len(),
             segment_count: Some(segment_count),
             cached_connection_count: Some(cache.entries.len()),
-            cached_bytes: Some(cache.resident_cache_bytes()),
+            cached_bytes: Some(
+                cache
+                    .resident_cache_bytes()
+                    .saturating_add(cached_writer_bytes),
+            ),
+            cache_admission_rejections: Some(
+                self.runtime_stats
+                    .cache_admission_rejections
+                    .load(Ordering::Relaxed),
+            ),
             cached_writer: Some(self.shared_writer.lock().is_some()),
+            tantivy_writer_constructions: Some(
+                self.runtime_stats
+                    .tantivy_writer_constructions
+                    .load(Ordering::Relaxed),
+            ),
+            writer_cache_lookups: Some(
+                self.runtime_stats
+                    .writer_cache_lookups
+                    .load(Ordering::Relaxed),
+            ),
+            writer_cache_hits: Some(self.runtime_stats.writer_cache_hits.load(Ordering::Relaxed)),
+            writer_cache_validation_failures: Some(
+                self.runtime_stats
+                    .writer_cache_validation_failures
+                    .load(Ordering::Relaxed),
+            ),
+            writer_cache_rollback_discards: Some(
+                self.runtime_stats
+                    .writer_cache_rollback_discards
+                    .load(Ordering::Relaxed),
+            ),
+            writer_cache_misses: Some(
+                self.runtime_stats
+                    .writer_cache_misses
+                    .load(Ordering::Relaxed),
+            ),
+            read_cache_lookups: Some(
+                self.runtime_stats
+                    .read_cache_lookups
+                    .load(Ordering::Relaxed),
+            ),
+            read_cache_hits: Some(self.runtime_stats.read_cache_hits.load(Ordering::Relaxed)),
+            read_cache_misses: Some(self.runtime_stats.read_cache_misses.load(Ordering::Relaxed)),
+            full_snapshot_loads: Some(
+                self.runtime_stats
+                    .full_snapshot_loads
+                    .load(Ordering::Relaxed),
+            ),
+            manifest_validation_hits: Some(
+                self.runtime_stats
+                    .manifest_validation_hits
+                    .load(Ordering::Relaxed),
+            ),
+            manifest_validation_misses: Some(
+                self.runtime_stats
+                    .manifest_validation_misses
+                    .load(Ordering::Relaxed),
+            ),
+            write_lease_acquisitions: Some(
+                self.runtime_stats
+                    .write_lease_acquisitions
+                    .load(Ordering::Relaxed),
+            ),
+            write_lease_rejections: Some(
+                self.runtime_stats
+                    .write_lease_rejections
+                    .load(Ordering::Relaxed),
+            ),
         }))
     }
 }
@@ -4075,8 +4299,8 @@ impl IndexMethodCursor for FtsCursor {
 #[cfg(test)]
 mod tests {
     use super::{
-        FtsCursor, FtsIndexAttachment, PendingFileMutations, DEFAULT_MEMORY_BUDGET_BYTES,
-        FTS_PATTERN_MATCH, FTS_PATTERN_MATCH_LIMIT, FTS_PATTERN_SCORE,
+        FtsControlRecord, FtsCursor, FtsIndexAttachment, FtsManifestFile, PendingFileMutations,
+        DEFAULT_MEMORY_BUDGET_BYTES, FTS_PATTERN_MATCH, FTS_PATTERN_MATCH_LIMIT, FTS_PATTERN_SCORE,
     };
     use crate::{
         index_method::{
@@ -4099,6 +4323,50 @@ mod tests {
         let flushes = mutations.take_flushes();
         assert_eq!(flushes.len(), 1);
         flushes.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn control_record_round_trips_and_detects_corruption() {
+        let mut files = FxHashMap::default();
+        files.insert(
+            PathBuf::from("segment.idx"),
+            FtsManifestFile {
+                size: 42,
+                chunks: 2,
+            },
+        );
+        let control = FtsControlRecord {
+            index_incarnation: 17,
+            manifest_generation: 9,
+            files,
+        };
+
+        let encoded = control.encode().unwrap();
+        let decoded = FtsControlRecord::decode(&encoded).unwrap();
+        assert_eq!(decoded.index_incarnation, 17);
+        assert_eq!(decoded.manifest_generation, 9);
+        assert_eq!(decoded.files, control.files);
+
+        let mut corrupt = encoded;
+        corrupt[8] ^= 1;
+        assert!(matches!(
+            FtsControlRecord::decode(&corrupt),
+            Err(crate::LimboError::Corrupt(message))
+                if message.contains("checksum mismatch")
+        ));
+
+        let exhausted = FtsControlRecord {
+            index_incarnation: 17,
+            manifest_generation: u64::MAX,
+            files: FxHashMap::default(),
+        };
+        let error = FtsControlRecord::from_catalog(
+            Some(&exhausted),
+            exhausted.index_incarnation,
+            &FxHashMap::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("generation is exhausted"));
     }
 
     #[test]
