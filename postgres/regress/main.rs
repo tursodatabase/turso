@@ -1357,23 +1357,30 @@ impl Table {
         out.push_str(&sep.join("+"));
         out.push('\n');
 
+        let last = self.columns.len().saturating_sub(1);
         for row in &self.rows {
             let cells: Vec<String> = row
                 .iter()
                 .zip(&self.columns)
                 .zip(&widths)
-                .map(|((value, col), &w)| {
+                .enumerate()
+                .map(|(i, ((value, col), &w))| {
                     let v = display(value);
                     let pad = " ".repeat(w - v.chars().count());
-                    if right_aligned(col.type_oid) {
-                        format!(" {pad}{v} ")
-                    } else {
-                        format!(" {v}{pad} ")
+                    // psql drops the padding that would trail the last column,
+                    // but not the padding that precedes a right-aligned value.
+                    // So a right-aligned NULL still fills its width, and the
+                    // line cannot simply be trimmed: that ate the alignment of
+                    // every row ending in a NULL number.
+                    match (right_aligned(col.type_oid), i == last) {
+                        (true, true) => format!(" {pad}{v}"),
+                        (true, false) => format!(" {pad}{v} "),
+                        (false, true) => format!(" {v}"),
+                        (false, false) => format!(" {v}{pad} "),
                     }
                 })
                 .collect();
-            let line = cells.join("|");
-            out.push_str(line.trim_end());
+            out.push_str(&cells.join("|"));
             out.push('\n');
         }
 
@@ -1816,6 +1823,71 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// psql pads every cell to its column width and then drops only the
+    /// padding that would trail the *last* column — not the padding that
+    /// precedes a right-aligned value. Trimming the whole line instead ate
+    /// the alignment of every row ending in a NULL number, which is 13k
+    /// lines of the corpus.
+    #[test]
+    fn a_row_keeps_the_padding_psql_keeps() {
+        let table = Table {
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    type_oid: 23,
+                }, // int4
+                Column {
+                    name: "char_length".to_string(),
+                    type_oid: 23,
+                },
+            ],
+            rows: vec![
+                vec![Some("1".to_string()), None],
+                vec![Some("2".to_string()), Some("10000".to_string())],
+            ],
+        };
+        let mut out = String::new();
+        table.render(&RenderOpts::default(), &mut out);
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(
+            lines[0], " id | char_length ",
+            "header keeps its trailing space"
+        );
+        assert_eq!(lines[1], "----+-------------");
+        // The NULL still fills its right-aligned width.
+        assert_eq!(lines[2], "  1 |            ");
+        assert_eq!(lines[3], "  2 |       10000");
+        assert_eq!(lines[4], "(2 rows)");
+    }
+
+    /// A left-aligned last column gets no padding at all, so a short text
+    /// value and a NULL both end the line immediately.
+    #[test]
+    fn a_text_last_column_is_not_padded() {
+        let table = Table {
+            columns: vec![
+                Column {
+                    name: "a".to_string(),
+                    type_oid: 23,
+                },
+                Column {
+                    name: "note".to_string(),
+                    type_oid: 25,
+                }, // text
+            ],
+            rows: vec![
+                vec![Some("1".to_string()), Some("hi".to_string())],
+                vec![Some("2".to_string()), None],
+            ],
+        };
+        let mut out = String::new();
+        table.render(&RenderOpts::default(), &mut out);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[2], " 1 | hi");
+        assert_eq!(lines[3], " 2 | ");
+    }
 
     #[test]
     fn a_timeout_and_a_dead_connection_read_differently() {

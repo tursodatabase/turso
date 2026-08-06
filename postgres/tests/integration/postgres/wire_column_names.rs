@@ -1,6 +1,6 @@
 // Copyright 2023-2026 the Turso authors. All rights reserved. MIT license.
 
-//! Output column names. PostgreSQL derives a name for every unaliased result
+//! Output column names and types. PostgreSQL derives a name for every unaliased result
 //! column from the expression's *shape*, not from its text: a bare column
 //! keeps its name, a function call takes the function's name, a cast takes the
 //! type's name, and anything else is `?column?`. We used to send the
@@ -189,4 +189,51 @@ fn several_unnamed_columns_are_all_question_column() {
         "SELECT 1 + 1, abs(-2), 1::bool, 4 AS four",
         &["?column?", "abs", "bool", "four"],
     );
+}
+
+/// A function's result type has to reach the client, because that is what
+/// decides how the value is rendered — psql right-aligns numbers and
+/// left-aligns text, so a `length()` column reported as text prints wrong
+/// even with the right value in it.
+#[test]
+fn a_function_reports_the_type_it_returns() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    exec(&mut conn, "CREATE TABLE fr (b text, n int)");
+    exec(&mut conn, "INSERT INTO fr VALUES ('abc', 5)");
+
+    const INT4: u32 = 23;
+    const TEXT: u32 = 25;
+    const FLOAT8: u32 = 701;
+
+    // Counting and measuring.
+    for sql in [
+        "SELECT length(b) FROM fr",
+        "SELECT char_length(b) FROM fr",
+        "SELECT octet_length(b) FROM fr",
+        "SELECT count(*) FROM fr",
+        "SELECT count(n) FROM fr",
+        "SELECT instr(b, 'b') FROM fr",
+    ] {
+        assert_eq!(column_type_oids(&mut conn, sql), vec![INT4], "for `{sql}`");
+    }
+
+    // Text producers stay text.
+    for sql in [
+        "SELECT upper(b) FROM fr",
+        "SELECT substr(b, 1, 2) FROM fr",
+        "SELECT quote_ident('x')",
+    ] {
+        assert_eq!(column_type_oids(&mut conn, sql), vec![TEXT], "for `{sql}`");
+    }
+
+    // Always-floating arithmetic.
+    for sql in ["SELECT avg(n) FROM fr", "SELECT sqrt(4)", "SELECT random()"] {
+        assert_eq!(
+            column_type_oids(&mut conn, sql),
+            vec![FLOAT8],
+            "for `{sql}`"
+        );
+    }
 }

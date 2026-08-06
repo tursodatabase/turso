@@ -174,6 +174,36 @@ pub enum ColumnTypeKind {
 /// inference) by walking through arithmetic, bitwise, comparison, logical,
 /// and concat operators — letting `SELECT 42 + 1` report INT4 to a
 /// PostgreSQL client the way PG itself does.
+/// The primitive a function's result has, for functions whose result type is
+/// fixed. None when the type depends on the arguments (`abs`, `coalesce`,
+/// `max`) or is not modelled — the caller then reports nothing rather than
+/// something wrong.
+fn function_result_primitive(name: &str) -> Option<&'static str> {
+    let lowered = name.to_ascii_lowercase();
+    Some(match lowered.as_str() {
+        // Counting and measuring produce integers.
+        "count" | "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
+        | "instr" | "strpos" | "position" | "unicode" | "ascii" | "changes" | "total_changes"
+        | "last_insert_rowid" | "sign" | "row_number" | "rank" | "dense_rank" | "ntile"
+        | "cume_dist" | "percent_rank" => "INTEGER",
+        // Arithmetic that is always floating point.
+        "random" | "avg" | "sqrt" | "exp" | "ln" | "log" | "log2" | "log10" | "pow" | "power"
+        | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh"
+        | "degrees" | "radians" | "pi" | "var_pop" | "var_samp" | "variance" | "stddev"
+        | "stddev_pop" | "stddev_samp" => "REAL",
+        // Text producers.
+        "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "substr" | "substring" | "replace"
+        | "printf" | "format" | "hex" | "quote" | "typeof" | "char" | "concat" | "concat_ws"
+        | "group_concat" | "string_agg" | "soundex" | "sqlite_version" | "md5" | "initcap"
+        | "left" | "right" | "split_part" | "repeat" | "reverse" | "lpad" | "rpad" | "to_char"
+        | "encode" | "version" | "current_database" | "current_schema" | "quote_ident"
+        | "quote_literal" | "pg_typeof" | "regexp_replace" => "TEXT",
+        // Blobs.
+        "randomblob" | "zeroblob" | "decode" | "unhex" => "BLOB",
+        _ => return None,
+    })
+}
+
 fn infer_expression_primitive(
     expr: &turso_parser::ast::Expr,
     referenced_tables: Option<&translate::plan::TableReferences>,
@@ -195,6 +225,15 @@ fn infer_expression_primitive(
             infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
         }
         Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
+        // A function's result type. Clients use this to decide how to render a
+        // column — psql right-aligns numbers and left-aligns text — so a
+        // `length()` column reported as text comes out looking wrong even
+        // though its value is right. Only functions whose result type does not
+        // depend on their arguments are listed; anything else stays unknown
+        // rather than guessed.
+        Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => {
+            function_result_primitive(name.as_str())
+        }
         Expr::Unary(_, inner) => {
             // Unary +/-/NOT preserve the operand's primitive (NOT on INTEGER
             // is still INTEGER in SQLite).

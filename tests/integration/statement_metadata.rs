@@ -299,6 +299,19 @@ mod tests {
         // Concat is always TEXT.
         let concat = conn.prepare("SELECT 'hello' || ' world'").unwrap();
         assert_eq!(expect_info(&concat, 0).declared_name, "TEXT");
+
+        // A function with a fixed result type reports it, so a client knows
+        // how to render the column.
+        for (sql, primitive) in [
+            ("SELECT length('abc')", "INTEGER"),
+            ("SELECT count(*)", "INTEGER"),
+            ("SELECT upper('a')", "TEXT"),
+            ("SELECT randomblob(8)", "BLOB"),
+            ("SELECT sqrt(4)", "REAL"),
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            assert_eq!(expect_info(&stmt, 0).declared_name, primitive, "for {sql}");
+        }
     }
 
     /// Expressions whose primitive can't be determined statically — function
@@ -310,10 +323,13 @@ mod tests {
         let db = fresh_db_with_custom_types("type_info_indet.db");
         let conn = db.connect_limbo();
 
-        // `randomblob(N)` returns a BLOB — no useful wire primitive to
-        // report. Use any function call with no declared return affinity.
-        let blob = conn.prepare("SELECT randomblob(8)").unwrap();
-        assert!(blob.get_column_type_info(0).unwrap().is_none());
+        // A function whose result type follows its arguments has nothing
+        // fixed to report: `abs` is an integer for an integer and a float for
+        // a float, and `coalesce` is whatever its arguments are.
+        let abs = conn.prepare("SELECT abs(?)").unwrap();
+        assert!(abs.get_column_type_info(0).unwrap().is_none());
+        let coalesce = conn.prepare("SELECT coalesce(?, ?)").unwrap();
+        assert!(coalesce.get_column_type_info(0).unwrap().is_none());
 
         // Blob literals carry a concrete value type but no useful primitive
         // to expose in wire-protocol terms (clients consuming BYTEA already
