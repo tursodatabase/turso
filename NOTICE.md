@@ -53,6 +53,23 @@ This project depends on pastey, distributed by the pastey authors:
 * License: licenses/core/pastey-mit-license.md (MIT License)
 * Homepage: https://github.com/AS1100K/pastey
 
+This project depends on memchr, distributed by Andrew Gallant:
+
+* License: licenses/core/memchr-mit-license.md (MIT License)
+* License: licenses/core/memchr-unlicense.md (The Unlicense)
+* Homepage: https://github.com/BurntSushi/memchr
+
+This project depends on simdutf8, distributed by the simdutf8 authors:
+
+* License: licenses/core/simdutf8-apache-license.md (Apache License v2.0)
+* License: licenses/core/simdutf8-mit-license.md (MIT License)
+* Homepage: https://github.com/rusticstuff/simdutf8
+
+This project depends on faster-hex, distributed by the faster-hex authors:
+
+* License: licenses/core/faster-hex-mit-license.md (MIT License)
+* Homepage: https://github.com/nervosnetwork/faster-hex
+
 This project depends on windows-sys, distributed by the Microsoft:
 
 * License: licenses/core/windows-apache.license.md (Apache License v2.0)
