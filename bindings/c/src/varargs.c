@@ -13,6 +13,8 @@
 */
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
 typedef struct sqlite3 sqlite3;
 
@@ -46,4 +48,53 @@ int turso_sqlite3_db_config_va(sqlite3 *db, int op, ...) {
     p_out = va_arg(ap, int *);
     va_end(ap);
     return turso_db_config_int(db, op, value, p_out);
+}
+
+extern char *turso_printf_va(const char *fmt, void *ap);
+extern void sqlite3_free(void *p);
+
+/*
+** One-line va_arg pumps. The Rust bridge walks the format string through
+** core's specifier grammar (printf_c_arg_plan) and calls back here for
+** each argument with the C type that grammar dictates — the only work a
+** va_list requires from C.
+*/
+int turso_va_i32(void *ap) { return va_arg(*(va_list *)ap, int); }
+long long turso_va_i64(void *ap) { return va_arg(*(va_list *)ap, long long); }
+double turso_va_f64(void *ap) { return va_arg(*(va_list *)ap, double); }
+void *turso_va_ptr(void *ap) { return va_arg(*(va_list *)ap, void *); }
+
+char *turso_sqlite3_mprintf_va(const char *fmt, ...) {
+    va_list ap;
+    char *r;
+
+    va_start(ap, fmt);
+    r = turso_printf_va(fmt, &ap);
+    va_end(ap);
+    return r;
+}
+
+char *turso_sqlite3_snprintf_va(int n, char *buf, const char *fmt, ...) {
+    va_list ap;
+    char *s;
+    size_t len;
+
+    if (n <= 0 || !buf) {
+        return buf;
+    }
+    va_start(ap, fmt);
+    s = turso_printf_va(fmt, &ap);
+    va_end(ap);
+    if (!s) {
+        buf[0] = 0;
+        return buf;
+    }
+    len = strlen(s);
+    if (len >= (size_t)n) {
+        len = (size_t)n - 1;
+    }
+    memcpy(buf, s, len);
+    buf[len] = 0;
+    sqlite3_free(s);
+    return buf;
 }

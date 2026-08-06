@@ -224,6 +224,10 @@ void *sqlite3_malloc64(int _n);
 
 void sqlite3_free(void *_ptr);
 
+char *sqlite3_mprintf(const char *fmt, ...);
+
+char *sqlite3_snprintf(int n, char *buf, const char *fmt, ...);
+
 int sqlite3_errcode(sqlite3 *_db);
 
 const char *sqlite3_errstr(int _err);

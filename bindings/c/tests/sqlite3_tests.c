@@ -25,6 +25,7 @@ void test_sqlite3_set_authorizer();
 void test_sqlite3_db_config();
 void test_sqlite3_extended_result_codes();
 void test_sqlite3_sql_introspection();
+void test_sqlite3_mprintf();
 
 int allocated = 0;
 
@@ -49,6 +50,7 @@ int main(void)
     test_sqlite3_db_config();
     test_sqlite3_extended_result_codes();
     test_sqlite3_sql_introspection();
+    test_sqlite3_mprintf();
     return 0;
 }
 
@@ -1066,4 +1068,66 @@ void test_sqlite3_sql_introspection()
 
     sqlite3_close(db);
     printf("test_sqlite3_sql_introspection test passed\n");
+}
+
+/*
+** sqlite3_mprintf / sqlite3_snprintf: the SQL-quoting specifiers backing
+** SQLite3::escapeString (%q) and PDO::quote ('%q'), plus the standard
+** conversions, width/precision, %z, and snprintf's bounded contract
+** (returns buf, truncates at n-1 with NUL, writes nothing when n <= 0).
+*/
+void test_sqlite3_mprintf()
+{
+    char *p;
+    char buf[8];
+
+    p = sqlite3_mprintf("%q", "it's");
+    assert(strcmp(p, "it''s") == 0);
+    sqlite3_free(p);
+
+    p = sqlite3_mprintf("%q", (const char *)0);
+    assert(strcmp(p, "(NULL)") == 0);
+    sqlite3_free(p);
+
+    p = sqlite3_mprintf("%Q", "it's");
+    assert(strcmp(p, "'it''s'") == 0);
+    sqlite3_free(p);
+
+    p = sqlite3_mprintf("%Q", (const char *)0);
+    assert(strcmp(p, "NULL") == 0);
+    sqlite3_free(p);
+
+    p = sqlite3_mprintf("%w", "a\"b");
+    assert(strcmp(p, "a\"\"b") == 0);
+    sqlite3_free(p);
+
+    /* Precision truncates the input before escaping; width pads after. */
+    p = sqlite3_mprintf("%8.3q", "ab'cdef");
+    assert(strcmp(p, "    ab''") == 0);
+    sqlite3_free(p);
+
+    p = sqlite3_mprintf("%d|%05d|%x|%.2f|%e|%lld", 42, 7, 255, 3.14159,
+                        12345.678, (long long)9223372036854775807LL);
+    assert(strcmp(p, "42|00007|ff|3.14|1.234568e+04|9223372036854775807") == 0);
+    sqlite3_free(p);
+
+    p = sqlite3_mprintf("%s|%10s|%-10s|100%%|%c%c", "hi", "hi", "hi", 'A', 'B');
+    assert(strcmp(p, "hi|        hi|hi        |100%|AB") == 0);
+    sqlite3_free(p);
+
+    /* %z consumes and frees its argument. */
+    p = sqlite3_mprintf("dup-%z-end", sqlite3_mprintf("inner"));
+    assert(strcmp(p, "dup-inner-end") == 0);
+    sqlite3_free(p);
+
+    assert(sqlite3_snprintf(sizeof buf, buf, "'%q'", "abcdefghij") == buf);
+    assert(strcmp(buf, "'abcdef") == 0);
+
+    sqlite3_snprintf(0, buf, "%d", 5);
+    assert(strcmp(buf, "'abcdef") == 0);
+
+    sqlite3_snprintf(sizeof buf, buf, "'%q'", "ab");
+    assert(strcmp(buf, "'ab'") == 0);
+
+    printf("test_sqlite3_mprintf test passed\n");
 }
