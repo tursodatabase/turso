@@ -664,6 +664,68 @@ expect {
     6|3
 }
 
+# EXISTS must run after FULL JOIN has made its missing-side rows.
+test exists-after-full-join {
+    CREATE TABLE full_exists_a(id INTEGER, x INTEGER);
+    CREATE TABLE full_exists_b(id INTEGER, y INTEGER);
+    CREATE TABLE full_exists_c(id INTEGER, z INTEGER);
+    CREATE TABLE full_exists_i(k INTEGER);
+    INSERT INTO full_exists_a VALUES (1,1),(2,2);
+    INSERT INTO full_exists_b VALUES (1,1),(2,2);
+    INSERT INTO full_exists_c VALUES (2,2),(3,3);
+    INSERT INTO full_exists_i VALUES (1);
+
+    SELECT a.id, b.id, c.id
+    FROM full_exists_a a
+    JOIN full_exists_b b ON a.id = b.id
+    FULL JOIN full_exists_c c ON b.id = c.id
+    WHERE EXISTS (SELECT 1 FROM full_exists_i i WHERE i.k = a.x);
+}
+expect {
+    1|1|
+}
+
+# A link to the first table must not move before a later FULL JOIN.
+test exists-linked-past-full-join {
+    CREATE TABLE past_full_a(x INTEGER);
+    CREATE TABLE past_full_b(y INTEGER);
+    CREATE TABLE past_full_c(z INTEGER);
+    CREATE TABLE past_full_i(v INTEGER);
+    INSERT INTO past_full_a VALUES (1);
+    INSERT INTO past_full_b VALUES (1);
+    INSERT INTO past_full_c VALUES (2);
+    INSERT INTO past_full_i VALUES (1);
+
+    SELECT a.x, b.y, c.z
+    FROM past_full_a a
+    JOIN past_full_b b ON a.x = b.y
+    FULL JOIN past_full_c c ON a.x = c.z
+    WHERE EXISTS (SELECT 1 FROM past_full_i i WHERE i.v = a.x);
+}
+expect {
+    1|1|
+}
+
+# NOT EXISTS must not remove a match before FULL JOIN sees it.
+test not-exists-linked-past-full-join {
+    CREATE TABLE anti_full_a(x INTEGER);
+    CREATE TABLE anti_full_b(y INTEGER);
+    CREATE TABLE anti_full_c(z INTEGER);
+    CREATE TABLE anti_full_i(v INTEGER);
+    INSERT INTO anti_full_a VALUES (1);
+    INSERT INTO anti_full_b VALUES (1);
+    INSERT INTO anti_full_c VALUES (1);
+    INSERT INTO anti_full_i VALUES (1);
+
+    SELECT a.x, b.y, c.z
+    FROM anti_full_a a
+    JOIN anti_full_b b ON a.x = b.y
+    FULL JOIN anti_full_c c ON a.x = c.z
+    WHERE NOT EXISTS (SELECT 1 FROM anti_full_i i WHERE i.v = a.x);
+}
+expect {
+}
+
 setup comparison_keys {
     CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
     CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
