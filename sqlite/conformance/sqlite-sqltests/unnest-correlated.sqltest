@@ -953,6 +953,104 @@ expect pattern {
     (?s)SEARCH scalar_subquery_.*SEARCH scalar_subquery_
 }
 
+# A grouped table search reads its result from the index when the result is
+# used. It must not also copy every index column to unused registers after
+# each match.
+@skip-if sqlite "Turso uses a different grouped subquery plan"
+test grouped-seek-does-not-copy-unused-columns {
+    CREATE TABLE bytecode_outer(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE bytecode_inner(k INTEGER, x REAL);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('bytecode_outer', NULL, '20000'),
+        ('bytecode_inner', NULL, '200000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN
+    SELECT o.id,
+           (SELECT avg(i.x) FROM bytecode_inner i WHERE i.k = o.k)
+    FROM bytecode_outer o;
+}
+expect pattern {
+    (?m)^\d+\|SeekGE\|.*$\n^\d+\|IdxGT\|.*$\n^\d+\|Integer\|1\|.*$\n^\d+\|RowId\|.*$
+}
+
+# The IN subquery index is not used after IN becomes a semi join. Its cursor
+# number must be free for the tables and index that remain in the plan.
+@skip-if sqlite "Turso uses a different IN plan"
+test unnested-in-reuses-unused-cursor {
+    CREATE TABLE cursor_outer(id INTEGER PRIMARY KEY, k INTEGER, x INTEGER);
+    CREATE TABLE cursor_inner(k INTEGER, x INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('cursor_outer', NULL, '20000'),
+        ('cursor_inner', NULL, '200000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN
+    SELECT o.id
+    FROM cursor_outer o
+    WHERE o.x IN (
+        SELECT i.x FROM cursor_inner i WHERE i.k = o.k
+    );
+}
+expect pattern {
+    (?m)^\d+\|OpenRead\|0\|.*table=cursor_outer.*$\n^\d+\|OpenRead\|1\|.*table=cursor_inner.*$(?s).*\n\d+\|OpenAutoindex\|2\|
+}
+
+# The scalar result register is not used after the aggregate becomes a grouped
+# table. The grouped table output must be able to use that register number.
+@skip-if sqlite "Turso uses a different aggregate plan"
+test grouped-aggregate-reuses-unused-result-register {
+    CREATE TABLE register_outer(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE register_inner(k INTEGER, x REAL);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('register_outer', NULL, '20000'),
+        ('register_inner', NULL, '200000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN
+    SELECT o.id,
+           (SELECT avg(i.x) FROM register_inner i WHERE i.k = o.k)
+    FROM register_outer o;
+}
+expect pattern {
+    (?m)^\d+\|AggFinal\|.*$\n^\d+\|Copy\|\d+\|1\|.*$\n^\d+\|Copy\|\d+\|2\|.*$
+}
+
+# A grouped value can be used while two outer hash joins build their inputs.
+# Preparing this form must keep the grouped value available in both builds.
+test grouped-value-is-available-to-two-hash-builds {
+    CREATE TABLE two_hash_sales(item_key INTEGER, sold_date_key INTEGER, discount REAL);
+    CREATE TABLE two_hash_items(item_key INTEGER, maker INTEGER);
+    CREATE TABLE two_hash_dates(date_key INTEGER, sold_on TEXT);
+    INSERT INTO two_hash_items VALUES (1,977),(2,1);
+    INSERT INTO two_hash_dates VALUES (1,'2000-02-01'),(2,'1999-01-01');
+    INSERT INTO two_hash_sales VALUES
+        (1,1,10.0),(1,1,20.0),(1,1,40.0),(2,1,100.0),(1,2,1000.0);
+
+    SELECT CAST(s.discount AS INTEGER)
+    FROM two_hash_sales s, two_hash_items i, two_hash_dates d
+    WHERE i.maker = 977
+      AND i.item_key = s.item_key
+      AND d.sold_on BETWEEN '2000-01-27' AND '2000-04-26'
+      AND d.date_key = s.sold_date_key
+      AND s.discount > (
+          SELECT 1.3 * avg(s2.discount)
+          FROM two_hash_sales s2, two_hash_dates d2
+          WHERE s2.item_key = i.item_key
+            AND d2.sold_on BETWEEN '2000-01-27' AND '2000-04-26'
+            AND d2.date_key = s2.sold_date_key
+      );
+}
+expect {
+    40
+}
+
 
 # Each level has one EXISTS that can be changed to a join and one EXISTS
 # that holds the next level. Preparing this query must not try every mix of

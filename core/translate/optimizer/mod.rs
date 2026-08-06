@@ -64,7 +64,11 @@ use order::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeSet, VecDeque},
+    sync::Arc,
+};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
@@ -546,6 +550,7 @@ pub fn optimize_plan(
     plan: &mut Plan,
     resolver: &Resolver,
 ) -> Result<()> {
+    let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, resolver)?,
@@ -563,9 +568,99 @@ pub fn optimize_plan(
             optimize_recursive_cte_query(&mut recursive_cte.recursive_query, resolver)?;
         }
     }
+    let resources_after = subquery_resources(plan);
+    for cursor_id in resources_before
+        .cursor_ids
+        .difference(&resources_after.cursor_ids)
+    {
+        program.release_cursor_id(*cursor_id);
+    }
+    for (start, count) in resources_before
+        .register_ranges
+        .difference(&resources_after.register_ranges)
+    {
+        program.release_registers(*start, *count);
+    }
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
     tracing::debug!(plan_sql = plan.to_string());
     Ok(())
+}
+
+#[derive(Default)]
+struct SubqueryResources {
+    cursor_ids: BTreeSet<usize>,
+    register_ranges: BTreeSet<(usize, usize)>,
+}
+
+/// Find result storage reserved by subqueries in a plan.
+fn subquery_resources(plan: &Plan) -> SubqueryResources {
+    fn add_subqueries(subqueries: &[NonFromClauseSubquery], resources: &mut SubqueryResources) {
+        for subquery in subqueries {
+            match &subquery.query_type {
+                SubqueryType::Exists { .. } => {}
+                SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs,
+                } => {
+                    resources
+                        .register_ranges
+                        .insert((*result_reg_start, *num_regs));
+                }
+                SubqueryType::In { cursor_id, .. } => {
+                    resources.cursor_ids.insert(*cursor_id);
+                }
+            }
+            if let SubqueryState::Unevaluated {
+                plan: Some(child_plan),
+            } = &subquery.state
+            {
+                add_plan(child_plan, resources);
+            }
+        }
+    }
+
+    fn add_select(plan: &SelectPlan, resources: &mut SubqueryResources) {
+        add_subqueries(&plan.non_from_clause_subqueries, resources);
+        for table in plan.table_references.joined_tables() {
+            if let Table::FromClauseSubquery(subquery) = &table.table {
+                add_plan(&subquery.plan, resources);
+            }
+        }
+    }
+
+    fn add_plan(plan: &Plan, resources: &mut SubqueryResources) {
+        match plan {
+            Plan::Select(plan) => add_select(plan, resources),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (plan, _) in left {
+                    add_select(plan, resources);
+                }
+                add_select(right_most, resources);
+            }
+            Plan::RecursiveCte(plan) => {
+                add_plan(&plan.initial_query, resources);
+                add_plan(&plan.recursive_query, resources);
+            }
+            Plan::Delete(plan) => {
+                add_subqueries(&plan.non_from_clause_subqueries, resources);
+                if let Some(rowset_plan) = &plan.rowset_plan {
+                    add_select(rowset_plan, resources);
+                }
+            }
+            Plan::Update(plan) => {
+                add_subqueries(&plan.non_from_clause_subqueries, resources);
+                if let Some(write_set_plan) = &plan.write_set_plan {
+                    add_select(&write_set_plan.select, resources);
+                }
+            }
+        }
+    }
+
+    let mut resources = SubqueryResources::default();
+    add_plan(plan, &mut resources);
+    resources
 }
 
 fn optimize_recursive_cte_query(query: &mut Plan, resolver: &Resolver) -> Result<()> {
