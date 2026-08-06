@@ -218,6 +218,14 @@ pub struct WhereTerm {
     /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
     /// is set, we force evaluation to happen during that table's loop.
     pub from_outer_join: Option<TableInternalId>,
+    /// Whether this term originated in the ON/USING clause of an INNER join
+    /// (as opposed to the WHERE clause). For plain queries the two are
+    /// equivalent, but when the query contains a FULL OUTER JOIN they are not:
+    /// an inner-join ON condition only restricts the join's own row pairs
+    /// (an always-false one merely empties that side of the FULL OUTER JOIN),
+    /// whereas an always-false WHERE condition empties the entire result,
+    /// including NULL-extended rows. Mirrors SQLite's EP_InnerON marking.
+    pub from_inner_join: bool,
     /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
     /// in the normal place where WHERE terms are evaluated.
     /// A term may have been consumed e.g. if:
@@ -273,6 +281,7 @@ impl From<Expr> for WhereTerm {
         Self {
             expr: value,
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }
     }
@@ -944,12 +953,15 @@ pub fn select_star(
     right_join_swapped: bool,
     long_names: bool,
 ) -> crate::Result<()> {
-    // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
-    let table_iter: Vec<&JoinedTable> = if right_join_swapped {
-        tables.iter().rev().collect()
-    } else {
-        tables.iter().collect()
-    };
+    // The planner rewrites RIGHT JOIN by swapping the first two tables and
+    // treating it as a LEFT JOIN (the swap is only allowed on a two-table FROM
+    // prefix, so it always involves indices 0 and 1). Swap them back here so
+    // SELECT * expands columns in the original declaration order; any tables
+    // joined afterwards keep their positions.
+    let mut table_iter: Vec<&JoinedTable> = tables.iter().collect();
+    if right_join_swapped && table_iter.len() >= 2 {
+        table_iter.swap(0, 1);
+    }
     for table in table_iter {
         // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
         // and should not contribute columns to SELECT *.

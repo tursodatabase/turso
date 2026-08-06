@@ -161,6 +161,7 @@ fn get_table_local_constraints_for_branch(
         .map(|expr| WhereTerm {
             expr,
             from_outer_join,
+            from_inner_join: false,
             consumed: false,
         })
         .collect::<Vec<_>>();
@@ -1458,6 +1459,7 @@ mod tests {
                 Box::new(right_disjunct),
             ),
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }];
 
@@ -1538,6 +1540,7 @@ mod tests {
                     Box::new(create_numeric_literal("10")),
                 ),
                 from_outer_join: None,
+                from_inner_join: false,
                 consumed: false,
             },
             WhereTerm {
@@ -1547,6 +1550,7 @@ mod tests {
                     Box::new(create_numeric_literal("7")),
                 ),
                 from_outer_join: None,
+                from_inner_join: false,
                 consumed: false,
             },
         ];
@@ -1737,6 +1741,7 @@ mod tests {
                 Box::new(right_disjunct),
             ),
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }];
 
@@ -1880,6 +1885,7 @@ mod tests {
                     Box::new(make_branch(1, 0, item_kind)),
                 ),
                 from_outer_join: None,
+                from_inner_join: false,
                 consumed: false,
             }]
         };

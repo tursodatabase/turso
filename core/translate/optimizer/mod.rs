@@ -764,8 +764,13 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    let has_full_outer = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_full_outer()));
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, has_full_outer)?
     {
         plan.contains_constant_false_condition = true;
         return Ok(());
@@ -842,7 +847,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, false)?
     {
         plan.contains_constant_false_condition = true;
         return Ok(());
@@ -888,8 +893,13 @@ fn optimize_update_plan(
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    let has_full_outer = plan
+        .from_tables
+        .joined_tables()
+        .iter()
+        .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_full_outer()));
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, has_full_outer)?
     {
         plan.contains_constant_false_condition = true;
         if is_update_from {
@@ -2644,6 +2654,13 @@ fn optimize_table_access(
         if !hash_join_op.materialize_build_input {
             continue;
         }
+        // FULL OUTER JOIN correctness depends on the whole join prefix being
+        // materialized into the hash-build input: the unmatched-probe and
+        // unmatched-build paths NULL-extend (or replay) the build payload,
+        // which must cover every left-side table. Never undo that decision.
+        if hash_join_op.join_type == crate::translate::plan::HashJoinType::FullOuter {
+            continue;
+        }
         let Some(probe_pos) = best_join_order
             .iter()
             .position(|member| member.original_idx == hash_join_op.probe_table_idx)
@@ -2832,8 +2849,11 @@ enum ConstantConditionEliminationResult {
 /// Removes predicates that are always true.
 /// Returns a ConstantEliminationResult indicating whether any predicates are always false.
 /// This is used to determine whether the query can be aborted early.
+///
+/// `has_full_outer` must be true when the plan contains a FULL OUTER JOIN.
 fn eliminate_constant_conditions(
     where_clause: &mut [WhereTerm],
+    has_full_outer: bool,
 ) -> Result<ConstantConditionEliminationResult> {
     let mut i = 0;
     while i < where_clause.len() {
@@ -2844,8 +2864,14 @@ fn eliminate_constant_conditions(
             i += 1;
         } else if predicate.expr.is_always_false()? {
             // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false,
-            // except an outer join condition, because that just results in NULLs, not skipping the whole loop
-            if predicate.from_outer_join.is_some() {
+            // except an outer join condition, because that just results in NULLs, not skipping the whole loop.
+            // Similarly, when the plan contains a FULL OUTER JOIN, an always-false INNER JOIN
+            // ON condition only empties that join's row pairs; the FULL OUTER JOIN still
+            // NULL-extends the rows of its preserved side, so the query result is not empty
+            // (e.g. `SELECT * FROM t1 JOIN t2 ON 0 FULL OUTER JOIN t3 ON true` returns
+            // one NULL-extended row per t3 row).
+            if predicate.from_outer_join.is_some() || (has_full_outer && predicate.from_inner_join)
+            {
                 i += 1;
                 continue;
             }

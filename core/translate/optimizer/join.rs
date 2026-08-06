@@ -528,19 +528,40 @@ pub fn join_lhs_and_rhs<'a>(
                         ..
                     } = &mut hash_join_method.params
                     {
+                        // A FULL OUTER JOIN NULL-extends the entire left side of the
+                        // join for unmatched probe rows, and replays the entire left
+                        // side in the unmatched-build scan. When the LHS contains
+                        // tables besides the build table, the only correct plan shape
+                        // is to materialize the whole join prefix as the hash-build
+                        // input (key+payload mode), so the prefix tables are pruned
+                        // from the main loop and their columns are NULL-extended
+                        // together with the build table's. Otherwise those tables
+                        // would remain as outer loops and leak live values into
+                        // NULL-extended rows (or suppress them entirely when the
+                        // prefix produces no rows).
+                        let full_outer_requires_prefix_materialization = rhs_table_reference
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|ji| ji.is_full_outer())
+                            && !prior_mask.is_empty();
                         let needs_materialization = build_has_uncovered_prior_constraints(
                             lhs_constraints,
                             join_keys,
                             &prior_mask,
                             &prior_hash_build_mask,
                         ) || build_table_is_prior_probe
-                            || !build_table_is_last;
+                            || !build_table_is_last
+                            || full_outer_requires_prefix_materialization;
                         let estimated_filtered_rows = (*build_base_rows)
                             * build_self_selectivity
                             * prior_constraint_selectivity;
 
-                        // Hard cap: avoid materializing huge lists when materialization is required.
+                        // Hard cap: avoid materializing huge lists when materialization is
+                        // required. FULL OUTER is exempt: materialization is the only
+                        // correct plan shape there, so a large build must not push the
+                        // planner into an incorrect (or nonexistent) alternative.
                         let materialization_too_large = needs_materialization
+                            && !full_outer_requires_prefix_materialization
                             && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
                         let can_materialize =
                             build_has_indexable_prior_constraints(lhs_constraints, &prior_mask);
@@ -3136,6 +3157,7 @@ mod tests {
                 Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
             ),
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }];
 
@@ -3254,6 +3276,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join: false,
                 consumed: false,
             },
             WhereTerm {
@@ -3268,6 +3291,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join: false,
                 consumed: false,
             },
         ];
@@ -3392,6 +3416,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join: false,
                 consumed: false,
             },
             WhereTerm {
@@ -3406,6 +3431,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join: false,
                 consumed: false,
             },
             WhereTerm {
@@ -3420,6 +3446,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join: false,
                 consumed: false,
             },
         ];
@@ -3593,6 +3620,7 @@ mod tests {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }
     }

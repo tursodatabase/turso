@@ -988,6 +988,13 @@ pub struct HashTable {
     track_matched: bool,
     /// Parallel to `buckets`: one Vec<bool> per bucket tracking which entries were matched.
     matched_bits: Vec<Vec<bool>>,
+    /// Insertion-order log of `(bucket_idx, entry_idx)` pairs, maintained only
+    /// when `track_matched` is set and the table has not spilled. Used so the
+    /// unmatched scan emits build rows in build-side scan order (like SQLite),
+    /// rather than in hash-bucket order.
+    insertion_log: Vec<(usize, usize)>,
+    /// Position in `insertion_log` for the in-memory unmatched scan.
+    unmatched_scan_pos: usize,
     /// Bucket index for iterating unmatched entries.
     unmatched_scan_bucket: usize,
     /// Entry index within bucket for iterating unmatched entries.
@@ -1086,6 +1093,8 @@ impl HashTable {
             temp_store: config.temp_store,
             track_matched: config.track_matched,
             matched_bits,
+            insertion_log: vec![],
+            unmatched_scan_pos: 0,
             unmatched_scan_bucket: 0,
             unmatched_scan_entry: 0,
             unmatched_scan_partition: 0,
@@ -1246,6 +1255,11 @@ impl HashTable {
             self.buckets[bucket_idx].insert(entry)?;
             if self.track_matched {
                 self.matched_bits[bucket_idx].try_push(false)?;
+                // Record insertion order so the unmatched scan can replay build
+                // rows in build-side scan order. Once the table spills, the
+                // spilled scan paths take over and this log is no longer used.
+                self.insertion_log
+                    .try_push((bucket_idx, self.buckets[bucket_idx].entries.len() - 1))?;
             }
         }
 
@@ -1395,12 +1409,20 @@ impl HashTable {
             let bucket_count = self.initial_buckets.max(1);
             self.buckets = (0..bucket_count).map(|_| HashBucket::new()).try_collect()?;
             self.non_empty_buckets.clear();
+            if self.track_matched {
+                self.matched_bits = (0..bucket_count).map(|_| vec![]).try_collect()?;
+            }
         } else {
             for &idx in &self.non_empty_buckets {
                 self.buckets[idx].entries.clear();
+                if self.track_matched {
+                    self.matched_bits[idx].clear();
+                }
             }
             self.non_empty_buckets.clear();
         }
+        self.insertion_log.clear();
+        self.unmatched_scan_pos = 0;
 
         self.num_entries = 0;
         self.mem_used = 0;
@@ -1432,7 +1454,10 @@ impl HashTable {
             }
         }
         // Clear in-memory matched bits; spilled partitions will have their own.
+        // The insertion-order log only serves the never-spilled unmatched scan,
+        // so it is dropped along with the in-memory buckets.
         self.matched_bits.clear();
+        self.insertion_log.clear();
         Ok(())
     }
 
@@ -2089,6 +2114,7 @@ impl HashTable {
 
     /// Reset the unmatched scan state to the beginning.
     pub fn begin_unmatched_scan(&mut self) {
+        self.unmatched_scan_pos = 0;
         self.unmatched_scan_bucket = 0;
         self.unmatched_scan_entry = 0;
         self.unmatched_scan_partition = 0;
@@ -2119,18 +2145,15 @@ impl HashTable {
     }
 
     fn next_unmatched_main_buckets(&mut self) -> Option<&HashEntry> {
-        while self.unmatched_scan_bucket < self.buckets.len() {
-            let bucket = &self.buckets[self.unmatched_scan_bucket];
-            let matched = &self.matched_bits[self.unmatched_scan_bucket];
-            while self.unmatched_scan_entry < bucket.entries.len() {
-                let idx = self.unmatched_scan_entry;
-                self.unmatched_scan_entry += 1;
-                if !matched[idx] {
-                    return Some(&bucket.entries[idx]);
-                }
+        // Walk the insertion log so unmatched build rows come out in the order
+        // the build side produced them, matching SQLite's RIGHT/FULL OUTER JOIN
+        // output order for the NULL-extended second pass.
+        while self.unmatched_scan_pos < self.insertion_log.len() {
+            let (bucket_idx, entry_idx) = self.insertion_log[self.unmatched_scan_pos];
+            self.unmatched_scan_pos += 1;
+            if !self.matched_bits[bucket_idx][entry_idx] {
+                return Some(&self.buckets[bucket_idx].entries[entry_idx]);
             }
-            self.unmatched_scan_bucket += 1;
-            self.unmatched_scan_entry = 0;
         }
         None
     }
@@ -3269,6 +3292,7 @@ impl HashTable {
     pub fn close(&mut self) {
         self.state = HashTableState::Closed;
         self.buckets.clear();
+        self.insertion_log.clear();
         self.num_entries = 0;
         self.mem_used = 0;
         self.loaded_partitions_lru.borrow_mut().clear();
