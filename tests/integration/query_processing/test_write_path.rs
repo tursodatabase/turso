@@ -2021,3 +2021,129 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+/// A COMMIT whose commit-time materialized-view delta merge needs I/O must not
+/// destroy the transaction it is committing.
+///
+/// `Program::commit_txn` runs `apply_view_deltas` before `commit_state` ever
+/// leaves `Ready`, so an I/O yield there re-enters `op_transaction` with
+/// `auto_commit` already flipped to true and no in-flight marker set. The
+/// re-entry was then classified as a fresh COMMIT outside a transaction and
+/// rejected, silently discarding the write. The merge only yields when the
+/// view's persisted state is cold, so the view must be created by one database
+/// handle and the transaction run through another.
+#[turso_macros::test(views)]
+fn test_commit_survives_view_delta_io_yield(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (1, 5), (2, 20)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    drop(conn);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (3, 7)")?;
+
+    // The row is visible inside the transaction ...
+    let in_txn: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(in_txn, vec![(4,)], "row must be visible inside the txn");
+
+    // ... so COMMIT must not claim there is no transaction to commit.
+    conn.execute("COMMIT")?;
+
+    let after_commit: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(
+        after_commit,
+        vec![(4,)],
+        "committed row must survive the commit"
+    );
+    drop(conn);
+
+    // ... and must still be on disk, with the view updated to match.
+    let after = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_views(true)
+        .build();
+    let conn = after.connect_limbo();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(4,)], "committed row must survive reopen");
+    let view: Vec<(i64, f64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 15.0), (2, 20.0), (3, 7.0)]);
+
+    Ok(())
+}
+
+/// Controls for `test_commit_survives_view_delta_io_yield`: the same write must
+/// keep working on the paths whose commit-time merge never yields.
+#[turso_macros::test(views)]
+fn test_commit_with_view_controls(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("CREATE TABLE u (x INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (1, 5), (2, 20)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+
+    // Matview created by this same handle: txn DML commits.
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (3, 7)")?;
+    conn.execute("COMMIT")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(4,)]);
+
+    // Autocommit DML on a matview'd table.
+    conn.execute("INSERT INTO t VALUES (4, 1)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(5,)]);
+
+    // Txn DML on a table no matview depends on.
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO u VALUES (9)")?;
+    conn.execute("COMMIT")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM u");
+    assert_eq!(rows, vec![(1,)]);
+
+    // A read-only txn still commits cleanly.
+    conn.execute("BEGIN")?;
+    let _: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    conn.execute("COMMIT")?;
+
+    // ROLLBACK of txn DML on a matview'd table leaves both table and view intact.
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (5, 3)")?;
+    conn.execute("ROLLBACK")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(5,)]);
+    let view: Vec<(i64, f64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 15.0), (2, 20.0), (3, 7.0), (4, 1.0)]);
+
+    Ok(())
+}
+
+/// The ordinary-VIEW counterpart of the reopen shape: no matview machinery is
+/// involved, so this must pass regardless.
+#[turso_macros::test(views)]
+fn test_commit_after_reopen_with_plain_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10)")?;
+    conn.execute("CREATE VIEW ov AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    drop(conn);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (3, 7)")?;
+    conn.execute("COMMIT")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(2,)]);
+
+    Ok(())
+}
