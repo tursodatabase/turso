@@ -836,8 +836,17 @@ pub fn join_lhs_and_rhs<'a>(
         ResidualConstraintMode::ApplyUnconsumed => unconsumed_constraint_multiplier,
         ResidualConstraintMode::None => 1.0,
     };
-    let output_cardinality =
-        input_cardinality * best_access_method.estimated_rows_per_outer_row * residual_multiplier;
+    let output_cardinality = if joined_tables[rhs_table_number]
+        .join_info
+        .as_ref()
+        .is_some_and(|join_info| join_info.is_semi_or_anti())
+    {
+        // A semi join or anti join can keep or remove a left row. It cannot
+        // make copies of that row.
+        input_cardinality
+    } else {
+        input_cardinality * best_access_method.estimated_rows_per_outer_row * residual_multiplier
+    };
     let mut subquery_calls = lhs
         .map(|lhs| lhs.subquery_calls.clone())
         .unwrap_or_default();

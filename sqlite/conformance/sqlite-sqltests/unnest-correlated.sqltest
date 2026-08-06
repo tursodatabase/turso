@@ -848,6 +848,30 @@ expect {
     2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_t3 (k=? AND x=?)
 }
 
+# Each EXISTS keeps its own outer row. A second one must not make both use
+# nested scans.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test two-exists-use-two-semi-joins {
+    CREATE TABLE two_exists_outer(id INTEGER PRIMARY KEY, key1 INTEGER, key2 INTEGER);
+    CREATE TABLE first_exists_inner(key1 INTEGER);
+    CREATE TABLE second_exists_inner(key2 INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM two_exists_outer o
+    WHERE EXISTS (
+              SELECT 1 FROM first_exists_inner i WHERE i.key1 = o.key1
+          )
+      AND EXISTS (
+              SELECT 1 FROM second_exists_inner j WHERE j.key2 = o.key2
+          );
+}
+expect {
+    1|0|0|SCAN two_exists_outer AS o
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_first_exists_inner_t3 (key1=?)
+    3|0|0|SEARCH j USING COVERING INDEX ephemeral_second_exists_inner_t5 (key2=?)
+}
+
 setup comparison_keys {
     CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
     CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
