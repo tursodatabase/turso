@@ -3627,6 +3627,8 @@ impl SubqueryPosition {
 /// Currently only subqueries in the WHERE clause are supported.
 pub struct NonFromClauseSubquery {
     pub internal_id: TableInternalId,
+    /// An earlier scalar subquery with the same text in the same clause.
+    pub same_query: Option<TableInternalId>,
     pub query_type: SubqueryType,
     pub state: SubqueryState,
     pub correlated: bool,

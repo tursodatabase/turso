@@ -927,17 +927,28 @@ expect pattern {
     (?s)CORRELATED SCALAR SUBQUERY.*SEARCH i USING INDEX indexed_avg_inner_k.*SCAN scalar_subquery_.*SCAN indexed_avg_inner AS i USING INDEX indexed_avg_inner_k
 }
 
-# Two useful aggregate rewrites must not make each other stay correlated.
+# Two copies of the same aggregate need one grouped table.
 @skip-if sqlite "query plan explanation output is different in sqlite"
-test two-averages-use-two-grouped-tables {
+test two-identical-averages-use-one-grouped-table {
     CREATE TABLE two_avg_outer(id INTEGER PRIMARY KEY, x REAL, k INTEGER);
     CREATE TABLE two_avg_inner(k INTEGER, q REAL);
+    INSERT INTO two_avg_outer VALUES (1, 0.5, 1);
+    INSERT INTO two_avg_inner VALUES (1, 1.0);
     ANALYZE;
     DELETE FROM sqlite_stat1;
     INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
         ('two_avg_outer', NULL, '500'),
         ('two_avg_inner', NULL, '500');
     ANALYZE sqlite_schema;
+
+    SELECT count(*)
+    FROM two_avg_outer o
+    WHERE o.x < (
+              SELECT avg(i.q) FROM two_avg_inner i WHERE i.k = o.k
+          )
+      AND o.x > (
+              SELECT avg(i.q) FROM two_avg_inner i WHERE i.k = o.k
+          ) - 100;
 
     EXPLAIN QUERY PLAN
     SELECT count(*)
@@ -950,7 +961,7 @@ test two-averages-use-two-grouped-tables {
           ) - 100;
 }
 expect pattern {
-    (?s)SEARCH scalar_subquery_.*SEARCH scalar_subquery_
+    ^1\n[0-9]+\|0\|0\|SCAN two_avg_outer AS o\n[0-9]+\|0\|0\|SEARCH scalar_subquery_[^\n]*\n[0-9]+\|[0-9]+\|0\|SCAN two_avg_inner AS i\n[0-9]+\|[0-9]+\|0\|USE SORTER FOR GROUP BY$
 }
 
 # A grouped table search reads its result from the index when the result is
@@ -1312,6 +1323,16 @@ matrix one-value-aggregate-cases {
 matrix one-value-aggregate-comparisons {
     SELECT o.id FROM outer_rows o
     WHERE o.amount $operator (SELECT $aggregate FROM inner_rows i WHERE $link)
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var aggregate { avg(i.amount) | min(i.amount) | max(i.amount) | count(*) | count(i.amount) | total(i.amount) }
+matrix two-copies-of-one-aggregate {
+    SELECT o.id,
+           (SELECT $aggregate FROM inner_rows i WHERE i.key1 = o.key1),
+           (SELECT $aggregate FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
     ORDER BY o.id;
 }
 

@@ -41,6 +41,7 @@
 //! - Neumann and Kemper, Unnesting Arbitrary Queries: https://db.cs.tum.edu/teaching/ws2122/foundationsde/unnesting.pdf
 //! - Neumann, A Formalization of Top-Down Unnesting: https://arxiv.org/abs/2412.04294
 
+use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use turso_parser::ast::{
     self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
@@ -93,6 +94,7 @@ pub fn rewrite_correlated_subqueries(
         subquery_index += 1;
     }
 
+    let mut aggregate_replacements = HashMap::default();
     let mut subquery_index = 0;
     while subquery_index < plan.non_from_clause_subqueries.len() {
         let subquery = &plan.non_from_clause_subqueries[subquery_index];
@@ -100,16 +102,36 @@ pub fn rewrite_correlated_subqueries(
             subquery_index += 1;
             continue;
         }
-        let rewritten = match subquery.query_type {
-            ast::SubqueryType::In { .. } => try_rewrite_in(plan, subquery_index, resolver)?,
-            ast::SubqueryType::RowValue { num_regs: 1, .. } if !has_full_join => {
-                try_rewrite_single_value_aggregate(plan, subquery_index, resolver)?
+        let query_type = subquery.query_type.clone();
+        let subquery_id = subquery.internal_id;
+        let same_query = subquery.same_query;
+        match query_type {
+            ast::SubqueryType::In { .. } => {
+                if try_rewrite_in(plan, subquery_index, resolver)? {
+                    changed = true;
+                    continue;
+                }
             }
-            _ => false,
-        };
-        if rewritten {
-            changed = true;
-            continue;
+            ast::SubqueryType::RowValue { num_regs: 1, .. } if !has_full_join => {
+                if let Some(replacement) = same_query
+                    .and_then(|same_query| aggregate_replacements.get(&same_query))
+                    .cloned()
+                {
+                    if replace_subquery_value(plan, subquery_id, &replacement)? {
+                        plan.non_from_clause_subqueries.remove(subquery_index);
+                        changed = true;
+                        continue;
+                    }
+                }
+                if let Some(replacement) =
+                    try_rewrite_single_value_aggregate(plan, subquery_index, resolver)?
+                {
+                    aggregate_replacements.insert(subquery_id, replacement);
+                    changed = true;
+                    continue;
+                }
+            }
+            _ => {}
         }
         subquery_index += 1;
     }
@@ -359,11 +381,11 @@ fn try_rewrite_single_value_aggregate(
     plan: &mut SelectPlan,
     subquery_index: usize,
     resolver: &Resolver<'_>,
-) -> Result<bool> {
+) -> Result<Option<Expr>> {
     // Window planning keeps copies of its expressions. Leave those plans alone
     // until all of those copies can be changed together.
     if plan.window.is_some() {
-        return Ok(false);
+        return Ok(None);
     }
 
     let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
@@ -373,17 +395,17 @@ fn try_rewrite_single_value_aggregate(
     if plan.where_clause.iter().any(|term| {
         term.from_outer_join.is_some() && expr_references_subquery_id(&term.expr, subquery_id)
     }) {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
-        return Ok(false);
+        return Ok(None);
     };
 
     if !can_rewrite_single_value_aggregate(&inner_plan, resolver)? {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(empty_value) = result_on_empty_input(&inner_plan) else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let outer_tables = inner_plan.table_references.outer_query_refs();
@@ -395,7 +417,7 @@ fn try_rewrite_single_value_aggregate(
                     .find_joined_table_by_internal_id(outer_table.internal_id)
                     .is_none())
     }) {
-        return Ok(false);
+        return Ok(None);
     }
     // A grouped table linked to more than one outer table can move before one
     // of those tables after its left join becomes an inner join.
@@ -405,7 +427,7 @@ fn try_rewrite_single_value_aggregate(
         .count()
         != 1
     {
-        return Ok(false);
+        return Ok(None);
     }
     let outer_table_ids: Vec<_> = outer_tables.iter().map(|table| table.internal_id).collect();
     let inner_table_ids: Vec<_> = inner_plan
@@ -426,18 +448,18 @@ fn try_rewrite_single_value_aggregate(
             continue;
         }
         if term.from_outer_join.is_some() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(pair) = read_column_pair(&term.expr, &outer_table_ids, &inner_table_ids) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !column_pair_compares_the_same(&pair, &inner_plan.table_references) {
-            return Ok(false);
+            return Ok(None);
         }
         pairs.push(pair);
     }
     if pairs.is_empty() || uses_outer_tables_outside_where(&inner_plan, &outer_table_ids) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut inner_plan = *inner_plan;
@@ -515,7 +537,7 @@ fn try_rewrite_single_value_aggregate(
         EmptyInputValue::RealZero => coalesce_with_zero(result_column, "0.0"),
     };
     if !replace_subquery_value(plan, subquery_id, &replacement)? {
-        return Ok(false);
+        return Ok(None);
     }
 
     for (pair, column) in pairs.into_iter().zip(result_positions) {
@@ -538,7 +560,7 @@ fn try_rewrite_single_value_aggregate(
     }
     plan.table_references.add_joined_table(grouped_table);
     plan.non_from_clause_subqueries.remove(subquery_index);
-    Ok(true)
+    Ok(Some(replacement))
 }
 
 /// Return whether a one-value aggregate is simple enough to move into a join.

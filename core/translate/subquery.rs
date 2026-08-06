@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::alloc::{TryClone, TursoSliceExt};
 
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, SortOrder, SubqueryType};
+use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use crate::{
     alloc::TursoIteratorExt,
@@ -265,6 +265,7 @@ pub fn plan_subqueries_from_select_plan(
         None => Vec::new(),
     };
     let mut cse_map: Vec<(ast::Expr, ast::Expr)> = Vec::new();
+    let mut same_query_map: Vec<(ast::Expr, TableInternalId, SubqueryOrigin)> = Vec::new();
     // WHERE
     {
         crate::stack::trace_stack!("select_where");
@@ -279,6 +280,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectWhere,
             SubqueryPosition::Where.allow_correlated(),
             &mut cse_map,
+            &mut same_query_map,
             &[],
         )?;
     }
@@ -298,6 +300,7 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryOrigin::SelectGroupBy,
                 SubqueryPosition::GroupBy.allow_correlated(),
                 &mut cse_map,
+                &mut same_query_map,
                 &shared_subqueries,
             )?;
         }
@@ -314,6 +317,7 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryOrigin::SelectHaving,
                 !group_by.exprs.is_empty(),
                 &mut cse_map,
+                &mut same_query_map,
                 &[],
             )?;
         }
@@ -333,6 +337,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectList,
             SubqueryPosition::ResultColumn.allow_correlated(),
             &mut cse_map,
+            &mut same_query_map,
             &shared_subqueries,
         )?;
     }
@@ -351,6 +356,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectOrderBy,
             SubqueryPosition::OrderBy.allow_correlated(),
             &mut cse_map,
+            &mut same_query_map,
             &[],
         )?;
     }
@@ -369,6 +375,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectLimitOffset,
             false,
             &mut cse_map,
+            &mut same_query_map,
             &[],
         );
         // Limit
@@ -432,6 +439,7 @@ pub fn plan_subqueries_from_where_clause(
         SubqueryOrigin::DmlWhere,
         SubqueryPosition::Where.allow_correlated(),
         &mut Vec::new(),
+        &mut Vec::new(),
         &[],
     )?;
 
@@ -462,6 +470,7 @@ pub fn plan_subqueries_from_values(
         SubqueryOrigin::SelectList,
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
+        &mut Vec::new(),
         &[],
     )?;
 
@@ -490,6 +499,7 @@ pub fn plan_subqueries_from_update_sets(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
         &mut Vec::new(),
         &[],
     )?;
@@ -527,6 +537,7 @@ pub fn plan_subqueries_from_returning(
         SubqueryOrigin::DmlReturning,
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
+        &mut Vec::new(),
         &[],
     )?;
 
@@ -557,6 +568,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         SubqueryOrigin::TriggerWhen,
         false,
         &mut Vec::new(),
+        &mut Vec::new(),
         &[],
     )
 }
@@ -575,6 +587,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
     origin: SubqueryOrigin,
     allow_correlated: bool,
     cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
@@ -635,6 +648,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
         origin,
         allow_correlated,
         cse_map,
+        same_query_map,
         shared,
     );
     for expr in exprs {
@@ -676,6 +690,7 @@ fn get_subquery_parser<'a>(
     origin: SubqueryOrigin,
     allow_correlated: bool,
     cse_map: &'a mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &'a mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &'a [ast::Expr],
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
     let handle_unsupported_correlation =
@@ -744,6 +759,7 @@ fn get_subquery_parser<'a>(
                 }
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
+                    same_query: None,
                     query_type: subquery_type,
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(Plan::Select(plan))),
@@ -776,6 +792,10 @@ fn get_subquery_parser<'a>(
                 } else {
                     origin
                 };
+                let same_query = same_query_map.iter().find_map(|(query, id, query_origin)| {
+                    (*query_origin == effective_origin && *query == *expr).then_some(*id)
+                });
+                let same_query_key = same_query.is_none().then(|| expr.clone());
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
@@ -871,9 +891,11 @@ fn get_subquery_parser<'a>(
                 };
                 *result_reg_start = reg_start;
                 *num_regs = reg_count;
+                let subquery_id = *subquery_id;
 
                 out_subqueries.push(NonFromClauseSubquery {
-                    internal_id: *subquery_id,
+                    internal_id: subquery_id,
+                    same_query,
                     query_type: SubqueryType::RowValue {
                         result_reg_start: reg_start,
                         num_regs: reg_count,
@@ -887,6 +909,9 @@ fn get_subquery_parser<'a>(
                 });
                 if let Some(key) = cse_key {
                     cse_map.push((key, expr.clone()));
+                }
+                if let Some(query) = same_query_key {
+                    same_query_map.push((query, subquery_id, effective_origin));
                 }
                 Ok(WalkControl::Continue)
             }
@@ -1021,6 +1046,7 @@ fn get_subquery_parser<'a>(
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
+                    same_query: None,
                     query_type: SubqueryType::In {
                         cursor_id,
                         affinity_str: in_affinity_str,
