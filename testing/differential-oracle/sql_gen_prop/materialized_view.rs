@@ -56,6 +56,8 @@ enum Shape {
     FilteredColumns,
     /// SELECT g, COUNT(*) FROM t GROUP BY g
     Aggregate,
+    /// SELECT COUNT(*) FROM t
+    UngroupedCount,
     /// SELECT t.a, u.b FROM t JOIN u ON t.a = u.b
     Join,
     /// SELECT t.a AS c0, ... FROM t UNION ALL SELECT u.b AS c0, ... FROM u
@@ -138,6 +140,7 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
         (1, Shape::Star),
         (2, Shape::FilteredColumns),
         (1, Shape::Aggregate),
+        (1, Shape::UngroupedCount),
         (1, Shape::ComplexFilterSelfJoin),
     ];
     if sources.len() >= 2 {
@@ -242,6 +245,7 @@ fn select_for_shape(
             vec![ColumnDef::new("cnt", DataType::Integer)],
         ))
         .boxed(),
+        Shape::UngroupedCount => Just(ungrouped_count(&name)).boxed(),
         Shape::ComplexFilterSelfJoin if integer_columns >= 2 => (0..COMPLEX_PREDICATE_KINDS)
             .prop_map(move |kind| complex_filter_self_join(&source, kind))
             .boxed(),
@@ -268,6 +272,13 @@ fn select_for_shape(
             .prop_map(move |other| union_all(&source, &other))
             .boxed(),
     }
+}
+
+fn ungrouped_count(table: &str) -> (String, Vec<ColumnDef>) {
+    (
+        format!("SELECT COUNT(*) AS cnt FROM {table}"),
+        vec![ColumnDef::new("cnt", DataType::Integer)],
+    )
 }
 
 fn join(left: &Table, right: &Table) -> (String, Vec<ColumnDef>) {
@@ -554,6 +565,10 @@ mod tests {
         assert!(sqls.iter().any(|sql| sql.starts_with("SELECT * FROM")));
         assert!(sqls.iter().any(|sql| sql.contains(" WHERE ")));
         assert!(sqls.iter().any(|sql| sql.contains(" GROUP BY ")));
+        assert!(
+            sqls.iter()
+                .any(|sql| sql.starts_with("SELECT COUNT(*) AS cnt FROM users"))
+        );
         assert!(sqls.iter().any(|sql| sql.contains("FROM mv_users")));
         assert!(
             sqls.iter()
