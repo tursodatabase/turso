@@ -345,6 +345,7 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
             patterns: self.patterns.as_slice(),
             backing_btree: false,
             results_materialized: true,
+            mvcc_support: super::IndexMethodMvccSupport::Unsupported,
         }
     }
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {

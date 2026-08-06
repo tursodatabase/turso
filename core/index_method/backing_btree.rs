@@ -37,6 +37,7 @@ impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
             patterns: &[],
             backing_btree: true,
             results_materialized: false,
+            mvcc_support: super::IndexMethodMvccSupport::Unsupported,
         }
     }
 

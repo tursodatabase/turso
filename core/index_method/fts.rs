@@ -1773,6 +1773,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
             // Unordered match queries stream directly from Tantivy scorers.
             // UPDATE/DELETE must therefore collect stable rowids before writes.
             results_materialized: false,
+            mvcc_support: super::IndexMethodMvccSupport::Unsupported,
         }
     }
 

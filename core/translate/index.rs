@@ -1,7 +1,7 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
-use crate::index_method::IndexMethodConfiguration;
+use crate::index_method::{ensure_mvcc_support, IndexMethodConfiguration};
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
@@ -65,9 +65,6 @@ fn validate(
         bail_parse_error!(
             "index method is an experimental feature. Enable with --experimental-index-method flag"
         )
-    }
-    if connection.mvcc_enabled() && using.is_some() {
-        bail_parse_error!("Custom index modules are not supported in MVCC mode");
     }
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
@@ -196,12 +193,16 @@ pub fn translate_create_index(
         }
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
-            index_method = Some(index_module.attach(&IndexMethodConfiguration {
+            let attachment = index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
                 columns: columns.try_clone()?,
                 parameters,
-            })?);
+            })?;
+            if connection.mvcc_enabled() {
+                ensure_mvcc_support(&attachment.definition(), true)?;
+            }
+            index_method = Some(attachment);
         }
     }
     let idx = Arc::new(Index {
