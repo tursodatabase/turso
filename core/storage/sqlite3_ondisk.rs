@@ -48,7 +48,7 @@ use crate::{
     types::{IOCompletions, IOResult},
     util::IOExt as _,
 };
-use branches::{mark_unlikely, unlikely};
+use branches::{likely, mark_unlikely, unlikely};
 use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
@@ -1310,65 +1310,108 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     }
 }
 
+/// The high bit of each varint byte except the ninth says "more bytes follow";
+/// the other 7 bits carry the value. These masks split a whole 8-byte word
+/// into those two parts.
+pub(crate) const VARINT_CONT_BITS: u64 = 0x8080_8080_8080_8080;
+const VARINT_PAYLOAD_BITS: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+
+/// Gather the low 7 bits of every byte of `x` into one 56-bit integer, keeping
+/// byte significance: the most significant byte contributes the highest 7 bits.
+/// Works by merging adjacent digits in three halving steps (7-bit digits into
+/// 14-bit, then 28-bit, then one 56-bit value), a dozen cheap ALU ops with no
+/// branches.
+#[inline(always)]
+fn varint_gather_payload_bits(x: u64) -> u64 {
+    let m = x & VARINT_PAYLOAD_BITS;
+    let m = (m & 0x007f_007f_007f_007f) | ((m & 0x7f00_7f00_7f00_7f00) >> 1);
+    let m = (m & 0x0000_3fff_0000_3fff) | ((m & 0x3fff_0000_3fff_0000) >> 2);
+    (m & 0x0000_0000_0fff_ffff) | ((m & 0x0fff_ffff_0000_0000) >> 4)
+}
+
 /// Reads varint integer from the buffer.
-/// This function is similar to `sqlite3GetVarint32`
+///
+/// 1- and 2-byte varints (nearly all serial types, rowids and payload sizes)
+/// return through two direct checks. Longer ones decode from a single 8-byte
+/// load without a per-byte loop, so the varint length adds no unpredictable
+/// branches.
 #[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
-    let mut v: u64 = 0;
-    for i in 0..8 {
-        match buf.get(i) {
-            Some(c) => {
-                v = (v << 7) + (c & 0x7f) as u64;
-                if (c & 0x80) == 0 {
-                    return Ok((v, i + 1));
-                }
-            }
-            None => {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid varint");
-            }
-        }
+    let Some(&b0) = buf.first() else {
+        mark_unlikely();
+        bail_corrupt_error!("Invalid varint");
+    };
+    if likely(b0 < 0x80) {
+        return Ok((b0 as u64, 1));
     }
-    match buf.get(8) {
-        Some(&c) => {
-            // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
-            // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
-            // If those are zero, this should be treated as corrupt.
-            // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
-            if unlikely((v >> 48) == 0) {
-                bail_corrupt_error!("Invalid varint");
-            }
-            v = (v << 8) + c as u64;
-            Ok((v, 9))
+    let Some(&b1) = buf.get(1) else {
+        mark_unlikely();
+        bail_corrupt_error!("Invalid varint");
+    };
+    if b1 < 0x80 {
+        return Ok(((((b0 & 0x7f) as u64) << 7) | b1 as u64, 2));
+    }
+    read_varint_long(buf)
+}
+
+/// Decode a varint of any length wholesale from an 8-byte word. Split out of
+/// [read_varint] so the common short cases stay small at every call site.
+fn read_varint_long(buf: &[u8]) -> Result<(u64, usize)> {
+    if let Some(chunk) = buf.first_chunk::<8>() {
+        let x = u64::from_be_bytes(*chunk);
+        let stops = !x & VARINT_CONT_BITS;
+        if likely(stops != 0) {
+            // The most significant stop bit sits in the first byte with a
+            // clear high bit: the last byte of the varint.
+            let n = (stops.leading_zeros() >> 3) as usize + 1;
+            // Gathering all 8 bytes leaves the digits past the stop byte in
+            // the bits below the wanted value; the shift drops them.
+            let v = varint_gather_payload_bits(x) >> (7 * (8 - n));
+            return Ok((v, n));
         }
-        None => {
+        // All 8 bytes continue: a 9-byte varint, whose last byte contributes
+        // a full 8 bits with no continuation flag.
+        let Some(&b8) = buf.get(8) else {
             mark_unlikely();
             bail_corrupt_error!("Invalid varint");
+        };
+        let v = varint_gather_payload_bits(x);
+        // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+        // Since the final value is `(v<<8) + b8`, the top 8 bits (v >> 48) must not be 0.
+        // If those are zero, this should be treated as corrupt.
+        if unlikely((v >> 48) == 0) {
+            bail_corrupt_error!("Invalid varint");
+        }
+        return Ok(((v << 8) + b8 as u64, 9));
+    }
+    // Fewer than 8 bytes left in the buffer: any valid varint fits in what
+    // remains, so a short byte loop covers it.
+    let mut v: u64 = 0;
+    for (i, &c) in buf.iter().enumerate() {
+        v = (v << 7) + (c & 0x7f) as u64;
+        if (c & 0x80) == 0 {
+            return Ok((v, i + 1));
         }
     }
+    mark_unlikely();
+    bail_corrupt_error!("Invalid varint");
 }
 
 #[inline(always)]
 /// Reads a varint from the buffer, returning None if more data is needed.
 pub fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>> {
+    if likely(buf.len() >= 9) {
+        // A varint is at most 9 bytes, so it cannot need more data than this.
+        return read_varint(buf).map(Some);
+    }
     let mut v: u64 = 0;
-    for i in 0..8 {
-        let Some(&c) = buf.get(i) else {
-            return Ok(None);
-        };
+    for (i, &c) in buf.iter().enumerate() {
         v = (v << 7) + (c & 0x7f) as u64;
         if (c & 0x80) == 0 {
             return Ok(Some((v, i + 1)));
         }
     }
-    let Some(&c) = buf.get(8) else {
-        return Ok(None);
-    };
-    if unlikely((v >> 48) == 0) {
-        bail_corrupt_error!("Invalid varint");
-    }
-    v = (v << 8) + c as u64;
-    Ok(Some((v, 9)))
+    Ok(None)
 }
 
 /// Compute the length of a varint encoding for a given u64 value.
@@ -2517,5 +2560,132 @@ mod tests {
         let mut buf = [0u8; 9];
         let written = write_varint(&mut buf, value);
         varint_len(value) == written
+    }
+
+    /// Byte-at-a-time varint decoder, the shape [read_varint] had before the
+    /// whole-word decode. Kept as the oracle the optimized decoder must match
+    /// on every input, valid or not.
+    fn read_varint_reference(buf: &[u8]) -> Result<(u64, usize)> {
+        let mut v: u64 = 0;
+        for i in 0..8 {
+            match buf.get(i) {
+                Some(c) => {
+                    v = (v << 7) + (c & 0x7f) as u64;
+                    if (c & 0x80) == 0 {
+                        return Ok((v, i + 1));
+                    }
+                }
+                None => bail_corrupt_error!("Invalid varint"),
+            }
+        }
+        match buf.get(8) {
+            Some(&c) => {
+                if (v >> 48) == 0 {
+                    bail_corrupt_error!("Invalid varint");
+                }
+                Ok(((v << 8) + c as u64, 9))
+            }
+            None => bail_corrupt_error!("Invalid varint"),
+        }
+    }
+
+    fn read_varint_partial_reference(buf: &[u8]) -> Result<Option<(u64, usize)>> {
+        let mut v: u64 = 0;
+        for i in 0..8 {
+            let Some(&c) = buf.get(i) else {
+                return Ok(None);
+            };
+            v = (v << 7) + (c & 0x7f) as u64;
+            if (c & 0x80) == 0 {
+                return Ok(Some((v, i + 1)));
+            }
+        }
+        let Some(&c) = buf.get(8) else {
+            return Ok(None);
+        };
+        if (v >> 48) == 0 {
+            bail_corrupt_error!("Invalid varint");
+        }
+        Ok(Some(((v << 8) + c as u64, 9)))
+    }
+
+    fn assert_matches_reference(buf: &[u8]) {
+        let expected = read_varint_reference(buf);
+        let actual = read_varint(buf);
+        match (&expected, &actual) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "decode mismatch on {buf:02x?}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!("outcome mismatch on {buf:02x?}: expected {expected:?}, got {actual:?}"),
+        }
+        let expected = read_varint_partial_reference(buf);
+        let actual = read_varint_partial(buf);
+        match (&expected, &actual) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "partial decode mismatch on {buf:02x?}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!(
+                "partial outcome mismatch on {buf:02x?}: expected {expected:?}, got {actual:?}"
+            ),
+        }
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_varint_matches_reference_on_arbitrary_bytes(buf: Vec<u8>) -> bool {
+        // Every window of the buffer, so varints land both flush against the
+        // end (short-tail path) and with plenty of room (whole-word path).
+        for start in 0..=buf.len().min(16) {
+            assert_matches_reference(&buf[start..]);
+        }
+        true
+    }
+
+    #[test]
+    fn read_varint_roundtrips_boundary_values_at_any_offset_from_buffer_end() {
+        let mut values: Vec<u64> = vec![0, 1, u64::MAX];
+        for bits in 1..=63 {
+            let v = 1u64 << bits;
+            values.extend_from_slice(&[v - 1, v, v + 1]);
+        }
+        for &value in &values {
+            let mut enc = [0u8; 32];
+            let n = write_varint(&mut enc, value);
+            // Decode with 0..=16 bytes of slack after the varint, then from
+            // every truncation of the varint itself.
+            for end in n..=32 {
+                let (decoded, len) = read_varint(&enc[..end]).unwrap();
+                assert_eq!((decoded, len), (value, n), "value {value} end {end}");
+            }
+            for cut in 0..n {
+                assert_matches_reference(&enc[..cut]);
+            }
+        }
+    }
+
+    #[rstest]
+    // Non-canonical encodings (leading 0x80 padding) decode like the loop
+    // decoder always decoded them: 2..=8 byte encodings of small values are
+    // accepted.
+    #[case(&[0x80, 0x00], (0, 2))]
+    #[case(&[0x80, 0x7f], (0x7f, 2))]
+    #[case(&[0x80, 0x80, 0x01], (1, 3))]
+    #[case(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01], (1, 8))]
+    // Largest 8-byte varint.
+    #[case(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f], ((1 << 56) - 1, 8))]
+    // Smallest valid 9-byte varint: 1 << 56.
+    #[case(&[0x80, 0xC0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00], (1 << 56, 9))]
+    // Largest varint: u64::MAX.
+    #[case(&[0xff; 9], (u64::MAX, 9))]
+    fn test_read_varint_exact_encodings(#[case] buf: &[u8], #[case] expected: (u64, usize)) {
+        assert_eq!(read_varint(buf).unwrap(), expected);
+        assert_eq!(read_varint_partial(buf).unwrap(), Some(expected));
+    }
+
+    /// A 9-byte varint whose value would fit in 8 bytes is rejected, even when
+    /// the buffer extends past it.
+    #[test]
+    fn test_read_varint_rejects_noncanonical_9_byte() {
+        let mut buf = [0x80u8; 16];
+        buf[8] = 0x01;
+        assert!(read_varint(&buf).is_err());
+        assert!(read_varint_partial(&buf).is_err());
     }
 }
