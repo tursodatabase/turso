@@ -822,7 +822,19 @@ pub fn get_triggers_including_temp(
                 })
                 .collect()
         });
-        triggers.extend(temp_triggers);
+        // TEMP triggers fire before the table's own triggers, and among
+        // themselves in creation order. SQLite builds its trigger list by
+        // walking the temp schema's trigger hash — which iterates newest
+        // first — and prepending each hit onto the table's own list
+        // (sqlite3TriggerList in trigger.c), so the temp group nets out
+        // oldest-first at the front. Mirror that exactly: push each temp
+        // trigger onto the front in the same newest-first walk. The order is
+        // observable whenever one trigger's changes feed another.
+        let mut list: std::collections::VecDeque<Arc<Trigger>> = triggers.into();
+        for trigger in temp_triggers {
+            list.push_front(trigger);
+        }
+        triggers = list.into();
     }
     triggers
 }
@@ -882,6 +894,19 @@ pub fn fire_trigger(
     let saved_register_collations = std::mem::take(&mut resolver.register_collations);
     populate_trigger_register_affinities(resolver, ctx);
     let result = (|| -> Result<()> {
+        // A trigger body is inlined and re-executed once per affected row. Any
+        // run-once block inside it (an uncorrelated subquery, a hash or
+        // ephemeral-index build) is guarded by Insn::Once, whose "already ran"
+        // state otherwise persists across firings and would reuse a value
+        // cached during an earlier firing. Clear that state at the start of
+        // each firing so every firing re-evaluates from the current table
+        // state, the same fresh start SQLite gets from a per-invocation trigger
+        // sub-program.
+        let firing_end = program.allocate_label();
+        program.emit_insn(Insn::ResetOnce {
+            region_end: firing_end,
+        });
+
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
             crate::stack::trace_stack!("when_clause");
@@ -948,6 +973,8 @@ pub fn fire_trigger(
             )?;
         }
 
+        // Marks the end of this firing's instruction range for ResetOnce above.
+        program.preassign_label_to_next_insn(firing_end);
         Ok(())
     })();
     resolver.register_affinities = saved_register_affinities;

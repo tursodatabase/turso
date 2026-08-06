@@ -3478,6 +3478,19 @@ pub fn halt(
             }
         }
 
+        // A FAIL resolution that cannot commit here because an outer statement
+        // is still running (this is a trigger subprogram fired mid-statement)
+        // must still tell the enclosing statement to keep the changes made
+        // before the error. Re-tag the constraint as a FAIL raise so the outer
+        // program's abort() preserves and commits them instead of rolling the
+        // statement back. FK errors do not respect ON CONFLICT, so leave them
+        // as-is.
+        if program.resolve_type == ResolveType::Fail {
+            if let LimboError::Constraint(msg) = error {
+                return Err(LimboError::Raise(ResolveType::Fail, msg));
+            }
+        }
+
         // For non-FAIL modes (or non-autocommit), just return the error.
         // abort() will handle rollback based on resolve_type.
         return Err(error);
@@ -6103,9 +6116,15 @@ pub fn seek_internal(
                         IOResult::Done(()) => {}
                         IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                     }
-                    // the MoveLast variant is only used for SeekOp::LT and SeekOp::LE when the seek condition is always true,
-                    // so we have always found what we were looking for.
-                    return Ok(SeekInternalResult::Found);
+                    // The MoveLast variant is only used for SeekOp::LT and SeekOp::LE when
+                    // the seek condition is true for every row, so the last row satisfies
+                    // it — but an empty table has no row to sit on, and reporting Found
+                    // there would make the scan loop emit one garbage row.
+                    return Ok(if cursor.is_empty() {
+                        SeekInternalResult::NotFound
+                    } else {
+                        SeekInternalResult::Found
+                    });
                 }
             }
         }
@@ -14043,6 +14062,7 @@ pub struct OpParseSchemaInner {
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
+    trigger_target_database_id: Option<usize>,
     db: usize,
     previous_auto_commit: bool,
 }
@@ -14063,7 +14083,14 @@ pub fn op_parse_schema(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(ParseSchema { db, where_clause }, insn);
+    load_insn!(
+        ParseSchema {
+            db,
+            where_clause,
+            trigger_target_database_id
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
 
@@ -14147,6 +14174,7 @@ pub fn op_parse_schema(
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
         materialized_view_info: Default::default(),
+        trigger_target_database_id: *trigger_target_database_id,
         db: *db,
         previous_auto_commit,
     }));
@@ -14207,6 +14235,11 @@ fn op_parse_schema_step(
                     &attached_resolver,
                     conn.dialect().as_ref(),
                 )?;
+                if ty == "trigger" {
+                    if let Some(target_database_id) = inner.trigger_target_database_id {
+                        schema.set_trigger_target_database_id(name, target_database_id)?;
+                    }
+                }
                 continue;
             }
             StepResult::Done => {
@@ -14219,6 +14252,7 @@ fn op_parse_schema_step(
                     dbsp_state_roots,
                     dbsp_state_index_roots,
                     materialized_view_info,
+                    trigger_target_database_id: _,
                     db,
                     previous_auto_commit,
                 } = *state
@@ -15290,6 +15324,26 @@ pub fn op_once(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Execute the [Insn::ResetOnce] instruction.
+///
+/// Forgets that any [Insn::Once] between this instruction and `region_end` has
+/// run, so a re-executed inlined trigger body re-evaluates its run-once blocks
+/// instead of reusing a value cached during an earlier firing.
+pub fn op_reset_once(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ResetOnce { region_end }, insn);
+    assert!(region_end.is_offset());
+    let start = state.pc;
+    let end = region_end.as_offset_int();
+    state.once.retain(|pc| *pc <= start || *pc >= end);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_found(
     program: &Program,
     state: &mut ProgramState,
@@ -15909,6 +15963,41 @@ pub fn op_rename_table(
 
     if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
+            // A TEMP trigger may run on a table in another database. Triggers
+            // are found by the name of that table. When the table is renamed,
+            // move its TEMP triggers to the new name. Changing only the stored
+            // SQL would leave them under the old name, so they would no longer
+            // run.
+            let temp_shadows_old_name = schema.tables.contains_key(&normalized_from);
+            if let Some(triggers) = schema.triggers.remove(&normalized_from) {
+                let mut triggers_to_keep = std::collections::VecDeque::new();
+                let mut triggers_to_rename = std::collections::VecDeque::new();
+                for mut trigger_arc in triggers {
+                    let targets_renamed_database = match trigger_arc.target_database_id {
+                        Some(target_db) => target_db == *db,
+                        None => !temp_shadows_old_name,
+                    };
+                    if targets_renamed_database {
+                        let trigger = Arc::make_mut(&mut trigger_arc);
+                        normalized_to.clone_into(&mut trigger.table_name);
+                        rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                        triggers_to_rename.push_back(trigger_arc);
+                    } else {
+                        triggers_to_keep.push_back(trigger_arc);
+                    }
+                }
+                if !triggers_to_keep.is_empty() {
+                    schema
+                        .triggers
+                        .insert(normalized_from.to_owned(), triggers_to_keep);
+                }
+                schema
+                    .triggers
+                    .entry(normalized_to.to_owned())
+                    .or_default()
+                    .extend(triggers_to_rename);
+            }
+
             for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {
                     if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {

@@ -13,6 +13,7 @@ use crate::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
             TableMask, ROWID_STRS,
         },
+        Resolver,
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
@@ -125,6 +126,7 @@ impl Constraint {
         &self,
         where_clause: &[WhereTerm],
         referenced_tables: Option<&TableReferences>,
+        resolver: Option<&Resolver>,
     ) -> (ast::Operator, ast::Expr, Affinity) {
         // For multi-index branches, use the pre-computed constraining expression
         if let Some(constraining) = &self.constraining_expr {
@@ -138,7 +140,11 @@ impl Constraint {
         };
         let mut affinity = Affinity::Blob;
         if op.as_ast_operator().is_some_and(|op| op.is_comparison()) {
-            affinity = comparison_affinity(lhs, rhs, referenced_tables, None);
+            // The resolver matters here: a scalar subquery's affinity is only
+            // known through it. Without it, `text_col < (SELECT int_col ...)`
+            // would take the TEXT side's affinity and the seek would compare
+            // the integer as text.
+            affinity = comparison_affinity(lhs, rhs, referenced_tables, resolver);
         }
 
         if side == BinaryExprSide::Lhs {
@@ -1084,22 +1090,28 @@ impl RangeConstraintRef {
         constraints: &[Constraint],
         where_clause: &[WhereTerm],
         referenced_tables: Option<&TableReferences>,
+        resolver: Option<&Resolver>,
     ) -> SeekRangeConstraint {
         if let Some(ref eq) = self.eq {
             return SeekRangeConstraint::new_eq(
                 self.sort_order,
                 self.nulls_order,
-                constraints[eq.constraint_pos]
-                    .get_constraining_expr(where_clause, referenced_tables),
+                constraints[eq.constraint_pos].get_constraining_expr(
+                    where_clause,
+                    referenced_tables,
+                    resolver,
+                ),
             );
         }
         SeekRangeConstraint::new_range(
             self.sort_order,
             self.nulls_order,
-            self.lower_bound
-                .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
-            self.upper_bound
-                .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
+            self.lower_bound.map(|x| {
+                constraints[x].get_constraining_expr(where_clause, referenced_tables, resolver)
+            }),
+            self.upper_bound.map(|x| {
+                constraints[x].get_constraining_expr(where_clause, referenced_tables, resolver)
+            }),
         )
     }
 }

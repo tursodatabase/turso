@@ -1577,6 +1577,16 @@ pub enum Insn {
     ParseSchema {
         db: usize,
         where_clause: Option<String>,
+        /// The database containing the table used by an unqualified TEMP trigger.
+        ///
+        /// SQLite can look through every attached database while rebuilding a
+        /// trigger. Turso's schema reader handles one schema at a time, so it
+        /// cannot repeat the lookup already done by CREATE TRIGGER. The SQL in
+        /// temp.sqlite_schema only says `ON table`, not which database supplied
+        /// `table`. CREATE TRIGGER passes the answer here so ParseSchema can keep
+        /// it on the in-memory trigger. Every other ParseSchema use leaves this
+        /// as `None`.
+        trigger_target_database_id: Option<usize>,
     },
 
     /// Populate all materialized views after schema parsing
@@ -1705,6 +1715,16 @@ pub enum Insn {
     /// Fall through to the next instruction on the first invocation, otherwise jump to target_pc
     Once {
         target_pc_when_reentered: BranchOffset,
+    },
+    /// Forget that any [Insn::Once] between this instruction and `region_end`
+    /// has already run. Trigger bodies are inlined and re-executed once per
+    /// affected row, so their run-once blocks (uncorrelated subqueries,
+    /// hash/ephemeral builds) must re-run each firing instead of reusing a
+    /// value cached during an earlier firing. Emitted at the start of each
+    /// trigger firing, this restores the fresh once-state that SQLite gets from
+    /// a per-invocation trigger sub-program.
+    ResetOnce {
+        region_end: BranchOffset,
     },
     /// Search for a record in the index cursor.
     /// If any entry for which the key is a prefix exists, jump to target_pc.
@@ -2207,6 +2227,7 @@ impl InsnVariants {
             InsnVariants::SetCookie => execute::op_set_cookie,
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
             InsnVariants::Once => execute::op_once,
+            InsnVariants::ResetOnce => execute::op_reset_once,
             InsnVariants::Found | InsnVariants::NotFound => execute::op_found,
             InsnVariants::Affinity => execute::op_affinity,
             InsnVariants::IdxDelete => execute::op_idx_delete,

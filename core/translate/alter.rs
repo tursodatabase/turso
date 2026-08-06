@@ -1550,7 +1550,7 @@ pub fn translate_alter_table(
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
-            let mut temp_triggers_to_rewrite: Vec<(String, String)> = Vec::new();
+            let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
 
             if resolver.with_schema(database_id, |s| {
                 s.get_table(new_name).is_some()
@@ -1578,6 +1578,14 @@ pub fn translate_alter_table(
                     )));
                 }
                 if trigger_entry.database_id == crate::TEMP_DB_ID {
+                    let temp_trigger_targets_renamed_table =
+                        normalize_ident(&trigger_entry.trigger.table_name) == normalized_old_name
+                            && match trigger_entry.trigger.target_database_id {
+                                Some(target_db) => target_db == database_id,
+                                None => resolver.with_schema(crate::TEMP_DB_ID, |schema| {
+                                    schema.get_table(&normalized_old_name).is_none()
+                                }),
+                            };
                     // Pass the renamed database's NAME so the rewrite
                     // only touches triggers whose `tbl_name.db_name`
                     // actually points at the db we are renaming in
@@ -1594,8 +1602,11 @@ pub fn translate_alter_table(
                         &renamed_db_name,
                     )?;
                     if new_sql != trigger_entry.trigger.sql {
-                        temp_triggers_to_rewrite
-                            .push((trigger_entry.trigger.name.clone(), new_sql));
+                        temp_triggers_to_rewrite.push((
+                            trigger_entry.trigger.name.clone(),
+                            new_sql,
+                            temp_trigger_targets_renamed_table,
+                        ));
                     }
                 }
             }
@@ -1712,14 +1723,20 @@ pub fn translate_alter_table(
                 );
             }
 
-            for (trigger_name, new_sql) in temp_triggers_to_rewrite {
+            for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
                 let qualified_schema_table = schema_table_name_for_db(resolver, crate::TEMP_DB_ID);
+                let tbl_name_update = if renames_target {
+                    let escaped_new_name = escape_sql_string_literal(new_name);
+                    format!(", tbl_name = '{escaped_new_name}'")
+                } else {
+                    String::new()
+                };
                 let update_stmt = format!(
                     r#"
                         UPDATE {qualified_schema_table}
-                        SET sql = '{escaped_sql}'
+                        SET sql = '{escaped_sql}'{tbl_name_update}
                         WHERE name = '{escaped_trigger_name}' COLLATE NOCASE AND type = 'trigger'
                     "#,
                 );
@@ -4031,6 +4048,7 @@ fn validate_trigger_columns_after_drop(
             ast::TriggerCmd::Update {
                 tbl_name,
                 sets,
+                from,
                 where_clause,
                 ..
             } => {
@@ -4044,15 +4062,41 @@ fn validate_trigger_columns_after_drop(
                     altered_database_id,
                     None,
                 );
-                // Check expressions in SET values and WHERE — these can reference
-                // the command target table and the trigger's owning table via NEW/OLD.
-                // Bare references to the trigger table are still invalid here.
+                let mut visible_columns = cmd_table_cols.clone().unwrap_or_default();
+                if let Some(from_clause) = from {
+                    if let Some(bad) = validate_from_clause_column_refs_after_drop(
+                        from_clause,
+                        &visible_columns,
+                        &owning_table_columns,
+                        allow_bare_owning_columns,
+                        altered_table_norm,
+                        post_drop_table,
+                        resolver,
+                        trigger_database_id,
+                        altered_database_id,
+                    )? {
+                        return Ok(Some(bad));
+                    }
+                    visible_columns = merge_column_lists(
+                        &visible_columns,
+                        &collect_from_clause_visible_columns(
+                            from_clause,
+                            altered_table_norm,
+                            post_drop_table,
+                            resolver,
+                            trigger_database_id,
+                            altered_database_id,
+                        ),
+                    );
+                }
+                // Check expressions in SET values and WHERE. They can use the
+                // table being updated, tables named by FROM, and NEW/OLD.
                 // Note: SET target column names are NOT checked here — SQLite defers
                 // that validation to trigger execution time.
                 for set in sets {
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         &set.expr,
-                        cmd_table_cols.as_deref().unwrap_or(&[]),
+                        &visible_columns,
                         &owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -4067,7 +4111,7 @@ fn validate_trigger_columns_after_drop(
                 if let Some(ref where_expr) = where_clause {
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         where_expr,
-                        cmd_table_cols.as_deref().unwrap_or(&[]),
+                        &visible_columns,
                         &owning_table_columns,
                         allow_bare_owning_columns,
                         altered_table_norm,
@@ -5462,20 +5506,71 @@ fn collect_select_table_visible_columns(
     altered_database_id: usize,
 ) -> Vec<String> {
     match select_table {
-        ast::SelectTable::Table(qualified_name, _, _)
-        | ast::SelectTable::TableCall(qualified_name, _, _) => get_table_columns(
-            &normalize_ident(qualified_name.name.as_str()),
-            altered_table_norm,
-            post_drop_table,
-            resolver,
-            trigger_database_id,
-            altered_database_id,
-            qualified_name.db_name.as_ref().map(|name| name.as_str()),
-        )
-        .unwrap_or_default(),
+        ast::SelectTable::Table(qualified_name, alias, _) => {
+            collect_qualified_table_visible_columns(
+                qualified_name,
+                alias.as_ref(),
+                altered_table_norm,
+                post_drop_table,
+                resolver,
+                trigger_database_id,
+                altered_database_id,
+            )
+        }
+        ast::SelectTable::TableCall(qualified_name, _, alias) => {
+            collect_qualified_table_visible_columns(
+                qualified_name,
+                alias.as_ref(),
+                altered_table_norm,
+                post_drop_table,
+                resolver,
+                trigger_database_id,
+                altered_database_id,
+            )
+        }
         ast::SelectTable::Select(select, _) => collect_select_output_columns(select),
         ast::SelectTable::Sub(from_clause, _) => collect_from_clause_output_columns(from_clause),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_qualified_table_visible_columns(
+    qualified_name: &ast::QualifiedName,
+    alias: Option<&ast::As>,
+    altered_table_norm: &str,
+    post_drop_table: &BTreeTable,
+    resolver: &Resolver,
+    trigger_database_id: usize,
+    altered_database_id: usize,
+) -> Vec<String> {
+    let columns = get_table_columns(
+        &normalize_ident(qualified_name.name.as_str()),
+        altered_table_norm,
+        post_drop_table,
+        resolver,
+        trigger_database_id,
+        altered_database_id,
+        qualified_name.db_name.as_ref().map(|name| name.as_str()),
+    )
+    .unwrap_or_default();
+    let qualifier = alias.map_or_else(
+        || normalize_ident(qualified_name.name.as_str()),
+        |alias| normalize_ident(alias.name().as_str()),
+    );
+    let mut visible = columns.clone();
+    visible.extend(columns.iter().map(|column| format!("{qualifier}.{column}")));
+    if alias.is_none() {
+        if let Some(db_name) = &qualified_name.db_name {
+            let database = normalize_ident(db_name.as_str());
+            let table = normalize_ident(qualified_name.name.as_str());
+            visible.extend(
+                columns
+                    .iter()
+                    .map(|column| format!("{database}.{table}.{column}")),
+            );
+        }
+    }
+    visible
 }
 
 fn collect_select_output_columns(select: &ast::Select) -> Vec<String> {
@@ -5537,6 +5632,17 @@ fn check_column_ref_valid(
                     }
                 }
             } else {
+                let qualified_col = format!("{ns_norm}.{col_norm}");
+                if valid_columns.contains(&qualified_col) {
+                    return None;
+                }
+                let qualifier_prefix = format!("{ns_norm}.");
+                if valid_columns
+                    .iter()
+                    .any(|valid| valid.starts_with(&qualifier_prefix))
+                {
+                    return Some(format!("{ns}.{col}"));
+                }
                 // table.col — validate against that table's columns
                 let table_cols = get_table_columns(
                     &ns_norm,
@@ -5555,8 +5661,22 @@ fn check_column_ref_valid(
             }
         }
         ast::Expr::DoublyQualified(db_name, table_name, col) => {
+            let database_norm = normalize_ident(db_name.as_str());
+            let table_norm = normalize_ident(table_name.as_str());
+            let col_norm = normalize_ident(col.as_str());
+            let qualifier_prefix = format!("{database_norm}.{table_norm}.");
+            let qualified_col = format!("{qualifier_prefix}{col_norm}");
+            if valid_columns.contains(&qualified_col) {
+                return None;
+            }
+            if valid_columns
+                .iter()
+                .any(|valid| valid.starts_with(&qualifier_prefix))
+            {
+                return Some(format!("{db_name}.{table_name}.{col}"));
+            }
             let table_cols = get_table_columns(
-                &normalize_ident(table_name.as_str()),
+                &table_norm,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5564,7 +5684,6 @@ fn check_column_ref_valid(
                 altered_database_id,
                 Some(db_name.as_str()),
             );
-            let col_norm = normalize_ident(col.as_str());
             if let Some(cols) = table_cols {
                 if !cols.contains(&col_norm) {
                     return Some(format!("{db_name}.{table_name}.{col}"));

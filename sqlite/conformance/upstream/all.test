@@ -466,7 +466,7 @@ set test_files {
   rowhash              fail
   rowid                skip {hangs at rowid-13.1}
   rowvalue             fail
-  rowvalue2            fail
+  rowvalue2            pass
   rowvalue3            fail
   rowvalue4            fail
   rowvalue5            fail
@@ -474,7 +474,7 @@ set test_files {
   rowvalue7            pass
   rowvalue8            fail
   rowvalue9          skip {aborts the harness on an engine panic at core/vdbe/builder.rs:1580}
-  rowvalueA            fail
+  rowvalueA            pass
   rowvaluevtab         fail
   savepoint            fail
   savepoint2           fail
@@ -612,9 +612,9 @@ set test_files {
   tkt-bd484a090c       fail
   tkt-bdc6bbbb38       fail
   tkt-c48d99d690       pass
-  tkt-c694113d5        fail
+  tkt-c694113d5        pass
   tkt-cbd054fa6b       fail
-  tkt-d11f09d36e       fail
+  tkt-d11f09d36e       pass
   tkt-d635236375       pass
   tkt-d82e3f3721       fail
   tkt-f3e5abed55       fail
@@ -685,7 +685,7 @@ set test_files {
   tkt35xx              fail
   tkt3630              pass
   tkt3718              skip {hangs at tkt3718-1.2}
-  tkt3731              fail
+  tkt3731              pass
   tkt3757              fail
   tkt3761              fail
   tkt3762              fail
@@ -704,7 +704,7 @@ set test_files {
   tkt3922              fail
   tkt3929              pass
   tkt3935              fail
-  tkt3992              fail
+  tkt3992              pass
   tkt3997              fail
   tkt4018              fail
   tokenize             fail
@@ -782,7 +782,7 @@ set test_files {
   wal8                 pass
   wal9                 fail
   walbak               fail
-  walbig               fail
+  walbig               pass
   walblock             fail
   walcksum             fail
   walhook              fail
@@ -897,20 +897,45 @@ while {$__runner_i < [llength $test_files]} {
     continue
   }
 
-  set __runner_errors0 $TC(errors)
-  set __runner_count0 $TC(count)
   set testprefix ""
 
-  # Contain TCL-level crashes (e.g. a missing harness command) so one bad
-  # file cannot abort the whole run.
+  # Run each test file in its own tclsh process. A file that hard-crashes the
+  # engine - a segfault, an abort, a stack overflow, or the OOM killer - takes
+  # down only its own process, so the run keeps going and the report names the
+  # file that died and the signal that killed it, instead of the whole suite
+  # aborting silently with no summary. A plain Tcl error in the file surfaces
+  # the same way, as a non-zero exit.
+  #
+  # Each file is self-contained (it sources tester.tcl and calls finish_test),
+  # so running it standalone prints its own "All N tests passed!" or "N errors
+  # out of M tests" line, which we parse below for this file's counts.
   set __runner_crashed 0
-  if {[catch {source $testdir/$__runner_name.test} __runner_err]} {
+  set __runner_out ""
+  set __runner_rc [catch {
+    exec [info nameofexecutable] $testdir/$__runner_name.test 2>@1
+  } __runner_out __runner_opts]
+  puts $__runner_out
+  if {$__runner_rc
+      && [lindex [dict get $__runner_opts -errorcode] 0] eq "CHILDKILLED"} {
     set __runner_crashed 1
-    puts "CRASH in $__runner_name.test: $__runner_err"
+    set __runner_signal [lindex [dict get $__runner_opts -errorcode] 2]
+    puts "CRASH in $__runner_name.test: killed by signal $__runner_signal"
   }
 
-  set __runner_nerr [expr {$TC(errors) - $__runner_errors0}]
-  set __runner_ntest [expr {$TC(count) - $__runner_count0}]
+  # Derive this file's counts from the summary line its finish_test printed. A
+  # file that crashed before finishing leaves both at 0, and the crash flag
+  # above still marks it.
+  set __runner_ntest 0
+  set __runner_nerr 0
+  if {[regexp {All (\d+) tests passed!} $__runner_out -> __runner_m]} {
+    set __runner_ntest $__runner_m
+  } elseif {[regexp {(\d+) errors out of (\d+) tests} \
+                 $__runner_out -> __runner_e __runner_t]} {
+    set __runner_nerr $__runner_e
+    set __runner_ntest $__runner_t
+  }
+  incr TC(count) $__runner_ntest
+  incr TC(errors) $__runner_nerr
 
   if {$__runner_status eq "pass"} {
     if {$__runner_crashed || $__runner_nerr > 0} {

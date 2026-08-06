@@ -27,10 +27,13 @@ expect {
     00
 }
 
+# A non-numeric text argument coerces to integer 0, so char('a') is a NUL byte
+# (SQLite coerces every argument to an integer, it does not drop non-integers).
 test char-non-integer {
-    select char('a')
+    select hex(char('a'))
 }
 expect {
+    00
 }
 
 # char() with unicode codepoints >= 256

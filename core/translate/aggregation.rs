@@ -18,8 +18,12 @@ use super::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
     },
-    plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
+    plan::{
+        Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
+        TableReferences,
+    },
     result_row::emit_select_result,
+    subquery::emit_non_from_clause_subqueries_for_phase,
 };
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
@@ -29,6 +33,7 @@ pub fn emit_ungrouped_aggregation<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
+    output_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     let agg_start_reg = t_ctx.reg_agg_start.unwrap();
 
@@ -51,6 +56,20 @@ pub fn emit_ungrouped_aggregation<'a>(
         );
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
+
+    // Subqueries that read an aggregate this query computes need the
+    // aggregate's finalized register, so they must be emitted now — after
+    // AggFinal and the cache population above, and before the result row that
+    // reads them.
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        output_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        SubqueryEvalPhase::UngroupedAggregateOutput,
+        |_| true,
+    )?;
 
     // Allocate a label for the end (used by both HAVING and OFFSET to skip row emission)
     let end_label = program.allocate_label();

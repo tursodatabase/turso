@@ -726,6 +726,17 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
+                // EXISTS only checks whether a row comes out, so ORDER BY and
+                // DISTINCT cannot change the result and SQLite drops them
+                // (select.c, "dropping superfluous ORDER BY"). Dropping them
+                // here — after the plan is prepared, so name errors in the
+                // ORDER BY still surface — also means their expressions are
+                // never evaluated: an ORDER BY term that would error at
+                // runtime (e.g. an integer overflow) must not fail the query.
+                // LIMIT and OFFSET stay: with DISTINCT gone they count plain
+                // rows, which matches SQLite.
+                plan.order_by.clear();
+                plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
                 optimize_select_plan(&mut plan, resolver)?;
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
@@ -2140,7 +2151,21 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         }
     }
 
+    let mut outer_aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        // A subquery that reads an aggregate the outer query computes must run
+        // in the outer query's aggregate-output phase, after that aggregate has
+        // been finalized into a register; run earlier, the aggregate expression
+        // inside the subquery has no register to read.
+        if subquery_reads_outer_aggregate(subquery) {
+            subquery.eval_phase = if has_grouped_output {
+                SubqueryEvalPhase::GroupedOutput
+            } else {
+                SubqueryEvalPhase::UngroupedAggregateOutput
+            };
+            outer_aggregate_subquery_ids.push(subquery.internal_id);
+            continue;
+        }
         subquery.eval_phase = match subquery.origin {
             SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy
                 if has_grouped_output
@@ -2151,4 +2176,77 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
             _ => subquery.origin.phase_floor(),
         };
     }
+
+    // A result column that reads one of these subqueries depends on an
+    // aggregate computed in the output phase, so it must be evaluated there
+    // rather than once per input row — the same treatment SQLite gives any
+    // result-column expression that references an aggregate result (select.c
+    // evaluates those after the aggregation loop, in the output step). Mark it
+    // so the emitter defers it, instead of taking an arbitrary row's NULL
+    // during the scan.
+    for rc in plan.result_columns.iter_mut() {
+        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &outer_aggregate_subquery_ids) {
+            rc.contains_aggregates = true;
+        }
+    }
+}
+
+/// True when `expr` reads one of the given subqueries.
+fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+            if subquery_ids.contains(subquery_id) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+/// True when a result column of the subquery contains an aggregate whose value
+/// the outer query computes: a plain aggregate call that is not one of the
+/// subquery's own aggregates, because its argument referenced an outer column
+/// and it was moved to the outer query during resolution. The subquery reads
+/// that aggregate back from the register the outer query finalizes it into.
+///
+/// Window functions (an aggregate name with an `OVER` clause) are computed by
+/// the subquery itself, not the outer query, so they are not counted here even
+/// though they also do not appear in `aggregates`.
+fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+        return false;
+    };
+    let Plan::Select(select) = plan.as_ref() else {
+        return false;
+    };
+    let mut found = false;
+    for rc in &select.result_columns {
+        let _ = walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            if let ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } = e
+            {
+                let is_plain_aggregate = filter_over.over_clause.is_none()
+                    && matches!(
+                        crate::function::Func::resolve_function(name.as_str(), args.len()),
+                        Ok(Some(crate::function::Func::Agg(_)))
+                    );
+                if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            Ok(WalkControl::Continue)
+        });
+        if found {
+            break;
+        }
+    }
+    found
 }

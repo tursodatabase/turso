@@ -363,22 +363,66 @@ jobs:
   #           }
   #         }
 
-  # TODO: for now leave this commented out, as it always fails
-  # differential-fuzzer:
-  #   runs-on: blacksmith-4vcpu-ubuntu-2404
-  #   timeout-minutes: 30
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - name: Setup mold linker
-  #       uses: rui314/setup-mold@v1
-  #     - uses: Swatinem/rust-cache@v2
-  #       with:
-  #         prefix-key: "v1-rust"
-  #         cache-on-failure: true
-  #     - name: Run differential_fuzzer
-  #       run: |
-  #         cargo run -p differential-fuzzer -- -n 1000 loop 10
+  # Pull requests run a fixed set of seeds so the fuzzer is deterministic: the
+  # same PR always generates the same SQL, a green run stays green, and a
+  # failure blocks the merge and reproduces exactly. New random seeds run only
+  # on pushes to main (differential-fuzzer-random below), where a failure is a
+  # signal to investigate rather than a gate on an unrelated change.
+  differential-fuzzer:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each profile weights top-level statements differently so CI covers
+        # several statement mixes instead of one distribution.
+        profile: [balanced, ddl, triggers, writes]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Run differential_fuzzer on a fixed set of seeds
+        run: |
+          # Reproduce a failure locally with:
+          #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
+          #     --seed <seed> --profile ${{ matrix.profile }} -n 1000
+          for seed in 1 2 3 4 5 6; do
+            cargo run -p differential-fuzzer --bin differential_fuzzer -- \
+              --seed "$seed" --profile ${{ matrix.profile }} -n 1000
+          done
+
+  # Random seeds keep discovering new divergences. Run them only on pushes to
+  # main, so a newly generated failing statement flags a real bug to look at
+  # without blocking an unrelated pull request.
+  differential-fuzzer-random:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [balanced, ddl, triggers, writes]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Run differential_fuzzer with random seeds
+        run: |
+          # A failure prints its seed and profile; reproduce with
+          #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
+          #     --seed <seed> --profile ${{ matrix.profile }} -n 1000
+          cargo run -p differential-fuzzer --bin differential_fuzzer -- \
+            --profile ${{ matrix.profile }} -n 1000 loop 10
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404

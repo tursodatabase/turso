@@ -569,13 +569,16 @@ fn emit_notnull_constraint_check(
                     NoConstantOptReason::RegisterReuse,
                 )?;
                 program.preassign_label_to_next_insn(continue_label);
-            } else {
-                program.emit_insn(Insn::HaltIfNull {
-                    target_reg,
-                    err_code: SQLITE_CONSTRAINT_NOTNULL,
-                    description: description(),
-                });
             }
+            // The value must still satisfy NOT NULL, whether it is the original
+            // (non-null) value or the substituted default: a column may declare
+            // DEFAULT (NULL), so substituting the default does not resolve the
+            // violation and SQLite aborts.
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: description(),
+            });
         }
         _ => {
             program.emit_insn(Insn::HaltIfNull {
@@ -1262,6 +1265,26 @@ fn emit_update_insns<'a>(
     };
     let skip_set_clauses = false;
 
+    // A BEFORE UPDATE trigger can change the row before constraint checks run,
+    // so NOT NULL checks on SET-clause columns are deferred until after those
+    // triggers fire (see emit_deferred_notnull_checks below). AFTER triggers
+    // run once the row is already written and do not affect this ordering, so
+    // they must not defer the checks. Skipping the inline check for any update
+    // trigger, but only re-emitting it when a BEFORE trigger exists, would drop
+    // the NOT NULL check entirely for a table that has only AFTER triggers.
+    let relevant_before_update_triggers = match target_table.table.btree() {
+        Some(btree_table) => get_triggers_including_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        ),
+        None => Vec::new(),
+    };
+    let has_before_triggers = !relevant_before_update_triggers.is_empty();
+
     emit_update_column_values(
         program,
         table_references,
@@ -1270,7 +1293,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
-        has_any_update_triggers,
+        has_before_triggers,
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -1298,18 +1321,9 @@ fn emit_update_insns<'a>(
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let mut has_before_triggers = false;
     let mut has_after_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> =
         if let Some(btree_table) = target_table.table.btree() {
-            let relevant_before_update_triggers = get_triggers_including_temp(
-                &t_ctx.resolver,
-                update_database_id,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            );
             has_after_triggers = has_triggers_including_temp(
                 &t_ctx.resolver,
                 update_database_id,
@@ -1323,7 +1337,6 @@ fn emit_update_insns<'a>(
                     s.any_resolved_fks_referencing(table_name)
                 });
 
-            has_before_triggers = !relevant_before_update_triggers.is_empty();
             let needs_old_registers = has_before_triggers || has_after_triggers || has_fk_cascade;
 
             // Only read OLD row values when triggers or FK cascades need them
@@ -2396,87 +2409,11 @@ fn emit_update_insns<'a>(
                 )?;
             }
 
-            // Fire AFTER UPDATE triggers
-            if let Some(btree_table) = target_table.table.btree() {
-                let relevant_triggers = get_triggers_including_temp(
-                    &t_ctx.resolver,
-                    update_database_id,
-                    TriggerEvent::Update,
-                    TriggerTime::After,
-                    Some(updated_column_indices.clone()),
-                    &btree_table,
-                );
-                if !relevant_triggers.is_empty() {
-                    let columns = target_table.table.columns();
-
-                    // Compute VIRTUAL columns for NEW values
-                    //TODO only emit required virtual columns
-                    let bt = target_table.table.btree().ok_or_else(|| {
-                        crate::LimboError::InternalError(
-                            "UPDATE on virtual table has no btree".into(),
-                        )
-                    })?;
-                    let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
-                    compute_virtual_columns(
-                        program,
-                        &btree_table.columns_topo_sort()?,
-                        &new_ctx,
-                        &t_ctx.resolver,
-                        &bt,
-                    )?;
-
-                    // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
-                    if let Some(ref old_regs) = preserved_old_registers {
-                        let pairs = columns.iter().zip(old_regs.iter().copied());
-                        //TODO only emit required virtual columns
-                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
-                        compute_virtual_columns(
-                            program,
-                            &btree_table.columns_topo_sort()?,
-                            &old_ctx,
-                            &t_ctx.resolver,
-                            &bt,
-                        )?;
-                    }
-
-                    // Build raw NEW registers. Values are encoded at this point;
-                    // fire_trigger will decode them via decode_trigger_registers.
-                    let new_registers_after: Vec<usize> = (0..col_len)
-                        .map(|i| layout.to_register(start, i))
-                        .chain(std::iter::once(effective_rowid_reg))
-                        .collect();
-
-                    // Use preserved OLD registers from BEFORE trigger
-                    let old_registers_after = preserved_old_registers;
-
-                    // Propagate conflict resolution to AFTER trigger context (same logic as BEFORE)
-                    let trigger_ctx_after = update_trigger_context(
-                        program,
-                        &btree_table,
-                        Some(new_registers_after),
-                        old_registers_after,
-                        or_conflict,
-                        TriggerTime::After,
-                    );
-
-                    // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-                    // not skip post-row work (RETURNING, CDC).
-                    let after_trigger_done = program.allocate_label();
-                    for trigger in relevant_triggers {
-                        fire_trigger(
-                            program,
-                            &mut t_ctx.resolver,
-                            trigger,
-                            &trigger_ctx_after,
-                            connection,
-                            update_database_id,
-                            after_trigger_done,
-                        )?;
-                    }
-                    program.preassign_label_to_next_insn(after_trigger_done);
-                }
-            }
-
+            // RETURNING and CDC must capture the row as written by this UPDATE,
+            // before any AFTER trigger runs. SQLite fires its RETURNING pseudo-
+            // trigger ahead of user AFTER triggers, so an AFTER trigger that
+            // rewrites or deletes the row does not change what RETURNING reports.
+            // The AFTER trigger is therefore fired at the end of this block.
             let has_post_write_returning_subqueries = non_from_clause_subqueries
                 .iter()
                 .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
@@ -2604,6 +2541,90 @@ fn emit_update_insns<'a>(
                         cdc_updates_record,
                         table_name,
                     )?;
+                }
+            }
+
+            // Fire AFTER UPDATE triggers last, after RETURNING and CDC have
+            // captured the row this UPDATE wrote. An AFTER trigger that rewrites
+            // or deletes the row then cannot change what RETURNING reports,
+            // matching SQLite.
+            if let Some(btree_table) = target_table.table.btree() {
+                let relevant_triggers = get_triggers_including_temp(
+                    &t_ctx.resolver,
+                    update_database_id,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices.clone()),
+                    &btree_table,
+                );
+                if !relevant_triggers.is_empty() {
+                    let columns = target_table.table.columns();
+
+                    // Compute VIRTUAL columns for NEW values
+                    //TODO only emit required virtual columns
+                    let bt = target_table.table.btree().ok_or_else(|| {
+                        crate::LimboError::InternalError(
+                            "UPDATE on virtual table has no btree".into(),
+                        )
+                    })?;
+                    let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
+                    compute_virtual_columns(
+                        program,
+                        &btree_table.columns_topo_sort()?,
+                        &new_ctx,
+                        &t_ctx.resolver,
+                        &bt,
+                    )?;
+
+                    // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
+                    if let Some(ref old_regs) = preserved_old_registers {
+                        let pairs = columns.iter().zip(old_regs.iter().copied());
+                        //TODO only emit required virtual columns
+                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+                        compute_virtual_columns(
+                            program,
+                            &btree_table.columns_topo_sort()?,
+                            &old_ctx,
+                            &t_ctx.resolver,
+                            &bt,
+                        )?;
+                    }
+
+                    // Build raw NEW registers. Values are encoded at this point;
+                    // fire_trigger will decode them via decode_trigger_registers.
+                    let new_registers_after: Vec<usize> = (0..col_len)
+                        .map(|i| layout.to_register(start, i))
+                        .chain(std::iter::once(effective_rowid_reg))
+                        .collect();
+
+                    // Use preserved OLD registers from BEFORE trigger
+                    let old_registers_after = preserved_old_registers;
+
+                    // Propagate conflict resolution to AFTER trigger context (same logic as BEFORE)
+                    let trigger_ctx_after = update_trigger_context(
+                        program,
+                        &btree_table,
+                        Some(new_registers_after),
+                        old_registers_after,
+                        or_conflict,
+                        TriggerTime::After,
+                    );
+
+                    // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
+                    // not skip post-row work (RETURNING, CDC).
+                    let after_trigger_done = program.allocate_label();
+                    for trigger in relevant_triggers {
+                        fire_trigger(
+                            program,
+                            &mut t_ctx.resolver,
+                            trigger,
+                            &trigger_ctx_after,
+                            connection,
+                            update_database_id,
+                            after_trigger_done,
+                        )?;
+                    }
+                    program.preassign_label_to_next_insn(after_trigger_done);
                 }
             }
         }

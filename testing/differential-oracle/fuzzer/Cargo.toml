@@ -18,11 +18,16 @@ path = "printf_fuzzer.rs"
 name = "custom_types_fuzzer"
 path = "custom_types_fuzzer.rs"
 
+[[bin]]
+name = "differential_probe"
+path = "probe.rs"
+
 [lib]
 path = "lib.rs"
 
 [dependencies]
 turso_core = { workspace = true, features = ["simulator"] }
+turso_parser = { workspace = true }
 sql_gen_prop = { path = "../sql_gen_prop" }
 sql_gen = { path = "../sql_gen", features = ["serde"] }
 rusqlite.workspace = true

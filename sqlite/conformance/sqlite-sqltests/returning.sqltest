@@ -890,7 +890,10 @@ expect {
     2|11|2
 }
 
-@skip-if sqlite "Turso intentionally exposes same-row AFTER UPDATE trigger writes through UPDATE RETURNING"
+# UPDATE RETURNING reports the row as written by the UPDATE, before the
+# AFTER trigger runs — matching SQLite and Turso's own INSERT RETURNING. The
+# trigger's later +100 shows up in the final SELECT, not in RETURNING.
+@cross-check-integrity
 test update-returning-after-trigger-same-row-direct {
     CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 10);
@@ -902,11 +905,13 @@ test update-returning-after-trigger-same-row-direct {
     SELECT val FROM t;
 }
 expect {
-    120
+    20
     120
 }
 
-@skip-if sqlite "Turso intentionally exposes same-row AFTER UPDATE trigger writes through UPDATE RETURNING"
+# The RETURNING subquery reads the target table after the write but before the
+# AFTER trigger, so it also sees the UPDATE's new value (20), not the trigger's.
+@cross-check-integrity
 test update-returning-after-trigger-same-row-subquery {
     CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 10);
@@ -919,7 +924,7 @@ test update-returning-after-trigger-same-row-subquery {
     SELECT val FROM t;
 }
 expect {
-    120|120
+    20|20
     120
 }
 

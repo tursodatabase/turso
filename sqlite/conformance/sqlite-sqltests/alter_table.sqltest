@@ -1269,6 +1269,26 @@ expect {
     1|2
 }
 
+# A TEMP trigger on a main table is stored in temp.sqlite_schema. Renaming the
+# table must update both the stored table name and the name used to find the
+# trigger in memory. Otherwise the trigger no longer runs.
+@cross-check-integrity
+test alter-table-rename-temp-trigger-target-fires-after-rename {
+    CREATE TABLE temp_trigger_target (a, b);
+    CREATE TABLE temp_trigger_log (x, y);
+    CREATE TEMP TRIGGER temp_trig AFTER INSERT ON temp_trigger_target BEGIN
+        INSERT INTO temp_trigger_log VALUES (new.a, new.b);
+    END;
+    ALTER TABLE temp_trigger_target RENAME TO temp_trigger_target_renamed;
+    INSERT INTO temp_trigger_target_renamed VALUES (3, 4);
+    SELECT * FROM temp_trigger_log;
+    SELECT tbl_name FROM temp.sqlite_schema WHERE name = 'temp_trig';
+}
+expect {
+    3|4
+    temp_trigger_target_renamed
+}
+
 # Verify trigger body UPDATE command targets renamed table
 @cross-check-integrity
 test alter-table-rename-trigger-body-update {
@@ -2580,6 +2600,40 @@ test fail-drop-column-cross-table-trigger-update-where-only {
 }
 expect error {
     error in trigger trg after drop column: no such column: m
+}
+
+# DROP COLUMN must understand table aliases when it checks triggers. The
+# reference to target_alias.dropped_col below must make the DROP fail.
+@cross-check-integrity
+test fail-drop-column-trigger-select-table-alias {
+    CREATE TABLE alias_drop_target (keep_col, dropped_col);
+    CREATE TRIGGER alias_drop_trigger AFTER UPDATE ON alias_drop_target BEGIN
+        SELECT keep_col
+        FROM alias_drop_target AS target_alias
+        ORDER BY target_alias.dropped_col;
+    END;
+    ALTER TABLE alias_drop_target DROP COLUMN dropped_col;
+}
+expect error {
+    error in trigger alias_drop_trigger after drop column: no such column: target_alias.dropped_col
+}
+
+# The same check must include aliases introduced by UPDATE FROM.
+@cross-check-integrity
+test fail-drop-column-trigger-update-from-alias {
+    CREATE TABLE update_from_drop_target (keep_col, dropped_col);
+    CREATE TABLE update_from_trigger_owner (value);
+    CREATE TRIGGER update_from_alias_trigger
+    AFTER INSERT ON update_from_trigger_owner BEGIN
+        UPDATE update_from_trigger_owner
+        SET value = source.keep_col
+        FROM update_from_drop_target AS source
+        WHERE source.dropped_col;
+    END;
+    ALTER TABLE update_from_drop_target DROP COLUMN dropped_col;
+}
+expect error {
+    error in trigger update_from_alias_trigger after drop column: no such column: source.dropped_col
 }
 
 # Cross-table trigger: UPDATE SET value expr references dropped column → fail

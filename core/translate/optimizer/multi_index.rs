@@ -184,8 +184,11 @@ fn get_table_local_constraints_for_branch(
         {
             continue;
         }
-        constraint.constraining_expr =
-            Some(constraint.get_constraining_expr(&synthetic_where_terms, Some(table_references)));
+        constraint.constraining_expr = Some(constraint.get_constraining_expr(
+            &synthetic_where_terms,
+            Some(table_references),
+            None,
+        ));
     }
     Ok((synthetic_where_terms, table_constraints))
 }

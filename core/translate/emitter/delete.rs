@@ -948,21 +948,17 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            // If the program has a trigger_conflict_override, propagate it to the trigger context.
-            let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
-                TriggerContext::new_with_override_conflict(
-                    btree_table,
-                    None, // No NEW for DELETE
-                    Some(old_registers),
-                    override_conflict,
-                )
-            } else {
-                TriggerContext::new(
-                    btree_table,
-                    None, // No NEW for DELETE
-                    Some(old_registers),
-                )
-            };
+            // A DELETE always fires its triggers with the default conflict
+            // resolution, never the enclosing statement's OR clause: SQLite
+            // codes row-delete triggers with OE_Default (delete.c). So a plain
+            // INSERT inside such a trigger aborts on a constraint violation
+            // even when an outer UPDATE/INSERT OR REPLACE is what ultimately
+            // fired this DELETE.
+            let trigger_ctx = TriggerContext::new(
+                btree_table,
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
 
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1019,22 +1015,14 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            // If the program has a trigger_conflict_override, propagate it to the trigger context.
-            let trigger_ctx_after =
-                if let Some(override_conflict) = program.trigger_conflict_override {
-                    TriggerContext::new_with_override_conflict(
-                        btree_table,
-                        None, // No NEW for DELETE
-                        Some(old_registers),
-                        override_conflict,
-                    )
-                } else {
-                    TriggerContext::new(
-                        btree_table,
-                        None, // No NEW for DELETE
-                        Some(old_registers),
-                    )
-                };
+            // A DELETE always fires its triggers with the default conflict
+            // resolution, never the enclosing statement's OR clause (see the
+            // BEFORE-trigger case above and SQLite's delete.c).
+            let trigger_ctx_after = TriggerContext::new(
+                btree_table,
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
 
             for trigger in relevant_triggers {
                 fire_trigger(

@@ -257,11 +257,12 @@ fn generate_select_impl_inner<C: Capabilities>(
     // --- DISTINCT ---
     let distinct = match mode {
         SelectMode::Full => ctx.gen_bool_with_prob(select_config.distinct_probability),
-        // Scalar: only when not grouped
-        SelectMode::Scalar => {
-            group_by.is_none()
-                && ctx.gen_bool_with_prob(select_config.subquery_distinct_probability)
-        }
+        // Scalar subqueries carry LIMIT 1, and DISTINCT makes that pick
+        // undecidable: when duplicates collapse, which duplicate's ORDER BY
+        // key survives is the engine's choice, so SQLite and Turso can return
+        // different rows and both are allowed. No tiebreaker can help because
+        // a unique column cannot be added through the deduplication.
+        SelectMode::Scalar => false,
     };
 
     let from = {
@@ -288,20 +289,24 @@ fn generate_select_impl_inner<C: Capabilities>(
     // --- Compound SELECT decision ---
     // Only at top level (not inside subqueries) since Turso doesn't support
     // compound SELECTs in subquery positions yet.
+    let compound_column_types = compound_column_types(&columns, ctx);
     let is_compound = mode == SelectMode::Full
         && ctx.subquery_depth() == 0
         && joins.is_empty()
         && group_by.is_none()
+        && compound_column_types.as_ref().is_some_and(|column_types| {
+            generator.schema().tables.iter().any(|table| {
+                column_types
+                    .iter()
+                    .all(|data_type| table.columns_of_type(*data_type).next().is_some())
+            })
+        })
         && ctx.gen_bool_with_prob(select_config.compound_probability);
 
     if is_compound {
-        let num_result_cols = if columns.is_empty() {
-            // SELECT * — count columns from primary table
-            ctx.tables_in_scope()[0].table.columns.len()
-        } else {
-            columns.len()
-        };
-        let compounds = generate_compound_arms(generator, ctx, num_result_cols)?;
+        let column_types = compound_column_types.as_ref().unwrap();
+        let num_result_cols = column_types.len();
+        let compounds = generate_compound_arms(generator, ctx, column_types)?;
 
         // ORDER BY for compounds uses positional indices (1..N)
         let mut order_by = if ctx.gen_bool_with_prob(select_config.compound_order_by_probability) {
@@ -359,6 +364,47 @@ fn generate_select_impl_inner<C: Capabilities>(
             } else {
                 generate_order_by(generator, ctx)?
             };
+        }
+
+        // A scalar subquery's LIMIT 1 must pick the same row in both engines,
+        // and an ORDER BY key with duplicate values leaves the pick to scan
+        // order. Grouped: order by every GROUP BY expression — groups are
+        // distinct combinations of them, so that is a total order. Ungrouped:
+        // append the table's primary key as a final tiebreaker.
+        if mode == SelectMode::Scalar {
+            if let Some(gb) = &group_by {
+                let covered: Vec<String> = order_by.iter().map(|i| i.expr.to_string()).collect();
+                for expr in &gb.exprs {
+                    if !covered.contains(&expr.to_string()) {
+                        let direction =
+                            select_order_direction(ctx, &select_config.order_direction_weights);
+                        order_by.push(OrderByItem {
+                            expr: expr.clone(),
+                            direction,
+                            nulls: None,
+                        });
+                    }
+                }
+            } else {
+                let scoped = &ctx.tables_in_scope()[0];
+                let qualifier = scoped.qualifier.clone();
+                let pk = scoped
+                    .table
+                    .columns
+                    .iter()
+                    .find(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "rowid".to_string());
+                let direction = select_order_direction(ctx, &select_config.order_direction_weights);
+                order_by.push(OrderByItem {
+                    expr: Expr::ColumnRef(crate::ast::ColumnRef {
+                        table: Some(qualifier),
+                        column: pk,
+                    }),
+                    direction,
+                    nulls: None,
+                });
+            }
         }
 
         Ok(SelectStmt {
@@ -1006,7 +1052,13 @@ fn generate_order_by<C: Capabilities>(
                 // Avoid bare literals — SQLite interprets integer literals in
                 // ORDER BY as column-ordinal positions (e.g. ORDER BY 2).
                 // Also catch unary wrappers like -478008 or +3.
-                if looks_like_literal(&e) {
+                //
+                // Also avoid any term without a column reference: it computes
+                // the same value for every row, so all keys tie and the order
+                // is whatever scan order the engine used. With a LIMIT that
+                // makes the surviving rows engine-specific, and both answers
+                // are allowed.
+                if looks_like_literal(&e) || !e.contains_column_ref() {
                     pick_scoped_column_ref(ctx)?
                 } else {
                     e
@@ -1276,14 +1328,57 @@ pub(crate) fn generate_join_on_condition<C: Capabilities>(
     Ok(Expr::binary_op(ctx, col_expr, op, lit_expr))
 }
 
+/// Return the declared type of each result column when every result is a table
+/// column. Expressions have no dependable declared type for compound queries.
+fn compound_column_types(columns: &[SelectColumn], ctx: &Context) -> Option<Vec<DataType>> {
+    if columns.is_empty() {
+        return Some(
+            ctx.tables_in_scope()[0]
+                .table
+                .columns
+                .iter()
+                .map(|column| column.data_type)
+                .collect(),
+        );
+    }
+
+    columns
+        .iter()
+        .map(|column| {
+            let Expr::ColumnRef(column_ref) = &column.expr else {
+                return None;
+            };
+            ctx.tables_in_scope()
+                .iter()
+                .filter(|table| {
+                    column_ref.table.as_ref().is_none_or(|qualifier| {
+                        qualifier == &table.qualifier || qualifier == &table.table.name
+                    })
+                })
+                .find_map(|table| {
+                    table
+                        .table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == column_ref.column)
+                        .map(|column| column.data_type)
+                })
+        })
+        .collect()
+}
+
 /// Generate compound arms for a compound SELECT.
 ///
-/// Each arm picks a table, generates columns matching `num_cols`, and optionally
-/// generates a WHERE clause. The compound operator is chosen by weighted random.
+/// Each arm picks a table, generates columns matching `column_types`, and
+/// optionally generates a WHERE clause. SQLite is free to choose the declared
+/// type of a compound result column from any SELECT arm. If the arms use
+/// different types, SQLite may turn an integer into a real while Turso leaves it
+/// unchanged, and both results are allowed. Using the same type in every arm
+/// gives the fuzzer one result to compare.
 fn generate_compound_arms<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    num_cols: usize,
+    column_types: &[DataType],
 ) -> Result<Vec<CompoundSelectArm>, GenError> {
     let select_config = &generator.policy().select_config;
     let weights = &select_config.compound_operator_weights;
@@ -1317,18 +1412,43 @@ fn generate_compound_arms<C: Capabilities>(
 
         let arm = ctx.scope(origin, |ctx| {
             // Pick a table for this arm
+            let tables: Vec<_> = generator
+                .schema()
+                .tables
+                .iter()
+                .filter(|table| {
+                    column_types
+                        .iter()
+                        .all(|data_type| table.columns_of_type(*data_type).next().is_some())
+                })
+                .cloned()
+                .collect();
             let table = ctx
-                .choose(&generator.schema().tables)
-                .ok_or_else(|| GenError::schema_empty("tables"))?;
-            let table = table.clone();
+                .choose(&tables)
+                .ok_or_else(|| {
+                    GenError::exhausted("compound_select", "no table has matching columns")
+                })?
+                .clone();
             let table_name = table.qualified_name();
 
             // Generate columns in a temporary table scope for this arm's table
             let (columns, where_clause) = ctx.with_table_scope(vec![(table, None)], |ctx| {
-                // Generate columns matching the required count
-                let mut cols = Vec::with_capacity(num_cols);
-                for _ in 0..num_cols {
-                    let expr = pick_scoped_column_ref(ctx)?;
+                let matching_columns: Vec<Vec<String>> = {
+                    let table = &ctx.tables_in_scope()[0].table;
+                    column_types
+                        .iter()
+                        .map(|data_type| {
+                            table
+                                .columns_of_type(*data_type)
+                                .map(|column| column.name.clone())
+                                .collect()
+                        })
+                        .collect()
+                };
+                let mut cols = Vec::with_capacity(column_types.len());
+                for column_names in matching_columns {
+                    let column_name = ctx.choose(&column_names).unwrap().clone();
+                    let expr = Expr::column_ref(ctx, None, column_name);
                     cols.push(SelectColumn { expr, alias: None });
                 }
 
@@ -1981,6 +2101,100 @@ mod tests {
              offset_range={saw_offset_range}, \
              unexcluded_removable_prefix={saw_unexcluded_removable_prefix}"
         );
+    }
+
+    #[test]
+    fn scalar_subqueries_pick_a_deterministic_row() {
+        // LIMIT 1 must select the same row in both engines, so a scalar
+        // subquery may not use DISTINCT, and its ORDER BY must fully decide
+        // the winner: the primary key as a tiebreaker, or (when grouped)
+        // every GROUP BY expression.
+        let generator = test_generator();
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope(
+                [(generator.schema().tables[0].clone(), None)],
+                |ctx| -> Result<(), GenError> {
+                    let stmt = generate_simple_select(&generator, ctx)?;
+                    assert!(!stmt.distinct, "seed {seed}: scalar subquery uses DISTINCT");
+                    if let Some(gb) = &stmt.group_by {
+                        let ordered: Vec<String> =
+                            stmt.order_by.iter().map(|i| i.expr.to_string()).collect();
+                        for e in &gb.exprs {
+                            assert!(
+                                ordered.contains(&e.to_string()),
+                                "seed {seed}: GROUP BY expr {e} missing from ORDER BY"
+                            );
+                        }
+                    } else {
+                        let last = stmt.order_by.last().expect("scalar must have ORDER BY");
+                        assert!(
+                            matches!(&last.expr, Expr::ColumnRef(c) if c.column == "id"
+                                || c.column == "rowid"),
+                            "seed {seed}: last ORDER BY term is not the tiebreaker: {}",
+                            last.expr
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn order_by_terms_always_reference_a_column() {
+        // A term that computes the same value for every row (e.g.
+        // REPLACE('a','b','c')) makes every key tie, so with a LIMIT the
+        // surviving rows depend on engine scan order.
+        let generator = test_generator();
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope(
+                [(generator.schema().tables[0].clone(), None)],
+                |ctx| -> Result<(), GenError> {
+                    let items = generate_order_by(&generator, ctx)?;
+                    for item in items {
+                        assert!(
+                            item.expr.contains_column_ref(),
+                            "seed {seed} produced constant ORDER BY term: {}",
+                            item.expr
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_compound_arms_use_matching_column_types() {
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "mixed",
+                vec![
+                    ColumnDef::new("integer_value", DataType::Integer),
+                    ColumnDef::new("real_value", DataType::Real),
+                ],
+            ))
+            .table(Table::new(
+                "integers",
+                vec![ColumnDef::new("integer_value", DataType::Integer)],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, Policy::default());
+        let mut ctx = Context::new_with_seed(42);
+
+        let arms =
+            generate_compound_arms(&generator, &mut ctx, &[DataType::Integer, DataType::Real])
+                .unwrap();
+
+        for arm in arms {
+            assert_eq!(arm.from.unwrap().table, "mixed");
+            assert_eq!(arm.columns[0].expr.to_string(), "integer_value");
+            assert_eq!(arm.columns[1].expr.to_string(), "real_value");
+        }
     }
 
     #[test]

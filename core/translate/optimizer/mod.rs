@@ -801,6 +801,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     let best_join_order = optimize_table_access(
         schema,
         resolver.dialect.as_ref(),
+        resolver,
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -881,6 +882,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     let _ = optimize_table_access(
         schema,
         resolver.dialect.as_ref(),
+        resolver,
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -943,6 +945,7 @@ fn optimize_update_plan(
     let optimize_result = optimize_table_access(
         schema,
         resolver.dialect.as_ref(),
+        resolver,
         &mut [],
         &mut target_tables,
         &available_indexes,
@@ -1871,6 +1874,7 @@ fn enforce_indexed_by_hints(
 fn optimize_table_access(
     schema: &Schema,
     dialect: &dyn crate::dialect::Dialect,
+    resolver: &Resolver,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
@@ -2399,6 +2403,7 @@ fn optimize_table_access(
                                 *iter_dir,
                                 where_clause,
                                 Some(table_references),
+                                Some(resolver),
                             )?,
                         });
                 } else {
@@ -2432,6 +2437,7 @@ fn optimize_table_access(
                                     *iter_dir,
                                     where_clause,
                                     Some(table_references),
+                                    Some(resolver),
                                 )?,
                             });
                         continue;
@@ -2447,7 +2453,11 @@ fn optimize_table_access(
                             Operation::Search(Search::RowidEq {
                                 cmp_expr: constraints_per_table[table_idx].constraints
                                     [eq.constraint_pos]
-                                    .get_constraining_expr(where_clause, Some(table_references))
+                                    .get_constraining_expr(
+                                        where_clause,
+                                        Some(table_references),
+                                        Some(resolver),
+                                    )
                                     .1,
                             })
                         } else {
@@ -2459,6 +2469,7 @@ fn optimize_table_access(
                                     *iter_dir,
                                     where_clause,
                                     Some(table_references),
+                                    Some(resolver),
                                 )?,
                             })
                         };
@@ -2515,6 +2526,7 @@ fn optimize_table_access(
                     *iter_dir,
                     where_clause,
                     Some(table_references),
+                    Some(resolver),
                 )?;
 
                 table_references.joined_tables_mut()[table_idx].op =
@@ -2593,6 +2605,7 @@ fn optimize_table_access(
                                 IterationDirection::Forwards, // Multi-index always scans forward
                                 where_clause,
                                 Some(table_references),
+                                Some(resolver),
                             )?,
                         },
                         MultiIndexBranchAccessParams::InSeek { source } => {
@@ -2773,7 +2786,7 @@ fn build_vtab_scan_op(
         if usage.omit {
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
-        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables);
+        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables, None);
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }
@@ -2980,18 +2993,21 @@ impl Optimizable for ast::Expr {
             Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
             Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
             Expr::Case {
-                base,
                 when_then_pairs,
                 else_expr,
                 ..
             } => {
-                base.as_ref().is_none_or(|base| base.is_nonnull(tables))
-                    && when_then_pairs
-                        .iter()
-                        .all(|(_, then)| then.is_nonnull(tables))
+                // With no ELSE, the CASE yields NULL when no WHEN matches.
+                // Otherwise its result is one of the THEN values or the ELSE
+                // value, so it is non-null only when all of those are. The base
+                // is only compared in the WHEN tests and never becomes the
+                // result, so its nullability does not matter.
+                when_then_pairs
+                    .iter()
+                    .all(|(_, then)| then.is_nonnull(tables))
                     && else_expr
                         .as_ref()
-                        .is_none_or(|else_expr| else_expr.is_nonnull(tables))
+                        .is_some_and(|else_expr| else_expr.is_nonnull(tables))
             }
             Expr::Cast { expr, .. } => expr.is_nonnull(tables),
             Expr::Collate(expr, _) => expr.is_nonnull(tables),
@@ -3327,6 +3343,7 @@ pub fn build_seek_def_from_constraints(
     iter_dir: IterationDirection,
     where_clause: &[WhereTerm],
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Result<SeekDef> {
     if constraint_refs.is_empty() {
         // Zero-prefix seeks are used for extremum scans over an already ordered
@@ -3354,7 +3371,9 @@ pub fn build_seek_def_from_constraints(
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
-        .map(|cref| cref.as_seek_range_constraint(constraints, where_clause, referenced_tables))
+        .map(|cref| {
+            cref.as_seek_range_constraint(constraints, where_clause, referenced_tables, resolver)
+        })
         .collect();
 
     let seek_def = build_seek_def(iter_dir, key)?;
