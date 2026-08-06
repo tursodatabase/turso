@@ -69,6 +69,8 @@ jobs:
           - scan-heavy
           - series-blob
           - update-churn
+          - fts-query-churn
+          - fts-update-churn
     steps:
       - uses: actions/checkout@v4
 

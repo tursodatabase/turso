@@ -1,4 +1,6 @@
 pub mod checkpoint;
+pub mod fts_query_churn;
+pub mod fts_update_churn;
 pub mod insert;
 pub mod mixed;
 pub mod read;
