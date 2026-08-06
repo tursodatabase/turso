@@ -526,6 +526,39 @@ expect {
     5
 }
 
+setup empty_not_in_rows {
+    CREATE TABLE not_in_outer(k INTEGER);
+    CREATE TABLE not_in_inner(k INTEGER, x INTEGER);
+    CREATE TABLE empty_values(a INTEGER);
+    INSERT INTO not_in_outer VALUES (1),(2);
+    INSERT INTO not_in_inner VALUES (1,10);
+}
+
+@setup empty_not_in_rows
+test one-value-not-in-empty-keeps-missing-group {
+    SELECT o.k
+    FROM not_in_outer o
+    WHERE (SELECT max(x) FROM not_in_inner i WHERE i.k = o.k)
+          NOT IN (SELECT a FROM empty_values)
+    ORDER BY o.k;
+}
+expect {
+    1
+    2
+}
+
+@setup empty_not_in_rows
+test one-value-not-in-empty-delete-removes-missing-group {
+    DELETE FROM not_in_outer
+    WHERE (SELECT max(x) FROM not_in_inner i WHERE i.k = not_in_outer.k)
+          NOT IN (SELECT a FROM empty_values);
+
+    SELECT count(*) FROM not_in_outer;
+}
+expect {
+    0
+}
+
 @setup correlated_rows
 test in-under-or {
     SELECT id
