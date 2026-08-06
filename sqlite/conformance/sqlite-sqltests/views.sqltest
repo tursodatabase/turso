@@ -400,6 +400,16 @@ expect {
     z
 }
 
+test drop-view-finds-temp-view-with-unqualified-name {
+    CREATE TABLE t(x);
+    CREATE TEMP VIEW tv AS SELECT x FROM t;
+    DROP VIEW tv;
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'view' AND name = 'tv';
+}
+expect {
+    0
+}
+
 @cross-check-integrity
 test view-star-does-not-inherit-source-primary-key {
     CREATE TABLE view_pk_source(id INTEGER PRIMARY KEY, value TEXT);

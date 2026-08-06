@@ -286,12 +286,13 @@ pub fn translate_inner(
             select,
             columns,
             if_not_exists,
-            ..
+            temporary,
         } => view::translate_create_view(
             &view_name,
             resolver,
             &select,
             &columns,
+            temporary,
             if_not_exists,
             program,
         )?,
