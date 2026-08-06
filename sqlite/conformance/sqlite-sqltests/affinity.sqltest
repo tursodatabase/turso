@@ -728,6 +728,7 @@ expect {
     real
 }
 
+@cross-check-integrity
 test affinity-sum-of-text-i64-min {
     SELECT typeof(sum(v)), sum(v) FROM (SELECT '-9223372036854775808' AS v);
 }
