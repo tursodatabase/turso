@@ -1544,7 +1544,14 @@ enum AllocatePageState {
 #[derive(Clone)]
 enum AllocatePage1State {
     Start,
-    Writing { page: PageRef },
+    Writing {
+        page: PageRef,
+    },
+    /// Fsyncing the freshly written page 1 to the main database file, so a
+    /// WAL can never exist next to an empty (0-byte on disk) database file.
+    Syncing {
+        page: PageRef,
+    },
     Done,
 }
 
@@ -5340,25 +5347,54 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page.get().id);
-                let mut cache = self.page_cache.write();
-                cache.insert(page_key, page.clone()).map_err(|e| {
-                    LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
-                })?;
-                // After we wrote the header page, we may now set this None, to signify we initialized
-                self.init_page_1.store(None);
-                page.unpin();
-                *self.allocate_page1_state.write() = AllocatePage1State::Done;
-                Ok(IOResult::Done(page))
+                if self.wal.is_some() {
+                    // Fsync page 1 to the main database file before any commit
+                    // can fsync frames into the WAL. This keeps the invariant
+                    // "a WAL exists ⇒ the database file has at least one page"
+                    // that SQLite guarantees (`PRAGMA journal_mode=WAL` on a
+                    // fresh database commits page 1 through a rollback journal
+                    // first). SQLite relies on it: `pagerOpenWalIfPresent()`
+                    // deletes any WAL found next to a zero-page database, so a
+                    // pre-first-checkpoint crash image with a 0-byte main file
+                    // would lose all its committed data if SQLite opened it.
+                    let c = sqlite3_ondisk::begin_sync(
+                        self.db_file.as_ref(),
+                        self.syncing.clone(),
+                        self.get_sync_type(),
+                    )?;
+                    *self.allocate_page1_state.write() = AllocatePage1State::Syncing { page };
+                    io_yield_one!(c);
+                }
+                self.finish_allocate_page1(page)
+            }
+            AllocatePage1State::Syncing { page } => {
+                tracing::trace!("allocate_page1(Syncing done)");
+                self.finish_allocate_page1(page)
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
         }
     }
 
+    /// Final step of [Pager::allocate_page1]: page 1 is written (and, for
+    /// WAL-backed databases, fsync'd) to the main database file; publish it
+    /// in the page cache and mark the database initialized.
+    fn finish_allocate_page1(&self, page: PageRef) -> Result<IOResult<PageRef>> {
+        let page_key = PageCacheKey::new(page.get().id);
+        let mut cache = self.page_cache.write();
+        cache.insert(page_key, page.clone()).map_err(|e| {
+            LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
+        })?;
+        // After we wrote the header page, we may now set this None, to signify we initialized
+        self.init_page_1.store(None);
+        page.unpin();
+        *self.allocate_page1_state.write() = AllocatePage1State::Done;
+        Ok(IOResult::Done(page))
+    }
+
     pub fn allocating_page1(&self) -> bool {
         matches!(
             *self.allocate_page1_state.read(),
-            AllocatePage1State::Writing { .. }
+            AllocatePage1State::Writing { .. } | AllocatePage1State::Syncing { .. }
         )
     }
 
