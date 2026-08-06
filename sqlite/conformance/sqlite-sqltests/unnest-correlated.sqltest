@@ -726,6 +726,28 @@ test not-exists-linked-past-full-join {
 expect {
 }
 
+# A SELECT with no FROM has no table that can be the left side of a semi join.
+test in-under-select-with-no-from {
+    CREATE TABLE no_from_outer(k INTEGER);
+    CREATE TABLE no_from_inner(k INTEGER);
+    INSERT INTO no_from_outer VALUES (1),(2);
+    INSERT INTO no_from_inner VALUES (1),(1),(3);
+
+    SELECT o.k,
+           (SELECT 1
+            WHERE 1 IN (
+                SELECT i.k
+                FROM no_from_inner i
+                WHERE i.k = o.k
+            ))
+    FROM no_from_outer o
+    ORDER BY o.k;
+}
+expect {
+    1|1
+    2|
+}
+
 setup comparison_keys {
     CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
     CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
