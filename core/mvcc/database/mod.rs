@@ -8399,6 +8399,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             mv_store.is_some(),
         )?;
         fresh.populate_materialized_views(
+            &syms,
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
@@ -9351,6 +9352,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             mv_store.is_some(),
         )?;
         fresh.populate_materialized_views(
+            &syms,
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,

@@ -468,6 +468,23 @@ pub fn translate_drop_view(
             }
         }
 
+        // A materialized view is backed by a real btree, so it can carry
+        // user indexes like a table. Their pages have to go back to the
+        // freelist, and their sqlite_schema rows are deleted below —
+        // leaving either behind makes the database unreadable, because
+        // loading the schema finds an index whose table is gone.
+        let user_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+            s.get_indices(&normalized_view_name).cloned().collect()
+        });
+        for index in &user_indexes {
+            program.emit_insn(Insn::Destroy {
+                db: database_id,
+                root: index.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+        }
+
         // Construct the DBSP state table name
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         Some(format!(
@@ -552,23 +569,64 @@ pub fn translate_drop_view(
 
     // Check if this row matches the view, DBSP table, or DBSP index
     let skip_delete_label = program.allocate_label();
+    // A materialized view can have user indexes on it, whose rows say
+    // type='index' and name=<the index>. They are found by tbl_name
+    // instead, so a failed view-row match falls through to that check
+    // rather than straight to the next row.
+    let delete_row_label = program.allocate_label();
+    let view_row_mismatch_label = if is_materialized_view {
+        program.allocate_label()
+    } else {
+        skip_delete_label
+    };
 
     // Check if this is the view entry (type='view' and name=view_name)
     program.emit_insn(Insn::Ne {
         lhs: col0_reg,
         rhs: type_reg,
-        target_pc: skip_delete_label,
+        target_pc: view_row_mismatch_label,
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
     program.emit_insn(Insn::Ne {
         lhs: col1_reg,
         rhs: view_name_reg,
-        target_pc: skip_delete_label,
+        target_pc: view_row_mismatch_label,
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
-    // Matches view - delete it
+    program.emit_insn(Insn::Goto {
+        target_pc: delete_row_label,
+    });
+
+    // Check if this is an index on the materialized view
+    // (type='index' and tbl_name=view_name).
+    if is_materialized_view {
+        program.preassign_label_to_next_insn(view_row_mismatch_label);
+        let index_type_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: index_type_reg,
+            value: "index".to_string(),
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: col0_reg,
+            rhs: index_type_reg,
+            target_pc: skip_delete_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        let col2_reg = program.alloc_register();
+        program.emit_column_or_rowid(sqlite_schema_cursor_id, 2, col2_reg);
+        program.emit_insn(Insn::Ne {
+            lhs: col2_reg,
+            rhs: view_name_reg,
+            target_pc: skip_delete_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+    }
+
+    program.preassign_label_to_next_insn(delete_row_label);
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
         dest: rowid_reg,

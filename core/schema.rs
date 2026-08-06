@@ -786,6 +786,18 @@ pub struct Schema {
     /// Track views that exist but have incompatible versions
     pub incompatible_views: HashSet<String>,
 
+    /// Indexes whose table was not in the schema yet when
+    /// [`Schema::populate_indices`] ran. A materialized view is btree-backed
+    /// and can carry indexes like a table, but it is only registered later,
+    /// by [`Schema::populate_materialized_views`], which is where these get
+    /// resolved. Anything still unresolved there is a genuinely orphaned
+    /// index and is reported as corruption.
+    pub(crate) deferred_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
+    /// Whether the deferred indexes were read under MVCC, which rejects
+    /// custom index modules. Recorded when deferring so the check still
+    /// happens when they are finally built.
+    pub(crate) deferred_indexes_mvcc: bool,
+
     /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
     /// older versions wrote view column lists without identifier quoting).
     /// The rows are tolerated at load time so the database stays usable;
@@ -940,6 +952,8 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
+            deferred_indexes: Vec::new(),
+            deferred_indexes_mvcc: false,
             broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
@@ -1687,6 +1701,7 @@ impl Schema {
                             mv_cursor.is_some(),
                         )?;
                         self.populate_materialized_views(
+                            syms,
                             acc.materialized_view_info,
                             acc.dbsp_state_roots,
                             acc.dbsp_state_index_roots,
@@ -1760,6 +1775,10 @@ impl Schema {
     /// Populate indices parsed from the schema.
     /// from_sql_indexes: indices explicitly created with CREATE INDEX
     /// automatic_indices: indices created automatically for primary key and unique constraints
+    ///
+    /// Must be followed by [`Schema::populate_materialized_views`], which
+    /// resolves the indexes deferred here and reports any that stay
+    /// unresolved.
     pub fn populate_indices(
         &mut self,
         syms: &SymbolTable,
@@ -1768,16 +1787,14 @@ impl Schema {
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
-            let table = self
-                .get_btree_table(&unparsed_sql_from_index.table_name)
-                .ok_or_else(|| {
-                    LimboError::Corrupt(format!(
-                        "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
-                        unparsed_sql_from_index.table_name,
-                        unparsed_sql_from_index.root_page,
-                        unparsed_sql_from_index.sql
-                    ))
-                })?;
+            // A materialized view is btree-backed and can carry indexes, but
+            // it is not in the schema until materialized views are populated.
+            // Defer rather than decide now whether the table is missing.
+            let Some(table) = self.get_btree_table(&unparsed_sql_from_index.table_name) else {
+                self.deferred_indexes.push(unparsed_sql_from_index);
+                self.deferred_indexes_mvcc = mvcc_enabled;
+                continue;
+            };
             let index = Index::from_sql(
                 syms,
                 &unparsed_sql_from_index.sql,
@@ -1914,9 +1931,13 @@ impl Schema {
         Ok(())
     }
 
-    /// Populate materialized views parsed from the schema.
+    /// Populate materialized views parsed from the schema. Takes `syms`
+    /// because it finishes the work [`Schema::populate_indices`] left
+    /// pending: an index on a materialized view cannot be built until the
+    /// view it indexes is registered here.
     pub fn populate_materialized_views(
         &mut self,
+        syms: &SymbolTable,
         materialized_view_info: HashMap<String, (String, i64)>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
@@ -1996,6 +2017,27 @@ impl Schema {
             for table_name in referenced_tables {
                 self.add_materialized_view_dependency(&table_name, &view_name);
             }
+        }
+        self.populate_deferred_indexes(syms)
+    }
+
+    /// Build the indexes [`Schema::populate_indices`] could not, now that
+    /// materialized views are registered. An index whose table is still
+    /// missing has outlived it, which leaves the schema unreadable, so it is
+    /// reported rather than dropped silently.
+    fn populate_deferred_indexes(&mut self, syms: &SymbolTable) -> Result<()> {
+        for deferred in std::mem::take(&mut self.deferred_indexes) {
+            let table = self.get_btree_table(&deferred.table_name).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
+                    deferred.table_name, deferred.root_page, deferred.sql
+                ))
+            })?;
+            let index = Index::from_sql(syms, &deferred.sql, deferred.root_page, table.as_ref())?;
+            if self.deferred_indexes_mvcc && index.index_method.is_some() {
+                crate::bail_parse_error!("Custom index modules are not supported with MVCC");
+            }
+            self.add_index(Arc::new(index))?;
         }
         Ok(())
     }
@@ -2834,6 +2876,11 @@ impl TryClone for Schema {
         let incompatible_views = self.incompatible_views.try_clone()?;
         Ok(Self {
             tables,
+            // Deferred indexes live only between populate_indices and
+            // populate_materialized_views, which run back to back, so a
+            // schema being cloned never has any pending.
+            deferred_indexes: Vec::new(),
+            deferred_indexes_mvcc: false,
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
             materialized_view_names,

@@ -14159,6 +14159,7 @@ fn op_parse_schema_step(
                     mv_store.is_some(),
                 );
                 let res2 = schema.populate_materialized_views(
+                    &syms,
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
