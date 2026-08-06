@@ -41,3 +41,4 @@ name = "compat"
 path = "tests/compat/mod.rs"
 
 [build-dependencies]
+cc = "1"

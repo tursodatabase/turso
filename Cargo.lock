@@ -7607,6 +7607,7 @@ dependencies = [
 name = "turso_sqlite3"
 version = "0.8.0-pre.3"
 dependencies = [
+ "cc",
  "env_logger",
  "libc",
  "tempfile",

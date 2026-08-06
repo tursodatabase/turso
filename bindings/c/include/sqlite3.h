@@ -19,6 +19,8 @@
 
 #define SQLITE_CANTOPEN 14
 
+#define SQLITE_CONSTRAINT 19
+
 #define SQLITE_MISUSE 21
 
 #define SQLITE_ROW 100
@@ -87,7 +89,49 @@ void sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void *), vo
 
 int sqlite3_busy_timeout(sqlite3 *_db, int _ms);
 
-int sqlite3_set_authorizer(sqlite3 *_db, int (*_callback)(void), void *_context);
+int sqlite3_set_authorizer(sqlite3 *db,
+                           int (*xAuth)(void*, int, const char*, const char*, const char*, const char*),
+                           void *pUserData);
+
+/* Authorizer callback return codes */
+#define SQLITE_DENY   1
+#define SQLITE_IGNORE 2
+
+/* Authorizer action codes (third parameter meanings per SQLite docs) */
+#define SQLITE_CREATE_INDEX          1
+#define SQLITE_CREATE_TABLE          2
+#define SQLITE_CREATE_TEMP_INDEX     3
+#define SQLITE_CREATE_TEMP_TABLE     4
+#define SQLITE_CREATE_TEMP_TRIGGER   5
+#define SQLITE_CREATE_TEMP_VIEW      6
+#define SQLITE_CREATE_TRIGGER        7
+#define SQLITE_CREATE_VIEW           8
+#define SQLITE_DELETE                9
+#define SQLITE_DROP_INDEX           10
+#define SQLITE_DROP_TABLE           11
+#define SQLITE_DROP_TEMP_INDEX      12
+#define SQLITE_DROP_TEMP_TABLE      13
+#define SQLITE_DROP_TEMP_TRIGGER    14
+#define SQLITE_DROP_TEMP_VIEW       15
+#define SQLITE_DROP_TRIGGER         16
+#define SQLITE_DROP_VIEW            17
+#define SQLITE_INSERT               18
+#define SQLITE_PRAGMA               19
+#define SQLITE_READ                 20
+#define SQLITE_SELECT               21
+#define SQLITE_TRANSACTION          22
+#define SQLITE_UPDATE               23
+#define SQLITE_ATTACH               24
+#define SQLITE_DETACH               25
+#define SQLITE_ALTER_TABLE          26
+#define SQLITE_REINDEX              27
+#define SQLITE_ANALYZE              28
+#define SQLITE_CREATE_VTABLE        29
+#define SQLITE_DROP_VTABLE          30
+#define SQLITE_FUNCTION             31
+#define SQLITE_SAVEPOINT            32
+#define SQLITE_COPY                  0
+#define SQLITE_RECURSIVE            33
 
 void *sqlite3_context_db_handle(void *_context);
 
@@ -145,7 +189,28 @@ int64_t sqlite3_last_insert_rowid(sqlite3 *_db);
 
 void sqlite3_interrupt(sqlite3 *_db);
 
-int sqlite3_db_config(sqlite3 *_db, int _op);
+int sqlite3_db_config(sqlite3 *db, int op, ...);
+
+#define SQLITE_DBCONFIG_MAINDBNAME            1000
+#define SQLITE_DBCONFIG_LOOKASIDE             1001
+#define SQLITE_DBCONFIG_ENABLE_FKEY           1002
+#define SQLITE_DBCONFIG_ENABLE_TRIGGER        1003
+#define SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER 1004
+#define SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION 1005
+#define SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE      1006
+#define SQLITE_DBCONFIG_ENABLE_QPSG           1007
+#define SQLITE_DBCONFIG_TRIGGER_EQP           1008
+#define SQLITE_DBCONFIG_RESET_DATABASE        1009
+#define SQLITE_DBCONFIG_DEFENSIVE             1010
+#define SQLITE_DBCONFIG_WRITABLE_SCHEMA       1011
+#define SQLITE_DBCONFIG_LEGACY_ALTER_TABLE    1012
+#define SQLITE_DBCONFIG_DQS_DML               1013
+#define SQLITE_DBCONFIG_DQS_DDL               1014
+#define SQLITE_DBCONFIG_ENABLE_VIEW           1015
+#define SQLITE_DBCONFIG_LEGACY_FILE_FORMAT    1016
+#define SQLITE_DBCONFIG_TRUSTED_SCHEMA        1017
+
+int sqlite3_extended_result_codes(sqlite3 *db, int onoff);
 
 sqlite3 *sqlite3_db_handle(sqlite3_stmt *_stmt);
 
