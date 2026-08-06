@@ -128,7 +128,7 @@ fn grouped_table_can_use_null_and_text_order() -> anyhow::Result<()> {
     let queries = [
         "SELECT o.id, (SELECT count(*) FROM inner_rows i WHERE i.key2 = x.key2)
          FROM outer_rows o LEFT JOIN outer_key2 x ON x.id = o.id",
-        "SELECT (SELECT sum(i.amount) FROM nocase_inner i WHERE o.key1 = i.key1)
+        "SELECT (SELECT avg(i.amount) FROM nocase_inner i WHERE o.key1 = i.key1)
          FROM nocase_outer o",
     ];
 
