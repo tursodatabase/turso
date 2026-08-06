@@ -4,11 +4,12 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
 
 use crate::{
+    mvcc::cursor::MvccCursorType,
     schema::IndexColumn,
-    storage::btree::BTreeCursor,
+    storage::btree::{BTreeCursor, CursorTrait},
     types::{IOResult, IndexInfo, KeyInfo},
     vdbe::Register,
-    Connection, LimboError, Result, Value,
+    Connection, LimboError, MvCursor, Result, Value,
 };
 
 pub mod backing_btree;
@@ -241,30 +242,75 @@ pub trait IndexMethodCursor {
     }
 }
 
-/// helper method to open table BTree cursor in the index method implementation
+fn promote_to_mvcc_cursor(
+    connection: &Arc<Connection>,
+    database_id: usize,
+    root_page: i64,
+    cursor: Box<dyn CursorTrait>,
+    cursor_type: MvccCursorType,
+) -> Result<Box<dyn CursorTrait>> {
+    let Some(mv_store) = connection.mv_store_for_db(database_id) else {
+        return Ok(cursor);
+    };
+    let tx_id = connection.get_mv_tx_id_for_db(database_id).ok_or_else(|| {
+        LimboError::InternalError(
+            "index method opened an MVCC cursor without an active transaction".to_string(),
+        )
+    })?;
+    Ok(Box::new(MvCursor::new(
+        mv_store,
+        connection,
+        tx_id,
+        root_page,
+        cursor_type,
+        cursor,
+    )?))
+}
+
+fn btree_root_page(connection: &Connection, database_id: usize, root_page: i64) -> i64 {
+    if root_page >= 0 {
+        return root_page;
+    }
+    connection
+        .mv_store_for_db(database_id)
+        .map_or(root_page, |mv_store| mv_store.get_real_table_id(root_page))
+}
+
+/// Helper method to open a table cursor in an index method implementation.
 pub(crate) fn open_table_cursor(
-    connection: &Connection,
+    connection: &Arc<Connection>,
     database_id: usize,
     table: &str,
-) -> Result<BTreeCursor> {
+) -> Result<Box<dyn CursorTrait>> {
     let pager = connection.get_pager_from_database_index(&database_id)?;
     let Some(table) = connection.with_schema(database_id, |schema| schema.get_table(table)) else {
         return Err(LimboError::InternalError(format!(
             "table {table} not found",
         )));
     };
-    let cursor = BTreeCursor::new_table(pager, table.get_root_page()?, table.columns().len());
-    Ok(cursor)
+    let root_page = table.get_root_page()?;
+    let cursor = Box::new(BTreeCursor::new_table(
+        pager,
+        btree_root_page(connection, database_id, root_page),
+        table.columns().len(),
+    ));
+    promote_to_mvcc_cursor(
+        connection,
+        database_id,
+        root_page,
+        cursor,
+        MvccCursorType::Table,
+    )
 }
 
-/// helper method to open index BTree cursor in the index method implementation
+/// Helper method to open an index cursor in an index method implementation.
 pub(crate) fn open_index_cursor<I, E>(
-    connection: &Connection,
+    connection: &Arc<Connection>,
     database_id: usize,
     table: &str,
     index: &str,
     keys: I,
-) -> Result<BTreeCursor>
+) -> Result<Box<dyn CursorTrait>>
 where
     I: IntoIterator<Item = KeyInfo, IntoIter = E>,
     E: ExactSizeIterator<Item = KeyInfo>,
@@ -279,14 +325,20 @@ where
     };
     let keys = keys.into_iter();
     let num_cols = keys.len();
-    let mut cursor = BTreeCursor::new(pager, scratch.root_page, num_cols);
-    cursor.index_info = Some(Arc::new(IndexInfo::new(
-        keys,
-        false,
+    let index_info = Arc::new(IndexInfo::new(keys, false, num_cols, scratch.unique)?);
+    let mut cursor = BTreeCursor::new(
+        pager,
+        btree_root_page(connection, database_id, scratch.root_page),
         num_cols,
-        scratch.unique,
-    )?));
-    Ok(cursor)
+    );
+    cursor.index_info = Some(index_info.clone());
+    promote_to_mvcc_cursor(
+        connection,
+        database_id,
+        scratch.root_page,
+        Box::new(cursor),
+        MvccCursorType::Index(index_info),
+    )
 }
 
 /// helper method to parse select patterns for [IndexMethodAttachment::definition] call

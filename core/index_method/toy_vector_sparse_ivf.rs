@@ -14,7 +14,7 @@ use crate::{
         BACKING_BTREE_INDEX_METHOD_NAME, TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
     },
     return_if_io,
-    storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
+    storage::btree::{BTreeKey, CursorTrait},
     sync::Arc,
     translate::collate::CollationSeq,
     types::{IOResult, ImmutableRecord, KeyInfo, SeekKey, SeekOp, SeekResult},
@@ -307,10 +307,10 @@ pub struct VectorSparseInvertedIndexMethodCursor {
     scan_portion: f64,
     scan_order: ScanOrder,
     inverted_index_btree: String,
-    inverted_index_cursor: Option<BTreeCursor>,
+    inverted_index_cursor: Option<Box<dyn CursorTrait>>,
     stats_btree: String,
-    stats_cursor: Option<BTreeCursor>,
-    main_btree: Option<BTreeCursor>,
+    stats_cursor: Option<Box<dyn CursorTrait>>,
+    main_btree: Option<Box<dyn CursorTrait>>,
     insert_state: VectorSparseInvertedIndexInsertState,
     delete_state: VectorSparseInvertedIndexDeleteState,
     search_state: VectorSparseInvertedIndexSearchState,
@@ -345,7 +345,7 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
             patterns: self.patterns.as_slice(),
             backing_btree: false,
             results_materialized: true,
-            mvcc_support: super::IndexMethodMvccSupport::Unsupported,
+            mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
         }
     }
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
