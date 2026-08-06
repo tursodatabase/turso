@@ -90,6 +90,87 @@ impl SessionState {
     }
 }
 
+/// The session-dependent fields of one pg_settings row.
+pub(crate) struct PgSettingRow {
+    pub(crate) name: String,
+    pub(crate) setting: String,
+    pub(crate) context: &'static str,
+    pub(crate) vartype: &'static str,
+    pub(crate) source: &'static str,
+    pub(crate) min_val: Option<&'static str>,
+    pub(crate) max_val: Option<&'static str>,
+    pub(crate) boot_val: Option<String>,
+    pub(crate) reset_val: String,
+}
+
+impl SessionState {
+    /// Snapshot for the pg_settings catalog table: every built-in with its
+    /// current value and source, the live search path, and the customized
+    /// (dotted) parameters this session set, sorted by name.
+    pub(crate) fn settings_snapshot(&self) -> Vec<PgSettingRow> {
+        let mut rows: Vec<PgSettingRow> = GUC_DEFAULTS
+            .iter()
+            .map(|def| {
+                let session_value = self.gucs.get(def.name);
+                PgSettingRow {
+                    name: def.display_name.to_string(),
+                    setting: session_value
+                        .cloned()
+                        .unwrap_or_else(|| def.default.to_string()),
+                    context: def.context,
+                    vartype: def.vartype,
+                    source: if session_value.is_some() {
+                        "session"
+                    } else {
+                        "default"
+                    },
+                    min_val: def.min_val,
+                    max_val: def.max_val,
+                    boot_val: Some(def.default.to_string()),
+                    reset_val: def.default.to_string(),
+                }
+            })
+            .collect();
+        rows.push(PgSettingRow {
+            name: "search_path".to_string(),
+            setting: self
+                .guc_value("search_path")
+                .expect("search_path always resolves"),
+            context: "user",
+            vartype: "string",
+            source: if self.search_path.is_empty() {
+                "default"
+            } else {
+                "session"
+            },
+            min_val: None,
+            max_val: None,
+            boot_val: Some("\"$user\", public".to_string()),
+            reset_val: "\"$user\", public".to_string(),
+        });
+        for (name, value) in &self.gucs {
+            if guc_default(name).is_some() {
+                continue;
+            }
+            // Customized (dotted) parameters exist only once set;
+            // PostgreSQL presents them as user-context strings.
+            rows.push(PgSettingRow {
+                name: name.clone(),
+                setting: value.clone(),
+                context: "user",
+                vartype: "string",
+                source: "session",
+                min_val: None,
+                max_val: None,
+                boot_val: None,
+                reset_val: value.clone(),
+            });
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows
+    }
+}
+
 /// The PostgreSQL session state attached to a core connection, present on
 /// every connection opened through [`PgConnection::new`]. Dialect scalar
 /// functions (`current_setting`, `set_config`) reach the session's GUCs
@@ -100,30 +181,101 @@ pub(crate) fn session_state_of(conn: &Connection) -> Option<Arc<Mutex<SessionSta
         .ok()
 }
 
-/// Built-in GUCs with their canonical display name (SHOW's column header
-/// preserves PostgreSQL's casing) and session defaults. `search_path` is
-/// special-cased against the session's live search path instead.
-const GUC_DEFAULTS: &[(&str, &str, &str)] = &[
-    ("application_name", "application_name", ""),
-    ("client_encoding", "client_encoding", "UTF8"),
-    ("client_min_messages", "client_min_messages", "notice"),
-    ("datestyle", "DateStyle", "ISO, MDY"),
-    ("extra_float_digits", "extra_float_digits", "1"),
-    ("intervalstyle", "IntervalStyle", "postgres"),
-    ("max_index_keys", "max_index_keys", "32"),
-    ("server_encoding", "server_encoding", "UTF8"),
-    ("server_version", "server_version", "17.0"),
-    (
+/// A built-in configuration parameter: its lowercased key, the canonical
+/// display name (SHOW's column header and pg_settings preserve
+/// PostgreSQL's casing), the session default, and the pg_settings
+/// metadata real tools filter on.
+pub(crate) struct GucDef {
+    pub(crate) name: &'static str,
+    pub(crate) display_name: &'static str,
+    pub(crate) default: &'static str,
+    pub(crate) vartype: &'static str,
+    pub(crate) context: &'static str,
+    pub(crate) min_val: Option<&'static str>,
+    pub(crate) max_val: Option<&'static str>,
+}
+
+/// A user-settable GUC with no numeric range, the common case.
+const fn guc_user(
+    name: &'static str,
+    display_name: &'static str,
+    default: &'static str,
+    vartype: &'static str,
+) -> GucDef {
+    GucDef {
+        name,
+        display_name,
+        default,
+        vartype,
+        context: "user",
+        min_val: None,
+        max_val: None,
+    }
+}
+
+/// Built-in GUCs with their session defaults, matching PostgreSQL's
+/// metadata for each. `search_path` is special-cased against the
+/// session's live search path instead.
+pub(crate) const GUC_DEFAULTS: &[GucDef] = &[
+    guc_user("application_name", "application_name", "", "string"),
+    guc_user("client_encoding", "client_encoding", "UTF8", "string"),
+    guc_user(
+        "client_min_messages",
+        "client_min_messages",
+        "notice",
+        "enum",
+    ),
+    guc_user("datestyle", "DateStyle", "ISO, MDY", "string"),
+    GucDef {
+        name: "extra_float_digits",
+        display_name: "extra_float_digits",
+        default: "1",
+        vartype: "integer",
+        context: "user",
+        min_val: Some("-15"),
+        max_val: Some("3"),
+    },
+    guc_user("intervalstyle", "IntervalStyle", "postgres", "enum"),
+    GucDef {
+        name: "max_index_keys",
+        display_name: "max_index_keys",
+        default: "32",
+        vartype: "integer",
+        context: "internal",
+        min_val: Some("32"),
+        max_val: Some("32"),
+    },
+    GucDef {
+        name: "server_encoding",
+        display_name: "server_encoding",
+        default: "UTF8",
+        vartype: "string",
+        context: "internal",
+        min_val: None,
+        max_val: None,
+    },
+    GucDef {
+        name: "server_version",
+        display_name: "server_version",
+        default: "17.0",
+        vartype: "string",
+        context: "internal",
+        min_val: None,
+        max_val: None,
+    },
+    guc_user(
         "standard_conforming_strings",
         "standard_conforming_strings",
         "on",
+        "bool",
     ),
-    ("synchronous_commit", "synchronous_commit", "on"),
-    ("timezone", "TimeZone", "UTC"),
-    (
+    guc_user("synchronous_commit", "synchronous_commit", "on", "enum"),
+    guc_user("timezone", "TimeZone", "UTC", "string"),
+    guc_user(
         "transaction_isolation",
         "transaction_isolation",
         "read committed",
+        "enum",
     ),
 ];
 
@@ -131,8 +283,8 @@ const GUC_DEFAULTS: &[(&str, &str, &str)] = &[
 fn guc_default(lower_name: &str) -> Option<(&'static str, &'static str)> {
     GUC_DEFAULTS
         .iter()
-        .find(|(name, _, _)| *name == lower_name)
-        .map(|(_, canonical, default)| (*canonical, *default))
+        .find(|def| def.name == lower_name)
+        .map(|def| (def.display_name, def.default))
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO

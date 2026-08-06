@@ -192,6 +192,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_publication_namespace"
             | "pg_publication_rel"
             | "pg_sequences"
+            | "pg_settings"
             | "pg_constraint"
             | "pg_index"
             | "pg_inherits"
@@ -2970,6 +2971,149 @@ impl InternalVirtualTableCursor for PgSequencesCursor {
     }
 }
 
+/// pg_settings: the session's configuration parameters, backed by the GUC
+/// store the frontend attaches to the connection. Engine-internal
+/// connections carry no session state and see the defaults.
+#[derive(Debug)]
+struct PgSettingsTable;
+
+const PG_SETTINGS_SQL: &str = "CREATE TABLE pg_settings (
+    name TEXT,
+    setting TEXT,
+    unit TEXT,
+    category TEXT,
+    short_desc TEXT,
+    extra_desc TEXT,
+    context TEXT,
+    vartype TEXT,
+    source TEXT,
+    min_val TEXT,
+    max_val TEXT,
+    enumvals TEXT,
+    boot_val TEXT,
+    reset_val TEXT,
+    sourcefile TEXT,
+    sourceline INTEGER,
+    pending_restart INTEGER
+)";
+
+impl InternalVirtualTable for PgSettingsTable {
+    fn name(&self) -> String {
+        "pg_settings".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgSettingsCursor {
+            conn,
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 100.0,
+            estimated_rows: 20,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        PG_SETTINGS_SQL.to_string()
+    }
+}
+
+struct PgSettingsCursor {
+    conn: Arc<Connection>,
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl PgSettingsCursor {
+    fn load_settings(&mut self) {
+        let snapshot = match crate::session::session_state_of(&self.conn) {
+            Some(state) => state.lock().unwrap().settings_snapshot(),
+            None => crate::session::SessionState::default().settings_snapshot(),
+        };
+        let opt_text = |v: Option<&'static str>| match v {
+            Some(v) => Value::build_text(v),
+            None => Value::Null,
+        };
+        self.rows = snapshot
+            .into_iter()
+            .map(|row| {
+                vec![
+                    Value::build_text(row.name),
+                    Value::build_text(row.setting),
+                    Value::Null, // unit
+                    Value::Null, // category
+                    Value::Null, // short_desc
+                    Value::Null, // extra_desc
+                    Value::build_text(row.context),
+                    Value::build_text(row.vartype),
+                    Value::build_text(row.source),
+                    opt_text(row.min_val),
+                    opt_text(row.max_val),
+                    Value::Null, // enumvals
+                    row.boot_val.map(Value::build_text).unwrap_or(Value::Null),
+                    Value::build_text(row.reset_val),
+                    Value::Null,        // sourcefile
+                    Value::Null,        // sourceline
+                    Value::from_i64(0), // pending_restart
+                ]
+            })
+            .collect();
+    }
+}
+
+impl InternalVirtualTableCursor for PgSettingsCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.load_settings();
+        Ok(!self.rows.is_empty())
+    }
+}
+
 /// Create PostgreSQL system catalog virtual tables
 pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
     vec![
@@ -2982,6 +3126,16 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
                 Arc::new(RwLock::new(PgClassTable::new())),
             )
             .expect("pg_class virtual table creation should not fail"),
+        ),
+        // pg_settings virtual table
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_settings".to_string(),
+                PgSettingsTable.sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgSettingsTable)),
+            )
+            .expect("pg_settings virtual table creation should not fail"),
         ),
         // pg_namespace virtual table
         Arc::new(

@@ -165,3 +165,65 @@ test guc-current-setting-canonicalizes-booleans {
 expect {
     on
 }
+
+test pg-settings-reflects-session-value {
+    SET extra_float_digits = 2;
+    SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+}
+expect {
+    2|session
+}
+
+test pg-settings-default-source {
+    SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+}
+expect {
+    1|default
+}
+
+test pg-settings-metadata-columns {
+    SELECT vartype, context, min_val, max_val FROM pg_settings WHERE name = 'extra_float_digits';
+}
+expect {
+    integer|user|-15|3
+}
+
+test pg-settings-reset-val-survives-set {
+    SET extra_float_digits = 2;
+    SELECT boot_val, reset_val FROM pg_settings WHERE name = 'extra_float_digits';
+}
+expect {
+    1|1
+}
+
+test pg-settings-set-config-updates-row {
+    SELECT set_config('application_name', 'myapp', false);
+    SELECT setting FROM pg_settings WHERE name = 'application_name';
+}
+expect {
+    myapp
+    myapp
+}
+
+test pg-settings-custom-parameter-appears {
+    SET myapp.tenant = 'acme';
+    SELECT setting, vartype, source FROM pg_settings WHERE name = 'myapp.tenant';
+}
+expect {
+    acme|string|session
+}
+
+test pg-settings-search-path-row {
+    SET search_path = public;
+    SELECT setting, source FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    public|session
+}
+
+test pg-settings-unknown-name-is-no-rows {
+    SELECT count(*) FROM pg_settings WHERE name = 'no_such_parameter';
+}
+expect {
+    0
+}
