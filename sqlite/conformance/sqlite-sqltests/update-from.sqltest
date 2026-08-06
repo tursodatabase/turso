@@ -3100,3 +3100,27 @@ test update-from-cte-shadows-source-is-circular {
 }
 expect error {
 }
+
+# A correlated subquery in the WHERE clause must keep the index order chosen
+# when it was first planned. Planning it again after ORDER BY was removed can
+# change a backwards index scan into a forwards scan.
+@cross-check-integrity
+test update-from-correlated-subquery-keeps-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE i(k INTEGER, x INTEGER);
+    CREATE INDEX ik ON i(k, x);
+    INSERT INTO t VALUES (1,1,0),(2,2,0);
+    INSERT INTO s VALUES (10,1),(20,2);
+    INSERT INTO i VALUES (1,5),(1,9),(2,3),(2,8);
+
+    UPDATE t SET v = s.id FROM s
+    WHERE s.k = t.k
+      AND (SELECT x FROM i WHERE i.k = t.k ORDER BY x DESC LIMIT 1) = 9;
+
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1|10
+    2|2|0
+}
