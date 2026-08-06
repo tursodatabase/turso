@@ -285,6 +285,41 @@ fn subquery_exists_correlated(bencher: Bencher) {
     );
 }
 
+#[turso_macros::divan_bench(args = [3, 5, 7])]
+fn subquery_two_correlated_wide_join(bencher: Bencher, tables: usize) {
+    let (db, conn) = open_db();
+    for i in 0..tables {
+        execute(
+            &db,
+            &conn,
+            &format!("CREATE TABLE wide_outer_{i} (id INTEGER PRIMARY KEY, k INTEGER, v REAL)"),
+        );
+    }
+    execute(
+        &db,
+        &conn,
+        "CREATE TABLE wide_inner_avg (k INTEGER, v REAL)",
+    );
+    execute(&db, &conn, "CREATE TABLE wide_inner_in (k INTEGER, v REAL)");
+
+    let mut sql = String::from("SELECT t0.id FROM wide_outer_0 t0");
+    for i in 1..tables {
+        sql.push_str(&format!(
+            " JOIN wide_outer_{i} t{i} ON t{i}.k = t{}.k",
+            i - 1
+        ));
+    }
+    sql.push_str(
+        " WHERE t0.v < (SELECT avg(a.v) FROM wide_inner_avg a WHERE a.k = t0.k) \
+           AND t1.v IN (SELECT b.v FROM wide_inner_in b WHERE b.k = t1.k)",
+    );
+
+    let _warmup = conn.prepare(&sql).unwrap();
+    bencher.bench_local(|| {
+        black_box(conn.prepare(black_box(&sql)).unwrap());
+    });
+}
+
 #[turso_macros::divan_bench]
 fn subquery_from_derived_table(bencher: Bencher) {
     bench_prepare(
