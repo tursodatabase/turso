@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -521,6 +522,54 @@ def test_blob_bytes_are_printed_raw_in_list_mode():
     )
 
 
+def test_ctrl_c_interrupts_a_running_query():
+    # A non-terminating query must be abandonable from the keyboard, the way it is in the
+    # sqlite3 shell. tursodb installs a SIGINT handler, which suppresses the default kill, so
+    # if that handler does not reach the running statement the shell becomes unrecoverable.
+    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+
+    console.test("Running test: ctrl-c-interrupts-a-running-query")
+    # SQLITE_EXEC may be the tursodb binary or the scripts/limbo-sqlite3 wrapper, which runs
+    # tursodb as a bash child. Give the whole thing its own process group and signal the group,
+    # so the interrupt reaches tursodb under either invocation, and so a regression can be
+    # cleaned up wholesale instead of leaving the runaway query spinning.
+    proc = subprocess.Popen(
+        [exec_name, ":memory:"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+    try:
+        try:
+            proc.stdin.write(
+                b"WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c;\n"
+            )
+            proc.stdin.flush()
+            # Let the statement get well inside the recursive fixed point before signalling.
+            time.sleep(1.0)
+            os.killpg(pgid, signal.SIGINT)
+
+            # The shell must be back at the prompt and able to run the next statement.
+            proc.stdin.write(b"SELECT 42;\n.quit\n")
+            proc.stdin.flush()
+            stdout, _ = proc.communicate(timeout=15)
+        except (subprocess.TimeoutExpired, BrokenPipeError) as exc:
+            raise AssertionError(
+                f"SIGINT did not interrupt the running query; the shell never returned to the prompt ({exc!r})"
+            ) from exc
+    finally:
+        # Nothing bounds the recursion, so on any failure the query is still burning a core.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+    assert b"42" in stdout, f"expected the shell to answer after the interrupt, got {stdout!r}"
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_read_command()
@@ -549,6 +598,7 @@ def main():
     test_tables_with_attached_db()
     test_dbtotxt()
     test_blob_bytes_are_printed_raw_in_list_mode()
+    test_ctrl_c_interrupts_a_running_query()
     console.info("All tests have passed")
 
 
