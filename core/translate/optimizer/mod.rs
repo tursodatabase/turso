@@ -894,14 +894,15 @@ fn find_select_plan_form(
     }
 
     let table_cost = table_plan.as_ref().map(|table_plan| table_plan.join.cost);
-    let subquery_calls = table_plan
+    let mut subquery_calls = table_plan
         .as_ref()
         .map(|table_plan| table_plan.join.subquery_calls.clone())
         .unwrap_or_default();
 
     if let Some(table_plan) = table_plan.as_ref() {
-        let mut rows =
+        let rows_before_limit =
             estimate_select_output_rows(plan, table_plan.join.output_cardinality, schema);
+        let mut rows = rows_before_limit;
         // Clamp to LIMIT when it's a literal non-negative number.
         // Negative LIMIT means "no limit" in SQLite, so we skip those.
         if let Some(limit) = &plan.limit {
@@ -922,6 +923,14 @@ fn find_select_plan_form(
                 };
                 if let Some(limit_rows) = limit_rows {
                     rows = rows.min(limit_rows);
+                    if rows_before_limit > 0.0 {
+                        // These call counts cover the full result. LIMIT only
+                        // needs the same share of those calls.
+                        let call_scale = (rows / rows_before_limit).min(1.0);
+                        for (_, calls) in &mut subquery_calls {
+                            *calls *= call_scale;
+                        }
+                    }
                 }
             }
         }

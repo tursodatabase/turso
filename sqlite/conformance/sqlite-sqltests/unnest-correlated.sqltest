@@ -813,6 +813,41 @@ test one-value-empty-outer-does-not-sum {
 expect {
 }
 
+# LIMIT 1 can stop after the first matching row. When matches are expected to
+# be common, building an index over the whole inner table costs more.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test limit-one-keeps-correlated-in {
+    CREATE TABLE limit_outer(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER);
+    CREATE TABLE limit_inner(k INTEGER, x INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM limit_outer o
+    WHERE o.v IN (SELECT i.x FROM limit_inner i WHERE i.k = o.k)
+    LIMIT 1;
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM limit_outer o
+    WHERE o.v IN (SELECT i.x FROM limit_inner i WHERE i.k = o.k)
+    LIMIT 100;
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM limit_outer o
+    WHERE o.v IN (SELECT i.x FROM limit_inner i WHERE i.k = o.k);
+}
+expect {
+    1|0|0|SCAN limit_outer AS o
+    6|0|0|CORRELATED LIST SUBQUERY 1
+    8|6|0|SCAN limit_inner AS i
+    1|0|0|SCAN limit_outer AS o
+    6|0|0|CORRELATED LIST SUBQUERY 1
+    8|6|0|SCAN limit_inner AS i
+    1|0|0|SCAN limit_outer AS o
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_t3 (k=? AND x=?)
+}
+
 setup comparison_keys {
     CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
     CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
