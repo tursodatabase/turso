@@ -262,7 +262,7 @@ pub fn join_lhs_and_rhs<'a>(
         .copied()
         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
 
-    let Some(mut method) = find_best_access_method_for_join_order(
+    let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
         rhs_constraints,
         join_order,
@@ -285,27 +285,6 @@ pub fn join_lhs_and_rhs<'a>(
         Some(lhs) => lhs.table_numbers().try_collect()?,
         None => TableMask::default(),
     };
-
-    // Check if this access method will trigger ephemeral index creation.
-    if let AccessMethodParams::BTreeTable {
-        index: None,
-        constraint_refs,
-        ..
-    } = &method.params
-    {
-        if constraint_refs.is_empty() {
-            let has_usable_constraints = rhs_constraints.constraints.iter().any(|constraint| {
-                constraint.usable
-                    && constraint.table_col_pos.is_some()
-                    && lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
-            });
-
-            if has_usable_constraints && lhs.is_some() {
-                let build_cost = *rhs_base_rows * params.cpu_cost_per_row;
-                method.cost = method.cost + Cost(build_cost);
-            }
-        }
-    }
 
     let lhs_cost = lhs.map_or(Cost(0.0), |l| l.cost);
     // If we have a previous table, consider hash join as an alternative
@@ -360,9 +339,11 @@ pub fn join_lhs_and_rhs<'a>(
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
             AccessMethodParams::BTreeTable {
+                ref index,
                 ref constraint_refs,
                 ..
             } if !constraint_refs.is_empty()
+                && index.as_ref().is_none_or(|index| !index.ephemeral)
         );
 
         // The probe table must NOT be the build table of any earlier hash join,
@@ -2871,26 +2852,27 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // Verify that t2 is chosen first due to its equality filter
-        assert_eq!(best_plan.table_numbers().next().unwrap(), 1);
-        // Verify table scan is used since there are no indexes
+        // Put the table with no filter first. The two inner tables can then
+        // build an automatic index once instead of scanning once per outer row.
+        assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![2, 1, 0]);
+
         let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
-        // Verify that t1 is chosen next due to its inequality filter
+
         let access_method = &access_methods_arena[best_plan.data[1].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
-        assert!(constraint_refs.is_empty());
+        assert!(!constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
-        assert!(index.is_none());
-        // Verify that t3 is chosen last due to no filters
+        assert!(index.is_some_and(|index| index.ephemeral));
+
         let access_method = &access_methods_arena[best_plan.data[2].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
-        assert!(constraint_refs.is_empty());
+        assert!(!constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
-        assert!(index.is_none());
+        assert!(index.is_some_and(|index| index.ephemeral));
     }
 
     #[test]

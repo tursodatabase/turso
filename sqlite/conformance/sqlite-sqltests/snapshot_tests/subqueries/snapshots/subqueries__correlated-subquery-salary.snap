@@ -17,81 +17,86 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN employees AS e
-`--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?)
-   |--SCAN employees AS e2
-   `--USE SORTER FOR GROUP BY
+|--SCAN scalar_subquery_t2
+|  |--SCAN employees AS e2
+|  `--USE SORTER FOR GROUP BY
+`--SEARCH e USING INDEX ephemeral_employees_t1 (department=? AND salary>?)
 
 BYTECODE
 addr  opcode                  p1  p2  p3  p4              p5  comment
-   0          Init             0  69   0                   0  Start at 69
-   1          Once            49   0   0                   0  goto 49
-   2          OpenEphemeral    0   0   0                   0  cursor=0 is_table=false
-   3          Null             0  11   0                   0  r[11]=NULL
-   4          SorterOpen       1   2   0  k(1,B)           0  cursor=1
-   5          Integer          0   8   0                   0  r[8]=0; clear group by abort flag
-   6          Null             0   9   0                   0  r[9]=NULL; initialize group by comparison registers to NULL
-   7          Gosub           15  46   0                   0  ; go to clear accumulator subroutine
-   8          OpenRead         3   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
-   9          Rewind           3  15   0                   0  Rewind table employees
-  10            ColumnRange    3   3  13  2                0  r[13..14]=employees.department..salary
-  11            RealAffinity  14   0   0                   0
-  12            MakeRecord    13   2  12                   0  r[12]=mkrec(r[13..14])
-  13            SorterInsert   1  12   0  0                0  key=r[12]
-  14          Next             3  10   0                   0
-  15          OpenPseudo       2  12   2                   0  2 columns in r[12]
-  16          SorterSort       1  31   0                   0
-  17            SorterData     1  12   2                   0  r[12]=data
-  18            Column         2   0  16                   0  r[16]=pseudo.column 0
-  19            Compare        9  16   1  k(1, Binary)     0  r[9..9]==r[16..16]
-  20            Jump          21  25  21                   0  ; start new group if comparison is not equal
-  21            Gosub          6  35   0                   0  ; check if ended group had data, and output if so
-  22            Move          16   9   1                   0  r[9..9]=r[16..16]
-  23            IfPos          8  49   0                   0  r[8]>0 -> r[8]-=0, goto 49; check abort flag
-  24            Gosub         15  46   0                   0  ; goto clear accumulator subroutine
-  25            Column         2   1  17                   0  r[17]=pseudo.column 1
-  26            AggStep        0  17  11  avg              0  accum=r[11] step(r[17])
-  27            If             7  29   0                   0  if r[7] goto 29; don't emit group columns if continuing existing group
-  28            Column         2   0  10                   0  r[10]=pseudo.column 0
-  29            Integer        1   7   0                   0  r[7]=1; indicate data in accumulator
-  30          SorterNext       1  17   0                   0
-  31          Gosub            6  35   0                   0  ; emit row for final group
-  32          Goto             0  49   0                   0  ; group by finished
-  33          Integer          1   8   0                   0  r[8]=1
-  34        Return             6   0   0                   0
-  35        IfPos              7  37   0                   0  r[7]>0 -> r[7]-=0, goto 37; output group by row subroutine start
-  36      Return               6   0   0                   0
-  37      AggFinal             0  11   0  avg              0  accum=r[11]
-  38      Copy                11   4   0                   0  r[4]=r[11]
-  39      Copy                10   5   0                   0  r[5]=r[10]
-  40      Copy                 5  19   0                   0  r[19]=r[5]
-  41      Copy                 4  20   0                   0  r[20]=r[4]
-  42      Sequence             0  21   0                   0
-  43      MakeRecord          19   3  18                   0  r[18]=mkrec(r[19..21]); for ephemeral_subquery_t2
-  44      IdxInsert            0  18   0                   8  key=r[18]
-  45    Return                 6   0   0                   0
-  46    Null                   0  10  11                   0  r[10..11]=NULL; clear accumulator subroutine start
-  47    Integer                0   7   0                   0  r[7]=0
-  48  Return                  15   0   0                   0
-  49  OpenRead                 4   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
-  50  Rewind                   4  68   0                   0  Rewind table employees
-  51    Column                 4   3  26                   0  r[26]=employees.department
-  52    IsNull                26  67   0                   0  if (r[26]==NULL) goto 67
-  53    SeekGE                 0  67  26                   0  key=[26..26]
-  54      IdxGT                0  67  26                   0  key=[26..26]
-  55      Column               0   1   2                   0  r[2]=ephemeral(ephemeral_subquery_t2).avg(e2.salary)
-  56      Column               0   0   3                   0  r[3]=ephemeral(ephemeral_subquery_t2).correlation_key_0
-  57      Column               4   4  28                   0  r[28]=employees.salary
-  58      RealAffinity        28   0   0                   0
-  59      Column               0   1  29                   0  r[29]=ephemeral(ephemeral_subquery_t2).avg(e2.salary)
-  60      Le                  28  29  66  Binary           0  if r[28]<=r[29] goto 66
-  61      RowId                4  22   0                   0  r[22]=employees.rowid
-  62      Column               4   1  23                   0  r[23]=employees.name
-  63      ColumnRange          4   3  24  2                0  r[24..25]=employees.department..salary
-  64      RealAffinity        25   0   0                   0
-  65      ResultRow           22   4   0                   0  output=r[22..25]
-  66    Next                   0  54   0                   0
-  67  Next                     4  51   0                   0
-  68  Halt                     0   0   0                   0
-  69  Transaction              0   1  11                   0  iDb=0 tx_mode=Read
-  70  Goto                     0   1   0                   0
+   0          Init             0  74   0                   0  Start at 74
+   1          InitCoroutine    2  45   2                   0
+   2          Null             0  10   0                   0  r[10]=NULL
+   3          SorterOpen       0   2   0  k(1,B)           0  cursor=0
+   4          Integer          0   7   0                   0  r[7]=0; clear group by abort flag
+   5          Null             0   8   0                   0  r[8]=NULL; initialize group by comparison registers to NULL
+   6          Gosub           14  41   0                   0  ; go to clear accumulator subroutine
+   7          OpenRead         2   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+   8          Rewind           2  14   0                   0  Rewind table employees
+   9            ColumnRange    2   3  12  2                0  r[12..13]=employees.department..salary
+  10            RealAffinity  13   0   0                   0
+  11            MakeRecord    12   2  11                   0  r[11]=mkrec(r[12..13])
+  12            SorterInsert   0  11   0  0                0  key=r[11]
+  13          Next             2   9   0                   0
+  14          OpenPseudo       1  11   2                   0  2 columns in r[11]
+  15          SorterSort       0  30   0                   0
+  16            SorterData     0  11   1                   0  r[11]=data
+  17            Column         1   0  15                   0  r[15]=pseudo.column 0
+  18            Compare        8  15   1  k(1, Binary)     0  r[8..8]==r[15..15]
+  19            Jump          20  24  20                   0  ; start new group if comparison is not equal
+  20            Gosub          5  34   0                   0  ; check if ended group had data, and output if so
+  21            Move          15   8   1                   0  r[8..8]=r[15..15]
+  22            IfPos          7  44   0                   0  r[7]>0 -> r[7]-=0, goto 44; check abort flag
+  23            Gosub         14  41   0                   0  ; goto clear accumulator subroutine
+  24            Column         1   1  16                   0  r[16]=pseudo.column 1
+  25            AggStep        0  16  10  avg              0  accum=r[10] step(r[16])
+  26            If             6  28   0                   0  if r[6] goto 28; don't emit group columns if continuing existing group
+  27            Column         1   0   9                   0  r[9]=pseudo.column 0
+  28            Integer        1   6   0                   0  r[6]=1; indicate data in accumulator
+  29          SorterNext       0  16   0                   0
+  30          Gosub            5  34   0                   0  ; emit row for final group
+  31          Goto             0  44   0                   0  ; group by finished
+  32          Integer          1   7   0                   0  r[7]=1
+  33        Return             5   0   0                   0
+  34        IfPos              6  36   0                   0  r[6]>0 -> r[6]-=0, goto 36; output group by row subroutine start
+  35      Return               5   0   0                   0
+  36      AggFinal             0  10   0  avg              0  accum=r[10]
+  37      Copy                10   3   0                   0  r[3]=r[10]
+  38      Copy                 9   4   0                   0  r[4]=r[9]
+  39      Yield                2   0   0                   0
+  40    Return                 5   0   0                   0
+  41    Null                   0   9  10                   0  r[9..10]=NULL; clear accumulator subroutine start
+  42    Integer                0   6   0                   0  r[6]=0
+  43  Return                  14   0   0                   0
+  44  EndCoroutine             2   0   0                   0
+  45  OpenRead                 3   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+  46  InitCoroutine            2   0   2                   0
+  47    Yield                  2  73   0                   0
+  48    Once                  58   0   0                   0  goto 58
+  49    OpenAutoindex          4   0   0                   0  cursor=4
+  50    Rewind                 3  51   0                   0  Rewind table employees
+  51      ColumnRange          3   3  21  2                0  r[21..22]=employees.department..salary
+  52      RowId                3  23   0                   0  r[23]=employees.rowid
+  53      Column               3   1  24                   0  r[24]=employees.name
+  54      RowId                3  25   0                   0  r[25]=employees.rowid
+  55      MakeRecord          21   5  26                   0  r[26]=mkrec(r[21..25]); for ephemeral_employees_t1
+  56      IdxInsert            4  26  21                   0  key=r[26]
+  57    Next                   3  51   0                   0
+  58    Copy                   4  27   0                   0  r[27]=r[4]
+  59    IsNull                27  72   0                   0  if (r[27]==NULL) goto 72
+  60    Copy                   3  28   0                   0  r[28]=r[3]
+  61    IsNull                28  72   0                   0  if (r[28]==NULL) goto 72
+  62    Affinity              27   2   0                   0  r[27..29] = A, C
+  63    SeekGT                 4  72  27                   0  key=[27..28]
+  64      IdxGT                4  72  27                   0  key=[27..27]
+  65      DeferredSeek         4   3   0                   0
+  66      IdxRowId             4  17   0                   0  r[17]=cursor 4 for index ephemeral(ephemeral_employees_t1).rowid
+  67      Column               4   3  18                   0  r[18]=ephemeral(ephemeral_employees_t1).name
+  68      ColumnRange          4   0  19  2                0  r[19..20]=ephemeral(ephemeral_employees_t1).department..salary
+  69      RealAffinity        20   0   0                   0
+  70      ResultRow           17   4   0                   0  output=r[17..20]
+  71    Next                   4  64   0                   0
+  72  Goto                     0  47   0                   0
+  73  Halt                     0   0   0                   0
+  74  Transaction              0   1  11                   0  iDb=0 tx_mode=Read
+  75  Goto                     0   1   0                   0

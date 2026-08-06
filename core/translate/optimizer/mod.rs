@@ -52,8 +52,8 @@ use crate::{
 };
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
-    automatic_index_terms, can_use_partial_index, constraints_from_where_clause, partial_index,
-    partial_index_predicate_terms, usable_constraints_for_join_order, Constraint, ConstraintRef,
+    can_use_partial_index, constraints_from_where_clause, partial_index,
+    partial_index_predicate_terms, Constraint,
 };
 use cost::Cost;
 use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinN, JoinPlanningContext};
@@ -780,9 +780,6 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         return optimize_select_plan_form(plan, resolver);
     }
 
-    let original_table_plan = find_select_plan_form(plan, resolver)?;
-    let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver)?;
-
     let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
         table
             .join_info
@@ -796,11 +793,19 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
             .non_from_clause_subqueries
             .iter()
             .any(|subquery| subquery.correlated);
-    let use_rewritten = full_join_rewrite_is_complete
-        || matches!(
-            (plan.estimated_cost, rewritten.estimated_cost),
-            (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
-        );
+    if full_join_rewrite_is_complete {
+        let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver)?;
+        *plan = rewritten;
+        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
+        return Ok(());
+    }
+
+    let original_table_plan = find_select_plan_form(plan, resolver)?;
+    let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver)?;
+    let use_rewritten = matches!(
+        (plan.estimated_cost, rewritten.estimated_cost),
+        (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
+    );
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;
@@ -2439,96 +2444,24 @@ fn apply_table_access_plan(
                     sort_eliminated,
                 );
                 if constraint_refs.is_empty() {
-                    let is_leftmost_table = i == 0;
-                    let uses_index = index.is_some();
-                    let try_to_build_ephemeral_index = !is_leftmost_table && !uses_index;
-
-                    if !try_to_build_ephemeral_index {
-                        if let Some(index) = partial_index(index.as_ref()) {
-                            let is_outer_join = table_references.joined_tables()[table_idx]
-                                .join_info
-                                .as_ref()
-                                .is_some_and(|join_info| join_info.is_outer());
-                            mark_partial_index_predicate_terms_consumed(
-                                index,
-                                &table_references.joined_tables()[table_idx],
-                                where_clause,
-                                is_outer_join,
-                            );
-                        }
-                        table_references.joined_tables_mut()[table_idx].op =
-                            Operation::Scan(Scan::BTreeTable {
-                                iter_dir: *iter_dir,
-                                index: index.clone(),
-                            });
-                        continue;
-                    }
-                    // This branch means we have a full table scan for a non-outermost table.
-                    // Try to construct an ephemeral index since it's going to be better than a scan.
-                    let table_id = table_references.joined_tables()[table_idx].internal_id;
-                    let table_constraints = constraints_per_table
-                        .iter()
-                        .find(|c| c.table_id == table_id);
-                    let Some(table_constraints) = table_constraints else {
-                        table_references.joined_tables_mut()[table_idx].op =
-                            Operation::Scan(Scan::BTreeTable {
-                                iter_dir: *iter_dir,
-                                index: index.clone(),
-                            });
-                        continue;
-                    };
-                    // Find this table's position in best_join_order (which excludes build tables)
-                    let join_order_pos = best_join_order
-                        .iter()
-                        .position(|m| m.original_idx == table_idx)
-                        .unwrap_or_else(|| best_join_order.len().saturating_sub(1));
-                    let index_terms = automatic_index_terms(
-                        &table_references.joined_tables()[table_idx],
-                        table_constraints,
-                    );
-                    let usable_constraint_refs = usable_constraints_for_join_order(
-                        &table_constraints.constraints,
-                        &index_terms,
-                        &best_join_order[..=join_order_pos],
-                    )?;
-
-                    if usable_constraint_refs.is_empty() {
-                        table_references.joined_tables_mut()[table_idx].op =
-                            Operation::Scan(Scan::BTreeTable {
-                                iter_dir: *iter_dir,
-                                index: index.clone(),
-                            });
-                        continue;
-                    }
-                    let ephemeral_index = ephemeral_index_build(
-                        &table_references.joined_tables_mut()[table_idx],
-                        &usable_constraint_refs,
-                    )?;
-
-                    mark_seek_constraints_consumed(
-                        &table_constraints.constraints,
-                        &usable_constraint_refs,
-                        where_clause,
-                        table_references.joined_tables()[table_idx]
+                    if let Some(index) = partial_index(index.as_ref()) {
+                        let is_outer_join = table_references.joined_tables()[table_idx]
                             .join_info
                             .as_ref()
-                            .is_some_and(|ji| ji.is_outer()),
-                        hash_join_build_only_tables.get(table_idx),
-                    );
-
-                    let ephemeral_index = Arc::new(ephemeral_index);
+                            .is_some_and(|join_info| join_info.is_outer());
+                        mark_partial_index_predicate_terms_consumed(
+                            index,
+                            &table_references.joined_tables()[table_idx],
+                            where_clause,
+                            is_outer_join,
+                        );
+                    }
                     table_references.joined_tables_mut()[table_idx].op =
-                        Operation::Search(Search::Seek {
-                            index: Some(ephemeral_index),
-                            seek_def: build_seek_def_from_constraints(
-                                &table_constraints.constraints,
-                                &usable_constraint_refs,
-                                *iter_dir,
-                                where_clause,
-                                Some(table_references),
-                                Some(resolver),
-                            )?,
+                        Operation::Scan(Scan::BTreeTable {
+                            iter_dir: *iter_dir,
+                            index: index.clone(),
                         });
+                    continue;
                 } else {
                     let is_outer_join = table_references.joined_tables()[table_idx]
                         .join_info

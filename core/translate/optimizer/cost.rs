@@ -98,6 +98,18 @@ fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelPar
     Cost(io_cost + cpu_cost)
 }
 
+/// Estimate the work to add every row to a new in-memory index.
+///
+/// Each insert searches the part of the index that was already built. A
+/// balanced index needs about log2(rows) comparisons per insert.
+pub(super) fn estimate_ephemeral_index_build_cost(
+    row_count: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let comparisons_per_row = row_count.max(2.0).log2();
+    Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek)
+}
+
 /// Estimate how many B-tree levels an index search reads.
 pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
     if row_count <= 1.0 {
