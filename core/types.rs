@@ -2878,23 +2878,22 @@ where
 
     // Skip over `skip` number of fields
     let mut skipped = 0;
-    while skipped < skip {
-        // Whole-word step: 8 one-byte serial types at once. Null and the
-        // constant int types add 0 there, matching the kind check below.
-        if skip - skipped >= 8 && header_end.saturating_sub(header_pos) >= 8 {
-            if let Some(chunk) = payload
-                .get(header_pos..)
-                .and_then(|rest| rest.first_chunk::<8>())
-            {
-                if let Some(size) = small_serial_type_run_size(chunk) {
-                    header_pos += 8;
-                    data_pos += size;
-                    skipped += 8;
-                    continue;
-                }
-            }
-        }
-
+    // Leading run of one-byte serial types, 8 header bytes per step. Null and
+    // the constant int types add 0 to data_pos there, matching the kind check
+    // in the one-at-a-time loop below.
+    while skip - skipped >= 8 && header_end.saturating_sub(header_pos) >= 8 {
+        let Some(size) = payload
+            .get(header_pos..)
+            .and_then(|rest| rest.first_chunk::<8>())
+            .and_then(small_serial_type_run_size)
+        else {
+            break;
+        };
+        header_pos += 8;
+        data_pos += size;
+        skipped += 8;
+    }
+    for _ in skipped..skip {
         if header_pos >= header_end {
             break;
         }
@@ -2909,7 +2908,6 @@ where
         ) {
             data_pos += serial_type.size();
         }
-        skipped += 1;
     }
 
     let mut field_idx = skip;
@@ -3178,33 +3176,39 @@ pub(crate) fn small_serial_type_run_size(chunk: &[u8; 8]) -> Option<usize> {
 
 /// Skip `n` serial-type varints from the front of `header`, totalling their
 /// data sizes. Behaves exactly like `n` sequential [read_varint] +
-/// [get_serial_type_size] calls (same values, same errors), but consumes runs
-/// of one-byte serial types 8 header bytes per step.
+/// [get_serial_type_size] calls (same values, same errors), but consumes the
+/// leading run of one-byte serial types 8 header bytes per step. Once the run
+/// ends the remainder goes one at a time; a header where the run never starts
+/// costs the same as the plain loop.
 ///
 /// Returns the remaining header and the summed data size, or `Ok(None)` when
 /// the header runs out before `n` serial types were read.
-#[inline]
+///
+/// Kept inline: the callers (Column opcode, [ValueIterator::nth]) previously
+/// ran this loop in their own bodies, and an outlined call costs more than
+/// skipping a few one-byte serial types.
+#[inline(always)]
 pub(crate) fn skip_serial_types(mut header: &[u8], n: usize) -> Result<Option<(&[u8], usize)>> {
     let mut data_sum = 0;
     let mut left = n;
-    while left > 0 {
-        if left >= 8 {
-            if let Some(chunk) = header.first_chunk::<8>() {
-                if let Some(size) = small_serial_type_run_size(chunk) {
-                    data_sum += size;
-                    header = &header[8..];
-                    left -= 8;
-                    continue;
-                }
-            }
-        }
+    while left >= 8 {
+        let Some(size) = header
+            .first_chunk::<8>()
+            .and_then(small_serial_type_run_size)
+        else {
+            break;
+        };
+        data_sum += size;
+        header = &header[8..];
+        left -= 8;
+    }
+    for _ in 0..left {
         if unlikely(header.is_empty()) {
             return Ok(None);
         }
         let (serial_type, bytes_read) = read_varint(header)?;
         header = &header[bytes_read..];
         data_sum += get_serial_type_size(serial_type)?;
-        left -= 1;
     }
     Ok(Some((header, data_sum)))
 }

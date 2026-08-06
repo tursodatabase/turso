@@ -1332,9 +1332,10 @@ fn varint_gather_payload_bits(x: u64) -> u64 {
 /// Reads varint integer from the buffer.
 ///
 /// 1- and 2-byte varints (nearly all serial types, rowids and payload sizes)
-/// return through two direct checks. Longer ones decode from a single 8-byte
-/// load without a per-byte loop, so the varint length adds no unpredictable
-/// branches.
+/// return through two direct checks inlined at the call site; everything
+/// longer goes through one outlined call. The byte-by-byte accumulator loop
+/// is gone from every path, so no decode carries a loop-carried data
+/// dependency per byte.
 #[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     let Some(&b0) = buf.first() else {
@@ -1354,47 +1355,74 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     read_varint_long(buf)
 }
 
-/// Decode a varint of any length wholesale from an 8-byte word. Split out of
-/// [read_varint] so the common short cases stay small at every call site.
+/// Decode a varint of 3 or more bytes; `buf[0]` and `buf[1]` are known to
+/// carry continuation bits.
+///
+/// 3- and 4-byte varints take direct checks: their length is usually stable
+/// within a scan (rowids and payload sizes of neighboring rows are alike), and
+/// the branch predictor then hides the checks entirely. 5 bytes and up
+/// (values >= 1<<28, rare) decode wholesale from one 8-byte load: locate the
+/// terminating byte through the continuation-bit mask, gather the 7-bit
+/// digits, shift. That trades the old per-byte loop for a handful of
+/// branch-free ALU ops, which wins precisely where lengths are too scattered
+/// to predict.
 fn read_varint_long(buf: &[u8]) -> Result<(u64, usize)> {
-    if let Some(chunk) = buf.first_chunk::<8>() {
-        let x = u64::from_be_bytes(*chunk);
-        let stops = !x & VARINT_CONT_BITS;
-        if likely(stops != 0) {
-            // The most significant stop bit sits in the first byte with a
-            // clear high bit: the last byte of the varint.
-            let n = (stops.leading_zeros() >> 3) as usize + 1;
-            // Gathering all 8 bytes leaves the digits past the stop byte in
-            // the bits below the wanted value; the shift drops them.
-            let v = varint_gather_payload_bits(x) >> (7 * (8 - n));
-            return Ok((v, n));
-        }
-        // All 8 bytes continue: a 9-byte varint, whose last byte contributes
-        // a full 8 bits with no continuation flag.
-        let Some(&b8) = buf.get(8) else {
-            mark_unlikely();
-            bail_corrupt_error!("Invalid varint");
-        };
-        let v = varint_gather_payload_bits(x);
-        // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
-        // Since the final value is `(v<<8) + b8`, the top 8 bits (v >> 48) must not be 0.
-        // If those are zero, this should be treated as corrupt.
-        if unlikely((v >> 48) == 0) {
-            bail_corrupt_error!("Invalid varint");
-        }
-        return Ok(((v << 8) + b8 as u64, 9));
+    let Some(&b2) = buf.get(2) else {
+        mark_unlikely();
+        bail_corrupt_error!("Invalid varint");
+    };
+    let v2 =
+        (((buf[0] & 0x7f) as u64) << 14) | (((buf[1] & 0x7f) as u64) << 7) | (b2 & 0x7f) as u64;
+    if b2 < 0x80 {
+        return Ok((v2, 3));
     }
-    // Fewer than 8 bytes left in the buffer: any valid varint fits in what
-    // remains, so a short byte loop covers it.
-    let mut v: u64 = 0;
-    for (i, &c) in buf.iter().enumerate() {
-        v = (v << 7) + (c & 0x7f) as u64;
-        if (c & 0x80) == 0 {
-            return Ok((v, i + 1));
-        }
+    let Some(&b3) = buf.get(3) else {
+        mark_unlikely();
+        bail_corrupt_error!("Invalid varint");
+    };
+    if b3 < 0x80 {
+        return Ok(((v2 << 7) | b3 as u64, 4));
     }
-    mark_unlikely();
-    bail_corrupt_error!("Invalid varint");
+
+    let Some(chunk) = buf.first_chunk::<8>() else {
+        // Fewer than 8 bytes left in the buffer: any valid varint fits in
+        // what remains, so a short byte loop covers it.
+        let mut v: u64 = 0;
+        for (i, &c) in buf.iter().enumerate() {
+            v = (v << 7) + (c & 0x7f) as u64;
+            if (c & 0x80) == 0 {
+                return Ok((v, i + 1));
+            }
+        }
+        mark_unlikely();
+        bail_corrupt_error!("Invalid varint");
+    };
+    let x = u64::from_be_bytes(*chunk);
+    let stops = !x & VARINT_CONT_BITS;
+    if likely(stops != 0) {
+        // The most significant stop bit sits in the first byte with a
+        // clear high bit: the last byte of the varint.
+        let n = (stops.leading_zeros() >> 3) as usize + 1;
+        // Gathering all 8 bytes leaves the digits past the stop byte in
+        // the bits below the wanted value; the shift drops them.
+        let v = varint_gather_payload_bits(x) >> (7 * (8 - n));
+        return Ok((v, n));
+    }
+    // All 8 bytes continue: a 9-byte varint (value >= 1<<56, e.g. a negative
+    // rowid), whose last byte contributes a full 8 bits with no continuation
+    // flag.
+    let Some(&b8) = buf.get(8) else {
+        mark_unlikely();
+        bail_corrupt_error!("Invalid varint");
+    };
+    let v = varint_gather_payload_bits(x);
+    // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+    // Since the final value is `(v<<8) + b8`, the top 8 bits (v >> 48) must not be 0.
+    // If those are zero, this should be treated as corrupt.
+    if unlikely((v >> 48) == 0) {
+        bail_corrupt_error!("Invalid varint");
+    }
+    Ok(((v << 8) + b8 as u64, 9))
 }
 
 #[inline(always)]
