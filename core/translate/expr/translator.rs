@@ -590,6 +590,9 @@ pub fn translate_expr(
                             target_register,
                             resolver,
                         )?;
+                        if let Some(span) = constant_span {
+                            program.constant_span_end(span);
+                        }
                         return Ok(target_register);
                     }
 
@@ -623,6 +626,9 @@ pub fn translate_expr(
                                 type_def,
                                 resolver,
                             )?;
+                        }
+                        if let Some(span) = constant_span {
+                            program.constant_span_end(span);
                         }
                         return Ok(target_register);
                     }

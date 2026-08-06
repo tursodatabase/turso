@@ -6,9 +6,8 @@
 # was told the column was text, so per-type output settings like DateStyle
 # never applied to it.
 #
-# `json`, `boolean`, `uuid` and `jsonb` casts still flatten. See
-# pg-sqltests/boolean_input.sqltest for how `::boolean` gets its value right
-# without the cast.
+# `uuid` and `jsonb` casts still flatten, because both are stored as blobs and
+# casting to them would change the value's representation.
 
 @database :memory:
 
@@ -69,6 +68,20 @@ test date-cast-of-a-column {
 }
 expect {
     27.12.2001
+}
+
+test json-cast-validates-its-input {
+    SELECT 'not json'::json;
+}
+expect error {
+    ^.*malformed JSON.*$
+}
+
+test json-cast-keeps-a-valid-value {
+    SELECT '{"a":1}'::json;
+}
+expect {
+    {"a":1}
 }
 
 # Types that still flatten must keep working rather than error.

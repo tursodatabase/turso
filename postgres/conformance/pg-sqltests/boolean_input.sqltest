@@ -8,52 +8,42 @@
 # value came out false — `'true'::boolean` was false and `WHERE flag::boolean`
 # matched nothing.
 #
-# The results are read back through a declared boolean column, which is what
-# gives PostgreSQL's t/f rendering: a boolean *expression* still reports as an
-# integer on the wire, because the engine describes a cast's result by its
-# storage rather than by the type that was asked for.
+# A cast reports boolean on the wire, so these render as t/f like PostgreSQL.
+# A boolean expression that is not a cast (`SELECT true`, `SELECT 1 = 1`) still
+# renders 1/0, because nothing states its type.
 
 @database :memory:
 
 test cast-true-spellings-are-all-true {
-    CREATE TABLE t_true (v boolean);
-    INSERT INTO t_true VALUES ('true'::boolean), ('t'::boolean), ('yes'::boolean),
-                              ('y'::boolean), ('on'::boolean), ('1'::boolean);
-    SELECT count(*) FROM t_true WHERE v;
+    SELECT 'true'::boolean, 't'::boolean, 'yes'::boolean,
+           'y'::boolean, 'on'::boolean, '1'::boolean;
 }
 expect {
-    6
+    t|t|t|t|t|t
 }
 
 test cast-false-spellings-are-all-false {
-    CREATE TABLE t_false (v boolean);
-    INSERT INTO t_false VALUES ('false'::boolean), ('f'::boolean), ('no'::boolean),
-                               ('n'::boolean), ('off'::boolean), ('0'::boolean);
-    SELECT count(*) FROM t_false WHERE NOT v;
+    SELECT 'false'::boolean, 'f'::boolean, 'no'::boolean,
+           'n'::boolean, 'off'::boolean, '0'::boolean;
 }
 expect {
-    6
+    f|f|f|f|f|f
 }
 
 test cast-boolean-input-ignores-case-and-space {
-    CREATE TABLE t_case (v boolean);
-    INSERT INTO t_case VALUES ('TRUE'::boolean), ('True'::boolean),
-                              ('  true  '::boolean), (' YES '::boolean);
-    SELECT count(*) FROM t_case WHERE v;
+    SELECT 'TRUE'::boolean, 'True'::boolean, '  true  '::boolean, ' YES '::boolean;
 }
 expect {
-    4
+    t|t|t|t
 }
 
 # PostgreSQL accepts any unambiguous prefix of the spelled-out words.
 test cast-boolean-accepts-unambiguous-prefixes {
-    CREATE TABLE t_pre (v boolean);
-    INSERT INTO t_pre VALUES ('tr'::boolean), ('tru'::boolean), ('ye'::boolean);
-    INSERT INTO t_pre VALUES ('fa'::boolean), ('fals'::boolean), ('of'::boolean);
-    SELECT (SELECT count(*) FROM t_pre WHERE v), (SELECT count(*) FROM t_pre WHERE NOT v);
+    SELECT 'tr'::boolean, 'tru'::boolean, 'ye'::boolean,
+           'fa'::boolean, 'fals'::boolean, 'of'::boolean;
 }
 expect {
-    3|3
+    t|t|t|f|f|f
 }
 
 test cast-boolean-rejects-a-word-it-does-not-know {
@@ -120,4 +110,25 @@ test declared-boolean-column-rejects-a-word-it-does-not-know {
 }
 expect error {
     ^invalid input syntax for type boolean: "bogus"$
+}
+
+# These shapes used to take the whole server down: a cast to a type whose
+# input function is a bare call left the comparison hoisted out of the loop,
+# reading a cursor that was never opened.
+test boolean-cast-compared-against-a-column {
+    CREATE TABLE cmp (b boolean);
+    INSERT INTO cmp VALUES (true), (false);
+    SELECT count(*) FROM cmp WHERE b = 'true'::boolean;
+}
+expect {
+    1
+}
+
+test boolean-cast-in-a-group-by {
+    CREATE TABLE grp (b boolean);
+    INSERT INTO grp VALUES (true), (true);
+    SELECT count(*) FROM grp GROUP BY 't'::boolean;
+}
+expect {
+    2
 }

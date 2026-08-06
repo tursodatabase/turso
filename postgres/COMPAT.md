@@ -56,7 +56,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of the first table only; CASCADE / RESTART IDENTITY dropped |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation-level and READ ONLY/WRITE options accepted but ignored |
-| Casts (`expr::type`, CAST) | 🟡 Partial | Also `int4(x)`-style cast functions. Casts to `date`/`time`/`timestamp`/`timestamptz` validate their input and report their type, so DateStyle applies to them. `boolean` validates but reports as an integer; `uuid`, `jsonb`, `json`, `numeric` and the integer widths cast by storage affinity without validating |
+| Casts (`expr::type`, CAST) | 🟡 Partial | Also `int4(x)`-style cast functions. Casts to `boolean`, `json`, `date`, `time`, `timestamp` and `timestamptz` validate their input and report their type, so booleans render `t`/`f` and DateStyle applies to date casts. `uuid`, `jsonb`, `numeric` and the integer widths cast by storage affinity without validating |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
 | Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; `~*`/`!~*` are case-insensitive |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
@@ -121,7 +121,7 @@ INTEGER. Unknown type names pass through as custom types.
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
 | Array support | ✅ Supported | `type[]` columns, ARRAY[...] literals, subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays |
-| Boolean data type | 🟡 Partial | Columns accept PostgreSQL's full input syntax (`true`/`false`, `t`/`f`, `yes`/`no`, `y`/`n`, `on`/`off`, `1`/`0`, unique prefixes, case- and whitespace-insensitive) and render as `t`/`f`; casts read the same syntax. A boolean *expression* still reports as an integer on the wire, so `SELECT true` shows `1` rather than `t` |
+| Boolean data type | 🟡 Partial | Columns and casts accept PostgreSQL's full input syntax (`true`/`false`, `t`/`f`, `yes`/`no`, `y`/`n`, `on`/`off`, `1`/`0`, unique prefixes, case- and whitespace-insensitive) and render as `t`/`f`. A boolean expression that is not a cast still reports as an integer, so `SELECT true` shows `1` rather than `t` |
 | ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS] |
 | GUID/UUID data type | ✅ Supported | uuid columns, gen_random_uuid(), input validation, text casts |
 | macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |

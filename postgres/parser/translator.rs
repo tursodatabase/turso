@@ -2255,29 +2255,6 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
                 let expr = Box::new(self.translate_expr(arg)?);
-                // boolean is stored as an integer, and a plain cast reaches
-                // that storage directly — reading `'true'` as a number and
-                // giving false. Casting to the boolean type would read it
-                // properly but cannot be emitted safely yet (see above), so
-                // call the same input function the write path uses.
-                let casts_to_boolean = type_cast
-                    .type_name
-                    .as_ref()
-                    .and_then(pg_type_name_text)
-                    .is_some_and(|t| t == "BOOLEAN" || t == "BOOL");
-                if casts_to_boolean {
-                    return Ok(ast::Expr::FunctionCall {
-                        name: ast::Name::from_string("boolean_to_int"),
-                        distinctness: None,
-                        args: vec![expr],
-                        order_by: vec![],
-                        within_group: vec![],
-                        filter_over: ast::FunctionTail {
-                            filter_clause: None,
-                            over_clause: None,
-                        },
-                    });
-                }
                 let type_name = type_cast
                     .type_name
                     .as_ref()
@@ -4517,19 +4494,15 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
-        // The rest still flatten:
-        //   - boolean and json would be right, but their encode function is a
-        //     bare function call, and emitting one for a cast inside a WHERE
-        //     or GROUP BY trips an engine bug that leaves a loop reading an
-        //     unopened cursor. `::boolean` is handled below instead.
-        //   - uuid and jsonb are stored as blobs, so casting to them changes
-        //     the value's representation: `DEFAULT '{}'::jsonb` would put a
-        //     blob in a text column.
-        //   - numeric and the integer widths carry precision rules of their
-        //     own, and varchar needs its length.
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "JSON" | "JSONB"
-        | "INTERVAL" | "INET" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR"
-        | "TSQUERY" => "TEXT",
+        "BOOLEAN" | "BOOL" => "boolean",
+        "JSON" => "json",
+        // The rest still flatten: uuid and jsonb are stored as blobs, so
+        // casting to them changes the value's representation — a
+        // `DEFAULT '{}'::jsonb` would put a blob in a text column. numeric and
+        // the integer widths carry precision rules of their own, and varchar
+        // needs its length.
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "JSONB" | "INTERVAL"
+        | "INET" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => return None,
     };

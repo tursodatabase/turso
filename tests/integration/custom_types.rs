@@ -425,4 +425,53 @@ mod tests {
             "LEFT JOIN on custom type column should find matches and produce NULLs for non-matches"
         );
     }
+
+    /// A cast to a custom type inside a WHERE or GROUP BY used to take the
+    /// whole process down with "cursor id 0 is None".
+    ///
+    /// `translate_expr` opens a constant span for an expression it can
+    /// evaluate once, and closes it on the way out. The custom-type branches
+    /// of a cast returned early without closing it, so the span stayed open
+    /// and swallowed whatever the caller emitted next — here the comparison
+    /// itself, which ended up in the prologue jumping to a loop whose cursor
+    /// was not open yet. Types whose encode is wrapped in a CASE happened to
+    /// escape it, which is why `date` worked and `boolean` did not.
+    #[test]
+    fn cast_to_a_custom_type_in_a_where_clause_runs() {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t (b boolean, j json, d date)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '{}', '2024-01-15')")
+            .unwrap();
+
+        // A bare function call as the type's encode is the shape that broke.
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM t WHERE b = CAST('true' AS boolean)");
+        assert_eq!(rows, vec![(1,)]);
+
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM t WHERE j = CAST('{}' AS json)");
+        assert_eq!(rows, vec![(1,)]);
+
+        // A CASE-wrapped encode, which used to be the only working shape.
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM t WHERE d = CAST('2024-01-15' AS date)");
+        assert_eq!(rows, vec![(1,)]);
+
+        // GROUP BY reaches the same emission path.
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM t GROUP BY CAST('t' AS boolean)");
+        assert_eq!(rows, vec![(1,)]);
+
+        // The cast still gives the right answer, not just a surviving process:
+        // 'false' must match nothing.
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM t WHERE b = CAST('false' AS boolean)");
+        assert_eq!(rows, vec![(0,)]);
+
+        conn.close().unwrap();
+    }
 }
