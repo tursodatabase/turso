@@ -6856,6 +6856,25 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_missing_statement_error() {
+        let translator = PostgreSQLTranslator::new();
+        for query in [
+            None,
+            Some(Box::new(pg_query::protobuf::Node { node: None })),
+        ] {
+            let explain = pg_query::protobuf::ExplainStmt {
+                query,
+                options: vec![],
+            };
+            let err = translator.translate_explain(&explain).unwrap_err();
+            assert!(
+                err.to_string().contains("EXPLAIN missing statement"),
+                "expected missing statement error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_array_overlaps_operator() {
         let translator = PostgreSQLTranslator::new();
         let sql = "SELECT id FROM posts WHERE tags && '{\"ORM\"}'";
