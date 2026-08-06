@@ -146,6 +146,7 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_vacuum: bool,
+    enable_autovacuum: bool,
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
@@ -166,6 +167,7 @@ impl Builder {
             enable_index_method: false,
             enable_materialized_views: false,
             enable_vacuum: false,
+            enable_autovacuum: false,
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
@@ -226,6 +228,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_autovacuum(mut self, enabled: bool) -> Self {
+        self.enable_autovacuum = enabled;
+        self
+    }
+
     pub fn experimental_multiprocess_wal(mut self, enabled: bool) -> Self {
         self.enable_multiprocess_wal = enabled;
         self
@@ -271,6 +278,9 @@ impl Builder {
         }
         if self.enable_vacuum {
             features.push("vacuum");
+        }
+        if self.enable_autovacuum {
+            features.push("autovacuum");
         }
         if self.enable_generated_columns {
             features.push("generated_columns");
@@ -863,6 +873,61 @@ mod tests {
             wal_size as f64 / 1024.0
         );
         assert!(wal_size > 0, "WAL file should exist and be non-empty");
+
+        Ok(())
+    }
+    /// Proves `Builder::experimental_autovacuum` reaches
+    /// `turso_core::DatabaseOpts::with_autovacuum`: a database with
+    /// autovacuum persisted in its header is forced read-only when opened
+    /// without the flag, and writable when opened with it. Mirrors the
+    /// engine-level `test_autovacuum_readonly_behavior` in
+    /// `tests/integration/storage/autovacuum.rs`, using `rusqlite` the same
+    /// way that test does to write the on-disk auto_vacuum header field
+    /// directly, independent of the engine's own `PRAGMA auto_vacuum`
+    /// support.
+    #[tokio::test]
+    async fn test_experimental_autovacuum_gates_readonly() -> Result<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "auto_vacuum", "FULL").unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+                .unwrap();
+            conn.execute("INSERT INTO t (v) VALUES ('seed')", [])
+                .unwrap();
+        }
+
+        // Open WITHOUT the flag: the engine must force read-only mode, so a
+        // write fails.
+        {
+            let db = Builder::new_local(db_path_str).build().await?;
+            let conn = db.connect()?;
+            let result = conn
+                .execute("INSERT INTO t (v) VALUES ('should_fail');", ())
+                .await;
+            assert!(
+                matches!(result, Err(Error::Readonly(_))),
+                "expected a Readonly error on a forced-readonly autovacuum database, got: {result:?}"
+            );
+        }
+
+        // Open WITH the flag: the database must be writable.
+        {
+            let db = Builder::new_local(db_path_str)
+                .experimental_autovacuum(true)
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            conn.execute("INSERT INTO t (v) VALUES ('should_succeed');", ())
+                .await?;
+
+            let mut rows = conn.query("SELECT count(*) FROM t;", ()).await?;
+            let row = rows.next().await?.unwrap();
+            assert_eq!(row.get_value(0)?, Value::Integer(2));
+        }
 
         Ok(())
     }
