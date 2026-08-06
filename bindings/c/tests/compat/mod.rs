@@ -213,6 +213,8 @@ mod tests {
         unsafe {
             let version = sqlite3_libversion();
             assert!(!version.is_null());
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(std::ffi::CStr::from_ptr(version), c"3.50.4");
         }
     }
 
@@ -220,7 +222,10 @@ mod tests {
     fn test_libversion_number() {
         unsafe {
             let version_num = sqlite3_libversion_number();
-            assert!(version_num >= 3042000);
+            #[cfg(feature = "sqlite3")]
+            assert!(version_num > 0);
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(version_num, 3050004);
         }
     }
 

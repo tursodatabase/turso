@@ -17272,7 +17272,7 @@ fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
 
 // Compat for applications that test for SQLite.
 fn execute_sqlite_version() -> String {
-    "3.50.4".to_string()
+    crate::dialect::sqlite::SQLITE_VERSION.to_string()
 }
 
 fn execute_turso_version(version_integer: i64) -> String {
@@ -18760,6 +18760,14 @@ mod tests {
 
     #[test]
     fn test_execute_sqlite_version() {
+        assert_eq!(
+            execute_sqlite_version(),
+            crate::dialect::sqlite::SQLITE_VERSION
+        );
+    }
+
+    #[test]
+    fn test_execute_turso_version() {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
