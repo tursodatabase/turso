@@ -1542,6 +1542,7 @@ fn error_info(conn: &PgConnection, e: &LimboError, sql: &str) -> ErrorInfo {
     let info = conn.pg_error(e, sql);
     let mut error = ErrorInfo::new("ERROR".to_owned(), info.code.to_owned(), info.message);
     error.position = info.position.map(|p| p.to_string());
+    error.hint = info.hint;
     error
 }
 

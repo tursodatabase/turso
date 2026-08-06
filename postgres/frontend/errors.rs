@@ -20,6 +20,10 @@ pub struct PgErrorInfo {
     pub code: &'static str,
     pub message: String,
     pub position: Option<usize>,
+    /// PostgreSQL's `HINT` field: what to try instead. Separate from the
+    /// message because clients render it separately and the golden files
+    /// compare it as its own line.
+    pub hint: Option<String>,
 }
 
 impl PgErrorInfo {
@@ -34,6 +38,7 @@ impl PgErrorInfo {
             code,
             message: message.into(),
             position: None,
+            hint: None,
         }
     }
 }
@@ -92,6 +97,7 @@ fn parse_error(msg: &str, sql: &str) -> PgErrorInfo {
                 code: "42601",
                 message: format!("syntax error at or near \"{token}\""),
                 position: unique_position(sql, token),
+                hint: None,
             };
         }
     }
@@ -101,10 +107,24 @@ fn parse_error(msg: &str, sql: &str) -> PgErrorInfo {
             message: "syntax error at end of input".to_string(),
             // PostgreSQL points one past the last character.
             position: Some(sql.chars().count() + 1),
+            hint: None,
         };
     }
     if let Some(idx) = msg.find("unrecognized configuration parameter") {
         return PgErrorInfo::new("42704", msg[idx..].to_string());
+    }
+    if let Some(name) = msg
+        .strip_prefix("invalid reference to FROM-clause entry for table \"")
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return PgErrorInfo {
+            code: "42P01",
+            message: msg.to_string(),
+            // The caret sits on the qualified reference, not on the FROM
+            // entry, so look for the name used as a qualifier.
+            position: qualifier_position(sql, name),
+            hint: aliased_relation_hint(sql, name),
+        };
     }
     if let Some(idx) = msg.find("invalid value for parameter") {
         return PgErrorInfo::new("22023", msg[idx..].to_string());
@@ -138,6 +158,25 @@ fn parse_error(msg: &str, sql: &str) -> PgErrorInfo {
         return PgErrorInfo::new("0A000", format!("Parse error: {msg}"));
     }
     PgErrorInfo::new("42601", format!("Parse error: {msg}"))
+}
+
+/// 1-based position of `name` where it is used as a table qualifier
+/// (`name.column`), which is where PostgreSQL points for a reference to an
+/// aliased relation.
+fn qualifier_position(sql: &str, name: &str) -> Option<usize> {
+    let lowered = sql.to_ascii_lowercase();
+    let needle = format!("{}.", name.to_ascii_lowercase());
+    let at = lowered.find(&needle)?;
+    Some(1 + sql[..at].chars().count())
+}
+
+/// PostgreSQL's hint for a reference to an aliased relation, which names the
+/// alias to use instead.
+fn aliased_relation_hint(sql: &str, name: &str) -> Option<String> {
+    let alias = turso_pg_parser::target_relation_alias(sql, name)?;
+    Some(format!(
+        "Perhaps you meant to reference the table alias \"{alias}\"."
+    ))
 }
 
 /// The table and columns a UNIQUE or PRIMARY KEY violation collided on.

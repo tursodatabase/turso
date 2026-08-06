@@ -122,7 +122,7 @@ STATUS = {
     "portals": "fail",
     "arrays": "fail",
     "update": "fail",
-    "delete": "fail",
+    "delete": "pass",
     "namespace": "fail",
 
     "matview": "fail",

@@ -297,3 +297,46 @@ fn syntax_errors_carry_postgres_wording_and_positions() {
         Some("syntax error at or near \"SELECT\""),
     );
 }
+
+/// PostgreSQL refuses a qualified reference to a relation the statement gave
+/// an alias: the alias replaces the name, so the name reaches nothing. The
+/// engine reported the relation as missing, which reads as though the table
+/// were gone. The reply also carries the position of the offending reference
+/// and a hint naming the alias, both of which the golden files compare.
+#[test]
+fn referring_to_an_aliased_relation_by_name_is_refused() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    exec(&mut conn, "CREATE TABLE alias_tbl (a int)");
+    exec(&mut conn, "INSERT INTO alias_tbl VALUES (30)");
+
+    let sql = "DELETE FROM alias_tbl dt WHERE alias_tbl.a > 25";
+    let fields = expect_error(&mut conn, sql);
+    assert_eq!(
+        fields.get(&b'M').map(String::as_str),
+        Some("invalid reference to FROM-clause entry for table \"alias_tbl\"")
+    );
+    assert_eq!(fields.get(&b'C').map(String::as_str), Some("42P01"));
+    assert_eq!(
+        fields.get(&b'H').map(String::as_str),
+        Some("Perhaps you meant to reference the table alias \"dt\".")
+    );
+    // The caret points at the qualified reference, not at the FROM entry.
+    let at: usize = sql.find("alias_tbl.a").unwrap() + 1;
+    assert_eq!(
+        fields.get(&b'P').map(String::as_str),
+        Some(at.to_string().as_str()),
+        "position should be the qualified reference"
+    );
+
+    // The row is untouched, and using the alias works.
+    assert_eq!(query_int(&mut conn, "SELECT count(*) FROM alias_tbl"), 1);
+    exec(&mut conn, "DELETE FROM alias_tbl dt WHERE dt.a > 25");
+    assert_eq!(query_int(&mut conn, "SELECT count(*) FROM alias_tbl"), 0);
+
+    // Without an alias the table's own name is still fine.
+    exec(&mut conn, "INSERT INTO alias_tbl VALUES (30)");
+    exec(&mut conn, "DELETE FROM alias_tbl WHERE alias_tbl.a > 25");
+    assert_eq!(query_int(&mut conn, "SELECT count(*) FROM alias_tbl"), 0);
+}

@@ -1461,6 +1461,8 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("DELETE missing target table".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation);
 
+        reject_reference_to_aliased_relation(Some(relation), &[delete.where_clause.as_deref()])?;
+
         // Translate WHERE clause
         let where_clause = if let Some(where_node) = &delete.where_clause {
             Some(Box::new(self.translate_expr(where_node)?))
@@ -4175,6 +4177,87 @@ impl PostgreSQLTranslator {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
+/// Rejects a qualified reference to a table that the statement gave an alias,
+/// the way PostgreSQL does.
+///
+/// `DELETE FROM t alias WHERE t.c > 1` is an error in PostgreSQL: naming the
+/// alias replaces the table's own name, so `t.c` refers to nothing. The engine
+/// would report the relation as missing, which is confusing — the relation
+/// exists, it just cannot be reached by that name here.
+///
+/// Only the statement's own target relation is checked, which is where the
+/// mistake is made; a name from an outer query is a different question.
+fn reject_reference_to_aliased_relation(
+    relation: Option<&pg_query::protobuf::RangeVar>,
+    exprs: &[Option<&pg_query::protobuf::Node>],
+) -> Result<(), ParseError> {
+    let Some(relation) = relation else {
+        return Ok(());
+    };
+    // Only aliasing hides the name.
+    if relation.alias.is_none() {
+        return Ok(());
+    }
+    let hidden = relation.relname.to_ascii_lowercase();
+    for expr in exprs.iter().flatten() {
+        if let Some(name) = first_qualifier_matching(expr, &hidden) {
+            return Err(ParseError::ParseError(format!(
+                "invalid reference to FROM-clause entry for table \"{name}\""
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The qualifier of the first qualified column reference in `node` whose table
+/// part is `hidden`, as written.
+fn first_qualifier_matching(node: &pg_query::protobuf::Node, hidden: &str) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+
+    if let Some(Node::ColumnRef(col_ref)) = &node.node {
+        if col_ref.fields.len() >= 2 {
+            if let Some(Node::String(s)) = &col_ref.fields[0].node {
+                if s.sval.to_ascii_lowercase() == hidden {
+                    return Some(s.sval.clone());
+                }
+            }
+        }
+    }
+    // Walk the rest of the tree. The protobuf nodes have no generic child
+    // iterator, so recurse through the shapes an expression can take.
+    let children: Vec<&pg_query::protobuf::Node> = match &node.node {
+        Some(Node::AExpr(e)) => [e.lexpr.as_deref(), e.rexpr.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        Some(Node::BoolExpr(e)) => e.args.iter().collect(),
+        Some(Node::NullTest(e)) => e.arg.as_deref().into_iter().collect(),
+        Some(Node::BooleanTest(e)) => e.arg.as_deref().into_iter().collect(),
+        Some(Node::TypeCast(e)) => e.arg.as_deref().into_iter().collect(),
+        Some(Node::CollateClause(e)) => e.arg.as_deref().into_iter().collect(),
+        Some(Node::FuncCall(e)) => e.args.iter().collect(),
+        Some(Node::CaseExpr(e)) => e
+            .args
+            .iter()
+            .chain(e.arg.as_deref())
+            .chain(e.defresult.as_deref())
+            .collect(),
+        Some(Node::CaseWhen(e)) => [e.expr.as_deref(), e.result.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        Some(Node::CoalesceExpr(e)) => e.args.iter().collect(),
+        Some(Node::MinMaxExpr(e)) => e.args.iter().collect(),
+        Some(Node::AArrayExpr(e)) => e.elements.iter().collect(),
+        Some(Node::RowExpr(e)) => e.args.iter().collect(),
+        Some(Node::List(e)) => e.items.iter().collect(),
+        _ => Vec::new(),
+    };
+    children
+        .into_iter()
+        .find_map(|child| first_qualifier_matching(child, hidden))
+}
+
 /// Whether PostgreSQL gives this expression the boolean type.
 ///
 /// It matters because a boolean prints as `t`/`f` rather than 1/0, and the

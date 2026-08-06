@@ -9,6 +9,35 @@ pub enum ParseError {
     ParseError(String),
 }
 
+/// The alias a statement gave its target relation, when that relation is
+/// named `name`. Used to build PostgreSQL's hint for a qualified reference to
+/// a relation the statement renamed; the alias is not in the error message, so
+/// it is read back from the statement.
+pub fn target_relation_alias(sql: &str, name: &str) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+
+    let parsed = parse(sql).ok()?;
+    let wanted = name.to_ascii_lowercase();
+    let relation = match parsed
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_ref()?
+        .node
+        .as_ref()?
+    {
+        Node::DeleteStmt(s) => s.relation.as_ref(),
+        Node::UpdateStmt(s) => s.relation.as_ref(),
+        Node::InsertStmt(s) => s.relation.as_ref(),
+        _ => None,
+    }?;
+    if relation.relname.to_ascii_lowercase() != wanted {
+        return None;
+    }
+    Some(relation.alias.as_ref()?.aliasname.clone())
+}
+
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
