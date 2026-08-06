@@ -569,15 +569,24 @@ pub fn optimize_plan(
 }
 
 fn optimize_recursive_cte_query(query: &mut Plan, resolver: &Resolver) -> Result<()> {
+    let mut cache = SubqueryPlanCache::default();
+    optimize_recursive_cte_query_with_cache(query, resolver, &mut cache)
+}
+
+fn optimize_recursive_cte_query_with_cache(
+    query: &mut Plan,
+    resolver: &Resolver,
+    cache: &mut SubqueryPlanCache,
+) -> Result<()> {
     match query {
-        Plan::Select(select) => optimize_select_plan(select, resolver),
+        Plan::Select(select) => optimize_select_plan_with_cache(select, resolver, cache),
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
             for (select, _) in left {
-                optimize_select_plan(select, resolver)?;
+                optimize_select_plan_with_cache(select, resolver, cache)?;
             }
-            optimize_select_plan(right_most, resolver)
+            optimize_select_plan_with_cache(right_most, resolver, cache)
         }
         Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Err(
             LimboError::InternalError("recursive CTE query is not a SELECT".to_string()),
@@ -757,6 +766,14 @@ struct TableAccessPlan {
     sort_eliminated: bool,
 }
 
+#[derive(Default)]
+struct SubqueryPlanCache {
+    // The original and changed forms copy the same child subqueries. Keep a
+    // finished child plan so the next copy does not plan that child again.
+    from_clause: HashMap<TableInternalId, Plan>,
+    correlated: HashMap<(TableInternalId, u64), Plan>,
+}
+
 /**
  * Make a few passes over the plan to optimize it.
  * TODO: these could probably be done in less passes,
@@ -764,12 +781,22 @@ struct TableAccessPlan {
  */
 #[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    let mut cache = SubqueryPlanCache::default();
+    optimize_select_plan_with_cache(plan, resolver, &mut cache)
+}
+
+#[turso_macros::trace_stack]
+fn optimize_select_plan_with_cache(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    cache: &mut SubqueryPlanCache,
+) -> Result<()> {
     if !plan
         .non_from_clause_subqueries
         .iter()
         .any(|subquery| subquery.correlated)
     {
-        return optimize_select_plan_form(plan, resolver);
+        return optimize_select_plan_form(plan, resolver, cache);
     }
 
     // TODO: Let join search run a correlated subquery as soon as all columns
@@ -777,7 +804,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     // join tables in one search. Until then, both forms need their own search.
     let mut rewritten = plan.clone();
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
-        return optimize_select_plan_form(plan, resolver);
+        return optimize_select_plan_form(plan, resolver, cache);
     }
 
     let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
@@ -794,14 +821,14 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
             .iter()
             .any(|subquery| subquery.correlated);
     if full_join_rewrite_is_complete {
-        let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver)?;
+        let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver, cache, false)?;
         *plan = rewritten;
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
         return Ok(());
     }
 
-    let original_table_plan = find_select_plan_form(plan, resolver)?;
-    let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver)?;
+    let original_table_plan = find_select_plan_form(plan, resolver, cache, true)?;
+    let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver, cache, false)?;
     let use_rewritten = matches!(
         (plan.estimated_cost, rewritten.estimated_cost),
         (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
@@ -818,8 +845,12 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
 }
 
 /// Choose table reads for one version of a query.
-fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
-    let table_plan = find_select_plan_form(plan, resolver)?;
+fn optimize_select_plan_form(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    cache: &mut SubqueryPlanCache,
+) -> Result<()> {
+    let table_plan = find_select_plan_form(plan, resolver, cache, false)?;
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
@@ -827,6 +858,8 @@ fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
 fn find_select_plan_form(
     plan: &mut SelectPlan,
     resolver: &Resolver,
+    cache: &mut SubqueryPlanCache,
+    save_subquery_plans: bool,
 ) -> Result<Option<TableAccessPlan>> {
     let schema = resolver.schema();
     #[cfg(feature = "optimizer_params")]
@@ -860,7 +893,7 @@ fn find_select_plan_form(
             }
         }
     }
-    optimize_subqueries(plan, resolver)?;
+    optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
@@ -870,7 +903,7 @@ fn find_select_plan_form(
         plan.contains_constant_false_condition = true;
         plan.estimated_output_rows = Some(0.0);
         plan.estimated_cost = Some(0.0);
-        plan_correlated_subqueries(plan, resolver, &[])?;
+        plan_correlated_subqueries(plan, resolver, &[], cache, save_subquery_plans)?;
         return Ok(None);
     }
 
@@ -942,7 +975,13 @@ fn find_select_plan_form(
         plan.estimated_output_rows = Some(rows);
     }
 
-    plan_correlated_subqueries(plan, resolver, &subquery_calls)?;
+    plan_correlated_subqueries(
+        plan,
+        resolver,
+        &subquery_calls,
+        cache,
+        save_subquery_plans,
+    )?;
 
     let table_cost = table_cost.or_else(|| {
         plan.table_references
@@ -1482,24 +1521,43 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
         .collect()
 }
 
-fn optimize_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+fn optimize_subqueries(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    cache: &mut SubqueryPlanCache,
+    save_plans: bool,
+) -> Result<()> {
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+            if let Some(cached) = cache.from_clause.remove(&table.internal_id) {
+                from_clause_subquery.plan = Box::new(cached);
+                continue;
+            }
             // Use match to handle both SelectPlan and CompoundSelect variants
             match from_clause_subquery.plan.as_mut() {
-                Plan::Select(select_plan) => optimize_select_plan(select_plan, resolver)?,
+                Plan::Select(select_plan) => {
+                    optimize_select_plan_with_cache(select_plan, resolver, cache)?
+                }
                 Plan::CompoundSelect {
                     left, right_most, ..
                 } => {
-                    optimize_select_plan(right_most, resolver)?;
+                    optimize_select_plan_with_cache(right_most, resolver, cache)?;
                     for (select_plan, _) in left {
-                        optimize_select_plan(select_plan, resolver)?;
+                        optimize_select_plan_with_cache(select_plan, resolver, cache)?;
                     }
                 }
                 Plan::RecursiveCte(recursive_cte) => {
-                    optimize_recursive_cte_query(&mut recursive_cte.initial_query, resolver)?;
-                    optimize_recursive_cte_query(&mut recursive_cte.recursive_query, resolver)?;
+                    optimize_recursive_cte_query_with_cache(
+                        &mut recursive_cte.initial_query,
+                        resolver,
+                        cache,
+                    )?;
+                    optimize_recursive_cte_query_with_cache(
+                        &mut recursive_cte.recursive_query,
+                        resolver,
+                        cache,
+                    )?;
                 }
                 Plan::Delete(_) | Plan::Update(_) => {
                     turso_soft_unreachable!(
@@ -1510,6 +1568,12 @@ fn optimize_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()>
                             .to_string(),
                     ));
                 }
+            }
+            if save_plans {
+                cache.from_clause.insert(
+                    table.internal_id,
+                    from_clause_subquery.plan.as_ref().clone(),
+                );
             }
         }
     }
@@ -1522,6 +1586,8 @@ fn plan_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     subquery_calls: &[(TableInternalId, f64)],
+    cache: &mut SubqueryPlanCache,
+    save_plans: bool,
 ) -> Result<()> {
     for subquery in &mut plan.non_from_clause_subqueries {
         // Write statements plan their subqueries while the statement is built.
@@ -1541,15 +1607,28 @@ fn plan_correlated_subqueries(
         else {
             continue;
         };
-        optimize_plan_for_calls(inner_plan, resolver, call_count)?;
+        let key = (subquery.internal_id, call_count.to_bits());
+        if let Some(cached) = cache.correlated.remove(&key) {
+            **inner_plan = cached;
+            continue;
+        }
+        optimize_plan_for_calls(inner_plan, resolver, call_count, cache)?;
+        if save_plans {
+            cache.correlated.insert(key, inner_plan.as_ref().clone());
+        }
     }
 
     Ok(())
 }
 
 /// Set how many times a plan will run, then plan its table reads again.
-fn optimize_plan_for_calls(plan: &mut Plan, resolver: &Resolver, call_count: f64) -> Result<()> {
-    let optimize = |plan: &mut SelectPlan| -> Result<()> {
+fn optimize_plan_for_calls(
+    plan: &mut Plan,
+    resolver: &Resolver,
+    call_count: f64,
+    cache: &mut SubqueryPlanCache,
+) -> Result<()> {
+    let mut optimize = |plan: &mut SelectPlan| -> Result<()> {
         if plan
             .input_cardinality_hint
             .is_some_and(|hint| hint >= call_count)
@@ -1557,7 +1636,7 @@ fn optimize_plan_for_calls(plan: &mut Plan, resolver: &Resolver, call_count: f64
             return Ok(());
         }
         plan.input_cardinality_hint = Some(call_count);
-        optimize_select_plan(plan, resolver)
+        optimize_select_plan_with_cache(plan, resolver, cache)
     };
 
     match plan {

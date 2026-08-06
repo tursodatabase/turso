@@ -117,7 +117,7 @@ pub fn rewrite_correlated_subqueries(
 }
 
 /// Return the SELECT plan for a subquery that has not run yet.
-fn select_subquery_plan(plan: &SelectPlan, subquery_index: usize) -> Option<Box<SelectPlan>> {
+fn select_subquery_plan(plan: &SelectPlan, subquery_index: usize) -> Option<&SelectPlan> {
     let subquery = &plan.non_from_clause_subqueries[subquery_index];
     let SubqueryState::Unevaluated { plan: inner } = &subquery.state else {
         return None;
@@ -125,7 +125,19 @@ fn select_subquery_plan(plan: &SelectPlan, subquery_index: usize) -> Option<Box<
     let Plan::Select(inner) = inner.as_ref()?.as_ref() else {
         return None;
     };
-    Some(inner.clone())
+    Some(inner)
+}
+
+/// Take a SELECT plan after all rewrite checks have passed.
+fn take_select_subquery_plan(plan: &mut SelectPlan, subquery_index: usize) -> Box<SelectPlan> {
+    let subquery = &mut plan.non_from_clause_subqueries[subquery_index];
+    let SubqueryState::Unevaluated { plan: inner } = &mut subquery.state else {
+        unreachable!("a checked subquery must not have run")
+    };
+    let Plan::Select(inner) = *inner.take().expect("a checked subquery must have a plan") else {
+        unreachable!("a checked subquery must be a SELECT")
+    };
+    inner
 }
 
 /// Try to change one `EXISTS` or `NOT EXISTS` into a join.
@@ -134,14 +146,17 @@ fn try_rewrite_exists(
     subquery_index: usize,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
-        return Ok(false);
-    };
     let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
 
     let Some(term) = find_exists_in_where(&plan.where_clause, subquery_id) else {
         return Ok(false);
     };
+    if plan.table_references.joined_tables().is_empty() {
+        return Ok(false);
+    }
+    if select_subquery_plan(plan, subquery_index).is_none() {
+        return Ok(false);
+    }
 
     let join_type = if term.negated {
         JoinType::Anti
@@ -149,14 +164,7 @@ fn try_rewrite_exists(
         JoinType::Semi
     };
 
-    rewrite_as_semi_or_anti_join(
-        plan,
-        subquery_index,
-        inner_plan,
-        term.index,
-        join_type,
-        resolver,
-    )
+    rewrite_as_semi_or_anti_join(plan, subquery_index, term.index, join_type, None, resolver)
 }
 
 /// Turn a direct `IN` test that is not `NOT IN` into a semi-join.
@@ -186,18 +194,17 @@ fn try_rewrite_in(
         return Ok(false);
     }
 
-    let mut inner_plan = inner_plan;
-    inner_plan.where_clause.push(WhereTerm {
+    let extra_term = WhereTerm {
         expr: Expr::Binary(Box::new(left), ast::Operator::Equals, Box::new(right)),
         from_outer_join: None,
         consumed: false,
-    });
+    };
     rewrite_as_semi_or_anti_join(
         plan,
         subquery_index,
-        inner_plan,
         where_term_index,
         JoinType::Semi,
+        Some(extra_term),
         resolver,
     )
 }
@@ -206,9 +213,9 @@ fn try_rewrite_in(
 fn rewrite_as_semi_or_anti_join(
     plan: &mut SelectPlan,
     subquery_index: usize,
-    inner_plan: Box<SelectPlan>,
     where_term_index: usize,
     join_type: JoinType,
+    extra_term: Option<WhereTerm>,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
     // A semi join needs a left table. Keep the subquery when the outer SELECT
@@ -217,7 +224,10 @@ fn rewrite_as_semi_or_anti_join(
         return Ok(false);
     }
 
-    if !can_rewrite_as_semi_join(&inner_plan, resolver)? {
+    let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
+        return Ok(false);
+    };
+    if !can_rewrite_as_semi_join(inner_plan, resolver)? {
         return Ok(false);
     }
 
@@ -234,7 +244,7 @@ fn rewrite_as_semi_or_anti_join(
         .map(|table| table.internal_id)
         .collect();
 
-    for term in &inner_plan.where_clause {
+    for term in inner_plan.where_clause.iter().chain(extra_term.iter()) {
         if !can_move_join_term(&term.expr, &outer_table_ids, &inner_table_ids) {
             return Ok(false);
         }
@@ -243,7 +253,7 @@ fn rewrite_as_semi_or_anti_join(
     // Every NOT EXISTS term must use an inner table. Moving a constant false
     // term into the outer query would reject a row that NOT EXISTS keeps.
     if join_type == JoinType::Anti {
-        for term in &inner_plan.where_clause {
+        for term in inner_plan.where_clause.iter().chain(extra_term.iter()) {
             let tables = collect_table_refs(&term.expr);
             if !tables.iter().any(|table| inner_table_ids.contains(table)) {
                 return Ok(false);
@@ -263,7 +273,7 @@ fn rewrite_as_semi_or_anti_join(
         }
     }
     if !outer_table_ids_that_may_be_null.is_empty() {
-        for term in &inner_plan.where_clause {
+        for term in inner_plan.where_clause.iter().chain(extra_term.iter()) {
             let tables = collect_table_refs(&term.expr);
             if tables
                 .iter()
@@ -274,7 +284,10 @@ fn rewrite_as_semi_or_anti_join(
         }
     }
 
-    let mut inner_plan = inner_plan;
+    let mut inner_plan = take_select_subquery_plan(plan, subquery_index);
+    if let Some(extra_term) = extra_term {
+        inner_plan.where_clause.push(extra_term);
+    }
     let inner_tables = std::mem::take(inner_plan.table_references.joined_tables_mut());
     for (index, mut table) in inner_tables.into_iter().enumerate() {
         if index == 0 {
@@ -364,10 +377,10 @@ fn try_rewrite_single_value_aggregate(
         return Ok(false);
     };
 
-    if !can_rewrite_single_value_aggregate(&inner_plan, resolver)? {
+    if !can_rewrite_single_value_aggregate(inner_plan, resolver)? {
         return Ok(false);
     }
-    let Some(empty_value) = result_on_empty_input(&inner_plan) else {
+    let Some(empty_value) = result_on_empty_input(inner_plan) else {
         return Ok(false);
     };
     let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
@@ -379,7 +392,6 @@ fn try_rewrite_single_value_aggregate(
     }) {
         return Ok(false);
     }
-
     let outer_tables = inner_plan.table_references.outer_query_refs();
     if outer_tables.iter().any(|outer_table| {
         outer_table.is_used()
@@ -430,11 +442,11 @@ fn try_rewrite_single_value_aggregate(
         }
         pairs.push(pair);
     }
-    if pairs.is_empty() || uses_outer_tables_outside_where(&inner_plan, &outer_table_ids) {
+    if pairs.is_empty() || uses_outer_tables_outside_where(inner_plan, &outer_table_ids) {
         return Ok(false);
     }
 
-    let mut inner_plan = *inner_plan;
+    let mut inner_plan = *take_select_subquery_plan(plan, subquery_index);
     inner_plan.where_clause = inner_where;
     inner_plan.limit = None;
     inner_plan.query_destination = QueryDestination::placeholder_for_subquery();

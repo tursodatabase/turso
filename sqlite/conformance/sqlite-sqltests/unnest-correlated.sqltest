@@ -953,6 +953,177 @@ expect pattern {
     (?s)SEARCH scalar_subquery_.*SEARCH scalar_subquery_
 }
 
+
+# Each level has one EXISTS that can be changed to a join and one EXISTS
+# that holds the next level. Preparing this query must not try every mix of
+# changed and unchanged levels.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+@backend cli
+test deep-correlated-subqueries-prepare-once {
+    CREATE TABLE deep_prepare_rows(k INTEGER);
+    CREATE TABLE deep_prepare_guards(k INTEGER);
+
+    SELECT r0.k
+        FROM deep_prepare_rows r0
+        WHERE EXISTS (
+            SELECT 1
+            FROM deep_prepare_guards g0
+            WHERE g0.k = r0.k
+        )
+          AND EXISTS (
+            SELECT r1.k
+            FROM deep_prepare_rows r1
+            WHERE r1.k = r0.k
+              AND EXISTS (
+                SELECT 1
+                FROM deep_prepare_guards g1
+                WHERE g1.k = r1.k
+            )
+              AND EXISTS (
+                SELECT r2.k
+                FROM deep_prepare_rows r2
+                WHERE r2.k = r1.k
+                  AND EXISTS (
+                    SELECT 1
+                    FROM deep_prepare_guards g2
+                    WHERE g2.k = r2.k
+                )
+                  AND EXISTS (
+                    SELECT r3.k
+                    FROM deep_prepare_rows r3
+                    WHERE r3.k = r2.k
+                      AND EXISTS (
+                        SELECT 1
+                        FROM deep_prepare_guards g3
+                        WHERE g3.k = r3.k
+                    )
+                      AND EXISTS (
+                        SELECT r4.k
+                        FROM deep_prepare_rows r4
+                        WHERE r4.k = r3.k
+                          AND EXISTS (
+                            SELECT 1
+                            FROM deep_prepare_guards g4
+                            WHERE g4.k = r4.k
+                        )
+                          AND EXISTS (
+                            SELECT r5.k
+                            FROM deep_prepare_rows r5
+                            WHERE r5.k = r4.k
+                              AND EXISTS (
+                                SELECT 1
+                                FROM deep_prepare_guards g5
+                                WHERE g5.k = r5.k
+                            )
+                              AND EXISTS (
+                                SELECT r6.k
+                                FROM deep_prepare_rows r6
+                                WHERE r6.k = r5.k
+                                  AND EXISTS (
+                                    SELECT 1
+                                    FROM deep_prepare_guards g6
+                                    WHERE g6.k = r6.k
+                                )
+                                  AND EXISTS (
+                                    SELECT r7.k
+                                    FROM deep_prepare_rows r7
+                                    WHERE r7.k = r6.k
+                                      AND EXISTS (
+                                        SELECT 1
+                                        FROM deep_prepare_guards g7
+                                        WHERE g7.k = r7.k
+                                    )
+                                      AND EXISTS (
+                                        SELECT r8.k
+                                        FROM deep_prepare_rows r8
+                                        WHERE r8.k = r7.k
+                                          AND EXISTS (
+                                            SELECT 1
+                                            FROM deep_prepare_guards g8
+                                            WHERE g8.k = r8.k
+                                        )
+                                          AND EXISTS (
+                                            SELECT r9.k
+                                            FROM deep_prepare_rows r9
+                                            WHERE r9.k = r8.k
+                                              AND EXISTS (
+                                                SELECT 1
+                                                FROM deep_prepare_guards g9
+                                                WHERE g9.k = r9.k
+                                            )
+                                              AND EXISTS (
+                                                SELECT r10.k
+                                                FROM deep_prepare_rows r10
+                                                WHERE r10.k = r9.k
+                                                  AND EXISTS (
+                                                    SELECT 1
+                                                    FROM deep_prepare_guards g10
+                                                    WHERE g10.k = r10.k
+                                                )
+                                                  AND EXISTS (
+                                                    SELECT r11.k
+                                                    FROM deep_prepare_rows r11
+                                                    WHERE r11.k = r10.k
+                                                      AND EXISTS (
+                                                        SELECT 1
+                                                        FROM deep_prepare_guards g11
+                                                        WHERE g11.k = r11.k
+                                                    )
+                                                      AND EXISTS (
+                                                        SELECT r12.k
+                                                        FROM deep_prepare_rows r12
+                                                        WHERE r12.k = r11.k
+                                                          AND EXISTS (
+                                                            SELECT 1
+                                                            FROM deep_prepare_guards g12
+                                                            WHERE g12.k = r12.k
+                                                        )
+                                                          AND EXISTS (
+                                                            SELECT r13.k
+                                                            FROM deep_prepare_rows r13
+                                                            WHERE r13.k = r12.k
+                                                              AND EXISTS (
+                                                                SELECT 1
+                                                                FROM deep_prepare_guards g13
+                                                                WHERE g13.k = r13.k
+                                                            )
+                                                              AND EXISTS (
+                                                                SELECT r14.k
+                                                                FROM deep_prepare_rows r14
+                                                                WHERE r14.k = r13.k
+                                                                  AND EXISTS (
+                                                                    SELECT 1
+                                                                    FROM deep_prepare_guards g14
+                                                                    WHERE g14.k = r14.k
+                                                                )
+                                                                  AND EXISTS (
+                                                                    SELECT r15.k
+                                                                    FROM deep_prepare_rows r15
+                                                                    WHERE r15.k = r14.k
+                                                                      AND EXISTS (
+                                                                        SELECT 1
+                                                                        FROM deep_prepare_guards g15
+                                                                        WHERE g15.k = r15.k
+                                                                    )
+                                                                )
+                                                            )
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        );
+}
+expect {
+}
+
 setup comparison_keys {
     CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
     CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
