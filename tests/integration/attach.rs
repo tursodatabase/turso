@@ -404,6 +404,40 @@ fn test_attach_inherits_index_method_flag_on_reattach(_tmp_db: TempDatabase) -> 
     Ok(())
 }
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_attached_mvcc_fts_uses_attached_store(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new().with_index_method(true));
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("attached_mvcc_fts.db");
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")?;
+    conn.execute("CREATE TABLE aux.docs(id INTEGER PRIMARY KEY, content TEXT)")?;
+    conn.execute("CREATE INDEX aux.docs_fts ON docs USING fts(content)")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO aux.docs VALUES (1, 'attached committed')")?;
+    conn.execute("COMMIT")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO aux.docs VALUES (2, 'attached rolledback')")?;
+    conn.execute("ROLLBACK")?;
+
+    let committed: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'committed')");
+    assert_eq!(committed, vec![(1,)]);
+    let rolled_back: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'rolledback')");
+    assert!(rolled_back.is_empty());
+
+    conn.execute("DETACH aux")?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    let recovered: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'attached')");
+    assert_eq!(recovered, vec![(1,)]);
+    Ok(())
+}
+
 #[test]
 fn test_attach_create_stores_canonical_schema_sql() -> anyhow::Result<()> {
     let aux_db = TempDatabase::builder().build();

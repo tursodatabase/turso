@@ -261,6 +261,7 @@ impl CommitState {
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
         connection.rollback_temp_schema();
+        connection.index_methods_transaction_rolled_back();
     }
 }
 
@@ -779,6 +780,21 @@ pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    /// Immutable execution/storage context captured when each index-method
+    /// cursor is first opened for this statement.
+    pub(crate) index_method_contexts: Vec<Option<crate::index_method::IndexMethodContext>>,
+    /// Index-method cursors explicitly closed by bytecode after their
+    /// statement work was prepared. Retain them until commit/rollback decides
+    /// whether prepared in-memory state may be published.
+    pub(crate) closed_index_method_cursors: Vec<(
+        Box<dyn crate::index_method::IndexMethodCursor>,
+        crate::index_method::IndexMethodContext,
+    )>,
+    /// Resumption coordinates for statement-level index-method finalization.
+    pub(crate) index_method_finalize_cursor: usize,
+    pub(crate) index_method_finalize_subprogram_keys: Option<Vec<usize>>,
+    pub(crate) index_method_finalize_subprogram: usize,
+    pub(crate) index_methods_finalized: bool,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
@@ -849,6 +865,10 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
+    /// FAIL can escape a trigger before the parent reaches its Halt opcode.
+    /// Keep the error here while index-method writes from earlier rows finish
+    /// through the normal resumable I/O path.
+    pending_fail_prepare_error: Option<LimboError>,
     /// Pending CDC info to apply after the program completes successfully.
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
@@ -904,6 +924,12 @@ impl ProgramState {
             io_completions: None,
             pc: 0,
             cursors,
+            index_method_contexts: vec![None; max_cursors],
+            closed_index_method_cursors: Vec::new(),
+            index_method_finalize_cursor: 0,
+            index_method_finalize_subprogram_keys: None,
+            index_method_finalize_subprogram: 0,
+            index_methods_finalized: false,
             cursor_seqs,
             registers,
             pre_op_registers: None,
@@ -943,6 +969,7 @@ impl ProgramState {
             n_total_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
+            pending_fail_prepare_error: None,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
         }
@@ -1008,6 +1035,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.index_method_contexts.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
             self.deferred_seeks.resize(max_cursors, None);
         }
@@ -1020,9 +1048,26 @@ impl ProgramState {
             self.registers = registers.into_boxed_slice();
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
-        self.cursors.iter_mut().for_each(|c| {
-            let _ = c.take();
-        });
+        for (cursor, context) in self
+            .cursors
+            .iter_mut()
+            .zip(self.index_method_contexts.iter_mut())
+        {
+            if let (Some(Cursor::IndexMethod(cursor)), Some(context)) =
+                (cursor.as_mut(), context.as_ref())
+            {
+                cursor.close(context);
+            }
+            let _ = cursor.take();
+            *context = None;
+        }
+        for (mut cursor, context) in self.closed_index_method_cursors.drain(..) {
+            cursor.close(&context);
+        }
+        self.index_method_finalize_cursor = 0;
+        self.index_method_finalize_subprogram_keys = None;
+        self.index_method_finalize_subprogram = 0;
+        self.index_methods_finalized = false;
         for r in self.registers.iter_mut() {
             match r {
                 Register::Value(v) => *v = Value::Null,
@@ -1073,6 +1118,7 @@ impl ProgramState {
         self.n_total_change.store(0, Ordering::SeqCst);
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
+        self.pending_fail_prepare_error = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
     }
@@ -1936,6 +1982,54 @@ impl Program {
                     self.abort(pager, None, state, true)?;
                     return Ok(StepResult::Interrupt);
                 }
+
+                // A trigger can return FAIL before the parent program reaches
+                // Halt. FAIL keeps changes made by earlier rows, so their
+                // index-method writes must finish before abort() releases the
+                // statement savepoint and commits those partial changes.
+                if let Some(fail_error) = state.pending_fail_prepare_error.take() {
+                    match execute::index_method_prepare_statement_all(state) {
+                        Ok(IOResult::Done(())) => {
+                            if let Err(abort_err) = self.abort(pager, Some(&fail_error), state) {
+                                tracing::error!(
+                                    "Abort failed after preparing FAIL index methods: {abort_err}"
+                                );
+                            }
+                            return Err(fail_error);
+                        }
+                        Ok(IOResult::IO(io)) => {
+                            state.pending_fail_prepare_error = Some(fail_error);
+                            io.set_waker(waker);
+                            if io.is_explicit_yield() {
+                                return Ok(StepResult::Yield);
+                            }
+                            let finished = io.finished();
+                            state.io_completions = Some(io);
+                            if !finished {
+                                return Ok(StepResult::IO);
+                            }
+                            continue 'io_check;
+                        }
+                        Err(prepare_error) => {
+                            // FAIL may keep earlier base-table rows only when every
+                            // matching index-method write was staged successfully.
+                            // Once preparation fails, committing those rows would
+                            // leave the table and index out of sync, so roll back the
+                            // whole transaction while returning the real preparation
+                            // error to the caller.
+                            let rollback_error =
+                                LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                            if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state)
+                            {
+                                tracing::error!(
+                                    "Abort also failed after FAIL index-method preparation: \
+                                     {abort_err}"
+                                );
+                            }
+                            return Err(prepare_error);
+                        }
+                    }
+                }
                 let (insn, _) = &self.insns[state.pc as usize];
                 let insn_function = insn.to_function();
                 if enable_tracing {
@@ -2030,6 +2124,13 @@ impl Program {
                         // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
                         // back, so auto-retrying can be useful.
                         return Ok(StepResult::Busy);
+                    }
+                    Err(err)
+                        if (matches!(err, LimboError::Constraint(_))
+                            && self.resolve_type == ResolveType::Fail)
+                            || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
+                    {
+                        state.pending_fail_prepare_error = Some(err);
                     }
                     Err(err) => {
                         if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
@@ -2699,6 +2800,9 @@ impl Program {
         // nested helper statements whose drop releases nested guards. Drop
         // them before the `is_nested_stmt()` check below for the same reason.
         state.close_virtual_table_cursors();
+        if err.is_some() || state.execution_state.is_running() {
+            execute::index_method_abort_statement_all(state);
+        }
 
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
@@ -2884,12 +2988,27 @@ impl Program {
                                         "vtab_commit_all failed during FAIL abort",
                                     );
                                 }
-                                if let Err(e) = execute::index_method_pre_commit_all(state, pager) {
-                                    capture_abort_error(
-                                        &mut abort_error,
-                                        e,
-                                        "index_method_pre_commit_all failed during FAIL abort",
-                                    );
+                                match execute::index_method_prepare_statement_all(state) {
+                                    Ok(IOResult::Done(())) => {}
+                                    Ok(IOResult::IO(io)) => {
+                                        io.abort();
+                                        capture_abort_error(
+                                            &mut abort_error,
+                                            LimboError::InternalError(
+                                                "FAIL cleanup reached asynchronous index-method \
+                                                 finalization outside the resumable Halt path"
+                                                    .to_string(),
+                                            ),
+                                            "index-method finalization yielded during FAIL abort",
+                                        );
+                                    }
+                                    Err(e) => {
+                                        capture_abort_error(
+                                            &mut abort_error,
+                                            e,
+                                            "index-method finalization failed during FAIL abort",
+                                        );
+                                    }
                                 }
                                 loop {
                                     match self.commit_txn(

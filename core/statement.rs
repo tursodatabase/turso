@@ -25,7 +25,7 @@ use crate::{
             EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
         },
     },
-    EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
+    Connection, EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
     EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
 };
 
@@ -335,6 +335,25 @@ impl std::fmt::Debug for Statement {
 }
 
 impl Statement {
+    pub(crate) fn prepare_index_methods(&mut self) -> Result<crate::IOResult<()>> {
+        crate::vdbe::execute::index_method_prepare_statement_all(&mut self.state)
+    }
+
+    pub(crate) fn abort_index_methods(&mut self) {
+        crate::vdbe::execute::index_method_abort_statement_all(&mut self.state);
+    }
+
+    pub(crate) fn commit_index_methods(&mut self) {
+        crate::vdbe::execute::index_method_transaction_committed_all(
+            &mut self.state,
+            &self.program.connection,
+        );
+    }
+
+    pub(crate) fn register_index_methods(&mut self, connection: &Connection) -> Result<()> {
+        crate::vdbe::execute::index_method_register_transaction_all(&mut self.state, connection)
+    }
+
     pub fn new(
         program: vdbe::Program,
         pager: Arc<Pager>,

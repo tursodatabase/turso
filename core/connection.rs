@@ -521,6 +521,11 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// One prepared cursor per index-method attachment touched by the active
+    /// database transaction. Statement reset transfers cursors here so the
+    /// eventual transaction outcome is delivered exactly once per attachment.
+    pub(crate) index_method_tx_cursors:
+        Mutex<Vec<crate::index_method::TransactionIndexMethodCursor>>,
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
@@ -2410,6 +2415,7 @@ impl Connection {
                 self.set_tx_state(TransactionState::None);
             }
         }
+        self.index_methods_transaction_rolled_back();
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
@@ -4982,6 +4988,86 @@ impl Connection {
         self.named_savepoints.write().clear();
     }
 
+    pub(crate) fn register_index_method_transaction_cursor(
+        &self,
+        mut entry: crate::index_method::TransactionIndexMethodCursor,
+    ) {
+        entry.cursor.statement_committed(&entry.context);
+        let mut entries = self.index_method_tx_cursors.lock();
+        let previous = if let Some(position) = entries
+            .iter()
+            .position(|existing| existing.same_attachment(&entry.context))
+        {
+            Some(std::mem::replace(&mut entries[position], entry))
+        } else {
+            entries.push(entry);
+            None
+        };
+        drop(entries);
+
+        if let Some(mut previous) = previous {
+            previous.cursor.close(&previous.context);
+        }
+    }
+
+    fn take_index_method_transaction_cursors(
+        &self,
+    ) -> Vec<crate::index_method::TransactionIndexMethodCursor> {
+        let mut entries = std::mem::take(&mut *self.index_method_tx_cursors.lock());
+        entries.sort_by(|left, right| {
+            (
+                left.context.database().id,
+                left.context.index().method_name.as_str(),
+                left.context.index().table_name.as_str(),
+                left.context.index().index_name.as_str(),
+                left.context.index().runtime_id,
+            )
+                .cmp(&(
+                    right.context.database().id,
+                    right.context.index().method_name.as_str(),
+                    right.context.index().table_name.as_str(),
+                    right.context.index().index_name.as_str(),
+                    right.context.index().runtime_id,
+                ))
+        });
+        entries
+    }
+
+    pub(crate) fn index_methods_transaction_committed(&self) {
+        let entries = self.take_index_method_transaction_cursors();
+        tracing::trace!(
+            attachments = entries.len(),
+            "publishing transaction-scoped index-method state"
+        );
+        for mut entry in entries {
+            entry.cursor.transaction_committed(&entry.context);
+            entry.cursor.close(&entry.context);
+        }
+    }
+
+    pub(crate) fn index_methods_transaction_rolled_back(&self) {
+        let entries = self.take_index_method_transaction_cursors();
+        tracing::trace!(
+            attachments = entries.len(),
+            "invalidating transaction-scoped index-method state"
+        );
+        for mut entry in entries {
+            entry.cursor.transaction_rolled_back(&entry.context);
+            entry.cursor.close(&entry.context);
+        }
+    }
+
+    pub(crate) fn index_methods_savepoint_rolled_back(&self) {
+        let mut entries = self.index_method_tx_cursors.lock();
+        tracing::trace!(
+            attachments = entries.len(),
+            "invalidating index-method state after savepoint rollback"
+        );
+        for entry in entries.iter_mut() {
+            entry.cursor.savepoint_rolled_back(&entry.context);
+        }
+    }
+
     /// Roll back the current main-db transaction state and any attached-db
     /// transaction state on this connection.
     pub(crate) fn rollback_current_txn_state(
@@ -5005,6 +5091,7 @@ impl Connection {
             self.auto_commit.store(true, Ordering::SeqCst);
         }
         self.rollback_attached_wal_txns();
+        self.index_methods_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
     }
@@ -5032,6 +5119,7 @@ impl Connection {
                 self.rollback_attached_mvcc_txs(clear_attached_schemas);
             }
             self.rollback_attached_wal_txns();
+            self.index_methods_transaction_rolled_back();
             self.set_tx_state(TransactionState::None);
             self.auto_commit.store(true, Ordering::SeqCst);
         }

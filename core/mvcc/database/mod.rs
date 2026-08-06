@@ -4018,6 +4018,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// If there is no exclusive transaction, the field is set to `NO_EXCLUSIVE_TX`.
     exclusive_tx: AtomicU64,
+    /// Active custom-index writer leases keyed by the backing object's stable
+    /// MVCC table ID. Leases reject contention instead of waiting, so acquiring
+    /// several leases cannot deadlock.
+    index_method_write_leases: Mutex<HashMap<MVTableId, TxID>>,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
     /// Held by checkpoints only during the brief in-memory publish phase; the I/O-heavy
@@ -4225,6 +4229,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             clock,
             storage,
             exclusive_tx: AtomicU64::new(NO_EXCLUSIVE_TX),
+            index_method_write_leases: Mutex::new(HashMap::default()),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
@@ -6172,6 +6177,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
+        self.release_index_method_write_leases(tx_id);
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
@@ -6202,6 +6208,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         self.txs.remove(&tx_id);
         Ok(())
+    }
+
+    /// Acquire a transaction-scoped custom-index writer lease.
+    ///
+    /// Acquisition is reentrant for the owning transaction. Contention is an
+    /// eager write conflict so expensive index construction never starts for a
+    /// transaction that cannot publish its work.
+    pub(crate) fn acquire_index_method_write_lease(
+        &self,
+        tx_id: TxID,
+        index_id: MVTableId,
+    ) -> Result<()> {
+        if !self.is_tx_rollbackable(tx_id) {
+            return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
+        }
+
+        let mut leases = self.index_method_write_leases.lock();
+        match leases.get(&index_id) {
+            Some(owner) if *owner == tx_id => Ok(()),
+            Some(_) => Err(LimboError::WriteWriteConflict),
+            None => {
+                leases.insert(index_id, tx_id);
+                Ok(())
+            }
+        }
+    }
+
+    fn release_index_method_write_leases(&self, tx_id: TxID) {
+        self.index_method_write_leases
+            .lock()
+            .retain(|_, owner| *owner != tx_id);
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]

@@ -6,7 +6,123 @@ use crate::mvcc::cursor::CursorYieldPoint;
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::sync::{Arc, Mutex};
+#[cfg(feature = "fts")]
+use crate::StepResult;
 use crate::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Value};
+
+#[derive(Debug)]
+struct FailingPrepareIndexMethod;
+
+#[derive(Debug)]
+struct FailingPrepareAttachment {
+    table_name: String,
+    index_name: String,
+}
+
+#[derive(Debug, Default)]
+struct FailingPrepareCursor {
+    dirty: bool,
+}
+
+impl crate::index_method::IndexMethod for FailingPrepareIndexMethod {
+    fn attach(
+        &self,
+        configuration: &crate::index_method::IndexMethodConfiguration,
+    ) -> Result<Arc<dyn crate::index_method::IndexMethodAttachment>> {
+        Ok(Arc::new(FailingPrepareAttachment {
+            table_name: configuration.table_name.clone(),
+            index_name: configuration.index_name.clone(),
+        }))
+    }
+}
+
+impl crate::index_method::IndexMethodAttachment for FailingPrepareAttachment {
+    fn definition<'a>(&'a self) -> crate::index_method::IndexMethodDefinition<'a> {
+        crate::index_method::IndexMethodDefinition {
+            method_name: "failing_prepare",
+            table_name: &self.table_name,
+            index_name: &self.index_name,
+            patterns: &[],
+            backing_btree: false,
+            results_materialized: true,
+            mvcc_support: crate::index_method::IndexMethodMvccSupport::ExternalTransactional,
+        }
+    }
+
+    fn init(&self) -> Result<Box<dyn crate::index_method::IndexMethodCursor>> {
+        Ok(Box::new(FailingPrepareCursor::default()))
+    }
+}
+
+impl crate::index_method::IndexMethodCursor for FailingPrepareCursor {
+    fn create(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn destroy(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn open_read(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn open_write(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn insert(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<()>> {
+        self.dirty = true;
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn delete(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<()>> {
+        self.dirty = true;
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn query_start(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<bool>> {
+        Ok(crate::IOResult::Done(false))
+    }
+
+    fn query_next(&mut self) -> Result<crate::IOResult<bool>> {
+        Ok(crate::IOResult::Done(false))
+    }
+
+    fn query_column(&mut self, _idx: usize) -> Result<crate::IOResult<Value>> {
+        Err(LimboError::InternalError(
+            "failing_prepare has no query rows".to_string(),
+        ))
+    }
+
+    fn query_rowid(&mut self) -> Result<crate::IOResult<Option<i64>>> {
+        Ok(crate::IOResult::Done(None))
+    }
+
+    fn prepare_statement_commit(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        if self.dirty {
+            return Err(LimboError::InternalError(
+                "forced index-method preparation failure".to_string(),
+            ));
+        }
+        Ok(crate::IOResult::Done(()))
+    }
+}
 
 #[derive(Debug)]
 struct FixedYieldInjector {
@@ -47,6 +163,103 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     })
     .unwrap();
     rows
+}
+
+#[test]
+fn fail_rolls_back_base_rows_when_index_method_preparation_fails() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:index-method-failing-prepare",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    db.builtin_syms.write().index_methods.insert(
+        "failing_prepare".to_string(),
+        Arc::new(FailingPrepareIndexMethod),
+    );
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fail ON docs USING failing_prepare(body)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER fail_second BEFORE INSERT ON docs WHEN NEW.id = 2 BEGIN \
+         SELECT RAISE(FAIL, 'stop'); END",
+    )
+    .unwrap();
+
+    let error = conn
+        .execute("INSERT INTO docs VALUES (1, 'first'), (2, 'second')")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced index-method preparation failure"),
+        "unexpected error: {error}"
+    );
+    assert!(get_rows(&conn, "SELECT id FROM docs").is_empty());
+}
+
+#[cfg(feature = "fts")]
+#[test]
+fn abandoning_after_index_method_prepare_rolls_back_without_drop_io() {
+    use crate::index_method::IndexMethodYieldPoint;
+
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:index-method-finalize-abandon",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        IndexMethodYieldPoint::AfterPrepareStatement.point(),
+    ])));
+    let mut insert = conn
+        .prepare("INSERT INTO docs VALUES (1, 'abandoned after prepare')")
+        .unwrap();
+    loop {
+        match insert.step().unwrap() {
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => break,
+            StepResult::Done => panic!("INSERT completed before the injected finalization yield"),
+            other => panic!("unexpected INSERT result: {other:?}"),
+        }
+    }
+    drop(insert);
+    conn.set_yield_injector(None);
+
+    assert!(get_rows(&conn, "SELECT id FROM docs").is_empty());
+    assert!(get_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(body, 'abandoned')"
+    )
+    .is_empty());
+
+    conn.execute("INSERT INTO docs VALUES (2, 'surviving retry')")
+        .unwrap();
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'surviving')"
+        ),
+        vec![vec![Value::from_i64(2)]]
+    );
 }
 
 fn open_mvcc_database_with_opts(path: &str, opts: DatabaseOpts) -> Arc<Database> {
