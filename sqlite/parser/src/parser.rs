@@ -855,6 +855,15 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_VIEW);
         let if_not_exists = self.parse_if_not_exists()?;
         let view_name = self.parse_fullname(false)?;
+        if temporary {
+            if let Some(ref db_name) = view_name.db_name {
+                if !db_name.as_str().eq_ignore_ascii_case("TEMP") {
+                    return Err(Error::Custom(
+                        "temporary table name must be unqualified".to_owned(),
+                    ));
+                }
+            }
+        }
         let columns = self.parse_eid_list(true)?;
         eat_expect!(self, TK_AS);
         let select = self.parse_select()?;

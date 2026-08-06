@@ -310,10 +310,17 @@ pub fn translate_create_view(
     resolver: &Resolver,
     select_stmt: &ast::Select,
     columns: &[ast::IndexedColumn],
+    temporary: bool,
     if_not_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(view_name)?;
+    // TEMP views always live in the temp schema. The parser rejects
+    // CREATE TEMP VIEW with a database name other than "temp".
+    let database_id = if temporary {
+        crate::TEMP_DB_ID
+    } else {
+        resolver.resolve_database_id(view_name)?
+    };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
@@ -421,7 +428,9 @@ pub fn translate_drop_view(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(view_name)?;
+    // Unqualified names search the temp schema first, then main, then
+    // attached databases, so DROP VIEW finds temp views like SQLite does.
+    let database_id = resolver.resolve_existing_table_database_id_qualified(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
