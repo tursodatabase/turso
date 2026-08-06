@@ -668,3 +668,70 @@ expect {
     integer|0
     text|1
 }
+
+# ============================================
+# INTEGER/NUMERIC affinity at the i64 boundaries. The magnitude of i64::MIN is
+# one past i64::MAX, so the range check applied to the parsed digits has to be
+# sign-dependent.
+# ============================================
+@cross-check-integrity
+test affinity-text-i64-min-integer-column {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('-9223372036854775808');
+    INSERT INTO t1 VALUES (' -9223372036854775808 ');
+    INSERT INTO t1 VALUES ('-009223372036854775808');
+    SELECT typeof(c), c FROM t1 ORDER BY rowid;
+}
+expect {
+    integer|-9223372036854775808
+    integer|-9223372036854775808
+    integer|-9223372036854775808
+}
+
+@cross-check-integrity
+test affinity-text-i64-min-numeric-column {
+    CREATE TABLE t1 (c NUMERIC);
+    INSERT INTO t1 VALUES ('-9223372036854775808');
+    SELECT typeof(c), c FROM t1;
+}
+expect {
+    integer|-9223372036854775808
+}
+
+@cross-check-integrity
+test affinity-text-i64-limits-stay-integer {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('-9223372036854775807');
+    INSERT INTO t1 VALUES ('9223372036854775807');
+    INSERT INTO t1 VALUES ('+9223372036854775807');
+    SELECT typeof(c), c FROM t1 ORDER BY rowid;
+}
+expect {
+    integer|-9223372036854775807
+    integer|9223372036854775807
+    integer|9223372036854775807
+}
+
+@cross-check-integrity
+test affinity-text-past-i64-limits-become-real {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('9223372036854775808');
+    INSERT INTO t1 VALUES ('-9223372036854775809');
+    INSERT INTO t1 VALUES ('-9223372036854775808.0');
+    INSERT INTO t1 VALUES ('-9.223372036854775808e18');
+    SELECT typeof(c) FROM t1 ORDER BY rowid;
+}
+expect {
+    real
+    real
+    real
+    real
+}
+
+@cross-check-integrity
+test affinity-sum-of-text-i64-min {
+    SELECT typeof(sum(v)), sum(v) FROM (SELECT '-9223372036854775808' AS v);
+}
+expect {
+    integer|-9223372036854775808
+}
