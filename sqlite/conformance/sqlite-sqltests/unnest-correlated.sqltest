@@ -28,6 +28,22 @@ setup correlated_rows {
     INSERT INTO outer_key2 VALUES (1, 10), (3, 20), (5, 40);
 }
 
+# A table function uses hidden columns to hold its arguments. Those checks
+# must stay inside the correlated subquery.
+test one-value-table-function-keeps-arguments {
+    CREATE TABLE outer_function_args(id INTEGER, first_value INTEGER);
+    INSERT INTO outer_function_args VALUES (1,3),(2,5);
+
+    SELECT o.id,
+           (SELECT sum(g.value) FROM generate_series(o.first_value, 6) g)
+    FROM outer_function_args o
+    ORDER BY o.id;
+}
+expect {
+    1|18
+    2|11
+}
+
 @setup correlated_rows
 test one-value-avg-in-select-list {
     SELECT id, (SELECT avg(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)

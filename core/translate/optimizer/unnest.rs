@@ -531,6 +531,9 @@ fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>
         .joined_tables()
         .iter()
         .any(|table| match &table.table {
+            // A virtual table can store function arguments as hidden-column
+            // checks. Moving those checks would change the function call.
+            crate::schema::Table::Virtual(_) => true,
             crate::schema::Table::FromClauseSubquery(subquery) => {
                 plan_is_correlated(&subquery.plan)
             }
