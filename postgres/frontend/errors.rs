@@ -55,6 +55,13 @@ pub fn pg_error(e: &LimboError, sql: &str) -> PgErrorInfo {
             PgErrorInfo::new("40001", e.to_string())
         }
         LimboError::Corrupt(_) => PgErrorInfo::new("XX001", e.to_string()),
+        // The engine raises Interrupt when a CancelRequest flips the
+        // connection's interrupt flag mid-statement; drivers branch on
+        // this exact SQLSTATE for query timeouts.
+        LimboError::Interrupt => PgErrorInfo::new(
+            "57014",
+            "canceling statement due to user request".to_string(),
+        ),
         _ => PgErrorInfo::new("XX000", e.to_string()),
     }
 }

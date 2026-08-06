@@ -20,8 +20,11 @@ use pgwire::messages::copy::{CopyData, CopyDone};
 use pgwire::messages::PgWireBackendMessage;
 use std::fmt::Debug;
 
-use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::auth::StartupHandler;
+use pgwire::api::auth::{
+    finish_authentication, protocol_negotiation, save_startup_parameters_to_metadata,
+    DefaultServerParameterProvider, StartupHandler,
+};
+use pgwire::api::cancel::CancelHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -31,16 +34,21 @@ use pgwire::api::results::{
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::cancel::CancelRequest;
 use pgwire::messages::data::DataRow;
+use pgwire::messages::startup::SecretKey;
 use pgwire::messages::PgWireFrontendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
+use std::collections::HashMap;
+use std::sync::Weak;
 
 pub struct TursoPgServer {
     address: String,
     db_file: String,
     db: Arc<turso_core::Database>,
     interrupt_count: Arc<AtomicUsize>,
+    cancel_registry: Arc<CancelRegistry>,
 }
 
 impl TursoPgServer {
@@ -55,6 +63,7 @@ impl TursoPgServer {
             db_file,
             db,
             interrupt_count,
+            cancel_registry: Arc::new(CancelRegistry::default()),
         }
     }
 
@@ -77,6 +86,7 @@ impl TursoPgServer {
                 query_parser: Arc::new(NoopQueryParser::new()),
                 copy_in: Mutex::new(None),
             }),
+            cancel_registry: self.cancel_registry.clone(),
         })
     }
 
@@ -183,41 +193,118 @@ impl TursoPgHandler {
     }
 }
 
-/// Seeds the session's configuration from the run-time parameters the
-/// client sent in the StartupMessage (psql sends application_name, JDBC
-/// sends extra_float_digits, poolers pass `options`), then proceeds with
-/// the no-auth handshake.
+/// Live sessions by cancellation keypair. A CancelRequest arrives on its
+/// own connection, so the (pid, secret) from BackendKeyData is the only
+/// link back to the session. Weak references mean a session's exit needs
+/// no deregistration; dead entries are pruned on every registration.
+#[derive(Default)]
+struct CancelRegistry {
+    sessions: Mutex<HashMap<(i32, i32), Weak<turso_core::Connection>>>,
+}
+
+impl CancelRegistry {
+    fn register(&self, key: (i32, i32), conn: Weak<turso_core::Connection>) {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, conn| conn.strong_count() > 0);
+        sessions.insert(key, conn);
+    }
+
+    /// Interrupt the session with this keypair. A miss is not an error:
+    /// PostgreSQL silently ignores cancels with a stale or wrong key.
+    fn interrupt(&self, key: (i32, i32)) {
+        let session = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(Weak::upgrade);
+        if let Some(conn) = session {
+            conn.interrupt();
+        }
+    }
+}
+
+/// A fresh cancellation keypair: a process-wide counter for the pid and a
+/// clock-derived secret. Not cryptographically strong, which matches the
+/// server's current no-authentication posture (TLS/auth is tracked in the
+/// roadmap).
+fn next_cancel_keypair() -> (i32, i32) {
+    static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
+    let pid = NEXT_PID.fetch_add(1, Ordering::SeqCst) as i32;
+    let secret = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() as i32) ^ (d.as_secs() as i32))
+        .unwrap_or(0x5eed)
+        | 1;
+    (pid, secret)
+}
+
+/// Runs the no-auth startup handshake with two additions to pgwire's
+/// stock flow: the session gets a unique cancellation keypair before
+/// BackendKeyData goes out, and the client's StartupMessage run-time
+/// parameters (psql sends application_name, JDBC sends
+/// extra_float_digits, poolers pass `options`) seed the session's
+/// configuration.
 struct TursoPgStartupHandler {
     conn: Arc<Mutex<PgConnection>>,
+    cancel_registry: Arc<CancelRegistry>,
 }
 
 #[async_trait]
-impl NoopStartupHandler for TursoPgStartupHandler {
-    async fn post_startup<C>(
+impl StartupHandler for TursoPgStartupHandler {
+    async fn on_startup<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        if let PgWireFrontendMessage::Startup(startup) = &message {
-            let conn = self.conn.lock().unwrap();
-            conn.init_startup_parameters(
-                startup
-                    .parameters
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.as_str())),
-            );
+        if let PgWireFrontendMessage::Startup(ref startup) = message {
+            protocol_negotiation(client, startup).await?;
+            save_startup_parameters_to_metadata(client, startup);
+
+            let keypair = next_cancel_keypair();
+            client.set_pid_and_secret_key(keypair.0, SecretKey::I32(keypair.1));
+            {
+                let conn = self.conn.lock().unwrap();
+                conn.init_startup_parameters(
+                    startup
+                        .parameters
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                );
+                self.cancel_registry
+                    .register(keypair, Arc::downgrade(conn.inner()));
+            }
+
+            finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
         }
         Ok(())
     }
 }
 
+/// Routes a CancelRequest to the session's engine connection, whose
+/// interrupt flag the VM checks while stepping — the running statement
+/// fails with the cancellation SQLSTATE and the session stays usable.
+struct TursoPgCancelHandler {
+    cancel_registry: Arc<CancelRegistry>,
+}
+
+#[async_trait]
+impl CancelHandler for TursoPgCancelHandler {
+    async fn on_cancel_request(&self, cancel_request: CancelRequest) {
+        if let Some(secret) = cancel_request.secret_key.as_i32() {
+            self.cancel_registry.interrupt((cancel_request.pid, secret));
+        }
+    }
+}
+
 struct TursoPgFactory {
     handler: Arc<TursoPgHandler>,
+    cancel_registry: Arc<CancelRegistry>,
 }
 
 impl PgWireServerHandlers for TursoPgFactory {
@@ -232,6 +319,13 @@ impl PgWireServerHandlers for TursoPgFactory {
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         Arc::new(TursoPgStartupHandler {
             conn: self.handler.conn.clone(),
+            cancel_registry: self.cancel_registry.clone(),
+        })
+    }
+
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> {
+        Arc::new(TursoPgCancelHandler {
+            cancel_registry: self.cancel_registry.clone(),
         })
     }
 
@@ -277,8 +371,8 @@ impl CopyHandler for TursoPgHandler {
         };
         let data = String::from_utf8_lossy(&buffer);
         let conn = self.conn.lock().unwrap().clone();
-        let rows = conn
-            .copy_stdin_finish(&stmt, &data)
+        // Bulk COPY loads are long synchronous engine work; see do_query.
+        let rows = tokio::task::block_in_place(|| conn.copy_stdin_finish(&stmt, &data))
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, ""))))?;
         client
             .send(PgWireBackendMessage::CommandComplete(
@@ -322,7 +416,7 @@ impl SimpleQueryHandler for TursoPgHandler {
 
             // COPY ... TO STDOUT: stream the rows here — data frames must
             // precede the CommandComplete the returned response produces.
-            match conn.copy_to_stdout(sql) {
+            match tokio::task::block_in_place(|| conn.copy_to_stdout(sql)) {
                 Ok(None) => {}
                 Ok(Some(lines)) => {
                     let rows = lines.len();
@@ -349,19 +443,26 @@ impl SimpleQueryHandler for TursoPgHandler {
                 }
             }
 
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, sql))))?;
+            // Statement execution is synchronous engine work that can run
+            // for a long time; block_in_place keeps it from starving the
+            // runtime's I/O driver — the accept loop must keep serving
+            // new connections or CancelRequest could never arrive.
+            let response = tokio::task::block_in_place(|| -> PgWireResult<Response> {
+                let mut stmt = conn
+                    .prepare(sql)
+                    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, sql))))?;
 
-            self.cleanup_dropped_schema_file(sql);
+                self.cleanup_dropped_schema_file(sql);
 
-            if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
-            } else {
-                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                let extra_float_digits = conn.extra_float_digits();
-                responses.push(execute_query(&mut stmt, header, extra_float_digits)?);
-            }
+                if stmt.num_columns() == 0 || is_pg_non_query(sql) {
+                    execute_non_query(&mut stmt, sql)
+                } else {
+                    let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                    let extra_float_digits = conn.extra_float_digits();
+                    execute_query(&mut stmt, header, extra_float_digits)
+                }
+            })?;
+            responses.push(response);
         }
 
         Ok(responses)
@@ -395,26 +496,31 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-        let query = &portal.statement.statement;
+        // block_in_place for the same reason as the simple-query path:
+        // long synchronous engine work must not starve the runtime's
+        // I/O driver, or CancelRequest connections would never be served.
+        tokio::task::block_in_place(|| {
+            let conn = self.conn.lock().unwrap().clone();
+            let query = &portal.statement.statement;
 
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, query))))?;
+            let mut stmt = conn
+                .prepare(query)
+                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, query))))?;
 
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
+            // Clean up schema file after successful DROP SCHEMA
+            self.cleanup_dropped_schema_file(query);
 
-        // Bind parameters from the portal
-        bind_portal_parameters(&mut stmt, portal)?;
+            // Bind parameters from the portal
+            bind_portal_parameters(&mut stmt, portal)?;
 
-        if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
-        }
+            if stmt.num_columns() == 0 || is_pg_non_query(query) {
+                return execute_non_query(&mut stmt, query);
+            }
 
-        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        let extra_float_digits = conn.extra_float_digits();
-        execute_query(&mut stmt, header, extra_float_digits)
+            let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
+            let extra_float_digits = conn.extra_float_digits();
+            execute_query(&mut stmt, header, extra_float_digits)
+        })
     }
 
     async fn do_describe_statement<C>(

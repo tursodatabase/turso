@@ -128,6 +128,9 @@ impl ConnParams {
 pub struct PgConn {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
+    /// The (pid, secret) from BackendKeyData, the credentials a
+    /// CancelRequest needs.
+    backend_key: Option<(i32, i32)>,
 }
 
 impl PgConn {
@@ -138,7 +141,11 @@ impl PgConn {
         let stream = TcpStream::connect((params.host.as_str(), params.port))?;
         let reader = BufReader::new(stream.try_clone()?);
         let writer = BufWriter::new(stream);
-        let mut conn = PgConn { reader, writer };
+        let mut conn = PgConn {
+            reader,
+            writer,
+            backend_key: None,
+        };
 
         let mut startup = Vec::new();
         startup.extend_from_slice(&196608u32.to_be_bytes()); // protocol 3.0
@@ -183,7 +190,14 @@ impl PgConn {
                         }
                     }
                 }
-                b'S' | b'K' | b'N' => {} // ParameterStatus, BackendKeyData, notices
+                b'K' => {
+                    // BackendKeyData: pid + secret (i32 in protocol 3.0).
+                    let mut r = Reader::new(&body);
+                    let pid = r.i32()?;
+                    let secret = r.i32()?;
+                    conn.backend_key = Some((pid, secret));
+                }
+                b'S' | b'N' => {} // ParameterStatus, notices
                 b'Z' => return Ok(conn),
                 b'E' => {
                     let fields = parse_error_fields(&body)?;
@@ -204,6 +218,26 @@ impl PgConn {
     /// state is indeterminate and it should be discarded.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.reader.get_ref().set_read_timeout(timeout)?;
+        Ok(())
+    }
+
+    /// The (pid, secret) the server sent in BackendKeyData, if any.
+    pub fn backend_key(&self) -> Option<(i32, i32)> {
+        self.backend_key
+    }
+
+    /// Sends a CancelRequest for the session identified by (pid, secret)
+    /// over a dedicated connection, the way the protocol requires. There
+    /// is no response; the server closes the connection.
+    pub fn cancel_request(params: &ConnParams, pid: i32, secret: i32) -> Result<()> {
+        let mut stream = TcpStream::connect((params.host.as_str(), params.port))?;
+        let mut msg = Vec::with_capacity(16);
+        msg.extend_from_slice(&16u32.to_be_bytes());
+        msg.extend_from_slice(&80877102u32.to_be_bytes());
+        msg.extend_from_slice(&pid.to_be_bytes());
+        msg.extend_from_slice(&secret.to_be_bytes());
+        stream.write_all(&msg)?;
+        stream.flush()?;
         Ok(())
     }
 
