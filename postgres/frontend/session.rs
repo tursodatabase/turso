@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
+use crate::datestyle::DateStyle;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
@@ -80,7 +81,7 @@ impl SessionState {
     /// value SHOW displays afterwards. Mirrors the frontend's `SET`/`RESET`
     /// handling, including for `search_path`, which lives outside the GUC
     /// map.
-    pub(crate) fn set_guc(&mut self, lower_name: &str, value: Option<String>) -> String {
+    pub(crate) fn set_guc(&mut self, lower_name: &str, value: Option<String>) -> Result<String> {
         if lower_name == "search_path" {
             self.search_path = match value {
                 Some(v) => v
@@ -90,22 +91,22 @@ impl SessionState {
                     .collect(),
                 None => Vec::new(),
             };
-            return self
+            return Ok(self
                 .guc_value(lower_name)
-                .expect("search_path always resolves");
+                .expect("search_path always resolves"));
         }
         // A plain SET or RESET takes effect immediately even after an
         // earlier SET LOCAL of the same name, the way PostgreSQL behaves.
         self.txn_gucs.remove(lower_name);
         match value {
             Some(v) => {
-                let v = canonicalize_guc(lower_name, v);
+                let v = self.canonical_guc_value(lower_name, v)?;
                 self.gucs.insert(lower_name.to_string(), v.clone());
-                v
+                Ok(v)
             }
             None => {
                 self.gucs.remove(lower_name);
-                self.guc_value(lower_name).unwrap_or_default()
+                Ok(self.guc_value(lower_name).unwrap_or_default())
             }
         }
     }
@@ -114,22 +115,26 @@ impl SessionState {
     /// the current transaction, returning the value SHOW displays. The
     /// session value underneath is untouched, so dropping the overlay at
     /// transaction end restores it for commit and rollback alike.
-    pub(crate) fn set_local_guc(&mut self, lower_name: &str, value: Option<String>) -> String {
+    pub(crate) fn set_local_guc(
+        &mut self,
+        lower_name: &str,
+        value: Option<String>,
+    ) -> Result<String> {
         match value {
             Some(v) => {
-                let v = canonicalize_guc(lower_name, v);
+                let v = self.canonical_guc_value(lower_name, v)?;
                 self.txn_gucs.insert(lower_name.to_string(), v.clone());
-                v
+                Ok(v)
             }
             None => match guc_default(lower_name) {
                 Some((_, default)) => {
                     self.txn_gucs
                         .insert(lower_name.to_string(), default.to_string());
-                    default.to_string()
+                    Ok(default.to_string())
                 }
                 None => {
                     self.txn_gucs.remove(lower_name);
-                    self.guc_value(lower_name).unwrap_or_default()
+                    Ok(self.guc_value(lower_name).unwrap_or_default())
                 }
             },
         }
@@ -154,9 +159,48 @@ impl SessionState {
                 .collect();
             return;
         }
-        let value = canonicalize_guc(lower_name, value);
-        self.startup_gucs.insert(lower_name.to_string(), value);
+        // PostgreSQL refuses the connection outright when a startup
+        // parameter is invalid. There is no error channel here, so the
+        // session keeps the default for that parameter instead of taking a
+        // value it would reject from SET.
+        match self.canonical_guc_value(lower_name, value) {
+            Ok(value) => {
+                self.startup_gucs.insert(lower_name.to_string(), value);
+            }
+            Err(e) => tracing::warn!("ignoring startup parameter {lower_name}: {e}"),
+        }
     }
+
+    /// The session's DateStyle. Stored values are canonical, so parsing one
+    /// back always succeeds.
+    pub(crate) fn date_style(&self) -> DateStyle {
+        self.guc_value("datestyle")
+            .and_then(|value| DateStyle::parse(DateStyle::default(), &value))
+            .unwrap_or_default()
+    }
+
+    /// The value a parameter displays as after being set to `value`, or
+    /// PostgreSQL's error if the value is not one the parameter accepts.
+    pub(crate) fn canonical_guc_value(&self, lower_name: &str, value: String) -> Result<String> {
+        if lower_name == "datestyle" {
+            let Some(style) = DateStyle::parse(self.date_style(), &value) else {
+                return Err(LimboError::ParseError(format!(
+                    "invalid value for parameter \"DateStyle\": \"{value}\""
+                )));
+            };
+            return Ok(style.canonical());
+        }
+        Ok(canonicalize_guc(lower_name, value))
+    }
+}
+
+/// The session settings a value's text representation depends on:
+/// `extra_float_digits` for float8, `DateStyle` for dates and timestamps.
+#[derive(Clone, Copy, Debug)]
+pub struct TextOutputSettings {
+    /// PostgreSQL's default of 1 means shortest-roundtrip float formatting.
+    pub extra_float_digits: i32,
+    pub date_style: DateStyle,
 }
 
 /// The session-dependent fields of one pg_settings row.
@@ -491,17 +535,30 @@ impl PgConnection {
         &self.inner.conn
     }
 
-    /// Current extra_float_digits setting; drives float8 text output.
-    /// PostgreSQL's default of 1 means shortest-roundtrip formatting.
-    pub fn extra_float_digits(&self) -> i32 {
+    /// The session settings that shape how result values print in text
+    /// format, read in one pass so a row's values all agree.
+    pub fn text_output_settings(&self) -> TextOutputSettings {
         let mut state = self.inner.session_state.lock().unwrap();
         if self.inner.conn.get_auto_commit() {
             state.clear_txn_gucs();
         }
-        state
-            .guc_value("extra_float_digits")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1)
+        TextOutputSettings {
+            extra_float_digits: state
+                .guc_value("extra_float_digits")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+            date_style: state.date_style(),
+        }
+    }
+
+    /// The value `SHOW name` would display, for a parameter name already in
+    /// lower case. None for a parameter this session does not know.
+    pub fn guc(&self, lower_name: &str) -> Option<String> {
+        self.inner
+            .session_state
+            .lock()
+            .unwrap()
+            .guc_value(lower_name)
     }
 
     /// Seeds the session from the client's StartupMessage run-time
@@ -915,11 +972,11 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut state = pg_conn.session_state.lock().unwrap();
-            state.set_guc(&name, Some(value));
+            state.set_guc(&name, Some(value))?;
         }
         PgSetKind::Reset => {
             let mut state = pg_conn.session_state.lock().unwrap();
-            state.set_guc(&name, None);
+            state.set_guc(&name, None)?;
         }
         PgSetKind::ResetAll => {
             let mut state = pg_conn.session_state.lock().unwrap();
@@ -960,10 +1017,10 @@ fn handle_pg_set_local(
                     .map(guc_value_text)
                     .collect::<Vec<_>>()
                     .join(", ");
-                state.set_local_guc(lower_name, Some(value));
+                state.set_local_guc(lower_name, Some(value))?;
             }
             PgSetKind::Reset => {
-                state.set_local_guc(lower_name, None);
+                state.set_local_guc(lower_name, None)?;
             }
             // The grammar has no LOCAL form of RESET ALL.
             PgSetKind::ResetAll => {
@@ -975,9 +1032,10 @@ fn handle_pg_set_local(
 }
 
 /// GUCs whose values SHOW displays in canonical PostgreSQL form. Booleans
-/// display as on/off however they were spelled; DateStyle tokens display in
-/// PostgreSQL's casing (unquoted SQL identifiers arrive lowercased).
-pub(crate) fn canonicalize_guc(lower_name: &str, value: String) -> String {
+/// display as on/off however they were spelled. DateStyle needs the current
+/// setting to canonicalize against, so it lives in
+/// [`SessionState::canonical_guc_value`] instead.
+fn canonicalize_guc(lower_name: &str, value: String) -> String {
     const BOOL_GUCS: &[&str] = &["standard_conforming_strings", "synchronous_commit"];
     if BOOL_GUCS.contains(&lower_name) {
         return match value.to_lowercase().as_str() {
@@ -985,22 +1043,6 @@ pub(crate) fn canonicalize_guc(lower_name: &str, value: String) -> String {
             "off" | "false" | "no" | "0" => "off".to_string(),
             _ => value,
         };
-    }
-    if lower_name == "datestyle" {
-        return value
-            .split(", ")
-            .map(|part| match part.to_lowercase().as_str() {
-                "iso" => "ISO",
-                "sql" => "SQL",
-                "postgres" => "Postgres",
-                "german" => "German",
-                "mdy" => "MDY",
-                "dmy" => "DMY",
-                "ymd" => "YMD",
-                _ => part,
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
     }
     // IntervalStyle values (postgres, postgres_verbose, sql_standard,
     // iso_8601) display lowercase, which they already are.

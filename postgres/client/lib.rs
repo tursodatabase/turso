@@ -131,6 +131,9 @@ pub struct PgConn {
     /// The (pid, secret) from BackendKeyData, the credentials a
     /// CancelRequest needs.
     backend_key: Option<(i32, i32)>,
+    /// The ParameterStatus values the server reported during startup, the
+    /// settings a real driver configures its value parsing from.
+    parameter_status: HashMap<String, String>,
 }
 
 impl PgConn {
@@ -145,6 +148,7 @@ impl PgConn {
             reader,
             writer,
             backend_key: None,
+            parameter_status: HashMap::new(),
         };
 
         let mut startup = Vec::new();
@@ -197,7 +201,13 @@ impl PgConn {
                     let secret = r.i32()?;
                     conn.backend_key = Some((pid, secret));
                 }
-                b'S' | b'N' => {} // ParameterStatus, notices
+                b'S' => {
+                    let mut r = Reader::new(&body);
+                    let name = r.cstring()?;
+                    let value = r.cstring()?;
+                    conn.parameter_status.insert(name, value);
+                }
+                b'N' => {} // Notices
                 b'Z' => return Ok(conn),
                 b'E' => {
                     let fields = parse_error_fields(&body)?;
@@ -224,6 +234,13 @@ impl PgConn {
     /// The (pid, secret) the server sent in BackendKeyData, if any.
     pub fn backend_key(&self) -> Option<(i32, i32)> {
         self.backend_key
+    }
+
+    /// A setting the server reported with ParameterStatus, under the exact
+    /// name it used (PostgreSQL spells this one `DateStyle`, not
+    /// `datestyle`).
+    pub fn parameter_status(&self, name: &str) -> Option<&str> {
+        self.parameter_status.get(name).map(String::as_str)
     }
 
     /// Sends a CancelRequest for the session identified by (pid, secret)

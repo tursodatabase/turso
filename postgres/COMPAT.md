@@ -62,7 +62,7 @@ Basics not enumerated by the official feature matrix.
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs (e.g. `SHOW search_path` returns nothing) |
+| SET / SHOW | 🟡 Partial | Per-session GUC store; see Configuration Management |
 
 ## Backend
 
@@ -350,7 +350,8 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Passed through as PRAGMAs; PostgreSQL GUCs (search_path, work_mem, ...) are not recognized |
+| SET / SHOW configuration parameters | 🟡 Partial | Per-session store with PostgreSQL defaults, `SET LOCAL`, `RESET`, `current_setting()`/`set_config()`, `pg_settings`, and startup parameters. Most parameters only store a value; `extra_float_digits` and `DateStyle` change output |
+| DateStyle | ✅ Supported | ISO, SQL, Postgres and German output for `date`, `timestamp` and `timestamptz`; DMY swaps day and month |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |

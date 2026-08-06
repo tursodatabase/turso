@@ -95,6 +95,9 @@ fn parse_error(msg: &str, sql: &str) -> PgErrorInfo {
     if let Some(idx) = msg.find("unrecognized configuration parameter") {
         return PgErrorInfo::new("42704", msg[idx..].to_string());
     }
+    if let Some(idx) = msg.find("invalid value for parameter") {
+        return PgErrorInfo::new("22023", msg[idx..].to_string());
+    }
     // The engine spells this both ways depending on the code path.
     if let Some(name) = msg
         .strip_prefix("no such table: ")

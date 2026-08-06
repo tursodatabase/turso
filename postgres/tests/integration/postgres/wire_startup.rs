@@ -101,6 +101,44 @@ fn startup_options_parameter_carries_dash_c_settings() {
 }
 
 #[test]
+fn startup_reports_the_settings_the_session_actually_uses() {
+    let (params, _dir) = start_server();
+
+    // With nothing requested, the reported values are the session
+    // defaults. A driver that trusts DateStyle here parses dates the way
+    // the session prints them.
+    let conn = PgConn::connect(&params, &[]).unwrap();
+    assert_eq!(conn.parameter_status("DateStyle"), Some("ISO, MDY"));
+    assert_eq!(conn.parameter_status("IntervalStyle"), Some("postgres"));
+
+    // A client that asks for a DateStyle in its StartupMessage is told the
+    // value it got, filled out to both halves the way SHOW displays it.
+    let mut conn = PgConn::connect(&params, &[("DateStyle", "German")]).unwrap();
+    assert_eq!(conn.parameter_status("DateStyle"), Some("German, DMY"));
+    assert_eq!(query_text(&mut conn, "SHOW DateStyle"), "German, DMY");
+    // The startup DateStyle drives output, not just SHOW.
+    for sql in [
+        "CREATE TABLE startup_dates (d date)",
+        "INSERT INTO startup_dates VALUES ('1997-02-10')",
+    ] {
+        for event in conn.simple_query(sql).unwrap() {
+            if let BackendEvent::ErrorResponse(fields) = event {
+                panic!("{sql} failed: {}", error_message(&fields));
+            }
+        }
+    }
+    assert_eq!(
+        query_text(&mut conn, "SELECT d FROM startup_dates"),
+        "10.02.1997"
+    );
+
+    // An unusable startup value leaves the default in place rather than a
+    // value SET would have rejected.
+    let conn = PgConn::connect(&params, &[("DateStyle", "garbage")]).unwrap();
+    assert_eq!(conn.parameter_status("DateStyle"), Some("ISO, MDY"));
+}
+
+#[test]
 fn connection_establishment_keys_are_not_treated_as_settings() {
     let (params, _dir) = start_server();
     // `user` and `database` always arrive in the startup packet; they must

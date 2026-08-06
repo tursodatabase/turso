@@ -11,6 +11,7 @@ use tracing::{error, info};
 use turso_core::Value;
 use turso_pg::{
     auto_attach_schemas, pg_error, split_statements, LimboError, PgConnection, PgCopyFromStmt,
+    TextOutputSettings,
 };
 
 use futures::sink::{Sink, SinkExt};
@@ -268,7 +269,7 @@ impl StartupHandler for TursoPgStartupHandler {
 
             let keypair = next_cancel_keypair();
             client.set_pid_and_secret_key(keypair.0, SecretKey::I32(keypair.1));
-            {
+            let parameters = {
                 let conn = self.conn.lock().unwrap();
                 conn.init_startup_parameters(
                     startup
@@ -278,12 +279,37 @@ impl StartupHandler for TursoPgStartupHandler {
                 );
                 self.cancel_registry
                     .register(keypair, Arc::downgrade(conn.inner()));
-            }
+                session_parameter_provider(&conn)
+            };
 
-            finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
+            finish_authentication(client, &parameters).await?;
         }
         Ok(())
     }
+}
+
+/// The ParameterStatus messages sent at the end of startup. PostgreSQL
+/// reports the session's own values here, so a client that asked for
+/// `DateStyle` in its StartupMessage is told what it actually got, and a
+/// client that asked for nothing is told our defaults rather than pgwire's
+/// (which spell DateStyle "ISO YMD" and would have drivers parse dates by a
+/// rule the session does not follow).
+fn session_parameter_provider(conn: &PgConnection) -> DefaultServerParameterProvider {
+    let mut provider = DefaultServerParameterProvider::default();
+    if let Some(value) = conn.guc("datestyle") {
+        provider.date_style = value;
+    }
+    if let Some(value) = conn.guc("intervalstyle") {
+        provider.interval_style = value;
+    }
+    if let Some(value) = conn.guc("search_path") {
+        provider.search_path = value;
+    }
+    if let Some(value) = conn.guc("standard_conforming_strings") {
+        provider.standard_conforming_strings = value == "on";
+    }
+    provider.client_encoding = conn.guc("client_encoding");
+    provider
 }
 
 /// Routes a CancelRequest to the session's engine connection, whose
@@ -458,8 +484,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                     execute_non_query(&mut stmt, sql)
                 } else {
                     let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                    let extra_float_digits = conn.extra_float_digits();
-                    execute_query(&mut stmt, header, extra_float_digits)
+                    execute_query(&mut stmt, header, conn.text_output_settings())
                 }
             })?;
             responses.push(response);
@@ -518,8 +543,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             }
 
             let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-            let extra_float_digits = conn.extra_float_digits();
-            execute_query(&mut stmt, header, extra_float_digits)
+            execute_query(&mut stmt, header, conn.text_output_settings())
         })
     }
 
@@ -665,7 +689,7 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 fn execute_query(
     stmt: &mut turso_core::Statement,
     header: Arc<Vec<FieldInfo>>,
-    extra_float_digits: i32,
+    output: TextOutputSettings,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
@@ -677,13 +701,7 @@ fn execute_query(
                 .get(i)
                 .map(|fi| (fi.datatype().clone(), fi.format()))
                 .unwrap_or((Type::TEXT, FieldFormat::Text));
-            encode_value(
-                &mut encoder,
-                val,
-                &pg_type,
-                field_format,
-                extra_float_digits,
-            )?;
+            encode_value(&mut encoder, val, &pg_type, field_format, output)?;
         }
         rows.push(encoder.finish());
         Ok(())
@@ -1249,12 +1267,42 @@ fn numeric_wire_bytes(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// What a date, timestamp or timestamptz value prints as, or None when the
+/// engine's own text is already right. The engine renders these ISO, which
+/// is what DateStyle ISO asks for, so only the other formats rewrite.
+fn format_temporal_text(
+    text: &str,
+    pg_type: &Type,
+    date_style: turso_pg::DateStyle,
+) -> Option<String> {
+    if *pg_type == Type::DATE {
+        return date_style.reformat_date(text);
+    }
+    if *pg_type == Type::TIMESTAMP {
+        return date_style.reformat_timestamp(text);
+    }
+    if *pg_type != Type::TIMESTAMPTZ {
+        return None;
+    }
+    // A timestamptz the engine rendered without a zone is UTC; saying so
+    // keeps clients from reading it as local time.
+    if text.contains('+') || text.contains('Z') || text.ends_with("-00") {
+        return date_style.reformat_timestamp(text);
+    }
+    let with_zone = format!("{text}+00");
+    Some(
+        date_style
+            .reformat_timestamp(&with_zone)
+            .unwrap_or(with_zone),
+    )
+}
+
 fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
     pg_type: &Type,
     field_format: FieldFormat,
-    extra_float_digits: i32,
+    output: TextOutputSettings,
 ) -> turso_core::Result<()> {
     // Binary result columns carry the type's PostgreSQL binary wire
     // representation, computed here; NULL uses the shared -1-length path.
@@ -1287,7 +1335,7 @@ fn encode_value(
         }
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field_with_type_and_format(
-                &format_float8(f64::from(*f), extra_float_digits).as_str(),
+                &format_float8(f64::from(*f), output.extra_float_digits).as_str(),
                 &Type::TEXT,
                 FieldFormat::Text,
                 &FormatOptions::default(),
@@ -1295,17 +1343,9 @@ fn encode_value(
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Text(t) => {
             let text = t.value.as_ref();
-            // For TIMESTAMPTZ columns, ensure timezone info is present so clients
-            // parse the value correctly (as UTC, not local time).
-            // TIMESTAMP (without TZ) should NOT have timezone suffix.
-            if *pg_type == Type::TIMESTAMPTZ
-                && !text.contains('+')
-                && !text.contains('Z')
-                && !text.ends_with("-00")
-            {
-                let with_tz = format!("{text}+00");
+            if let Some(temporal) = format_temporal_text(text, pg_type, output.date_style) {
                 encoder
-                    .encode_field(&with_tz.as_str())
+                    .encode_field(&temporal.as_str())
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             } else if pg_type.name().starts_with('_') {
                 // Array types: pgwire's to_sql_text quotes strings containing

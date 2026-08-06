@@ -1,0 +1,247 @@
+# DateStyle: the setting that picks how dates and timestamps are printed.
+# The first word chooses the format (ISO, SQL, Postgres, German), the second
+# the field order (MDY, DMY, YMD). For SQL and Postgres, only DMY changes the
+# output — MDY and YMD both print the month first. German always prints
+# day.month.year whatever the order says. SHOW always renders both words, and
+# unknown words are rejected. The expected strings here come from
+# PostgreSQL's own regress golden files (horology.out, date.out), so they
+# hold for real PostgreSQL too.
+
+@database :memory:
+
+test datestyle-show-fills-in-the-missing-word {
+    SET DateStyle = 'SQL';
+    SHOW DateStyle;
+}
+expect {
+    SQL, MDY
+}
+
+test datestyle-german-also-sets-dmy {
+    SET DateStyle = 'German';
+    SHOW DateStyle;
+}
+expect {
+    German, DMY
+}
+
+test datestyle-us-and-european-are-aliases {
+    SET DateStyle TO 'US,Postgres';
+    SHOW DateStyle;
+}
+expect {
+    Postgres, MDY
+}
+
+test datestyle-european-means-dmy {
+    SET DateStyle TO 'European,ISO';
+    SHOW DateStyle;
+}
+expect {
+    ISO, DMY
+}
+
+test datestyle-order-alone-keeps-the-format {
+    SET DateStyle = 'German';
+    SET DateStyle = 'MDY';
+    SHOW DateStyle;
+}
+expect {
+    German, MDY
+}
+
+test datestyle-default-restores-iso-mdy {
+    SET DateStyle = 'German';
+    SET DateStyle = 'default';
+    SHOW DateStyle;
+}
+expect {
+    ISO, MDY
+}
+
+test datestyle-unknown-word-is-rejected {
+    SET DateStyle = 'garbage';
+}
+expect error {
+    ^invalid value for parameter "DateStyle": "garbage"$
+}
+
+test datestyle-two-formats-conflict {
+    SET DateStyle = 'ISO, SQL';
+}
+expect error {
+    ^invalid value for parameter "DateStyle": "ISO, SQL"$
+}
+
+test datestyle-reset-restores-iso {
+    SET DateStyle = 'German';
+    RESET DateStyle;
+    SHOW DateStyle;
+}
+expect {
+    ISO, MDY
+}
+
+test date-iso-output {
+    CREATE TABLE d_iso (f1 date);
+    INSERT INTO d_iso VALUES ('1957-04-09'), ('2040-04-10');
+    SET DateStyle = 'ISO, MDY';
+    SELECT f1 FROM d_iso;
+}
+expect {
+    1957-04-09
+    2040-04-10
+}
+
+test date-postgres-output-uses-dashes-month-first {
+    CREATE TABLE d_pg (f1 date);
+    INSERT INTO d_pg VALUES ('1957-04-09'), ('2040-04-10');
+    SET DateStyle = 'Postgres, MDY';
+    SELECT f1 FROM d_pg;
+}
+expect {
+    04-09-1957
+    04-10-2040
+}
+
+test date-postgres-dmy-output-puts-the-day-first {
+    CREATE TABLE d_pg_dmy (f1 date);
+    INSERT INTO d_pg_dmy VALUES ('1957-04-09');
+    SET DateStyle = 'Postgres, DMY';
+    SELECT f1 FROM d_pg_dmy;
+}
+expect {
+    09-04-1957
+}
+
+test date-sql-output-uses-slashes {
+    CREATE TABLE d_sql (f1 date);
+    INSERT INTO d_sql VALUES ('1957-04-09');
+    SET DateStyle = 'SQL, MDY';
+    SELECT f1 FROM d_sql;
+}
+expect {
+    04/09/1957
+}
+
+test date-sql-dmy-output-puts-the-day-first {
+    CREATE TABLE d_sql_dmy (f1 date);
+    INSERT INTO d_sql_dmy VALUES ('1957-04-09');
+    SET DateStyle = 'SQL, DMY';
+    SELECT f1 FROM d_sql_dmy;
+}
+expect {
+    09/04/1957
+}
+
+test date-ymd-order-still-prints-the-month-first {
+    CREATE TABLE d_ymd (f1 date);
+    INSERT INTO d_ymd VALUES ('1957-04-09');
+    SET DateStyle = 'SQL, YMD';
+    SELECT f1 FROM d_ymd;
+}
+expect {
+    04/09/1957
+}
+
+test date-german-output-uses-dots {
+    CREATE TABLE d_de (f1 date);
+    INSERT INTO d_de VALUES ('1957-04-09');
+    SET DateStyle = 'German';
+    SELECT f1 FROM d_de;
+}
+expect {
+    09.04.1957
+}
+
+test timestamp-postgres-output-leads-with-the-weekday {
+    CREATE TABLE ts_pg (d1 timestamp);
+    INSERT INTO ts_pg VALUES ('1997-02-10 17:32:01'), ('1970-01-01 00:00:00');
+    SET DateStyle = 'Postgres, MDY';
+    SELECT d1 FROM ts_pg;
+}
+expect {
+    Mon Feb 10 17:32:01 1997
+    Thu Jan 01 00:00:00 1970
+}
+
+test timestamp-postgres-dmy-output-swaps-day-and-month {
+    CREATE TABLE ts_pg_dmy (d1 timestamp);
+    INSERT INTO ts_pg_dmy VALUES ('1997-02-10 17:32:01');
+    SET DateStyle = 'Postgres, DMY';
+    SELECT d1 FROM ts_pg_dmy;
+}
+expect {
+    Mon 10 Feb 17:32:01 1997
+}
+
+test timestamp-sql-output {
+    CREATE TABLE ts_sql (d1 timestamp);
+    INSERT INTO ts_sql VALUES ('1997-02-10 17:32:01'), ('1997-01-02 03:04:05');
+    SET DateStyle = 'SQL, MDY';
+    SELECT d1 FROM ts_sql;
+}
+expect {
+    02/10/1997 17:32:01
+    01/02/1997 03:04:05
+}
+
+test timestamp-sql-dmy-output {
+    CREATE TABLE ts_sql_dmy (d1 timestamp);
+    INSERT INTO ts_sql_dmy VALUES ('1997-02-10 17:32:01');
+    SET DateStyle = 'SQL, DMY';
+    SELECT d1 FROM ts_sql_dmy;
+}
+expect {
+    10/02/1997 17:32:01
+}
+
+test timestamp-german-output {
+    CREATE TABLE ts_de (d1 timestamp);
+    INSERT INTO ts_de VALUES ('2001-12-27 04:05:06');
+    SET DateStyle = 'German';
+    SELECT d1 FROM ts_de;
+}
+expect {
+    27.12.2001 04:05:06
+}
+
+test timestamp-keeps-fractional-seconds-in-every-format {
+    CREATE TABLE ts_frac (d1 timestamp);
+    INSERT INTO ts_frac VALUES ('1997-02-10 17:32:01.4');
+    SET DateStyle = 'Postgres, MDY';
+    SELECT d1 FROM ts_frac;
+}
+expect {
+    Mon Feb 10 17:32:01.4 1997
+}
+
+test timestamp-iso-output-is-unchanged {
+    CREATE TABLE ts_iso (d1 timestamp);
+    INSERT INTO ts_iso VALUES ('1997-02-10 17:32:01.4');
+    SET DateStyle = 'ISO, DMY';
+    SELECT d1 FROM ts_iso;
+}
+expect {
+    1997-02-10 17:32:01.4
+}
+
+test time-output-ignores-datestyle {
+    CREATE TABLE tm (f1 time);
+    INSERT INTO tm VALUES ('17:32:01');
+    SET DateStyle = 'Postgres, DMY';
+    SELECT f1 FROM tm;
+}
+expect {
+    17:32:01
+}
+
+test text-columns-are-not-reformatted {
+    CREATE TABLE txt (f1 text);
+    INSERT INTO txt VALUES ('1957-04-09');
+    SET DateStyle = 'Postgres, MDY';
+    SELECT f1 FROM txt;
+}
+expect {
+    1957-04-09
+}

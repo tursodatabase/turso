@@ -435,14 +435,14 @@ fn exec_set_config(conn: &Connection, args: &[Value]) -> Result<Value> {
         if conn.get_auto_commit() {
             // No transaction block: report the value without storing it.
             match value {
-                Some(v) => crate::session::canonicalize_guc(&name, v),
+                Some(v) => state.canonical_guc_value(&name, v)?,
                 None => state.guc_value(&name).unwrap_or_default(),
             }
         } else {
-            state.set_local_guc(&name, value)
+            state.set_local_guc(&name, value)?
         }
     } else {
-        state.set_guc(&name, value)
+        state.set_guc(&name, value)?
     };
     Ok(Value::build_text(displayed))
 }
