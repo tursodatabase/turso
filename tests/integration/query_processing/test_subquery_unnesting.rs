@@ -115,9 +115,9 @@ fn minimum_over_a_join_becomes_a_joined_table() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A grouped table can use two outer tables and a NULL outer value.
+/// A grouped table can use a NULL outer value and a text order.
 #[test]
-fn grouped_table_can_use_two_outer_tables_and_null() -> anyhow::Result<()> {
+fn grouped_table_can_use_null_and_text_order() -> anyhow::Result<()> {
     let database = TempDatabase::new_with_rusqlite("CREATE TABLE outer_rows(id INT, key1 INT)");
     let connection = database.connect_limbo();
     connection.execute("CREATE TABLE outer_key2(id INT, key2 INT)")?;
@@ -126,9 +126,6 @@ fn grouped_table_can_use_two_outer_tables_and_null() -> anyhow::Result<()> {
     connection.execute("CREATE TABLE nocase_inner(key1 TEXT COLLATE NOCASE, amount INT)")?;
 
     let queries = [
-        "SELECT o.id, (SELECT sum(i.amount) FROM inner_rows i
-         WHERE i.key1 = o.key1 AND i.key2 = x.key2)
-         FROM outer_rows o JOIN outer_key2 x ON x.id = o.id",
         "SELECT o.id, (SELECT count(*) FROM inner_rows i WHERE i.key2 = x.key2)
          FROM outer_rows o LEFT JOIN outer_key2 x ON x.id = o.id",
         "SELECT (SELECT sum(i.amount) FROM nocase_inner i WHERE o.key1 = i.key1)

@@ -380,6 +380,16 @@ fn try_rewrite_single_value_aggregate(
     }) {
         return Ok(false);
     }
+    // A grouped table linked to more than one outer table can move before one
+    // of those tables after its left join becomes an inner join.
+    if outer_tables
+        .iter()
+        .filter(|outer_table| outer_table.is_used())
+        .count()
+        != 1
+    {
+        return Ok(false);
+    }
     let outer_table_ids: Vec<_> = outer_tables.iter().map(|table| table.internal_id).collect();
     let inner_table_ids: Vec<_> = inner_plan
         .table_references
