@@ -1366,6 +1366,11 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
 /// digits, shift. That trades the old per-byte loop for a handful of
 /// branch-free ALU ops, which wins precisely where lengths are too scattered
 /// to predict.
+///
+/// Kept inline: an outlined call serializes the caller's decode loop on the
+/// call's argument and result flow, which measures slower than the decode
+/// itself.
+#[inline(always)]
 fn read_varint_long(buf: &[u8]) -> Result<(u64, usize)> {
     let Some(&b2) = buf.get(2) else {
         mark_unlikely();
