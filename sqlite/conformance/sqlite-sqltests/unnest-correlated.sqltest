@@ -1,5 +1,39 @@
 @database :memory:
 
+# Review task list for PR 8184. Each reported SQL bug names its test.
+# The last two items are code review notes that do not change SQL results.
+# INFO 5193112247: the broad planning-time question is covered by the concrete
+# reports 5196246768 and 5197077223 below.
+# DONE 5196202658: update-from-correlated-subquery-keeps-order in update-from.sqltest.
+# DONE 5196209784: one-value-table-function-keeps-arguments.
+# DONE 5196224385: one-value-two-outer-links-in-filter.
+# DONE 5196238752: one-value-outer-rowid-filter, one-value-outer-rowid-link,
+# one-value-outer-rowid-in-result, and one-value-outer-rowid-in-input.
+# DONE 5196246768: deep-correlated-subqueries-prepare-once.
+# DONE 5196256427: two-exists-use-two-semi-joins.
+# DONE 5196261314: outer-filter-keeps-exists-semi-join and indexed-average-uses-outer-row-count.
+# DONE 5196264171: one-value-result-has-no-text-order.
+# DONE 5196280630: one-value-does-not-sum-unused-group,
+# one-value-does-not-read-unused-bad-json, one-value-does-not-filter-unused-bad-json,
+# and one-value-empty-outer-does-not-sum.
+# DONE 5196348701: grouped-seek-does-not-copy-unused-columns,
+# unnested-in-reuses-unused-cursor, and grouped-aggregate-reuses-unused-result-register.
+# DONE 5196372619: exists-after-full-join.
+# DONE 5196378560: one-value-does-not-read-unused-bad-json.
+# DONE 5196670948: in-under-select-with-no-from.
+# DONE 5196703992: exists-linked-past-full-join and not-exists-linked-past-full-join.
+# DONE 5196818373: outer-filter-keeps-exists-semi-join.
+# DONE 5196839498: grouped-subquery-builds-once in the subquery snapshot tests.
+# DONE 5196856489: limit-one-keeps-correlated-in.
+# DONE 5197077223: PR 8186 caches repeated join searches. The
+# subquery_two_correlated_wide_join benchmark keeps this case measured.
+# DONE 5197083580: indexed-average-uses-outer-row-count.
+# DONE 5197089834: two-identical-averages-use-one-grouped-table.
+# DONE 5197384826: one-value-not-in-empty-keeps-missing-group and
+# one-value-not-in-empty-delete-removes-missing-group.
+# DONE 3723812243: code review; table mask allocation errors are returned.
+# DONE 3723822351: code review; query shape is checked before a child plan is copied.
+
 setup correlated_rows {
     CREATE TABLE outer_rows(
         id INTEGER PRIMARY KEY,
