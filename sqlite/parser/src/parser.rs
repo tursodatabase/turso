@@ -3320,6 +3320,32 @@ impl<'a> Parser<'a> {
         let body = self.parse_select_body()?;
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
+        if !order_by.is_empty() || limit.is_some() {
+            if let Some(tok) = self.peek()? {
+                let op_name = match tok.token_type {
+                    TK_UNION => {
+                        eat_assert!(self, TK_UNION);
+                        match self.peek()? {
+                            Some(tok) if tok.token_type == TK_ALL => "UNION ALL",
+                            _ => "UNION",
+                        }
+                    }
+                    TK_EXCEPT => "EXCEPT",
+                    TK_INTERSECT => "INTERSECT",
+                    _ => "",
+                };
+                if !op_name.is_empty() {
+                    let clause = if order_by.is_empty() {
+                        "LIMIT"
+                    } else {
+                        "ORDER BY"
+                    };
+                    return Err(Error::Custom(format!(
+                        "{clause} clause should come after {op_name} not before"
+                    )));
+                }
+            }
+        }
         Ok(Select {
             with,
             body,

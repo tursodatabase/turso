@@ -506,7 +506,7 @@ set test_files {
   selectB              fail
   selectC              pass
   selectD              fail
-  selectE              fail
+  selectE              pass
   selectF              pass
   selectG              skip {hangs on an INSERT with a 100,000-entry VALUES clause}
   selectH              fail
@@ -543,7 +543,7 @@ set test_files {
   strict2              fail
   subjournal           fail
   subquery             fail
-  subquery2            fail
+  subquery2            pass
   subselect            fail
   substr               fail
   subtype1             fail
