@@ -237,31 +237,49 @@ fn test_current_setting_and_set_config_are_per_session(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_set_config_is_local_errors_instead_of_leaking_session_scope(db: TempDatabase) {
+fn test_set_config_is_local_scopes_to_the_transaction(db: TempDatabase) {
     let conn = db.connect_postgres();
 
-    // PostgreSQL scopes is_local = true to the transaction (SET LOCAL).
-    // The frontend has no transaction-scoped GUCs yet, so it must error
-    // rather than silently applying session scope.
-    let mut stmt = conn
-        .query("SELECT set_config('application_name', 'x', true)")
-        .unwrap()
-        .unwrap();
-    let err = loop {
-        match stmt.step() {
-            Err(e) => break e,
-            Ok(StepResult::Done) => panic!("set_config with is_local = true must error"),
-            Ok(_) => {}
-        }
-    };
-    assert!(
-        err.to_string().contains("is_local"),
-        "unexpected error: {err}"
+    // Outside a transaction block the value would revert as soon as the
+    // statement's implicit transaction ends: the call reports the value
+    // but must not leak it into the session.
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('application_name', 'x', true)"),
+        ["x"]
     );
-
-    // The failed call must not have changed the session value.
     assert_eq!(
         query_text(&conn, "SELECT current_setting('application_name')"),
         [""]
     );
+
+    // Inside a transaction the value holds until COMMIT, then reverts to
+    // the session value.
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('application_name', 'y', true)"),
+        ["y"]
+    );
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('application_name')"),
+        ["y"]
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('application_name')"),
+        [""]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_set_local_search_path_errors_instead_of_acting_session_wide(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    // The live search path has no transaction-local overlay; erroring
+    // beats silently changing it for the whole session.
+    conn.execute("BEGIN").unwrap();
+    let err = conn
+        .query("SET LOCAL search_path = public")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("SET LOCAL search_path"), "unexpected: {err}");
 }

@@ -227,3 +227,72 @@ test pg-settings-unknown-name-is-no-rows {
 expect {
     0
 }
+
+test guc-set-local-reverts-on-commit {
+    BEGIN;
+    SET LOCAL extra_float_digits = 3;
+    SELECT current_setting('extra_float_digits');
+    COMMIT;
+    SELECT current_setting('extra_float_digits');
+}
+expect {
+    3
+    1
+}
+
+test guc-set-local-reverts-on-rollback {
+    SET extra_float_digits = 2;
+    BEGIN;
+    SET LOCAL extra_float_digits = 3;
+    SELECT current_setting('extra_float_digits');
+    ROLLBACK;
+    SHOW extra_float_digits;
+}
+expect {
+    3
+    2
+}
+
+test guc-set-local-outside-transaction-has-no-lasting-effect {
+    SET LOCAL extra_float_digits = 3;
+    SHOW extra_float_digits;
+}
+expect {
+    1
+}
+
+test guc-plain-set-overrides-earlier-set-local {
+    BEGIN;
+    SET LOCAL extra_float_digits = 3;
+    SET extra_float_digits = 2;
+    SELECT current_setting('extra_float_digits');
+    COMMIT;
+    SHOW extra_float_digits;
+}
+expect {
+    2
+    2
+}
+
+test guc-set-config-local-in-transaction {
+    BEGIN;
+    SELECT set_config('extra_float_digits', '3', true);
+    SELECT current_setting('extra_float_digits');
+    COMMIT;
+    SELECT current_setting('extra_float_digits');
+}
+expect {
+    3
+    3
+    1
+}
+
+test guc-set-local-shows-in-pg-settings {
+    BEGIN;
+    SET LOCAL extra_float_digits = 3;
+    SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+    COMMIT;
+}
+expect {
+    3|session
+}

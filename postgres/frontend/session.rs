@@ -39,6 +39,12 @@ pub(crate) struct SessionState {
     /// Session GUCs set via `SET`, keyed by lowercased name. Values fall
     /// back to [`GUC_DEFAULTS`] when unset.
     gucs: std::collections::HashMap<String, String>,
+    /// GUCs set via `SET LOCAL` or `set_config(..., is_local => true)`,
+    /// layered over `gucs` until the transaction ends. The frontend has no
+    /// commit hook, so readers sweep this lazily: every GUC access that can
+    /// see the connection clears it once the connection is back in
+    /// autocommit (see [`SessionState::clear_txn_gucs`] call sites).
+    txn_gucs: std::collections::HashMap<String, String>,
 }
 
 impl SessionState {
@@ -51,6 +57,9 @@ impl SessionState {
             } else {
                 self.search_path.join(", ")
             });
+        }
+        if let Some(value) = self.txn_gucs.get(lower_name) {
+            return Some(value.clone());
         }
         if let Some(value) = self.gucs.get(lower_name) {
             return Some(value.clone());
@@ -76,6 +85,9 @@ impl SessionState {
                 .guc_value(lower_name)
                 .expect("search_path always resolves");
         }
+        // A plain SET or RESET takes effect immediately even after an
+        // earlier SET LOCAL of the same name, the way PostgreSQL behaves.
+        self.txn_gucs.remove(lower_name);
         match value {
             Some(v) => {
                 let v = canonicalize_guc(lower_name, v);
@@ -87,6 +99,38 @@ impl SessionState {
                 self.guc_value(lower_name).unwrap_or_default()
             }
         }
+    }
+
+    /// Set (Some) or reset-to-default (None) a parameter for the rest of
+    /// the current transaction, returning the value SHOW displays. The
+    /// session value underneath is untouched, so dropping the overlay at
+    /// transaction end restores it for commit and rollback alike.
+    pub(crate) fn set_local_guc(&mut self, lower_name: &str, value: Option<String>) -> String {
+        match value {
+            Some(v) => {
+                let v = canonicalize_guc(lower_name, v);
+                self.txn_gucs.insert(lower_name.to_string(), v.clone());
+                v
+            }
+            None => match guc_default(lower_name) {
+                Some((_, default)) => {
+                    self.txn_gucs
+                        .insert(lower_name.to_string(), default.to_string());
+                    default.to_string()
+                }
+                None => {
+                    self.txn_gucs.remove(lower_name);
+                    self.guc_value(lower_name).unwrap_or_default()
+                }
+            },
+        }
+    }
+
+    /// Drop every SET LOCAL value. Called by GUC readers once the
+    /// connection is back in autocommit, which is how transaction end is
+    /// observed.
+    pub(crate) fn clear_txn_gucs(&mut self) {
+        self.txn_gucs.clear();
     }
 }
 
@@ -111,7 +155,10 @@ impl SessionState {
         let mut rows: Vec<PgSettingRow> = GUC_DEFAULTS
             .iter()
             .map(|def| {
-                let session_value = self.gucs.get(def.name);
+                let session_value = self
+                    .txn_gucs
+                    .get(def.name)
+                    .or_else(|| self.gucs.get(def.name));
                 PgSettingRow {
                     name: def.display_name.to_string(),
                     setting: session_value
@@ -148,10 +195,18 @@ impl SessionState {
             boot_val: Some("\"$user\", public".to_string()),
             reset_val: "\"$user\", public".to_string(),
         });
-        for (name, value) in &self.gucs {
-            if guc_default(name).is_some() {
-                continue;
-            }
+        let custom_names: std::collections::BTreeSet<&String> = self
+            .gucs
+            .keys()
+            .chain(self.txn_gucs.keys())
+            .filter(|name| guc_default(name).is_none())
+            .collect();
+        for name in custom_names {
+            let value = self
+                .txn_gucs
+                .get(name)
+                .or_else(|| self.gucs.get(name))
+                .expect("custom names come from these maps");
             // Customized (dotted) parameters exist only once set;
             // PostgreSQL presents them as user-context strings.
             rows.push(PgSettingRow {
@@ -380,10 +435,12 @@ impl PgConnection {
     /// Current extra_float_digits setting; drives float8 text output.
     /// PostgreSQL's default of 1 means shortest-roundtrip formatting.
     pub fn extra_float_digits(&self) -> i32 {
-        let state = self.inner.session_state.lock().unwrap();
+        let mut state = self.inner.session_state.lock().unwrap();
+        if self.inner.conn.get_auto_commit() {
+            state.clear_txn_gucs();
+        }
         state
-            .gucs
-            .get("extra_float_digits")
+            .guc_value("extra_float_digits")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1)
     }
@@ -601,6 +658,12 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         ));
     }
 
+    // Autocommit means any transaction that held SET LOCAL values has
+    // ended; drop them before this statement can observe them.
+    if pg_conn.conn.get_auto_commit() {
+        pg_conn.session_state.lock().unwrap().clear_txn_gucs();
+    }
+
     reject_sqlite_catalog_access(sql)?;
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
@@ -741,6 +804,9 @@ fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Resu
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
     let name = set_stmt.name.to_lowercase();
+    if set_stmt.local {
+        return handle_pg_set_local(pg_conn, set_stmt, &name);
+    }
     match set_stmt.kind {
         PgSetKind::Value if name == "search_path" => {
             let path = set_stmt
@@ -781,10 +847,55 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     noop_statement(&pg_conn.conn)
 }
 
+/// SET LOCAL: the setting lasts until the end of the current transaction.
+/// Outside a transaction block PostgreSQL warns and applies nothing, so
+/// this is a no-op there. The live search path has no transaction-local
+/// overlay, so SET LOCAL search_path errors instead of silently acting
+/// session-wide.
+fn handle_pg_set_local(
+    pg_conn: &Arc<PgConnectionInner>,
+    set_stmt: &PgSetStmt,
+    lower_name: &str,
+) -> Result<Statement> {
+    if lower_name == "search_path" {
+        return Err(LimboError::ParseError(
+            "SET LOCAL search_path is not supported".to_string(),
+        ));
+    }
+    if !pg_conn.conn.get_auto_commit() {
+        let mut state = pg_conn.session_state.lock().unwrap();
+        match set_stmt.kind {
+            PgSetKind::Value => {
+                if set_stmt.values.is_empty() {
+                    return Err(LimboError::ParseError(format!(
+                        "SET {}: no value provided",
+                        set_stmt.name
+                    )));
+                }
+                let value = set_stmt
+                    .values
+                    .iter()
+                    .map(guc_value_text)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                state.set_local_guc(lower_name, Some(value));
+            }
+            PgSetKind::Reset => {
+                state.set_local_guc(lower_name, None);
+            }
+            // The grammar has no LOCAL form of RESET ALL.
+            PgSetKind::ResetAll => {
+                state.clear_txn_gucs();
+            }
+        }
+    }
+    noop_statement(&pg_conn.conn)
+}
+
 /// GUCs whose values SHOW displays in canonical PostgreSQL form. Booleans
 /// display as on/off however they were spelled; DateStyle tokens display in
 /// PostgreSQL's casing (unquoted SQL identifiers arrive lowercased).
-fn canonicalize_guc(lower_name: &str, value: String) -> String {
+pub(crate) fn canonicalize_guc(lower_name: &str, value: String) -> String {
     const BOOL_GUCS: &[&str] = &["standard_conforming_strings", "synchronous_commit"];
     if BOOL_GUCS.contains(&lower_name) {
         return match value.to_lowercase().as_str() {

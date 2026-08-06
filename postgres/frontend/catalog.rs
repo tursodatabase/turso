@@ -3050,7 +3050,13 @@ struct PgSettingsCursor {
 impl PgSettingsCursor {
     fn load_settings(&mut self) {
         let snapshot = match crate::session::session_state_of(&self.conn) {
-            Some(state) => state.lock().unwrap().settings_snapshot(),
+            Some(state) => {
+                let mut state = state.lock().unwrap();
+                if self.conn.get_auto_commit() {
+                    state.clear_txn_gucs();
+                }
+                state.settings_snapshot()
+            }
             None => crate::session::SessionState::default().settings_snapshot(),
         };
         let opt_text = |v: Option<&'static str>| match v {

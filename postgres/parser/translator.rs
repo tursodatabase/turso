@@ -4620,6 +4620,9 @@ pub struct PgSetStmt {
     pub name: String,
     pub values: Vec<PgSetValue>,
     pub kind: PgSetKind,
+    /// True for `SET LOCAL`: the setting lasts until the end of the
+    /// current transaction.
+    pub local: bool,
 }
 
 /// Which form of SET/RESET the statement is.
@@ -4735,6 +4738,7 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         name: set_stmt.name.clone(),
         values,
         kind,
+        local: set_stmt.is_local,
     })
 }
 

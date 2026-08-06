@@ -385,7 +385,11 @@ fn exec_current_setting(conn: &Connection, args: &[Value]) -> Result<Value> {
     };
     let missing_ok = args.get(1).is_some_and(value_is_true);
     let store = guc_store(conn)?;
-    let value = store.lock().unwrap().guc_value(&name);
+    let mut state = store.lock().unwrap();
+    if conn.get_auto_commit() {
+        state.clear_txn_gucs();
+    }
+    let value = state.guc_value(&name);
     match value {
         Some(value) => Ok(Value::build_text(value)),
         None if missing_ok => Ok(Value::Null),
@@ -396,10 +400,11 @@ fn exec_current_setting(conn: &Connection, args: &[Value]) -> Result<Value> {
 }
 
 /// PostgreSQL's set_config(name, value, is_local): set a configuration
-/// parameter for the session and return the value it now displays as. A
-/// NULL value resets the parameter to its default. is_local = true means
-/// transaction-scoped (SET LOCAL), which the frontend does not support
-/// yet; it errors rather than silently applying session scope.
+/// parameter and return the value it now displays as. A NULL value resets
+/// the parameter to its default. is_local = true scopes the value to the
+/// current transaction (SET LOCAL); outside a transaction block it would
+/// revert as soon as the statement's implicit transaction ends, so
+/// nothing is stored and the would-be value is returned.
 fn exec_set_config(conn: &Connection, args: &[Value]) -> Result<Value> {
     let name = match args.first() {
         Some(Value::Null) | None => {
@@ -410,9 +415,10 @@ fn exec_set_config(conn: &Connection, args: &[Value]) -> Result<Value> {
         Some(Value::Text(t)) => t.as_str().to_lowercase(),
         Some(other) => other.to_string().to_lowercase(),
     };
-    if args.get(2).is_some_and(value_is_true) {
+    let is_local = args.get(2).is_some_and(value_is_true);
+    if is_local && name == "search_path" {
         return Err(LimboError::ParseError(
-            "set_config with is_local = true is not supported".to_string(),
+            "SET LOCAL search_path is not supported".to_string(),
         ));
     }
     let value = match args.get(1) {
@@ -421,7 +427,23 @@ fn exec_set_config(conn: &Connection, args: &[Value]) -> Result<Value> {
         Some(other) => Some(other.to_string()),
     };
     let store = guc_store(conn)?;
-    let displayed = store.lock().unwrap().set_guc(&name, value);
+    let mut state = store.lock().unwrap();
+    if conn.get_auto_commit() {
+        state.clear_txn_gucs();
+    }
+    let displayed = if is_local {
+        if conn.get_auto_commit() {
+            // No transaction block: report the value without storing it.
+            match value {
+                Some(v) => crate::session::canonicalize_guc(&name, v),
+                None => state.guc_value(&name).unwrap_or_default(),
+            }
+        } else {
+            state.set_local_guc(&name, value)
+        }
+    } else {
+        state.set_guc(&name, value)
+    };
     Ok(Value::build_text(displayed))
 }
 
