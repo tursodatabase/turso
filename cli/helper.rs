@@ -4,7 +4,6 @@ use rustyline::completion::{extract_word, Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::HistoryHinter;
 use rustyline::{Completer, Helper, Hinter, Validator};
-use shlex::Shlex;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use turso_core::Connection;
 
 use crate::commands::CommandParser;
 use crate::config::{HighlightConfig, CONFIG_DIR};
+use crate::dot_command::tokenize_dot_command;
 
 macro_rules! try_result {
     ($expr:expr, $err:expr) => {
@@ -163,14 +163,7 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
 
         let (prefix_pos, _) = extract_word(line, pos, ESCAPE_CHAR, default_break_chars);
 
-        let args = Shlex::new(line);
-        let mut args = std::iter::once("".to_owned())
-            .chain(args)
-            .map(OsString::from)
-            .collect::<Vec<_>>();
-        if line.ends_with(' ') {
-            args.push(OsString::new());
-        }
+        let args = dot_completion_args(line);
         let arg_index = args.len() - 1;
         // dbg!(&pos, line, &args, arg_index);
 
@@ -227,6 +220,17 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
     }
 }
 
+fn dot_completion_args(line: &str) -> Vec<OsString> {
+    let (tokens, unterminated_quote) = tokenize_dot_command(line);
+    let mut args = std::iter::once(OsString::new())
+        .chain(tokens.into_iter().map(OsString::from))
+        .collect::<Vec<_>>();
+    if line.ends_with(char::is_whitespace) && unterminated_quote.is_none() {
+        args.push(OsString::new());
+    }
+    args
+}
+
 // Got this from the FilenameCompleter.
 // TODO have to see what chars break words in Sqlite
 cfg_if::cfg_if! {
@@ -272,5 +276,33 @@ impl<C: Parser + Send + Sync + 'static> Completer for SqlCompleter<C> {
         } else {
             self.sql_completion(line, pos)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dot_completion_args;
+
+    fn args(line: &str) -> Vec<String> {
+        dot_completion_args(line)
+            .into_iter()
+            .map(|arg| arg.into_string().expect("test arguments must be UTF-8"))
+            .collect()
+    }
+
+    #[test]
+    fn completion_keeps_trailing_whitespace_in_open_quote() {
+        assert_eq!(
+            args(r#"read "C:\Users\Jane Doe "#),
+            vec!["", "read", r"C:\Users\Jane Doe "]
+        );
+    }
+
+    #[test]
+    fn completion_starts_new_argument_after_closed_quote() {
+        assert_eq!(
+            args(r#"open "C:\Users\Jane Doe\test.db" "#),
+            vec!["", "open", r"C:\Users\Jane Doe\test.db", ""]
+        );
     }
 }

@@ -53,7 +53,7 @@ stacker = ["dep:stacker"]
 percentile = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = [
+windows-sys = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",

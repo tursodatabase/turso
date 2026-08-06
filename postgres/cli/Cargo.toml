@@ -40,10 +40,17 @@ limbo_completion = { workspace = true, features = ["static"] }
 cfg-if = { workspace = true }
 ctrlc = "3.4.4"
 libc = "0.2.172"
-shlex = "1.3.0"
 clap_complete = { version = "=4.5.47", features = ["unstable-dynamic"] }
 itertools.workspace = true
 mimalloc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+] }
 
 [features]
 default = ["io_uring", "mimalloc"]
