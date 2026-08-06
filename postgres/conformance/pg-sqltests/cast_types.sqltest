@@ -1,0 +1,80 @@
+# A cast says what type its result is, and that has to reach the client.
+#
+# Cast target types used to be flattened to the engine's storage — `date` and
+# `timestamp` to TEXT — before the statement was built. Two things followed:
+# the cast validated nothing (`'not-a-date'::date` was accepted), and a client
+# was told the column was text, so per-type output settings like DateStyle
+# never applied to it.
+#
+# `json`, `boolean`, `uuid` and `jsonb` casts still flatten. See
+# pg-sqltests/boolean_input.sqltest for how `::boolean` gets its value right
+# without the cast.
+
+@database :memory:
+
+test date-cast-validates-its-input {
+    SELECT 'not-a-date'::date;
+}
+expect error {
+    ^.*invalid date.*$
+}
+
+test timestamp-cast-validates-its-input {
+    SELECT 'nonsense'::timestamp;
+}
+expect error {
+    ^.*invalid.*$
+}
+
+test date-cast-keeps-a-valid-value {
+    SELECT '1997-02-10'::date;
+}
+expect {
+    1997-02-10
+}
+
+# DateStyle applies to a cast now that the cast reports a date. It only ever
+# reached declared date columns before.
+test datestyle-applies-to-a-date-cast {
+    SET DateStyle = 'German';
+    SELECT '1997-02-10'::date;
+}
+expect {
+    10.02.1997
+}
+
+test datestyle-applies-to-a-timestamp-cast {
+    SET DateStyle = 'SQL, DMY';
+    SELECT '1997-02-10 17:32:01'::timestamp;
+}
+expect {
+    10/02/1997 17:32:01
+}
+
+test datestyle-iso-leaves-a-cast-alone {
+    SET DateStyle = 'ISO, MDY';
+    SELECT '1997-02-10'::date;
+}
+expect {
+    1997-02-10
+}
+
+# A cast in a bigger expression still carries its type outwards where the
+# engine can see it, and casting a column works the same as casting a literal.
+test date-cast-of-a-column {
+    CREATE TABLE raw_dates (s text);
+    INSERT INTO raw_dates VALUES ('2001-12-27');
+    SET DateStyle = 'German';
+    SELECT s::date FROM raw_dates;
+}
+expect {
+    27.12.2001
+}
+
+# Types that still flatten must keep working rather than error.
+test text-and-numeric-casts-still-work {
+    SELECT 42::text, '42'::integer, '4.5'::double precision, 'abc'::varchar;
+}
+expect {
+    42|42|4.5|abc
+}

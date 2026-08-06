@@ -1163,9 +1163,45 @@ impl Statement {
                 kind,
             }));
         }
+        // A cast states the type of its result, which beats anything guessed
+        // from the expression's shape: report the type that was asked for,
+        // resolved through the type registry the same way a declared column
+        // is. Without this a `CAST(x AS date)` describes itself by its storage
+        // and reaches a client as text.
+        if let turso_parser::ast::Expr::Cast {
+            type_name: Some(ty),
+            ..
+        } = &column.expr
+        {
+            let schema = self.program.connection.schema.read();
+            let resolved = schema.resolve_type(&ty.name, false).ok().flatten();
+            let (base_type, kind) = match resolved {
+                Some(resolved) => {
+                    let leaf = resolved.leaf();
+                    let kind = if leaf.is_struct() {
+                        ColumnTypeKind::Struct
+                    } else if leaf.is_union() {
+                        ColumnTypeKind::Union
+                    } else if leaf.is_domain {
+                        ColumnTypeKind::Domain
+                    } else {
+                        ColumnTypeKind::Custom
+                    };
+                    (Some(resolved.primitive.to_uppercase()), kind)
+                }
+                None => (None, ColumnTypeKind::Builtin),
+            };
+            drop(schema);
+            return Ok(Some(ColumnTypeInfo {
+                declared_name: ty.name.clone(),
+                array_dimensions: ty.array_dimensions,
+                base_type,
+                kind,
+            }));
+        }
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
-        // op, the CAST target, etc.).
+        // op, etc.).
         let Some(name) =
             infer_expression_primitive(&column.expr, Some(&self.program.table_references))
         else {

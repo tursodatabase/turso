@@ -56,7 +56,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of the first table only; CASCADE / RESTART IDENTITY dropped |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation-level and READ ONLY/WRITE options accepted but ignored |
-| Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
+| Casts (`expr::type`, CAST) | 🟡 Partial | Also `int4(x)`-style cast functions. Casts to `date`/`time`/`timestamp`/`timestamptz` validate their input and report their type, so DateStyle applies to them. `boolean` validates but reports as an integer; `uuid`, `jsonb`, `json`, `numeric` and the integer widths cast by storage affinity without validating |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
 | Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; `~*`/`!~*` are case-insensitive |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |

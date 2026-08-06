@@ -2255,14 +2255,11 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
                 let expr = Box::new(self.translate_expr(arg)?);
-                let type_name = type_cast
-                    .type_name
-                    .as_ref()
-                    .and_then(pg_type_name_to_ast_type);
-                // `boolean` is stored as an integer, and a plain cast would
-                // reach that storage directly — turning every string into 0,
-                // so `'true'::boolean` came out false. Read it the way
-                // PostgreSQL's boolean input does instead.
+                // boolean is stored as an integer, and a plain cast reaches
+                // that storage directly — reading `'true'` as a number and
+                // giving false. Casting to the boolean type would read it
+                // properly but cannot be emitted safely yet (see above), so
+                // call the same input function the write path uses.
                 let casts_to_boolean = type_cast
                     .type_name
                     .as_ref()
@@ -2281,6 +2278,10 @@ impl PostgreSQLTranslator {
                         },
                     });
                 }
+                let type_name = type_cast
+                    .type_name
+                    .as_ref()
+                    .and_then(pg_type_name_to_ast_type);
                 Ok(ast::Expr::Cast { expr, type_name })
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
@@ -4508,12 +4509,27 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        // For CAST expressions, map all text-like PG types to TEXT and
-        // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "DATE" | "TIME" | "TIMETZ"
-        | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL" | "INET" | "JSON" | "JSONB" | "XML" | "CIDR"
-        | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        // The date/time types the engine has as real types keep their name, so
+        // the cast validates its input and tells a client what it produced.
+        // Flattening them to TEXT left `x::date` looking like text on the
+        // wire, so DateStyle never reached it.
+        "DATE" => "date",
+        "TIME" | "TIMETZ" => "time",
+        "TIMESTAMP" => "timestamp",
+        "TIMESTAMPTZ" => "timestamptz",
+        // The rest still flatten:
+        //   - boolean and json would be right, but their encode function is a
+        //     bare function call, and emitting one for a cast inside a WHERE
+        //     or GROUP BY trips an engine bug that leaves a loop reading an
+        //     unopened cursor. `::boolean` is handled below instead.
+        //   - uuid and jsonb are stored as blobs, so casting to them changes
+        //     the value's representation: `DEFAULT '{}'::jsonb` would put a
+        //     blob in a text column.
+        //   - numeric and the integer widths carry precision rules of their
+        //     own, and varchar needs its length.
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "JSON" | "JSONB"
+        | "INTERVAL" | "INET" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR"
+        | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => return None,
     };
