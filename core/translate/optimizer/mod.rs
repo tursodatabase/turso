@@ -1496,7 +1496,10 @@ fn plan_correlated_subqueries(
     subquery_calls: &[(TableInternalId, f64)],
 ) -> Result<()> {
     for subquery in &mut plan.non_from_clause_subqueries {
-        if !subquery.correlated {
+        // Write statements plan their subqueries while the statement is built.
+        // Planning them again can reuse changed fields such as an ORDER BY that
+        // the first plan removed.
+        if !subquery.correlated || subquery.origin.is_write_statement() {
             continue;
         }
         let call_count = subquery_calls
