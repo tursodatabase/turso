@@ -45,6 +45,12 @@ pub(crate) struct SessionState {
     /// see the connection clears it once the connection is back in
     /// autocommit (see [`SessionState::clear_txn_gucs`] call sites).
     txn_gucs: std::collections::HashMap<String, String>,
+    /// GUCs the client supplied in the wire StartupMessage. A layer under
+    /// `gucs` rather than an insert into it because PostgreSQL treats
+    /// client-sourced values as the session's reset point: RESET (and
+    /// RESET ALL) restores these, not the built-in defaults, and
+    /// pg_settings reports their source as "client".
+    startup_gucs: std::collections::HashMap<String, String>,
 }
 
 impl SessionState {
@@ -62,6 +68,9 @@ impl SessionState {
             return Some(value.clone());
         }
         if let Some(value) = self.gucs.get(lower_name) {
+            return Some(value.clone());
+        }
+        if let Some(value) = self.startup_gucs.get(lower_name) {
             return Some(value.clone());
         }
         guc_default(lower_name).map(|(_, default)| default.to_string())
@@ -132,6 +141,22 @@ impl SessionState {
     pub(crate) fn clear_txn_gucs(&mut self) {
         self.txn_gucs.clear();
     }
+
+    /// Record one client-supplied StartupMessage parameter. The live
+    /// search path is seeded directly (it has no reset point to preserve);
+    /// everything else becomes the session's client-sourced reset value.
+    pub(crate) fn set_startup_guc(&mut self, lower_name: &str, value: String) {
+        if lower_name == "search_path" {
+            self.search_path = value
+                .split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect();
+            return;
+        }
+        let value = canonicalize_guc(lower_name, value);
+        self.startup_gucs.insert(lower_name.to_string(), value);
+    }
 }
 
 /// The session-dependent fields of one pg_settings row.
@@ -159,22 +184,28 @@ impl SessionState {
                     .txn_gucs
                     .get(def.name)
                     .or_else(|| self.gucs.get(def.name));
+                let startup_value = self.startup_gucs.get(def.name);
                 PgSettingRow {
                     name: def.display_name.to_string(),
                     setting: session_value
+                        .or(startup_value)
                         .cloned()
                         .unwrap_or_else(|| def.default.to_string()),
                     context: def.context,
                     vartype: def.vartype,
                     source: if session_value.is_some() {
                         "session"
+                    } else if startup_value.is_some() {
+                        "client"
                     } else {
                         "default"
                     },
                     min_val: def.min_val,
                     max_val: def.max_val,
                     boot_val: Some(def.default.to_string()),
-                    reset_val: def.default.to_string(),
+                    reset_val: startup_value
+                        .cloned()
+                        .unwrap_or_else(|| def.default.to_string()),
                 }
             })
             .collect();
@@ -199,13 +230,14 @@ impl SessionState {
             .gucs
             .keys()
             .chain(self.txn_gucs.keys())
+            .chain(self.startup_gucs.keys())
             .filter(|name| guc_default(name).is_none())
             .collect();
         for name in custom_names {
-            let value = self
-                .txn_gucs
-                .get(name)
-                .or_else(|| self.gucs.get(name))
+            let session_value = self.txn_gucs.get(name).or_else(|| self.gucs.get(name));
+            let startup_value = self.startup_gucs.get(name);
+            let value = session_value
+                .or(startup_value)
                 .expect("custom names come from these maps");
             // Customized (dotted) parameters exist only once set;
             // PostgreSQL presents them as user-context strings.
@@ -214,16 +246,43 @@ impl SessionState {
                 setting: value.clone(),
                 context: "user",
                 vartype: "string",
-                source: "session",
+                source: if session_value.is_some() {
+                    "session"
+                } else {
+                    "client"
+                },
                 min_val: None,
                 max_val: None,
                 boot_val: None,
-                reset_val: value.clone(),
+                reset_val: startup_value.unwrap_or(value).clone(),
             });
         }
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         rows
     }
+}
+
+/// Extracts `name=value` settings from a StartupMessage `options`
+/// parameter, which uses server command-line syntax: `-c name=value`
+/// (space after -c optional) and `--name=value`. Tokens that are not
+/// settings are skipped; a connection must not fail over an option we
+/// would ignore at runtime anyway.
+fn parse_startup_options(options: &str) -> Vec<(String, String)> {
+    let mut settings = Vec::new();
+    let mut tokens = options.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let assignment = if token == "-c" {
+            tokens.next()
+        } else {
+            token
+                .strip_prefix("--")
+                .or_else(|| token.strip_prefix("-c"))
+        };
+        if let Some((name, value)) = assignment.and_then(|a| a.split_once('=')) {
+            settings.push((name.to_lowercase(), value.to_string()));
+        }
+    }
+    settings
 }
 
 /// The PostgreSQL session state attached to a core connection, present on
@@ -443,6 +502,29 @@ impl PgConnection {
             .guc_value("extra_float_digits")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1)
+    }
+
+    /// Seeds the session from the client's StartupMessage run-time
+    /// parameters. Everything except the connection-establishment keys is
+    /// a configuration parameter; `options` carries command-line style
+    /// `-c name=value` pairs.
+    pub fn init_startup_parameters<'a>(
+        &self,
+        params: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) {
+        let mut state = self.inner.session_state.lock().unwrap();
+        for (name, value) in params {
+            let lower = name.to_lowercase();
+            match lower.as_str() {
+                "user" | "database" | "replication" => {}
+                "options" => {
+                    for (opt_name, opt_value) in parse_startup_options(value) {
+                        state.set_startup_guc(&opt_name, opt_value);
+                    }
+                }
+                _ => state.set_startup_guc(&lower, value.to_string()),
+            }
+        }
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {

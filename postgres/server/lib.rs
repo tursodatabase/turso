@@ -20,6 +20,7 @@ use pgwire::messages::copy::{CopyData, CopyDone};
 use pgwire::messages::PgWireBackendMessage;
 use std::fmt::Debug;
 
+use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
@@ -28,9 +29,10 @@ use pgwire::api::results::{
     QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
+use pgwire::messages::PgWireFrontendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -181,6 +183,39 @@ impl TursoPgHandler {
     }
 }
 
+/// Seeds the session's configuration from the run-time parameters the
+/// client sent in the StartupMessage (psql sends application_name, JDBC
+/// sends extra_float_digits, poolers pass `options`), then proceeds with
+/// the no-auth handshake.
+struct TursoPgStartupHandler {
+    conn: Arc<Mutex<PgConnection>>,
+}
+
+#[async_trait]
+impl NoopStartupHandler for TursoPgStartupHandler {
+    async fn post_startup<C>(
+        &self,
+        _client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let PgWireFrontendMessage::Startup(startup) = &message {
+            let conn = self.conn.lock().unwrap();
+            conn.init_startup_parameters(
+                startup
+                    .parameters
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            );
+        }
+        Ok(())
+    }
+}
+
 struct TursoPgFactory {
     handler: Arc<TursoPgHandler>,
 }
@@ -195,7 +230,9 @@ impl PgWireServerHandlers for TursoPgFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(NoopHandler)
+        Arc::new(TursoPgStartupHandler {
+            conn: self.handler.conn.clone(),
+        })
     }
 
     fn copy_handler(&self) -> Arc<impl CopyHandler> {
