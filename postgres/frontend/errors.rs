@@ -51,6 +51,11 @@ pub fn pg_error(e: &LimboError, sql: &str) -> PgErrorInfo {
         LimboError::InvalidDate(msg) | LimboError::InvalidTime(msg) => {
             PgErrorInfo::new("22007", format!("Parse error: {msg}"))
         }
+        // A message already in PostgreSQL's own wording is surfaced as-is;
+        // prefixing it would stop any golden file from matching.
+        LimboError::ConversionError(msg) if msg.starts_with("invalid input syntax for type ") => {
+            PgErrorInfo::new("22P02", msg.clone())
+        }
         LimboError::ConversionError(msg) => {
             PgErrorInfo::new("22P02", format!("Conversion error: {msg}"))
         }

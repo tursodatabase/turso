@@ -2259,6 +2259,28 @@ impl PostgreSQLTranslator {
                     .type_name
                     .as_ref()
                     .and_then(pg_type_name_to_ast_type);
+                // `boolean` is stored as an integer, and a plain cast would
+                // reach that storage directly — turning every string into 0,
+                // so `'true'::boolean` came out false. Read it the way
+                // PostgreSQL's boolean input does instead.
+                let casts_to_boolean = type_cast
+                    .type_name
+                    .as_ref()
+                    .and_then(pg_type_name_text)
+                    .is_some_and(|t| t == "BOOLEAN" || t == "BOOL");
+                if casts_to_boolean {
+                    return Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("boolean_to_int"),
+                        distinctness: None,
+                        args: vec![expr],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    });
+                }
                 Ok(ast::Expr::Cast { expr, type_name })
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
@@ -4457,7 +4479,10 @@ fn translate_create_enum(
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types.
-fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
+/// The PostgreSQL type a cast names, e.g. "BOOLEAN" or "DOUBLE PRECISION".
+/// Needed on its own because [`pg_type_name_to_ast_type`] maps several PG
+/// types onto one Turso type, losing which one was asked for.
+fn pg_type_name_text(type_name: &pg_query::protobuf::TypeName) -> Option<String> {
     use pg_query::protobuf::node::Node;
 
     let mut parts = Vec::new();
@@ -4471,9 +4496,13 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     if parts.is_empty() {
         return None;
     }
-    let pg_type = parts.join(" ");
+    Some(parts.join(" ").to_uppercase())
+}
 
-    let name = match pg_type.to_uppercase().as_str() {
+fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
+    let pg_type = pg_type_name_text(type_name)?;
+
+    let name = match pg_type.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
         | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {

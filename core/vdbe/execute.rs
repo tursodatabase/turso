@@ -9951,29 +9951,16 @@ pub fn op_function(
                     Value::Numeric(Numeric::Integer(i)) => match *i {
                         0 => Value::from_i64(0),
                         1 => Value::from_i64(1),
-                        _ => {
-                            return Err(LimboError::Constraint(format!(
-                                "invalid input for type boolean: \"{i}\""
-                            )));
-                        }
+                        _ => return Err(invalid_boolean_input(&i.to_string())),
                     },
                     Value::Text(t) => {
-                        let v = &t.value;
-                        match v.to_ascii_lowercase().as_str() {
-                            "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
-                            "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
-                            _ => {
-                                return Err(LimboError::Constraint(format!(
-                                    "invalid input for type boolean: \"{v}\""
-                                )));
-                            }
+                        let v = t.value.as_ref();
+                        match crate::functions::parse_boolean_text(v) {
+                            Some(b) => Value::from_i64(i64::from(b)),
+                            None => return Err(invalid_boolean_input(v)),
                         }
                     }
-                    other => {
-                        return Err(LimboError::Constraint(format!(
-                            "invalid input for type boolean: \"{other}\""
-                        )));
-                    }
+                    other => return Err(invalid_boolean_input(&other.to_string())),
                 };
                 state.registers[*dest].set_value(result);
             }
@@ -18452,6 +18439,15 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     } else {
         root_page
     }
+}
+
+/// PostgreSQL's wording and class for text that is not boolean input. It is a
+/// bad literal rather than a violated constraint, so it maps to SQLSTATE
+/// 22P02 (invalid_text_representation) via the frontend's error mapping.
+fn invalid_boolean_input(shown: &str) -> LimboError {
+    LimboError::ConversionError(format!(
+        "invalid input syntax for type boolean: \"{shown}\""
+    ))
 }
 
 #[cfg(test)]

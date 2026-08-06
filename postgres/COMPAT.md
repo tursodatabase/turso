@@ -121,6 +121,7 @@ INTEGER. Unknown type names pass through as custom types.
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
 | Array support | ✅ Supported | `type[]` columns, ARRAY[...] literals, subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays |
+| Boolean data type | 🟡 Partial | Columns accept PostgreSQL's full input syntax (`true`/`false`, `t`/`f`, `yes`/`no`, `y`/`n`, `on`/`off`, `1`/`0`, unique prefixes, case- and whitespace-insensitive) and render as `t`/`f`; casts read the same syntax. A boolean *expression* still reports as an integer on the wire, so `SELECT true` shows `1` rather than `t` |
 | ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS] |
 | GUID/UUID data type | ✅ Supported | uuid columns, gen_random_uuid(), input validation, text casts |
 | macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |

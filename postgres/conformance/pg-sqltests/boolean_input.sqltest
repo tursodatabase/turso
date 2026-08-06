@@ -1,0 +1,123 @@
+# Casting text to boolean. PostgreSQL's boolean input accepts `true`/`false`,
+# `t`/`f`, `yes`/`no`, `y`/`n`, `on`/`off` and `1`/`0`, case-insensitively and
+# with surrounding whitespace ignored, plus any unambiguous prefix of the
+# spelled-out words (`tr`, `fal`, `ye`, `of`). `o` is rejected because it
+# could start either `on` or `off`. Anything else is an error.
+#
+# A cast used to reach the boolean type's integer storage directly, so every
+# value came out false — `'true'::boolean` was false and `WHERE flag::boolean`
+# matched nothing.
+#
+# The results are read back through a declared boolean column, which is what
+# gives PostgreSQL's t/f rendering: a boolean *expression* still reports as an
+# integer on the wire, because the engine describes a cast's result by its
+# storage rather than by the type that was asked for.
+
+@database :memory:
+
+test cast-true-spellings-are-all-true {
+    CREATE TABLE t_true (v boolean);
+    INSERT INTO t_true VALUES ('true'::boolean), ('t'::boolean), ('yes'::boolean),
+                              ('y'::boolean), ('on'::boolean), ('1'::boolean);
+    SELECT count(*) FROM t_true WHERE v;
+}
+expect {
+    6
+}
+
+test cast-false-spellings-are-all-false {
+    CREATE TABLE t_false (v boolean);
+    INSERT INTO t_false VALUES ('false'::boolean), ('f'::boolean), ('no'::boolean),
+                               ('n'::boolean), ('off'::boolean), ('0'::boolean);
+    SELECT count(*) FROM t_false WHERE NOT v;
+}
+expect {
+    6
+}
+
+test cast-boolean-input-ignores-case-and-space {
+    CREATE TABLE t_case (v boolean);
+    INSERT INTO t_case VALUES ('TRUE'::boolean), ('True'::boolean),
+                              ('  true  '::boolean), (' YES '::boolean);
+    SELECT count(*) FROM t_case WHERE v;
+}
+expect {
+    4
+}
+
+# PostgreSQL accepts any unambiguous prefix of the spelled-out words.
+test cast-boolean-accepts-unambiguous-prefixes {
+    CREATE TABLE t_pre (v boolean);
+    INSERT INTO t_pre VALUES ('tr'::boolean), ('tru'::boolean), ('ye'::boolean);
+    INSERT INTO t_pre VALUES ('fa'::boolean), ('fals'::boolean), ('of'::boolean);
+    SELECT (SELECT count(*) FROM t_pre WHERE v), (SELECT count(*) FROM t_pre WHERE NOT v);
+}
+expect {
+    3|3
+}
+
+test cast-boolean-rejects-a-word-it-does-not-know {
+    SELECT 'bogus'::boolean;
+}
+expect error {
+    ^invalid input syntax for type boolean: "bogus"$
+}
+
+# `o` is short for both `on` and `off`, so PostgreSQL rejects it.
+test cast-boolean-rejects-an-ambiguous-prefix {
+    SELECT 'o'::boolean;
+}
+expect error {
+    ^invalid input syntax for type boolean: "o"$
+}
+
+test cast-boolean-of-null-is-null {
+    CREATE TABLE t_null (v boolean);
+    INSERT INTO t_null VALUES ((NULL)::boolean);
+    SELECT count(*), count(v) FROM t_null;
+}
+expect {
+    1|0
+}
+
+# The value has to be right, not just its rendering: a broken cast used to
+# send every row down the ELSE branch.
+test cast-boolean-drives-a-conditional {
+    SELECT CASE WHEN 'yes'::boolean THEN 'taken' ELSE 'missed' END;
+}
+expect {
+    taken
+}
+
+test cast-boolean-filters-rows {
+    CREATE TABLE flags (name text, raw text);
+    INSERT INTO flags VALUES ('a', 'true'), ('b', 'off'), ('c', 'YES'), ('d', 'n');
+    SELECT name FROM flags WHERE raw::boolean ORDER BY name;
+}
+expect {
+    a
+    c
+}
+
+# Inserting into a declared boolean column already applied the input
+# function; it must accept the same spellings as the cast, and a column is
+# where PostgreSQL's t/f rendering does come through.
+test declared-boolean-column-accepts-the-same-spellings {
+    CREATE TABLE b (v boolean);
+    INSERT INTO b VALUES ('y'), ('n'), ('tr'), ('of');
+    SELECT v FROM b;
+}
+expect {
+    t
+    f
+    t
+    f
+}
+
+test declared-boolean-column-rejects-a-word-it-does-not-know {
+    CREATE TABLE b_bad (v boolean);
+    INSERT INTO b_bad VALUES ('bogus');
+}
+expect error {
+    ^invalid input syntax for type boolean: "bogus"$
+}
