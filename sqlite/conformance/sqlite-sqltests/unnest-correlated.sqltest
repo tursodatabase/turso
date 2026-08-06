@@ -282,6 +282,28 @@ expect {
     5|
 }
 
+# Both outer tables must be ready before the grouped table reads either link
+# value. A new inner join may not move the grouped table before them.
+test one-value-two-outer-links-in-filter {
+    CREATE TABLE filter_a(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, amount INTEGER);
+    CREATE TABLE filter_b(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, amount INTEGER);
+    CREATE TABLE filter_c(id INTEGER PRIMARY KEY, k INTEGER, amount INTEGER);
+    INSERT INTO filter_a VALUES (1,1,1,10);
+    INSERT INTO filter_b VALUES (1,1,1,100);
+    INSERT INTO filter_c VALUES (1,1,50);
+
+    SELECT a.id, c.id
+    FROM filter_a a JOIN filter_c c ON a.k = c.k
+    WHERE a.amount < (
+        SELECT sum(b.amount)
+        FROM filter_b b
+        WHERE b.k = a.k AND b.g = c.k
+    );
+}
+expect {
+    1|1
+}
+
 @setup correlated_rows
 test one-value-correlated-to-outer-table-that-may-be-null {
     SELECT o.id, (SELECT count(*) FROM inner_rows i WHERE i.key2 = x.key2)
