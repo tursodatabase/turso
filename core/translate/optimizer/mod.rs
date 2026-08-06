@@ -1794,6 +1794,64 @@ fn base_row_estimate(
     }
 }
 
+/// Read a group count from ANALYZE for a simple list of table columns.
+///
+/// For an index that starts with the GROUP BY columns, sqlite_stat1 stores the
+/// total row count and the average rows for one key. Dividing them gives the
+/// number of groups.
+fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Schema) -> Option<f64> {
+    let mut table_id = None;
+    let mut columns: SmallVec<[usize; 4]> = SmallVec::new();
+    for expr in &group_by.exprs {
+        let Expr::Column { table, column, .. } = expr else {
+            return None;
+        };
+        if table_id.is_some_and(|id| id != *table) {
+            return None;
+        }
+        table_id = Some(*table);
+        columns.push(*column);
+    }
+
+    let table_id = table_id?;
+    let table = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .find(|table| table.internal_id == table_id)?;
+    let btree = table.btree()?;
+    let table_stats = schema.analyze_stats.table_stats(&btree.name)?;
+
+    table_stats
+        .index_stats
+        .iter()
+        .filter_map(|(index_name, index_stats)| {
+            let index = schema.get_index(&btree.name, index_name)?;
+            if index.where_clause.is_some() || index.columns.len() < columns.len() {
+                return None;
+            }
+            let columns_match =
+                index
+                    .columns
+                    .iter()
+                    .zip(&columns)
+                    .all(|(index_column, group_column)| {
+                        index_column.expr.is_none() && index_column.pos_in_table == *group_column
+                    });
+            if !columns_match {
+                return None;
+            }
+            let total_rows = index_stats.total_rows? as f64;
+            let rows_per_group = *index_stats
+                .avg_rows_per_distinct_prefix
+                .get(columns.len().checked_sub(1)?)? as f64;
+            (rows_per_group > 0.0).then_some(total_rows / rows_per_group)
+        })
+        .fold(None, |best: Option<f64>, groups| {
+            Some(best.map_or(groups, |best| best.max(groups)))
+        })
+}
+
 /// Estimate the rows returned by a SELECT after grouping or an aggregate.
 fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Schema) -> f64 {
     let calls = plan.input_cardinality_hint.unwrap_or(1.0);
@@ -1806,6 +1864,9 @@ fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Sche
     };
     if group_by.exprs.is_empty() {
         return calls;
+    }
+    if let Some(groups) = group_count_from_analyze(plan, group_by, schema) {
+        return input_rows.min(calls * groups.max(1.0));
     }
 
     let mut table_ids: SmallVec<[TableInternalId; 2]> = SmallVec::new();

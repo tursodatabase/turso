@@ -892,6 +892,41 @@ expect {
     2|0|0|SEARCH i USING COVERING INDEX ephemeral_filtered_exists_inner_t3 (key1=?)
 }
 
+# With table counts from ANALYZE, one outer row should use the saved inner
+# index. All outer rows should group the inner table once.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test indexed-average-uses-outer-row-count {
+    CREATE TABLE one_indexed_avg_outer(id INTEGER PRIMARY KEY, k INTEGER, x REAL);
+    CREATE TABLE many_indexed_avg_outer(id INTEGER PRIMARY KEY, k INTEGER, x REAL);
+    CREATE TABLE indexed_avg_inner(k INTEGER, q REAL);
+    CREATE INDEX indexed_avg_inner_k ON indexed_avg_inner(k);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('one_indexed_avg_outer', NULL, '1'),
+        ('many_indexed_avg_outer', NULL, '20000'),
+        ('indexed_avg_inner', 'indexed_avg_inner_k', '200000 100');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM one_indexed_avg_outer o
+    WHERE o.x < (
+              SELECT avg(i.q) FROM indexed_avg_inner i WHERE i.k = o.k
+          );
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM many_indexed_avg_outer o
+    WHERE o.x < (
+              SELECT avg(i.q) FROM indexed_avg_inner i WHERE i.k = o.k
+          );
+}
+expect pattern {
+    (?s)CORRELATED SCALAR SUBQUERY.*SEARCH i USING INDEX indexed_avg_inner_k.*SCAN scalar_subquery_.*SCAN indexed_avg_inner AS i USING INDEX indexed_avg_inner_k
+}
+
 setup comparison_keys {
     CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
     CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
