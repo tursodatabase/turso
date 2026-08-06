@@ -50,6 +50,33 @@ expect {
     2
 }
 
+# A `db.table.column` reference names the same column as `table.column`, and a
+# view may only name its own database, so the plan keys the column on the table
+# alone.
+test matview-schema-qualified-column {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v_dbqual AS SELECT main.msg.id AS id FROM main.msg;
+    SELECT id FROM v_dbqual ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test matview-schema-qualified-column-is-case-insensitive {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v_dbqual_case AS SELECT MAIN.MSG.ID AS id FROM msg;
+    INSERT INTO msg VALUES (3,'c');
+    SELECT id FROM v_dbqual_case ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
 test matview-case-insensitive-group-by {
     CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
     INSERT INTO msg VALUES (1,'a'),(2,'b'),(3,'a');
