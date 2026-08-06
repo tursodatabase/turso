@@ -1,5 +1,9 @@
 # Turso examples
 
+## Full-text search
+
+- [`fts`](./fts/) — investigate two MVCC writers, conflict rollback, retry, and FTS visibility
+
 ## Javascript
 
 - [`database-node`](./javascript/database-node/) — Node.js, local file database (no sync)
