@@ -33,6 +33,7 @@ arguments starting with `--` are passed through to the pgregress runner.
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -319,14 +320,30 @@ class ServerHarness:
         self.runner_args = runner_args
         self.proc = None
         self.restarts = 0
+        self.log = db_file.parent / "tursopg.log"
 
     def start(self) -> None:
-        self.proc = subprocess.Popen(
-            [self.bins / "tursopg", "--server", f"127.0.0.1:{self.port}", self.db_file],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        wait_for_server(self.proc, self.port)
+        # Keep the server's own stderr: when it will not come back up, its
+        # message is the only evidence of why, and the alternative is a
+        # summary that guesses ("a crashed test likely corrupted it").
+        with open(self.log, "ab") as log:
+            self.proc = subprocess.Popen(
+                [self.bins / "tursopg", "--server", f"127.0.0.1:{self.port}", self.db_file],
+                stdout=subprocess.DEVNULL,
+                stderr=log,
+            )
+        try:
+            wait_for_server(self.proc, self.port)
+        except ServerStartError as e:
+            raise ServerStartError(f"{e}{self.last_server_error()}") from None
+
+    def last_server_error(self) -> str:
+        """The tail of the server's stderr, for a start that failed."""
+        try:
+            lines = self.log.read_text(errors="replace").strip().splitlines()
+        except OSError:
+            return ""
+        return "\n  " + "\n  ".join(lines[-5:]) if lines else ""
 
     def ensure(self) -> None:
         """Restarts the server lazily, only when the next test needs it —
@@ -384,36 +401,42 @@ def main() -> int:
         PG_LIBDIR=str(UPSTREAM),
         PG_DLSUFFIX=".so",
     )
-    with tempfile.TemporaryDirectory(prefix="pgregress-") as tmp:
-        srv = ServerHarness(bins, port, Path(tmp) / "regression.db", env, runner_args)
-        start_or_die(srv.start)
-        tally = Tally()
-        aborted = None
-        try:
-            for path in paths:
-                name = Path(path).stem
-                status, reason = test_status(name)
-                if status == "skip":
-                    print(f"{name} ... skip ({reason})")
-                    tally.skipped += 1
-                    continue
-                try:
-                    srv.ensure()
-                    returncode = srv.run_one(path)
-                    tally.classify(name, status, returncode)
-                    if returncode == 3:
-                        srv.drop()
-                except ServerStartError as e:
-                    aborted = f"{e} — aborting; a crashed test likely corrupted the database"
-                    break
-        finally:
-            srv.drop()
-        tally.restarts = srv.restarts
-        exit_code = tally.report()
-        if aborted:
-            print(f"ABORTED: {aborted}")
-            return 2
-        return exit_code
+    tmp = tempfile.mkdtemp(prefix="pgregress-")
+    srv = ServerHarness(bins, port, Path(tmp) / "regression.db", env, runner_args)
+    start_or_die(srv.start)
+    tally = Tally()
+    aborted = None
+    try:
+        for path in paths:
+            name = Path(path).stem
+            status, reason = test_status(name)
+            if status == "skip":
+                print(f"{name} ... skip ({reason})")
+                tally.skipped += 1
+                continue
+            try:
+                srv.ensure()
+                returncode = srv.run_one(path)
+                tally.classify(name, status, returncode)
+                if returncode == 3:
+                    srv.drop()
+            except ServerStartError as e:
+                aborted = f"{e}\n  aborting: the server cannot reopen the database"
+                break
+    finally:
+        srv.drop()
+        # Keep the database when the run aborts: it is the only copy of
+        # whatever state the server refused to reopen, and deleting it
+        # throws away the evidence.
+        if aborted is None:
+            shutil.rmtree(tmp, ignore_errors=True)
+    tally.restarts = srv.restarts
+    exit_code = tally.report()
+    if aborted:
+        print(f"ABORTED: {aborted}")
+        print(f"  database kept for inspection: {tmp}")
+        return 2
+    return exit_code
 
 
 if __name__ == "__main__":

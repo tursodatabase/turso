@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 /// Default endpoint when neither `--dsn` nor `PGREGRESS_DSN` is set.
@@ -459,7 +459,13 @@ impl Session {
         self.conn.send_query(stmt)?;
         let mut table: Option<Table> = None;
         loop {
-            let (tag, body) = self.conn.read_message()?;
+            // Naming the statement matters most when the connection dies or
+            // times out: the transcript stops before the statement that
+            // caused it, so the error is the only place it appears.
+            let (tag, body) = self
+                .conn
+                .read_message()
+                .with_context(|| format!("running: {}", first_line(stmt)))?;
             match tag {
                 b'T' => table = Some(Table::from_row_description(&body)?),
                 b'D' => {
@@ -1555,9 +1561,71 @@ impl ConnParams {
     }
 }
 
+/// Why reading a reply failed. A read timeout and a closed socket are
+/// different failures wanting different fixes — the first is a server that
+/// is wedged or a statement too slow for the harness, the second a server
+/// that died — and calling both "server closed the connection" sent us
+/// looking for a hang that was really a slow query.
+/// A CancelRequest packet: a fixed 16 bytes carrying the cancel code and
+/// the session's BackendKeyData. It has no message-type byte, because it is
+/// sent before a startup handshake rather than during a session.
+fn cancel_request(pid: i32, secret: i32) -> [u8; 16] {
+    const CANCEL_REQUEST_CODE: u32 = 80877102;
+    let mut request = [0u8; 16];
+    request[0..4].copy_from_slice(&16u32.to_be_bytes());
+    request[4..8].copy_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
+    request[8..12].copy_from_slice(&pid.to_be_bytes());
+    request[12..16].copy_from_slice(&secret.to_be_bytes());
+    request
+}
+
+/// Whether a read failed because the deadline passed rather than because
+/// the connection went away. Platforms disagree on which kind a socket
+/// read timeout reports.
+fn is_read_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn describe_read_failure(e: &std::io::Error) -> anyhow::Error {
+    if is_read_timeout(e) {
+        return anyhow!(
+            "no reply within {READ_TIMEOUT_SECS}s: the server is wedged \
+             or the statement is too slow for this harness"
+        );
+    }
+    anyhow!("reading reply: {e} (the server closed the connection)")
+}
+
+/// A statement's first line, collapsed onto one line and shortened, so a
+/// failure names the statement without pasting a whole query into the
+/// summary.
+fn first_line(stmt: &str) -> String {
+    let line = stmt.trim().lines().next().unwrap_or("").trim_end();
+    match line.char_indices().nth(80) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line.to_string(),
+    }
+}
+
+/// How long to wait for a reply before giving up on a statement. Fails the
+/// test instead of hanging the whole run. Regress statements finish in
+/// milliseconds against PostgreSQL, so this is generous — but it is a
+/// harness limit, not a correctness one: a statement we plan badly enough
+/// can exceed it while still being on its way to the right answer.
+const READ_TIMEOUT_SECS: u64 = 15;
+
 struct PgConn {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
+    /// Where to reach the server again, for a CancelRequest — which the
+    /// protocol requires be sent on its own connection.
+    params: ConnParams,
+    /// The (pid, secret) from BackendKeyData, the credentials a
+    /// CancelRequest needs.
+    backend_key: Option<(i32, i32)>,
 }
 
 impl PgConn {
@@ -1567,17 +1635,17 @@ impl PgConn {
     fn connect(params: &ConnParams, test_name: &str) -> Result<PgConn> {
         let stream = TcpStream::connect((params.host.as_str(), params.port))
             .with_context(|| format!("connecting to {}:{}", params.host, params.port))?;
-        // A statement that gets no reply within this window means the server
-        // is wedged (e.g. a panic poisoned its connection state). Fail the
-        // test instead of hanging the whole run; regress statements finish
-        // in milliseconds, so this is generous while keeping the worst-case
-        // cost of a wedged server bounded.
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(READ_TIMEOUT_SECS)))
             .context("setting read timeout")?;
         let reader = BufReader::new(stream.try_clone().context("cloning stream")?);
         let writer = BufWriter::new(stream);
-        let mut conn = PgConn { reader, writer };
+        let mut conn = PgConn {
+            reader,
+            writer,
+            params: params.clone(),
+            backend_key: None,
+        };
 
         let mut startup = Vec::new();
         startup.extend_from_slice(&196608u32.to_be_bytes()); // protocol 3.0
@@ -1620,7 +1688,11 @@ impl PgConn {
                         method => bail!("unsupported authentication method {method}"),
                     }
                 }
-                b'S' | b'K' | b'N' => {} // ParameterStatus, BackendKeyData, notices
+                b'K' => {
+                    let mut r = Reader::new(&body);
+                    conn.backend_key = Some((r.i32()?, r.i32()?));
+                }
+                b'S' | b'N' => {} // ParameterStatus, notices
                 b'Z' => return Ok(conn),
                 b'E' => {
                     let fields = parse_error_fields(&body)?;
@@ -1632,6 +1704,22 @@ impl PgConn {
                 other => bail!("unexpected message {:?} during startup", other as char),
             }
         }
+    }
+
+    /// Asks the server to stop the statement running on this session, over
+    /// the separate connection the protocol requires. Best effort: there is
+    /// no reply to a CancelRequest, and the test has already failed, so a
+    /// server that cannot be reached is not worth reporting twice.
+    fn cancel_running_statement(&self) {
+        let Some((pid, secret)) = self.backend_key else {
+            return;
+        };
+        let Ok(mut socket) = TcpStream::connect((self.params.host.as_str(), self.params.port))
+        else {
+            return;
+        };
+        let _ = socket.write_all(&cancel_request(pid, secret));
+        let _ = socket.flush();
     }
 
     fn send_query(&mut self, sql: &str) -> Result<()> {
@@ -1651,9 +1739,17 @@ impl PgConn {
 
     fn read_message(&mut self) -> Result<(u8, Vec<u8>)> {
         let mut header = [0u8; 5];
-        self.reader
-            .read_exact(&mut header)
-            .context("reading message header (server closed the connection?)")?;
+        if let Err(e) = self.reader.read_exact(&mut header) {
+            if is_read_timeout(&e) {
+                // Giving up on the reply does not stop the server working on
+                // it. An abandoned statement keeps a core busy for as long
+                // as it takes to finish, which slows every test after this
+                // one enough to trip the per-test timeout — so cancel it the
+                // way psql does on Ctrl-C.
+                self.cancel_running_statement();
+            }
+            return Err(describe_read_failure(&e));
+        }
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         if len < 4 {
             bail!("invalid message length {len}");
@@ -1720,6 +1816,56 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timeout_and_a_dead_connection_read_differently() {
+        let timed_out =
+            describe_read_failure(&std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                .to_string();
+        assert!(timed_out.contains("no reply within"), "{timed_out}");
+        assert!(!timed_out.contains("closed the connection"), "{timed_out}");
+
+        // Some platforms report a socket read timeout as TimedOut instead.
+        let timed_out =
+            describe_read_failure(&std::io::Error::from(std::io::ErrorKind::TimedOut)).to_string();
+        assert!(timed_out.contains("no reply within"), "{timed_out}");
+
+        let closed =
+            describe_read_failure(&std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                .to_string();
+        assert!(closed.contains("closed the connection"), "{closed}");
+        assert!(!closed.contains("no reply within"), "{closed}");
+    }
+
+    #[test]
+    fn a_cancel_request_carries_the_backend_key_the_server_issued() {
+        // The exact bytes a PostgreSQL server expects: length, cancel code,
+        // then the pid and secret from BackendKeyData.
+        let request = cancel_request(4242, -7);
+        assert_eq!(request.len(), 16);
+        assert_eq!(u32::from_be_bytes(request[0..4].try_into().unwrap()), 16);
+        assert_eq!(
+            u32::from_be_bytes(request[4..8].try_into().unwrap()),
+            80877102
+        );
+        assert_eq!(i32::from_be_bytes(request[8..12].try_into().unwrap()), 4242);
+        assert_eq!(i32::from_be_bytes(request[12..16].try_into().unwrap()), -7);
+    }
+
+    #[test]
+    fn a_failure_names_the_statement_on_one_short_line() {
+        assert_eq!(first_line("SELECT 1;"), "SELECT 1;");
+        // Only the first line, so a long query does not flood the summary.
+        assert_eq!(
+            first_line("select count(*) from tenk1 t\nwhere exists (select 1);"),
+            "select count(*) from tenk1 t"
+        );
+        assert_eq!(first_line("\n\n  SELECT 2;  \n"), "SELECT 2;");
+        let long = "x".repeat(200);
+        let shortened = first_line(&long);
+        assert_eq!(shortened.len(), 83);
+        assert!(shortened.ends_with("..."));
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
