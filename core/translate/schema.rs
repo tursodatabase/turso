@@ -1795,6 +1795,17 @@ fn validate_drop_table(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
     }
+    // A materialized view re-resolves its stored query every time the schema
+    // loads, so dropping a table one reads would leave a view that cannot
+    // resolve — and that stops the whole database from opening, not just
+    // that view. PostgreSQL refuses the same drop and asks for CASCADE.
+    // PostgreSQL names the dependents in a DETAIL line, which engine errors
+    // cannot carry yet, so only the reason is reported.
+    if resolver.with_schema(database_id, |schema| {
+        !schema.get_dependent_materialized_views(tbl_name).is_empty()
+    }) {
+        bail_parse_error!("cannot drop table {tbl_name} because other objects depend on it");
+    }
     Ok(())
 }
 

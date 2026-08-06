@@ -88,6 +88,24 @@ pub fn translate_create_materialized_view(
     let view_column_schema = resolver.with_schema(database_id, |s| {
         IncrementalView::validate_and_extract_columns(select_stmt, s)
     })?;
+
+    // Reading another materialized view would build something that never
+    // updates: a write to the base table refreshes the view it feeds, but
+    // that refresh does not carry on to a view reading *it*, so the outer one
+    // stays empty. Refuse instead of returning wrong answers.
+    if let Some(source) = resolver.with_schema(database_id, |s| {
+        view_column_schema
+            .tables
+            .iter()
+            .find(|t| s.is_materialized_view(&t.name))
+            .map(|t| t.name.clone())
+    }) {
+        bail_parse_error!(
+            "materialized view {normalized_view_name} cannot read materialized view {source}: \
+             nested materialized views are not supported"
+        );
+    }
+
     let view_columns = view_column_schema.flat_columns();
 
     // Reconstruct the SQL string for storage

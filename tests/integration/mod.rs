@@ -13,6 +13,7 @@ mod functions;
 mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
+mod materialized_view_dependencies;
 mod materialized_view_index;
 mod mvcc;
 mod pragma;

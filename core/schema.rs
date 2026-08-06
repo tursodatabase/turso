@@ -1942,83 +1942,139 @@ impl Schema {
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
-        for (view_name, (sql, main_root)) in materialized_view_info {
-            // Look up the DBSP state root for this view
-            // If missing, it means version mismatch - skip this view
-            // Check if we have a compatible DBSP state root
-            let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(&view_name) {
-                root
-            } else {
-                tracing::warn!(
-                    "Materialized view '{}' has incompatible version or missing DBSP state table",
-                    view_name
-                );
-                // Track this as an incompatible view
-                self.incompatible_views.insert(view_name.clone());
-                // Use a dummy root page - the view won't be usable anyway
-                0
-            };
+        // A materialized view's stored query is re-resolved here, so one that
+        // reads another view only works once that view is registered. Creating
+        // such a view is refused now, but databases from before that check
+        // contain them, and schema rows arrive in no useful order — so keep
+        // making passes for as long as any view resolves. Retrying a view that
+        // failed for another reason costs nothing at schema-load sizes, and it
+        // saves having to tell "not registered yet" apart from "actually
+        // broken" by matching on the error text.
+        let mut pending: Vec<(String, (String, i64))> =
+            materialized_view_info.into_iter().collect();
+        // Sorted so a schema loads, or fails, the same way every time instead
+        // of depending on hash order.
+        pending.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-            // Look up the DBSP state index root (may not exist for older schemas)
-            let dbsp_state_index_root =
-                dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
-
-            // Register the DBSP state index so integrity check can account for its pages.
-            if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
-                let mut index = create_dbsp_state_index(dbsp_state_index_root);
-                let dbsp_table_name =
-                    format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
-                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
-                index.table_name = dbsp_table_name;
-                if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
-                    if !e.to_string().contains("already exists") {
-                        return Err(e);
-                    }
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut unresolved = Vec::new();
+            for (view_name, (sql, main_root)) in pending {
+                match self.populate_materialized_view(
+                    &view_name,
+                    &sql,
+                    main_root,
+                    &dbsp_state_roots,
+                    &dbsp_state_index_roots,
+                ) {
+                    Ok(()) => {}
+                    Err(_) => unresolved.push((view_name, (sql, main_root))),
                 }
             }
-
-            // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(
-                &sql,
-                self,
-                main_root,
-                dbsp_state_root,
-                dbsp_state_index_root,
-            )?;
-            let referenced_tables = incremental_view.get_referenced_table_names();
-
-            // Create a BTreeTable for the materialized view
-            let cols = incremental_view.column_schema.flat_columns();
-            let logical_to_physical_map =
-                BTreeTable::build_logical_to_physical_map(&cols, &[], true);
-            let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
-                name: view_name.clone(),
-                root_page: main_root,
-                columns: cols,
-                primary_key_columns: vec![],
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                unique_sets: vec![],
-                has_virtual_columns: false,
-                logical_to_physical_map,
-                column_dependencies: Default::default(),
-            })));
-
-            // Only add to schema if compatible
-            if !self.incompatible_views.contains(&view_name) {
-                self.add_materialized_view(incremental_view, table, sql);
+            if unresolved.len() == before {
+                // Nothing resolved this round, so nothing will next round.
+                // What is left reads something the schema does not have —
+                // possible in a database an older build damaged. Record the
+                // views as broken and keep going: one unusable view must not
+                // cost the caller every other table in the database, which is
+                // the same reason `broken_views` exists for regular views.
+                for (view_name, _) in unresolved {
+                    tracing::warn!(
+                        "materialized view '{view_name}' reads something that is no longer \
+                         in the schema; leaving it unusable"
+                    );
+                    self.broken_views.insert(view_name.clone());
+                    self.incompatible_views.insert(view_name);
+                }
+                break;
             }
-
-            // Register dependencies regardless of compatibility
-            for table_name in referenced_tables {
-                self.add_materialized_view_dependency(&table_name, &view_name);
-            }
+            pending = unresolved;
         }
         self.populate_deferred_indexes(syms)
+    }
+
+    /// One materialized view from the schema. Fails when its query cannot be
+    /// resolved yet, which the caller retries in case the view it reads has
+    /// not been registered.
+    fn populate_materialized_view(
+        &mut self,
+        view_name: &str,
+        sql: &str,
+        main_root: i64,
+        dbsp_state_roots: &HashMap<String, i64>,
+        dbsp_state_index_roots: &HashMap<String, i64>,
+    ) -> Result<()> {
+        // A missing DBSP state table means the view was written by an
+        // incompatible version; it is registered as unusable rather than
+        // failing the load.
+        let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(view_name) {
+            root
+        } else {
+            tracing::warn!(
+                "Materialized view '{}' has incompatible version or missing DBSP state table",
+                view_name
+            );
+            self.incompatible_views.insert(view_name.to_string());
+            0
+        };
+
+        // May not exist for older schemas.
+        let dbsp_state_index_root = dbsp_state_index_roots.get(view_name).copied().unwrap_or(0);
+
+        // Register the DBSP state index so integrity check can account for its pages.
+        if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
+            let mut index = create_dbsp_state_index(dbsp_state_index_root);
+            let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+            index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
+            index.table_name = dbsp_table_name;
+            if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                if !e.to_string().contains("already exists") {
+                    return Err(e);
+                }
+            }
+        }
+
+        // This is the step that needs the views it reads to be registered
+        // already, and the reason the caller may have to come back to us.
+        let incremental_view = IncrementalView::from_sql(
+            sql,
+            self,
+            main_root,
+            dbsp_state_root,
+            dbsp_state_index_root,
+        )?;
+        let referenced_tables = incremental_view.get_referenced_table_names();
+
+        // Create a BTreeTable for the materialized view
+        let cols = incremental_view.column_schema.flat_columns();
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols, &[], true);
+        let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
+            name: view_name.to_string(),
+            root_page: main_root,
+            columns: cols,
+            primary_key_columns: vec![],
+            has_rowid: true,
+            is_strict: false,
+            has_autoincrement: false,
+            foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
+            unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
+            column_dependencies: Default::default(),
+        })));
+
+        // Only add to schema if compatible
+        if !self.incompatible_views.contains(view_name) {
+            self.add_materialized_view(incremental_view, table, sql.to_string());
+        }
+
+        // Register dependencies regardless of compatibility
+        for table_name in referenced_tables {
+            self.add_materialized_view_dependency(&table_name, view_name);
+        }
+        Ok(())
     }
 
     /// Build the indexes [`Schema::populate_indices`] could not, now that
