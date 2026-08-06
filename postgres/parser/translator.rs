@@ -4170,7 +4170,95 @@ impl PostgreSQLTranslator {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
+/// The name PostgreSQL gives an unaliased result column, following
+/// `FigureColname`. The name comes from the expression's *shape*, never from
+/// its text: a bare column keeps its name, a call takes the function's name, a
+/// cast takes the type's name, and a few constructs are named after
+/// themselves. Everything else is `?column?` — including arithmetic, string
+/// concatenation and bare literals, which is why `SELECT 1+1` is not called
+/// `1+1`.
 fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    Some(figure_column_name(node).unwrap_or_else(|| "?column?".to_string()))
+}
+
+/// The part of [`derived_column_name`] that can say "no name of my own",
+/// which matters for the constructs that look inside themselves.
+fn figure_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        // A cast reports the type, in PostgreSQL's own spelling: `boolean` is
+        // `bool` and `integer` is `int4`, because the grammar rewrites both to
+        // a pg_catalog name before we see them.
+        Some(Node::TypeCast(type_cast)) => {
+            let names = &type_cast.type_name.as_ref()?.names;
+            names.iter().rev().find_map(|n| match &n.node {
+                Some(Node::String(s)) if s.sval != "pg_catalog" => Some(s.sval.clone()),
+                _ => None,
+            })
+        }
+        // A column keeps its own name; `t.a` is `a`.
+        Some(Node::ColumnRef(col_ref)) => col_ref.fields.iter().rev().find_map(|f| match &f.node {
+            Some(Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        }),
+        // COLLATE and parentheses are see-through.
+        Some(Node::CollateClause(collate)) => figure_column_name(collate.arg.as_deref()?),
+        // A CASE takes its ELSE branch's name if it has one, else "case".
+        Some(Node::CaseExpr(case_expr)) => Some(
+            case_expr
+                .defresult
+                .as_deref()
+                .and_then(figure_column_name)
+                .unwrap_or_else(|| "case".to_string()),
+        ),
+        Some(Node::CoalesceExpr(_)) => Some("coalesce".to_string()),
+        Some(Node::MinMaxExpr(min_max)) => {
+            use pg_query::protobuf::MinMaxOp;
+            Some(match MinMaxOp::try_from(min_max.op) {
+                Ok(MinMaxOp::IsLeast) => "least".to_string(),
+                _ => "greatest".to_string(),
+            })
+        }
+        Some(Node::AArrayExpr(_)) => Some("array".to_string()),
+        Some(Node::RowExpr(_)) => Some("row".to_string()),
+        Some(Node::SubLink(sub_link)) => {
+            use pg_query::protobuf::SubLinkType;
+            match SubLinkType::try_from(sub_link.sub_link_type) {
+                Ok(SubLinkType::ExistsSublink) => Some("exists".to_string()),
+                Ok(SubLinkType::ArraySublink) => Some("array".to_string()),
+                // A scalar subquery is named after the column it selects, so
+                // `(SELECT max(x) FROM t)` is `max`.
+                Ok(SubLinkType::ExprSublink) => {
+                    let Some(Node::SelectStmt(select)) =
+                        sub_link.subselect.as_deref().and_then(|n| n.node.clone())
+                    else {
+                        return None;
+                    };
+                    let first = select.target_list.first()?;
+                    let Some(Node::ResTarget(res_target)) = &first.node else {
+                        return None;
+                    };
+                    if !res_target.name.is_empty() {
+                        return Some(res_target.name.clone());
+                    }
+                    figure_column_name(res_target.val.as_deref()?)
+                }
+                _ => None,
+            }
+        }
+        // NULLIF is spelled as an operator expression.
+        Some(Node::AExpr(a_expr)) => {
+            use pg_query::protobuf::AExprKind;
+            match AExprKind::try_from(a_expr.kind) {
+                Ok(AExprKind::AexprNullif) => Some("nullif".to_string()),
+                _ => None,
+            }
+        }
+        _ => figure_column_name_legacy(node),
+    }
+}
+
+fn figure_column_name_legacy(node: &pg_query::protobuf::Node) -> Option<String> {
     use pg_query::protobuf::node::Node;
     match &node.node {
         Some(Node::FuncCall(func_call)) => func_call

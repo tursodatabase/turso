@@ -132,3 +132,12 @@ test boolean-cast-in-a-group-by {
 expect {
     2
 }
+
+# PostgreSQL's int-to-bool cast treats any nonzero number as true, so
+# `SELECT 2::boolean` is t rather than an error (upstream boolean.out).
+test cast-a-number-to-boolean {
+    SELECT 0::boolean, 1::boolean, 2::boolean, (-1)::boolean, 42::boolean;
+}
+expect {
+    f|t|t|t|t
+}

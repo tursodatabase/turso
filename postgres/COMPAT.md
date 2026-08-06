@@ -37,7 +37,7 @@ Basics not enumerated by the official feature matrix.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
+| SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | Unaliased result columns are named the way PostgreSQL names them — the column, the function, the cast's type, or `?column?` |
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
 | UNION / UNION ALL / INTERSECT / EXCEPT | ✅ Supported | Including ORDER BY/LIMIT on compounds |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |

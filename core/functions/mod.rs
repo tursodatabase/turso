@@ -59,6 +59,16 @@ mod boolean_input_tests {
         }
     }
 
+    /// Numbers do not go through this function — PostgreSQL treats any
+    /// nonzero number as true, which the caller handles.
+    #[test]
+    fn digits_are_only_accepted_as_the_single_characters_1_and_0() {
+        assert_eq!(parse_boolean_text("1"), Some(true));
+        assert_eq!(parse_boolean_text("0"), Some(false));
+        assert_eq!(parse_boolean_text("2"), None);
+        assert_eq!(parse_boolean_text("10"), None);
+    }
+
     #[test]
     fn anything_else_is_rejected() {
         // `o` could start either `on` or `off`.

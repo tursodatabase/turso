@@ -13,6 +13,7 @@ mod wire;
 mod wire_binary_params;
 mod wire_binary_results;
 mod wire_cancel;
+mod wire_column_names;
 mod wire_copy;
 mod wire_errors;
 mod wire_portal_suspension;

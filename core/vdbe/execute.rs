@@ -9948,11 +9948,9 @@ pub fn op_function(
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
-                    Value::Numeric(Numeric::Integer(i)) => match *i {
-                        0 => Value::from_i64(0),
-                        1 => Value::from_i64(1),
-                        _ => return Err(invalid_boolean_input(&i.to_string())),
-                    },
+                    // Any nonzero number is true, as PostgreSQL's int-to-bool
+                    // cast does: `SELECT 2::boolean` is `t`, not an error.
+                    Value::Numeric(Numeric::Integer(i)) => Value::from_i64(i64::from(*i != 0)),
                     Value::Text(t) => {
                         let v = t.value.as_ref();
                         match crate::functions::parse_boolean_text(v) {
