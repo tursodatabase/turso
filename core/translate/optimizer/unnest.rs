@@ -211,6 +211,12 @@ fn rewrite_as_semi_or_anti_join(
     join_type: JoinType,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
+    // A semi join needs a left table. Keep the subquery when the outer SELECT
+    // has no FROM clause.
+    if plan.table_references.joined_tables().is_empty() {
+        return Ok(false);
+    }
+
     if !can_rewrite_as_semi_join(&inner_plan, resolver)? {
         return Ok(false);
     }
