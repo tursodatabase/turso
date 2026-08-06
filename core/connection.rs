@@ -500,6 +500,15 @@ pub struct Connection {
     pub(crate) prepare_context_generation: AtomicU64,
     /// Per-connection last-returned value for each sequence (for currval()).
     pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
+    /// Opaque per-connection state owned by the SQL frontend.
+    ///
+    /// A dialect frontend (e.g. the PostgreSQL server) keeps per-session
+    /// state such as configuration parameters outside the engine, but its
+    /// scalar functions ([`crate::Dialect::exec_scalar_function`]) receive
+    /// only this connection. The frontend stashes a handle here so those
+    /// functions can reach that state at execution time. The engine never
+    /// looks inside.
+    pub(super) frontend_state: RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -3889,6 +3898,19 @@ impl Connection {
             schema.get_sequence(&seq_name).map(Arc::clone)
         })
         .ok_or_else(|| LimboError::ParseError(format!("sequence \"{name}\" does not exist")))
+    }
+
+    /// Attach frontend-owned session state to this connection. Dialect
+    /// scalar functions retrieve it with [`Connection::frontend_state`];
+    /// the engine itself never reads it.
+    pub fn set_frontend_state(&self, state: Arc<dyn std::any::Any + Send + Sync>) {
+        *self.frontend_state.write() = Some(state);
+    }
+
+    /// The frontend session state attached with
+    /// [`Connection::set_frontend_state`], if any.
+    pub fn frontend_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.frontend_state.read().clone()
     }
 
     /// Record that this connection has seen a value from the named sequence (for currval).

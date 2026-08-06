@@ -152,9 +152,14 @@ impl Dialect for PostgresDialect {
         if crate::functions::resolve_scalar(name, arg_count) {
             return Ok(Some(Func::Dialect {
                 name: name.to_string(),
-                // random() must be drawn per row and per call site; the
-                // optimizer hoists or deduplicates deterministic calls.
-                deterministic: !matches!(name, "random" | "setseed"),
+                // random() must be drawn per row and per call site, and
+                // current_setting()/set_config() read and write session
+                // state; the optimizer hoists or deduplicates
+                // deterministic calls.
+                deterministic: !matches!(
+                    name,
+                    "random" | "setseed" | "current_setting" | "set_config"
+                ),
             }));
         }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)

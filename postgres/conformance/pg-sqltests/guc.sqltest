@@ -71,3 +71,97 @@ test guc-boolean-value-displays-as-on {
 expect {
     on
 }
+
+test guc-current-setting-reads-session-value {
+    SET extra_float_digits = 2;
+    SELECT current_setting('extra_float_digits');
+}
+expect {
+    2
+}
+
+test guc-current-setting-reads-default {
+    SELECT current_setting('standard_conforming_strings');
+}
+expect {
+    on
+}
+
+test guc-current-setting-unknown-errors {
+    SELECT current_setting('no_such_parameter');
+}
+expect error {
+    ^unrecognized configuration parameter "no_such_parameter"$
+}
+
+test guc-current-setting-missing-ok-returns-null {
+    SELECT coalesce(current_setting('no_such_parameter', true), 'missing');
+}
+expect {
+    missing
+}
+
+test guc-current-setting-missing-not-ok-errors {
+    SELECT current_setting('no_such_parameter', false);
+}
+expect error {
+    ^unrecognized configuration parameter "no_such_parameter"$
+}
+
+test guc-set-config-returns-new-value {
+    SELECT set_config('application_name', 'myapp', false);
+}
+expect {
+    myapp
+}
+
+test guc-set-config-then-show {
+    SELECT set_config('application_name', 'myapp', false);
+    SHOW application_name;
+}
+expect {
+    myapp
+    myapp
+}
+
+test guc-set-config-custom-parameter {
+    SELECT set_config('myapp.owner', 'joe', false);
+    SELECT current_setting('myapp.owner');
+}
+expect {
+    joe
+    joe
+}
+
+test guc-set-config-null-resets-to-default {
+    SET extra_float_digits = 2;
+    SELECT set_config('extra_float_digits', NULL, false);
+}
+expect {
+    1
+}
+
+test guc-set-config-search-path {
+    SELECT set_config('search_path', 'public', false);
+    SHOW search_path;
+}
+expect {
+    public
+    public
+}
+
+test guc-set-config-drives-float-output {
+    SELECT set_config('extra_float_digits', '0', false);
+    SELECT sqrt(0.5);
+}
+expect {
+    0
+    0.707106781186548
+}
+
+test guc-current-setting-canonicalizes-booleans {
+    SELECT set_config('standard_conforming_strings', 'true', false);
+}
+expect {
+    on
+}

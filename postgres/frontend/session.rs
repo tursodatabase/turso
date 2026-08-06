@@ -23,7 +23,7 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
-    session_state: Mutex<SessionState>,
+    session_state: Arc<Mutex<SessionState>>,
 }
 
 impl PgConnectionInner {
@@ -34,11 +34,70 @@ impl PgConnectionInner {
 }
 
 #[derive(Default)]
-struct SessionState {
+pub(crate) struct SessionState {
     search_path: Vec<String>,
     /// Session GUCs set via `SET`, keyed by lowercased name. Values fall
     /// back to [`GUC_DEFAULTS`] when unset.
     gucs: std::collections::HashMap<String, String>,
+}
+
+impl SessionState {
+    /// Value of a configuration parameter the way SHOW displays it, or
+    /// None when the name is neither set in this session nor a built-in.
+    pub(crate) fn guc_value(&self, lower_name: &str) -> Option<String> {
+        if lower_name == "search_path" {
+            return Some(if self.search_path.is_empty() {
+                "\"$user\", public".to_string()
+            } else {
+                self.search_path.join(", ")
+            });
+        }
+        if let Some(value) = self.gucs.get(lower_name) {
+            return Some(value.clone());
+        }
+        guc_default(lower_name).map(|(_, default)| default.to_string())
+    }
+
+    /// Set (Some) or reset (None) a configuration parameter, returning the
+    /// value SHOW displays afterwards. Mirrors the frontend's `SET`/`RESET`
+    /// handling, including for `search_path`, which lives outside the GUC
+    /// map.
+    pub(crate) fn set_guc(&mut self, lower_name: &str, value: Option<String>) -> String {
+        if lower_name == "search_path" {
+            self.search_path = match value {
+                Some(v) => v
+                    .split(',')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            };
+            return self
+                .guc_value(lower_name)
+                .expect("search_path always resolves");
+        }
+        match value {
+            Some(v) => {
+                let v = canonicalize_guc(lower_name, v);
+                self.gucs.insert(lower_name.to_string(), v.clone());
+                v
+            }
+            None => {
+                self.gucs.remove(lower_name);
+                self.guc_value(lower_name).unwrap_or_default()
+            }
+        }
+    }
+}
+
+/// The PostgreSQL session state attached to a core connection, present on
+/// every connection opened through [`PgConnection::new`]. Dialect scalar
+/// functions (`current_setting`, `set_config`) reach the session's GUCs
+/// through this.
+pub(crate) fn session_state_of(conn: &Connection) -> Option<Arc<Mutex<SessionState>>> {
+    conn.frontend_state()?
+        .downcast::<Mutex<SessionState>>()
+        .ok()
 }
 
 /// Built-in GUCs with their canonical display name (SHOW's column header
@@ -152,10 +211,12 @@ impl PgConnection {
         // PostgreSQL always enforces foreign keys; the engine's SQLite-style
         // default is off, so every session turns it on.
         conn.set_foreign_keys_enabled(true);
+        let session_state = Arc::new(Mutex::new(SessionState::default()));
+        conn.set_frontend_state(session_state.clone());
         Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
-                session_state: Mutex::new(SessionState::default()),
+                session_state,
             }),
         }
     }
@@ -553,13 +614,12 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 .map(guc_value_text)
                 .collect::<Vec<_>>()
                 .join(", ");
-            let value = canonicalize_guc(&name, value);
             let mut state = pg_conn.session_state.lock().unwrap();
-            state.gucs.insert(name, value);
+            state.set_guc(&name, Some(value));
         }
         PgSetKind::Reset => {
             let mut state = pg_conn.session_state.lock().unwrap();
-            state.gucs.remove(&name);
+            state.set_guc(&name, None);
         }
         PgSetKind::ResetAll => {
             let mut state = pg_conn.session_state.lock().unwrap();
@@ -620,18 +680,7 @@ fn guc_value_text(value: &PgSetValue) -> String {
 fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, name: &str) -> Result<Statement> {
     let lower = name.to_lowercase();
     let state = pg_conn.session_state.lock().unwrap();
-    let value = if lower == "search_path" {
-        let path = &state.search_path;
-        if path.is_empty() {
-            "\"$user\", public".to_string()
-        } else {
-            path.join(", ")
-        }
-    } else if let Some(value) = state.gucs.get(&lower) {
-        value.clone()
-    } else if let Some((_, default)) = guc_default(&lower) {
-        default.to_string()
-    } else {
+    let Some(value) = state.guc_value(&lower) else {
         return Err(LimboError::ParseError(format!(
             "unrecognized configuration parameter \"{lower}\""
         )));

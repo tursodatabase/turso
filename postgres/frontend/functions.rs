@@ -31,6 +31,8 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         // 64-bit integer; PostgreSQL returns a double in [0, 1).
         "random" => &[0],
         "setseed" => &[1],
+        "current_setting" => &[1, 2],
+        "set_config" => &[3],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         _ => return false,
     };
@@ -103,6 +105,8 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         "pg_typeof" => Ok(exec_pg_typeof(args.first().unwrap_or(&Value::Null))),
         "random" => Ok(exec_random()),
         "setseed" => exec_setseed(args.first().unwrap_or(&Value::Null)),
+        "current_setting" => exec_current_setting(conn, args),
+        "set_config" => exec_set_config(conn, args),
         "encode" => match (args.first(), args.get(1)) {
             (Some(Value::Null), _) | (_, Some(Value::Null)) | (None, _) | (_, None) => {
                 Ok(Value::Null)
@@ -343,6 +347,82 @@ fn exec_setseed(value: &Value) -> Result<Value> {
     // Map [-1, 1] onto the full state space; never leave the state zero.
     *RANDOM_STATE.lock().unwrap() = (seed.to_bits() ^ 0x9e3779b97f4a7c15) | 1;
     Ok(Value::Null)
+}
+
+/// How PostgreSQL reads a boolean argument out of a Value; text spellings
+/// cover frontends that pass booleans through as strings.
+fn value_is_true(value: &Value) -> bool {
+    use turso_core::Numeric;
+    match value {
+        Value::Numeric(Numeric::Integer(n)) => *n != 0,
+        Value::Numeric(Numeric::Float(f)) => f64::from(*f) != 0.0,
+        Value::Text(t) => matches!(
+            t.as_str().to_ascii_lowercase().as_str(),
+            "t" | "true" | "on" | "yes" | "1"
+        ),
+        _ => false,
+    }
+}
+
+/// The session GUC store, reachable because [`crate::session::PgConnection`]
+/// attaches it to the core connection. Only engine-internal connections
+/// lack it, and user SQL never executes on those.
+fn guc_store(conn: &Connection) -> Result<Arc<std::sync::Mutex<crate::session::SessionState>>> {
+    crate::session::session_state_of(conn).ok_or_else(|| {
+        LimboError::InternalError("connection has no PostgreSQL session state attached".to_string())
+    })
+}
+
+/// PostgreSQL's current_setting(name [, missing_ok]): the value of a
+/// configuration parameter as SHOW displays it. Strict in PostgreSQL, so a
+/// NULL name returns NULL; an unknown name errors unless missing_ok is
+/// true, in which case it returns NULL.
+fn exec_current_setting(conn: &Connection, args: &[Value]) -> Result<Value> {
+    let name = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(t)) => t.as_str().to_lowercase(),
+        Some(other) => other.to_string().to_lowercase(),
+    };
+    let missing_ok = args.get(1).is_some_and(value_is_true);
+    let store = guc_store(conn)?;
+    let value = store.lock().unwrap().guc_value(&name);
+    match value {
+        Some(value) => Ok(Value::build_text(value)),
+        None if missing_ok => Ok(Value::Null),
+        None => Err(LimboError::ParseError(format!(
+            "unrecognized configuration parameter \"{name}\""
+        ))),
+    }
+}
+
+/// PostgreSQL's set_config(name, value, is_local): set a configuration
+/// parameter for the session and return the value it now displays as. A
+/// NULL value resets the parameter to its default. is_local = true means
+/// transaction-scoped (SET LOCAL), which the frontend does not support
+/// yet; it errors rather than silently applying session scope.
+fn exec_set_config(conn: &Connection, args: &[Value]) -> Result<Value> {
+    let name = match args.first() {
+        Some(Value::Null) | None => {
+            return Err(LimboError::ParseError(
+                "SET requires parameter name".to_string(),
+            ))
+        }
+        Some(Value::Text(t)) => t.as_str().to_lowercase(),
+        Some(other) => other.to_string().to_lowercase(),
+    };
+    if args.get(2).is_some_and(value_is_true) {
+        return Err(LimboError::ParseError(
+            "set_config with is_local = true is not supported".to_string(),
+        ));
+    }
+    let value = match args.get(1) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(t)) => Some(t.as_str().to_string()),
+        Some(other) => Some(other.to_string()),
+    };
+    let store = guc_store(conn)?;
+    let displayed = store.lock().unwrap().set_guc(&name, value);
+    Ok(Value::build_text(displayed))
 }
 
 fn exec_encode(data: &Value, format: &str) -> Result<Value> {

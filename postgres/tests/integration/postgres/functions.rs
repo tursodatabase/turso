@@ -206,3 +206,62 @@ fn test_setseed_makes_random_reproducible(db: TempDatabase) {
     let third = query_text(&conn, "SELECT random()::text");
     assert_ne!(first, third);
 }
+
+#[turso_macros::test(mvcc)]
+fn test_current_setting_and_set_config_are_per_session(db: TempDatabase) {
+    let session_a = db.connect_postgres();
+    let session_b = db.connect_postgres();
+
+    assert_eq!(
+        query_text(
+            &session_a,
+            "SELECT set_config('application_name', 'session_a', false)"
+        ),
+        ["session_a"]
+    );
+    assert_eq!(
+        query_text(&session_a, "SELECT current_setting('application_name')"),
+        ["session_a"]
+    );
+    // The other session keeps its own value (the built-in default).
+    assert_eq!(
+        query_text(&session_b, "SELECT current_setting('application_name')"),
+        [""]
+    );
+
+    // A NULL name returns NULL: current_setting is strict in PostgreSQL.
+    assert_eq!(
+        query_text(&session_a, "SELECT current_setting(NULL)"),
+        ["NULL"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_set_config_is_local_errors_instead_of_leaking_session_scope(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    // PostgreSQL scopes is_local = true to the transaction (SET LOCAL).
+    // The frontend has no transaction-scoped GUCs yet, so it must error
+    // rather than silently applying session scope.
+    let mut stmt = conn
+        .query("SELECT set_config('application_name', 'x', true)")
+        .unwrap()
+        .unwrap();
+    let err = loop {
+        match stmt.step() {
+            Err(e) => break e,
+            Ok(StepResult::Done) => panic!("set_config with is_local = true must error"),
+            Ok(_) => {}
+        }
+    };
+    assert!(
+        err.to_string().contains("is_local"),
+        "unexpected error: {err}"
+    );
+
+    // The failed call must not have changed the session value.
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('application_name')"),
+        [""]
+    );
+}
