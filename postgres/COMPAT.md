@@ -58,7 +58,7 @@ Basics not enumerated by the official feature matrix.
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation-level and READ ONLY/WRITE options accepted but ignored |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
-| Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; case-insensitive variants treated as sensitive |
+| Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; `~*`/`!~*` are case-insensitive |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
@@ -214,13 +214,14 @@ INTEGER. Unknown type names pass through as custom types.
 | CREATE ACCESS METHOD | ❌ Not supported | |
 | CREATE TABLE ... (LIKE) with foreign tables, views and composite types | ❌ Not supported | LIKE is silently ignored |
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
+| Identity columns | 🟡 Partial | `GENERATED ALWAYS/BY DEFAULT AS IDENTITY` numbers from a sequence like SERIAL, and brings NOT NULL. An explicit value into an `ALWAYS` column is accepted where PostgreSQL errors; sequence options and `OVERRIDING SYSTEM VALUE` are not honored |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | TEMP itself is silently ignored |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | ❌ Not supported | GENERATED ... AS silently ignored |
+| Stored generated columns | ✅ Supported | `GENERATED ALWAYS AS (expr) STORED`; computed on read rather than stored, which PostgreSQL's immutability rule makes indistinguishable. Writing to one is refused |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | TEMP silently ignored — the table is persistent |
 | Typed tables | ❌ Not supported | |
-| Virtual generated columns | ❌ Not supported | GENERATED ... AS silently ignored |
+| Virtual generated columns | ❌ Not supported | The `VIRTUAL` keyword (new in PG 18) is not parsed; `STORED` works |
 
 ## Performance
 

@@ -365,6 +365,8 @@ impl PostgreSQLTranslator {
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
+        let mut generated_expr: Option<ast::Expr> = None;
+        let mut is_identity = false;
 
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
@@ -397,6 +399,22 @@ impl PostgreSQLTranslator {
                 ConstrType::ConstrForeign => {
                     foreign_key = extract_foreign_key(constraint);
                 }
+                ConstrType::ConstrGenerated => {
+                    let Some(ref raw_expr) = constraint.raw_expr else {
+                        return Err(ParseError::ParseError(
+                            "GENERATED ALWAYS AS: missing expression".into(),
+                        ));
+                    };
+                    generated_expr = Some(self.translate_expr(raw_expr)?);
+                }
+                // GENERATED ALWAYS/BY DEFAULT AS IDENTITY is the standard
+                // spelling of what SERIAL does, so it gets the same
+                // sequence-backed default. NOT NULL comes with it, as in
+                // PostgreSQL.
+                ConstrType::ConstrIdentity => {
+                    is_identity = true;
+                    is_not_null = true;
+                }
                 _ => {}
             }
         }
@@ -425,8 +443,8 @@ impl PostgreSQLTranslator {
         // Build constraints list
         let mut constraints = Vec::new();
 
-        // For serial columns, add DEFAULT nextval('tablename_colname_seq')
-        if is_serial && default_expr.is_none() {
+        // For serial and identity columns, add DEFAULT nextval('tablename_colname_seq')
+        if (is_serial || is_identity) && default_expr.is_none() {
             let seq_name = format!("{}_{}_seq", table_name.to_lowercase(), name.to_lowercase());
             serial_sequences.push(seq_name.clone());
             default_expr = Some(ast::Expr::FunctionCall {
@@ -480,6 +498,20 @@ impl PostgreSQLTranslator {
             constraints.push(ast::NamedColumnConstraint {
                 name: None,
                 constraint: ast::ColumnConstraint::Default(Box::new(expr)),
+            });
+        }
+
+        // GENERATED ALWAYS AS. PostgreSQL only stores these, but it also
+        // requires the expression to be immutable, so computing it on read
+        // gives the same value for the same row. The engine computes virtual
+        // columns and rejects storing them, so that is what we ask for.
+        if let Some(expr) = generated_expr {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Generated {
+                    expr: Box::new(expr),
+                    typ: Some(ast::GeneratedColumnType::Virtual),
+                },
             });
         }
 
@@ -7094,10 +7126,17 @@ mod tests {
 
         if let ast::Stmt::AlterTable(alter) = translated {
             assert_eq!(alter.name.name.as_str(), "users");
-            if let ast::AlterTableBody::AlterColumn { old, .. } = &alter.body {
+            // A retype keeps the column's constraints, so it has its own
+            // variant rather than reusing turso's replacing ALTER COLUMN.
+            if let ast::AlterTableBody::AlterColumnType { old, new } = &alter.body {
                 assert_eq!(old.as_str(), "age");
+                assert_eq!(new.col_name.as_str(), "age");
+                assert_eq!(
+                    new.col_type.as_ref().map(|t| t.name.as_str()),
+                    Some("bigint")
+                );
             } else {
-                panic!("Expected AlterColumn, got: {:?}", alter.body);
+                panic!("Expected AlterColumnType, got: {:?}", alter.body);
             }
         } else {
             panic!("Expected AlterTable");
