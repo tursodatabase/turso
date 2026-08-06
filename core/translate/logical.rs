@@ -1628,16 +1628,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                 name,
             )))),
 
-            ast::Expr::DoublyQualified(db, table, col) => {
-                Ok(LogicalExpr::Column(Column::with_table(
-                    Self::normalized_name(col),
-                    format!(
-                        "{}.{}",
-                        Self::normalized_name(db),
-                        Self::normalized_name(table)
-                    ),
-                )))
-            }
+            // A view may only reference tables in its own database (enforced by
+            // `validate_no_cross_db_references`), so `db.table.col` names the same column
+            // as `table.col`. `TableScan` records the bare table name, so key on
+            // that.
+            ast::Expr::DoublyQualified(_db, table, col) => Ok(LogicalExpr::Column(
+                Column::with_table(Self::normalized_name(col), Self::normalized_name(table)),
+            )),
 
             ast::Expr::Qualified(table, col) => Ok(LogicalExpr::Column(Column::with_table(
                 Self::normalized_name(col),
