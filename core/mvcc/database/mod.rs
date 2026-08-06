@@ -3937,6 +3937,28 @@ impl RootEntry {
     }
 }
 
+/// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
+/// Test-only harness data, not part of the public MVCC API.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GcDebugSnapshot {
+    pub rows_slots: usize,
+    pub rows_empty_slots: usize,
+    pub rows_versions: usize,
+    pub index_slots: usize,
+    pub index_empty_slots: usize,
+    pub index_versions: usize,
+    pub live_version_count_approx: usize,
+    pub live_versions_at_last_gc: usize,
+    pub lwm: u64,
+    pub durable_txid_max: u64,
+    pub logical_log_offset: u64,
+    pub logical_log_size: u64,
+    pub active_txs: usize,
+    pub min_reader_mark: WalPos,
+    pub backfill_floor: WalPos,
+}
+
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
@@ -4097,9 +4119,9 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// pass short-circuits when the LWM hasn't advanced, avoiding wasted scans
     /// while a long txn is open. `u64::MAX` means "no pass has run yet" and also
     /// the no-active-txn state, which never short-circuits (there is always
-    /// potential garbage to reclaim then). Aborted garbage and post-checkpoint
-    /// sole-survivors that a skipped pass leaves behind are still collected by
-    /// the checkpoint's full sweep.
+    /// potential garbage to reclaim then). Aborted garbage and redundant current
+    /// versions that a skipped pass leaves behind are still collected by the
+    /// checkpoint's full sweep.
     gc_last_lwm: AtomicU64,
     experimental_mvcc_passive_checkpoint: bool,
 }
@@ -5506,6 +5528,66 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.find_next_visible_index_row(tx, mv_store_iterator)
     }
 
+    /// Whether a SkipMap chain must still participate in MVCC merge/shadow for `tx`.
+    ///
+    /// False only for a sole materialized current inside the published durable
+    /// boundary (Rule 3 shape). Longer chains, pending TxIDs, and unmaterialized
+    /// versions stay on the SkipMap path.
+    fn chain_is_write_buffer_for(
+        &self,
+        tx: &Transaction<A>,
+        versions: &[RowVersion],
+        ckpt_max: u64,
+        reader_mark: WalPos,
+    ) -> bool {
+        if versions.is_empty() {
+            return false;
+        }
+        if versions.len() != 1 {
+            return true;
+        }
+        let rv = &versions[0];
+        let Some(TxTimestampOrID::Timestamp(begin_ts)) = rv.begin() else {
+            return true;
+        };
+        if rv.end().is_some() || !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
+            return true;
+        }
+        // Passive may stamp materialized_at during write-out before publish.
+        if begin_ts > ckpt_max {
+            return true;
+        }
+        let mat = rv.materialized_at();
+        if mat == WalPos::ORIGIN || reader_mark < mat {
+            return true;
+        }
+        false
+    }
+
+    /// True when `tx` should ignore this SkipMap chain and read the key from B-tree.
+    ///
+    /// Passive keeps SkipMap cover for all chains (table/index views can disagree
+    /// under concurrent Passive). Truncate may fall through for sole materialized
+    /// currents when no checkpoint is in progress.
+    fn btree_covers_chain_for_tx(
+        &self,
+        tx: &Transaction<A>,
+        table_id: MVTableId,
+        versions: &[RowVersion],
+    ) -> bool {
+        if self.experimental_mvcc_passive_checkpoint {
+            return false;
+        }
+        if self.checkpoint_in_progress.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.is_btree_readable_at(&table_id, tx.begin_ts, tx.read_mark) {
+            return false;
+        }
+        let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
+        !self.chain_is_write_buffer_for(tx, versions, ckpt_max, tx.read_mark)
+    }
+
     /// Whether an already-resolved index version chain shadows (invalidates) the
     /// corresponding B-tree row for `tx_id`.
     ///
@@ -5526,6 +5608,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .expect("transaction should exist in txs map");
         let tx = tx.value();
         let versions = versions.read();
+        if versions.is_empty() {
+            return false;
+        }
+        let table_id = versions[0].row.id.table_id;
+        if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
+            return false;
+        }
         versions.iter().rev().any(|version| {
             version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
         })
@@ -5558,6 +5647,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return true;
                 };
                 let versions = versions.value().read();
+                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
+                    return true;
+                }
 
                 // Check if any version invalidates the B-tree row
                 let btree_is_invalid = versions.iter().rev().any(|version| {
@@ -5577,6 +5669,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return true;
                 };
                 let versions = versions.value().read();
+                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
+                    return true;
+                }
 
                 // Check if any version invalidates the B-tree row
                 let btree_is_invalid = versions.iter().rev().any(|version| {
@@ -5593,12 +5688,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx: &Transaction<A>,
         row: &TableRowEntry<'_, A>,
     ) -> Option<(RowID, RowVersions<A>)> {
-        row.value()
-            .read()
-            .iter()
-            .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-            .map(|_| (row.key().clone(), row.value().clone()))
+        let versions_arc = row.value();
+        {
+            let versions = versions_arc.read();
+            let has_visible = versions
+                .iter()
+                .rev()
+                .any(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states));
+            if !has_visible {
+                return None;
+            }
+            if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
+                return None;
+            }
+        }
+        Some((row.key().clone(), versions_arc.clone()))
     }
 
     fn find_last_visible_index_version(
@@ -5606,12 +5710,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx: &Transaction<A>,
         row: IndexRowEntry<'_, A>,
     ) -> Option<RowID> {
-        row.value()
-            .read()
+        let versions = row.value().read();
+        let visible = versions
             .iter()
             .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-            .map(|version| version.row.id.clone())
+            .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
+        let table_id = visible.row.id.table_id;
+        if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
+            return None;
+        }
+        Some(visible.row.id.clone())
     }
 
     fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction<A>, mut rows: I) -> Option<RowID>
@@ -6992,6 +7100,52 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.live_version_count_approx.load(Ordering::Relaxed)
     }
 
+    /// Debug SkipMap / GC counters. Walks every chain; not for hot paths.
+    #[cfg(test)]
+    pub(crate) fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
+        let mut rows_empty_slots = 0;
+        let mut rows_versions = 0;
+        for entry in self.rows.iter() {
+            let n = entry.value().read().len();
+            rows_versions += n;
+            if n == 0 {
+                rows_empty_slots += 1;
+            }
+        }
+
+        let mut index_slots = 0;
+        let mut index_empty_slots = 0;
+        let mut index_versions = 0;
+        for index in self.index_rows.iter() {
+            for entry in index.value().iter() {
+                index_slots += 1;
+                let n = entry.value().read().len();
+                index_versions += n;
+                if n == 0 {
+                    index_empty_slots += 1;
+                }
+            }
+        }
+
+        GcDebugSnapshot {
+            rows_slots: self.rows.len(),
+            rows_empty_slots,
+            rows_versions,
+            index_slots,
+            index_empty_slots,
+            index_versions,
+            live_version_count_approx: self.live_version_count_approx(),
+            live_versions_at_last_gc: self.live_versions_at_last_gc.load(Ordering::Relaxed),
+            lwm: self.compute_lwm(),
+            durable_txid_max: self.durable_txid_max.load(Ordering::SeqCst),
+            logical_log_offset: self.logical_log_offset(),
+            logical_log_size: self.get_logical_log_file().size().unwrap_or(0),
+            active_txs: self.txs.len(),
+            min_reader_mark: self.compute_min_reader_mark(),
+            backfill_floor: *self.backfill_floor.read(),
+        }
+    }
+
     /// Saturating decrement of the live-version heuristic. The counter is
     /// approximate, so clamp at zero rather than risk an underflow wrap that
     /// would make `should_gc` fire on every commit.
@@ -7044,38 +7198,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
     /// Returns the number of removed versions.
     pub fn drop_unused_row_versions(&self) -> usize {
-        self.drop_unused_row_versions_inner(false)
+        self.drop_unused_row_versions_inner(
+            false,
+            !self.experimental_mvcc_passive_checkpoint,
+            WalPos::STAGED,
+        )
     }
 
-    /// Like [`Self::drop_unused_row_versions`], but additionally removes chain
-    /// slots that end up empty from the skip maps, bounding their entry counts.
-    ///
-    /// The caller must hold the blocking checkpoint lock (or otherwise guarantee
-    /// no concurrent writers): slot removal happens after the chain write lock
-    /// is dropped, so without that guarantee it races a concurrent
-    /// `get_or_insert_with` on the same key — see the TOCTOU note in
-    /// `gc_table_row_versions`.
+    /// Like [`Self::drop_unused_row_versions`], and remove emptied SkipMap slots.
+    /// Also drops last currents already in the B-tree (Truncate Finalize).
+    /// Writers retry if GC unlinks their Arc (`insert_version` / `insert_index_version`).
     pub fn drop_unused_row_versions_and_slots(&self) -> usize {
-        self.drop_unused_row_versions_inner(true)
+        self.drop_unused_row_versions_inner(true, true, WalPos::STAGED)
     }
 
-    /// Incremental, non-blocking GC pass — the inline counterpart to
-    /// [`Self::drop_unused_row_versions`], driven from the commit path.
-    ///
-    /// Reclaims invisible versions (same rules as `gc_version_chain`) from up
-    /// to `max_chains` table-row chains, resuming from where the previous pass
-    /// stopped (`gc_table_cursor`) so repeated calls eventually cover the whole
-    /// `rows` map without scanning it all at once.
-    ///
-    /// Safety / design notes:
-    /// - **Lazy mode only.** Empty SkipMap slots are left in place (no
-    ///   `entry.remove()`), so the pass needs no blocking checkpoint lock — it
-    ///   races no concurrent `get_or_insert_with` (see the TOCTOU note in
-    ///   `gc_table_row_versions`). Physical slot removal stays exclusive to the
-    ///   checkpoint's `_and_slots` sweep.
-    /// - `finalized_tx_states` pruning is intentionally skipped here: it needs
-    ///   the *complete* referenced-txid set across all chains, which a partial
-    ///   sweep cannot produce. The checkpoint path still prunes it.
+    /// Drop old versions and empty SkipMap slots, but keep the latest copy of each
+    /// row (Rule 3 off). Passive Finalize uses this. `reader_mark_floor` should
+    /// include pager-held readers, not only `txs`.
+    pub fn drop_unused_row_versions_unlink_empty_at(&self, reader_mark_floor: WalPos) -> usize {
+        self.drop_unused_row_versions_inner(true, false, reader_mark_floor)
+    }
+
+    /// Incremental GC on the commit path: reclaim up to `max_chains` table chains
+    /// (resuming via `gc_table_cursor`). Truncate mode unlinks empty SkipMap slots;
+    /// Passive leaves them for Finalize `unlink_empty`. Skips `finalized_tx_states`
+    /// pruning (checkpoint still does that).
     pub fn gc_incremental(&self, max_chains: usize) -> usize {
         // Truncate checkpoints hold the write side for the whole pass; pin a read
         // guard so inline GC cannot race them. Passive checkpoints use the publish
@@ -7116,6 +7263,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let _gate = GcGate(&self.gc_in_progress);
 
         let passive = self.experimental_mvcc_passive_checkpoint;
+        // Passive: keep the last current SkipMap version (B-trees may still be mid-write).
+        // Blocking Truncate: safe to drop it once the B-tree already has the row.
+        let drop_current_if_in_btree = !passive;
         let lwm = if passive {
             let mut sampled = u64::MAX;
             self.clock.get_timestamp(|_| sampled = self.compute_lwm());
@@ -7171,6 +7321,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             ckpt_max,
                             true,
                             min_reader_mark,
+                            drop_current_if_in_btree,
                         );
                     });
                 } else {
@@ -7181,7 +7332,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         ckpt_max,
                         false,
                         min_reader_mark,
+                        drop_current_if_in_btree,
                     );
+                    if versions.is_empty() {
+                        entry.remove();
+                    }
                 }
             }
             last_key = Some(entry.key().clone());
@@ -7229,9 +7384,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// in [`Self::gc_incremental`]. Applies `gc_version_chain` to up to
     /// `max_chains` index version chains, resuming strictly after the
     /// `(index id, key)` the previous pass stopped at (`gc_index_cursor`) and
-    /// wrapping to the start when the nested maps are exhausted. Lazy mode: it
-    /// never removes empty slots (no blocking lock), exactly like the table
-    /// sweep. Returns the number of versions reclaimed.
+    /// wrapping to the start when the nested maps are exhausted. Truncate mode
+    /// unlinks empty slots; Passive leaves them for Finalize `unlink_empty`.
+    /// Returns the number of versions reclaimed.
     ///
     /// `index_rows` is nested (`MVTableId -> key -> chain`), so the cursor is a
     /// `(MVTableId, key)` pair: the outer scan resumes at the saved index id
@@ -7239,6 +7394,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// after the saved key; later indexes start from their first key.
     fn gc_index_incremental(&self, lwm: u64, ckpt_max: u64, max_chains: usize) -> usize {
         let passive = self.experimental_mvcc_passive_checkpoint;
+        let drop_current_if_in_btree = !passive;
         let mut dropped = 0;
         let mut processed = 0;
         let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
@@ -7283,6 +7439,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             ckpt_max,
                             true,
                             min_reader_mark,
+                            drop_current_if_in_btree,
                         );
                     });
                 } else {
@@ -7293,7 +7450,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         ckpt_max,
                         false,
                         min_reader_mark,
+                        drop_current_if_in_btree,
                     );
+                    if versions.is_empty() {
+                        self.bump_index_rows_epoch();
+                        inner_entry.remove();
+                    }
                 }
                 last = Some((index_id, inner_entry.key().clone()));
                 processed += 1;
@@ -7306,19 +7468,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         dropped
     }
 
-    fn drop_unused_row_versions_inner(&self, remove_empty_slots: bool) -> usize {
+    fn drop_unused_row_versions_inner(
+        &self,
+        remove_empty_slots: bool,
+        drop_current_if_in_btree: bool,
+        reader_mark_floor: WalPos,
+    ) -> usize {
         let lwm = self.compute_lwm();
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let mut referenced_tx_ids = HashSet::default();
 
-        let dropped =
-            self.gc_table_row_versions(lwm, ckpt_max, &mut referenced_tx_ids, remove_empty_slots)
-                + self.gc_index_row_versions(
-                    lwm,
-                    ckpt_max,
-                    &mut referenced_tx_ids,
-                    remove_empty_slots,
-                );
+        let dropped = self.gc_table_row_versions(
+            lwm,
+            ckpt_max,
+            &mut referenced_tx_ids,
+            remove_empty_slots,
+            drop_current_if_in_btree,
+            reader_mark_floor,
+        ) + self.gc_index_row_versions(
+            lwm,
+            ckpt_max,
+            &mut referenced_tx_ids,
+            remove_empty_slots,
+            drop_current_if_in_btree,
+            reader_mark_floor,
+        );
         self.dec_live_version_count_approx(dropped);
         let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
 
@@ -7337,39 +7511,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ckpt_max: u64,
         referenced_tx_ids: &mut HashSet<TxID>,
         remove_empty_slots: bool,
+        drop_current_if_in_btree: bool,
+        reader_mark_floor: WalPos,
     ) -> usize {
         let mut dropped = 0;
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
         // WAL frames — a db-file reader (present or future) needs the version-store copy.
+        // `reader_mark_floor` additionally covers pager-pinned readers not yet published as
+        // MVCC transactions (see `drop_unused_row_versions_unlink_empty_at`).
         let min_reader_mark = self
             .compute_min_reader_mark()
-            .min(*self.backfill_floor.read());
+            .min(*self.backfill_floor.read())
+            .min(reader_mark_floor);
 
         for entry in self.rows.iter() {
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
             if self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
                 continue;
             }
-            let is_now_empty = {
-                let mut versions = entry.value().write();
-                dropped += Self::gc_version_chain(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    self.experimental_mvcc_passive_checkpoint,
-                    min_reader_mark,
-                );
-                Self::collect_referenced_txids(&versions, referenced_tx_ids);
-                versions.is_empty()
-            };
-            // Unless the caller holds the blocking checkpoint lock
-            // (`remove_empty_slots`), empty entries are left in the SkipMap
-            // (lazy removal). This avoids a TOCTOU race where a concurrent
-            // writer inserts a version between the emptiness check and
-            // SkipMap::remove(). Empty entries are reused by
-            // get_or_insert_with on subsequent inserts and cleaned up by
-            // checkpoint-time GC which runs under the blocking lock.
-            if remove_empty_slots && is_now_empty {
+            let mut versions = entry.value().write();
+            dropped += Self::gc_version_chain(
+                &mut versions,
+                lwm,
+                ckpt_max,
+                self.experimental_mvcc_passive_checkpoint,
+                min_reader_mark,
+                drop_current_if_in_btree,
+            );
+            Self::collect_referenced_txids(&versions, referenced_tx_ids);
+            if remove_empty_slots && versions.is_empty() {
                 entry.remove();
             }
         }
@@ -7382,13 +7552,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ckpt_max: u64,
         referenced_tx_ids: &mut HashSet<TxID>,
         remove_empty_slots: bool,
+        drop_current_if_in_btree: bool,
+        reader_mark_floor: WalPos,
     ) -> usize {
         let mut dropped = 0;
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
         // WAL frames — a db-file reader (present or future) needs the version-store copy.
+        // `reader_mark_floor` additionally covers pager-pinned readers not yet published as
+        // MVCC transactions (see `drop_unused_row_versions_unlink_empty_at`).
         let min_reader_mark = self
             .compute_min_reader_mark()
-            .min(*self.backfill_floor.read());
+            .min(*self.backfill_floor.read())
+            .min(reader_mark_floor);
 
         for outer_entry in self.index_rows.iter() {
             // GC floor: retain a freshly-materialized index not yet visible to all readers.
@@ -7398,21 +7573,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let inner_map = outer_entry.value();
 
             for inner_entry in inner_map.iter() {
-                let is_now_empty = {
-                    let mut versions = inner_entry.value().write();
-                    dropped += Self::gc_version_chain(
-                        &mut versions,
-                        lwm,
-                        ckpt_max,
-                        self.experimental_mvcc_passive_checkpoint,
-                        min_reader_mark,
-                    );
-                    Self::collect_referenced_txids(&versions, referenced_tx_ids);
-                    versions.is_empty()
-                };
-                // Same TOCTOU rationale as table rows. The outer per-index map
-                // is kept even when emptied — it is bounded by index count.
-                if remove_empty_slots && is_now_empty {
+                let mut versions = inner_entry.value().write();
+                dropped += Self::gc_version_chain(
+                    &mut versions,
+                    lwm,
+                    ckpt_max,
+                    self.experimental_mvcc_passive_checkpoint,
+                    min_reader_mark,
+                    drop_current_if_in_btree,
+                );
+                Self::collect_referenced_txids(&versions, referenced_tx_ids);
+                if remove_empty_slots && versions.is_empty() {
+                    self.bump_index_rows_epoch();
+                    // Inner key only — the outer per-index map stays (bounded by index count).
                     inner_entry.remove();
                 }
             }
@@ -7456,22 +7629,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// Rule 1: aborted garbage (begin=None, end=None) — always remove.
     /// Rule 2: superseded (end=Timestamp(e)) — remove once no reader can see it,
-    ///         unless it's a tombstone (no committed current version) whose
-    ///         deletion hasn't been checkpointed, or a B-tree-resident version
-    ///         (flagged, or with a checkpointed insert: begin <= ckpt_max)
-    ///         whose physical delete/overwrite hasn't been checkpointed.
-    /// Rule 3: checkpointed sole-survivor (end=None) — remove.
+    ///         unless it's a tombstone (no committed current) whose delete isn't
+    ///         checkpointed yet, or a B-tree-resident version whose physical
+    ///         delete/overwrite hasn't been checkpointed.
+    /// Rule 3: last remaining current (end=None) — remove only when
+    ///         `drop_current_if_in_btree` is true and the B-tree already has it.
     ///
-    /// Passive gates Rules 2/3 on `materialized_at` + `min_reader_mark`: reclaim only once the
-    /// version is in the B-tree AND every reader's mark has reached that frame, so a reader
-    /// pinned at an older frame never loses a version it can still see. The blocking path is
-    /// stop-the-world and uses the logical `ckpt_max` proxy instead.
+    /// Passive gates Rule 2 on `materialized_at` + `min_reader_mark`. Blocking
+    /// Truncate uses `ckpt_max` instead.
+    ///
+    /// Leaving Rule 3 off keeps a SkipMap copy so an older reader cannot fall
+    /// through to a B-tree page a later checkpoint already rewrote. Truncate can
+    /// turn it on under the blocking lock (no open MVCC txs). Callers set
+    /// `drop_current_if_in_btree` when they want Rule 3.
     fn gc_version_chain(
         versions: &mut RowVersionChain<A>,
         lwm: u64,
         ckpt_max: u64,
         passive: bool,
         min_reader_mark: WalPos,
+        drop_current_if_in_btree: bool,
     ) -> usize {
         let before = versions.len();
 
@@ -7495,18 +7672,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // Keep until this delete is in the B-tree and reachable by every reader.
                     !materialized_for_readers(rv)
                 } else {
-                    // Retain superseded versions until checkpoint makes the physical change
-                    // durable. Tombstones without a committed current successor must survive
-                    // even when a newer current exists, and so must B-tree-resident versions.
-                    // A version is B-tree resident not only when flagged (seeded from
-                    // the B-tree by the dual cursor) but also when its insert was
-                    // made durable by a checkpoint (begin <= ckpt_max < end): the
-                    // checkpointer derives DB-file existence from begin/end
-                    // timestamps relative to the durable boundary, so dropping such
-                    // a version would erase the only evidence that a later delete
-                    // must be written to the B-tree (see #7638: an abandoned
-                    // post-commit checkpoint advances ckpt_max without clearing
-                    // these chains, and premature GC then resurrects the row).
+                    // Keep until the delete is checkpointed. Tombstones without a committed
+                    // current successor must survive, as must versions already in the B-tree
+                    // (btree_resident, or begin <= ckpt_max). Dropping the latter erases the
+                    // only evidence that a later delete must be written (#7638).
                     let in_btree = rv.btree_resident
                         || matches!(&rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if *b <= ckpt_max);
                     *e > ckpt_max && (in_btree || !has_current)
@@ -7515,8 +7684,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             _ => true,
         });
 
-        // Rule 3: checkpointed sole-survivor current version (end=None).
-        if versions.len() == 1 {
+        // Rule 3: optionally drop the last current version when the B-tree already has it.
+        if drop_current_if_in_btree && versions.len() == 1 {
             if let (Some(TxTimestampOrID::Timestamp(b)), None) =
                 (&versions[0].begin(), &versions[0].end())
             {
@@ -7619,9 +7788,36 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         id: RowID,
         row_version: RowVersion,
     ) -> Result<RowVersions<A>, TryReserveError> {
-        let row_versions = self.get_or_create_table_row_versions(id)?;
-        self.insert_version_raw(&mut row_versions.write(), row_version)?;
-        Ok(row_versions)
+        // Retry if GC unlinked this slot while we waited for the write lock.
+        loop {
+            let row_versions = self.get_or_create_table_row_versions(id.clone())?;
+            let mut versions = row_versions.write();
+            if !self.table_versions_still_mapped(&id, &row_versions) {
+                continue;
+            }
+            self.insert_version_raw(&mut versions, row_version)?;
+            drop(versions);
+            return Ok(row_versions);
+        }
+    }
+
+    /// True if `arc` is still the mapped value for `id`.
+    fn table_versions_still_mapped(&self, id: &RowID, arc: &RowVersions<A>) -> bool {
+        self.rows
+            .get(id)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), arc))
+    }
+
+    /// True if `arc` is still the mapped value for `key`.
+    fn index_versions_still_mapped(
+        &self,
+        index: &IndexRowsMap<A>,
+        key: &SortableIndexKey,
+        arc: &RowVersions<A>,
+    ) -> bool {
+        index
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), arc))
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TableRowsEntry)]
@@ -7663,23 +7859,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Publish the key-set mutation *before* the key becomes visible in the
         // map: a concurrent shadow finger that races with this insert may then
         // reset spuriously, but can never miss the new key (#7578).
-        self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
+        self.bump_index_rows_epoch();
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
-        let entry = self.get_or_create_index_key_entry(index, key)?;
-        // The Arc that's actually stored in the SkipMap may be the one we
-        // passed in (on miss) or a pre-existing one (on hit). Return that
-        // canonical Arc so savepoint tracking and the SkipMap stay in sync.
-        let canonical_key = entry.key().clone();
-        row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
-        let row_versions = entry.value().clone();
-        self.insert_version_raw(&mut row_versions.write(), row_version)?;
-        Ok((canonical_key, row_versions))
+        // Same drain-retry as `insert_version`.
+        loop {
+            let entry = self.get_or_create_index_key_entry(index, key.clone())?;
+            // SkipMap may keep our Arc (miss) or a pre-existing one (hit); return that
+            // canonical Arc so savepoint tracking and the map stay in sync.
+            let canonical_key = entry.key().clone();
+            let row_versions = entry.value().clone();
+            let mut versions = row_versions.write();
+            if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
+                continue;
+            }
+            row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
+            self.insert_version_raw(&mut versions, row_version)?;
+            drop(versions);
+            return Ok((canonical_key, row_versions));
+        }
     }
 
     /// Current epoch of `index_rows` key-set mutations; see the field docs.
     pub(crate) fn index_rows_epoch(&self) -> u64 {
         self.index_rows_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Key-set mutation of `index_rows` (insert or empty-slot remove); see field docs.
+    pub(crate) fn bump_index_rows_epoch(&self) {
+        self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]
@@ -7805,10 +8013,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// purged state. Callers without that guarantee must add proper
     /// tombstones via the normal write path instead.
     ///
-    /// Empty chain slots are left in the `SkipMap` (lazy removal). The
-    /// same TOCTOU rationale as `gc_table_row_versions` applies: removing
-    /// the slot would race a concurrent `get_or_insert_with` from a future
-    /// write to the same key.
+    /// Clears the chain but keeps the empty SkipMap slot (write-set GC still looks it up).
     pub fn purge_row_versions_during_checkpoint(&self, rowid: RowID) {
         if let Some(entry) = self.rows.get(&rowid) {
             let mut versions = entry.value().write();
@@ -7820,38 +8025,43 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
     pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
-        let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
-            return;
-        };
-        let mut versions = row_versions.write();
-        // If a committed current version exists, mark it deleted as of end_ts — the normal
-        // collection then materializes the B-tree delete (begin <= durable_max => exists_in_db_file).
-        if let Some(rv) = versions.iter_mut().find(|rv| {
-            matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
-        }) {
-            rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+        loop {
+            let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
+                return;
+            };
+            let mut versions = row_versions.write();
+            if !self.table_versions_still_mapped(&rowid, &row_versions) {
+                continue;
+            }
+            // End-stamp the live committed version, if any — collection then
+            // materializes the B-tree delete (begin <= durable_max => exists_in_db_file).
+            if let Some(rv) = versions.iter_mut().find(|rv| {
+                matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
+            }) {
+                rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+                return;
+            }
+            // Already tombstoned / no live version: nothing to delete again.
+            if versions.iter().any(|rv| rv.end().is_some()) {
+                return;
+            }
+            // B-tree-only row: btree-resident tombstone so collection materializes the delete.
+            let version_id = self.get_version_id();
+            let row = Row::new_table_row_in(rowid, &[], num_cols, self.alloc.clone())
+                .expect("empty tombstone row");
+            let _ = self.insert_version_raw(
+                &mut versions,
+                RowVersion {
+                    id: version_id,
+                    begin: PackedTs::pack(None),
+                    end: PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts))),
+                    row,
+                    btree_resident: true,
+                    materialized_at: WalPos::ORIGIN,
+                },
+            );
             return;
         }
-        // Already tombstoned / no live version: nothing to delete again.
-        if versions.iter().any(|rv| rv.end().is_some()) {
-            return;
-        }
-        // Row lives only in the B-tree: record a B-tree-resident tombstone so the collection
-        // (btree_resident => exists_in_db_file) materializes the physical delete.
-        let version_id = self.get_version_id();
-        let row = Row::new_table_row_in(rowid, &[], num_cols, self.alloc.clone())
-            .expect("empty tombstone row");
-        let _ = self.insert_version_raw(
-            &mut versions,
-            RowVersion {
-                id: version_id,
-                begin: PackedTs::pack(None),
-                end: PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts))),
-                row,
-                btree_resident: true,
-                materialized_at: WalPos::ORIGIN,
-            },
-        );
     }
 
     pub fn get_last_table_rowid(

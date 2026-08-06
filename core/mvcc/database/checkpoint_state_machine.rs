@@ -1476,6 +1476,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
+    /// Publish `nbackfills` after Passive backfill + DB sync. Skip Truncate/Restart.
+    /// Leaves the checkpoint guard held until Finalize (same as the pager).
+    fn publish_wal_backfill_if_needed(&mut self) {
+        if self.mode.should_restart_log() {
+            return;
+        }
+        let Some(result) = self.checkpoint_result.as_ref() else {
+            return;
+        };
+        if result.wal_checkpoint_backfilled == 0 {
+            return;
+        }
+        let max_frame = result.wal_total_backfilled;
+        turso_assert!(self.pager.wal.is_some(), "No WAL to publish backfill");
+        let wal = self.pager.wal.as_ref().unwrap();
+        tracing::debug!(
+            max_frame,
+            backfilled = result.wal_checkpoint_backfilled,
+            "publishing WAL backfill after MVCC checkpoint"
+        );
+        wal.publish_backfill(max_frame);
+    }
+
     fn has_unpublished_schema_changes(&self) -> bool {
         let schema = self.connection.db.schema.lock();
         if !schema.dropped_root_pages.is_empty() {
@@ -1734,19 +1757,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn gc_checkpointed_table_versions(&mut self) -> Option<IOCompletions> {
-        // Empty-slot removal after dropping the version-chain write lock has a TOCTOU
-        // gap — a concurrent writer could `get_or_insert_with` between the emptiness
-        // check and `remove()`. It is only safe under the stop-the-world blocking lock,
-        // which the Truncate/Restart path holds. The passive path runs lazily
-        // (slots are reclaimed by a later insert or a future blocking checkpoint), exactly
-        // like the inline commit-path GC (`gc_incremental`).
-        let remove_empty_slots = self.lock_states.blocking_checkpoint_lock_held;
+        // Keep empty SkipMap slots; Truncate Finalize `_and_slots` unlinks them later.
         let ckpt_max = self.durable_txid_max_new;
-        // Reader floor for the per-version GC, including readers pinned at the pager/WAL level
-        // that have not yet published an MVCC transaction (the begin-tx publish window).
+        // Includes pager/WAL-pinned readers not yet in `txs` (begin-tx publish window).
         let min_reader_mark = self.gc_floor_reader_mark();
-        // The WAL position this checkpoint's pages reached durability at; what we stamp the
-        // just-materialized versions with. (Unchanged since CommitPagerTxn — single orchestrator.)
+        // WAL pos this checkpoint made durable; stamp just-materialized versions with it
+        // (unchanged since CommitPagerTxn — single orchestrator).
         let materialized_frame = WalPos::from_pair(self.pager.wal_pos());
         let snapshot_ts = self.snapshot_ts;
         let CheckpointState::GcTableRows { next_index, lwm } = self.state else {
@@ -1754,6 +1770,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         let mut index = next_index;
         let mut processed = 0;
+        // Drop current SkipMap versions only when B-trees are stable (blocking Truncate).
+        let drop_current_if_in_btree = self.lock_states.blocking_checkpoint_lock_held
+            || !self.mvstore.experimental_mvcc_passive_checkpoint;
         while index < self.write_set.len() {
             let current = index;
             index += 1;
@@ -1764,25 +1783,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             let row_id = &self.write_set[current].0.row.id;
             if let Some(entry) = self.mvstore.rows.get(row_id) {
-                let is_now_empty = {
-                    let mut versions = entry.value().write();
-                    self.mvstore.stamp_chain_materialized(
-                        &mut versions,
-                        materialized_frame,
-                        snapshot_ts,
-                    );
-                    MvStore::<Clock, A>::gc_version_chain(
-                        &mut versions,
-                        lwm,
-                        ckpt_max,
-                        self.mvstore.experimental_mvcc_passive_checkpoint,
-                        min_reader_mark,
-                    );
-                    versions.is_empty()
-                };
-                if is_now_empty && remove_empty_slots {
-                    self.mvstore.rows.remove(row_id);
-                }
+                let mut versions = entry.value().write();
+                self.mvstore.stamp_chain_materialized(
+                    &mut versions,
+                    materialized_frame,
+                    snapshot_ts,
+                );
+                let dropped = MvStore::<Clock, A>::gc_version_chain(
+                    &mut versions,
+                    lwm,
+                    ckpt_max,
+                    self.mvstore.experimental_mvcc_passive_checkpoint,
+                    min_reader_mark,
+                    drop_current_if_in_btree,
+                );
+                self.mvstore.dec_live_version_count_approx(dropped);
             } else {
                 // The MVCC metadata table row (persistent_tx_ts_max) is staged
                 // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
@@ -1811,11 +1826,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn gc_checkpointed_index_versions(&mut self) -> Option<IOCompletions> {
-        // See gc_checkpointed_table_versions: slot removal only under the blocking lock
-        // (Truncate/Restart); the passive path is lazy.
-        let remove_empty_slots = self.lock_states.blocking_checkpoint_lock_held;
+        // Same as table GC: keep empty SkipMap slots; Truncate Finalize unlinks later.
         let ckpt_max = self.durable_txid_max_new;
         let min_reader_mark = self.gc_floor_reader_mark();
+        // Same stamp as table GC (unchanged since CommitPagerTxn).
         let materialized_frame = WalPos::from_pair(self.pager.wal_pos());
         let snapshot_ts = self.snapshot_ts;
         let CheckpointState::GcIndexRows { next_index, lwm } = self.state else {
@@ -1823,6 +1837,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         let mut index = next_index;
         let mut processed = 0;
+        let drop_current_if_in_btree = self.lock_states.blocking_checkpoint_lock_held
+            || !self.mvstore.experimental_mvcc_passive_checkpoint;
         while index < self.index_write_set.len() {
             let current = index;
             index += 1;
@@ -1838,28 +1854,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .get(&index_id)
                     .expect("index_id from write set must exist in index_rows");
                 let inner_map = outer_entry.value();
-                let is_now_empty = {
-                    let inner_entry = inner_map
-                        .get(sortable_key)
-                        .expect("index row from write set must exist in inner map");
-                    let mut versions = inner_entry.value().write();
-                    self.mvstore.stamp_chain_materialized(
-                        &mut versions,
-                        materialized_frame,
-                        snapshot_ts,
-                    );
-                    MvStore::<Clock, A>::gc_version_chain(
-                        &mut versions,
-                        lwm,
-                        ckpt_max,
-                        self.mvstore.experimental_mvcc_passive_checkpoint,
-                        min_reader_mark,
-                    );
-                    versions.is_empty()
-                };
-                if is_now_empty && remove_empty_slots {
-                    inner_map.remove(sortable_key);
-                }
+                let inner_entry = inner_map
+                    .get(sortable_key)
+                    .expect("index row from write set must exist in inner map");
+                let mut versions = inner_entry.value().write();
+                self.mvstore.stamp_chain_materialized(
+                    &mut versions,
+                    materialized_frame,
+                    snapshot_ts,
+                );
+                let dropped = MvStore::<Clock, A>::gc_version_chain(
+                    &mut versions,
+                    lwm,
+                    ckpt_max,
+                    self.mvstore.experimental_mvcc_passive_checkpoint,
+                    min_reader_mark,
+                    drop_current_if_in_btree,
+                );
+                self.mvstore.dec_live_version_count_approx(dropped);
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {
@@ -2831,23 +2843,42 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::CheckpointWal => {
-                tracing::debug!("Performing TRUNCATE checkpoint on WAL");
-                match self.checkpoint_wal()? {
-                    IOResult::Done(result) => {
+                tracing::debug!("Performing checkpoint on WAL");
+                match self.checkpoint_wal() {
+                    Ok(IOResult::Done(result)) => {
                         self.checkpoint_result = Some(result);
                         self.state = CheckpointState::SyncDbFile;
                         Ok(TransitionResult::Continue)
                     }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    Ok(IOResult::IO(io)) => Ok(TransitionResult::Io(io)),
+                    // Busy under a DbFile reader: finish without publishing nbackfills.
+                    Err(crate::LimboError::Busy)
+                        if matches!(self.mode, CheckpointMode::Passive { .. }) =>
+                    {
+                        tracing::debug!(
+                            "Passive WAL checkpoint Busy under pinned DbFile reader; continuing without backfill"
+                        );
+                        let (max_frame, nbackfills) = self
+                            .pager
+                            .wal
+                            .as_ref()
+                            .map(|wal| (wal.get_max_frame_in_wal(), wal.backfill_frame()))
+                            .unwrap_or((0, 0));
+                        self.checkpoint_result =
+                            Some(CheckpointResult::new(max_frame, nbackfills, 0));
+                        self.state = CheckpointState::TruncateLogicalLog;
+                        Ok(TransitionResult::Continue)
+                    }
+                    Err(e) => Err(e),
                 }
             }
 
             CheckpointState::SyncDbFile => {
-                // Fsync database file before truncating WAL.
-                // This ensures durability: if we crash after WAL truncation but before DB fsync,
-                // the checkpointed data would be lost.
+                // Fsync DB before WAL truncate / publish_backfill (pager PublishBackfill order).
+                // Crash after truncate but before fsync would lose checkpointed data.
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
+                    self.publish_wal_backfill_if_needed();
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
@@ -2865,6 +2896,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 // Check if we already sent the sync
                 if checkpoint_result.db_sync_sent {
+                    self.publish_wal_backfill_if_needed();
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
@@ -2953,13 +2985,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             CheckpointState::Finalize => {
                 if self.lock_states.blocking_checkpoint_lock_held {
-                    // Slot-removing GC is safe while the blocking lock is held.
+                    // Truncate: under the blocking lock, drop last SkipMap copies and empty slots.
+                    // That lock waits out open MVCC txs, so no old reader can see a later rewrite.
                     self.mvstore.drop_unused_row_versions_and_slots();
                 } else {
-                    // Passive: GC chains in place; empty slots reclaimed on next insert.
-                    self.mvstore.drop_unused_row_versions();
+                    // Passive: drop old versions and empty slots, but keep the latest SkipMap
+                    // copy of each row. Without it, an older reader can fall through to a
+                    // B-tree page that a later checkpoint already rewrote.
+                    // Also use the pager reader mark so we don't GC versions a brand-new
+                    // reader still needs before its MVCC tx is registered.
+                    self.mvstore
+                        .drop_unused_row_versions_unlink_empty_at(self.gc_floor_reader_mark());
                 }
-                // Locks stay held until `step()` runs `on_checkpoint_end`.
+                // Locks stay held until `step()` runs `on_checkpoint_end`, then
+                // `release_checkpoint_locks_if_needed`.
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
                     self.checkpoint_result.take().ok_or_else(|| {
@@ -3645,6 +3684,25 @@ mod tests {
         );
 
         while checkpoint.gc_checkpointed_table_versions().is_some() {}
+        // Write-set GC clears version chains but leaves empty SkipMap slots;
+        // Truncate Finalize `_and_slots` unlinks them.
+        let slots = mvstore
+            .rows
+            .iter()
+            .filter(|entry| entry.key().table_id == table_id)
+            .count();
+        let versions: usize = mvstore
+            .rows
+            .iter()
+            .filter(|entry| entry.key().table_id == table_id)
+            .map(|entry| entry.value().read().len())
+            .sum();
+        assert_eq!(versions, 0, "write-set GC must reclaim version chains");
+        assert_eq!(
+            slots, row_count,
+            "empty slots remain until Finalize `_and_slots`"
+        );
+        mvstore.drop_unused_row_versions_and_slots();
         let remaining = mvstore
             .rows
             .iter()
@@ -3694,6 +3752,27 @@ mod tests {
         );
 
         while checkpoint.gc_checkpointed_index_versions().is_some() {}
+        // Write-set GC clears version chains but leaves empty SkipMap slots;
+        // Truncate Finalize `_and_slots` unlinks them.
+        let inner = mvstore
+            .index_rows
+            .get(&index_id)
+            .expect("index map must exist");
+        let slots = inner.value().len();
+        let versions: usize = inner
+            .value()
+            .iter()
+            .map(|entry| entry.value().read().len())
+            .sum();
+        assert_eq!(
+            versions, 0,
+            "write-set GC must reclaim index version chains"
+        );
+        assert_eq!(
+            slots, row_count,
+            "empty index slots remain until Finalize `_and_slots`"
+        );
+        mvstore.drop_unused_row_versions_and_slots();
         let remaining = mvstore
             .index_rows
             .get(&index_id)
