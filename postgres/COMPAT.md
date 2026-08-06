@@ -121,7 +121,7 @@ INTEGER. Unknown type names pass through as custom types.
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
 | Array support | ✅ Supported | `type[]` columns, ARRAY[...] literals, subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays |
-| Boolean data type | 🟡 Partial | Columns and casts accept PostgreSQL's full input syntax (`true`/`false`, `t`/`f`, `yes`/`no`, `y`/`n`, `on`/`off`, `1`/`0`, unique prefixes, case- and whitespace-insensitive) and render as `t`/`f`. A boolean expression that is not a cast still reports as an integer, so `SELECT true` shows `1` rather than `t` |
+| Boolean data type | ✅ Supported | Columns, casts and boolean-valued expressions (comparisons, connectives, IS NULL, LIKE, BETWEEN, IN, EXISTS, ...) all report boolean and render as `t`/`f`. Input accepts PostgreSQL's full syntax: `true`/`false`, `t`/`f`, `yes`/`no`, `y`/`n`, `on`/`off`, `1`/`0`, unique prefixes, case- and whitespace-insensitive, and any nonzero number |
 | ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS] |
 | GUID/UUID data type | ✅ Supported | uuid columns, gen_random_uuid(), input validation, text casts |
 | macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |

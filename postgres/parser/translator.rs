@@ -2150,13 +2150,18 @@ impl PostgreSQLTranslator {
                             };
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         } else {
-                            let expr = self.translate_expr(val)?;
+                            let mut expr = self.translate_expr(val)?;
+                            // The name is taken from the PostgreSQL node, so
+                            // marking the type below cannot change it.
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
                                 derived_column_name(val)
                                     .map(|name| ast::As::Elided(ast::Name::from_string(name)))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
+                            if yields_boolean(val) {
+                                expr = mark_as_boolean(expr);
+                            }
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         }
                     }
@@ -4170,6 +4175,81 @@ impl PostgreSQLTranslator {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
+/// Whether PostgreSQL gives this expression the boolean type.
+///
+/// It matters because a boolean prints as `t`/`f` rather than 1/0, and the
+/// only way a client learns the type is from the statement's description. An
+/// expression that is boolean without saying so — a comparison, `IS NULL`, a
+/// connective — reported as an integer, so the value was right but printed
+/// wrong. Callers wrap these in a cast to the engine's boolean type, which is
+/// what carries the type through to the client.
+///
+/// Deliberately conservative: an operator expression only counts when the
+/// operator is one of the comparisons, because `+` and `||` are spelled the
+/// same way.
+fn yields_boolean(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::AExprKind;
+
+    match &node.node {
+        Some(Node::AExpr(a_expr)) => match AExprKind::try_from(a_expr.kind) {
+            Ok(AExprKind::AexprOp) => {
+                const COMPARISONS: [&str; 6] = ["=", "<>", "!=", "<", ">", "<="];
+                let name = a_expr.name.iter().rev().find_map(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                });
+                name.is_some_and(|n| COMPARISONS.contains(&n) || n == ">=")
+            }
+            Ok(
+                AExprKind::AexprDistinct
+                | AExprKind::AexprNotDistinct
+                | AExprKind::AexprIn
+                | AExprKind::AexprLike
+                | AExprKind::AexprIlike
+                | AExprKind::AexprSimilar
+                | AExprKind::AexprBetween
+                | AExprKind::AexprNotBetween
+                | AExprKind::AexprBetweenSym
+                | AExprKind::AexprNotBetweenSym,
+            ) => true,
+            // ANY/ALL over a subquery is boolean, over an array it depends on
+            // the operator, so it is left alone.
+            _ => false,
+        },
+        Some(Node::BoolExpr(_)) | Some(Node::NullTest(_)) | Some(Node::BooleanTest(_)) => true,
+        Some(Node::SubLink(sub_link)) => {
+            use pg_query::protobuf::SubLinkType;
+            matches!(
+                SubLinkType::try_from(sub_link.sub_link_type),
+                Ok(SubLinkType::ExistsSublink)
+            )
+        }
+        // TRUE and FALSE arrive as typed constants.
+        Some(Node::AConst(a_const)) => {
+            matches!(
+                &a_const.val,
+                Some(pg_query::protobuf::a_const::Val::Boolval(_))
+            )
+        }
+        Some(Node::CollateClause(collate)) => collate.arg.as_deref().is_some_and(yields_boolean),
+        _ => false,
+    }
+}
+
+/// Wraps a boolean-valued expression in a cast to the engine's boolean type,
+/// so the statement describes the column as boolean and it prints as `t`/`f`.
+fn mark_as_boolean(expr: ast::Expr) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(ast::Type {
+            name: "boolean".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
 /// The name PostgreSQL gives an unaliased result column, following
 /// `FigureColname`. The name comes from the expression's *shape*, never from
 /// its text: a bare column keeps its name, a call takes the function's name, a

@@ -1,0 +1,115 @@
+# Boolean-valued expressions render as t/f.
+#
+# PostgreSQL types comparisons, IS NULL, boolean connectives, LIKE, BETWEEN,
+# IN and EXISTS as boolean, and prints a boolean as t or f. We reported such a
+# column as an integer, so every one of them came back as 1 or 0 — the value
+# was right but no client could tell it was a boolean, and psql printed the
+# wrong thing.
+#
+# A declared boolean column and a cast already rendered correctly; this is
+# about expressions that are boolean without saying so.
+
+@database :memory:
+
+test boolean-literals-render-as-t-and-f {
+    SELECT true, false;
+}
+expect {
+    t|f
+}
+
+test comparisons-render-as-t-and-f {
+    SELECT 1 = 1, 1 = 2, 1 < 2, 2 <= 1, 'a' = 'a', 1 <> 2;
+}
+expect {
+    t|f|t|f|t|t
+}
+
+test boolean-connectives-render-as-t-and-f {
+    SELECT true AND false, true OR false, NOT true;
+}
+expect {
+    f|t|f
+}
+
+test is-null-renders-as-t-and-f {
+    SELECT NULL IS NULL, 1 IS NULL, NULL IS NOT NULL, 1 IS NOT NULL;
+}
+expect {
+    t|f|f|t
+}
+
+test like-renders-as-t-and-f {
+    SELECT 'abc' LIKE 'a%', 'abc' LIKE 'b%', 'ABC' ILIKE 'a%', 'abc' NOT LIKE 'a%';
+}
+expect {
+    t|f|t|f
+}
+
+test between-renders-as-t-and-f {
+    SELECT 5 BETWEEN 1 AND 10, 5 BETWEEN 6 AND 10, 5 NOT BETWEEN 1 AND 10;
+}
+expect {
+    t|f|f
+}
+
+test in-renders-as-t-and-f {
+    SELECT 1 IN (1, 2), 3 IN (1, 2), 1 NOT IN (1, 2);
+}
+expect {
+    t|f|f
+}
+
+test exists-renders-as-t-and-f {
+    SELECT EXISTS (SELECT 1), EXISTS (SELECT 1 WHERE false);
+}
+expect {
+    t|f
+}
+
+test is-distinct-from-renders-as-t-and-f {
+    SELECT 1 IS DISTINCT FROM 2, 1 IS NOT DISTINCT FROM 1, NULL IS DISTINCT FROM 1;
+}
+expect {
+    t|t|t
+}
+
+test boolean-test-renders-as-t-and-f {
+    SELECT true IS TRUE, true IS FALSE, NULL IS UNKNOWN, true IS NOT FALSE;
+}
+expect {
+    t|f|t|t
+}
+
+test a-null-boolean-expression-is-still-null {
+    SELECT NULL = 1, NULL AND true;
+}
+expect {
+    |
+}
+
+# The value must stay usable, not just look right.
+test a-boolean-expression-still-drives-a-conditional {
+    SELECT CASE WHEN 1 = 1 THEN 'taken' ELSE 'missed' END;
+}
+expect {
+    taken
+}
+
+test comparisons-over-a-table-render-as-t-and-f {
+    CREATE TABLE bo (a int, b int);
+    INSERT INTO bo VALUES (1, 1), (1, 2);
+    SELECT a = b FROM bo ORDER BY b;
+}
+expect {
+    t
+    f
+}
+
+# Arithmetic is not boolean and must keep rendering as a number.
+test non-boolean-expressions-are-unaffected {
+    SELECT 1 + 1, 'a' || 'b', 3 % 2, -1;
+}
+expect {
+    2|ab|1|-1
+}

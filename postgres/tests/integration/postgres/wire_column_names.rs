@@ -23,6 +23,20 @@ fn column_names(conn: &mut PgConn, sql: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("no RowDescription for: {sql}"))
 }
 
+/// The column type OIDs a query reports, from its RowDescription.
+fn column_type_oids(conn: &mut PgConn, sql: &str) -> Vec<u32> {
+    conn.simple_query(sql)
+        .unwrap_or_else(|e| panic!("{sql} failed: {e}"))
+        .into_iter()
+        .find_map(|event| match event {
+            BackendEvent::RowDescription(cols) => {
+                Some(cols.into_iter().map(|c| c.type_oid).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no RowDescription for: {sql}"))
+}
+
 fn assert_names(conn: &mut PgConn, sql: &str, expected: &[&str]) {
     assert_eq!(
         column_names(conn, sql),
@@ -110,6 +124,52 @@ fn names_that_come_from_the_expression_itself() {
     );
     // ...and still `?column?` when the inner column has no name either.
     assert_names(&mut conn, "SELECT (SELECT 1 + 1)", &["?column?"]);
+}
+
+/// Marking a boolean expression's type must not rename its column: the name
+/// comes from the PostgreSQL expression, not from the cast added afterwards.
+#[test]
+fn marking_a_boolean_expression_does_not_rename_it() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    assert_names(&mut conn, "SELECT 1 = 1", &["?column?"]);
+    assert_names(&mut conn, "SELECT true", &["?column?"]);
+    assert_names(&mut conn, "SELECT NULL IS NULL", &["?column?"]);
+    assert_names(&mut conn, "SELECT 1 = 1 AS eq", &["eq"]);
+    assert_names(&mut conn, "SELECT EXISTS (SELECT 1)", &["exists"]);
+}
+
+/// A boolean expression has to arrive as the boolean type, not just print
+/// like one, because a driver reads the type OID to decode the value.
+#[test]
+fn a_boolean_expression_reports_the_boolean_type() {
+    let (params, _dir) = start_server();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+
+    /// PostgreSQL's OID for `bool`.
+    const BOOL_OID: u32 = 16;
+
+    for sql in [
+        "SELECT true",
+        "SELECT 1 = 1",
+        "SELECT NULL IS NULL",
+        "SELECT 'abc' LIKE 'a%'",
+        "SELECT 5 BETWEEN 1 AND 10",
+        "SELECT EXISTS (SELECT 1)",
+        "SELECT 1 IS DISTINCT FROM 2",
+        "SELECT 'yes'::boolean",
+    ] {
+        let oids = column_type_oids(&mut conn, sql);
+        assert_eq!(oids, vec![BOOL_OID], "type OID for `{sql}`");
+    }
+
+    // Arithmetic is not boolean and must not be marked as one.
+    assert_ne!(column_type_oids(&mut conn, "SELECT 1 + 1"), vec![BOOL_OID]);
+    assert_ne!(
+        column_type_oids(&mut conn, "SELECT 'a' || 'b'"),
+        vec![BOOL_OID]
+    );
 }
 
 #[test]

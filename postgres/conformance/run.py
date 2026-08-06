@@ -68,7 +68,7 @@ STATUS = {
     "rangetypes": "fail",
 
     "strings": "fail",
-    "md5": "fail",
+    "md5": "pass",
     "numerology": "fail",
     "date": "fail",
     "time": "fail",
