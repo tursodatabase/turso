@@ -173,11 +173,14 @@ fn try_rewrite_in(
     subquery_index: usize,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
-        return Ok(false);
-    };
     let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
     let Some((where_term_index, left)) = find_in_term(&plan.where_clause, subquery_id) else {
+        return Ok(false);
+    };
+    if plan.table_references.joined_tables().is_empty() {
+        return Ok(false);
+    }
+    let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
         return Ok(false);
     };
     let Some(right) = inner_plan
@@ -373,6 +376,15 @@ fn try_rewrite_single_value_aggregate(
         return Ok(false);
     }
 
+    let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
+
+    // A value used by an outer join condition must be ready before that join
+    // decides whether to fill its right side with NULL values.
+    if plan.where_clause.iter().any(|term| {
+        term.from_outer_join.is_some() && expr_references_subquery_id(&term.expr, subquery_id)
+    }) {
+        return Ok(false);
+    }
     let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
         return Ok(false);
     };
@@ -383,15 +395,6 @@ fn try_rewrite_single_value_aggregate(
     let Some(empty_value) = result_on_empty_input(inner_plan) else {
         return Ok(false);
     };
-    let subquery_id = plan.non_from_clause_subqueries[subquery_index].internal_id;
-
-    // A value used by an outer join condition must be ready before that join
-    // decides whether to fill its right side with NULL values.
-    if plan.where_clause.iter().any(|term| {
-        term.from_outer_join.is_some() && expr_references_subquery_id(&term.expr, subquery_id)
-    }) {
-        return Ok(false);
-    }
     let outer_tables = inner_plan.table_references.outer_query_refs();
     if outer_tables.iter().any(|outer_table| {
         outer_table.is_used()
