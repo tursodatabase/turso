@@ -550,6 +550,9 @@ fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>
     {
         return Ok(false);
     }
+    if !aggregate_can_run_for_unused_rows(plan) {
+        return Ok(false);
+    }
     if !matches!(
         plan.limit.as_deref(),
         Some(Expr::Literal(ast::Literal::Numeric(value))) if value.parse::<i64>() == Ok(1)
@@ -583,6 +586,60 @@ fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>
         }
     }
     Ok(true)
+}
+
+/// Return whether the aggregate can run for an inner row that no outer row uses.
+fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
+    // The grouped form reads every inner key. sum can fail on integer overflow.
+    // A function or special operator in an argument or filter can also fail on
+    // its input. Keep those forms correlated so they only read requested keys.
+    if plan
+        .aggregates
+        .iter()
+        .any(|aggregate| matches!(aggregate.func, AggFunc::Sum))
+    {
+        return false;
+    }
+
+    let aggregate_expressions = plan
+        .aggregates
+        .iter()
+        .flat_map(|aggregate| aggregate.args.iter().chain(aggregate.filter_expr.iter()));
+    let filter_expressions = plan.where_clause.iter().map(|term| &term.expr);
+    !aggregate_expressions
+        .chain(filter_expressions)
+        .any(expression_can_fail_on_input)
+}
+
+/// Return whether an expression has an operation that can fail for some input.
+fn expression_can_fail_on_input(expr: &Expr) -> bool {
+    let mut can_fail = false;
+    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if matches!(
+            expr,
+            Expr::FunctionCall { .. }
+                | Expr::FunctionCallStar { .. }
+                | Expr::Like { .. }
+                | Expr::Raise(_, _)
+                | Expr::Binary(
+                    _,
+                    ast::Operator::ArrowRight
+                        | ast::Operator::ArrowRightShift
+                        | ast::Operator::ArrayContains
+                        | ast::Operator::ArrayOverlap,
+                    _
+                )
+        ) {
+            can_fail = true;
+        }
+        Ok(if can_fail {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })
+    .expect("walking an aggregate expression cannot fail");
+    can_fail
 }
 
 /// Return the result for no input rows, if it is known.

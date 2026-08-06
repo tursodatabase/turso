@@ -748,6 +748,71 @@ expect {
     2|
 }
 
+# A group that no outer row uses must not make sum fail.
+test one-value-does-not-sum-unused-group {
+    CREATE TABLE used_sum_key(id INTEGER, k INTEGER);
+    CREATE TABLE sum_values(k INTEGER, x INTEGER);
+    INSERT INTO used_sum_key VALUES (1,1);
+    INSERT INTO sum_values VALUES
+        (1,10),
+        (2,9223372036854775807),
+        (2,9223372036854775807);
+
+    SELECT o.id, (SELECT sum(i.x) FROM sum_values i WHERE i.k = o.k)
+    FROM used_sum_key o;
+}
+expect {
+    1|10
+}
+
+# A bad function input in an unused group must not fail the query.
+test one-value-does-not-read-unused-bad-json {
+    CREATE TABLE used_json_key(id INTEGER, k INTEGER);
+    CREATE TABLE json_values(k INTEGER, v TEXT);
+    INSERT INTO used_json_key VALUES (1,1);
+    INSERT INTO json_values VALUES (1,'{"a":1}'),(99,'not json');
+
+    SELECT o.id,
+           (SELECT sum(json_extract(i.v, '$.a'))
+            FROM json_values i
+            WHERE i.k = o.k)
+    FROM used_json_key o;
+}
+expect {
+    1|1
+}
+
+# A function in an inner filter must not run for an unused key.
+test one-value-does-not-filter-unused-bad-json {
+    CREATE TABLE used_filter_key(id INTEGER, k INTEGER);
+    CREATE TABLE filtered_json_values(k INTEGER, v TEXT);
+    INSERT INTO used_filter_key VALUES (1,1);
+    INSERT INTO filtered_json_values VALUES (1,'{"a":1}'),(99,'not json');
+
+    SELECT o.id,
+           (SELECT count(*)
+            FROM filtered_json_values i
+            WHERE i.k = o.k AND json_extract(i.v, '$.a') > 0)
+    FROM used_filter_key o;
+}
+expect {
+    1|1
+}
+
+# An empty outer table must not run sum over any inner key.
+test one-value-empty-outer-does-not-sum {
+    CREATE TABLE empty_sum_key(id INTEGER, k INTEGER);
+    CREATE TABLE unused_sum_values(k INTEGER, x INTEGER);
+    INSERT INTO unused_sum_values VALUES
+        (2,9223372036854775807),
+        (2,9223372036854775807);
+
+    SELECT o.id, (SELECT sum(i.x) FROM unused_sum_values i WHERE i.k = o.k)
+    FROM empty_sum_key o;
+}
+expect {
+}
+
 setup comparison_keys {
     CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
     CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
