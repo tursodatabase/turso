@@ -838,6 +838,302 @@ fn format_float8(value: f64, extra_float_digits: i32) -> String {
     out
 }
 
+/// PostgreSQL's binary wire representation of one value for the declared
+/// column type: big-endian fixed-width numbers, days/microseconds since
+/// 2000-01-01 for date/time types, raw bytes for the string family, a
+/// version byte plus text for jsonb, and base-10000 digit groups for
+/// numeric. Types without an implemented representation error rather than
+/// sending bytes the client would misdecode.
+fn binary_wire_bytes(val: &Value, pg_type: &Type) -> turso_core::Result<Vec<u8>> {
+    use turso_core::Numeric;
+
+    let invalid = |what: &str| {
+        turso_core::LimboError::InternalError(format!(
+            "cannot encode value as binary {what}: {val:?}"
+        ))
+    };
+    let text_of = |v: &Value| -> String {
+        match v {
+            Value::Text(t) => t.as_str().to_string(),
+            Value::Numeric(Numeric::Float(f)) => {
+                // Rust's Display is shortest-roundtrip and never scientific,
+                // which decimal parsers below rely on.
+                format!("{}", f64::from(*f))
+            }
+            other => other.to_string(),
+        }
+    };
+    let as_i64 = |v: &Value| -> Option<i64> {
+        match v {
+            Value::Numeric(Numeric::Integer(i)) => Some(*i),
+            Value::Numeric(Numeric::Float(f)) => {
+                let f = f64::from(*f);
+                (f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64)
+                    .then_some(f as i64)
+            }
+            Value::Text(t) => t.as_str().trim().parse().ok(),
+            _ => None,
+        }
+    };
+    let as_f64 = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Numeric(Numeric::Integer(i)) => Some(*i as f64),
+            Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f)),
+            Value::Text(t) => t.as_str().trim().parse().ok(),
+            _ => None,
+        }
+    };
+
+    if *pg_type == Type::INT2 {
+        let i = as_i64(val).ok_or_else(|| invalid("int2"))?;
+        let i = i16::try_from(i)
+            .map_err(|_| turso_core::LimboError::ParseError("smallint out of range".to_string()))?;
+        Ok(i.to_be_bytes().to_vec())
+    } else if *pg_type == Type::INT4 {
+        let i = as_i64(val).ok_or_else(|| invalid("int4"))?;
+        let i = i32::try_from(i)
+            .map_err(|_| turso_core::LimboError::ParseError("integer out of range".to_string()))?;
+        Ok(i.to_be_bytes().to_vec())
+    } else if *pg_type == Type::INT8 {
+        let i = as_i64(val).ok_or_else(|| invalid("int8"))?;
+        Ok(i.to_be_bytes().to_vec())
+    } else if *pg_type == Type::OID {
+        let i = as_i64(val).ok_or_else(|| invalid("oid"))?;
+        let i = u32::try_from(i)
+            .map_err(|_| turso_core::LimboError::ParseError("OID out of range".to_string()))?;
+        Ok(i.to_be_bytes().to_vec())
+    } else if *pg_type == Type::FLOAT4 {
+        let f = as_f64(val).ok_or_else(|| invalid("float4"))?;
+        Ok((f as f32).to_be_bytes().to_vec())
+    } else if *pg_type == Type::FLOAT8 {
+        let f = as_f64(val).ok_or_else(|| invalid("float8"))?;
+        Ok(f.to_be_bytes().to_vec())
+    } else if *pg_type == Type::BOOL {
+        let b = match val {
+            Value::Numeric(Numeric::Integer(i)) => *i != 0,
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f) != 0.0,
+            Value::Text(t) => matches!(
+                t.as_str().to_ascii_lowercase().as_str(),
+                "t" | "true" | "yes" | "on" | "1"
+            ),
+            _ => return Err(invalid("bool")),
+        };
+        Ok(vec![b as u8])
+    } else if *pg_type == Type::BYTEA {
+        Ok(match val {
+            Value::Blob(b) => b.to_vec(),
+            other => text_of(other).into_bytes(),
+        })
+    } else if *pg_type == Type::JSONB {
+        // Binary jsonb is a format version byte followed by the json text.
+        let mut out = vec![1u8];
+        out.extend_from_slice(text_of(val).as_bytes());
+        Ok(out)
+    } else if *pg_type == Type::UUID {
+        let text = text_of(val);
+        let hex: String = text.chars().filter(|c| *c != '-').collect();
+        if hex.len() != 32 {
+            return Err(invalid("uuid"));
+        }
+        decode_hex(&hex).map_err(|_| invalid("uuid"))
+    } else if *pg_type == Type::DATE {
+        let text = text_of(val);
+        let days = parse_date_to_pg_days(&text).ok_or_else(|| invalid("date"))?;
+        Ok((days as i32).to_be_bytes().to_vec())
+    } else if *pg_type == Type::TIME {
+        let text = text_of(val);
+        let micros = parse_time_to_micros(&text).ok_or_else(|| invalid("time"))?;
+        Ok(micros.to_be_bytes().to_vec())
+    } else if *pg_type == Type::TIMESTAMP || *pg_type == Type::TIMESTAMPTZ {
+        let text = text_of(val);
+        let micros = parse_timestamp_to_pg_micros(&text).ok_or_else(|| invalid("timestamp"))?;
+        Ok(micros.to_be_bytes().to_vec())
+    } else if *pg_type == Type::NUMERIC {
+        let text = text_of(val);
+        numeric_wire_bytes(&text).ok_or_else(|| invalid("numeric"))
+    } else if *pg_type == Type::TEXT
+        || *pg_type == Type::VARCHAR
+        || *pg_type == Type::BPCHAR
+        || *pg_type == Type::NAME
+        || *pg_type == Type::CHAR
+        || *pg_type == Type::UNKNOWN
+        || *pg_type == Type::JSON
+    {
+        // The string family's binary format is the text itself; plain
+        // json has no version byte either.
+        Ok(text_of(val).into_bytes())
+    } else {
+        Err(turso_core::LimboError::ParseError(format!(
+            "binary format for type \"{}\" is not supported",
+            pg_type.name()
+        )))
+    }
+}
+
+/// Days between 1970-01-01 and y-m-d in the proleptic Gregorian calendar
+/// (Howard Hinnant's days_from_civil).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719_468
+}
+
+/// Days between PostgreSQL's 2000-01-01 epoch and the Unix epoch.
+const PG_EPOCH_DAYS_FROM_UNIX: i64 = 10_957;
+
+/// "YYYY-MM-DD" to days since 2000-01-01, PostgreSQL's binary date unit.
+fn parse_date_to_pg_days(s: &str) -> Option<i64> {
+    let mut parts = s.trim().split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d) - PG_EPOCH_DAYS_FROM_UNIX)
+}
+
+/// "HH:MM[:SS[.fraction]]" to microseconds since midnight.
+fn parse_time_to_micros(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (hms, frac) = match s.split_once('.') {
+        Some((hms, frac)) => (hms, Some(frac)),
+        None => (s, None),
+    };
+    let mut parts = hms.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let sec: i64 = match parts.next() {
+        Some(sec) => sec.parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some()
+        || !(0..=24).contains(&h)
+        || !(0..60).contains(&m)
+        || !(0..61).contains(&sec)
+    {
+        return None;
+    }
+    let micros_frac: i64 = match frac {
+        Some(frac) => {
+            if frac.is_empty() || frac.len() > 6 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            format!("{frac:0<6}").parse().ok()?
+        }
+        None => 0,
+    };
+    Some(((h * 60 + m) * 60 + sec) * 1_000_000 + micros_frac)
+}
+
+/// "YYYY-MM-DD HH:MM:SS[.fraction][±HH[:MM]|Z]" to microseconds since
+/// 2000-01-01 00:00:00 UTC, PostgreSQL's binary timestamp unit.
+fn parse_timestamp_to_pg_micros(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date_part, time_part) = s.split_once([' ', 'T'])?;
+    // A timezone suffix begins with +, -, or Z somewhere after the HH:MM
+    // digits start; a leading '-' cannot occur inside the time itself.
+    let (time_part, offset_secs) = if let Some(rest) = time_part.strip_suffix('Z') {
+        (rest, 0)
+    } else if let Some(pos) = time_part.rfind(['+', '-']).filter(|&p| p > 0) {
+        let (time, tz) = time_part.split_at(pos);
+        let sign: i64 = if tz.starts_with('-') { -1 } else { 1 };
+        let tz = &tz[1..];
+        let (th, tm) = match tz.split_once(':') {
+            Some((th, tm)) => (th.parse::<i64>().ok()?, tm.parse::<i64>().ok()?),
+            None => (tz.parse::<i64>().ok()?, 0),
+        };
+        (time, sign * (th * 3600 + tm * 60))
+    } else {
+        (time_part, 0)
+    };
+    let days = parse_date_to_pg_days(date_part)?;
+    let micros = parse_time_to_micros(time_part)?;
+    Some(days * 86_400_000_000 + micros - offset_secs * 1_000_000)
+}
+
+/// A plain decimal string ("[-]digits[.digits]" or "NaN") to PostgreSQL's
+/// binary numeric format: i16 count of base-10000 digit groups, i16 weight
+/// of the first group (in units of 10000^weight), u16 sign, u16 display
+/// scale, then the groups.
+fn numeric_wire_bytes(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("nan") {
+        return Some(
+            [0u16, 0, 0xC000, 0]
+                .iter()
+                .flat_map(|v| v.to_be_bytes())
+                .collect(),
+        );
+    }
+    let (negative, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let dscale = frac_part.len() as u16;
+
+    // Group the digits into base-10000 chunks aligned on the decimal
+    // point: pad the integer side to a multiple of 4 on the left and the
+    // fraction side on the right.
+    let mut padded = String::new();
+    for _ in 0..(4 - int_part.len() % 4) % 4 {
+        padded.push('0');
+    }
+    padded.push_str(int_part);
+    let int_groups = padded.len() / 4;
+    padded.push_str(frac_part);
+    while padded.len() % 4 != 0 {
+        padded.push('0');
+    }
+    let mut groups: Vec<i16> = padded
+        .as_bytes()
+        .chunks(4)
+        .map(|c| {
+            std::str::from_utf8(c)
+                .expect("ascii digits")
+                .parse()
+                .expect("four digits")
+        })
+        .collect();
+
+    // Strip zero groups off both ends; weight counts from the first kept
+    // group, so leading strips lower it.
+    let mut weight = int_groups as i64 - 1;
+    let leading_zeros = groups.iter().take_while(|g| **g == 0).count();
+    groups.drain(..leading_zeros);
+    weight -= leading_zeros as i64;
+    while groups.last() == Some(&0) {
+        groups.pop();
+    }
+    if groups.is_empty() {
+        weight = 0;
+    }
+
+    let mut out = Vec::with_capacity(8 + groups.len() * 2);
+    out.extend_from_slice(&(groups.len() as i16).to_be_bytes());
+    out.extend_from_slice(&(weight as i16).to_be_bytes());
+    out.extend_from_slice(&if negative { 0x4000u16 } else { 0 }.to_be_bytes());
+    out.extend_from_slice(&dscale.to_be_bytes());
+    for group in groups {
+        out.extend_from_slice(&group.to_be_bytes());
+    }
+    Some(out)
+}
+
 fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
@@ -845,6 +1141,19 @@ fn encode_value(
     field_format: FieldFormat,
     extra_float_digits: i32,
 ) -> turso_core::Result<()> {
+    // Binary result columns carry the type's PostgreSQL binary wire
+    // representation, computed here; NULL uses the shared -1-length path.
+    if field_format == FieldFormat::Binary && !matches!(val, Value::Null) {
+        let bytes = binary_wire_bytes(val, pg_type)?;
+        return encoder
+            .encode_field_with_type_and_format(
+                &bytes.as_slice(),
+                &Type::BYTEA,
+                FieldFormat::Binary,
+                &FormatOptions::default(),
+            )
+            .map_err(|e| turso_core::LimboError::InternalError(e.to_string()));
+    }
     match val {
         Value::Null => encoder
             .encode_field(&None::<i8>)
@@ -861,22 +1170,14 @@ fn encode_value(
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
-        Value::Numeric(turso_core::Numeric::Float(f)) => {
-            if field_format == FieldFormat::Text {
-                encoder
-                    .encode_field_with_type_and_format(
-                        &format_float8(f64::from(*f), extra_float_digits).as_str(),
-                        &Type::TEXT,
-                        FieldFormat::Text,
-                        &FormatOptions::default(),
-                    )
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-            } else {
-                encoder
-                    .encode_field(&f64::from(*f))
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-            }
-        }
+        Value::Numeric(turso_core::Numeric::Float(f)) => encoder
+            .encode_field_with_type_and_format(
+                &format_float8(f64::from(*f), extra_float_digits).as_str(),
+                &Type::TEXT,
+                FieldFormat::Text,
+                &FormatOptions::default(),
+            )
+            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Text(t) => {
             let text = t.value.as_ref();
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients
@@ -1257,5 +1558,66 @@ mod tests {
 
         assert!(!ends_with_with_no_data("CREATE TABLE T AS SELECT 1"));
         assert!(!ends_with_with_no_data("SELECT 'WITH NO DATA'"));
+    }
+
+    #[test]
+    fn numeric_wire_bytes_matches_postgres_binary_format() {
+        // 123.45: groups [123, 4500], weight 0, positive, dscale 2.
+        assert_eq!(
+            numeric_wire_bytes("123.45").unwrap(),
+            vec![0, 2, 0, 0, 0, 0, 0, 2, 0, 123, 0x11, 0x94]
+        );
+        // 20001.5 spans three groups with weight 1.
+        assert_eq!(
+            numeric_wire_bytes("20001.5").unwrap(),
+            vec![0, 3, 0, 1, 0, 0, 0, 1, 0, 2, 0, 1, 0x13, 0x88]
+        );
+        // -0.0042: one group in the 10000^-1 position, negative, dscale 4.
+        assert_eq!(
+            numeric_wire_bytes("-0.0042").unwrap(),
+            vec![0, 1, 0xff, 0xff, 0x40, 0, 0, 4, 0, 42]
+        );
+        // Zero keeps only the display scale.
+        assert_eq!(
+            numeric_wire_bytes("0.00").unwrap(),
+            vec![0, 0, 0, 0, 0, 0, 0, 2]
+        );
+        // NaN is the reserved sign value.
+        assert_eq!(
+            numeric_wire_bytes("NaN").unwrap(),
+            vec![0, 0, 0, 0, 0xc0, 0, 0, 0]
+        );
+        assert_eq!(numeric_wire_bytes("12e4"), None);
+    }
+
+    #[test]
+    fn date_and_time_parsers_use_the_postgres_epoch() {
+        assert_eq!(parse_date_to_pg_days("2000-01-01"), Some(0));
+        assert_eq!(parse_date_to_pg_days("1999-12-31"), Some(-1));
+        assert_eq!(parse_date_to_pg_days("2024-01-15"), Some(8780));
+        assert_eq!(parse_date_to_pg_days("2024-13-01"), None);
+
+        assert_eq!(parse_time_to_micros("00:00"), Some(0));
+        assert_eq!(parse_time_to_micros("12:00:00.25"), Some(43_200_250_000));
+        assert_eq!(parse_time_to_micros("25:00:00"), None);
+
+        assert_eq!(parse_timestamp_to_pg_micros("2000-01-01 00:00:00"), Some(0));
+        assert_eq!(
+            parse_timestamp_to_pg_micros("2024-01-15T12:00:00"),
+            Some(758_635_200_000_000)
+        );
+        // A -05 offset means five hours later in UTC.
+        assert_eq!(
+            parse_timestamp_to_pg_micros("2000-01-01 00:00:00-05"),
+            Some(5 * 3600 * 1_000_000)
+        );
+        assert_eq!(
+            parse_timestamp_to_pg_micros("2000-01-01 01:30:00+01:30"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_timestamp_to_pg_micros("2000-01-01 00:00:00Z"),
+            Some(0)
+        );
     }
 }

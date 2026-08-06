@@ -327,6 +327,65 @@ impl PgConn {
         }
     }
 
+    /// Like [`PgConn::extended_query`], but asks for every result column
+    /// in binary format and returns each data row as raw per-column bytes,
+    /// since text strings cannot carry binary values. Text parameters
+    /// only; an ErrorResponse fails the call after the sync completes.
+    pub fn extended_query_binary_results(
+        &mut self,
+        sql: &str,
+        params: &[Option<Vec<u8>>],
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
+        // Parse: unnamed statement, query, no declared parameter types.
+        let mut body = vec![0u8];
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0u16.to_be_bytes());
+        self.write_message(b'P', &body)?;
+
+        // Bind: text parameters, one result format code of 1 (binary).
+        let mut body = vec![0u8, 0u8];
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&(params.len() as u16).to_be_bytes());
+        for param in params {
+            match param {
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(bytes) => {
+                    body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    body.extend_from_slice(bytes);
+                }
+            }
+        }
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        self.write_message(b'B', &body)?;
+
+        // Describe portal, Execute (no row limit), Sync.
+        self.write_message(b'D', &[b'P', 0])?;
+        self.write_message(b'E', &[0, 0, 0, 0, 0])?;
+        self.write_message(b'S', &[])?;
+
+        let mut rows = Vec::new();
+        let mut error = None;
+        loop {
+            let (tag, body) = self.read_message()?;
+            match tag {
+                b'D' => rows.push(parse_data_row_bytes(&body)?),
+                b'E' => {
+                    let fields = parse_error_fields(&body)?;
+                    error.get_or_insert_with(|| error_message(&fields).to_string());
+                }
+                b'Z' => {
+                    return match error {
+                        Some(message) => Err(Error::Rejected(message)),
+                        None => Ok(rows),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Sends one CopyData frame during an active `COPY ... FROM STDIN`.
     pub fn send_copy_data(&mut self, data: &[u8]) -> Result<()> {
         self.write_message(b'd', data)
@@ -375,6 +434,23 @@ pub fn parse_data_row(body: &[u8]) -> Result<Vec<Option<String>>> {
         } else {
             let bytes = r.bytes(len as usize)?;
             row.push(Some(String::from_utf8_lossy(bytes).into_owned()));
+        }
+    }
+    Ok(row)
+}
+
+/// Parses a `DataRow` message body into raw per-column bytes. `None` is
+/// SQL NULL.
+pub fn parse_data_row_bytes(body: &[u8]) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut r = Reader::new(body);
+    let ncols = r.u16()? as usize;
+    let mut row = Vec::with_capacity(ncols);
+    for _ in 0..ncols {
+        let len = r.i32()?;
+        if len < 0 {
+            row.push(None);
+        } else {
+            row.push(Some(r.bytes(len as usize)?.to_vec()));
         }
     }
     Ok(row)
