@@ -4061,6 +4061,33 @@ mod tests {
     }
 
     #[test]
+    fn null_rejection_detection_treats_empty_not_in_as_non_rejecting() {
+        let table = TableInternalId::from(15);
+        let column = Expr::Column {
+            database: None,
+            table,
+            column: 0,
+            is_rowid_alias: false,
+        };
+        let not_in_empty = Expr::InList {
+            lhs: Box::new(column.clone()),
+            not: true,
+            rhs: vec![],
+        };
+        let in_value = Expr::InList {
+            lhs: Box::new(column),
+            not: false,
+            rhs: vec![Box::new(Expr::Literal(ast::Literal::Numeric("1".into())))],
+        };
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &not_in_empty,
+            table
+        ));
+        assert!(where_term_is_null_rejecting_for_table(&in_value, table));
+    }
+
+    #[test]
     fn null_rejection_detection_treats_is_between_columns_as_non_rejecting() {
         let table = TableInternalId::from(12);
         let expr = Expr::Binary(
