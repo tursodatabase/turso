@@ -672,6 +672,25 @@ expect {
     1|30
 }
 
+# A scalar subquery result does not use the text order of its result column.
+# Replacing it with a grouped-table column must keep that rule.
+test one-value-result-has-no-text-order {
+    CREATE TABLE result_order_outer(k INTEGER, v TEXT);
+    CREATE TABLE result_order_inner(k INTEGER, v TEXT COLLATE NOCASE);
+    INSERT INTO result_order_outer VALUES (1,'a'),(2,'zz');
+    INSERT INTO result_order_inner VALUES (1,'A'),(2,'q');
+
+    SELECT o.k
+    FROM result_order_outer o
+    WHERE (o.v || '') = (
+        SELECT max(i.v)
+        FROM result_order_inner i
+        WHERE i.k = o.k
+    );
+}
+expect {
+}
+
 @setup comparison_keys
 test correlated-in-keeps-number-to-text-comparison {
     SELECT o.id

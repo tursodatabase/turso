@@ -49,6 +49,8 @@ use turso_parser::ast::{
 use crate::translate::plan::Plan;
 
 use crate::function::AggFunc;
+use crate::schema::Table;
+use crate::sync::Arc;
 use crate::translate::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
@@ -473,6 +475,15 @@ fn try_rewrite_single_value_aggregate(
         }),
         subquery_id,
     )?;
+    // A scalar subquery result has no text order. Do not give its replacement
+    // the text order of the grouped table's first result column.
+    let Table::FromClauseSubquery(grouped_subquery) = &mut grouped_table.table else {
+        unreachable!("a grouped table must hold a subquery")
+    };
+    Arc::get_mut(grouped_subquery)
+        .expect("a new grouped subquery is not shared")
+        .columns[0]
+        .set_collation(None);
     for column in 0..grouped_table.columns().len() {
         grouped_table.mark_column_used(column);
     }
