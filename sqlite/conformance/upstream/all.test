@@ -466,7 +466,7 @@ set test_files {
   rowhash              fail
   rowid                skip {hangs at rowid-13.1}
   rowvalue             fail
-  rowvalue2            fail
+  rowvalue2            pass
   rowvalue3            fail
   rowvalue4            fail
   rowvalue5            fail
@@ -474,7 +474,7 @@ set test_files {
   rowvalue7            pass
   rowvalue8            fail
   rowvalue9          skip {aborts the harness on an engine panic at core/vdbe/builder.rs:1580}
-  rowvalueA            fail
+  rowvalueA            pass
   rowvaluevtab         fail
   savepoint            fail
   savepoint2           fail
@@ -612,9 +612,9 @@ set test_files {
   tkt-bd484a090c       fail
   tkt-bdc6bbbb38       fail
   tkt-c48d99d690       pass
-  tkt-c694113d5        fail
+  tkt-c694113d5        pass
   tkt-cbd054fa6b       fail
-  tkt-d11f09d36e       fail
+  tkt-d11f09d36e       pass
   tkt-d635236375       pass
   tkt-d82e3f3721       fail
   tkt-f3e5abed55       fail
@@ -685,7 +685,7 @@ set test_files {
   tkt35xx              fail
   tkt3630              pass
   tkt3718              skip {hangs at tkt3718-1.2}
-  tkt3731              fail
+  tkt3731              pass
   tkt3757              fail
   tkt3761              fail
   tkt3762              fail
@@ -704,7 +704,7 @@ set test_files {
   tkt3922              fail
   tkt3929              pass
   tkt3935              fail
-  tkt3992              fail
+  tkt3992              pass
   tkt3997              fail
   tkt4018              fail
   tokenize             fail
@@ -782,7 +782,7 @@ set test_files {
   wal8                 pass
   wal9                 fail
   walbak               fail
-  walbig               fail
+  walbig               pass
   walblock             fail
   walcksum             fail
   walhook              fail
