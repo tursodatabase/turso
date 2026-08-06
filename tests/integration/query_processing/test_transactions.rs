@@ -2597,3 +2597,267 @@ fn test_user_sequence_rollback_does_not_pollute_watermark(tmp_db: TempDatabase) 
         rows[0].0
     );
 }
+
+/// Regression coverage for the ENG-61 Antithesis finding: "row N missing
+/// from index sqlite_autoindex_..." reported by turso's own
+/// PRAGMA integrity_check.
+///
+/// Chain of events (all were necessary):
+/// 1. A savepoint opened before the transaction's first write predates the
+///    WAL restart performed at the write upgrade (log fully backfilled).
+///    ROLLBACK TO installed the dead-generation WAL position, so the
+///    following spills/commit appended at a bogus offset with a broken
+///    checksum chain: the commit was live-visible but invisible to WAL
+///    recovery.
+/// 2. A checkpoint began backfilling that live-visible commit into the
+///    database file and aborted midway (injected write failure here; an IO
+///    fault or kill under Antithesis). A partial backfill is normally
+///    harmless because the WAL still overlays the partial pages.
+/// 3. On reopen, recovery dropped the corrupt-chain commit, exposing the
+///    partial backfill: torn table/index state ("row N missing from index
+///    sqlite_autoindex_t_1") or, with no partial pages, silent loss of the
+///    committed transaction.
+///
+/// This test drives that exact sequence, aborting the checkpoint after k
+/// database-file writes for a spread of k, and asserts the reopened
+/// database is consistent and still contains the committed transaction.
+mod savepoint_wal_restart_partial_checkpoint {
+    use super::helper_read_all_rows;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use turso_core::io::FileSyncType;
+    use turso_core::{
+        Buffer, Clock, Completion, Database, File, LimboError, OpenFlags, PlatformIO, IO,
+    };
+
+    /// Wraps the main database file; once armed, fails every pwrite after
+    /// the write budget is exhausted, so a checkpoint backfill aborts midway.
+    struct FaultFile {
+        inner: Arc<dyn File>,
+        armed: Arc<AtomicBool>,
+        budget: Arc<AtomicI64>,
+    }
+
+    impl File for FaultFile {
+        fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> turso_core::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> turso_core::Result<Completion> {
+            if self.armed.load(AtomicOrdering::SeqCst)
+                && self.budget.fetch_sub(1, AtomicOrdering::SeqCst) <= 0
+            {
+                return Err(LimboError::InternalError(
+                    "injected db-file write failure".into(),
+                ));
+            }
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> turso_core::Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    struct FaultIo {
+        inner: Arc<dyn IO>,
+        db_path: String,
+        armed: Arc<AtomicBool>,
+        budget: Arc<AtomicI64>,
+    }
+
+    impl Clock for FaultIo {
+        fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for FaultIo {
+        fn sleep(&self, _duration: std::time::Duration) {}
+        fn open_file(
+            &self,
+            path: &str,
+            flags: OpenFlags,
+            direct: bool,
+        ) -> turso_core::Result<Arc<dyn File>> {
+            let f = self.inner.open_file(path, flags, direct)?;
+            if path == self.db_path {
+                Ok(Arc::new(FaultFile {
+                    inner: f,
+                    armed: self.armed.clone(),
+                    budget: self.budget.clone(),
+                }))
+            } else {
+                Ok(f)
+            }
+        }
+        fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+            self.inner.file_id(path)
+        }
+        fn cancel(&self, c: &[Completion]) -> turso_core::Result<()> {
+            self.inner.cancel(c)
+        }
+        fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+            self.inner.drain_completions(completions)
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            self.inner.fill_bytes(dest)
+        }
+        fn generate_random_number(&self) -> i64 {
+            self.inner.generate_random_number()
+        }
+        fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
+            self.inner.get_memory_io()
+        }
+        fn register_fixed_buffer(
+            &self,
+            ptr: std::ptr::NonNull<u8>,
+            len: usize,
+        ) -> turso_core::Result<u32> {
+            self.inner.register_fixed_buffer(ptr, len)
+        }
+        fn step(&self) -> turso_core::Result<()> {
+            self.inner.step()
+        }
+        fn wait_for_completion(&self, c: Completion) -> turso_core::Result<()> {
+            self.inner.wait_for_completion(c)
+        }
+        fn yield_now(&self) {
+            self.inner.yield_now()
+        }
+    }
+
+    /// Runs the savepoint/WAL-restart dance, aborts a passive checkpoint
+    /// after `k` database-file writes, reopens from disk, and returns the
+    /// integrity_check rows plus whether the committed update survived.
+    fn aborted_checkpoint_recovery(k: i64) -> (Vec<String>, bool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("eng61.db");
+        let path_str = db_path.to_str().unwrap().to_string();
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let budget = Arc::new(AtomicI64::new(0));
+        let io: Arc<dyn IO> = Arc::new(FaultIo {
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            db_path: path_str.clone(),
+            armed: armed.clone(),
+            budget: budget.clone(),
+        });
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        // Small page cache so the big batch below spills mid-transaction.
+        conn.execute("PRAGMA cache_size = 100").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)")
+            .unwrap();
+        let pad = "x".repeat(2000);
+        conn.execute("BEGIN").unwrap();
+        for i in 1..=300 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{i}-{pad}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        // Fully backfill so the next write transaction restarts the WAL.
+        conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
+
+        // Savepoint before the transaction's first write, so it predates the
+        // WAL restart performed at the write upgrade.
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SAVEPOINT sp").unwrap();
+        for i in 301..=900 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{i}-{pad}')"))
+                .unwrap();
+        }
+        conn.execute("ROLLBACK TO sp").unwrap();
+        // In-place updates so any torn backfill lands inside the live page
+        // range: each one moves a UNIQUE key, touching a table leaf and the
+        // corresponding autoindex leaf.
+        for i in 1..=60 {
+            conn.execute(format!("UPDATE t SET val = 'u{i}-{pad}' WHERE id = {i}"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+
+        // Abort a passive checkpoint after k database-file writes. Stay
+        // armed through close so the close-time checkpoint cannot finish the
+        // backfill and mask the recovery bug.
+        budget.store(k, AtomicOrdering::SeqCst);
+        armed.store(true, AtomicOrdering::SeqCst);
+        let _ = conn.execute("PRAGMA wal_checkpoint(PASSIVE)");
+        drop(conn);
+        drop(db);
+        turso_core::clear_database_registry();
+
+        // Fresh open from disk drives WAL recovery.
+        let io2: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db2 = Database::open_file_with_flags(
+            io2,
+            &path_str,
+            OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn2 = db2.connect().unwrap();
+        let stmt = conn2
+            .query("SELECT count(*) FROM t WHERE id = 1 AND val LIKE 'u1-%'")
+            .unwrap()
+            .unwrap();
+        let updated_row_survived =
+            helper_read_all_rows(stmt)[0][0] == turso_core::Value::from_i64(1);
+        let stmt = conn2.query("PRAGMA integrity_check").unwrap().unwrap();
+        let messages = helper_read_all_rows(stmt)
+            .iter()
+            .map(|r| format!("{:?}", r[0]))
+            .collect();
+        turso_core::clear_database_registry();
+        (messages, updated_row_survived)
+    }
+
+    #[test]
+    fn test_savepoint_wal_restart_survives_aborted_checkpoint_recovery() {
+        // k = 0 covers the pure recovery-loss case; the larger values place
+        // the abort throughout the backfill, including inside the band of
+        // pages the post-rollback updates changed (where the torn state used
+        // to surface as "row N missing from index sqlite_autoindex_t_1").
+        for k in (0..=1000).step_by(20) {
+            let (messages, updated_row_survived) = aborted_checkpoint_recovery(k as i64);
+            assert!(
+                messages.len() == 1 && messages[0].contains("\"ok\""),
+                "integrity check must pass after recovery with checkpoint aborted at write {k}, got: {messages:?}"
+            );
+            assert!(
+                updated_row_survived,
+                "committed update must survive recovery with checkpoint aborted at write {k}"
+            );
+        }
+    }
+}
