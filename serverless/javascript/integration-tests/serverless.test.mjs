@@ -39,12 +39,12 @@ test.serial('prepare() method creates statement', async t => {
   const stmt = await client.prepare('SELECT * FROM test_users WHERE name = ?');
   
   const row = await stmt.get(['John Doe']);
-  t.is(row[1], 'John Doe');
-  t.is(row[2], 'john@example.com');
+  t.is(row.name, 'John Doe');
+  t.is(row.email, 'john@example.com');
   
   const rows = await stmt.all(['John Doe']);
   t.is(rows.length, 1);
-  t.is(rows[0][1], 'John Doe');
+  t.is(rows[0].name, 'John Doe');
 });
 
 test.serial('Statement.run()', async t => {
@@ -66,7 +66,7 @@ test.serial('statement iterate() method works', async t => {
   }
   
   t.true(rows.length >= 1);
-  t.is(rows[0][1], 'John Doe');
+  t.is(rows[0].name, 'John Doe');
 });
 
 test.serial('batch() method executes multiple statements', async t => {
@@ -74,9 +74,9 @@ test.serial('batch() method executes multiple statements', async t => {
   
   const batchResult = await client.batch([
     'CREATE TABLE test_products (id INTEGER PRIMARY KEY, name TEXT, price REAL)',
-    'INSERT INTO test_products (name, price) VALUES ("Widget", 9.99)',
-    'INSERT INTO test_products (name, price) VALUES ("Gadget", 19.99)',
-    'INSERT INTO test_products (name, price) VALUES ("Tool", 29.99)'
+    "INSERT INTO test_products (name, price) VALUES ('Widget', 9.99)",
+    "INSERT INTO test_products (name, price) VALUES ('Gadget', 19.99)",
+    "INSERT INTO test_products (name, price) VALUES ('Tool', 29.99)"
   ]);
   
   // batch() returns one ResultSet per statement, in order.
@@ -92,7 +92,6 @@ test.serial('get() method queries a single value', async t => {
   const row = await client.get('SELECT 42 AS answer');
 
   t.is(row.answer, 42);
-  t.is(row[0], 42);
 });
 
 test.serial('get() method queries a single row', async t => {
@@ -109,10 +108,10 @@ test.serial('get() method queries a single row', async t => {
     ["three", 0.5],
   ]);
 
-  // Positional access is also available
-  t.is(r[0], 1);
-  t.is(r[1], "two");
-  t.is(r[2], 0.5);
+  // Positional access requires raw mode
+  const stmt2 = await client.prepare("SELECT 1 AS one, 'two' AS two, 0.5 AS three");
+  const rawRow = await stmt2.raw().get();
+  t.deepEqual(rawRow, [1, "two", 0.5]);
 });
 
 test.serial('error handling works correctly', async t => {

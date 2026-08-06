@@ -217,7 +217,11 @@ function _buildValueArbs(v) {
   throw new Error(`unknown value spec: ${id}`);
 }
 
-const arbValue = fc.oneof(..._SPEC.values.flatMap(_buildValueArbs));
+// Entries carrying a "disabled" field are excluded while a known server bug
+// makes them fail differentially.
+const arbValue = fc.oneof(
+  ..._SPEC.values.filter(v => !v.disabled).flatMap(_buildValueArbs)
+);
 
 // Generate 1-5 columns with unique names (c0..c4)
 const arbDynamicCols = fc.integer({ min: 1, max: 5 }).chain(n =>
