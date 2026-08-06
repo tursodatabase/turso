@@ -148,11 +148,33 @@ distinguishable from an expired stream.
 ### 4.5 Expiry
 
 The server expires streams that stay idle for longer than a server-defined
-timeout. A request carrying a baton for an expired or unknown stream fails
-with a non-200 status, typically `404 Not Found` (section 9.3); a baton
-that is not from the most recent response fails the same way. The client
-MUST treat this as fatal for the stream: any open transaction was rolled
-back, and the client has to open a new stream with a `null` baton.
+timeout. Responses MAY disclose the timeout in the `stream_ttl_ms` field
+(sections 5.2 and 7.2): a stream that receives no request for this many
+milliseconds must be expected to be gone. Clients MUST NOT rely on any
+particular timeout value or on the field being present; the server may
+shorten the timeout at any time, for example under resource pressure.
+
+A request carrying a baton for a stream that no longer exists fails with a
+non-200 status and a stream-fatal error code (section 9.3.1). The code
+distinguishes, as far as the server can tell, *why* the stream is gone:
+
+* `STREAM_EXPIRED`: the stream existed on this server and was expired or
+  evicted. Any transaction open on it was rolled back at eviction time:
+  none of the transaction's statements took effect.
+* `STREAM_LOST`: the baton names a server process that is gone, typically
+  after a restart or failover. Any open transaction died with the process;
+  its uncommitted statements did not take effect.
+* `STREAM_NOT_FOUND`: the server has no record of this stream. This covers
+  malformed and fabricated batons, batons that are not from the most
+  recent response, and expired streams the server no longer remembers.
+
+All three are fatal for the stream: the client has to open a new stream
+with a `null` baton. A client that held an open transaction MAY treat
+`STREAM_EXPIRED` and `STREAM_LOST` as an assurance that the transaction
+was rolled back and that re-running it is safe; `STREAM_NOT_FOUND` gives
+no such assurance. Servers SHOULD remember recently expired streams long
+enough that a client returning shortly after expiry receives
+`STREAM_EXPIRED` rather than `STREAM_NOT_FOUND`.
 
 ### 4.6 The base URL
 
@@ -168,7 +190,10 @@ Interactive transactions fall out of the stream mechanism: the client sends
 `BEGIN` in one pipeline, receives a baton because the stream is now in a
 transaction, and sends further statements and finally `COMMIT` or `ROLLBACK`
 in later pipelines carrying that baton. If the stream expires or the client
-loses the baton, the server rolls the transaction back.
+loses the baton, the server rolls the transaction back, and the next
+request on the stream reports `STREAM_EXPIRED` (section 4.5) — which the
+client may take as permission to retry the whole transaction on a new
+stream.
 
 ## 5. The pipeline endpoint
 
@@ -209,11 +234,14 @@ to an empty pipeline by closing the stream.
 }
 ```
 
-| Field      | Type             | Description                                        |
-|------------|------------------|----------------------------------------------------|
-| `baton`    | `string \| null` | Baton for the next request, or `null` if the stream is closed. |
-| `base_url` | `string \| null` | Base URL for subsequent requests on this stream (section 4.6). |
-| `results`  | `array`          | One result per request, in request order.          |
+| Field           | Type             | Description                                        |
+|-----------------|------------------|----------------------------------------------------|
+| `baton`         | `string \| null` | Baton for the next request, or `null` if the stream is closed. |
+| `base_url`      | `string \| null` | Base URL for subsequent requests on this stream (section 4.6). |
+| `stream_ttl_ms` | `integer`        | Optional. Idle timeout of this stream in milliseconds (section 4.5). Only meaningful alongside a non-null baton. |
+| `results`       | `array`          | One result per request, in request order.          |
+
+Clients MUST ignore response fields they do not recognize.
 
 Each element of `results` is one of:
 
@@ -234,7 +262,7 @@ The whole HTTP request fails (with a non-200 status and no `results`) for
 protocol-level problems, including:
 
 * a malformed request body,
-* an invalid, expired, or already-consumed baton,
+* an invalid, expired, or already-consumed baton (sections 4.5 and 9.3.1),
 * an unknown database or failed authentication,
 * a `close` request that is not the last request of the pipeline,
 * a malformed batch condition: a reference to the current or a later step,
@@ -560,12 +588,13 @@ The response body is a stream of JSON values separated by newline characters
 The first line is the cursor response:
 
 ```json
-{ "baton": "<baton>", "base_url": null }
+{ "baton": "<baton>", "base_url": null, "stream_ttl_ms": 30000 }
 ```
 
 Unlike the pipeline endpoint, the cursor endpoint issues the baton at the
-start of the request, before the batch has finished. The baton and `base_url`
-follow the same rules as in sections 4.2 and 4.6.
+start of the request, before the batch has finished. The baton, `base_url`,
+and the optional `stream_ttl_ms` follow the same rules as in sections 4.2,
+4.6, and 4.5 (and 5.2) respectively.
 
 Every subsequent line is a cursor entry, a JSON object tagged with a `type`
 field. Entries describing the steps of the batch arrive in execution order.
@@ -813,22 +842,53 @@ status codes for failures of the HTTP request itself:
 | `400 Bad Request`           | Malformed request body, malformed baton, or other protocol violation. |
 | `401 Unauthorized`          | Missing or invalid authentication token.      |
 | `403 Forbidden`             | The database exists but access to it is blocked. |
-| `404 Not Found`             | Unknown endpoint, unknown database, or a baton referring to an unknown or expired stream (section 4.5). |
+| `404 Not Found`             | Unknown endpoint, unknown database, or a baton referring to a stream the server has no record of (section 4.5). |
 | `408 Request Timeout`       | The request timed out.                        |
+| `410 Gone`                  | The stream existed but is gone: expired, evicted, or lost to a restart (sections 4.5 and 9.3.1). |
 | `429 Too Many Requests`     | The client is rate limited and should retry later. |
 | `500 Internal Server Error` | Unexpected server-side failure.               |
 | `503 Service Unavailable`   | The server is temporarily out of resources.   |
 
 Error bodies of non-200 responses are JSON objects with at least an `error`
-field containing a human-readable message:
+field containing a human-readable message, and optionally a `code` field
+with a machine-readable error code:
 
 ```json
-{ "error": "stream not found: ..." }
+{ "error": "stream not found: ...", "code": "STREAM_NOT_FOUND" }
 ```
 
-Clients SHOULD surface the message but MUST NOT rely on the exact body shape
-of non-200 responses. Clients SHOULD treat any non-200 response to a request
-that carried a baton as fatal for that stream.
+Clients SHOULD surface the message and SHOULD use `code` when present, but
+MUST tolerate its absence, MUST tolerate codes not listed here, and MUST
+NOT otherwise rely on the exact body shape of non-200 responses. Clients
+SHOULD treat any non-200 response to a request that carried a baton as
+fatal for that stream.
+
+### 9.3.1 Stream-fatal error codes
+
+A request that fails because its baton names a stream that no longer
+exists carries one of the following codes. Section 4.5 defines their exact
+meaning:
+
+| Code               | Status          | Meaning                                |
+|--------------------|-----------------|----------------------------------------|
+| `STREAM_EXPIRED`   | `410 Gone`      | The stream was expired or evicted; any open transaction was rolled back and none of its statements took effect. |
+| `STREAM_LOST`      | `410 Gone`      | The server process that owned the stream is gone; any open transaction was rolled back with it. |
+| `STREAM_NOT_FOUND` | `404 Not Found` | The server has no record of this stream. |
+
+Servers that predate this section report all three cases as `404 Not
+Found` with no `code`; clients MUST treat that legacy form as
+`STREAM_NOT_FOUND`.
+
+The `error` message accompanying `STREAM_EXPIRED` and `STREAM_LOST` SHOULD
+state what happened, its consequence, and the recovery action, since the
+message is routinely surfaced verbatim to users and to automated agents:
+
+```json
+{
+  "error": "stream expired: idle 31s (limit 30s); the open transaction was rolled back and none of its statements took effect. Open a new stream and retry the transaction.",
+  "code": "STREAM_EXPIRED"
+}
+```
 
 ## 10. Security considerations
 
