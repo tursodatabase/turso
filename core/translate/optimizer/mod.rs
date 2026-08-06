@@ -783,10 +783,24 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     let original_table_plan = find_select_plan_form(plan, resolver)?;
     let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver)?;
 
-    let use_rewritten = matches!(
-        (plan.estimated_cost, rewritten.estimated_cost),
-        (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
-    );
+    let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_full_outer)
+    });
+    // The correlated form cannot run on every matched and unmatched FULL JOIN
+    // row yet. A complete semi-join or anti-join rewrite can, so use it.
+    let full_join_rewrite_is_complete = has_full_join
+        && !rewritten
+            .non_from_clause_subqueries
+            .iter()
+            .any(|subquery| subquery.correlated);
+    let use_rewritten = full_join_rewrite_is_complete
+        || matches!(
+            (plan.estimated_cost, rewritten.estimated_cost),
+            (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
+        );
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;

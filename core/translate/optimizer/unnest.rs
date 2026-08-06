@@ -71,6 +71,12 @@ pub fn rewrite_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
+    let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_full_outer)
+    });
     let mut changed = false;
     let mut subquery_index = 0;
     while subquery_index < plan.non_from_clause_subqueries.len() {
@@ -96,7 +102,7 @@ pub fn rewrite_correlated_subqueries(
         }
         let rewritten = match subquery.query_type {
             ast::SubqueryType::In { .. } => try_rewrite_in(plan, subquery_index, resolver)?,
-            ast::SubqueryType::RowValue { num_regs: 1, .. } => {
+            ast::SubqueryType::RowValue { num_regs: 1, .. } if !has_full_join => {
                 try_rewrite_single_value_aggregate(plan, subquery_index, resolver)?
             }
             _ => false,
@@ -243,13 +249,10 @@ fn rewrite_as_semi_or_anti_join(
     // link into a later join could remove that row too early.
     let mut outer_table_ids_that_may_be_null: Vec<TableInternalId> = Vec::new();
     let outer_tables = plan.table_references.joined_tables();
-    for (index, table) in outer_tables.iter().enumerate() {
+    for table in outer_tables {
         if let Some(join_info) = &table.join_info {
-            if join_info.is_outer() {
+            if join_info.is_outer() && !join_info.is_full_outer() {
                 outer_table_ids_that_may_be_null.push(table.internal_id);
-            }
-            if join_info.is_full_outer() && index > 0 {
-                outer_table_ids_that_may_be_null.push(outer_tables[index - 1].internal_id);
             }
         }
     }
