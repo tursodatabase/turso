@@ -151,6 +151,8 @@ int sqlite3_exec(sqlite3 *db, const char *sql, exec_callback _callback, void *_c
 
 int sqlite3_reset(sqlite3_stmt *stmt);
 
+int sqlite3_clear_bindings(sqlite3_stmt *stmt);
+
 int sqlite3_changes(sqlite3 *_db);
 
 int64_t sqlite3_changes64(sqlite3 *_db);
@@ -238,7 +240,9 @@ int sqlite3_backup_pagecount(void *_backup);
 
 int sqlite3_backup_finish(void *_backup);
 
-char *sqlite3_expanded_sql(sqlite3_stmt *_stmt);
+const char *sqlite3_sql(sqlite3_stmt *stmt);
+
+char *sqlite3_expanded_sql(sqlite3_stmt *stmt);
 
 int sqlite3_data_count(sqlite3_stmt *stmt);
 
