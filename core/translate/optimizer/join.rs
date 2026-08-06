@@ -45,13 +45,18 @@ use crate::{
 /// join planner as we add order-aware access path choices.
 pub(crate) struct JoinPlanningContext<'a> {
     pub maybe_order_target: Option<&'a OrderTarget>,
+    /// Stop growing a join plan after it costs more than another query form.
+    pub cost_limit: Option<Cost>,
 }
 
 impl<'a> JoinPlanningContext<'a> {
     /// Convenience constructor used by the default planner entrypoints and tests.
     #[cfg_attr(not(test), allow(dead_code))]
     fn default_with_order_target(maybe_order_target: Option<&'a OrderTarget>) -> Self {
-        Self { maybe_order_target }
+        Self {
+            maybe_order_target,
+            cost_limit: None,
+        }
     }
 }
 
@@ -1115,7 +1120,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
     // Keep track of the current best cost so we can short-circuit planning for subplans
     // that already exceed the cost of the current best plan.
-    let cost_upper_bound = best_plan.as_ref().map_or(Cost(f64::MAX), |plan| plan.cost);
+    let mut cost_upper_bound = best_plan.as_ref().map_or(Cost(f64::MAX), |plan| plan.cost);
+    if let Some(cost_limit) = planning_context.cost_limit {
+        if cost_limit < cost_upper_bound {
+            cost_upper_bound = cost_limit;
+        }
+    }
 
     // Keep track of the best plan for a given subset of tables.
     // Consider this example: we have tables a,b,c,d to join.
@@ -1174,7 +1184,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Example:
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
-    let left_join_illegal_map = {
+    let (left_join_illegal_map, required_lhs_by_table) = {
         let ordering_constrained_count = joined_tables
             .iter()
             .filter(|t| {
@@ -1187,11 +1197,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             .iter()
             .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
         if ordering_constrained_count == 0 && !has_full_outer {
-            None
+            (None, None)
         } else {
             // map from rhs table index to lhs table index
             let mut left_join_illegal_map: HashMap<usize, TableMask> =
                 HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
+            let mut required_lhs_by_table = vec![TableMask::default(); num_tables];
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
                     // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
@@ -1201,6 +1212,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         .as_ref()
                         .is_some_and(|j| j.is_ordering_constrained())
                     {
+                        required_lhs_by_table[j].set(i)?;
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
                             illegal_lhs.set(j)?;
@@ -1221,7 +1233,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 if !t.join_info.as_ref().is_some_and(|j| j.is_full_outer()) {
                     continue;
                 }
-                for j in (k + 1)..joined_tables.len() {
+                for (j, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(k + 1) {
+                    required_lhs.set(k)?;
                     if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
                         illegal_lhs.set(j)?;
                     } else {
@@ -1231,7 +1244,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     }
                 }
             }
-            Some(left_join_illegal_map)
+            (Some(left_join_illegal_map), Some(required_lhs_by_table))
         }
     };
 
@@ -1240,6 +1253,13 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     for subset_size in 2..=num_tables {
         for mask in generate_join_bitmasks(num_tables, subset_size) {
             let mask = mask?;
+            if required_lhs_by_table.as_ref().is_some_and(|required| {
+                required.iter().enumerate().any(|(table, required)| {
+                    mask.get(table) && !mask.contains_all_set_bits_of(required)
+                })
+            }) {
+                continue;
+            }
             // Keep track of the best way to join this subset of tables per possible last table.
             // This preserves alternative join orders that may be more expensive for the subset
             // but enable cheaper joins when adding more tables.

@@ -916,14 +916,15 @@ fn optimize_select_plan_with_cache(
             .iter()
             .any(|subquery| subquery.correlated);
     if full_join_rewrite_is_complete {
-        let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver, cache)?;
+        let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver, cache, None)?;
         *plan = rewritten;
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
         return Ok(());
     }
 
-    let original_table_plan = find_select_plan_form(plan, resolver, cache)?;
-    let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver, cache)?;
+    let original_table_plan = find_select_plan_form(plan, resolver, cache, None)?;
+    let cost_limit = plan.estimated_cost.map(Cost);
+    let rewritten_table_plan = find_select_plan_form(&mut rewritten, resolver, cache, cost_limit)?;
     let use_rewritten = matches!(
         (plan.estimated_cost, rewritten.estimated_cost),
         (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
@@ -945,7 +946,7 @@ fn optimize_select_plan_form(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
-    let table_plan = find_select_plan_form(plan, resolver, cache)?;
+    let table_plan = find_select_plan_form(plan, resolver, cache, None)?;
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
@@ -954,6 +955,7 @@ fn find_select_plan_form(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
+    cost_limit: Option<Cost>,
 ) -> Result<Option<TableAccessPlan>> {
     let schema = resolver.schema();
     #[cfg(feature = "optimizer_params")]
@@ -1015,6 +1017,7 @@ fn find_select_plan_form(
         &mut plan.limit,
         &mut plan.offset,
         plan.input_cardinality_hint.unwrap_or(1.0),
+        cost_limit,
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -2238,6 +2241,7 @@ fn optimize_table_access(
         limit,
         offset,
         initial_input_cardinality,
+        None,
     )?
     else {
         return Ok(None);
@@ -2272,6 +2276,7 @@ fn find_table_access_plan(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
+    cost_limit: Option<Cost>,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2440,6 +2445,7 @@ fn find_table_access_plan(
 
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
+        cost_limit,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
