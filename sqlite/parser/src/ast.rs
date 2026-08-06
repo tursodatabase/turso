@@ -1340,8 +1340,13 @@ pub enum AlterTableBody {
     RenameTo(Name),
     /// `ADD COLUMN`
     AddColumn(ColumnDefinition), // TODO distinction between ADD and ADD COLUMN
-    /// `ALTER COLUMN`
+    /// `ALTER COLUMN old TO new-definition`: Turso extension that replaces
+    /// the whole column definition, dropping constraints the new definition
+    /// does not repeat.
     AlterColumn { old: Name, new: ColumnDefinition },
+    /// `ALTER COLUMN old TYPE type` (PostgreSQL): changes only the column's
+    /// type; name and constraints survive. `new` carries no constraints.
+    AlterColumnType { old: Name, new: ColumnDefinition },
     /// `RENAME COLUMN`
     RenameColumn {
         /// old name

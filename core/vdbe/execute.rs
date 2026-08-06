@@ -10402,7 +10402,7 @@ pub fn op_function(
                 ),
             },
         },
-        crate::function::Func::Dialect(name) => {
+        crate::function::Func::Dialect { name, .. } => {
             let args: Vec<Value> = state.registers[*start_reg..*start_reg + arg_count]
                 .iter()
                 .map(|r| r.get_value().clone())
@@ -10725,7 +10725,9 @@ pub fn op_function(
 
                     (new_name, new_tbl_name, new_sql)
                 }
-                AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
+                AlterTableFunc::AlterColumn
+                | AlterTableFunc::AlterColumnType
+                | AlterTableFunc::RenameColumn => {
                     let table = {
                         match &state.registers[*start_reg + 5].get_value() {
                             Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
@@ -10848,16 +10850,18 @@ pub fn op_function(
                                     };
 
                                     match alter_func {
+                                        // Turso's ALTER COLUMN replaces the whole
+                                        // definition, dropping constraints the new
+                                        // definition does not repeat.
                                         AlterTableFunc::AlterColumn => {
-                                            if column_def.constraints.is_empty() {
-                                                // Bare retype (ALTER COLUMN c TYPE t): the
-                                                // constraints are not part of the change and
-                                                // must survive in the stored DDL too.
-                                                column.col_name = column_def.col_name.clone();
-                                                column.col_type.clone_from(&column_def.col_type);
-                                            } else {
-                                                *column = column_def.clone();
-                                            }
+                                            *column = column_def.clone();
+                                        }
+                                        // PostgreSQL's ALTER COLUMN TYPE changes the
+                                        // type only; constraints must survive in the
+                                        // stored DDL too.
+                                        AlterTableFunc::AlterColumnType => {
+                                            column.col_name = column_def.col_name.clone();
+                                            column.col_type.clone_from(&column_def.col_type);
                                         }
                                         AlterTableFunc::RenameColumn => {
                                             column.col_name = column_def.col_name.clone()
@@ -16032,6 +16036,7 @@ pub fn op_alter_column(
             column_index,
             definition,
             rename,
+            retype_only,
         },
         insn
     );
@@ -16039,20 +16044,30 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let old_column_name = conn.with_schema(*db, |schema| {
+    let (old_column_name, old_column) = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
             .get(&normalized_table_name)
             .expect("table being ALTERed should be in schema");
-        table
+        let column = table
             .get_column_at(*column_index)
-            .expect("column being ALTERed should be in schema")
-            .name
-            .as_ref()
-            .expect("column being ALTERed should be named")
-            .clone()
+            .expect("column being ALTERed should be in schema");
+        (
+            column
+                .name
+                .as_ref()
+                .expect("column being ALTERed should be named")
+                .clone(),
+            column.clone(),
+        )
     });
-    let new_column = crate::schema::Column::try_from(definition.as_ref())?;
+    let mut new_column = crate::schema::Column::try_from(definition.as_ref())?;
+    if *retype_only {
+        // PostgreSQL's ALTER COLUMN TYPE keeps the column's constraints;
+        // the in-memory schema must agree with the patched stored DDL.
+        new_column.inherit_constraints_from(&old_column);
+    }
+    let new_column = new_column;
     let new_name = definition.col_name.as_str().to_owned();
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {

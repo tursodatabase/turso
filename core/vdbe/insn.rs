@@ -1766,6 +1766,9 @@ pub enum Insn {
         column_index: usize,
         definition: Box<turso_parser::ast::ColumnDefinition>,
         rename: bool,
+        /// True for PostgreSQL's ALTER COLUMN TYPE: only the type changes
+        /// and the old column's constraints survive.
+        retype_only: bool,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and

@@ -70,8 +70,14 @@ pub(super) fn emit_binary_expr_scalar(
     resolver: &Resolver,
     emit_mode: BinaryEmitMode,
 ) -> Result<usize> {
-    // Check if both sides of the expression are equivalent and reuse the same register if so
-    if exprs_are_equivalent(e1, e2) {
+    // Check if both sides of the expression are equivalent and reuse the same
+    // register if so. Not with a nondeterministic call inside: SQLite draws
+    // `random() <> random()` twice, so each side must keep its own register.
+    if exprs_are_equivalent(e1, e2)
+        && !crate::translate::expr::walk::expr_contains_nondeterministic_scalar_function(
+            e1, resolver,
+        )?
+    {
         let shared_reg = program.alloc_register();
         translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
 

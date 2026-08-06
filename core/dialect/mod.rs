@@ -227,9 +227,10 @@ mod tests {
                 return sqlite::resolve_builtin_function("coalesce", arg_count);
             }
             if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
-                return Ok(Some(crate::function::Func::Dialect(
-                    "test_add_one".to_string(),
-                )));
+                return Ok(Some(crate::function::Func::Dialect {
+                    name: "test_add_one".to_string(),
+                    deterministic: true,
+                }));
             }
             sqlite::resolve_builtin_function(name, arg_count)
         }

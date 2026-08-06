@@ -1519,7 +1519,11 @@ impl Display for MathFunc {
 #[derive(Debug, Clone)]
 pub enum AlterTableFunc {
     RenameTable,
+    /// Replace a column's whole definition (Turso's ALTER COLUMN ... TO).
     AlterColumn,
+    /// Change only a column's type (PostgreSQL's ALTER COLUMN ... TYPE);
+    /// constraints survive.
+    AlterColumnType,
     RenameColumn,
 }
 
@@ -1529,6 +1533,7 @@ impl Display for AlterTableFunc {
             AlterTableFunc::RenameTable => write!(f, "limbo_rename_table"),
             AlterTableFunc::RenameColumn => write!(f, "limbo_rename_column"),
             AlterTableFunc::AlterColumn => write!(f, "limbo_alter_column"),
+            AlterTableFunc::AlterColumnType => write!(f, "limbo_alter_column_type"),
         }
     }
 }
@@ -1548,8 +1553,12 @@ pub enum Func {
     External(Arc<ExternalFunc>),
     /// Scalar function provided by the database's schema dialect (e.g. a
     /// PostgreSQL catalog function). Resolved and executed through
-    /// [`crate::dialect::Dialect`]; the engine only carries the name.
-    Dialect(String),
+    /// [`crate::dialect::Dialect`]; the engine carries the name and
+    /// whether the optimizer may treat calls as deterministic.
+    Dialect {
+        name: String,
+        deterministic: bool,
+    },
 }
 
 impl Display for Func {
@@ -1566,7 +1575,7 @@ impl Display for Func {
             Self::Json(json_func) => write!(f, "{json_func}"),
             Self::External(generic_func) => write!(f, "{generic_func}"),
             Self::AlterTable(alter_func) => write!(f, "{alter_func}"),
-            Self::Dialect(name) => write!(f, "{name}"),
+            Self::Dialect { name, .. } => write!(f, "{name}"),
         }
     }
 }
@@ -1591,10 +1600,10 @@ impl Deterministic for Func {
             Self::Json(json_func) => json_func.is_deterministic(),
             Self::External(external_func) => external_func.is_deterministic(),
             Self::AlterTable(_) => true,
-            // Dialect scalars are catalog readers (stable within a
-            // statement); a dialect that adds a nondeterministic function
-            // should register it as an extension function instead.
-            Self::Dialect(_) => true,
+            // Most dialect scalars are catalog readers (stable within a
+            // statement); the dialect marks the exceptions, e.g. random(),
+            // when it resolves the function.
+            Self::Dialect { deterministic, .. } => *deterministic,
         }
     }
 }

@@ -188,3 +188,21 @@ fn test_pg_description_stubs_return_null(db: TempDatabase) {
         assert_eq!(query_text(&conn, sql), ["NULL"], "{sql}");
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_setseed_makes_random_reproducible(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    // Same seed, same draw sequence. The values themselves are engine
+    // specific, so only reproducibility is asserted, not the numbers.
+    conn.execute("SELECT setseed(0.5)").unwrap();
+    let first = query_text(&conn, "SELECT random()::text");
+    conn.execute("SELECT setseed(0.5)").unwrap();
+    let second = query_text(&conn, "SELECT random()::text");
+    assert_eq!(first, second);
+
+    // A different seed diverges.
+    conn.execute("SELECT setseed(-0.25)").unwrap();
+    let third = query_text(&conn, "SELECT random()::text");
+    assert_ne!(first, third);
+}

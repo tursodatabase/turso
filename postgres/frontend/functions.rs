@@ -27,6 +27,10 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
+        // Overrides the engine's SQLite-style random(), which returns a
+        // 64-bit integer; PostgreSQL returns a double in [0, 1).
+        "random" => &[0],
+        "setseed" => &[1],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         _ => return false,
     };
@@ -97,6 +101,8 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             _ => exec_regexp_replace(&text_arg(0), &text_arg(1), &text_arg(2), &text_arg(3)),
         },
         "pg_typeof" => Ok(exec_pg_typeof(args.first().unwrap_or(&Value::Null))),
+        "random" => Ok(exec_random()),
+        "setseed" => exec_setseed(args.first().unwrap_or(&Value::Null)),
         "encode" => match (args.first(), args.get(1)) {
             (Some(Value::Null), _) | (_, Some(Value::Null)) | (None, _) | (_, None) => {
                 Ok(Value::Null)
@@ -292,6 +298,51 @@ fn exec_pg_typeof(value: &Value) -> Value {
         Value::Text(_) => "text",
         Value::Blob(_) => "bytea",
     })
+}
+
+/// State for random()/setseed(). Process-wide rather than per-session:
+/// PostgreSQL scopes the seed to a backend, but sessions here share the
+/// process, and the difference is only observable when two sessions
+/// interleave draws after seeding — an accepted deviation.
+static RANDOM_STATE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+fn next_random_u64() -> u64 {
+    let mut state = RANDOM_STATE.lock().unwrap();
+    if *state == 0 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+            .unwrap_or(0x9e3779b97f4a7c15);
+        *state = nanos ^ ((std::process::id() as u64) << 32) | 1;
+    }
+    // xorshift64*: fast, and quality is fine for SQL random().
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545F4914F6CDD1D)
+}
+
+/// PostgreSQL's random(): uniform double in [0, 1).
+fn exec_random() -> Value {
+    Value::from_f64((next_random_u64() >> 11) as f64 / (1u64 << 53) as f64)
+}
+
+/// PostgreSQL's setseed(): reseed the generator from a value in [-1, 1].
+fn exec_setseed(value: &Value) -> Result<Value> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let seed = value.to_float_or_zero();
+    if !(-1.0..=1.0).contains(&seed) || seed.is_nan() {
+        return Err(LimboError::ParseError(format!(
+            "setseed parameter {seed} is out of allowed range [-1,1]"
+        )));
+    }
+    // Map [-1, 1] onto the full state space; never leave the state zero.
+    *RANDOM_STATE.lock().unwrap() = (seed.to_bits() ^ 0x9e3779b97f4a7c15) | 1;
+    Ok(Value::Null)
 }
 
 fn exec_encode(data: &Value, format: &str) -> Result<Value> {

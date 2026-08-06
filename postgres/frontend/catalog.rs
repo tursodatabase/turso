@@ -150,7 +150,12 @@ impl Dialect for PostgresDialect {
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         if crate::functions::resolve_scalar(name, arg_count) {
-            return Ok(Some(Func::Dialect(name.to_string())));
+            return Ok(Some(Func::Dialect {
+                name: name.to_string(),
+                // random() must be drawn per row and per call site; the
+                // optimizer hoists or deduplicates deterministic calls.
+                deterministic: !matches!(name, "random" | "setseed"),
+            }));
         }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }

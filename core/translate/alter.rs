@@ -1777,11 +1777,13 @@ pub fn translate_alter_table(
             });
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
+        | ast::AlterTableBody::AlterColumnType { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
             let from;
             let definition;
             let col_name;
             let rename;
+            let mut retype_only = false;
 
             match body {
                 ast::AlterTableBody::AlterColumn { old, new } => {
@@ -1789,6 +1791,13 @@ pub fn translate_alter_table(
                     definition = new;
                     col_name = definition.col_name.clone();
                     rename = false;
+                }
+                ast::AlterTableBody::AlterColumnType { old, new } => {
+                    from = old;
+                    definition = new;
+                    col_name = definition.col_name.clone();
+                    rename = false;
+                    retype_only = true;
                 }
                 ast::AlterTableBody::RenameColumn { old, new } => {
                     from = old;
@@ -1845,10 +1854,11 @@ pub fn translate_alter_table(
                 false => {
                     let mut replacement_column = Column::try_from(&definition)?;
                     let old_column = &btree.columns()[column_index];
-                    // A bare retype (ALTER COLUMN c TYPE t) sends a
-                    // definition with no constraints; they are not part of
-                    // the change and must survive.
-                    if definition.constraints.is_empty() {
+                    // PostgreSQL's ALTER COLUMN TYPE changes the type only;
+                    // the constraints are not part of the change and must
+                    // survive. The engine's own ALTER COLUMN replaces the
+                    // whole definition instead.
+                    if retype_only {
                         replacement_column.inherit_constraints_from(old_column);
                     }
                     let becomes_generated =
@@ -2105,6 +2115,8 @@ pub fn translate_alter_table(
                     func: crate::function::FuncCtx {
                         func: Func::AlterTable(if rename {
                             AlterTableFunc::RenameColumn
+                        } else if retype_only {
+                            AlterTableFunc::AlterColumnType
                         } else {
                             AlterTableFunc::AlterColumn
                         }),
@@ -2287,6 +2299,7 @@ pub fn translate_alter_table(
                 column_index,
                 definition: Box::new(definition),
                 rename,
+                retype_only,
             });
         }
     };

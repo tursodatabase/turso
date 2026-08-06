@@ -680,7 +680,10 @@ impl PostgreSQLTranslator {
                 // persisted a column literally named "" into the table's
                 // stored DDL, making the database unopenable.
                 col.col_name = ast::Name::from_string(&cmd.name);
-                ast::AlterTableBody::AlterColumn {
+                // AlterColumnType, not AlterColumn: PostgreSQL retypes in
+                // place and keeps the column's constraints, while the
+                // engine's own ALTER COLUMN replaces the whole definition.
+                ast::AlterTableBody::AlterColumnType {
                     old: ast::Name::from_string(&cmd.name),
                     new: col,
                 }

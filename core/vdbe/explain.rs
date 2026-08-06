@@ -2337,7 +2337,7 @@ pub fn insn_to_row(
                 0,
                 format!("add_column({table}, {column:?})"),
             ),
-            Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
+            Insn::AlterColumn { db: _, table, column_index, definition: column, rename, retype_only: _ } => (
                 "AlterColumn",
                 0,
                 0,

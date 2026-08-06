@@ -535,3 +535,39 @@ expect {
     1|0.5
     2|0
 }
+
+test random-is-a-unit-interval-double {
+    SELECT (random() >= 0 AND random() < 1)::int, floor(random())::int, pg_typeof(random());
+}
+expect {
+    1|0|double precision
+}
+
+test random-draws-independently-per-call {
+    SELECT (random() <> random())::int;
+}
+expect {
+    1
+}
+
+test random-draws-per-row {
+    CREATE TABLE rnd (i int);
+    INSERT INTO rnd VALUES (1), (2), (3);
+    SELECT count(DISTINCT random()) FROM rnd;
+}
+expect {
+    3
+}
+
+test setseed-accepts-unit-range {
+    SELECT setseed(0.5);
+}
+expect {
+}
+
+test setseed-out-of-range-errors {
+    SELECT setseed(1.5);
+}
+expect error {
+    out of allowed range
+}
