@@ -816,7 +816,7 @@ set test_files {
   whereB               pass
   whereC               pass
   whereD               fail
-  whereE               fail
+  whereE               pass
   whereF               fail
   whereG               fail
   whereH               fail

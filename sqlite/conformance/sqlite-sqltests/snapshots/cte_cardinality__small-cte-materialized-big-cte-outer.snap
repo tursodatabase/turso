@@ -22,7 +22,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN small AS s
+|--SCAN big AS b
 |  `--SCAN items
-`--SEARCH b USING INDEX ephemeral_subquery_t4 (id=?)
+`--SEARCH s USING INDEX ephemeral_subquery_t2 (id=?)
    `--SCAN items

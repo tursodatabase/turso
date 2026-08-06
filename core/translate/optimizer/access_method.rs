@@ -11,8 +11,8 @@ use crate::stats::AnalyzeStats;
 use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, ordered_materialized_key_columns, partial_index,
-    partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
+    automatic_index_terms, convert_to_vtab_constraint, ordered_materialized_key_columns,
+    partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
     RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
@@ -35,8 +35,8 @@ use super::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
     cost::{
-        estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_index_cost,
-        estimate_rows_per_seek, AnalyzeCtx, Cost, IndexInfo,
+        estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
+        estimate_index_cost, estimate_rows_per_seek, AnalyzeCtx, Cost, IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -874,6 +874,97 @@ fn find_best_access_method_for_btree(
         },
     };
 
+    let is_full_outer = rhs_table
+        .join_info
+        .as_ref()
+        .is_some_and(|join_info| join_info.is_full_outer());
+    let uses_full_table_scan = matches!(
+        &best_access_method.params,
+        AccessMethodParams::BTreeTable {
+            index: None,
+            constraint_refs,
+            ..
+        } if constraint_refs.is_empty()
+    );
+    let has_ready_term = rhs_constraints.constraints.iter().any(|constraint| {
+        lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+            && constraint.can_drive_index_seek(rhs_table.columns(), rhs_table.table.is_strict())
+    });
+    if rhs_table.indexed.is_none()
+        && uses_full_table_scan
+        && has_ready_term
+        && !lhs_mask.is_empty()
+        && !is_full_outer
+    {
+        // A temporary index uses the table column's text order. It cannot use
+        // a custom text order that appears only in the join condition.
+        let index_terms: Vec<_> = automatic_index_terms(rhs_table, rhs_constraints)
+            .into_iter()
+            .filter(|term| {
+                let constraint = &rhs_constraints.constraints[term.constraint_vec_pos];
+                let where_term = &where_clause[constraint.where_clause_pos.0];
+                !expr_uses_custom_collation(&where_term.expr)
+            })
+            .collect();
+        let constraint_refs = usable_constraints_for_join_order(
+            &rhs_constraints.constraints,
+            &index_terms,
+            join_order,
+        )?;
+        if !constraint_refs.is_empty() {
+            let index = Arc::new(super::ephemeral_index_build(rhs_table, &constraint_refs)?);
+            let index_info = IndexInfo {
+                unique: false,
+                column_count: index.columns.len(),
+                covering: true,
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    rhs_table,
+                    params.rows_per_table_page,
+                ),
+            };
+            let rows_per_seek = estimate_rows_per_seek(
+                index_info,
+                &rhs_constraints.constraints,
+                &constraint_refs,
+                base_row_count,
+                None,
+            );
+            let scan_cost = estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                1.0,
+                base_row_count,
+                false,
+                params,
+                None,
+            );
+            let build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
+            let seek_cost = Cost(
+                input_cardinality * params.cpu_cost_per_seek
+                    + input_cardinality * rows_per_seek * params.cpu_cost_per_row,
+            );
+            let cost = scan_cost + build_cost + seek_cost;
+            if cost < best_access_method.cost {
+                best_access_method = AccessMethod {
+                    cost,
+                    estimated_rows_per_outer_row: rows_per_seek,
+                    residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+                    consumed_where_terms: consumed_where_terms_from_constraint_refs(
+                        &rhs_constraints.constraints,
+                        &constraint_refs,
+                    ),
+                    params: AccessMethodParams::BTreeTable {
+                        iter_dir: best.iter_dir,
+                        index: Some(index),
+                        constraint_refs,
+                    },
+                };
+            }
+        }
+    }
+
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
@@ -1671,7 +1762,7 @@ fn find_best_access_method_for_subquery(
     );
     let one_pass_scan_cost =
         estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);
-    let append_build_cost = Cost(*base_row_count * params.cpu_cost_per_seek);
+    let append_build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
     let seek_setup_cost = if table_materialization_required || can_direct_materialize_index {
         // Both table-backed materialization and direct-index materialization avoid
         // the extra "scan table into probe index" pass. They differ in storage,

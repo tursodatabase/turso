@@ -872,6 +872,26 @@ expect {
     3|0|0|SEARCH j USING COVERING INDEX ephemeral_second_exists_inner_t5 (key2=?)
 }
 
+# A filter on the outer table must not turn the EXISTS semi join back into a
+# nested scan.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test outer-filter-keeps-exists-semi-join {
+    CREATE TABLE filtered_exists_outer(id INTEGER PRIMARY KEY, key1 INTEGER, body TEXT);
+    CREATE TABLE filtered_exists_inner(key1 INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM filtered_exists_outer o
+    WHERE o.body LIKE 'apple%'
+      AND EXISTS (
+              SELECT 1 FROM filtered_exists_inner i WHERE i.key1 = o.key1
+          );
+}
+expect {
+    1|0|0|SCAN filtered_exists_outer AS o
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_filtered_exists_inner_t3 (key1=?)
+}
+
 setup comparison_keys {
     CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
     CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
