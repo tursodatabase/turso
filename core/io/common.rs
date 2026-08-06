@@ -18,10 +18,19 @@ pub mod tests {
 
         let current_exe = std::env::current_exe().expect("Failed to get current executable path");
 
+        // The child runs the whole test binary and then leaves through
+        // `process::exit`, so its destructors never run and any temp file
+        // another test had in flight is orphaned. Point it at a directory we
+        // own so those files disappear with it.
+        let child_temp_dir = tempfile::tempdir().expect("Failed to create child temp dir");
+
         // Spawn a child process and try to open the same file
         let child = Command::new(current_exe)
             .env("RUST_TEST_CHILD_PROCESS", "1")
             .env("RUST_TEST_FILE_PATH", &path)
+            .env("TMPDIR", child_temp_dir.path())
+            .env("TMP", child_temp_dir.path())
+            .env("TEMP", child_temp_dir.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

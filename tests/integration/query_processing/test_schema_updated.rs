@@ -220,9 +220,9 @@ fn test_deferred_seeks_resize_on_reprepare(tmp_db: TempDatabase) -> Result<()> {
 /// sequence row.
 #[test]
 fn test_alter_table_alter_column_clears_autoincrement_reopen() {
-    let path = TempDir::new()
-        .unwrap()
-        .keep()
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
         .join("alter_col_autoincrement_clear_reopen.db");
 
     {

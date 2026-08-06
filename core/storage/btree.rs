@@ -10058,10 +10058,12 @@ mod tests {
         page
     }
 
+    /// The returned `TempDir` deletes the database directory when it drops, so
+    /// callers must hold it for as long as they use the database.
     #[allow(clippy::arc_with_non_send_sync)]
-    fn get_database() -> Arc<Database> {
-        let mut path = TempDir::new().unwrap().keep();
-        path.push("test.db");
+    fn get_database() -> (Arc<Database>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.db");
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
             connection
@@ -10072,7 +10074,7 @@ mod tests {
         let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))
             .unwrap();
 
-        db
+        (db, temp_dir)
     }
 
     /// Deterministic coverage for the allocation-failure window created by routing
@@ -10544,7 +10546,7 @@ mod tests {
 
     #[test]
     fn test_insert_cell() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
         let page = get_page(2);
 
@@ -10568,7 +10570,7 @@ mod tests {
 
     #[test]
     fn test_drop_1() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -11589,7 +11591,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_odd() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12413,7 +12415,7 @@ mod tests {
 
     #[test]
     pub fn test_defragment() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12454,7 +12456,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_odd_with_defragment() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12501,7 +12503,7 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_drop_defragment_insert() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12585,7 +12587,7 @@ mod tests {
     pub fn test_fuzz_drop_defragment_insert_issue_1085() {
         // This test is used to demonstrate that issue at https://github.com/tursodatabase/turso/issues/1085
         // is FIXED.
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12665,7 +12667,7 @@ mod tests {
     //   +cells:
     #[test]
     pub fn test_drop_page_in_balancing_issue_1203() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let queries = vec![
@@ -12704,7 +12706,7 @@ mod tests {
     //   +cells:
     #[test]
     pub fn test_drop_page_in_balancing_issue_1203_2() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let queries = vec![
@@ -12758,7 +12760,7 @@ mod tests {
 
     #[test]
     pub fn test_free_space() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
         let page = get_page(2);
 
@@ -12775,7 +12777,7 @@ mod tests {
 
     #[test]
     pub fn test_defragment_1() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12797,7 +12799,7 @@ mod tests {
 
     #[test]
     pub fn test_insert_drop_insert() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12828,7 +12830,7 @@ mod tests {
 
     #[test]
     pub fn test_insert_drop_insert_multiple() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12861,7 +12863,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_a_few_insert() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12887,7 +12889,7 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_victim_1() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12919,7 +12921,7 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_victim_2() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -12960,7 +12962,7 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_victim_3() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
@@ -13057,7 +13059,7 @@ mod tests {
 
     #[test]
     pub fn test_big_payload_compute_free() {
-        let db = get_database();
+        let (db, _temp_dir) = get_database();
         let conn = db.connect().unwrap();
 
         let page = get_page(2);

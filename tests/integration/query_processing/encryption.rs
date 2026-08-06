@@ -766,12 +766,14 @@ const CIPHER_B: &str = "aes256gcm";
 
 /// Helper: create an encrypted database file with the given cipher, hexkey, table name, and value.
 /// Returns the file path.
+/// The returned `TempDir` deletes the database directory when it drops, so
+/// callers must hold it for as long as they use the database.
 fn create_encrypted_db(
     cipher: &str,
     hexkey: &str,
     table_name: &str,
     value: &str,
-) -> anyhow::Result<std::path::PathBuf> {
+) -> anyhow::Result<(std::path::PathBuf, tempfile::TempDir)> {
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir
         .path()
@@ -811,9 +813,7 @@ fn create_encrypted_db(
         io.wait_for_completion(c)?;
     }
 
-    // Keep the temp dir alive by leaking it (the test process will clean up)
-    std::mem::forget(temp_dir);
-    Ok(db_path)
+    Ok((db_path, temp_dir))
 }
 
 /// Helper: open a plain (unencrypted) main database with attach + encryption enabled.
@@ -830,8 +830,8 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     // Create two encrypted databases with different keys and ciphers
-    let path_a = create_encrypted_db(CIPHER_A, KEY_A, "secret_a", "data from A")?;
-    let path_b = create_encrypted_db(CIPHER_B, KEY_B, "secret_b", "data from B")?;
+    let (path_a, _dir_a) = create_encrypted_db(CIPHER_A, KEY_A, "secret_a", "data from A")?;
+    let (path_b, _dir_b) = create_encrypted_db(CIPHER_B, KEY_B, "secret_b", "data from B")?;
 
     // --- Test 1: Happy path — attach both with correct keys ---
     {

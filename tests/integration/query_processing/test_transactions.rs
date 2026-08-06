@@ -2180,7 +2180,8 @@ fn test_mvcc_autoincrement_stress_multipage(tmp_db: TempDatabase) {
 /// high-water mark. No ID reuse is ever acceptable.
 #[test]
 fn test_autoincrement_watermark_survives_restart() {
-    let path = TempDir::new().unwrap().keep().join("p1_autoinc_restart");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("p1_autoinc_restart");
 
     // Phase 1: create table, insert rows, close
     {
@@ -2229,7 +2230,8 @@ fn test_autoincrement_watermark_survives_restart() {
 /// nextval must return a value past the previously committed high-water mark.
 #[test]
 fn test_user_sequence_watermark_survives_restart_mvcc() {
-    let path = TempDir::new().unwrap().keep().join("p1_user_seq_restart");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("p1_user_seq_restart");
 
     // Phase 1: create sequence, advance it, close
     {

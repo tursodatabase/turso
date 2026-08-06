@@ -6701,9 +6701,11 @@ mod checkpoint_phase_tests {
         }
     }
 
-    fn open_checkpoint_test_database() -> (Arc<Database>, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let db_path = dir.join("test.db");
+    /// The returned `TempDir` deletes the database directory when it drops, so
+    /// callers must hold it for as long as they use the database.
+    fn open_checkpoint_test_database() -> (Arc<Database>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
         {
             let connection = rusqlite::Connection::open(&db_path).unwrap();
             connection
@@ -6734,7 +6736,7 @@ mod checkpoint_phase_tests {
     #[test]
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
         let (db, dir) = open_checkpoint_test_database();
-        let db_path = dir.join("test.db");
+        let db_path = dir.path().join("test.db");
         let conn = db.connect().unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
