@@ -3,7 +3,6 @@ use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::collections::HashSet;
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +11,32 @@ use turso_pg_client::{BackendEvent, ConnParams, PgConn, error_message};
 
 /// How long to wait for a spawned tursopg server to accept connections.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many ports to try before giving up on starting a server.
+const PORT_ATTEMPTS: u32 = 20;
+
+/// Hands out a distinct port to every server this process starts.
+///
+/// Asking the OS for an ephemeral port means binding a listener, reading the
+/// port, and closing it again — and between the close and the server's own
+/// bind, a sibling test doing the same thing can be handed the same port. One
+/// server then loses the race and exits "Address already in use", while its
+/// client happily connects to the *other* test's server and fails later when
+/// that one is torn down. Walking a counter instead means two tests here
+/// never aim at the same port; a clash with an unrelated process is still
+/// possible, and the caller retries for that.
+fn next_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    /// Above the range Linux uses for ephemeral ports by default, so the
+    /// counter does not fight with unrelated connections on the machine.
+    const FIRST_PORT: u16 = 21000;
+    const LAST_PORT: u16 = 40000;
+    static NEXT: AtomicU16 = AtomicU16::new(FIRST_PORT);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
+        Some(if p >= LAST_PORT { FIRST_PORT } else { p + 1 })
+    })
+    .unwrap_or(FIRST_PORT)
+}
 
 /// PostgreSQL wire-protocol backend. Each database instance spawns its own
 /// `tursopg --server` on an ephemeral port and drives it over one connection
@@ -94,72 +119,86 @@ impl SqlBackend for PgBackend {
             }
         };
 
-        // Reserve an ephemeral port, then hand it to the server. The port
-        // could in principle be claimed between the drop and the spawn, in
-        // which case the server fails to bind and the readiness loop below
-        // reports the exit.
-        let port = TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map_err(|e| BackendError::CreateDatabase(format!("allocating port: {e}")))?
-            .port();
+        // Try a fresh port for each attempt: a clash with an unrelated
+        // process makes the server exit rather than fall back, and there is
+        // nothing to inspect until it has bound.
+        let mut last_error = String::new();
+        for _ in 0..PORT_ATTEMPTS {
+            let port = next_port();
+            let mut cmd = tokio::process::Command::new(&self.binary_path);
+            cmd.arg(&db_path)
+                .arg("--server")
+                .arg(format!("127.0.0.1:{port}"))
+                .arg("-q");
+            if config.readonly {
+                cmd.arg("--readonly");
+            }
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.kill_on_drop(true);
+            let mut child = cmd.spawn().map_err(|e| {
+                BackendError::CreateDatabase(format!(
+                    "failed to spawn {}: {e}",
+                    self.binary_path.display()
+                ))
+            })?;
 
-        let mut cmd = tokio::process::Command::new(&self.binary_path);
-        cmd.arg(&db_path)
-            .arg("--server")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("-q");
-        if config.readonly {
-            cmd.arg("--readonly");
-        }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            BackendError::CreateDatabase(format!(
-                "failed to spawn {}: {e}",
-                self.binary_path.display()
-            ))
-        })?;
+            let params = ConnParams {
+                host: "127.0.0.1".to_string(),
+                port,
+                user: "sqltest".to_string(),
+                password: None,
+                database: "main".to_string(),
+            };
 
-        let params = ConnParams {
-            host: "127.0.0.1".to_string(),
-            port,
-            user: "sqltest".to_string(),
-            password: None,
-            database: "main".to_string(),
-        };
-
-        // Wait for the server to accept the startup handshake.
-        let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
-        let conn = loop {
-            match connect(&params).await {
-                Ok(conn) => break conn,
-                Err(e) => {
-                    if let Some(status) = child.try_wait().ok().flatten() {
-                        let stderr = read_stderr(&mut child).await;
-                        return Err(BackendError::CreateDatabase(format!(
-                            "tursopg exited with {status} before accepting connections: {stderr}"
-                        )));
+            // Wait for the server to accept the startup handshake. The exit
+            // check comes before the connect attempt, not after: a server
+            // that failed to bind is already gone, and connecting anyway
+            // would reach whoever else holds the port.
+            let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
+            let mut conn = None;
+            loop {
+                if let Some(status) = child.try_wait().ok().flatten() {
+                    let stderr = read_stderr(&mut child).await;
+                    last_error = format!(
+                        "tursopg exited with {status} before accepting connections on port {port}: {stderr}"
+                    );
+                    break;
+                }
+                match connect(&params).await {
+                    Ok(c) => {
+                        conn = Some(c);
+                        break;
                     }
-                    if Instant::now() >= deadline {
-                        return Err(BackendError::CreateDatabase(format!(
-                            "tursopg did not accept connections within {SERVER_STARTUP_TIMEOUT:?}: {e}"
-                        )));
+                    Err(e) => {
+                        if Instant::now() >= deadline {
+                            last_error = format!(
+                                "tursopg did not accept connections within {SERVER_STARTUP_TIMEOUT:?}: {e}"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }
-        };
-        conn.set_read_timeout(Some(self.timeout))
-            .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
+            let Some(conn) = conn else {
+                continue;
+            };
 
-        Ok(Box::new(PgDatabaseInstance {
-            child,
-            conn: Some(conn),
-            timeout: self.timeout,
-            _temp_file: temp_file,
-        }))
+            conn.set_read_timeout(Some(self.timeout))
+                .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
+
+            return Ok(Box::new(PgDatabaseInstance {
+                child,
+                conn: Some(conn),
+                timeout: self.timeout,
+                _temp_file: temp_file,
+            }));
+        }
+        Err(BackendError::CreateDatabase(format!(
+            "no tursopg server started after {PORT_ATTEMPTS} ports; last: {last_error}"
+        )))
     }
 }
 
@@ -193,6 +232,26 @@ pub struct PgDatabaseInstance {
     _temp_file: Option<NamedTempFile>,
 }
 
+impl PgDatabaseInstance {
+    /// The server's stderr if it has exited, or None if it is still up. Waits
+    /// briefly, because the socket error usually reaches us a moment before
+    /// the process is reaped.
+    async fn server_died(&mut self) -> Option<String> {
+        for _ in 0..25 {
+            if self.child.try_wait().ok().flatten().is_some() {
+                let stderr = read_stderr(&mut self.child).await;
+                return Some(if stderr.is_empty() {
+                    "no output on stderr".to_string()
+                } else {
+                    stderr
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+}
+
 #[async_trait]
 impl DatabaseInstance for PgDatabaseInstance {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
@@ -221,7 +280,16 @@ impl DatabaseInstance for PgDatabaseInstance {
             {
                 return Err(BackendError::Timeout(self.timeout));
             }
-            Err(e) => return Err(BackendError::Execute(e.to_string())),
+            Err(e) => {
+                // A protocol error usually means the server died. Its stderr
+                // holds the panic that explains why, and this is the only
+                // place it can still be read — without it the failure reads
+                // as "server closed the connection" and says nothing.
+                return Err(BackendError::Execute(match self.server_died().await {
+                    Some(stderr) => format!("{e}; tursopg died: {stderr}"),
+                    None => e.to_string(),
+                }));
+            }
         };
 
         // The simple query protocol runs statements in order and aborts the
@@ -252,5 +320,38 @@ impl DatabaseInstance for PgDatabaseInstance {
             Some(tf) => Ok(DatabaseFileHandle::temp(tf)),
             None => Ok(DatabaseFileHandle::none()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// The whole point of the counter: two servers started concurrently must
+    /// never be told to bind the same port. Reusing one meant a test could
+    /// connect to another test's server and fail when that one shut down.
+    #[test]
+    fn ports_are_never_handed_out_twice() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..250).map(|_| next_port()).collect::<Vec<u16>>()))
+            .collect();
+        let ports: Vec<u16> = threads
+            .into_iter()
+            .flat_map(|t| t.join().expect("thread panicked"))
+            .collect();
+
+        let unique: HashSet<u16> = ports.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ports.len(),
+            "handed out a duplicate port across threads"
+        );
+        // Above the range Linux picks ephemeral ports from, so the counter
+        // does not collide with unrelated connections.
+        assert!(
+            ports.iter().all(|&p| (21000..=40000).contains(&p)),
+            "a port fell outside the range reserved for servers"
+        );
     }
 }
