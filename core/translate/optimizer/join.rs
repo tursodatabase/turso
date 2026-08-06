@@ -166,13 +166,16 @@ fn count_subquery_calls_after_join(
             continue;
         }
 
-        let skipped_where_terms: SmallVec<[usize; 2]> = where_clause
-            .iter()
-            .enumerate()
-            .filter_map(|(index, term)| {
-                expr_references_subquery_id(&term.expr, subquery.internal_id).then_some(index)
-            })
-            .collect();
+        let first_subquery_term = where_clause.iter().enumerate().find_map(|(index, term)| {
+            expr_references_subquery_id(&term.expr, subquery.internal_id).then_some(index)
+        });
+        // A WHERE term cannot cut the call count for a subquery in that term
+        // or in an earlier term. Terms before it may cut the count.
+        let skipped_where_terms: SmallVec<[usize; 2]> = if let Some(first) = first_subquery_term {
+            (first..where_clause.len()).collect()
+        } else {
+            SmallVec::new()
+        };
         let rows = match method.residual_constraints {
             ResidualConstraintMode::ApplyUnconsumed => {
                 let multiplier = constraint_output_multipliers(
