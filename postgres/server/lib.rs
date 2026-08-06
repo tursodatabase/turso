@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
 use turso_pg::{
-    auto_attach_schemas, pg_error, split_statements, LimboError, PgConnection, PgCopyFromStmt,
+    auto_attach_schemas, split_statements, LimboError, PgConnection, PgCopyFromStmt,
     TextOutputSettings,
 };
 
@@ -399,7 +399,7 @@ impl CopyHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         // Bulk COPY loads are long synchronous engine work; see do_query.
         let rows = tokio::task::block_in_place(|| conn.copy_stdin_finish(&stmt, &data))
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, ""))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&conn, &e, ""))))?;
         client
             .send(PgWireBackendMessage::CommandComplete(
                 Tag::new("COPY").with_rows(rows).into(),
@@ -427,7 +427,7 @@ impl SimpleQueryHandler for TursoPgHandler {
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
         let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, query))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&conn, &e, query))))?;
 
         let mut responses = Vec::new();
         for sql in &statements {
@@ -465,7 +465,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                     continue;
                 }
                 Err(e) => {
-                    return Err(PgWireError::UserError(Box::new(error_info(&e, sql))));
+                    return Err(PgWireError::UserError(Box::new(error_info(&conn, &e, sql))));
                 }
             }
 
@@ -476,15 +476,15 @@ impl SimpleQueryHandler for TursoPgHandler {
             let response = tokio::task::block_in_place(|| -> PgWireResult<Response> {
                 let mut stmt = conn
                     .prepare(sql)
-                    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, sql))))?;
+                    .map_err(|e| PgWireError::UserError(Box::new(error_info(&conn, &e, sql))))?;
 
                 self.cleanup_dropped_schema_file(sql);
 
                 if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                    execute_non_query(&mut stmt, sql)
+                    execute_non_query(&conn, &mut stmt, sql)
                 } else {
                     let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                    execute_query(&mut stmt, header, conn.text_output_settings())
+                    execute_query(&conn, &mut stmt, header)
                 }
             })?;
             responses.push(response);
@@ -530,7 +530,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
             let mut stmt = conn
                 .prepare(query)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, query))))?;
+                .map_err(|e| PgWireError::UserError(Box::new(error_info(&conn, &e, query))))?;
 
             // Clean up schema file after successful DROP SCHEMA
             self.cleanup_dropped_schema_file(query);
@@ -539,11 +539,11 @@ impl ExtendedQueryHandler for TursoPgHandler {
             bind_portal_parameters(&mut stmt, portal)?;
 
             if stmt.num_columns() == 0 || is_pg_non_query(query) {
-                return execute_non_query(&mut stmt, query);
+                return execute_non_query(&conn, &mut stmt, query);
             }
 
             let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-            execute_query(&mut stmt, header, conn.text_output_settings())
+            execute_query(&conn, &mut stmt, header)
         })
     }
 
@@ -556,9 +556,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, &target.statement))))?;
+        let stmt = conn.prepare(&target.statement).map_err(|e| {
+            PgWireError::UserError(Box::new(error_info(&conn, &e, &target.statement)))
+        })?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -580,7 +580,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn.prepare(&portal.statement.statement).map_err(|e| {
-            PgWireError::UserError(Box::new(error_info(&e, &portal.statement.statement)))
+            PgWireError::UserError(Box::new(error_info(&conn, &e, &portal.statement.statement)))
         })?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
@@ -687,10 +687,11 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 
 /// Execute a query that returns rows and build a Query response.
 fn execute_query(
+    conn: &PgConnection,
     stmt: &mut turso_core::Statement,
     header: Arc<Vec<FieldInfo>>,
-    output: TextOutputSettings,
 ) -> PgWireResult<Response> {
+    let output: TextOutputSettings = conn.text_output_settings();
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
 
@@ -706,16 +707,20 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, ""))))?;
+    .map_err(|e| PgWireError::UserError(Box::new(error_info(conn, &e, ""))))?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
+fn execute_non_query(
+    conn: &PgConnection,
+    stmt: &mut turso_core::Statement,
+    query: &str,
+) -> PgWireResult<Response> {
     stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, query))))?;
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(conn, &e, query))))?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -1530,8 +1535,11 @@ fn is_create_table_as(upper: &str) -> bool {
 }
 
 /// Maps an engine error to a PostgreSQL error response with its SQLSTATE.
-fn error_info(e: &LimboError, sql: &str) -> ErrorInfo {
-    let info = pg_error(e, sql);
+/// It goes through the session because some wording needs the schema — a
+/// unique violation names columns in the engine and a constraint in
+/// PostgreSQL.
+fn error_info(conn: &PgConnection, e: &LimboError, sql: &str) -> ErrorInfo {
+    let info = conn.pg_error(e, sql);
     let mut error = ErrorInfo::new("ERROR".to_owned(), info.code.to_owned(), info.message);
     error.position = info.position.map(|p| p.to_string());
     error

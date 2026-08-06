@@ -63,6 +63,7 @@ Basics not enumerated by the official feature matrix.
 | generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
 | SET / SHOW | 🟡 Partial | Per-session GUC store; see Configuration Management |
+| Error SQLSTATEs and wording | 🟡 Partial | Common classes carry the right SQLSTATE. PostgreSQL wording for syntax errors (with caret positions), undefined relation/column, not-null, unique/primary-key and check violations, which name the constraint. Missing: `DETAIL`/`HINT` lines (need the failing key or row from the engine), positions for semantic errors, foreign-key violation wording |
 
 ## Backend
 

@@ -1,0 +1,106 @@
+# Unique and primary-key violations. PostgreSQL reports these as
+# "duplicate key value violates unique constraint" naming the constraint,
+# not the columns, and drivers branch on the SQLSTATE (23505) to turn a
+# failed insert into an upsert retry. The engine only knows which columns
+# collided, so the constraint name is resolved from the schema using the
+# same naming rules pg_constraint already uses: <table>_pkey for a primary
+# key, <table>_<columns>_key for a unique constraint, and the index's own
+# name for a standalone CREATE UNIQUE INDEX. The expected strings come from
+# PostgreSQL's regress golden files (insert_conflict.out, arrays.out).
+
+@database :memory:
+
+test primary-key-violation-names-the-pkey-constraint {
+    CREATE TABLE pk_tbl (i int PRIMARY KEY, t text);
+    INSERT INTO pk_tbl VALUES (1, 'one');
+    INSERT INTO pk_tbl VALUES (1, 'again');
+}
+expect error {
+    ^duplicate key value violates unique constraint "pk_tbl_pkey"$
+}
+
+test unique-column-violation-names-the-key-constraint {
+    CREATE TABLE uq_tbl (i int UNIQUE, t text);
+    INSERT INTO uq_tbl VALUES (1, 'one');
+    INSERT INTO uq_tbl VALUES (1, 'again');
+}
+expect error {
+    ^duplicate key value violates unique constraint "uq_tbl_i_key"$
+}
+
+test multi-column-unique-violation-joins-the-column-names {
+    CREATE TABLE uq_multi (a int, b int, UNIQUE (a, b));
+    INSERT INTO uq_multi VALUES (1, 2);
+    INSERT INTO uq_multi VALUES (1, 2);
+}
+expect error {
+    ^duplicate key value violates unique constraint "uq_multi_a_b_key"$
+}
+
+test standalone-unique-index-violation-uses-the-index-name {
+    CREATE TABLE idx_tbl (i int, t text);
+    CREATE UNIQUE INDEX fruit_index ON idx_tbl (t);
+    INSERT INTO idx_tbl VALUES (1, 'Peach');
+    INSERT INTO idx_tbl VALUES (2, 'Peach');
+}
+expect error {
+    ^duplicate key value violates unique constraint "fruit_index"$
+}
+
+test text-primary-key-violation-reads-the-same {
+    CREATE TABLE pk_text (t text PRIMARY KEY);
+    INSERT INTO pk_text VALUES ('a');
+    INSERT INTO pk_text VALUES ('a');
+}
+expect error {
+    ^duplicate key value violates unique constraint "pk_text_pkey"$
+}
+
+test update-into-an-existing-key-violates-too {
+    CREATE TABLE upd_tbl (i int PRIMARY KEY);
+    INSERT INTO upd_tbl VALUES (1), (2);
+    UPDATE upd_tbl SET i = 1 WHERE i = 2;
+}
+expect error {
+    ^duplicate key value violates unique constraint "upd_tbl_pkey"$
+}
+
+# A failed CHECK names the table it belongs to, which the engine message
+# does not carry either: an unnamed check is found in the schema by the
+# expression the engine printed, and PostgreSQL names it after the column
+# it guards.
+test unnamed-column-check-is-named-after-its-column {
+    CREATE TABLE chk_col (c int CHECK (c > 0));
+    INSERT INTO chk_col VALUES (-1);
+}
+expect error {
+    ^new row for relation "chk_col" violates check constraint "chk_col_c_check"$
+}
+
+test unnamed-table-check-is-named-after-its-table {
+    CREATE TABLE chk_tbl (a int, b int, CHECK (a < b));
+    INSERT INTO chk_tbl VALUES (5, 1);
+}
+expect error {
+    ^new row for relation "chk_tbl" violates check constraint "chk_tbl_check"$
+}
+
+test named-check-keeps-the-name-it-was-given {
+    CREATE TABLE chk_named (c int CONSTRAINT c_positive CHECK (c > 0));
+    INSERT INTO chk_named VALUES (-1);
+}
+expect error {
+    ^new row for relation "chk_named" violates check constraint "c_positive"$
+}
+
+# ON CONFLICT DO NOTHING is the reason drivers care about 23505 at all: the
+# insert must succeed silently instead of raising it.
+test on-conflict-do-nothing-suppresses-the-violation {
+    CREATE TABLE oc_tbl (i int PRIMARY KEY, t text);
+    INSERT INTO oc_tbl VALUES (1, 'one');
+    INSERT INTO oc_tbl VALUES (1, 'again') ON CONFLICT DO NOTHING;
+    SELECT t FROM oc_tbl;
+}
+expect {
+    one
+}

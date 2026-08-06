@@ -551,6 +551,122 @@ impl PgConnection {
         }
     }
 
+    /// Maps an engine error to its PostgreSQL SQLSTATE and wording, using
+    /// this session's schema for what the message alone cannot say. `sql` is
+    /// the statement that failed.
+    pub fn pg_error(&self, e: &LimboError, sql: &str) -> crate::errors::PgErrorInfo {
+        // A unique violation names columns in the engine and a constraint in
+        // PostgreSQL, so the schema has to bridge the two.
+        if let Some(violation) = crate::errors::unique_violation(e) {
+            if let Some(name) = self.unique_constraint_name(&violation) {
+                return crate::errors::PgErrorInfo::user_error(
+                    "23505",
+                    crate::errors::unique_violation_message(&name),
+                );
+            }
+        }
+        if let Some(description) = crate::errors::check_violation(e) {
+            if let Some((table, name)) = self.check_constraint_name(description) {
+                return crate::errors::PgErrorInfo::user_error(
+                    "23514",
+                    crate::errors::check_violation_message(&table, &name),
+                );
+            }
+        }
+        crate::errors::pg_error(e, sql)
+    }
+
+    /// The table and constraint name behind a failed CHECK, found by the
+    /// description the engine put in the message — the constraint's name, or
+    /// its expression when it has none. Returns None unless exactly one
+    /// constraint in the schema describes itself that way, because naming
+    /// the wrong table is worse than keeping the engine's wording.
+    fn check_constraint_name(&self, description: &str) -> Option<(String, String)> {
+        let schema = self.inner.conn.current_schema();
+        let mut found = None;
+        for (table_name, table) in schema.tables.iter() {
+            let Some(table) = table.btree() else { continue };
+            for check in &table.check_constraints {
+                // Mirrors how the engine describes a check constraint when
+                // it emits the failure (translate/emitter: the name, else
+                // the expression).
+                let describes_itself_as = match &check.name {
+                    Some(name) => name.clone(),
+                    None => format!("{}", check.expr),
+                };
+                if describes_itself_as != description {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                // PostgreSQL names an unnamed check after the column it
+                // guards, or after the table for a table-level one.
+                let name = match (&check.name, &check.column) {
+                    (Some(name), _) => name.clone(),
+                    (None, Some(column)) => format!("{table_name}_{column}_check"),
+                    (None, None) => format!("{table_name}_check"),
+                };
+                found = Some((table_name.clone(), name));
+            }
+        }
+        found
+    }
+
+    /// The name PostgreSQL would give the constraint covering exactly these
+    /// columns, following the same rules `pg_constraint` uses: `<table>_pkey`
+    /// for a primary key, `<table>_<columns>_key` for a unique constraint,
+    /// and its own name for a standalone unique index. None when no
+    /// constraint matches, which leaves the engine wording in place rather
+    /// than inventing a name.
+    fn unique_constraint_name(
+        &self,
+        violation: &crate::errors::UniqueViolation<'_>,
+    ) -> Option<String> {
+        let schema = self.inner.conn.current_schema();
+        let table = schema.get_table(violation.table)?;
+        let table = table.btree()?;
+        let matches = |columns: &[&str]| -> bool {
+            columns.len() == violation.columns.len()
+                && columns
+                    .iter()
+                    .zip(&violation.columns)
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        };
+
+        for set in &table.unique_sets {
+            let columns: Vec<&str> = set.columns.iter().map(|c| c.name.as_str()).collect();
+            if !matches(&columns) {
+                continue;
+            }
+            return Some(if set.is_primary_key {
+                format!("{}_pkey", violation.table)
+            } else {
+                format!("{}_{}_key", violation.table, columns.join("_"))
+            });
+        }
+        // A rowid-alias primary key (`i int PRIMARY KEY`) has no unique set.
+        let pk: Vec<&str> = table
+            .primary_key_columns
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !pk.is_empty() && matches(&pk) {
+            return Some(format!("{}_pkey", violation.table));
+        }
+        // A standalone CREATE UNIQUE INDEX carries its own name, which is
+        // what PostgreSQL reports for one.
+        let index_name = schema
+            .get_indices(violation.table)
+            .filter(|index| index.unique && !index.ephemeral)
+            .find(|index| {
+                let columns: Vec<&str> = index.columns.iter().map(|c| c.name.as_str()).collect();
+                matches(&columns)
+            })
+            .map(|index| index.name.clone());
+        index_name
+    }
+
     /// The value `SHOW name` would display, for a parameter name already in
     /// lower case. None for a parameter this session does not know.
     pub fn guc(&self, lower_name: &str) -> Option<String> {
