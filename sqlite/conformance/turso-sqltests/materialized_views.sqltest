@@ -2508,3 +2508,59 @@ test matview-reserved-prefix-sqlite {
 expect error {
     object name reserved for internal use: sqlite_matview
 }
+
+# An ungrouped aggregate is evaluated over exactly one implicit group, so the
+# view holds one row even when the source table is empty.
+test matview-ungrouped-aggregate-over-empty-input {
+    CREATE TABLE t(x REAL);
+    CREATE MATERIALIZED VIEW mv AS
+    SELECT COUNT(*), SUM(x), SUM(DISTINCT x), AVG(x), MIN(x), MAX(x) FROM t;
+    SELECT * FROM mv;
+}
+expect {
+    0|||||
+}
+
+test matview-ungrouped-aggregate-fills-after-empty-create {
+    CREATE TABLE t(x REAL);
+    CREATE MATERIALIZED VIEW mv AS SELECT COUNT(*), SUM(x) FROM t;
+    SELECT * FROM mv;
+    INSERT INTO t VALUES (5.0), (7.5);
+    SELECT * FROM mv;
+}
+expect {
+    0|
+    2|12.5
+}
+
+# Emptying the source returns the view to the zero row rather than dropping it.
+test matview-ungrouped-aggregate-returns-to-zero-row {
+    CREATE TABLE t(x REAL);
+    INSERT INTO t VALUES (5.0), (7.5);
+    CREATE MATERIALIZED VIEW mv AS SELECT COUNT(*), SUM(x) FROM t;
+    SELECT * FROM mv;
+    DELETE FROM t;
+    SELECT * FROM mv;
+    INSERT INTO t VALUES (3.5);
+    SELECT * FROM mv;
+}
+expect {
+    2|12.5
+    0|
+    1|3.5
+}
+
+# Control: a grouped aggregate has no implicit group, so an empty source means
+# no rows both at creation and after all rows are deleted.
+test matview-grouped-aggregate-over-empty-input-has-no-rows {
+    CREATE TABLE t(g TEXT, x REAL);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, COUNT(*), SUM(x) FROM t GROUP BY g;
+    SELECT * FROM mv;
+    INSERT INTO t VALUES ('a', 1.0);
+    DELETE FROM t;
+    SELECT * FROM mv;
+    SELECT 'end';
+}
+expect {
+    end
+}
