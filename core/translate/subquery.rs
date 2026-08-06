@@ -1568,9 +1568,11 @@ pub fn emit_from_clause_subqueries(
             }
 
             let result_columns_start = match execution_mode {
-                FromClauseSubqueryExecutionMode::Coroutine => {
-                    emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?
-                }
+                FromClauseSubqueryExecutionMode::Coroutine => Some(emit_from_clause_subquery(
+                    program,
+                    from_clause_subquery.plan.as_mut(),
+                    t_ctx,
+                )?),
                 FromClauseSubqueryExecutionMode::MaterializedTable => {
                     let (result_columns_start, cte_cursor_id, cte_table) =
                         emit_materialized_subquery_table(
@@ -1590,7 +1592,7 @@ pub fn emit_from_clause_subqueries(
                             },
                         );
                     }
-                    result_columns_start
+                    Some(result_columns_start)
                 }
                 FromClauseSubqueryExecutionMode::DirectMaterializedIndex(direct_index) => {
                     emit_indexed_materialized_subquery(
@@ -1600,13 +1602,15 @@ pub fn emit_from_clause_subqueries(
                         table_reference.internal_id,
                         direct_index.index,
                         direct_index.affinity_str,
-                        from_clause_subquery.columns.len(),
-                    )?
+                    )?;
+                    None
                 }
             };
 
-            from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-            program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
+            from_clause_subquery.result_columns_start_reg = result_columns_start;
+            if let Some(result_columns_start) = result_columns_start {
+                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
+            }
         }
 
         program.pop_current_parent_explain();
@@ -1735,11 +1739,9 @@ fn emit_indexed_materialized_subquery(
     internal_id: ast::TableInternalId,
     index: Arc<Index>,
     affinity_str: Option<Arc<String>>,
-    num_columns: usize,
-) -> Result<usize> {
+) -> Result<()> {
     let cursor_id = program
         .alloc_cursor_index_if_not_exists(CursorKey::index(internal_id, index.clone()), &index)?;
-    let result_columns_start_reg = program.alloc_registers(num_columns);
 
     if let Some(dest) = plan.select_query_destination_mut() {
         *dest = QueryDestination::EphemeralIndex {
@@ -1817,7 +1819,7 @@ fn emit_indexed_materialized_subquery(
         program.preassign_label_to_next_insn(build_end);
     }
 
-    Ok(result_columns_start_reg)
+    Ok(())
 }
 
 fn emit_materialized_subquery_table(
