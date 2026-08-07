@@ -4099,9 +4099,10 @@ mod tests {
         assert_eq!(row1.values[1], Value::from_i64(25)); // SUM(val1) = 10 + 15
         assert_eq!(row1.values[2], Value::from_i64(3)); // MIN(val3) = min(5, 3)
 
-        // Create operator with same ID but different column mappings: SUM(col3), MIN(col1)
+        // The blob's SUM belongs to col1. Reading it as a SUM over col3 would
+        // produce a number for a column the state never saw.
         let mut agg2 = AggregateOperator::new(
-            1, // Same operator_id
+            1, // Same operator_id, so agg2 finds the state agg1 wrote
             vec![0],
             vec![AggregateFunction::Sum(3), AggregateFunction::Min(1)],
             vec![
@@ -4113,7 +4114,6 @@ mod tests {
         )
         .unwrap();
 
-        // Process new data
         let mut delta2 = Delta::new();
         delta2.insert(
             3,
@@ -4125,33 +4125,15 @@ mod tests {
             ],
         );
 
-        let result2 = pager
+        let err = pager
             .io
             .block(|| agg2.commit((&delta2).into(), &mut cursors))
-            .unwrap();
-
-        // Find the positive weight row for group A (the updated aggregate)
-        let row2 = result2
-            .changes
-            .iter()
-            .find(|(row, weight)| row.values[0] == Value::Text("A".into()) && *weight > 0)
-            .expect("Should have a positive weight row for group A");
-        let (row2, _) = row2;
-
-        // Verify that column indices are preserved correctly in serialization
-        // When agg2 processes the data with different column mappings:
-        // - It reads the existing state which has SUM(col1)=25 and MIN(col3)=3
-        // - For SUM(col3), there's no existing state, so it starts fresh: 4
-        // - For MIN(col1), there's no existing state, so it starts fresh: 20
-        assert_eq!(
-            row2.values[1],
-            Value::from_i64(4),
-            "SUM(col3) should be 4 (new data only)"
-        );
-        assert_eq!(
-            row2.values[2],
-            Value::from_i64(20),
-            "MIN(col1) should be 20 (new data only)"
+            .expect_err(
+                "state written for SUM(col1)/MIN(col3) must not be read as SUM(col3)/MIN(col1)",
+            );
+        assert!(
+            err.to_string().contains("REFRESH MATERIALIZED VIEW"),
+            "the error must name the recovery, got: {err}"
         );
     }
 
