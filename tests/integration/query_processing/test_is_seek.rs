@@ -129,3 +129,44 @@ fn is_operator_seek_matches_null_key_components() {
         vec!["c2".to_string(), "c3".to_string()]
     );
 }
+
+#[test]
+fn is_operator_seek_matches_null_in_65th_key_column() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    const WIDTH: usize = 65;
+    let columns = (1..=WIDTH)
+        .map(|i| format!("c{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = (1..=WIDTH)
+        .map(|i| if i == WIDTH { "NULL" } else { "1" })
+        .collect::<Vec<_>>()
+        .join(", ");
+    for statement in [
+        format!("CREATE TABLE t ({columns})"),
+        format!("CREATE INDEX ti ON t ({columns})"),
+        format!("INSERT INTO t VALUES ({values})"),
+    ] {
+        limbo_exec_rows(&conn, &statement);
+    }
+
+    // Column 65 is the first column that does not fit in one 64-bit word.
+    let predicate = (1..=WIDTH)
+        .map(|i| {
+            if i == WIDTH {
+                format!("c{i} IS NULL")
+            } else {
+                format!("c{i} = 1")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let query = format!("SELECT count(*) FROM t WHERE {predicate}");
+
+    assert_eq!(
+        limbo_exec_rows(&conn, &query),
+        vec![vec![Value::Integer(1)]]
+    );
+}

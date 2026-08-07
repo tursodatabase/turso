@@ -5766,32 +5766,27 @@ pub fn op_seek(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
-    let is_eq_only = match insn {
-        Insn::SeekGE { eq_only, .. } => *eq_only,
-        Insn::SeekLE { eq_only, .. } => *eq_only,
-        _ => false,
-    };
-    let null_matching_mask = match insn {
+    let has_null_that_cannot_match = match insn {
         Insn::SeekGE {
-            null_matching_mask, ..
-        } => *null_matching_mask,
-        Insn::SeekLE {
-            null_matching_mask, ..
-        } => *null_matching_mask,
-        _ => 0,
-    };
-
-    if is_eq_only
-        && state.registers[start_reg..start_reg + num_regs]
+            eq_only: true,
+            null_matching_mask,
+            ..
+        }
+        | Insn::SeekLE {
+            eq_only: true,
+            null_matching_mask,
+            ..
+        } => state.registers[start_reg..start_reg + num_regs]
             .iter()
             .enumerate()
             .any(|(i, value)| {
-                // A NULL-matching component (`x IS ?`) seeks with the NULL key:
-                // index keys compare NULLs as equal, so such a key can match.
-                let null_matching = i < 64 && (null_matching_mask >> i) & 1 == 1;
-                value.is_null() && !null_matching
-            })
-    {
+                // `IS` can match NULL. `=` cannot.
+                value.is_null() && !null_matching_mask.get(i)
+            }),
+        _ => false,
+    };
+
+    if has_null_that_cannot_match {
         // Exact-match seeks use "=" semantics across the full unpacked key.
         // If any key column is NULL, the comparison is unknown, so no row can match.
         // Translation often emits IsNull guards earlier, but outer joins can still

@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::plan::BitSet;
 use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
@@ -199,9 +200,12 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         // Which key components match NULL rather than comparing with `=`; the
         // seek and the bloom-filter probe keep their "NULL key cannot match"
         // shortcut for the rest.
-        let null_matching_mask = (0..num_regs.min(64))
-            .filter(|i| self.seek_def.is_null_matching_key_component(*i))
-            .fold(0u64, |mask, i| mask | (1u64 << i));
+        let mut null_matching_mask = BitSet::default();
+        for i in 0..num_regs {
+            if self.seek_def.is_null_matching_key_component(i) {
+                null_matching_mask.set(i)?;
+            }
+        }
 
         if let Some(idx) = self.seek_index {
             encode_seek_keys_for_custom_types(
@@ -224,7 +228,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             // The bloom filter neither stores nor probes NULLs (a NULL key can
             // never satisfy `=`), so a NULL-matching seek cannot use it: probing
             // would report "definitely not present" for keys that do match.
-            if use_bloom_filter && null_matching_mask == 0 {
+            if use_bloom_filter && null_matching_mask.is_empty() {
                 turso_assert!(
                     idx.ephemeral,
                     "bloom filter can only be used with ephemeral indexes"
