@@ -3762,8 +3762,14 @@ mod tests {
         }
     }
 
+    // `std::vec::Vec` spelled out on purpose: this module glob-imports
+    // `crate::alloc`, whose `Vec` carries our allocator under `--cfg nightly`,
+    // and quickcheck only generates the plain global-allocator `Vec`.
     #[quickcheck_macros::quickcheck]
-    fn skip_serial_types_matches_reference_on_arbitrary_headers(header: Vec<u8>, n: usize) -> bool {
+    fn skip_serial_types_matches_reference_on_arbitrary_headers(
+        header: std::vec::Vec<u8>,
+        n: usize,
+    ) -> bool {
         // Cap n a little above the byte count: enough to exhaust any header.
         let n = n % (header.len() + 4);
         assert_skip_matches_reference(&header, n);
