@@ -1,0 +1,306 @@
+# Sort elision for IN-list index seeks
+#
+# `WHERE k IN (...)` answered by one index seek per RHS value walks the RHS
+# values in ascending order and, for each one, walks the matching run of the
+# index forward. So the rows already come out sorted by the seek column, then
+# by the index columns after it, and ORDER BY / GROUP BY on those columns does
+# not need a sorter.
+#
+# The negative cases below are the ones that would break that argument.
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup asc_schema {
+    CREATE TABLE t (k INTEGER, j INTEGER, v TEXT);
+    CREATE INDEX t_kj ON t (k, j);
+    INSERT INTO t VALUES (3, 30, 'c'), (1, 10, 'a'), (2, 20, 'b');
+    INSERT INTO t VALUES (1, 11, 'd'), (3, 31, 'e'), (2, 21, 'f');
+    INSERT INTO t VALUES (NULL, 99, 'g');
+
+    CREATE TABLE u (y INTEGER);
+    INSERT INTO u VALUES (3), (1), (2), (1);
+
+    CREATE TABLE o (id INTEGER PRIMARY KEY, m INTEGER);
+    INSERT INTO o VALUES (1, 7), (2, 8);
+}
+
+# Leading index column declared DESC. The seek still walks the RHS values
+# ascending, so the output is ascending on k no matter what the index says.
+setup desc_schema {
+    CREATE TABLE t (k INTEGER, j INTEGER);
+    CREATE INDEX t_kj ON t (k DESC, j ASC);
+    INSERT INTO t VALUES (3, 30), (1, 10), (2, 20), (1, 11), (3, 31), (2, 21);
+}
+
+# Trailing index column declared DESC.
+setup trailing_desc_schema {
+    CREATE TABLE t (k INTEGER, j INTEGER);
+    CREATE INDEX t_kj ON t (k ASC, j DESC);
+    INSERT INTO t VALUES (3, 30), (1, 10), (2, 20), (1, 11), (3, 31), (2, 21);
+}
+
+setup text_schema {
+    CREATE TABLE t (k TEXT, j INTEGER);
+    CREATE INDEX t_kj ON t (k, j);
+    INSERT INTO t VALUES ('B', 1), ('a', 2), ('A', 3), ('b', 4);
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Results: the rows must come out in the requested order
+# ══════════════════════════════════════════════════════════════════
+
+@setup asc_schema
+test literal-list-order-by-seek-column {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j;
+}
+expect {
+    1|10
+    1|11
+    2|20
+    2|21
+    3|30
+    3|31
+}
+
+@setup asc_schema
+test literal-list-group-by-seek-column {
+    SELECT k, count(*) FROM t WHERE k IN (3, 1, 2) GROUP BY k;
+}
+expect {
+    1|2
+    2|2
+    3|2
+}
+
+@setup asc_schema
+test subquery-order-by-seek-column {
+    SELECT k, j FROM t WHERE k IN (SELECT y FROM u) ORDER BY k, j;
+}
+expect {
+    1|10
+    1|11
+    2|20
+    2|21
+    3|30
+    3|31
+}
+
+@setup asc_schema
+test rowid-seek-order-by-rowid {
+    SELECT rowid, k FROM t WHERE rowid IN (5, 2, 3) ORDER BY rowid;
+}
+expect {
+    2|1
+    3|2
+    5|3
+}
+
+# A NULL in the list produces no row, so it cannot land out of order.
+@setup asc_schema
+test null-in-list-order-by-seek-column {
+    SELECT k, j FROM t WHERE k IN (NULL, 2, 1) ORDER BY k, j;
+}
+expect {
+    1|10
+    1|11
+    2|20
+    2|21
+}
+
+@setup asc_schema
+test no-match-order-by-seek-column {
+    SELECT k, j FROM t WHERE k IN (100, 200) ORDER BY k;
+}
+expect {
+}
+
+# The seek walks ascending even though the index stores k descending.
+@setup desc_schema
+test desc-index-order-by-seek-column-asc {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j;
+}
+expect {
+    1|10
+    1|11
+    2|20
+    2|21
+    3|30
+    3|31
+}
+
+@setup desc_schema
+test desc-index-order-by-seek-column-desc {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k DESC, j;
+}
+expect {
+    3|30
+    3|31
+    2|20
+    2|21
+    1|10
+    1|11
+}
+
+# Columns after the seek column keep the direction the index declares.
+@setup trailing_desc_schema
+test trailing-desc-column {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j DESC;
+}
+expect {
+    1|11
+    1|10
+    2|21
+    2|20
+    3|31
+    3|30
+}
+
+@setup trailing_desc_schema
+test trailing-desc-column-asked-ascending {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j;
+}
+expect {
+    1|10
+    1|11
+    2|20
+    2|21
+    3|30
+    3|31
+}
+
+# "Ascending" means the seek column's own collation. Asking for a different
+# one asks for a different order.
+@setup text_schema
+test text-order-by-seek-column {
+    SELECT k, j FROM t WHERE k IN ('a', 'A', 'b', 'B') ORDER BY k, j;
+}
+expect {
+    A|3
+    B|1
+    a|2
+    b|4
+}
+
+@setup text_schema
+test text-order-by-other-collation {
+    SELECT k, j FROM t WHERE k IN ('a', 'A', 'b', 'B') ORDER BY k COLLATE NOCASE, j;
+}
+expect {
+    a|2
+    A|3
+    B|1
+    b|4
+}
+
+# Re-running the seek for every outer row concatenates several ascending runs,
+# which is not itself ascending.
+@setup asc_schema
+test in-seek-inner-loop-of-join {
+    SELECT o.id, t.k FROM o, t WHERE t.k IN (3, 1, 2) ORDER BY t.k, o.id;
+}
+expect {
+    1|1
+    1|1
+    2|1
+    2|1
+    1|2
+    1|2
+    2|2
+    2|2
+    1|3
+    1|3
+    2|3
+    2|3
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Plans: sorter gone where the seek already provides the order
+# ══════════════════════════════════════════════════════════════════
+
+@setup asc_schema
+snapshot-eqp eqp-literal-list-group-by-elided {
+    SELECT k, count(*) FROM t WHERE k IN (3, 1, 2) GROUP BY k;
+}
+
+@setup asc_schema
+snapshot-eqp eqp-literal-list-order-by-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k;
+}
+
+@setup asc_schema
+snapshot-eqp eqp-literal-list-order-by-trailing-column-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j;
+}
+
+@setup asc_schema
+snapshot-eqp eqp-literal-list-group-by-trailing-column-elided {
+    SELECT k, j, count(*) FROM t WHERE k IN (3, 1, 2) GROUP BY k, j;
+}
+
+@setup asc_schema
+snapshot-eqp eqp-subquery-group-by-elided {
+    SELECT k, count(*) FROM t WHERE k IN (SELECT y FROM u) GROUP BY k;
+}
+
+@setup asc_schema
+snapshot-eqp eqp-subquery-order-by-elided {
+    SELECT k, j FROM t WHERE k IN (SELECT y FROM u) ORDER BY k, j;
+}
+
+@setup asc_schema
+snapshot-eqp eqp-rowid-seek-order-by-elided {
+    SELECT rowid, k FROM t WHERE rowid IN (5, 2, 3) ORDER BY rowid;
+}
+
+# The seek column is ascending, so the implicit rowid suffix of the index can
+# still supply the next ORDER BY term.
+@setup asc_schema
+snapshot-eqp eqp-order-by-rowid-suffix-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j, rowid;
+}
+
+@setup desc_schema
+snapshot-eqp eqp-desc-index-order-by-asc-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j;
+}
+
+@setup trailing_desc_schema
+snapshot-eqp eqp-trailing-desc-column-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j DESC;
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Plans: sorter kept where the seek does not provide the order
+# ══════════════════════════════════════════════════════════════════
+
+# There is no reverse walk of the RHS values, so DESC still needs a sorter.
+@setup asc_schema
+snapshot-eqp eqp-order-by-desc-not-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k DESC;
+}
+
+@setup desc_schema
+snapshot-eqp eqp-desc-index-order-by-desc-not-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k DESC, j;
+}
+
+@setup trailing_desc_schema
+snapshot-eqp eqp-trailing-desc-column-asked-ascending-not-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j;
+}
+
+@setup asc_schema
+snapshot-eqp eqp-order-by-non-seek-column-not-elided {
+    SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY j;
+}
+
+@setup text_schema
+snapshot-eqp eqp-order-by-other-collation-not-elided {
+    SELECT k, j FROM t WHERE k IN ('a', 'A', 'b', 'B') ORDER BY k COLLATE NOCASE, j;
+}
+
+@setup asc_schema
+snapshot-eqp eqp-in-seek-inner-loop-of-join-not-elided {
+    SELECT o.id, t.k FROM o, t WHERE t.k IN (3, 1, 2) ORDER BY t.k, o.id;
+}

@@ -287,6 +287,7 @@ pub fn plan_satisfies_order_target(
                 constraint_refs,
                 order_target,
                 target_col_idx,
+                0,
                 schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
@@ -301,8 +302,21 @@ pub fn plan_satisfies_order_target(
                 constraint_refs,
                 order_target,
                 target_col_idx,
+                0,
                 schema,
                 EqualityPrefixScope::ConstantEquality,
+            ),
+            AccessMethodParams::InSeek {
+                index,
+                seek_key_collation,
+                ..
+            } => in_seek_order_consumed(
+                table_ref,
+                index.as_deref(),
+                *seek_key_collation,
+                order_target,
+                target_col_idx,
+                schema,
             ),
             AccessMethodParams::Subquery { iter_dir } => {
                 let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
@@ -632,6 +646,7 @@ fn finalized_scan_subquery_order_consumed(
                     purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
                 },
                 0,
+                0,
                 schema,
                 EqualityPrefixScope::ConstantEquality,
             )
@@ -771,6 +786,134 @@ impl OrderConsumption {
     };
 }
 
+/// Return how many leading `order_target` columns an `InSeek` access path can
+/// satisfy.
+///
+/// `InSeek` emits a two-level loop: the outer level walks the ephemeral cursor
+/// holding the RHS values forward, and for each value the inner level walks the
+/// matching run of the real index forward (`SeekGE` + `IdxGT`, or a single
+/// `SeekRowid`). So the rows come out fully sorted, not merely grouped:
+///
+/// * The seek column comes out **ascending in the ephemeral cursor's
+///   collation**. That is a property of the ephemeral walk, not of the real
+///   index, so an index that declares the seek column `DESC` still emits it
+///   ascending and cannot satisfy a `DESC` target here.
+/// * The index columns after the seek column come out in their own declared
+///   directions, exactly like an ordinary forward index scan.
+///
+/// A `DESC` target on the seek column would need a reverse walk (`Last`/`Prev`
+/// plus `SeekLE`/`IdxLT`), which this access path does not emit, so we bail.
+fn in_seek_order_consumed(
+    table_ref: &JoinedTable,
+    index: Option<&Index>,
+    seek_key_collation: Option<CollationSeq>,
+    order_target: &OrderTarget,
+    start_col: usize,
+    schema: &Schema,
+) -> OrderConsumption {
+    let Some(seek_key_collation) = seek_key_collation else {
+        return OrderConsumption::NONE;
+    };
+    let Some(target_col) = order_target.columns.get(start_col) else {
+        return OrderConsumption::NONE;
+    };
+    if target_col.table_id != table_ref.internal_id {
+        return OrderConsumption::NONE;
+    }
+    // The ephemeral cursor is only ever walked forwards.
+    if target_col.order != SortOrder::Asc {
+        return OrderConsumption::NONE;
+    }
+    // The RHS values are ordered by the ephemeral cursor's collation, so that
+    // is the collation the seek column comes out sorted by. If the target wants
+    // a different one, "ascending" means two different things and the rows are
+    // not in the requested order.
+    if target_col.collation != seek_key_collation {
+        return OrderConsumption::NONE;
+    }
+    // NULL seek keys are skipped (`IsNull` -> next value), so no row with a
+    // NULL seek key is emitted at all and any requested NULLS FIRST/LAST on
+    // this column holds vacuously.
+    let rowid_alias_col = table_ref
+        .table
+        .columns()
+        .iter()
+        .position(|column| column.is_rowid_alias());
+    let target_is_rowid = match target_col.target {
+        ColumnTarget::RowId => true,
+        ColumnTarget::Column(col_no) => rowid_alias_col == Some(col_no),
+        ColumnTarget::Expr(_) => false,
+    };
+
+    let Some(index) = index else {
+        // Rowid seek: `SeekRowid` returns at most one row per RHS value, so the
+        // output is sorted by rowid and never repeats a rowid.
+        if !target_is_rowid {
+            return OrderConsumption::NONE;
+        }
+        return OrderConsumption {
+            consumed: 1,
+            includes_rowid: true,
+        };
+    };
+
+    let Some(seek_index_col) = index.columns.first() else {
+        return OrderConsumption::NONE;
+    };
+    if !target_matches_index_column(target_col, seek_index_col, table_ref) {
+        return OrderConsumption::NONE;
+    }
+    // Each seek emits the run of rows whose key is equal *under the index's
+    // collation*, while the runs themselves are visited in the ephemeral
+    // cursor's collation order. Requiring the two to agree is what makes the
+    // runs both disjoint and visited in increasing order.
+    if seek_key_collation != seek_index_col.collation.unwrap_or_default() {
+        return OrderConsumption::NONE;
+    }
+    if column_has_custom_type(target_col, table_ref, schema) {
+        return OrderConsumption::NONE;
+    }
+
+    // Everything after the seek column is an ordinary forward index scan.
+    let trailing = btree_access_order_consumed(
+        table_ref,
+        IterationDirection::Forwards,
+        Some(index),
+        &[],
+        order_target,
+        start_col + 1,
+        1,
+        schema,
+        EqualityPrefixScope::ConstantEquality,
+    );
+    OrderConsumption {
+        consumed: 1 + trailing.consumed,
+        includes_rowid: target_is_rowid || trailing.includes_rowid,
+    }
+}
+
+/// Custom type columns store encoded blobs. The B-tree's bytewise ordering does
+/// not match the custom type's semantic ordering, so a b-tree walk cannot
+/// satisfy ORDER BY for those columns.
+fn column_has_custom_type(
+    target_col: &ColumnOrder,
+    table_ref: &JoinedTable,
+    schema: &Schema,
+) -> bool {
+    let ColumnTarget::Column(col_no) = &target_col.target else {
+        return false;
+    };
+    table_ref
+        .table
+        .columns()
+        .get(*col_no)
+        .is_some_and(|column| {
+            schema
+                .get_type_def(&column.ty_str, table_ref.table.is_strict())
+                .is_some()
+        })
+}
+
 /// Return how many leading `order_target` columns this single-table btree
 /// access path can satisfy.
 ///
@@ -780,6 +923,11 @@ impl OrderConsumption {
 /// [`EqualityPrefixScope`] because candidate scoring may skip any equality
 /// prefix in the chosen seek key, while final global ordering proof may only
 /// skip prefixes that are constant across all output rows.
+///
+/// `start_index_col` is where to start reading the index's columns.
+/// [`in_seek_order_consumed`] passes 1 because it has already accounted for the
+/// seek column itself, which it orders by different rules; everyone else passes
+/// 0.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn btree_access_order_consumed(
     table_ref: &JoinedTable,
@@ -788,6 +936,7 @@ pub(super) fn btree_access_order_consumed(
     constraint_refs: &[RangeConstraintRef],
     order_target: &OrderTarget,
     start_col: usize,
+    start_index_col: usize,
     schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
 ) -> OrderConsumption {
@@ -832,7 +981,7 @@ pub(super) fn btree_access_order_consumed(
         }
         Some(index) => {
             let mut col_idx = 0;
-            let mut idx_pos = 0;
+            let mut idx_pos = start_index_col;
             let mut includes_rowid = false;
             let target_is_rowid = |target_col: &ColumnOrder| match target_col.target {
                 ColumnTarget::RowId => true,
@@ -874,18 +1023,8 @@ pub(super) fn btree_access_order_consumed(
                     break;
                 }
 
-                // Custom type columns store encoded blobs. The B-tree's bytewise
-                // ordering does not match the custom type's semantic ordering, so
-                // the index cannot satisfy ORDER BY for those columns.
-                if let ColumnTarget::Column(col_no) = &target_col.target {
-                    if let Some(col) = table_ref.table.columns().get(*col_no) {
-                        if schema
-                            .get_type_def(&col.ty_str, table_ref.table.is_strict())
-                            .is_some()
-                        {
-                            break;
-                        }
-                    }
+                if column_has_custom_type(target_col, table_ref, schema) {
+                    break;
                 }
 
                 if target_col.collation != idx_col.collation.unwrap_or_default() {

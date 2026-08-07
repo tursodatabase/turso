@@ -1,0 +1,13 @@
+---
+source: in-seek-sort-elision.sqltest
+expression: SELECT rowid, k FROM t WHERE rowid IN (5, 2, 3) ORDER BY rowid;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - asc_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH t USING INTEGER PRIMARY KEY (rowid=?)

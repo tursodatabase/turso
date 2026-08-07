@@ -1,0 +1,14 @@
+---
+source: in-seek-sort-elision.sqltest
+expression: SELECT k, j FROM t WHERE k IN ('a', 'A', 'b', 'B') ORDER BY k COLLATE NOCASE, j;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - text_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH t USING INDEX t_kj (k=?)
+`--USE SORTER FOR ORDER BY

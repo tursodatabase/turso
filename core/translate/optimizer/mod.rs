@@ -2564,6 +2564,7 @@ fn optimize_table_access(
                 index,
                 affinity,
                 where_term_idx,
+                seek_key_collation: _,
             } => {
                 let source = match &where_clause[*where_term_idx].expr {
                     Expr::InList { rhs, .. } => {

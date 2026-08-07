@@ -1,0 +1,13 @@
+---
+source: in-seek-sort-elision.sqltest
+expression: SELECT k, j FROM t WHERE k IN (3, 1, 2) ORDER BY k, j;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - desc_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH t USING INDEX t_kj (k=?)

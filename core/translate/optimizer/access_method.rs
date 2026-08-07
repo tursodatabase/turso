@@ -19,7 +19,7 @@ use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEs
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
     plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery,
-    SetOperation, SubqueryState, TableReferences, WhereTerm,
+    QueryDestination, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -164,6 +164,12 @@ pub enum AccessMethodParams {
         index: Option<Arc<Index>>,
         affinity: Affinity,
         where_term_idx: usize,
+        /// Collation the RHS values come out of the ephemeral cursor in, if we
+        /// can tell. The seek visits those values in ascending order, so this
+        /// is the collation the emitted rows end up sorted by. `None` means we
+        /// could not determine it and no ordering may be claimed. See
+        /// [`in_seek_key_collation`].
+        seek_key_collation: Option<CollationSeq>,
     },
 }
 
@@ -292,6 +298,7 @@ pub(super) fn choose_best_btree_candidate(
                     &usable_constraint_refs,
                     order_target,
                     0,
+                    0,
                     schema,
                     EqualityPrefixScope::AnyEquality,
                 )
@@ -303,6 +310,7 @@ pub(super) fn choose_best_btree_candidate(
                     candidate.index.as_deref(),
                     &usable_constraint_refs,
                     order_target,
+                    0,
                     0,
                     schema,
                     EqualityPrefixScope::AnyEquality,
@@ -652,10 +660,65 @@ pub(super) fn choose_best_in_seek_candidate(
     Ok(best_in_seek)
 }
 
+/// Collation the RHS values of an `IN` are stored in inside the ephemeral
+/// cursor that drives an `InSeek`.
+///
+/// The seek walks that cursor forward, so this is the collation its output rows
+/// come out sorted by. `None` means we could not work it out, and the caller
+/// must then not claim any ordering.
+///
+/// A literal list is materialized with the seek index's own collation (see
+/// `open_in_seek_source_cursor`), so it always agrees with the index. An
+/// IN-subquery builds its ephemeral index back in subquery translation and can
+/// land on a different collation, in which case the RHS values are visited in
+/// an order unrelated to the seek column's own ordering.
+fn in_seek_key_collation(
+    where_term: &WhereTerm,
+    subqueries: &[NonFromClauseSubquery],
+    index: Option<&Index>,
+) -> Option<CollationSeq> {
+    match &where_term.expr {
+        ast::Expr::InList { .. } => Some(
+            index
+                .and_then(|index| index.columns.first().and_then(|column| column.collation))
+                .unwrap_or_default(),
+        ),
+        ast::Expr::SubqueryResult {
+            subquery_id,
+            query_type: ast::SubqueryType::In { .. },
+            ..
+        } => {
+            let subquery = subqueries
+                .iter()
+                .find(|subquery| subquery.internal_id == *subquery_id)?;
+            let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+                return None;
+            };
+            let Some(QueryDestination::EphemeralIndex {
+                index: ephemeral_index,
+                ..
+            }) = plan.select_query_destination()
+            else {
+                return None;
+            };
+            Some(
+                ephemeral_index
+                    .columns
+                    .first()?
+                    .collation
+                    .unwrap_or_default(),
+            )
+        }
+        _ => None,
+    }
+}
+
 fn consider_in_seek_access_method(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
+    where_clause: &[WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -671,16 +734,22 @@ fn consider_in_seek_access_method(
         best_cost,
         BranchReadMode::FullRow,
     )?
-    .map(|chosen| AccessMethod {
-        cost: chosen.cost,
-        estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
-        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
-        consumed_where_terms: smallvec::smallvec![chosen.constraint_idx],
-        params: AccessMethodParams::InSeek {
-            index: chosen.index,
-            affinity: chosen.affinity,
-            where_term_idx: chosen.constraint_idx,
-        },
+    .map(|chosen| {
+        let seek_key_collation = where_clause
+            .get(chosen.constraint_idx)
+            .and_then(|term| in_seek_key_collation(term, subqueries, chosen.index.as_deref()));
+        AccessMethod {
+            cost: chosen.cost,
+            estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: smallvec::smallvec![chosen.constraint_idx],
+            params: AccessMethodParams::InSeek {
+                index: chosen.index,
+                affinity: chosen.affinity,
+                where_term_idx: chosen.constraint_idx,
+                seek_key_collation,
+            },
+        }
     }))
 }
 
@@ -896,6 +965,8 @@ fn find_best_access_method_for_btree(
             rhs_table,
             rhs_constraints,
             &lhs_mask,
+            where_clause,
+            subqueries,
             input_cardinality,
             base_row_count,
             params,
@@ -1816,6 +1887,7 @@ fn materialized_subquery_order_properties(
         constraint_refs,
         order_target,
         0,
+        0,
         schema,
         EqualityPrefixScope::AnyEquality,
     )
@@ -1827,6 +1899,7 @@ fn materialized_subquery_order_properties(
         Some(index.as_ref()),
         constraint_refs,
         order_target,
+        0,
         0,
         schema,
         EqualityPrefixScope::AnyEquality,
