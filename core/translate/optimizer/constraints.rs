@@ -2,10 +2,10 @@ use crate::alloc::TursoIteratorExt;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
-        collate::get_collseq_from_expr,
+        collate::{get_collseq_from_expr, CollationSeq},
         expr::{
             as_binary_components, comparison_affinity, get_expr_affinity, truth_test_rhs,
-            unwrap_parens, walk_expr_mut, WalkControl,
+            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -283,6 +283,8 @@ pub struct TableConstraints {
     pub constraints: Vec<Constraint>,
     /// Candidates for indexes that may use the constraints to perform a lookup.
     pub candidates: Vec<ConstraintUseCandidate>,
+    /// Conditions that a temporary index may use for a lookup.
+    pub temporary_index_terms: SmallVec<[ConstraintRef; 4]>,
 }
 
 /// Build the search terms for an automatic index.
@@ -291,27 +293,28 @@ pub struct TableConstraints {
 pub(super) fn automatic_index_terms(
     table: &JoinedTable,
     constraints: &TableConstraints,
-) -> Vec<ConstraintRef> {
+) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
     let is_strict = table.table.is_strict();
-    let mut index_columns: SmallVec<[usize; 4]> = constraints
+    let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
         .filter(|term| term.can_drive_index_seek(columns, is_strict))
-        .filter_map(|term| term.table_col_pos)
         .collect();
-    index_columns.sort_unstable();
-    index_columns.dedup();
+    let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
-    let mut terms: Vec<_> = constraints
+    let mut terms: SmallVec<[ConstraintRef; 4]> = constraints
         .constraints
         .iter()
         .enumerate()
         .filter(|(_, term)| term.can_drive_index_seek(columns, is_strict))
         .filter_map(|(term_index, term)| {
+            let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
                 constraint_vec_pos: term_index,
-                index_col_pos: index_columns.binary_search(&term.table_col_pos?).ok()?,
+                index_col_pos: index_columns
+                    .iter()
+                    .position(|column| *column == table_col_pos)?,
                 sort_order: SortOrder::Asc,
                 nulls_order: ast::NullsOrder::First,
             })
@@ -319,6 +322,22 @@ pub(super) fn automatic_index_terms(
         .collect();
     terms.sort_by_key(|term| term.index_col_pos);
     terms
+}
+
+/// Return true when an expression names a custom text order.
+pub(super) fn expr_uses_custom_collation(expr: &ast::Expr) -> bool {
+    let mut uses_custom = false;
+    walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+        if let ast::Expr::Collate(_, collation_name) = expr {
+            uses_custom = CollationSeq::known_custom(collation_name.as_str()).is_some();
+            if uses_custom {
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("reading a constraint cannot fail");
+    uses_custom
 }
 
 /// Estimate selectivity for IN expressions given the number of values and table row count.
@@ -524,6 +543,7 @@ pub fn constraints_from_where_clause(
         let mut cs = TableConstraints {
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
+            temporary_index_terms: SmallVec::new(),
             candidates: available_indexes
                 .indexes_for_table(table_reference.internal_id)
                 .map_or(Vec::new(), |indexes| {
@@ -1108,6 +1128,14 @@ pub fn constraints_from_where_clause(
             }
             true
         });
+        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs)
+            .into_iter()
+            .filter(|term| {
+                let constraint = &cs.constraints[term.constraint_vec_pos];
+                let where_term = &where_clause[constraint.where_clause_pos.0];
+                !expr_uses_custom_collation(&where_term.expr)
+            })
+            .collect();
         constraints.push(cs);
     }
 
@@ -1248,10 +1276,10 @@ pub fn usable_constraints_for_lhs_mask(
     refs: &[ConstraintRef],
     lhs_mask: &TableMask,
     table_idx: usize,
-) -> Vec<RangeConstraintRef> {
+) -> SmallVec<[RangeConstraintRef; 2]> {
     turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
-    let mut usable: Vec<RangeConstraintRef> = Vec::new();
+    let mut usable: SmallVec<[RangeConstraintRef; 2]> = SmallVec::new();
     let mut current_required_column_pos = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
@@ -1377,31 +1405,23 @@ pub fn usable_constraints_for_join_order<'a>(
         .take(join_order.len() - 1)
         .map(|j| j.original_idx)
         .try_collect()?;
-    Ok(usable_constraints_for_lhs_mask(
-        constraints,
-        refs,
-        &lhs_mask,
-        table_idx,
-    ))
+    Ok(usable_constraints_for_lhs_mask(constraints, refs, &lhs_mask, table_idx).into_vec())
 }
 
-/// Order synthetic key columns for a materialized subquery seek index.
+/// Order key columns for a temporary index.
 ///
-/// Unlike ordinary index analysis, the ephemeral index does not have a fixed
-/// on-disk column order, so we can choose one that matches the intended probe
-/// shape. Equalities come first, followed by columns that are constrained only
-/// by ranges. Columns that have both equality and range predicates stay in the
-/// equality prefix; the range side is redundant for key ordering.
-pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usize> {
-    let mut equality_cols = Vec::new();
-    let mut range_only_cols = Vec::new();
+/// Equalities come first because an index cannot use a column after a range.
+/// A column with both an equality and a range stays in the equality part.
+pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[usize; 4]> {
+    let mut equality_cols = SmallVec::<[usize; 4]>::new();
+    let mut range_only_cols = SmallVec::<[usize; 4]>::new();
 
     for constraint in constraints {
         let Some(col_pos) = constraint.table_col_pos else {
             continue;
         };
         match constraint.operator.as_ast_operator() {
-            Some(ast::Operator::Equals) => equality_cols.push(col_pos),
+            Some(ast::Operator::Equals | ast::Operator::Is) => equality_cols.push(col_pos),
             Some(
                 ast::Operator::Greater
                 | ast::Operator::GreaterEquals

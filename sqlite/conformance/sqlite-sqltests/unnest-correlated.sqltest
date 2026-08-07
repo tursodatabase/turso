@@ -924,7 +924,7 @@ test indexed-average-uses-outer-row-count {
           );
 }
 expect pattern {
-    (?s)CORRELATED SCALAR SUBQUERY.*SEARCH i USING INDEX indexed_avg_inner_k.*SCAN scalar_subquery_.*SCAN indexed_avg_inner AS i USING INDEX indexed_avg_inner_k
+    (?s)SCAN one_indexed_avg_outer AS o.*CORRELATED SCALAR SUBQUERY.*SEARCH i USING INDEX indexed_avg_inner_k.*SCAN many_indexed_avg_outer AS o.*SEARCH scalar_subquery_.*SCAN indexed_avg_inner AS i USING INDEX indexed_avg_inner_k
 }
 
 # Two copies of the same aggregate need one grouped table.

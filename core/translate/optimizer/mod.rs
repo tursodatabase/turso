@@ -56,7 +56,10 @@ use constraints::{
     partial_index_predicate_terms, Constraint,
 };
 use cost::Cost;
-use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinN, JoinPlanningContext};
+use join::{
+    compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
+    JoinN, JoinPlanningContext,
+};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
@@ -857,6 +860,7 @@ struct TableAccessPlan {
     access_methods: Vec<AccessMethod>,
     constraints: Vec<TableConstraints>,
     join: JoinN,
+    subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
     order_target: Option<OrderTarget>,
     sort_eliminated: bool,
 }
@@ -1034,7 +1038,7 @@ fn find_select_plan_form(
     let table_cost = table_plan.as_ref().map(|table_plan| table_plan.join.cost);
     let mut subquery_calls = table_plan
         .as_ref()
-        .map(|table_plan| table_plan.join.subquery_calls.clone())
+        .map(|table_plan| table_plan.subquery_calls.clone())
         .unwrap_or_default();
 
     if let Some(table_plan) = table_plan.as_ref() {
@@ -1075,13 +1079,7 @@ fn find_select_plan_form(
         plan.estimated_output_rows = Some(rows);
     }
 
-    plan_correlated_subqueries(
-        plan,
-        resolver,
-        &subquery_calls,
-        cache,
-        save_subquery_plans,
-    )?;
+    plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, save_subquery_plans)?;
 
     let table_cost = table_cost.or_else(|| {
         plan.table_references
@@ -2509,15 +2507,27 @@ fn find_table_access_plan(
             &best_plan,
             &access_methods_arena,
             table_references.joined_tables(),
+            &constraints_per_table,
             order_target,
             schema,
         )
     });
+    let subquery_calls = count_subquery_calls_for_plan(
+        &best_plan,
+        &access_methods_arena,
+        &constraints_per_table,
+        table_references.joined_tables(),
+        where_clause,
+        subqueries,
+        initial_input_cardinality,
+        params,
+    )?;
 
     Ok(Some(TableAccessPlan {
         access_methods: access_methods_arena,
         constraints: constraints_per_table,
         join: best_plan,
+        subquery_calls,
         order_target: maybe_order_target,
         sort_eliminated,
     }))
@@ -2540,6 +2550,7 @@ fn apply_table_access_plan(
         access_methods: mut access_methods_arena,
         constraints: constraints_per_table,
         join: best_plan,
+        subquery_calls: _,
         order_target: maybe_order_target,
         sort_eliminated,
     } = plan;
@@ -2678,8 +2689,30 @@ fn apply_table_access_plan(
             AccessMethodParams::BTreeTable {
                 iter_dir,
                 index,
+                build_index,
                 constraint_refs,
             } => {
+                if *build_index {
+                    turso_assert!(index.is_none(), "a new temporary index must not exist yet");
+                    let prior_tables: TableMask =
+                        best_table_numbers.iter().take(i).copied().try_collect()?;
+                    *constraint_refs = constraints::usable_constraints_for_lhs_mask(
+                        &constraints_per_table[table_idx].constraints,
+                        &constraints_per_table[table_idx].temporary_index_terms,
+                        &prior_tables,
+                        table_idx,
+                    )
+                    .into_vec();
+                    turso_assert!(
+                        !constraint_refs.is_empty(),
+                        "a temporary index must have a search key"
+                    );
+                    *index = Some(Arc::new(ephemeral_index_build(
+                        &table_references.joined_tables()[table_idx],
+                        constraint_refs,
+                    )?));
+                    *build_index = false;
+                }
                 maybe_remove_index_candidate(
                     index,
                     &table_references.joined_tables()[table_idx],
@@ -2976,10 +3009,13 @@ fn apply_table_access_plan(
 
     let mut probe_pos_by_table: Vec<Option<usize>> =
         vec![None; table_references.joined_tables().len()];
+    let mut hash_build_by_probe: Vec<Option<usize>> =
+        vec![None; table_references.joined_tables().len()];
     for (pos, member) in best_join_order.iter().enumerate() {
         let table = &table_references.joined_tables()[member.original_idx];
-        if matches!(table.op, Operation::HashJoin(_)) {
+        if let Operation::HashJoin(hash_join_op) = &table.op {
             probe_pos_by_table[member.original_idx] = Some(pos);
+            hash_build_by_probe[member.original_idx] = Some(hash_join_op.build_table_idx);
         }
     }
 
@@ -3006,10 +3042,17 @@ fn apply_table_access_plan(
         if build_table_was_prior_probe {
             continue;
         }
-        let prior_mask = best_join_order[..probe_pos]
+        let mut prior_mask: TableMask = best_join_order[..probe_pos]
             .iter()
             .map(|member| member.original_idx)
             .try_collect()?;
+        // A hash build table is read through its probe table. Include it when
+        // checking which earlier tables can filter this build input.
+        for member in &best_join_order[..probe_pos] {
+            if let Some(build_table_idx) = hash_build_by_probe[member.original_idx] {
+                prior_mask.set(build_table_idx)?;
+            }
+        }
         let join_key_indices: BitSet = hash_join_op
             .join_keys
             .iter()

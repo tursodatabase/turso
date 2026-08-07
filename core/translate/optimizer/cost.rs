@@ -1,8 +1,10 @@
 use crate::schema::Index;
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
+use turso_parser::ast;
 
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;
@@ -12,6 +14,40 @@ use super::cost_params::CostModelParams;
 /// This is used to estimate the cost of scans, seeks, and joins.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Cost(pub f64);
+
+/// Count the operations needed to check one `WHERE` expression.
+pub fn where_expr_steps(expr: &ast::Expr) -> usize {
+    let mut steps = 0;
+    walk_expr(expr, &mut |expr| {
+        steps += where_node_steps(expr);
+        Ok(WalkControl::Continue)
+    })
+    .expect("counting WHERE operations cannot fail");
+    steps.max(1)
+}
+
+pub fn where_node_steps(expr: &ast::Expr) -> usize {
+    match expr {
+        ast::Expr::Between { .. } => 2,
+        ast::Expr::InList { rhs, .. } => rhs.len().max(1),
+        ast::Expr::Case {
+            when_then_pairs, ..
+        } => when_then_pairs.len().max(1),
+        ast::Expr::Register(_)
+        | ast::Expr::Collate(..)
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Id(_)
+        | ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Literal(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::Parenthesized(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Variable(_)
+        | ast::Expr::Default => 0,
+        _ => 1,
+    }
+}
 
 impl std::ops::Add for Cost {
     type Output = Cost;
