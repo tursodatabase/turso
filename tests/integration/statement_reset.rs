@@ -438,3 +438,95 @@ fn returning_read_all_rows_commits(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(count, 3);
     Ok(())
 }
+
+/// Steps a COMMIT to completion and reports how many times it yielded on IO.
+/// A non-zero count means `op_auto_commit` took its re-entry branch.
+fn step_commit_counting_io(stmt: &mut turso_core::Statement) -> turso_core::Result<usize> {
+    let mut io_yields = 0;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => {
+                io_yields += 1;
+                stmt._io().step()?;
+            }
+            StepResult::Yield => continue,
+            StepResult::Done => return Ok(io_yields),
+            other => panic!("unexpected {other:?} from COMMIT"),
+        }
+    }
+}
+
+#[test]
+fn commit_resumed_after_io_starts_a_new_cdc_transaction() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(io, "queued-commit-reentry-cdc.db", Arc::new(SqliteDialect))?;
+    let conn = db.connect()?;
+
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")?;
+    conn.execute("PRAGMA capture_data_changes_conn('id')")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    let io_yields = {
+        let mut commit = conn.prepare("COMMIT")?;
+        step_commit_counting_io(&mut commit)?
+    };
+    assert!(
+        io_yields > 0,
+        "COMMIT must yield on IO for this test to cover the re-entry path"
+    );
+
+    conn.execute("INSERT INTO t VALUES (2)")?;
+
+    // Each transaction owns a CDC transaction id. If the resumed COMMIT keeps
+    // the first id, the second transaction's rows are filed under it.
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(DISTINCT change_txn_id) FROM turso_cdc");
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(2));
+    Ok(())
+}
+
+#[test]
+fn commit_resumed_after_io_clears_savepoints() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "queued-commit-reentry-savepoint.db",
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+
+    conn.execute("ATTACH 'queued-commit-reentry-savepoint-aux.db' AS aux1")?;
+    conn.execute("CREATE TABLE m(x INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE aux1.t(x INTEGER PRIMARY KEY)")?;
+
+    // The savepoint is opened on the main pager, but the transaction writes
+    // only to the attached database. The main pager therefore never commits a
+    // write transaction, so nothing along its own commit path clears the
+    // savepoint — only the post-commit bookkeeping does.
+    conn.execute("BEGIN")?;
+    conn.execute("SAVEPOINT sp")?;
+    conn.execute("INSERT INTO aux1.t VALUES (1)")?;
+
+    let io_yields = {
+        let mut commit = conn.prepare("COMMIT")?;
+        step_commit_counting_io(&mut commit)?
+    };
+    assert!(
+        io_yields > 0,
+        "COMMIT must yield on IO for this test to cover the re-entry path"
+    );
+
+    // This must be the next statement: any write in between would clear the
+    // stale savepoint through its own commit path and hide the bug.
+    let err = conn
+        .execute("ROLLBACK TO sp")
+        .expect_err("the committed transaction took its savepoint with it");
+    assert!(
+        err.to_string().contains("no such savepoint"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
