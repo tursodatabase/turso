@@ -144,7 +144,9 @@ expect {
 
 # TRUE and FALSE on the right of IS check boolean value, not equality. For
 # example, 2 and text '1' are true even though neither is equal to integer 1.
-# The special rule only applies when TRUE or FALSE is directly on the right.
+# The rule applies when TRUE or FALSE is on the right, also inside
+# parentheses or under COLLATE — but not on the left, and not under a unary
+# `+`, which turns it back into an ordinary comparison with 1 or 0.
 test is-true-and-false-keep-boolean-semantics-with-an-index {
     CREATE TABLE t (x);
     CREATE INDEX ti ON t (x);
@@ -152,6 +154,7 @@ test is-true-and-false-keep-boolean-semantics-with-an-index {
 
     SELECT 'true', quote(x) FROM t WHERE x IS TRUE ORDER BY rowid;
     SELECT 'false', quote(x) FROM t WHERE x IS FALSE ORDER BY rowid;
+    SELECT 'paren', quote(x) FROM t WHERE x IS (TRUE) ORDER BY rowid;
 
     SELECT 'left', quote(x) FROM t WHERE TRUE IS x;
     SELECT 'plus', quote(x) FROM t WHERE x IS +TRUE;
@@ -164,6 +167,10 @@ expect {
     false|0
     false|'true'
     false|'x'
+    paren|1
+    paren|2
+    paren|-1
+    paren|'1'
     left|1
     plus|1
 }

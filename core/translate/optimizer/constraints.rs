@@ -4,7 +4,8 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         expr::{
-            as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens, walk_expr_mut, WalkControl,
+            as_binary_components, comparison_affinity, get_expr_affinity, truth_test_rhs,
+            unwrap_parens, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -525,12 +526,11 @@ pub fn constraints_from_where_clause(
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
                 // `x IS TRUE` checks whether x is true; it does not compare x
                 // with 1. For example, `2 IS TRUE` is true, so an index lookup
-                // for 1 would miss that row. The same rule applies to FALSE.
+                // for 1 would miss that row. The same rule applies to FALSE,
+                // and it holds through parentheses and COLLATE: `x IS (TRUE)`
+                // is still a truth test (see [truth_test_rhs]).
                 if matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
-                    && matches!(
-                        rhs,
-                        ast::Expr::Literal(ast::Literal::True | ast::Literal::False)
-                    )
+                    && truth_test_rhs(rhs).is_some()
                 {
                     continue;
                 }
@@ -570,8 +570,9 @@ pub fn constraints_from_where_clause(
                     };
                 // See [Constraint::null_matching]. The constraining value sits
                 // on the opposite side of the constrained column.
-                let null_matching =
-                    |constraining_expr: &ast::Expr| is_op && !is_non_null_literal(constraining_expr);
+                let null_matching = |constraining_expr: &ast::Expr| {
+                    is_op && !is_non_null_literal(constraining_expr)
+                };
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
