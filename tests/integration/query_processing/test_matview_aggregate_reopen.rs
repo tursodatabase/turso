@@ -34,12 +34,17 @@ fn matview_sum_avg_over_all_null_column_stay_null_after_reopen() {
             .unwrap();
         conn.execute(
             "CREATE MATERIALIZED VIEW v AS
-             SELECT sum(x) AS sx, avg(x) AS ax, count(*) AS n FROM t",
+             SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n FROM t",
         )
         .unwrap();
         assert_eq!(
-            limbo_exec_rows(&conn, "SELECT sx, ax, n FROM v"),
-            vec![vec![Value::Null, Value::Null, Value::Integer(2)]],
+            limbo_exec_rows(&conn, "SELECT cx, sx, ax, n FROM v"),
+            vec![vec![
+                Value::Integer(0),
+                Value::Null,
+                Value::Null,
+                Value::Integer(2)
+            ]],
             "before reopen"
         );
         conn.close().unwrap();
@@ -49,8 +54,13 @@ fn matview_sum_avg_over_all_null_column_stay_null_after_reopen() {
         let db = open(&path);
         let conn = db.connect_limbo();
         assert_eq!(
-            limbo_exec_rows(&conn, "SELECT sx, ax, n FROM v"),
-            vec![vec![Value::Null, Value::Null, Value::Integer(2)]],
+            limbo_exec_rows(&conn, "SELECT cx, sx, ax, n FROM v"),
+            vec![vec![
+                Value::Integer(0),
+                Value::Null,
+                Value::Null,
+                Value::Integer(2)
+            ]],
             "after reopen"
         );
     }
