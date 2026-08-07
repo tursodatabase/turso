@@ -82,6 +82,25 @@ fn sparse_vector(v: &str) -> Value {
     vector::operations::serialize::vector_serialize(vector).expect(turso_core::alloc::ALLOC_ERR_MSG)
 }
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_mvcc_capability_is_checked_before_create(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+
+    let error = conn
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("index method 'fts' does not support MVCC"),
+        "unexpected error: {error}"
+    );
+}
+
 // TODO: cannot use MVCC as we use indexes here
 #[turso_macros::test(init_sql = "CREATE TABLE t(name, embedding)")]
 fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
