@@ -225,13 +225,18 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     affinities,
                 });
             }
-            // The bloom filter neither stores nor probes NULLs (a NULL key can
-            // never satisfy `=`), so a NULL-matching seek cannot use it: probing
-            // would report "definitely not present" for keys that do match.
-            if use_bloom_filter && null_matching_mask.is_empty() {
+            if use_bloom_filter {
                 turso_assert!(
                     idx.ephemeral,
                     "bloom filter can only be used with ephemeral indexes"
+                );
+                // The probe treats a NULL key as "definitely absent", which
+                // would skip rows whose key IS NULL. `emit_autoindex` never
+                // builds a filter for a NULL-matching seek, so probing one
+                // here means the build and probe decisions have diverged.
+                turso_assert!(
+                    null_matching_mask.is_empty(),
+                    "a NULL-matching seek must not probe a bloom filter"
                 );
                 self.program.emit_insn(Insn::Filter {
                     cursor_id: self.seek_cursor_id,

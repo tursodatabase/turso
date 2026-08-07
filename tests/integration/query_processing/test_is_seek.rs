@@ -294,6 +294,56 @@ fn is_with_non_null_literal_key_is_a_point_lookup_for_order_by() {
     );
 }
 
+/// An `IS`-driven seek never probes the bloom filter (the probe treats a NULL
+/// key as "definitely absent", which would skip matching NULL rows), so the
+/// ephemeral autoindex build must not pay for `FilterAdd` on every row either.
+#[test]
+fn is_seek_on_autoindex_does_not_build_a_bloom_filter_nothing_probes() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(&conn, "CREATE TABLE big(k, v)");
+    limbo_exec_rows(&conn, "CREATE TABLE small(k)");
+
+    let opcodes = |query: &str| -> Vec<String> {
+        limbo_exec_rows(&conn, &format!("EXPLAIN {query}"))
+            .iter()
+            .filter_map(|row| match row.get(1) {
+                Some(Value::Text(op)) => Some(op.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let is_join = opcodes("SELECT big.v FROM small JOIN big ON big.k IS small.k");
+    let builds = is_join.iter().any(|op| op == "FilterAdd");
+    let probes = is_join.iter().any(|op| op == "Filter");
+    assert!(
+        !builds && !probes,
+        "an IS seek cannot probe the filter, so nothing may build one: \
+         FilterAdd={builds}, Filter={probes}\n{is_join:?}"
+    );
+
+    // Controls: the same autoindex with a key that is never NULL keeps its
+    // bloom filter — both for `=` and for `IS` with a non-NULL literal.
+    // (The plain `ON big.k = small.k` join would pick a hash join instead of
+    // the autoindex, so these use a literal key like the IS case above
+    // cannot.)
+    for query in [
+        "SELECT big.v FROM small CROSS JOIN big WHERE big.k = 'x'",
+        "SELECT big.v FROM small CROSS JOIN big WHERE big.k IS 'x'",
+    ] {
+        let ops = opcodes(query);
+        let builds = ops.iter().any(|op| op == "FilterAdd");
+        let probes = ops.iter().any(|op| op == "Filter");
+        assert!(
+            builds && probes,
+            "a non-NULL key must keep both filter build and probe for \
+             `{query}`: FilterAdd={builds}, Filter={probes}\n{ops:?}"
+        );
+    }
+}
+
 #[test]
 fn is_operator_seek_matches_null_in_65th_key_column() {
     let tmp_db = TempDatabase::new_empty();
