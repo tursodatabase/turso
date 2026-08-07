@@ -294,7 +294,9 @@ pub(super) fn choose_best_btree_candidate(
                     0,
                     schema,
                     EqualityPrefixScope::AnyEquality,
-                ) == order_target.columns.len();
+                )
+                .consumed
+                    == order_target.columns.len();
                 let all_opposite_direction = btree_access_order_consumed(
                     rhs_table,
                     IterationDirection::Backwards,
@@ -304,7 +306,9 @@ pub(super) fn choose_best_btree_candidate(
                     0,
                     schema,
                     EqualityPrefixScope::AnyEquality,
-                ) == order_target.columns.len();
+                )
+                .consumed
+                    == order_target.columns.len();
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
                 if satisfies_order {
@@ -1802,7 +1806,9 @@ fn materialized_subquery_order_properties(
         0,
         schema,
         EqualityPrefixScope::AnyEquality,
-    ) == order_target.columns.len();
+    )
+    .consumed
+        == order_target.columns.len();
     let all_opposite_direction = btree_access_order_consumed(
         rhs_table,
         IterationDirection::Backwards,
@@ -1812,7 +1818,9 @@ fn materialized_subquery_order_properties(
         0,
         schema,
         EqualityPrefixScope::AnyEquality,
-    ) == order_target.columns.len();
+    )
+    .consumed
+        == order_target.columns.len();
 
     if !(all_same_direction || all_opposite_direction) {
         return (IterationDirection::Forwards, false, Cost(0.0));

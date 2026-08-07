@@ -262,6 +262,38 @@ fn is_null_seek_does_not_use_average_rows_per_key_from_analyze() {
     );
 }
 
+/// `x IS 'a'` behaves exactly like `x = 'a'`: the key is a non-NULL literal,
+/// so a fully-constrained UNIQUE index returns at most one row and the sorter
+/// can be skipped. `x IS NULL` gives no such bound, so its sorter must stay.
+#[test]
+fn is_with_non_null_literal_key_is_a_point_lookup_for_order_by() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(&conn, "CREATE TABLE t1(x UNIQUE)");
+    limbo_exec_rows(&conn, "CREATE TABLE t2(y)");
+    limbo_exec_rows(&conn, "INSERT INTO t1 VALUES ('a'), ('b')");
+    limbo_exec_rows(&conn, "INSERT INTO t2 VALUES (1), (2)");
+
+    let literal_key = query_plan(
+        &conn,
+        "SELECT t2.y FROM t1 JOIN t2 WHERE t1.x IS 'a' ORDER BY t1.x, t2.rowid",
+    );
+    assert!(
+        !literal_key.contains("USE SORTER"),
+        "IS 'a' pins one row of t1, so t2's rowid order already satisfies ORDER BY:\n{literal_key}"
+    );
+
+    let null_key = query_plan(
+        &conn,
+        "SELECT t2.y FROM t1 JOIN t2 WHERE t1.x IS NULL ORDER BY t1.x, t2.rowid",
+    );
+    assert!(
+        null_key.contains("USE SORTER"),
+        "IS NULL can match many rows of t1, so the sorter must stay:\n{null_key}"
+    );
+}
+
 #[test]
 fn is_operator_seek_matches_null_in_65th_key_column() {
     let tmp_db = TempDatabase::new_empty();
