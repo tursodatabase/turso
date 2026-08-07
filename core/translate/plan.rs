@@ -2968,14 +2968,34 @@ impl SeekDef {
     /// be NULL, while an `IS` seek must seek with the NULL key because index keys
     /// compare NULLs as equal. Only equality prefix components can be
     /// NULL-matching; range bounds never are.
+    ///
+    /// `x IS 5` does not count: a literal 5 is never NULL, so the component
+    /// behaves exactly like `x = 5`.
     pub fn is_null_matching_key_component(&self, pos: usize) -> bool {
         self.prefix.get(pos).is_some_and(|component| {
-            matches!(
-                component.eq.as_ref().map(|(op, _, _)| op),
-                Some(ast::Operator::Is)
-            )
+            component
+                .eq
+                .as_ref()
+                .is_some_and(|(op, expr, _)| *op == ast::Operator::Is && !is_non_null_literal(expr))
         })
     }
+}
+
+/// True only for literal values that are never NULL: numbers, strings, blobs,
+/// TRUE and FALSE. Columns and parameters do not count — their runtime value
+/// can be NULL. A column does not count even when declared NOT NULL, because
+/// an outer join can still null-extend it.
+pub fn is_non_null_literal(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Literal(
+            ast::Literal::Numeric(_)
+                | ast::Literal::String(_)
+                | ast::Literal::Blob(_)
+                | ast::Literal::True
+                | ast::Literal::False
+        )
+    )
 }
 
 /// Build the affinity string for a synthesized ephemeral seek index.
