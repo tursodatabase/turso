@@ -286,16 +286,25 @@ fn select_for_shape(
 enum AggregateFunction {
     Sum,
     Avg,
+    Count,
+    CountDistinct,
 }
 
 /// TOTAL is left out because Turso refuses it in a materialized view.
-const AGGREGATE_FUNCTIONS: &[AggregateFunction] = &[AggregateFunction::Sum, AggregateFunction::Avg];
+const AGGREGATE_FUNCTIONS: &[AggregateFunction] = &[
+    AggregateFunction::Sum,
+    AggregateFunction::Avg,
+    AggregateFunction::Count,
+    AggregateFunction::CountDistinct,
+];
 
 impl AggregateFunction {
     fn name(self) -> &'static str {
         match self {
             AggregateFunction::Sum => "sum",
             AggregateFunction::Avg => "avg",
+            AggregateFunction::Count => "count",
+            AggregateFunction::CountDistinct => "count_distinct",
         }
     }
 
@@ -303,6 +312,8 @@ impl AggregateFunction {
         match self {
             AggregateFunction::Sum => format!("SUM({column})"),
             AggregateFunction::Avg => format!("AVG({column})"),
+            AggregateFunction::Count => format!("COUNT({column})"),
+            AggregateFunction::CountDistinct => format!("COUNT(DISTINCT {column})"),
         }
     }
 
@@ -310,6 +321,7 @@ impl AggregateFunction {
         match (self, input) {
             (AggregateFunction::Sum, DataType::Integer) => DataType::Integer,
             (AggregateFunction::Sum | AggregateFunction::Avg, _) => DataType::Real,
+            (AggregateFunction::Count | AggregateFunction::CountDistinct, _) => DataType::Integer,
         }
     }
 }
