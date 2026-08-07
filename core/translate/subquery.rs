@@ -1451,8 +1451,13 @@ pub fn emit_from_clause_subqueries(
                     } => {
                         let constraints =
                             super::display::seek_constraint_annotation(index, seek_def);
+                        let covering = if table_reference.utilizes_covering_index() {
+                            "COVERING "
+                        } else {
+                            ""
+                        };
                         format!(
-                            "SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                            "SEARCH {} USING {covering}INDEX {}{constraints}{left_join_suffix}",
                             table_reference.identifier, index.name
                         )
                     }
@@ -1464,8 +1469,13 @@ pub fn emit_from_clause_subqueries(
                         } else {
                             String::new()
                         };
+                        let covering = if table_reference.utilizes_covering_index() {
+                            "COVERING "
+                        } else {
+                            ""
+                        };
                         format!(
-                            "SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
+                            "SEARCH {} USING {covering}INDEX {}{constraint}{left_join_suffix}",
                             table_reference.identifier, index.name
                         )
                     }
