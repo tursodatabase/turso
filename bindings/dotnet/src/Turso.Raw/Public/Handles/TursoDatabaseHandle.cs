@@ -31,7 +31,9 @@ public class TursoDatabaseHandle() : SafeHandle(IntPtr.Zero, true)
             throw new NullReferenceException("database is invalid");
     }
 
-    public static TursoDatabaseHandle FromPtrs(IntPtr database, IntPtr connection)
+    public static TursoDatabaseHandle FromPtrs(
+        IntPtr database,
+        IntPtr connection)
     {
         var handle = new TursoDatabaseHandle();
         handle._database = database;

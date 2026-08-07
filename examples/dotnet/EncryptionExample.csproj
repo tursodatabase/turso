@@ -2,26 +2,14 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <RootNamespace>EncryptionExample</RootNamespace>
+    <RootNamespace>Turso.EncryptionExample</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../bindings/dotnet/src/Turso.Data/Turso.Data.csproj" />
-  </ItemGroup>
-
-  <!-- Copy native library to output directory -->
-  <ItemGroup>
-    <None Include="../../target/release/libturso_dotnet.dylib" Condition="Exists('../../target/release/libturso_dotnet.dylib')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>libturso_dotnet.dylib</Link>
-    </None>
-    <None Include="../../target/debug/libturso_dotnet.dylib" Condition="Exists('../../target/debug/libturso_dotnet.dylib') And !Exists('../../target/release/libturso_dotnet.dylib')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>libturso_dotnet.dylib</Link>
-    </None>
+    <ProjectReference Include="..\..\bindings\dotnet\src\Turso.Data\Turso.Data.csproj" />
   </ItemGroup>
 
 </Project>
