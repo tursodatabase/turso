@@ -2359,6 +2359,7 @@ fn emit_window_full_scan(
         num_regs: 1,
         target_pc: label_break,
         eq_only: false,
+        null_matching_mask: Default::default(),
     });
     program.preassign_label_to_next_insn(label_loop);
     program.emit_insn(Insn::RowId {
@@ -3341,6 +3342,7 @@ fn emit_function_inverse(
                 num_regs: 1,
                 target_pc: label_skip,
                 eq_only: false,
+                null_matching_mask: Default::default(),
             });
             program.emit_insn(Insn::Delete {
                 cursor_id: state.cursor,

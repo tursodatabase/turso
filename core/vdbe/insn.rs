@@ -15,7 +15,7 @@ use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     sync::{Arc, OnceLock, Weak},
-    translate::{collate::CollationSeq, emitter::TransactionMode},
+    translate::{collate::CollationSeq, emitter::TransactionMode, plan::BitSet},
     types::KeyInfo,
     vdbe::affinity::Affinity,
     PreparedProgram, Value,
@@ -998,6 +998,9 @@ pub enum Insn {
         num_regs: usize,
         target_pc: BranchOffset,
         eq_only: bool,
+        /// Key columns that use `IS` instead of `=`. NULL may match in these
+        /// columns, so the seek must not stop when their key value is NULL.
+        null_matching_mask: BitSet,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -1035,6 +1038,9 @@ pub enum Insn {
         num_regs: usize,
         target_pc: BranchOffset,
         eq_only: bool,
+        /// Key columns that use `IS` instead of `=`. NULL may match in these
+        /// columns, so the seek must not stop when their key value is NULL.
+        null_matching_mask: BitSet,
     },
 
     // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.

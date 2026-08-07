@@ -310,21 +310,24 @@ pub fn plan_satisfies_order_target(
                         "access_method.params::Subquery must be for a FromClauseSubquery table"
                     );
                 };
-                subquery_intrinsic_order_consumed(
-                    table_ref.internal_id,
-                    from_clause_subquery,
-                    *iter_dir,
-                    &order_target.columns[target_col_idx..],
-                    schema,
-                )
+                OrderConsumption {
+                    consumed: subquery_intrinsic_order_consumed(
+                        table_ref.internal_id,
+                        from_clause_subquery,
+                        *iter_dir,
+                        &order_target.columns[target_col_idx..],
+                        schema,
+                    ),
+                    includes_rowid: false,
+                }
             }
             _ => return false,
         };
 
-        if consumed == 0 {
+        if consumed.consumed == 0 {
             return false;
         }
-        target_col_idx += consumed;
+        target_col_idx += consumed.consumed;
         if target_col_idx == num_cols_in_order_target {
             return true;
         }
@@ -345,7 +348,7 @@ pub fn plan_satisfies_order_target(
                         })
                 });
         if next_term_comes_from_later_loop
-            && !access_method_emits_unique_order_prefix(access_method, consumed)
+            && !access_method_emits_unique_order_prefix(access_method, &consumed)
         {
             return false;
         }
@@ -355,27 +358,30 @@ pub fn plan_satisfies_order_target(
 
 fn access_method_emits_unique_order_prefix(
     access_method: &AccessMethod,
-    consumed_order_terms: usize,
+    order_consumption: &OrderConsumption,
 ) -> bool {
+    // Rows always differ in rowid, so a consumed prefix that includes the
+    // rowid never repeats.
+    if order_consumption.includes_rowid {
+        return true;
+    }
+    // Otherwise the only safe claim is a point lookup: a UNIQUE index with
+    // every column pinned by plain `=` returns at most one row. Anything
+    // weaker can emit duplicate prefixes: an `IS` equality matches NULL keys
+    // (a UNIQUE index stores any number of NULL keys), and counting
+    // equality-pinned columns together with consumed ORDER BY terms counts
+    // the same column twice when the ORDER BY mentions the equality column.
     match &access_method.params {
         AccessMethodParams::BTreeTable {
             index,
             constraint_refs,
             ..
-        } => access_path_makes_consumed_prefix_unique(
-            index.as_deref(),
-            constraint_refs,
-            consumed_order_terms,
-        ),
+        } => is_unique_point_lookup(index_info_for_access(index.as_deref()), constraint_refs),
         AccessMethodParams::MaterializedSubquery {
             index,
             constraint_refs,
             ..
-        } => access_path_makes_consumed_prefix_unique(
-            Some(index.as_ref()),
-            constraint_refs,
-            consumed_order_terms,
-        ),
+        } => is_unique_point_lookup(index_info_for_access(Some(index.as_ref())), constraint_refs),
         AccessMethodParams::Subquery { .. }
         | AccessMethodParams::RecursiveCteInput
         | AccessMethodParams::HashJoin { .. }
@@ -383,40 +389,6 @@ fn access_method_emits_unique_order_prefix(
         | AccessMethodParams::IndexMethod { .. }
         | AccessMethodParams::MultiIndexScan { .. }
         | AccessMethodParams::InSeek { .. } => false,
-    }
-}
-
-fn access_path_makes_consumed_prefix_unique(
-    index: Option<&Index>,
-    constraint_refs: &[RangeConstraintRef],
-    consumed_order_terms: usize,
-) -> bool {
-    if is_unique_point_lookup(index_info_for_access(index), constraint_refs) {
-        return true;
-    }
-
-    match index {
-        // Table scans only provide rowid order. If that rowid term was consumed,
-        // the prefix is unique even though the scan obviously returns many rows.
-        None => consumed_order_terms >= 1,
-        Some(index) => {
-            let eq_prefix_len = constraint_refs
-                .iter()
-                .take_while(|constraint| constraint.eq.is_some())
-                .count();
-            let unique_prefix_terms = eq_prefix_len + consumed_order_terms;
-
-            // Unique indexes become prefix-unique once all key columns are either
-            // fixed by equality or consumed as ORDER BY terms.
-            if index.unique && unique_prefix_terms >= index.columns.len() {
-                return true;
-            }
-
-            // Rowid tables keep duplicate secondary-index keys ordered by rowid.
-            // If the consumed ORDER BY terms already include that implicit rowid
-            // suffix, the emitted prefix is unique too.
-            index.has_rowid && unique_prefix_terms > index.columns.len()
-        }
     }
 }
 
@@ -649,19 +621,22 @@ fn finalized_scan_subquery_order_consumed(
     }
 
     match &joined_table.op {
-        Operation::Scan(Scan::BTreeTable { index, .. }) => btree_access_order_consumed(
-            joined_table,
-            effective_iter_dir,
-            index.as_deref(),
-            &[],
-            &OrderTarget {
-                columns: mapped_target,
-                purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
-            },
-            0,
-            schema,
-            EqualityPrefixScope::ConstantEquality,
-        ),
+        Operation::Scan(Scan::BTreeTable { index, .. }) => {
+            btree_access_order_consumed(
+                joined_table,
+                effective_iter_dir,
+                index.as_deref(),
+                &[],
+                &OrderTarget {
+                    columns: mapped_target,
+                    purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+                },
+                0,
+                schema,
+                EqualityPrefixScope::ConstantEquality,
+            )
+            .consumed
+        }
         Operation::Scan(Scan::Subquery { .. }) => {
             let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table else {
                 return 0;
@@ -777,6 +752,25 @@ fn target_matches_index_column(
     }
 }
 
+/// What a single-table btree access path contributes to an ORDER BY / GROUP BY
+/// target. See [`btree_access_order_consumed`].
+pub(super) struct OrderConsumption {
+    /// How many leading order-target columns the access path satisfies.
+    pub consumed: usize,
+    /// Whether one of those consumed columns is the table's rowid (directly,
+    /// through a rowid alias, or through the implicit rowid suffix of a
+    /// secondary index). Every row has a different rowid, so a consumed prefix
+    /// that includes the rowid never repeats across the rows this loop emits.
+    pub includes_rowid: bool,
+}
+
+impl OrderConsumption {
+    pub const NONE: OrderConsumption = OrderConsumption {
+        consumed: 0,
+        includes_rowid: false,
+    };
+}
+
 /// Return how many leading `order_target` columns this single-table btree
 /// access path can satisfy.
 ///
@@ -796,10 +790,10 @@ pub(super) fn btree_access_order_consumed(
     start_col: usize,
     schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
-) -> usize {
+) -> OrderConsumption {
     let target_columns = &order_target.columns[start_col..];
     let Some(first_target_col) = target_columns.first() else {
-        return 0;
+        return OrderConsumption::NONE;
     };
 
     let rowid_alias_col = table_ref
@@ -812,30 +806,39 @@ pub(super) fn btree_access_order_consumed(
         None => {
             // Without an index, only rowid order is available.
             if first_target_col.table_id != table_ref.internal_id {
-                return 0;
+                return OrderConsumption::NONE;
             }
             match first_target_col.target {
                 ColumnTarget::RowId => {}
                 ColumnTarget::Column(col_no) => {
                     let Some(rowid_alias_col) = rowid_alias_col else {
-                        return 0;
+                        return OrderConsumption::NONE;
                     };
                     if col_no != rowid_alias_col {
-                        return 0;
+                        return OrderConsumption::NONE;
                     }
                 }
-                ColumnTarget::Expr(_) => return 0,
+                ColumnTarget::Expr(_) => return OrderConsumption::NONE,
             }
             let correct_order = if iter_dir == IterationDirection::Forwards {
                 first_target_col.order == SortOrder::Asc
             } else {
                 first_target_col.order == SortOrder::Desc
             };
-            usize::from(correct_order)
+            OrderConsumption {
+                consumed: usize::from(correct_order),
+                includes_rowid: correct_order,
+            }
         }
         Some(index) => {
             let mut col_idx = 0;
             let mut idx_pos = 0;
+            let mut includes_rowid = false;
+            let target_is_rowid = |target_col: &ColumnOrder| match target_col.target {
+                ColumnTarget::RowId => true,
+                ColumnTarget::Column(col_no) => rowid_alias_col == Some(col_no),
+                ColumnTarget::Expr(_) => false,
+            };
             while col_idx < target_columns.len() && idx_pos < index.columns.len() {
                 let target_col = &target_columns[col_idx];
                 if target_col.table_id != table_ref.internal_id {
@@ -913,6 +916,10 @@ pub(super) fn btree_access_order_consumed(
                     }
                 }
 
+                if target_is_rowid(target_col) {
+                    // The index explicitly contains the rowid alias column.
+                    includes_rowid = true;
+                }
                 col_idx += 1;
                 idx_pos += 1;
             }
@@ -921,24 +928,24 @@ pub(super) fn btree_access_order_consumed(
             // by rowid. That implicit suffix can satisfy one extra ORDER BY term.
             if col_idx < target_columns.len() && idx_pos == index.columns.len() && index.has_rowid {
                 let target_col = &target_columns[col_idx];
-                let rowid_matches = match target_col.target {
-                    ColumnTarget::RowId => true,
-                    ColumnTarget::Column(col_no) => {
-                        rowid_alias_col.is_some_and(|alias| alias == col_no)
-                    }
-                    ColumnTarget::Expr(_) => false,
-                };
                 let correct_order = if iter_dir == IterationDirection::Forwards {
                     target_col.order == SortOrder::Asc
                 } else {
                     target_col.order == SortOrder::Desc
                 };
-                if target_col.table_id == table_ref.internal_id && rowid_matches && correct_order {
+                if target_col.table_id == table_ref.internal_id
+                    && target_is_rowid(target_col)
+                    && correct_order
+                {
                     col_idx += 1;
+                    includes_rowid = true;
                 }
             }
 
-            col_idx
+            OrderConsumption {
+                consumed: col_idx,
+                includes_rowid,
+            }
         }
     }
 }

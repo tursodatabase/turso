@@ -477,6 +477,7 @@ impl OpenLoop {
                                     target_pc: next_val_label,
                                     is_index: true,
                                     eq_only: false,
+                                    null_matching_mask: Default::default(),
                                 });
                                 program.preassign_label_to_next_insn(loop_start);
                                 program.emit_insn(Insn::IdxGT {

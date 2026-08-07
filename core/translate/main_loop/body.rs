@@ -448,11 +448,55 @@ fn emit_loop_source<'a>(
     }
 }
 
+/// Whether every column a condition reads holds the right value at the
+/// unmatched-row scan point.
+///
+/// A column is readable if its table's cursor is one of `allowed` and so still
+/// positioned, or if it lives in `payload_regs` — this hash join's payload,
+/// which the unmatched scan reloads for each row it produces. Registers cached
+/// by anything else are stale here: nothing refills them once the probe loop has
+/// exited. Skipping a condition whose columns are all readable silently drops it
+/// from the null-extended rows, letting through rows the query filtered out.
+fn condition_operands_are_available(
+    expr: &Expr,
+    table_references: &TableReferences,
+    allowed: &TableMask,
+    resolver: &Resolver,
+    payload_regs: Range<usize>,
+) -> bool {
+    let mut ok = true;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        let (Expr::Column { table, .. } | Expr::RowId { table, .. }) = e else {
+            return Ok(WalkControl::Continue);
+        };
+        if resolver
+            .resolve_cached_expr_reg(e)
+            .is_some_and(|(reg, ..)| payload_regs.contains(&reg))
+        {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if let Some(idx) = table_references
+            .joined_tables()
+            .iter()
+            .position(|t| t.internal_id == *table)
+        {
+            if !allowed.get(idx) {
+                ok = false;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        // Outer query references are already in scope — allow them.
+        Ok(WalkControl::Continue)
+    });
+    ok
+}
+
 /// Emit WHERE conditions and inner-loop entry for an unmatched outer hash join row.
 ///
 /// Filters applicable WHERE terms (non-ON, non-consumed), optionally restricted to
-/// `build_table_idx` / `probe_table_idx` when a Gosub wraps inner tables. Then either
-/// enters the inner-loop subroutine via Gosub or calls `emit_loop` directly.
+/// the ones whose columns are readable here when a Gosub wraps inner tables. Then
+/// either enters the inner-loop subroutine via Gosub or calls `emit_loop` directly.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
@@ -461,6 +505,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
     probe_table_idx: usize,
     skip_label: BranchOffset,
     gosub: Option<(usize, BranchOffset)>,
+    payload_regs: Range<usize>,
 ) -> Result<()> {
     let has_gosub = gosub.is_some();
     let allowed_tables = {
@@ -483,14 +528,22 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         }
         m
     };
-    for cond in plan
+    let conditions = plan
         .where_clause
         .iter()
         .filter(|c| !c.consumed && c.from_outer_join.is_none())
         .filter(|c| {
-            !has_gosub || expr_tables_subset_of(&c.expr, &plan.table_references, &allowed_tables)
+            !has_gosub
+                || condition_operands_are_available(
+                    &c.expr,
+                    &plan.table_references,
+                    &allowed_tables,
+                    &t_ctx.resolver,
+                    payload_regs.clone(),
+                )
         })
-    {
+        .collect::<Vec<_>>();
+    for cond in conditions {
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {
             jump_if_condition_is_true: false,

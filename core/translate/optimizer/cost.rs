@@ -182,9 +182,12 @@ pub(crate) fn is_unique_point_lookup(
     index_info: IndexInfo,
     usable_constraint_refs: &[RangeConstraintRef],
 ) -> bool {
+    // Only plain `=` equalities count. An `IS` equality matches NULL keys, and
+    // a UNIQUE index can store many NULL keys, so a key with an `IS` component
+    // can return many rows.
     let eq_count = usable_constraint_refs
         .iter()
-        .take_while(|cref| cref.eq.is_some())
+        .take_while(|cref| cref.eq.as_ref().is_some_and(|eq| !eq.null_matching))
         .count();
     index_info.unique && eq_count >= index_info.column_count
 }
@@ -301,6 +304,18 @@ fn estimate_rows_from_analyze_stats(
         .iter()
         .take_while(|cref| cref.eq.is_some())
         .count();
+
+    // The per-key average must not be applied to a key that can be NULL:
+    // NULL keys pile up in one bucket (think `deleted_at IS NULL` matching
+    // most of the table), so the average across all keys says nothing about
+    // that bucket. Decline, so the caller falls back to the pessimistic
+    // heuristic estimate for `IS`.
+    if constraint_refs[..eq_prefix_len]
+        .iter()
+        .any(|cref| cref.eq.as_ref().is_some_and(|eq| eq.null_matching))
+    {
+        return None;
+    }
 
     if eq_prefix_len == 0 {
         // Pure range scan — ANALYZE per-distinct-value stats don't apply.

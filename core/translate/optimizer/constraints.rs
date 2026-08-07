@@ -4,11 +4,14 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         expr::{
-            as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens,
-            walk_expr_mut, WalkControl,
+            as_binary_components, comparison_affinity, get_expr_affinity, truth_test_rhs,
+            unwrap_parens, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
-        plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
+        plan::{
+            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
+            TableReferences, WhereTerm,
+        },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
             TableMask, ROWID_STRS,
@@ -21,7 +24,7 @@ use crate::{
 };
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
-use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
@@ -90,6 +93,14 @@ pub struct Constraint {
     /// not yet plumb per-column affinity into the index-selection path, so
     /// such constraints fall through to scans).
     pub comparison_affinity: Option<Affinity>,
+    /// Whether this constraint's seek key can be NULL and still match rows.
+    /// True only for `IS` whose constraining value is not known to be
+    /// non-NULL. `a IS 5` gets false: a literal 5 is never NULL, so the
+    /// constraint filters exactly like `a = 5`. `a IS NULL`, `a IS ?` and
+    /// `a IS other.col` get true — an index (even a UNIQUE one) can store
+    /// many NULL keys, so such a constraint can match many rows and its cost
+    /// and row estimates must not be taken from equality statistics.
+    pub null_matching: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -379,10 +390,19 @@ fn estimate_constraint_selectivity(
     table_reference: &JoinedTable,
     column: Option<&Column>,
     operator: ConstraintOperator,
+    null_matching: bool,
     index: Option<&Index>,
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
+    // `a IS 5` filters exactly like `a = 5` — the key is never NULL — so give
+    // it the `=` estimate. Only a NULL-matching `IS` keeps its own, much less
+    // selective, estimate (see [Constraint::null_matching]).
+    let operator = if operator.as_ast_operator() == Some(ast::Operator::Is) && !null_matching {
+        ConstraintOperator::from(ast::Operator::Equals)
+    } else {
+        operator
+    };
     estimate_selectivity(
         schema,
         table_reference.table.get_name(),
@@ -504,6 +524,16 @@ pub fn constraints_from_where_clause(
 
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+                // `x IS TRUE` checks whether x is true; it does not compare x
+                // with 1. For example, `2 IS TRUE` is true, so an index lookup
+                // for 1 would miss that row. The same rule applies to FALSE,
+                // and it holds through parentheses and COLLATE: `x IS (TRUE)`
+                // is still a truth test (see [truth_test_rhs]).
+                if matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
+                    && truth_test_rhs(rhs).is_some()
+                {
+                    continue;
+                }
                 // Resolve the comparison affinity once per term per SQLite's
                 // `comparisonAffinity` (see `Constraint::comparison_affinity`)
                 // and propagate it to every constraint derived from this term.
@@ -511,6 +541,38 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                // A WHERE term must not constrain the loop of a table that an
+                // outer join can null-extend, with two exceptions below.
+                // Consuming the term into the access path filters that table's
+                // rows, which changes which rows of the other side count as
+                // unmatched — and the join then emits null-extended rows the
+                // consumed term is never checked against.
+                //
+                // Exception 1: terms from that join's own ON clause define what
+                // counts as a match, so they are always fine.
+                //
+                // Exception 2: on the right side of a plain LEFT JOIN, the
+                // engine re-checks consumed terms when it emits the
+                // null-extended row, so any operator except `IS` stays usable
+                // there: such terms are never TRUE on a null-extended row, so
+                // the re-check removes the bogus rows. `IS` (e.g. `e.id IS
+                // NULL`) *is* TRUE on the null-extended row, so no re-check can
+                // repair it — it is unusable for every null-extendable table.
+                // A FULL JOIN synthesizes its extra rows by jumping past the
+                // scan with no re-check, so nothing is usable for any table a
+                // FULL JOIN can null-extend.
+                let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
+                let usable = term.from_outer_join == Some(table_reference.internal_id)
+                    || if is_op {
+                        !table_references.outer_join_may_null_extend(table_reference.internal_id)
+                    } else {
+                        !table_references.full_join_may_null_extend(table_reference.internal_id)
+                    };
+                // See [Constraint::null_matching]. The constraining value sits
+                // on the opposite side of the constrained column.
+                let null_matching = |constraining_expr: &ast::Expr| {
+                    is_op && !is_non_null_literal(constraining_expr)
+                };
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -528,13 +590,15 @@ pub fn constraints_from_where_clause(
                                     table_reference,
                                     Some(table_column),
                                     operator,
+                                    null_matching(rhs),
                                     index_for_column(*column),
                                     params,
                                     false,
                                 ),
-                                usable: true,
+                                usable,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
+                                null_matching: null_matching(rhs),
                             });
                         }
                     }
@@ -557,13 +621,15 @@ pub fn constraints_from_where_clause(
                                     table_reference,
                                     col,
                                     operator,
+                                    null_matching(rhs),
                                     None,
                                     params,
                                     true,
                                 ),
-                                usable: true,
+                                usable,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                null_matching: null_matching(rhs),
                             });
                         }
                     }
@@ -579,6 +645,7 @@ pub fn constraints_from_where_clause(
                             table_reference,
                             None,
                             operator,
+                            null_matching(rhs),
                             None,
                             params,
                             false,
@@ -599,9 +666,10 @@ pub fn constraints_from_where_clause(
                             constraining_expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
                             selectivity,
-                            usable: true,
+                            usable,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
+                            null_matching: null_matching(rhs),
                         });
                     }
                     _ => {}
@@ -622,13 +690,15 @@ pub fn constraints_from_where_clause(
                                     table_reference,
                                     Some(table_column),
                                     operator,
+                                    null_matching(lhs),
                                     index_for_column(*column),
                                     params,
                                     false,
                                 ),
-                                usable: true,
+                                usable,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
+                                null_matching: null_matching(lhs),
                             });
                         }
                     }
@@ -651,13 +721,15 @@ pub fn constraints_from_where_clause(
                                     table_reference,
                                     col,
                                     operator,
+                                    null_matching(lhs),
                                     None,
                                     params,
                                     true,
                                 ),
-                                usable: true,
+                                usable,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                null_matching: null_matching(lhs),
                             });
                         }
                     }
@@ -673,6 +745,7 @@ pub fn constraints_from_where_clause(
                             table_reference,
                             None,
                             operator,
+                            null_matching(lhs),
                             None,
                             params,
                             false,
@@ -693,9 +766,10 @@ pub fn constraints_from_where_clause(
                             constraining_expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
                             selectivity,
-                            usable: true,
+                            usable,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
+                            null_matching: null_matching(lhs),
                         });
                     }
                     _ => {}
@@ -749,6 +823,7 @@ pub fn constraints_from_where_clause(
                             usable: false, // IN uses a separate seek path, not the range-seek model
                             is_rowid,
                             comparison_affinity: cmp_aff,
+                            null_matching: false,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -766,6 +841,7 @@ pub fn constraints_from_where_clause(
                             usable: false,
                             is_rowid: true,
                             comparison_affinity: cmp_aff,
+                            null_matching: false,
                         });
                     }
                     _ => {}
@@ -829,6 +905,7 @@ pub fn constraints_from_where_clause(
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
                                 is_rowid,
                                 comparison_affinity: cmp_aff,
+                                null_matching: false,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -846,6 +923,7 @@ pub fn constraints_from_where_clause(
                                 usable: false,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                null_matching: false,
                             });
                         }
                         _ => {}
@@ -855,15 +933,11 @@ pub fn constraints_from_where_clause(
         }
         // sort equalities first so that index keys will be properly constructed.
         // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
-        cs.constraints.sort_by(|a, b| {
-            if a.operator == ast::Operator::Equals.into() {
-                Ordering::Less
-            } else if b.operator == ast::Operator::Equals.into() {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
-            }
-        });
+        // A stable partition, not a comparison: comparing two equalities as
+        // "less" in both directions is not a valid ordering, and now that `IS`
+        // counts as an equality there are more pairs that would hit it.
+        cs.constraints
+            .sort_by_key(|c| !is_equality_operator(c.operator));
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
@@ -1022,6 +1096,10 @@ pub struct EqConstraintRef {
     /// entire query (true for `col = 5`, false for `t2.x = t1.b` where the
     /// value changes per outer row in a nested-loop join).
     pub is_const: bool,
+    /// Whether this equality comes from `IS` instead of `=`. An `IS` equality
+    /// matches NULL keys, and an index (even a UNIQUE one) can store many NULL
+    /// keys, so an `IS` equality does not pin the column to at most one row.
+    pub null_matching: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1199,7 +1277,7 @@ pub fn usable_constraints_for_lhs_mask(
         }
         let operator = constraints[cref.constraint_vec_pos].operator;
         let table_col_pos = constraints[cref.constraint_vec_pos].table_col_pos;
-        if operator == ast::Operator::Equals.into()
+        if is_equality_operator(operator)
             && usable
                 .last()
                 .is_some_and(|x| x.table_col_pos == table_col_pos)
@@ -1209,7 +1287,7 @@ pub fn usable_constraints_for_lhs_mask(
             continue;
         }
         let constraint_group = match operator.as_ast_operator() {
-            Some(ast::Operator::Equals) => RangeConstraintRef {
+            Some(ast::Operator::Equals | ast::Operator::Is) => RangeConstraintRef {
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
@@ -1217,6 +1295,7 @@ pub fn usable_constraints_for_lhs_mask(
                 eq: Some(EqConstraintRef {
                     constraint_pos: cref.constraint_vec_pos,
                     is_const: constraints[cref.constraint_vec_pos].lhs_mask.is_empty(),
+                    null_matching: constraints[cref.constraint_vec_pos].null_matching,
                 }),
                 lower_bound: None,
                 upper_bound: None,
@@ -1485,7 +1564,20 @@ fn estimate_bound_expr_selectivity(
         let index = col_pos.and_then(|pos| {
             selectivity_index_for_column(schema, table_reference, available_indexes, pos)
         });
-        estimate_constraint_selectivity(schema, table_reference, col, op, index, params, is_rowid)
+        // For `IS`, the key can be NULL unless one side is a non-NULL literal
+        // (the constrained column is on the other side).
+        let null_matching = op.as_ast_operator() == Some(ast::Operator::Is)
+            && !(is_non_null_literal(lhs) || is_non_null_literal(rhs));
+        estimate_constraint_selectivity(
+            schema,
+            table_reference,
+            col,
+            op,
+            null_matching,
+            index,
+            params,
+            is_rowid,
+        )
     };
 
     match expr {
@@ -1557,6 +1649,7 @@ fn estimate_bound_expr_selectivity(
                     not: *not,
                     estimated_values: rhs.len() as f64,
                 },
+                false,
                 index,
                 params,
                 is_rowid,
@@ -1612,6 +1705,22 @@ pub fn convert_to_vtab_constraint(
         })
         .collect();
     Ok(constraints)
+}
+
+/// Whether `op` constrains an index column to a single value, making it usable
+/// as an index seek key.
+///
+/// `IS` belongs here next to `=`: SQLite treats it as an index-usable equality
+/// that additionally matches NULL (`x IS NULL` seeks the index's NULL entries,
+/// and `x IS ?` with a NULL bind finds the rows whose key component is NULL).
+/// The only difference is in codegen: an `=` seek can stop early when its key is
+/// NULL because `NULL = NULL` is not true, while an `IS` seek must seek with the
+/// NULL key. See [`SeekDef::is_null_matching_key_component`].
+pub fn is_equality_operator(op: ConstraintOperator) -> bool {
+    matches!(
+        op.as_ast_operator(),
+        Some(ast::Operator::Equals | ast::Operator::Is)
+    )
 }
 
 fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
@@ -1838,11 +1947,15 @@ pub(crate) fn analyze_binary_term_for_index(
     }
 
     let table_column = table_col_pos.and_then(|pos| table_reference.table.columns().get(pos));
+    // See [Constraint::null_matching].
+    let null_matching = operator.as_ast_operator() == Some(ast::Operator::Is)
+        && !is_non_null_literal(constraining_expr);
     let selectivity = estimate_constraint_selectivity(
         schema,
         table_reference,
         table_column,
         operator,
+        null_matching,
         best_index.as_deref(),
         params,
         is_rowid,
@@ -1892,6 +2005,7 @@ pub(crate) fn analyze_binary_term_for_index(
         usable: true,
         is_rowid,
         comparison_affinity: Some(affinity),
+        null_matching,
     };
 
     Some(AnalyzedTerm {
@@ -1922,6 +2036,7 @@ fn find_best_index_for_constraint(
                 Some(EqConstraintRef {
                     constraint_pos: 0,
                     is_const: false,
+                    null_matching: false,
                 })
             } else {
                 None
@@ -1953,6 +2068,7 @@ fn find_best_index_for_constraint(
                 Some(EqConstraintRef {
                     constraint_pos: 0,
                     is_const: false,
+                    null_matching: false,
                 })
             } else {
                 None
@@ -1990,6 +2106,7 @@ fn find_best_index_for_constraint(
                             Some(EqConstraintRef {
                                 constraint_pos: 0,
                                 is_const: false,
+                                null_matching: false,
                             })
                         } else {
                             None

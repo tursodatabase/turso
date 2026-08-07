@@ -5766,17 +5766,27 @@ pub fn op_seek(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
-    let is_eq_only = match insn {
-        Insn::SeekGE { eq_only, .. } => *eq_only,
-        Insn::SeekLE { eq_only, .. } => *eq_only,
+    let has_null_that_cannot_match = match insn {
+        Insn::SeekGE {
+            eq_only: true,
+            null_matching_mask,
+            ..
+        }
+        | Insn::SeekLE {
+            eq_only: true,
+            null_matching_mask,
+            ..
+        } => state.registers[start_reg..start_reg + num_regs]
+            .iter()
+            .enumerate()
+            .any(|(i, value)| {
+                // `IS` can match NULL. `=` cannot.
+                value.is_null() && !null_matching_mask.get(i)
+            }),
         _ => false,
     };
 
-    if is_eq_only
-        && state.registers[start_reg..start_reg + num_regs]
-            .iter()
-            .any(|value| value.is_null())
-    {
+    if has_null_that_cannot_match {
         // Exact-match seeks use "=" semantics across the full unpacked key.
         // If any key column is NULL, the comparison is unknown, so no row can match.
         // Translation often emits IsNull guards earlier, but outer joins can still

@@ -294,7 +294,9 @@ pub(super) fn choose_best_btree_candidate(
                     0,
                     schema,
                     EqualityPrefixScope::AnyEquality,
-                ) == order_target.columns.len();
+                )
+                .consumed
+                    == order_target.columns.len();
                 let all_opposite_direction = btree_access_order_consumed(
                     rhs_table,
                     IterationDirection::Backwards,
@@ -304,7 +306,9 @@ pub(super) fn choose_best_btree_candidate(
                     0,
                     schema,
                     EqualityPrefixScope::AnyEquality,
-                ) == order_target.columns.len();
+                )
+                .consumed
+                    == order_target.columns.len();
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
                 if satisfies_order {
@@ -1033,6 +1037,18 @@ pub fn find_equijoin_conditions(
 
     for (where_idx, where_term) in where_clause.iter().enumerate() {
         if where_term.consumed {
+            continue;
+        }
+
+        // An ON-clause term of an outer join decides what counts as a match
+        // for that join only. A term that belongs to a *different* join's ON
+        // clause may legally mention only these two tables (an ON clause can
+        // reference any table to its left), but it must not become this
+        // join's key — it filters the rows of its own join instead.
+        if where_term
+            .from_outer_join
+            .is_some_and(|owner| owner != probe_table_id)
+        {
             continue;
         }
 
@@ -1802,7 +1818,9 @@ fn materialized_subquery_order_properties(
         0,
         schema,
         EqualityPrefixScope::AnyEquality,
-    ) == order_target.columns.len();
+    )
+    .consumed
+        == order_target.columns.len();
     let all_opposite_direction = btree_access_order_consumed(
         rhs_table,
         IterationDirection::Backwards,
@@ -1812,7 +1830,9 @@ fn materialized_subquery_order_properties(
         0,
         schema,
         EqualityPrefixScope::AnyEquality,
-    ) == order_target.columns.len();
+    )
+    .consumed
+        == order_target.columns.len();
 
     if !(all_same_direction || all_opposite_direction) {
         return (IterationDirection::Forwards, false, Cost(0.0));

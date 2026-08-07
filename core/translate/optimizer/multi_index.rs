@@ -766,6 +766,25 @@ fn evaluate_multi_index_branches(
     }
 }
 
+/// Whether a multi-index scan on `table` may be driven by `term`.
+///
+/// The scan *is* the term's evaluation: rows failing it are never visited, and
+/// the term is marked consumed so nothing checks it again. For a table that an
+/// outer join can null-extend (the right-hand table of a LEFT/FULL JOIN, or
+/// any table on the left side of a FULL JOIN) that only holds for the join's
+/// own ON clause, which defines what counts as a match. Any other term must
+/// also reject the null-extended row the join emits when nothing matched, and
+/// that row is produced by jumping straight past the scan — so consuming such
+/// a term silently drops it.
+fn multi_index_can_consume_term(
+    table: &JoinedTable,
+    term: &WhereTerm,
+    table_references: &TableReferences,
+) -> bool {
+    !table_references.outer_join_may_null_extend(table.internal_id)
+        || term.from_outer_join == Some(table.internal_id)
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Analyze top-level AND terms to determine whether they can be executed as an
 /// AND-by-intersection plan.
@@ -801,6 +820,9 @@ fn analyze_and_terms_for_multi_index(
 
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed || matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _)) {
+            continue;
+        }
+        if !multi_index_can_consume_term(table_reference, term, table_references) {
             continue;
         }
 
@@ -946,6 +968,9 @@ pub fn consider_multi_index_union(
 ) -> Result<Option<AccessMethod>> {
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
+            continue;
+        }
+        if !multi_index_can_consume_term(rhs_table, term, table_references) {
             continue;
         }
 

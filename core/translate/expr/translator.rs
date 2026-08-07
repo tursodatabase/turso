@@ -382,17 +382,9 @@ pub fn translate_expr(
         ast::Expr::Binary(e1, op, e2) => {
             // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
             // These use truth semantics (only non-zero numbers are truthy) rather than equality.
-            if let Some((is_not, is_true_literal)) = match (op, e2.as_ref()) {
-                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::True)) => Some((false, true)),
-                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::False)) => {
-                    Some((false, false))
-                }
-                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::True)) => {
-                    Some((true, true))
-                }
-                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::False)) => {
-                    Some((true, false))
-                }
+            if let Some((is_not, is_true_literal)) = match (op, truth_test_rhs(e2)) {
+                (ast::Operator::Is, Some(is_true_literal)) => Some((false, is_true_literal)),
+                (ast::Operator::IsNot, Some(is_true_literal)) => Some((true, is_true_literal)),
                 _ => None,
             } {
                 let reg = program.alloc_register();

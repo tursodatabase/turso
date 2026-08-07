@@ -389,6 +389,7 @@ where
         num_regs,
         target_pc: done,
         eq_only: true,
+        null_matching_mask: Default::default(),
     });
 
     let loop_top = program.allocate_label();
