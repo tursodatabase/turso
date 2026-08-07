@@ -235,9 +235,13 @@ public class TursoTests
 
         using var command = new TursoCommand(connection, "SELECT ?");
 
-        command.Invoking(x => x.ExecuteScalar())
+        var exception = command.Invoking(x => x.ExecuteScalar())
             .Should().Throw<InvalidOperationException>()
-            .WithMessage("Missing value for parameter ?1.");
+            .Which;
+
+        exception.Message.Should().BeOneOf(
+            "Missing value for parameter ?1.",
+            "Missing value for parameter at position 1.");
     }
 
     [Test]
