@@ -1199,6 +1199,14 @@ impl DbspCompiler {
                                             "Only column references are supported in aggregate functions for incremental views".to_string()
                                         ));
                                     }
+                                } else if let Some(LogicalExpr::Column(col)) = args.first() {
+                                    // COUNT(column) skips NULLs. COUNT(*) and
+                                    // COUNT(<constant>) count every row.
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("COUNT column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::CountColumn(col_idx));
                                 } else {
                                     aggregate_functions.push(AggregateFunction::Count);
                                 }
