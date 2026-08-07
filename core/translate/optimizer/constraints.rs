@@ -294,14 +294,12 @@ pub(super) fn automatic_index_terms(
 ) -> Vec<ConstraintRef> {
     let columns = table.columns();
     let is_strict = table.table.is_strict();
-    let mut index_columns: SmallVec<[usize; 4]> = constraints
+    let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
         .filter(|term| term.can_drive_index_seek(columns, is_strict))
-        .filter_map(|term| term.table_col_pos)
         .collect();
-    index_columns.sort_unstable();
-    index_columns.dedup();
+    let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
     let mut terms: Vec<_> = constraints
         .constraints
@@ -309,9 +307,12 @@ pub(super) fn automatic_index_terms(
         .enumerate()
         .filter(|(_, term)| term.can_drive_index_seek(columns, is_strict))
         .filter_map(|(term_index, term)| {
+            let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
                 constraint_vec_pos: term_index,
-                index_col_pos: index_columns.binary_search(&term.table_col_pos?).ok()?,
+                index_col_pos: index_columns
+                    .iter()
+                    .position(|column| *column == table_col_pos)?,
                 sort_order: SortOrder::Asc,
                 nulls_order: ast::NullsOrder::First,
             })
@@ -1385,14 +1386,11 @@ pub fn usable_constraints_for_join_order<'a>(
     ))
 }
 
-/// Order synthetic key columns for a materialized subquery seek index.
+/// Order key columns for a temporary index.
 ///
-/// Unlike ordinary index analysis, the ephemeral index does not have a fixed
-/// on-disk column order, so we can choose one that matches the intended probe
-/// shape. Equalities come first, followed by columns that are constrained only
-/// by ranges. Columns that have both equality and range predicates stay in the
-/// equality prefix; the range side is redundant for key ordering.
-pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usize> {
+/// Equalities come first because an index cannot use a column after a range.
+/// A column with both an equality and a range stays in the equality part.
+pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> Vec<usize> {
     let mut equality_cols = Vec::new();
     let mut range_only_cols = Vec::new();
 
@@ -1401,7 +1399,7 @@ pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usiz
             continue;
         };
         match constraint.operator.as_ast_operator() {
-            Some(ast::Operator::Equals) => equality_cols.push(col_pos),
+            Some(ast::Operator::Equals | ast::Operator::Is) => equality_cols.push(col_pos),
             Some(
                 ast::Operator::Greater
                 | ast::Operator::GreaterEquals

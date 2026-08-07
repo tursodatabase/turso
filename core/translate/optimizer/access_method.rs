@@ -11,16 +11,17 @@ use crate::stats::AnalyzeStats;
 use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    automatic_index_terms, convert_to_vtab_constraint, ordered_materialized_key_columns,
+    automatic_index_terms, convert_to_vtab_constraint, ordered_ephemeral_key_columns,
     partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
     RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery,
+    plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery, Plan,
     SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
+use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
@@ -53,30 +54,14 @@ use crate::translate::planner::TableMask;
 #[derive(Debug, Clone)]
 /// Represents a way to access a table.
 pub struct AccessMethod {
-    /// The estimated number of page fetches.
-    /// CPU costs are folded into the same scalar cost model.
+    /// The estimated page and CPU work for this path.
     pub cost: Cost,
     /// Estimated rows produced per outer row before applying remaining filters.
     pub estimated_rows_per_outer_row: f64,
-    /// Whether join cardinality should still apply planner-side selectivity after
-    /// using this access path's own row estimate.
-    pub residual_constraints: ResidualConstraintMode,
     /// WHERE-term indices already accounted for by this access path's row estimate.
     pub consumed_where_terms: SmallVec<[usize; 4]>,
     /// Table-type specific access method details.
     pub params: AccessMethodParams,
-}
-
-/// Describes whether join planning should still apply residual WHERE-term
-/// selectivity after choosing an access path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResidualConstraintMode {
-    /// Apply the selectivity of all relevant WHERE terms that this access path
-    /// did not already consume.
-    ApplyUnconsumed,
-    /// The access path already provided its own final row estimate; do not
-    /// multiply any planner-side residual selectivity on top.
-    None,
 }
 
 /// Table‑specific details of how an [`AccessMethod`] operates.
@@ -668,7 +653,6 @@ fn consider_in_seek_access_method(
     .map(|chosen| AccessMethod {
         cost: chosen.cost,
         estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
-        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
         consumed_where_terms: smallvec::smallvec![chosen.constraint_idx],
         params: AccessMethodParams::InSeek {
             index: chosen.index,
@@ -678,33 +662,51 @@ fn consider_in_seek_access_method(
     }))
 }
 
-fn residual_literal_in_list_eval_cost(
-    constraints: &[Constraint],
-    where_clause: &[WhereTerm],
-    consumed_where_terms: &[usize],
+/// Add the cost of ready `WHERE` conditions.
+fn cost_with_where_work(
+    method: &AccessMethod,
+    ready_where: &[(usize, usize)],
     input_cardinality: f64,
-    rows_per_outer_row: f64,
     params: &CostModelParams,
 ) -> Cost {
-    let eval_count = input_cardinality * rows_per_outer_row;
-    let comparison_count: f64 = constraints
+    let used_steps: usize = ready_where
         .iter()
-        .filter(|constraint| !consumed_where_terms.contains(&constraint.where_clause_pos.0))
-        .filter(|constraint| {
-            where_clause
-                .get(constraint.where_clause_pos.0)
-                .is_some_and(|term| matches!(term.expr, ast::Expr::InList { .. }))
-        })
-        .filter_map(|constraint| match constraint.operator {
-            ConstraintOperator::In {
-                not: false,
-                estimated_values,
-            } => Some(estimated_values),
-            _ => None,
-        })
+        .filter(|(term_idx, _)| method.consumed_where_terms.contains(term_idx))
+        .map(|(_, step_count)| step_count)
         .sum();
+    let remaining_steps: usize = ready_where
+        .iter()
+        .filter(|(term_idx, _)| !method.consumed_where_terms.contains(term_idx))
+        .map(|(_, step_count)| step_count)
+        .sum();
+    let output_rows = input_cardinality * method.estimated_rows_per_outer_row;
+    let used_rows = input_cardinality.max(output_rows);
+    let work = used_rows * used_steps as f64 + output_rows * remaining_steps as f64;
+    method.cost + Cost(work * params.cpu_cost_per_where_step)
+}
 
-    Cost(eval_count * comparison_count * params.cpu_cost_per_row)
+pub(super) fn add_where_cost(
+    method: &mut AccessMethod,
+    ready_where: &[(usize, usize)],
+    input_cardinality: f64,
+    params: &CostModelParams,
+) {
+    method.cost = cost_with_where_work(method, ready_where, input_cardinality, params);
+}
+
+fn replace_if_cheaper(
+    best_method: &mut AccessMethod,
+    best_cost: &mut Cost,
+    method: AccessMethod,
+    ready_where: &[(usize, usize)],
+    input_cardinality: f64,
+    params: &CostModelParams,
+) {
+    let cost = cost_with_where_work(&method, ready_where, input_cardinality, params);
+    if cost < *best_cost {
+        *best_method = method;
+        *best_cost = cost;
+    }
 }
 
 /// Return the best [AccessMethod] for a given join order.
@@ -715,6 +717,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
     where_clause: &[WhereTerm],
+    ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -731,6 +734,7 @@ pub fn find_best_access_method_for_join_order(
             join_order,
             planning_context.maybe_order_target,
             where_clause,
+            ready_where,
             available_indexes,
             table_references,
             subqueries,
@@ -754,6 +758,7 @@ pub fn find_best_access_method_for_join_order(
             rhs_constraints,
             join_order,
             planning_context,
+            ready_where,
             schema,
             input_cardinality,
             base_row_count,
@@ -771,7 +776,6 @@ pub fn find_best_access_method_for_join_order(
                 None,
             ),
             estimated_rows_per_outer_row: 1.0,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
             consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::RecursiveCteInput,
         })),
@@ -785,6 +789,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     where_clause: &[WhereTerm],
+    ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -865,7 +870,6 @@ fn find_best_access_method_for_btree(
     let mut best_access_method = AccessMethod {
         cost: best.cost,
         estimated_rows_per_outer_row,
-        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
         consumed_where_terms,
         params: AccessMethodParams::BTreeTable {
             iter_dir: best.iter_dir,
@@ -873,6 +877,8 @@ fn find_best_access_method_for_btree(
             constraint_refs: best.constraint_refs,
         },
     };
+    let mut best_cost_with_filters =
+        cost_with_where_work(&best_access_method, ready_where, input_cardinality, params);
 
     let is_full_outer = rhs_table
         .join_info
@@ -946,37 +952,33 @@ fn find_best_access_method_for_btree(
                     + input_cardinality * rows_per_seek * params.cpu_cost_per_row,
             );
             let cost = scan_cost + build_cost + seek_cost;
-            if cost < best_access_method.cost {
-                best_access_method = AccessMethod {
-                    cost,
-                    estimated_rows_per_outer_row: rows_per_seek,
-                    residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
-                    consumed_where_terms: consumed_where_terms_from_constraint_refs(
-                        &rhs_constraints.constraints,
-                        &constraint_refs,
-                    ),
-                    params: AccessMethodParams::BTreeTable {
-                        iter_dir: best.iter_dir,
-                        index: Some(index),
-                        constraint_refs,
-                    },
-                };
-            }
+            let auto_index_method = AccessMethod {
+                cost,
+                estimated_rows_per_outer_row: rows_per_seek,
+                consumed_where_terms: consumed_where_terms_from_constraint_refs(
+                    &rhs_constraints.constraints,
+                    &constraint_refs,
+                ),
+                params: AccessMethodParams::BTreeTable {
+                    iter_dir: best.iter_dir,
+                    index: Some(index),
+                    constraint_refs,
+                },
+            };
+            replace_if_cheaper(
+                &mut best_access_method,
+                &mut best_cost_with_filters,
+                auto_index_method,
+                ready_where,
+                input_cardinality,
+                params,
+            );
         }
     }
 
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
-        let in_seek_threshold = best_access_method.cost
-            + residual_literal_in_list_eval_cost(
-                &rhs_constraints.constraints,
-                where_clause,
-                &best_access_method.consumed_where_terms,
-                input_cardinality,
-                best_access_method.estimated_rows_per_outer_row,
-                params,
-            );
         if let Some(in_seek_method) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,
@@ -984,7 +986,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            in_seek_threshold,
+            best_cost_with_filters,
         )? {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
@@ -997,7 +999,14 @@ fn find_best_access_method_for_btree(
                     );
                 }
             }
-            best_access_method = in_seek_method;
+            replace_if_cheaper(
+                &mut best_access_method,
+                &mut best_cost_with_filters,
+                in_seek_method,
+                ready_where,
+                input_cardinality,
+                params,
+            );
         }
 
         if let Some(multi_idx_method) = consider_multi_index_union(
@@ -1010,11 +1019,18 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_access_method.cost,
+            best_cost_with_filters,
             &lhs_mask,
             analyze_stats,
         )? {
-            best_access_method = multi_idx_method;
+            replace_if_cheaper(
+                &mut best_access_method,
+                &mut best_cost_with_filters,
+                multi_idx_method,
+                ready_where,
+                input_cardinality,
+                params,
+            );
         }
 
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
@@ -1027,11 +1043,18 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_access_method.cost,
+            best_cost_with_filters,
             &lhs_mask,
             analyze_stats,
         )? {
-            best_access_method = multi_idx_and_method;
+            replace_if_cheaper(
+                &mut best_access_method,
+                &mut best_cost_with_filters,
+                multi_idx_and_method,
+                ready_where,
+                input_cardinality,
+                params,
+            );
         }
     }
 
@@ -1054,8 +1077,35 @@ fn find_best_access_method_for_vtab(
 
     match best_index_result {
         Ok(index_info) => {
+            if index_info.constraint_usages.len() != vtab_constraints.len() {
+                return Err(LimboError::ExtensionError(format!(
+                    "Constraint usage count mismatch (expected {}, got {})",
+                    vtab_constraints.len(),
+                    index_info.constraint_usages.len()
+                )));
+            }
+            let has_row_estimate = index_info.estimated_rows != u32::MAX;
+            let estimated_rows_per_outer_row = if has_row_estimate {
+                f64::from(index_info.estimated_rows)
+            } else {
+                *base_row_count
+            };
+            // A row estimate includes each condition passed to the virtual table.
+            // Do not apply the same row cut again in the join planner.
+            let consumed_where_terms = if has_row_estimate {
+                vtab_constraints
+                    .iter()
+                    .zip(&index_info.constraint_usages)
+                    .filter(|(_, usage)| usage.argv_index.is_some())
+                    .map(|(vtab_constraint, _)| {
+                        constraints[vtab_constraint.index].where_clause_pos.0
+                    })
+                    .collect()
+            } else {
+                SmallVec::new()
+            };
             Ok(Some(AccessMethod {
-                // TODO: Base cost on `IndexInfo::estimated_cost` and output cardinality on `IndexInfo::estimated_rows`
+                // TODO: Base cost on `IndexInfo::estimated_cost`.
                 cost: estimate_cost_for_scan_or_seek(
                     None,
                     &[],
@@ -1066,9 +1116,8 @@ fn find_best_access_method_for_vtab(
                     params,
                     None,
                 ),
-                estimated_rows_per_outer_row: *base_row_count,
-                residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
-                consumed_where_terms: SmallVec::new(),
+                estimated_rows_per_outer_row,
+                consumed_where_terms,
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,
@@ -1458,6 +1507,25 @@ pub fn try_hash_join_access_method(
         }
     }
 
+    let join_selectivity = join_keys
+        .iter()
+        .map(|key| {
+            probe_constraints
+                .constraints
+                .iter()
+                .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
+                .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
+        })
+        .product::<f64>();
+    let rows_per_build_row = probe_cardinality * join_selectivity;
+    let estimated_rows_per_outer_row = match hash_join_type {
+        HashJoinType::Inner => rows_per_build_row,
+        HashJoinType::LeftOuter => rows_per_build_row.max(1.0),
+        HashJoinType::FullOuter => rows_per_build_row
+            .max(1.0)
+            .max(probe_cardinality / build_cardinality.max(1.0)),
+    };
+
     let cost = estimate_hash_join_cost(
         build_cardinality,
         probe_cardinality,
@@ -1467,8 +1535,7 @@ pub fn try_hash_join_access_method(
     );
     Some(AccessMethod {
         cost,
-        estimated_rows_per_outer_row: probe_cardinality,
-        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+        estimated_rows_per_outer_row,
         consumed_where_terms: join_keys.iter().map(|key| key.where_clause_idx).collect(),
         params: AccessMethodParams::HashJoin {
             build_table_idx,
@@ -1543,6 +1610,7 @@ fn find_best_access_method_for_subquery(
     rhs_constraints: &TableConstraints,
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
+    ready_where: &[(usize, usize)],
     schema: &Schema,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
@@ -1591,7 +1659,6 @@ fn find_best_access_method_for_subquery(
             // enclosing CTE/subquery might otherwise be shareable.
             cost: coroutine_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
             consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::Subquery {
                 iter_dir: IterationDirection::Forwards,
@@ -1652,7 +1719,6 @@ fn find_best_access_method_for_subquery(
             return Ok(Some(AccessMethod {
                 cost: scan_cost,
                 estimated_rows_per_outer_row: *base_row_count,
-                residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
                 consumed_where_terms: SmallVec::new(),
                 params: AccessMethodParams::Subquery { iter_dir },
             }));
@@ -1663,7 +1729,6 @@ fn find_best_access_method_for_subquery(
         return Ok(Some(AccessMethod {
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
             consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::Subquery {
                 iter_dir: IterationDirection::Forwards,
@@ -1672,12 +1737,11 @@ fn find_best_access_method_for_subquery(
     }
 
     let usable_constraints: Vec<&Constraint> = usable.iter().map(|(_, c)| *c).collect();
-    let key_col_positions = ordered_materialized_key_columns(&usable_constraints);
+    let key_col_positions = ordered_ephemeral_key_columns(&usable_constraints);
     if key_col_positions.is_empty() {
         return Ok(Some(AccessMethod {
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
             consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::Subquery {
                 iter_dir: IterationDirection::Forwards,
@@ -1727,7 +1791,6 @@ fn find_best_access_method_for_subquery(
         return Ok(Some(AccessMethod {
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
             consumed_where_terms: SmallVec::new(),
             params: AccessMethodParams::Subquery {
                 iter_dir: IterationDirection::Forwards,
@@ -1748,18 +1811,23 @@ fn find_best_access_method_for_subquery(
             params,
         );
 
-    let estimated_rows_per_outer_row = estimate_rows_per_seek(
-        IndexInfo {
-            unique: false,
-            column_count: key_col_positions.len(),
-            covering: true,
-            rows_per_leaf_page: params.rows_per_table_page,
-        },
-        &rhs_constraints.constraints,
-        &usable_constraint_refs,
-        base_row_count,
-        None,
-    );
+    let estimated_rows_per_outer_row =
+        if grouped_subquery_lookup_is_unique(subquery, &usable_constraint_refs) {
+            1.0
+        } else {
+            estimate_rows_per_seek(
+                IndexInfo {
+                    unique: false,
+                    column_count: key_col_positions.len(),
+                    covering: true,
+                    rows_per_leaf_page: params.rows_per_table_page,
+                },
+                &rhs_constraints.constraints,
+                &usable_constraint_refs,
+                base_row_count,
+                None,
+            )
+        };
     let one_pass_scan_cost =
         estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);
     let append_build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
@@ -1779,23 +1847,17 @@ fn find_best_access_method_for_subquery(
             + input_cardinality * estimated_rows_per_outer_row * params.cpu_cost_per_row,
     );
     let total_cost = Cost(subquery_cost) + seek_setup_cost + seek_cost;
-
-    if total_cost >= scan_cost + order_satisfiability_bonus {
-        return Ok(Some(AccessMethod {
-            cost: scan_cost,
-            estimated_rows_per_outer_row: *base_row_count,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
-            consumed_where_terms: SmallVec::new(),
-            params: AccessMethodParams::Subquery {
-                iter_dir: IterationDirection::Forwards,
-            },
-        }));
-    }
-
-    Ok(Some(AccessMethod {
+    let scan_method = AccessMethod {
+        cost: scan_cost,
+        estimated_rows_per_outer_row: *base_row_count,
+        consumed_where_terms: SmallVec::new(),
+        params: AccessMethodParams::Subquery {
+            iter_dir: IterationDirection::Forwards,
+        },
+    };
+    let index_method = AccessMethod {
         cost: total_cost,
         estimated_rows_per_outer_row,
-        residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
         consumed_where_terms: consumed_where_terms_from_constraint_refs(
             &rhs_constraints.constraints,
             &usable_constraint_refs,
@@ -1805,7 +1867,42 @@ fn find_best_access_method_for_subquery(
             constraint_refs: usable_constraint_refs,
             iter_dir,
         },
-    }))
+    };
+    let scan_cost = cost_with_where_work(&scan_method, ready_where, input_cardinality, params);
+    let index_cost = cost_with_where_work(&index_method, ready_where, input_cardinality, params);
+
+    if index_cost >= scan_cost + order_satisfiability_bonus {
+        Ok(Some(scan_method))
+    } else {
+        Ok(Some(index_method))
+    }
+}
+
+/// A grouped query has at most one row for one full group key.
+fn grouped_subquery_lookup_is_unique(
+    subquery: &FromClauseSubquery,
+    constraint_refs: &[RangeConstraintRef],
+) -> bool {
+    let Plan::Select(plan) = subquery.plan.as_ref() else {
+        return false;
+    };
+    let Some(group_by) = &plan.group_by else {
+        return false;
+    };
+    if group_by.exprs.is_empty() {
+        return false;
+    }
+
+    group_by.exprs.iter().all(|group_expr| {
+        plan.result_columns
+            .iter()
+            .position(|column| exprs_are_equivalent(&column.expr, group_expr))
+            .is_some_and(|column_pos| {
+                constraint_refs.iter().any(|constraint| {
+                    constraint.table_col_pos == Some(column_pos) && constraint.eq.is_some()
+                })
+            })
+    })
 }
 
 /// Describe the temporary index layout we would build on top of a materialized

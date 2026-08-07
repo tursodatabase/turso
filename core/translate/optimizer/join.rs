@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use super::{
-    access_method::{find_best_access_method_for_join_order, AccessMethod},
+    access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
@@ -21,11 +21,10 @@ use crate::{
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
-                ResidualConstraintMode,
             },
             cost::{
-                estimate_rows_per_seek, rows_per_leaf_page_for_index, AnalyzeCtx, Cost, IndexInfo,
-                RowCountEstimate,
+                estimate_rows_per_seek, rows_per_leaf_page_for_index, where_node_steps, AnalyzeCtx,
+                Cost, IndexInfo, RowCountEstimate,
             },
             order::plan_satisfies_order_target,
         },
@@ -177,20 +176,15 @@ fn count_subquery_calls_after_join(
         } else {
             SmallVec::new()
         };
-        let rows = match method.residual_constraints {
-            ResidualConstraintMode::ApplyUnconsumed => {
-                let multiplier = constraint_output_multipliers(
-                    new_table_constraints,
-                    prior_tables,
-                    new_table_mask.clone(),
-                    &method.consumed_where_terms,
-                    &skipped_where_terms,
-                    params,
-                );
-                rows_before_filters * multiplier
-            }
-            ResidualConstraintMode::None => rows_before_filters,
-        };
+        let multiplier = constraint_output_multipliers(
+            new_table_constraints,
+            prior_tables,
+            new_table_mask.clone(),
+            &method.consumed_where_terms,
+            &skipped_where_terms,
+            params,
+        );
+        let rows = rows_before_filters * multiplier;
         subquery_calls.push((subquery.internal_id, rows.max(1.0)));
     }
 
@@ -208,6 +202,11 @@ pub struct JoinN {
     pub cost: Cost,
     /// Expected calls to correlated subqueries that can now run.
     pub subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
+}
+
+struct WhereTermInfo {
+    table_ids: HashSet<TableInternalId>,
+    extra_steps: usize,
 }
 
 impl JoinN {
@@ -233,7 +232,7 @@ impl JoinN {
 /// - Probe->build chaining is only allowed when the build input is materialized from the
 ///   join prefix; rebuilding from the full table would ignore prior join filters.
 #[allow(clippy::too_many_arguments)]
-pub fn join_lhs_and_rhs<'a>(
+fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
     initial_input_cardinality: f64,
     rhs_table_reference: &JoinedTable,
@@ -246,7 +245,7 @@ pub fn join_lhs_and_rhs<'a>(
     cost_upper_bound: Cost,
     joined_tables: &[JoinedTable],
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -265,6 +264,13 @@ pub fn join_lhs_and_rhs<'a>(
         .get(rhs_table_number)
         .copied()
         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+    let ready_where = ready_where_work(
+        where_clause,
+        where_terms,
+        join_order,
+        subqueries,
+        table_references,
+    );
 
     let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
@@ -272,6 +278,7 @@ pub fn join_lhs_and_rhs<'a>(
         join_order,
         planning_context,
         where_clause,
+        &ready_where,
         available_indexes,
         table_references,
         subqueries,
@@ -293,6 +300,12 @@ pub fn join_lhs_and_rhs<'a>(
     let lhs_cost = lhs.map_or(Cost(0.0), |l| l.cost);
     // If we have a previous table, consider hash join as an alternative
     let mut best_access_method = method;
+    add_where_cost(
+        &mut best_access_method,
+        &ready_where,
+        input_cardinality,
+        params,
+    );
 
     // Reuse for hash cost and output cardinality computation
     // Self-constraints are conditions comparing columns within the same table
@@ -312,9 +325,12 @@ pub fn join_lhs_and_rhs<'a>(
         })
         .unwrap_or_default();
     let has_join_constraint = lhs.is_some()
-        && where_term_table_ids.iter().any(|table_ids| {
-            table_ids.contains(&rhs_internal_id)
-                && table_ids.iter().any(|id| lhs_internal_ids.contains(id))
+        && where_terms.iter().any(|term| {
+            term.table_ids.contains(&rhs_internal_id)
+                && term
+                    .table_ids
+                    .iter()
+                    .any(|id| lhs_internal_ids.contains(id))
         });
     if lhs.is_some() && !has_join_constraint {
         let rhs_self_constraint_selectivity =
@@ -719,6 +735,12 @@ pub fn join_lhs_and_rhs<'a>(
                             );
                         }
                     }
+                    add_where_cost(
+                        &mut hash_join_method,
+                        &ready_where,
+                        input_cardinality,
+                        params,
+                    );
                     // FULL OUTER requires hash join for the unmatched-build scan.
                     let is_full_outer = matches!(
                         &hash_join_method.params,
@@ -753,17 +775,18 @@ pub fn join_lhs_and_rhs<'a>(
                 Cost(cost_estimate.estimated_cost * input_cardinality)
             };
 
-            if fts_cost < best_access_method.cost {
-                best_access_method = AccessMethod {
-                    cost: fts_cost,
-                    estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
-                    residual_constraints: ResidualConstraintMode::None,
-                    consumed_where_terms: candidate.where_covered.into_iter().collect(),
-                    params: AccessMethodParams::IndexMethod {
-                        query: candidate.to_query(),
-                        where_covered: candidate.where_covered,
-                    },
-                };
+            let mut index_method = AccessMethod {
+                cost: fts_cost,
+                estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
+                consumed_where_terms: candidate.where_covered.into_iter().collect(),
+                params: AccessMethodParams::IndexMethod {
+                    query: candidate.to_query(),
+                    where_covered: candidate.where_covered,
+                },
+            };
+            add_where_cost(&mut index_method, &ready_where, input_cardinality, params);
+            if index_method.cost < best_access_method.cost {
+                best_access_method = index_method;
             }
         }
     }
@@ -817,10 +840,6 @@ pub fn join_lhs_and_rhs<'a>(
         &[],
         params,
     );
-    let residual_multiplier = match best_access_method.residual_constraints {
-        ResidualConstraintMode::ApplyUnconsumed => unconsumed_constraint_multiplier,
-        ResidualConstraintMode::None => 1.0,
-    };
     let output_cardinality = if joined_tables[rhs_table_number]
         .join_info
         .as_ref()
@@ -830,7 +849,9 @@ pub fn join_lhs_and_rhs<'a>(
         // make copies of that row.
         input_cardinality
     } else {
-        input_cardinality * best_access_method.estimated_rows_per_outer_row * residual_multiplier
+        input_cardinality
+            * best_access_method.estimated_rows_per_outer_row
+            * unconsumed_constraint_multiplier
     };
     let mut subquery_calls = lhs
         .map(|lhs| lhs.subquery_calls.clone())
@@ -1040,7 +1061,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_term_table_ids = build_where_term_table_ids(where_clause, joined_tables);
+    let where_terms = build_where_term_info(where_clause, joined_tables);
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
@@ -1050,7 +1071,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             base_table_rows,
             access_methods_arena,
             where_clause,
-            &where_term_table_ids,
+            &where_terms,
             subqueries,
             index_method_candidates,
             params,
@@ -1070,7 +1091,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         access_methods_arena,
         constraints,
         where_clause,
-        &where_term_table_ids,
+        &where_terms,
         subqueries,
         index_method_candidates,
         params,
@@ -1165,7 +1186,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             cost_upper_bound,
             joined_tables,
             where_clause,
-            &where_term_table_ids,
+            &where_terms,
             subqueries,
             index_method_candidates,
             params,
@@ -1340,7 +1361,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         cost_upper_bound,
                         joined_tables,
                         where_clause,
-                        &where_term_table_ids,
+                        &where_terms,
                         subqueries,
                         index_method_candidates,
                         params,
@@ -1492,7 +1513,7 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 ///
 /// Respects outer join ordering constraints.
 #[allow(clippy::too_many_arguments)]
-pub fn compute_greedy_join_order<'a>(
+fn compute_greedy_join_order<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
     planning_context: JoinPlanningContext<'_>,
@@ -1500,7 +1521,7 @@ pub fn compute_greedy_join_order<'a>(
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -1566,7 +1587,7 @@ pub fn compute_greedy_join_order<'a>(
         Cost(f64::MAX),
         joined_tables,
         where_clause,
-        where_term_table_ids,
+        where_terms,
         subqueries,
         index_method_candidates,
         params,
@@ -1599,13 +1620,13 @@ pub fn compute_greedy_join_order<'a>(
                     continue;
                 }
             }
-            let connected = where_term_table_ids.iter().any(|table_ids| {
+            let connected = where_terms.iter().any(|term| {
                 let table_id = joined_tables[idx].internal_id;
-                table_ids.contains(&table_id)
+                term.table_ids.contains(&table_id)
                     && current_mask
                         .iter()
                         .map(|table_no| joined_tables[table_no].internal_id)
-                        .any(|id| table_ids.contains(&id))
+                        .any(|id| term.table_ids.contains(&id))
             });
             if connected {
                 has_connected_candidate = true;
@@ -1621,13 +1642,13 @@ pub fn compute_greedy_join_order<'a>(
                 }
             }
             if has_connected_candidate {
-                let connected = where_term_table_ids.iter().any(|table_ids| {
+                let connected = where_terms.iter().any(|term| {
                     let table_id = joined_tables[idx].internal_id;
-                    table_ids.contains(&table_id)
+                    term.table_ids.contains(&table_id)
                         && current_mask
                             .iter()
                             .map(|table_no| joined_tables[table_no].internal_id)
-                            .any(|id| table_ids.contains(&id))
+                            .any(|id| term.table_ids.contains(&id))
                 });
                 if !connected {
                     continue;
@@ -1653,7 +1674,7 @@ pub fn compute_greedy_join_order<'a>(
                 Cost(f64::MAX),
                 joined_tables,
                 where_clause,
-                where_term_table_ids,
+                where_terms,
                 subqueries,
                 index_method_candidates,
                 params,
@@ -1955,7 +1976,7 @@ fn get_best_seek_score(
 /// in the SQL query. This is used as an upper bound for any other plans -- we can give up enumerating
 /// permutations if they exceed this cost during enumeration.
 #[allow(clippy::too_many_arguments)]
-pub fn compute_naive_left_deep_plan<'a>(
+fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
     planning_context: JoinPlanningContext<'_>,
@@ -1963,7 +1984,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     access_methods_arena: &'a mut Vec<AccessMethod>,
     constraints: &'a [TableConstraints],
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -1999,7 +2020,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         Cost(f64::MAX),
         joined_tables,
         where_clause,
-        where_term_table_ids,
+        where_terms,
         subqueries,
         index_method_candidates,
         params,
@@ -2027,7 +2048,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             Cost(f64::MAX),
             joined_tables,
             where_clause,
-            where_term_table_ids,
+            where_terms,
             subqueries,
             index_method_candidates,
             params,
@@ -2044,37 +2065,61 @@ pub fn compute_naive_left_deep_plan<'a>(
     Ok(best_plan)
 }
 
-/// Precompute table IDs referenced by each WHERE term for join-order decisions.
-fn build_where_term_table_ids(
+/// Read the table IDs and extra work for each `WHERE` term once.
+fn build_where_term_info(
     where_clause: &[WhereTerm],
     joined_tables: &[JoinedTable],
-) -> Vec<HashSet<TableInternalId>> {
+) -> Vec<WhereTermInfo> {
     let joined_ids: HashSet<TableInternalId> =
         joined_tables.iter().map(|t| t.internal_id).collect();
     where_clause
         .iter()
-        .map(|term| expr_table_ids_filtered(&term.expr, &joined_ids))
+        .map(|term| {
+            let mut table_ids = HashSet::default();
+            let mut steps = 0;
+            walk_expr(&term.expr, &mut |expr| {
+                if let Expr::Column { table, .. } | Expr::RowId { table, .. } = expr {
+                    if joined_ids.contains(table) {
+                        table_ids.insert(*table);
+                    }
+                }
+                steps += where_node_steps(expr);
+                Ok(WalkControl::Continue)
+            })
+            .expect("reading WHERE terms cannot fail");
+            WhereTermInfo {
+                table_ids,
+                // FIXME: The row cost also includes one simple condition. Give row work
+                // and condition work separate costs so this does not need to subtract one.
+                extra_steps: steps.saturating_sub(1),
+            }
+        })
         .collect()
 }
 
-/// Collect table IDs from an expression that belong to the joined tables set.
-fn expr_table_ids_filtered(
-    expr: &Expr,
-    joined_ids: &HashSet<TableInternalId>,
-) -> HashSet<TableInternalId> {
-    let mut tables = HashSet::default();
-    let _ = walk_expr(expr, &mut |node| {
-        match node {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if joined_ids.contains(table) {
-                    tables.insert(*table);
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    tables
+fn ready_where_work(
+    where_clause: &[WhereTerm],
+    where_terms: &[WhereTermInfo],
+    join_order: &[JoinOrderMember],
+    subqueries: &[NonFromClauseSubquery],
+    table_references: &TableReferences,
+) -> SmallVec<[(usize, usize); 4]> {
+    let loop_idx = join_order.len() - 1;
+    where_clause
+        .iter()
+        .zip(where_terms)
+        .enumerate()
+        .filter_map(|(term_idx, (term, info))| {
+            (info.extra_steps > 0
+                && term.should_eval_at_loop(
+                    loop_idx,
+                    join_order,
+                    subqueries,
+                    Some(table_references),
+                ))
+            .then_some((term_idx, info.extra_steps))
+        })
+        .collect()
 }
 
 /// Iterator that generates all possible size k bitmasks for a given number of tables.
@@ -2144,7 +2189,10 @@ mod tests {
         translate::{
             optimizer::{
                 access_method::AccessMethodParams,
-                constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
+                constraints::{
+                    automatic_index_terms, constraints_from_where_clause, BinaryExprSide,
+                    RangeConstraintRef,
+                },
                 cost_params::DEFAULT_PARAMS,
             },
             plan::{
@@ -2162,6 +2210,111 @@ mod tests {
 
     fn empty_schema() -> Schema {
         Schema::default()
+    }
+
+    fn single_table_plan_cost(where_expr: Expr) -> Cost {
+        let table =
+            _create_btree_table("test_table", _create_column_list(&["value"], Type::Integer));
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![_create_table_reference(
+            table,
+            None,
+            table_id_counter.next(),
+        )];
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let mut where_clause = vec![WhereTerm::from(where_expr)];
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        let mut access_methods = Vec::new();
+        let base_rows = default_base_rows(1);
+        let schema = empty_schema();
+        compute_best_join_order(
+            table_references.joined_tables(),
+            1.0,
+            None,
+            &constraints,
+            &base_rows,
+            &mut access_methods,
+            &mut where_clause,
+            &[],
+            &[],
+            &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
+        )
+        .unwrap()
+        .unwrap()
+        .best_plan
+        .cost
+    }
+
+    #[test]
+    fn automatic_index_puts_equalities_before_ranges() {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let outer = _create_table_reference(
+            _create_btree_table("outer_rows", _create_column_list(&["k"], Type::Integer)),
+            None,
+            table_id_counter.next(),
+        );
+        let inner = _create_table_reference(
+            _create_btree_table(
+                "inner_rows",
+                _create_column_list(&["x", "k"], Type::Integer),
+            ),
+            Some(JoinInfo {
+                join_type: JoinType::Inner,
+                using: vec![],
+                no_reorder: false,
+            }),
+            table_id_counter.next(),
+        );
+        let inner_id = inner.internal_id;
+        let outer_id = outer.internal_id;
+        let table_references = TableReferences::new(vec![outer, inner], vec![]);
+        let where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(inner_id, 0, false),
+                Operator::Greater,
+                _create_numeric_literal("10"),
+            ),
+            _create_binary_expr(
+                _create_column_expr(inner_id, 1, false),
+                Operator::Equals,
+                _create_column_expr(outer_id, 0, false),
+            ),
+        ];
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &AvailableIndexes::default(),
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+
+        let terms = automatic_index_terms(&table_references.joined_tables()[1], &constraints[1]);
+        let operators: Vec<_> = terms
+            .iter()
+            .map(|term| {
+                constraints[1].constraints[term.constraint_vec_pos]
+                    .operator
+                    .as_ast_operator()
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(operators, vec![Operator::Equals, Operator::Greater]);
     }
 
     #[test]
@@ -2238,6 +2391,29 @@ mod tests {
         );
 
         assert!(composite_score > single_col_score);
+    }
+
+    #[test]
+    fn plan_cost_counts_long_where_condition() {
+        let table_id = TableInternalId::default();
+        let check = |value| {
+            Expr::Binary(
+                Box::new(_create_column_expr(table_id, 0, false)),
+                Operator::Equals,
+                Box::new(_create_numeric_literal(value)),
+            )
+        };
+        let simple_cost = single_table_plan_cost(check("1"));
+        let long_cost = single_table_plan_cost(Expr::Binary(
+            Box::new(check("1")),
+            Operator::Or,
+            Box::new(check("2")),
+        ));
+
+        assert!(
+            long_cost > simple_cost,
+            "simple cost: {simple_cost:?}, long cost: {long_cost:?}"
+        );
     }
 
     #[test]
@@ -3785,5 +3961,58 @@ mod tests {
             }
             _ => panic!("Unexpected access method for t2"),
         }
+    }
+
+    #[test]
+    fn hash_join_uses_estimated_matches_for_row_count() {
+        let t1 = _create_btree_table("t1", _create_column_list(&["value"], Type::Integer));
+        let mut t2 = _create_btree_table("t2", _create_column_list(&["value"], Type::Integer));
+        Arc::get_mut(&mut t2).unwrap().root_page = 2;
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(
+                t2,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                    no_reorder: false,
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+        let mut where_clause = vec![_create_binary_expr(
+            _create_column_expr(joined_tables[0].internal_id, 0, false),
+            Operator::Equals,
+            _create_column_expr(joined_tables[1].internal_id, 0, false),
+        )];
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        let method = try_hash_join_access_method(
+            &table_references.joined_tables()[0],
+            &table_references.joined_tables()[1],
+            0,
+            1,
+            &constraints[0],
+            &constraints[1],
+            &mut where_clause,
+            1_000.0,
+            1_000.0,
+            1.0,
+            &[],
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+
+        assert!(method.estimated_rows_per_outer_row < 1_000.0);
     }
 }
