@@ -1,0 +1,97 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# A materialized view whose source is another materialized view must see base
+# table changes. The maintenance cascade only walked one level out from the
+# changed table, so views chained on top of another view never got a delta.
+
+test matview-chain-depth2-insert {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW mv1 AS SELECT a, b FROM t;
+    CREATE MATERIALIZED VIEW mv2 AS SELECT b FROM mv1;
+    INSERT INTO t VALUES (3, 30);
+    SELECT * FROM mv1 ORDER BY a;
+    SELECT * FROM mv2 ORDER BY b;
+}
+expect {
+    1|10
+    2|20
+    3|30
+    10
+    20
+    30
+}
+
+test matview-chain-depth3-insert {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW mv1 AS SELECT a, b FROM t;
+    CREATE MATERIALIZED VIEW mv2 AS SELECT b FROM mv1;
+    CREATE MATERIALIZED VIEW mv3 AS SELECT b * 2 AS bb FROM mv2;
+    INSERT INTO t VALUES (3, 30);
+    SELECT * FROM mv2 ORDER BY b;
+    SELECT * FROM mv3 ORDER BY bb;
+}
+expect {
+    10
+    20
+    30
+    20
+    40
+    60
+}
+
+test matview-chain-delete-and-update {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    CREATE MATERIALIZED VIEW mv1 AS SELECT a, b FROM t;
+    CREATE MATERIALIZED VIEW mv2 AS SELECT b FROM mv1;
+    CREATE MATERIALIZED VIEW mv3 AS SELECT b * 2 AS bb FROM mv2;
+    DELETE FROM t WHERE a = 1;
+    SELECT * FROM mv2 ORDER BY b;
+    SELECT * FROM mv3 ORDER BY bb;
+    UPDATE t SET b = 99 WHERE a = 2;
+    SELECT * FROM mv2 ORDER BY b;
+    SELECT * FROM mv3 ORDER BY bb;
+}
+expect {
+    20
+    30
+    40
+    60
+    30
+    99
+    60
+    198
+}
+
+test matview-chain-aggregate-on-view {
+    CREATE TABLE s(g TEXT, v INTEGER);
+    INSERT INTO s VALUES ('a', 1), ('a', 2), ('b', 5);
+    CREATE MATERIALIZED VIEW base AS SELECT g, v FROM s WHERE v > 0;
+    CREATE MATERIALIZED VIEW agg AS SELECT g, count(*) AS n FROM base GROUP BY g;
+    INSERT INTO s VALUES ('a', 10), ('c', 7);
+    SELECT * FROM agg ORDER BY g;
+}
+expect {
+    a|3
+    b|1
+    c|1
+}
+
+test matview-chain-insert-inside-explicit-transaction {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 10);
+    CREATE MATERIALIZED VIEW mv1 AS SELECT a, b FROM t;
+    CREATE MATERIALIZED VIEW mv2 AS SELECT b FROM mv1;
+    BEGIN;
+    INSERT INTO t VALUES (2, 20);
+    COMMIT;
+    SELECT * FROM mv2 ORDER BY b;
+}
+expect {
+    10
+    20
+}
