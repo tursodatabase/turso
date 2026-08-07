@@ -652,7 +652,8 @@ pub trait Wal: Debug + Send + Sync {
     /// Find the latest frame containing a page.
     ///
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
-    /// caller must guarantee, that frame_watermark must be greater than last checkpointed frame, otherwise method will panic
+    /// frame_watermark must be within [last checkpointed frame, max_frame], otherwise method returns an error
+    /// (frames below the checkpointed prefix are already in the DB file, so the WAL cannot serve that position)
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL.
@@ -3485,21 +3486,26 @@ impl Wal for WalFile {
             "unexpected use of frame_watermark optional argument"
         );
 
-        turso_assert!(
-            frame_watermark.unwrap_or(0) <= self.max_frame.load(Ordering::Acquire),
-            "frame_watermark must be <= than current WAL max_frame value"
-        );
+        // frame_watermark comes from the caller (raw connection API), so treat
+        // an out-of-range value as bad input, not a broken internal invariant.
+        let max_frame = self.max_frame.load(Ordering::Acquire);
+        if frame_watermark.unwrap_or(0) > max_frame {
+            return Err(LimboError::InvalidArgument(format!(
+                "frame_watermark {frame_watermark:?} is beyond the current WAL max_frame {max_frame}"
+            )));
+        }
 
         // we can guarantee correctness of the method, only if frame_watermark is strictly after the current checkpointed prefix
         //
         // if it's not, than pages from WAL range [frame_watermark..nBackfill] are already in the DB file,
-        // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page
+        // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page:
+        // the DB file may already hold a newer version of the page than the watermark allows
         let nbackfills = self.load_coordination_snapshot().nbackfills;
-        turso_assert!(
-            frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
-            "frame_watermark must be >= than current WAL backfill amount",
-            { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
-        );
+        if frame_watermark.is_some_and(|watermark| watermark < nbackfills) {
+            return Err(LimboError::InvalidArgument(format!(
+                "frame_watermark {frame_watermark:?} is below the WAL backfill amount {nbackfills}: those frames were checkpointed into the DB file and can no longer be read at this position"
+            )));
+        }
 
         // if we are holding read_lock 0 and didn't write anything to the WAL, skip and read right from db file.
         //
