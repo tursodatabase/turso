@@ -1361,6 +1361,54 @@ impl TableReferences {
         &mut self.joined_tables
     }
 
+    /// Whether an outer join in the FROM list can give this table's columns
+    /// NULLs ("null-extend" it).
+    ///
+    /// The right-hand table of a LEFT or FULL JOIN — the table that carries
+    /// the `join_info` — gets NULLs when a left-side row has no match. A FULL
+    /// JOIN *also* gives NULLs to every table on its left side when a
+    /// right-side row has no match, and those tables carry no `join_info` of
+    /// their own, so checking only `table.join_info` misses them. (This is
+    /// SQLite's `JT_LTORJ` bit.)
+    pub fn outer_join_may_null_extend(&self, table: TableInternalId) -> bool {
+        let Some(pos) = self
+            .joined_tables
+            .iter()
+            .position(|t| t.internal_id == table)
+        else {
+            return false;
+        };
+        if self.joined_tables[pos]
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_outer)
+        {
+            return true;
+        }
+        self.joined_tables[pos + 1..]
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
+    }
+
+    /// Like [Self::outer_join_may_null_extend], but true only when the
+    /// null extension comes from a FULL JOIN. Matters because the two join
+    /// kinds emit their null-extended rows differently: a LEFT JOIN re-checks
+    /// consumed WHERE terms when it emits the null-extended row, while a FULL
+    /// JOIN synthesizes its extra rows by jumping past the scan entirely, so a
+    /// consumed term is never checked against them.
+    pub fn full_join_may_null_extend(&self, table: TableInternalId) -> bool {
+        let Some(pos) = self
+            .joined_tables
+            .iter()
+            .position(|t| t.internal_id == table)
+        else {
+            return false;
+        };
+        self.joined_tables[pos..]
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
+    }
+
     /// Resets the expression index usages for all joined tables.
     pub fn reset_expression_index_usages(&mut self) {
         for table in self.joined_tables.iter_mut() {

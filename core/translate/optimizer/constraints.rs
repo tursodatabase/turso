@@ -541,25 +541,37 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
-                // `IS` is the one seek-usable operator that can be TRUE for a
-                // null-extended row (`e.id IS NULL`). Such a WHERE term must not
-                // constrain the loop of an outer join's RHS table: filtering the
-                // RHS by it removes the very rows whose absence produces the null
-                // extension, so an antijoin would report every LHS row as
-                // unmatched. Terms from that join's own ON clause are fine, since
-                // they define what counts as a match.
-                let usable = !matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
-                    || !table_reference
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|join| join.is_outer())
-                    || term.from_outer_join == Some(table_reference.internal_id);
+                // A WHERE term must not constrain the loop of a table that an
+                // outer join can null-extend, with two exceptions below.
+                // Consuming the term into the access path filters that table's
+                // rows, which changes which rows of the other side count as
+                // unmatched — and the join then emits null-extended rows the
+                // consumed term is never checked against.
+                //
+                // Exception 1: terms from that join's own ON clause define what
+                // counts as a match, so they are always fine.
+                //
+                // Exception 2: on the right side of a plain LEFT JOIN, the
+                // engine re-checks consumed terms when it emits the
+                // null-extended row, so any operator except `IS` stays usable
+                // there: such terms are never TRUE on a null-extended row, so
+                // the re-check removes the bogus rows. `IS` (e.g. `e.id IS
+                // NULL`) *is* TRUE on the null-extended row, so no re-check can
+                // repair it — it is unusable for every null-extendable table.
+                // A FULL JOIN synthesizes its extra rows by jumping past the
+                // scan with no re-check, so nothing is usable for any table a
+                // FULL JOIN can null-extend.
+                let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
+                let usable = term.from_outer_join == Some(table_reference.internal_id)
+                    || if is_op {
+                        !table_references.outer_join_may_null_extend(table_reference.internal_id)
+                    } else {
+                        !table_references.full_join_may_null_extend(table_reference.internal_id)
+                    };
                 // See [Constraint::null_matching]. The constraining value sits
                 // on the opposite side of the constrained column.
-                let null_matching = |constraining_expr: &ast::Expr| {
-                    matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
-                        && !is_non_null_literal(constraining_expr)
-                };
+                let null_matching =
+                    |constraining_expr: &ast::Expr| is_op && !is_non_null_literal(constraining_expr);
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
