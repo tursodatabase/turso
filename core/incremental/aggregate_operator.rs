@@ -1630,7 +1630,7 @@ impl AggregateOperator {
             // Generate synthetic rowid for this group
             let result_key = self.generate_group_rowid(group_key_str);
 
-            // Always store the state for persistence (even if count=0, we need to delete it)
+            // Always store the state: count=0 means deletion only for non-implicit groups.
             final_states.insert(group_key_str.clone(), (group_key.clone(), state.clone()));
 
             // Seeded, untouched by the delta, already materialized: nothing to emit.
