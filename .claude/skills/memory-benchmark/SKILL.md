@@ -110,7 +110,7 @@ cargo run --release -p memory-benchmark -- --mode mvcc --workload insert-heavy -
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
-  --workload insert-heavy|read-heavy|mixed|scan-heavy|recursive-cte|series-blob|update-churn \
+  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob|recursive-cte|update-churn|fts-query-churn|fts-update-churn \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
@@ -141,8 +141,11 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `recursive-cte` | Repeated linear, priority-queue, UNION-distinct, and outer-LIMIT recursive CTE queries | No schema setup; `batch-size` is the target recursive result cardinality |
 | `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
 | `update-churn` | Repeated UPDATEs to a fixed 10k-row set (key space partitioned per connection to avoid write-write conflicts) | Seeds 10k rows. Generates superseded versions — the MVCC GC accumulation case. |
+| `fts-query-churn` | Repeated full-text queries from one or more connections against the same immutable index | Seeds one 2k-row table and FTS index. Exposes reader/cache multiplication. |
+| `fts-update-churn` | Repeated updates of a bounded FTS document set | Seeds one 2k-row table and FTS index per connection. Separate indexes honor the single-writer-per-index contract while permitting concurrent churn. |
 
 Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`.
+The workload engine enables experimental index methods for every profile.
 
 ## Understanding the Output
 
@@ -251,8 +254,8 @@ When `--connections > 1`:
 journal modes with CodSpeed's memory instrument (eBPF-based malloc tracking:
 peak memory, total allocated, allocation count) so allocation regressions show
 up on PRs. The bench harness is the separate crate `perf/memory/codspeed/`
-(criterion benchmarks named `<mode>/<workload>/<total-ops>`, e.g.
-`mvcc/insert-heavy/2000`, with much smaller iteration counts than the CLI
+(criterion benchmarks named `<mode>/<workload>/<connections>-connections/<total-ops>`,
+e.g. `mvcc/insert-heavy/1-connections/2000`, with much smaller iteration counts than the CLI
 defaults). Each (mode, workload) pair runs at 1x/2x/4x scale — same batch
 size, more iterations — so comparing the sizes shows how memory grows with
 workload volume, plus an 8x `<ops>-checkpoint` variant that guarantees

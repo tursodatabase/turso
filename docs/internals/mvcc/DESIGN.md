@@ -1,5 +1,8 @@
 # Design
 
+See [MVCC index methods](INDEX_METHOD.md) for the custom-index transaction,
+storage, cache, and conflict contract.
+
 ## Persistent storage
 
 Persistent storage must implement the `Storage` trait that the MVCC module uses for transaction logging.

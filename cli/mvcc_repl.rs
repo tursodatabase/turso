@@ -39,7 +39,11 @@ use rustyline::DefaultEditor;
 use std::{collections::HashMap, sync::Arc};
 use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, SqliteDialect, Value};
 
-pub fn run(path: &str, passive_checkpoint: bool) -> anyhow::Result<()> {
+pub fn run(
+    path: &str,
+    passive_checkpoint: bool,
+    experimental_index_method: bool,
+) -> anyhow::Result<()> {
     let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if interactive_stdin {
         println!("MVCC REPL");
@@ -48,7 +52,7 @@ pub fn run(path: &str, passive_checkpoint: bool) -> anyhow::Result<()> {
         println!();
     }
 
-    let db = open_mvcc_db(path, passive_checkpoint)?;
+    let db = open_mvcc_db(path, passive_checkpoint, experimental_index_method)?;
     let mut connections: HashMap<String, Arc<Connection>> = HashMap::new();
     let mut rl = DefaultEditor::new()?;
 
@@ -90,12 +94,18 @@ pub fn run(path: &str, passive_checkpoint: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn open_mvcc_db(path: &str, passive_checkpoint: bool) -> anyhow::Result<Arc<Database>> {
+fn open_mvcc_db(
+    path: &str,
+    passive_checkpoint: bool,
+    experimental_index_method: bool,
+) -> anyhow::Result<Arc<Database>> {
     let (_, db) = Database::open_new::<&str>(
         path,
         None,
         OpenFlags::default(),
-        DatabaseOpts::default().with_experimental_mvcc_passive_checkpoint(passive_checkpoint),
+        DatabaseOpts::default()
+            .with_experimental_mvcc_passive_checkpoint(passive_checkpoint)
+            .with_index_method(experimental_index_method),
         None,
         Arc::new(SqliteDialect),
     )
@@ -159,5 +169,20 @@ fn fmt_value(v: &Value) -> String {
         }
         Value::Text(s) => s.to_string(),
         Value::Blob(b) => format!("<blob {} bytes>", b.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_mvcc_db;
+
+    #[test]
+    fn experimental_index_methods_are_available_in_mvcc_repl() {
+        let db = open_mvcc_db(":memory:", false, true).unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE docs(body TEXT)").unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
     }
 }

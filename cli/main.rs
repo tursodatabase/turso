@@ -69,7 +69,11 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|p| p.to_str())
                 .unwrap_or(":memory:")
                 .to_owned();
-            return mvcc_repl::run(&path, opts.experimental_mvcc_passive_checkpoint);
+            return mvcc_repl::run(
+                &path,
+                opts.experimental_mvcc_passive_checkpoint,
+                opts.experimental_index_method,
+            );
         }
     }
 

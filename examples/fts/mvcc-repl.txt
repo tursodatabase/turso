@@ -1,0 +1,13 @@
+conn1 CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT);
+conn1 CREATE INDEX docs_fts ON docs USING fts(body);
+conn1 BEGIN CONCURRENT;
+conn2 BEGIN CONCURRENT;
+conn1 INSERT INTO docs VALUES (1, 'writer one');
+conn2 INSERT INTO docs VALUES (2, 'writer two');
+conn1 COMMIT;
+conn2 BEGIN CONCURRENT;
+conn2 INSERT INTO docs VALUES (2, 'writer two retry');
+conn2 COMMIT;
+conn1 SELECT id, body FROM docs ORDER BY id;
+conn2 SELECT id FROM docs WHERE body MATCH 'writer' ORDER BY id;
+.quit
