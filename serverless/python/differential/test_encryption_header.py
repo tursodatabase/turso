@@ -22,7 +22,6 @@ from pathlib import Path
 import hypothesis.strategies as st
 import pytest
 from hypothesis import given, settings
-
 from turso_serverless import connect
 from turso_serverless.session import ENCRYPTION_KEY_HEADER
 
