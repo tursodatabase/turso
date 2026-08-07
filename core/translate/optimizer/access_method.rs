@@ -717,6 +717,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
     where_clause: &[WhereTerm],
+    where_term_masks: &[TableMask],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -733,6 +734,7 @@ pub fn find_best_access_method_for_join_order(
             join_order,
             planning_context.maybe_order_target,
             where_clause,
+            where_term_masks,
             available_indexes,
             table_references,
             subqueries,
@@ -787,6 +789,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     where_clause: &[WhereTerm],
+    where_term_masks: &[TableMask],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -914,6 +917,7 @@ fn find_best_access_method_for_btree(
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table,
             where_clause,
+            where_term_masks,
             available_indexes,
             table_references,
             subqueries,
@@ -931,6 +935,7 @@ fn find_best_access_method_for_btree(
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
             rhs_table,
             where_clause,
+            where_term_masks,
             available_indexes,
             table_references,
             subqueries,
@@ -1010,26 +1015,26 @@ fn collect_table_refs(expr: &ast::Expr) -> Option<Vec<TableInternalId>> {
     result.ok().map(|_| tables)
 }
 
-/// Detect equi-join conditions between exactly two tables for hash join.
-///
-/// Returns `HashJoinKey` entries pointing at `WHERE` terms of the form:
-///   <build-only expr> = <probe-only expr>
-/// or
-///   <probe-only expr> = <build-only expr>
+/// A WHERE term of the form `<one-table expr> = <one-table expr>` between two
+/// different tables — the only shape usable as a hash-join key.
+#[derive(Debug, Clone, Copy)]
+pub struct EquijoinCandidate {
+    where_clause_idx: usize,
+    lhs_table: TableInternalId,
+    rhs_table: TableInternalId,
+}
+
+/// Collect every WHERE term usable as a hash-join key.
 ///
 /// Both sides may be arbitrary expressions (e.g. `lower(t1.a) = substr(t2.b,1,3)`),
-/// but each side must reference columns from exactly one table:
-/// - the build side must reference only `build_table_id`
-/// - the probe side must reference only `probe_table_id`
+/// but each side must reference columns from exactly one table. Constants and
+/// multi-table expressions are rejected.
 ///
-/// This function does *not* mark any terms as consumed; the caller is responsible
-/// for doing so if a hash join is selected.
-pub fn find_equijoin_conditions(
-    build_table_id: TableInternalId,
-    probe_table_id: TableInternalId,
-    where_clause: &[WhereTerm],
-) -> Vec<HashJoinKey> {
-    let mut join_keys = Vec::new();
+/// Join enumeration evaluates many (build, probe) table pairs against the same
+/// WHERE clause, so the terms are classified once here and
+/// [find_equijoin_conditions] then only matches table IDs per pair.
+pub fn collect_equijoin_candidates(where_clause: &[WhereTerm]) -> Vec<EquijoinCandidate> {
+    let mut candidates = Vec::new();
 
     for (where_idx, where_term) in where_clause.iter().enumerate() {
         if where_term.consumed {
@@ -1050,19 +1055,46 @@ pub fn find_equijoin_conditions(
             continue;
         };
 
-        // Require each side to reference exactly one table. This prevents
-        // constants or multi-table expressions from being considered join keys.
         if lhs_tables.len() != 1 || rhs_tables.len() != 1 {
             continue;
         }
 
-        let lhs_tid = lhs_tables[0];
-        let rhs_tid = rhs_tables[0];
+        candidates.push(EquijoinCandidate {
+            where_clause_idx: where_idx,
+            lhs_table: lhs_tables[0],
+            rhs_table: rhs_tables[0],
+        });
+    }
 
+    candidates
+}
+
+/// Detect equi-join conditions between exactly two tables for hash join.
+///
+/// Returns `HashJoinKey` entries pointing at `WHERE` terms of the form:
+///   <build-only expr> = <probe-only expr>
+/// or
+///   <probe-only expr> = <build-only expr>
+///
+/// `candidates` comes from [collect_equijoin_candidates] on the same WHERE
+/// clause the returned indexes refer to.
+///
+/// This function does *not* mark any terms as consumed; the caller is responsible
+/// for doing so if a hash join is selected.
+pub fn find_equijoin_conditions(
+    build_table_id: TableInternalId,
+    probe_table_id: TableInternalId,
+    candidates: &[EquijoinCandidate],
+) -> Vec<HashJoinKey> {
+    let mut join_keys = Vec::new();
+
+    for candidate in candidates {
         // Accept either orientation: build=probe or probe=build.
-        let build_side = if lhs_tid == build_table_id && rhs_tid == probe_table_id {
+        let build_side = if candidate.lhs_table == build_table_id
+            && candidate.rhs_table == probe_table_id
+        {
             Some(BinaryExprSide::Lhs)
-        } else if rhs_tid == build_table_id && lhs_tid == probe_table_id {
+        } else if candidate.rhs_table == build_table_id && candidate.lhs_table == probe_table_id {
             Some(BinaryExprSide::Rhs)
         } else {
             None
@@ -1070,7 +1102,7 @@ pub fn find_equijoin_conditions(
 
         if let Some(build_side) = build_side {
             join_keys.push(HashJoinKey {
-                where_clause_idx: where_idx,
+                where_clause_idx: candidate.where_clause_idx,
                 build_side,
             });
         }
@@ -1145,7 +1177,8 @@ pub fn try_hash_join_access_method(
     probe_table_idx: usize,
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
+    equijoin_candidates: &[EquijoinCandidate],
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
@@ -1249,20 +1282,14 @@ pub fn try_hash_join_access_method(
         }
     }
 
+    // Each candidate side references exactly one table and the orientation
+    // match pins the probe side to `probe_table`, so no per-key re-validation
+    // of the probe expression is needed.
     let join_keys = find_equijoin_conditions(
         build_table.internal_id,
         probe_table.internal_id,
-        where_clause,
-    )
-    .into_iter()
-    .filter(|join_key| {
-        let probe_expr = join_key.get_probe_expr(where_clause);
-        let Some(probe_tables) = collect_table_refs(probe_expr) else {
-            return false;
-        };
-        probe_tables.len() == 1 && probe_tables[0] == probe_table.internal_id
-    })
-    .collect::<Vec<_>>();
+        equijoin_candidates,
+    );
     tracing::debug!(
         build_table = build_table.table.get_name(),
         probe_table = probe_table.table.get_name(),
