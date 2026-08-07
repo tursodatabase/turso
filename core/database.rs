@@ -332,12 +332,10 @@ pub enum OpenDbAsyncPhase {
     Done,
 }
 
-/// Sub state machine for [`Database::header_validation`], driven from
-/// [`OpenDbAsyncPhase::ValidatingHeader`]. Keeps WAL recovery on open
-/// non-blocking by yielding through its IO instead of `io.block`.
-/// Non-blocking read of the 512-byte database file header. Used by
-/// [`Database::init_pager`] to recover page size + reserved bytes without
-/// blocking on open.
+/// Sub state machine for [`Database::read_db_header_buf`], the non-blocking
+/// read of the 512-byte database header. Not an open phase: it is driven
+/// from connect-time pager init ([`Database::_init`] via `init_pager`), which
+/// runs outside the open state machine.
 #[derive(Default)]
 pub(crate) enum DbHeaderReadState {
     #[default]
@@ -394,6 +392,11 @@ enum HeaderValidationState {
         pager: Box<Pager>,
         open_mv_store: bool,
         driver: Option<storage::wal::OpenSharedWal>,
+        /// Set once the WAL of an empty database file has been thrown away
+        /// (see the orphan-WAL handling in [`Database::header_validation`]).
+        /// The WAL is reopened after that, and the reopened WAL must come
+        /// back empty, so this can only ever happen once per open.
+        discarded_orphan_wal: bool,
     },
 }
 
@@ -1988,6 +1991,7 @@ impl Database {
                             pager,
                             open_mv_store,
                             driver: None,
+                            discarded_orphan_wal: false,
                         }
                     };
                 }
@@ -2016,16 +2020,18 @@ impl Database {
                         pager,
                         open_mv_store,
                         driver: None,
+                        discarded_orphan_wal: false,
                     };
                 }
                 HeaderValidationState::OpenWal {
                     open_mv_store,
                     driver,
+                    discarded_orphan_wal,
                     ..
                 } => {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
-                    let shared_wal = {
+                    let mut shared_wal = {
                         #[cfg(not(host_shared_wal))]
                         {
                             if driver.is_none() {
@@ -2070,6 +2076,52 @@ impl Database {
                             }
                         }
                     };
+
+                    // A WAL never belongs to a database file with zero pages:
+                    // `Pager::allocate_page1` fsyncs page 1 to the main file
+                    // before any commit can fsync WAL frames, so no crash of
+                    // ours leaves frames next to an empty database file. When
+                    // that pair shows up anyway, the database file was deleted
+                    // (a common way to reset a database is to remove the `.db`
+                    // and forget the `-wal`) or the image predates the page-1
+                    // fsync. Either way the frames describe a database that no
+                    // longer exists: replaying them would splice a dead
+                    // database's pages into this one as soon as it grows past
+                    // zero pages.
+                    //
+                    // Throw the orphan WAL away and open the database empty,
+                    // which is what SQLite does — `pagerOpenWalIfPresent()`
+                    // deletes a WAL it finds next to a zero-page database —
+                    // and what upstream tests expect.
+                    if shared_wal.read().last_checksum_and_max_frame().1 > 0
+                        && self.db_file.size()? == 0
+                    {
+                        turso_assert!(
+                            !*discarded_orphan_wal,
+                            "orphan WAL reopened with frames after being discarded"
+                        );
+                        *discarded_orphan_wal = true;
+                        tracing::warn!(
+                            "discarding WAL '{}': it holds frames but database file '{}' has no pages, so the WAL does not belong to it",
+                            self.wal_path,
+                            self.path
+                        );
+                        if self.open_flags.contains(OpenFlags::ReadOnly) {
+                            // A read-only open must not delete files, so just
+                            // detach the WAL. This is the same state a
+                            // read-only open reaches when there is no WAL file
+                            // at all.
+                            shared_wal = WalFileShared::new_noop();
+                        } else {
+                            drop(shared_wal);
+                            *driver = None;
+                            self.io.remove_file(&self.wal_path)?;
+                            // Reopen the (now absent) WAL: `open_file` recreates
+                            // it empty and recovery of a WAL shorter than its
+                            // header finishes without any IO.
+                            continue;
+                        }
+                    }
 
                     let open_mv_store = *open_mv_store;
                     let HeaderValidationState::OpenWal { mut pager, .. } = std::mem::take(st)
@@ -2358,8 +2410,6 @@ impl Database {
         self.open_flags.contains(OpenFlags::ReadOnly)
     }
 
-    /// If we do not have a physical WAL file, but we know the database file is initialized on disk,
-    /// we need to read the page_size from the database header.
     /// Non-blocking read of the 512-byte database file header (page 1's
     /// header region). Yields the read completion via the supplied state until
     /// it finishes, then returns the filled buffer.

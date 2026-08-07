@@ -268,18 +268,32 @@ fn test_attach_rejects_fresh_read_only_database(_tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+/// A WAL holding frames next to a database file with zero pages does not
+/// belong to it: page 1 reaches the main file before the first WAL commit, so
+/// this pair only shows up when the database file was deleted or truncated
+/// and the `-wal` was left behind. Attaching such a file discards the WAL and
+/// attaches an empty database, the same thing SQLite's
+/// `pagerOpenWalIfPresent()` does when it finds a WAL next to a zero-page
+/// database.
 #[turso_macros::test]
-fn test_attach_rejects_zero_byte_database_with_existing_wal(
+fn test_attach_discards_orphan_wal_of_zero_byte_database(
     _tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let temp_dir = TempDir::new()?;
+    let source_path = temp_dir.path().join("wal_backed_source.db");
     let aux_path = temp_dir.path().join("wal_backed_aux.db");
     let wal_path = aux_path.with_extension("db-wal");
 
-    let sqlite = RusqliteConnection::open(&aux_path)?;
+    // Build the pair with SQLite and copy it aside while the WAL is still hot
+    // (SQLite checkpoints and removes the WAL when the connection closes), so
+    // the files under test have no open handles.
+    let sqlite = RusqliteConnection::open(&source_path)?;
     sqlite.pragma_update(None, "journal_mode", "WAL")?;
     sqlite.execute("CREATE TABLE t(x INTEGER)", ())?;
     sqlite.execute("INSERT INTO t VALUES (1)", ())?;
+    std::fs::copy(&source_path, &aux_path)?;
+    std::fs::copy(source_path.with_extension("db-wal"), &wal_path)?;
+    drop(sqlite);
 
     assert!(std::fs::metadata(&wal_path)?.len() > 0);
     std::fs::OpenOptions::new()
@@ -291,18 +305,21 @@ fn test_attach_rejects_zero_byte_database_with_existing_wal(
     let db = attach_enabled_db(DatabaseOpts::new());
     let conn = db.connect_limbo();
 
-    for attach_sql in [
-        format!("ATTACH '{}' AS aux", aux_path.display()),
-        format!("ATTACH 'file:{}?mode=ro' AS aux", aux_path.display()),
-    ] {
-        let err = conn.execute(attach_sql).unwrap_err().to_string();
-        assert_eq!(
-            err,
-            "Invalid argument supplied: cannot attach database 'aux': main database file is uninitialized but WAL state exists"
-        );
-    }
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM aux.sqlite_schema");
+    assert_eq!(
+        rows,
+        vec![vec![rusqlite::types::Value::Integer(0)]],
+        "the orphan WAL must not be replayed into the attached database"
+    );
+    // The orphan frames are gone for good: the WAL file is deleted and
+    // immediately recreated empty by the open that follows the deletion.
+    assert_eq!(
+        std::fs::metadata(&wal_path)?.len(),
+        0,
+        "the orphan frames must be gone so they cannot come back"
+    );
 
-    drop(sqlite);
     Ok(())
 }
 

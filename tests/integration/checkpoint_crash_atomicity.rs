@@ -231,11 +231,10 @@ fn full_commit_right_after_truncate_checkpoint_survives_power_loss() -> anyhow::
 /// has raised the WAL dirty flag yet, so before the fix the commit returned
 /// with all of its frames still unsynced.
 ///
-/// This asserts WAL durability only, not crash recovery: the database file
-/// itself is created by writes that are not fsynced before the commit is
-/// acknowledged, and a WAL sitting next to a zero-length database file is
-/// ignored on open (SQLite behaves the same). Closing that bootstrap gap is
-/// separate work; this test pins down the commit fsync.
+/// This asserts WAL durability only; end-to-end crash recovery before the
+/// first checkpoint (page 1 durable in the main file, committed data replayed
+/// from the WAL) is covered by `wal::test_power_loss_before_first_checkpoint`.
+/// This test pins down the commit fsync itself.
 #[test]
 fn first_full_commit_on_fresh_database_fsyncs_the_wal() -> anyhow::Result<()> {
     let db_path_sim = "first-full-commit-on-fresh-database.db";

@@ -2915,8 +2915,10 @@ mod tests {
 
         let before = io.counts();
         assert_eq!(
-            before.db, 0,
-            "target build with synchronous=OFF must not sync the destination db file before finalization"
+            before.db, 1,
+            "creating the database does exactly one db fsync (page 1 must be durable \
+             before the first WAL commit, even with synchronous=OFF); the target \
+             build must not add more before finalization"
         );
 
         finalize_vacuum_into_output(&VacuumTargetBuildContext::new(conn))?;
@@ -3044,8 +3046,10 @@ mod tests {
 
         let before = io.counts();
         assert_eq!(
-            before.db, 0,
-            "synchronous=OFF writes should not sync the source db file before VACUUM"
+            before.db, 1,
+            "creating the database does exactly one source db fsync (page 1 must be \
+             durable before the first WAL commit, even with synchronous=OFF); \
+             ordinary writes must not add more"
         );
 
         conn.execute("VACUUM")?;
