@@ -1427,7 +1427,26 @@ fn decode_recovery_ops_to_logical_txn(
 
     let mut ops = header_ops;
     append_schema_ops(schema_deltas, &mut ops)?;
-    ops.extend(row_ops);
+    // Every row delete in a transaction is applied before every row upsert.
+    //
+    // MVCC coalesces a transaction to one final version per rowid, and a row
+    // whose primary key changed arrives as a delete of its old key followed by
+    // an upsert of its new image. Applying those pairs row by row breaks as soon
+    // as two rows exchange keys inside one transaction: the second row's delete
+    // targets the key the first row's upsert just took, so it removes the row
+    // that was just written and the replica silently ends up one row short.
+    //
+    // Draining the deletes first applies the transaction as a set difference,
+    // which is also what lets both upserts land without tripping the unique
+    // index on an intermediate state — the remote needed a temporary key to make
+    // the same swap statement by statement. A rowid appears at most once per
+    // coalesced transaction, so no upsert can depend on a delete of its own row
+    // running later.
+    let (row_deletes, row_upserts): (Vec<_>, Vec<_>) = row_ops
+        .into_iter()
+        .partition(|op| op.op_type == LogicalOpType::DeleteRow as i32);
+    ops.extend(row_deletes);
+    ops.extend(row_upserts);
 
     Ok(LogicalTxnData {
         end_offset: portable_txn.end_offset,
@@ -3047,20 +3066,39 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                             .push(step(replay_info.query.clone(), convert_to_args(values)))
                     }
                     DatabaseTapeRowChangeType::Insert { after } => {
+                        if generator.upsert_needs_null_safe_predelete(&replay_info, after) {
+                            // ON CONFLICT cannot resolve a key with a NULL
+                            // component, so remove the remote row by its
+                            // NULL-safe identity before inserting the new image.
+                            let delete_info = generator
+                                .delete_query(ctx.coro, &change.table_name, false)
+                                .await?;
+                            let delete_values = generator.replay_delete_values(
+                                &delete_info,
+                                change.id,
+                                after.clone(),
+                                None,
+                            )?;
+                            sql_over_http_requests.push(step(
+                                delete_info.query.clone(),
+                                convert_to_args(delete_values),
+                            ));
+                        }
                         let values = generator.replay_values(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
                             after.clone(),
                             None,
+                            None,
                         );
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
                     }
                     DatabaseTapeRowChangeType::Update {
+                        before,
                         after,
                         updates: Some(updates),
-                        ..
                     } => {
                         let values = generator.replay_values(
                             &replay_info,
@@ -3068,6 +3106,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                             change.id,
                             after.clone(),
                             Some(updates.clone()),
+                            Some(before.clone()),
                         );
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
@@ -3082,6 +3121,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                             replay_info.change_type,
                             change.id,
                             after.clone(),
+                            None,
                             None,
                         );
                         sql_over_http_requests
@@ -4544,14 +4584,106 @@ mod tests {
         assert_eq!(txns[0].ops[0].op_type, LogicalOpType::Schema as i32);
         assert_eq!(txns[0].ops[0].schema_name, "t");
         assert_eq!(txns[0].ops[0].stable_table_id, 0);
-        assert_eq!(txns[0].ops[1].op_type, LogicalOpType::UpsertRow as i32);
+        // Row deletes are drained before row upserts, so the frame's
+        // upsert-then-delete order is inverted here on purpose.
+        assert_eq!(txns[0].ops[1].op_type, LogicalOpType::DeleteRow as i32);
         assert_eq!(txns[0].ops[1].table_name, "t");
         assert_eq!(txns[0].ops[1].rowid, 1);
-        assert_eq!(txns[0].ops[1].record, row_record);
-        assert_eq!(txns[0].ops[2].op_type, LogicalOpType::DeleteRow as i32);
+        assert_eq!(txns[0].ops[1].record, primary_key_record);
+        assert_eq!(txns[0].ops[2].op_type, LogicalOpType::UpsertRow as i32);
         assert_eq!(txns[0].ops[2].table_name, "t");
         assert_eq!(txns[0].ops[2].rowid, 1);
-        assert_eq!(txns[0].ops[2].record, primary_key_record);
+        assert_eq!(txns[0].ops[2].record, row_record);
+    }
+
+    /// A transaction that swaps the primary keys of two rows arrives as
+    /// interleaved (delete old key, upsert new image) pairs. Replaying it in that
+    /// order lets the second row's delete remove the row the first row's upsert
+    /// just wrote, so the decoder has to group all deletes ahead of all upserts.
+    #[test]
+    fn raw_mvcc_log_decoder_orders_row_deletes_before_upserts() {
+        let table_id = -42;
+        let text = turso_core::Value::build_text;
+        let first_new_image = record(&[text("b"), text("2"), text("left")]);
+        let second_new_image = record(&[text("a"), text("1"), text("right")]);
+        let first_old_key = record(&[text("a"), text("1")]);
+        let second_old_key = record(&[text("b"), text("2")]);
+
+        let portable_txn = super::PortableLogicalTxn {
+            end_offset: 104,
+            commit_ts: 77,
+            string_table: vec![Bytes::from_static(b"t")],
+            object_map: vec![super::PortableObjectMap {
+                mv_table_id: table_id,
+                name_ref: 0,
+            }],
+            meta: vec![],
+        };
+        let portable_payload = portable_txn.encode_length_delimited_to_vec();
+
+        // Exactly what the MVCC writer emits for
+        //   BEGIN;
+        //     UPDATE t SET x='tmp' WHERE x='a' AND y='1';
+        //     UPDATE t SET x='a', y='1' WHERE x='b' AND y='2';
+        //     UPDATE t SET x='b', y='2' WHERE x='tmp';
+        //   COMMIT;
+        // on `CREATE TABLE t(x, y, z, PRIMARY KEY (x, y))`: one delete+upsert
+        // pair per rowid, coalesced to the transaction's final image.
+        let mut recovery_payload = Vec::new();
+        append_test_table_delete(&mut recovery_payload, table_id, 1, &first_old_key);
+        append_test_table_upsert(&mut recovery_payload, table_id, 1, &first_new_image);
+        append_test_table_delete(&mut recovery_payload, table_id, 2, &second_old_key);
+        append_test_table_upsert(&mut recovery_payload, table_id, 2, &second_new_image);
+
+        let salt = 0x0123_4567_89ab_cdefu64;
+        let log_header = raw_mvcc_log_header(salt);
+        let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
+        let (frame, _) =
+            raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 4, initial_crc);
+        let end_offset = (log_header.len() + frame.len()) as u64;
+        let header = PullUpdatesRespProtoBody {
+            protocol: 0,
+            server_revision: format!("g1:o{end_offset}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: 0,
+                    end_offset,
+                    starts_with_header: true,
+                    crc_seed: None,
+                }],
+            }),
+        };
+        let mut body = log_header;
+        body.extend_from_slice(&frame);
+
+        let txns = decode_raw_mvcc_log_for_test(header, body).unwrap();
+        assert_eq!(txns.len(), 1);
+        let ops = &txns[0].ops;
+        assert_eq!(ops.len(), 4);
+        let kinds = ops.iter().map(|op| op.op_type).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                LogicalOpType::DeleteRow as i32,
+                LogicalOpType::DeleteRow as i32,
+                LogicalOpType::UpsertRow as i32,
+                LogicalOpType::UpsertRow as i32,
+            ],
+            "row deletes must precede row upserts"
+        );
+        // Order within each group is the frame's order.
+        assert_eq!(ops[0].record, first_old_key);
+        assert_eq!(ops[1].record, second_old_key);
+        assert_eq!(ops[2].record, first_new_image);
+        assert_eq!(ops[3].record, second_new_image);
     }
 
     #[test]

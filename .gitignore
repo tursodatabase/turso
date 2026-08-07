@@ -88,6 +88,7 @@ custom-types-fuzzer-output/
 CLAUDE.md
 bindings/python/dev.py
 bindings/python/implementation-test/
+bindings/javascript/wasi-sdk-*
 dhat-heap.json
 
 # Aristo runtime, cache, and per-user state: never commit these.

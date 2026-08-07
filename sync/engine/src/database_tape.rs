@@ -730,6 +730,27 @@ impl DatabaseReplaySession {
                                 "ready to use prepared insert statement for replay: key={:?}",
                                 key
                             );
+                            let needs_predelete = {
+                                let cached = self.cached_insert_stmt.get(&key).unwrap();
+                                self.generator
+                                    .upsert_needs_null_safe_predelete(&cached.info, &after)
+                            };
+                            if needs_predelete {
+                                // ON CONFLICT cannot resolve a key with a NULL
+                                // component, so remove the row by its NULL-safe
+                                // identity before inserting the new image.
+                                let delete_key =
+                                    self.populate_delete_stmt(coro, table, false).await?;
+                                let cached = self.cached_delete_stmt.get_mut(&delete_key).unwrap();
+                                cached.stmt.reset()?;
+                                let values = self.generator.replay_delete_values(
+                                    &cached.info,
+                                    change.id,
+                                    after.clone(),
+                                    None,
+                                )?;
+                                replay_stmt(coro, &mut cached.stmt, values).await?;
+                            }
                             let cached = self.cached_insert_stmt.get_mut(&key).unwrap();
                             cached.stmt.reset()?;
                             let values = self.generator.replay_values(
@@ -738,13 +759,14 @@ impl DatabaseReplaySession {
                                 change.id,
                                 after,
                                 None,
+                                None,
                             );
                             replay_stmt(coro, &mut cached.stmt, values).await?;
                         }
                         DatabaseTapeRowChangeType::Update {
+                            before,
                             after,
                             updates: Some(updates),
-                            ..
                         } => {
                             assert!(updates.len() % 2 == 0);
                             let columns_cnt = updates.len() / 2;
@@ -768,6 +790,7 @@ impl DatabaseReplaySession {
                                 change.id,
                                 after,
                                 Some(updates),
+                                Some(before),
                             );
                             replay_stmt(coro, &mut cached.stmt, values).await?;
                         }
@@ -804,6 +827,7 @@ impl DatabaseReplaySession {
                                 DatabaseChangeType::Insert,
                                 change.id,
                                 after,
+                                None,
                                 None,
                             );
                             replay_stmt(coro, &mut cached.stmt, values).await?;
@@ -3271,5 +3295,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// End state of a primary-key swap replayed as one logical transaction.
+    ///
+    /// The remote needed three statements and a temporary key to swap the keys of
+    /// two rows; the logical stream carries the coalesced result as a delete of
+    /// each row's old key plus an upsert of its new image. Replaying every delete
+    /// before every upsert is what keeps both rows: interleaved per-row order
+    /// would have the second delete remove the row the first upsert wrote.
+    #[test]
+    pub fn test_pk_swap_in_one_txn_replays_both_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x, y, z, PRIMARY KEY (x, y))")
+                    .unwrap();
+                conn.execute("INSERT INTO t VALUES ('a', '1', 'left'), ('b', '2', 'right')")
+                    .unwrap();
+
+                fn text(value: &str) -> turso_core::Value {
+                    turso_core::Value::Text(turso_core::types::Text::new(value.to_string()))
+                }
+                let key = |x: &str, y: &str| Some(turso_core::alloc::vec![text(x), text(y)]);
+                let image =
+                    |x: &str, y: &str, z: &str| turso_core::alloc::vec![text(x), text(y), text(z)];
+                let change = |id: i64, change: DatabaseTapeRowChangeType| DatabaseTapeRowChange {
+                    change_id: 0,
+                    change_time: 0,
+                    change,
+                    table_name: "t".to_string(),
+                    id,
+                };
+
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: true,
+                    };
+                    let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                    // Deletes first, then upserts — the order the decoder emits.
+                    for operation in [
+                        change(
+                            1,
+                            DatabaseTapeRowChangeType::Delete {
+                                before: turso_core::alloc::vec![],
+                                key: key("a", "1"),
+                            },
+                        ),
+                        change(
+                            2,
+                            DatabaseTapeRowChangeType::Delete {
+                                before: turso_core::alloc::vec![],
+                                key: key("b", "2"),
+                            },
+                        ),
+                        change(
+                            1,
+                            DatabaseTapeRowChangeType::Insert {
+                                after: image("b", "2", "left"),
+                            },
+                        ),
+                        change(
+                            2,
+                            DatabaseTapeRowChangeType::Insert {
+                                after: image("a", "1", "right"),
+                            },
+                        ),
+                    ] {
+                        session
+                            .replay(&coro, DatabaseTapeOperation::RowChange(operation))
+                            .await
+                            .unwrap();
+                    }
+                    session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+                }
+
+                let mut stmt = conn.prepare("SELECT x, y, z FROM t ORDER BY x, y").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(
+                        row.get_values()
+                            .map(|value| format!("{value}"))
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    );
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+
+        assert_eq!(
+            rows,
+            vec!["a|1|right".to_string(), "b|2|left".to_string()],
+            "the swap must keep both rows"
+        );
     }
 }
