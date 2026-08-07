@@ -241,13 +241,7 @@ impl<'a> Parser<'a> {
             }
             self.last_variable_id = self.last_variable_id.max(variable_id);
             let index = NonZeroU32::new(variable_id).unwrap();
-            // An explicit ?N carries "?N" as its name (sqlite3_bind_parameter_name
-            // returns it and bind_parameter_index resolves it); only a bare ? is
-            // anonymous.
-            Ok(Expr::Variable(Variable::named(
-                from_bytes_as_str(token),
-                index,
-            )))
+            Ok(Expr::Variable(Variable::indexed(index)))
         } else {
             debug_assert!(matches!(token[0], b':' | b'@' | b'$'));
             let index = if let Some(index) = self.named_variables.get(token).copied() {

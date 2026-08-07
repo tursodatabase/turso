@@ -24,7 +24,6 @@ void test_sqlite3_insert_returning();
 void test_sqlite3_set_authorizer();
 void test_sqlite3_db_config();
 void test_sqlite3_extended_result_codes();
-void test_sqlite3_sql_introspection();
 
 int allocated = 0;
 
@@ -48,7 +47,6 @@ int main(void)
     test_sqlite3_set_authorizer();
     test_sqlite3_db_config();
     test_sqlite3_extended_result_codes();
-    test_sqlite3_sql_introspection();
     return 0;
 }
 
@@ -969,101 +967,4 @@ void test_sqlite3_extended_result_codes()
 
     sqlite3_close(db);
     printf("test_sqlite3_extended_result_codes test passed\n");
-}
-
-/*
-** sqlite3_sql / sqlite3_expanded_sql / sqlite3_stmt_busy.
-** sqlite3_sql returns the original text, owned by the statement.
-** sqlite3_expanded_sql renders current bindings as SQL literals (NULL when
-** unbound), does not treat markers inside strings or comments as
-** parameters, and its buffer is released with sqlite3_free. Bindings
-** survive reset; clear_bindings reverts parameters to NULL.
-** sqlite3_stmt_busy is true after a step that returned a row, false before
-** any step, after SQLITE_DONE, and after reset.
-*/
-void test_sqlite3_sql_introspection()
-{
-    sqlite3 *db;
-    sqlite3_stmt *stmt;
-    char *expanded;
-    int rc;
-
-    rc = sqlite3_open(":memory:", &db);
-    assert(rc == SQLITE_OK);
-
-    const char *text = "SELECT ?1, :nm, ':nm' /* ? */, -- ?\n?";
-    rc = sqlite3_prepare_v2(db, text, -1, &stmt, NULL);
-    assert(rc == SQLITE_OK);
-
-    assert(strcmp(sqlite3_sql(stmt), text) == 0);
-
-    /* Nothing bound yet: every parameter renders as NULL. */
-    expanded = sqlite3_expanded_sql(stmt);
-    assert(expanded != NULL);
-    assert(strcmp(expanded, "SELECT NULL, NULL, ':nm' /* ? */, -- ?\nNULL") == 0);
-    sqlite3_free(expanded);
-
-    rc = sqlite3_bind_int64(stmt, 1, 42);
-    assert(rc == SQLITE_OK);
-    rc = sqlite3_bind_text(stmt, sqlite3_bind_parameter_index(stmt, ":nm"),
-                           "it's", -1, SQLITE_TRANSIENT);
-    assert(rc == SQLITE_OK);
-    rc = sqlite3_bind_double(stmt, 3, 3.5);
-    assert(rc == SQLITE_OK);
-
-    expanded = sqlite3_expanded_sql(stmt);
-    assert(expanded != NULL);
-    assert(strcmp(expanded, "SELECT 42, 'it''s', ':nm' /* ? */, -- ?\n3.5") == 0);
-    sqlite3_free(expanded);
-
-    /* Busy transitions around stepping. */
-    assert(sqlite3_stmt_busy(stmt) == 0);
-    rc = sqlite3_step(stmt);
-    assert(rc == SQLITE_ROW);
-    assert(sqlite3_stmt_busy(stmt) == 1);
-    rc = sqlite3_step(stmt);
-    assert(rc == SQLITE_DONE);
-    assert(sqlite3_stmt_busy(stmt) == 0);
-
-    /* Bindings survive reset... */
-    rc = sqlite3_reset(stmt);
-    assert(rc == SQLITE_OK);
-    assert(sqlite3_stmt_busy(stmt) == 0);
-    expanded = sqlite3_expanded_sql(stmt);
-    assert(expanded != NULL);
-    assert(strcmp(expanded, "SELECT 42, 'it''s', ':nm' /* ? */, -- ?\n3.5") == 0);
-    sqlite3_free(expanded);
-
-    /* ...and clear_bindings reverts them to NULL. */
-    rc = sqlite3_clear_bindings(stmt);
-    assert(rc == SQLITE_OK);
-    expanded = sqlite3_expanded_sql(stmt);
-    assert(expanded != NULL);
-    assert(strcmp(expanded, "SELECT NULL, NULL, ':nm' /* ? */, -- ?\nNULL") == 0);
-    sqlite3_free(expanded);
-    sqlite3_finalize(stmt);
-
-    /* Blob rendering, and busy after a reset taken mid-rows. */
-    rc = sqlite3_exec(db, "CREATE TABLE sq_t(a); INSERT INTO sq_t VALUES (1), (2)",
-                      NULL, NULL, NULL);
-    assert(rc == SQLITE_OK);
-    rc = sqlite3_prepare_v2(db, "SELECT a FROM sq_t WHERE ? IS x'0102'", -1, &stmt, NULL);
-    assert(rc == SQLITE_OK);
-    rc = sqlite3_bind_blob(stmt, 1, "\x01\x02", 2, SQLITE_TRANSIENT);
-    assert(rc == SQLITE_OK);
-    expanded = sqlite3_expanded_sql(stmt);
-    assert(expanded != NULL);
-    assert(strcmp(expanded, "SELECT a FROM sq_t WHERE x'0102' IS x'0102'") == 0);
-    sqlite3_free(expanded);
-
-    rc = sqlite3_step(stmt);
-    assert(rc == SQLITE_ROW);
-    assert(sqlite3_stmt_busy(stmt) == 1);
-    rc = sqlite3_reset(stmt);
-    assert(rc == SQLITE_OK);
-    assert(sqlite3_stmt_busy(stmt) == 0);
-    sqlite3_finalize(stmt);
-
-    sqlite3_close(db);
-    printf("test_sqlite3_sql_introspection test passed\n");
 }

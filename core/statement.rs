@@ -1265,51 +1265,6 @@ impl Statement {
         Ok(())
     }
 
-    /// Returns the SQL text with every parameter marker replaced by the
-    /// literal of its currently bound value (NULL when unbound), following
-    /// SQLite's sqlite3_expanded_sql rendering. The text is re-tokenized
-    /// with the lexer — whose token stream partitions the input, emitting
-    /// whitespace and comments as TK_NONE tokens carrying their bytes — so
-    /// string literals, quoted identifiers and comments are never mistaken
-    /// for markers. Each TK_VARIABLE token resolves to its bind index from
-    /// its own text: `?N` carries the number, named markers are looked up
-    /// in the parameter table (the same marker can occur several times),
-    /// and a bare `?` takes one more than the largest number assigned so
-    /// far, which is SQLite's numbering rule.
-    pub fn expanded_sql(&self) -> String {
-        let sql = self.get_sql();
-        let params = &self.program.parameters;
-        let mut out = String::with_capacity(sql.len());
-        let mut max_index = 0usize;
-        for token in turso_parser::lexer::Lexer::new(sql.as_bytes()) {
-            let Ok(token) = token else {
-                // The statement already parsed once, so re-lexing its text
-                // cannot fail; return the unexpanded SQL if it somehow does.
-                return sql.to_string();
-            };
-            if token.token_type == turso_parser::token::TokenType::TK_VARIABLE {
-                let text = String::from_utf8_lossy(token.value);
-                let index = if let Some(digits) = text.strip_prefix('?') {
-                    if digits.is_empty() {
-                        max_index + 1
-                    } else {
-                        digits.parse().unwrap_or(0)
-                    }
-                } else {
-                    params.index(text.as_ref()).map_or(0, |i| i.get())
-                };
-                max_index = max_index.max(index);
-                let value = NonZero::new(index)
-                    .map(|i| self.state.get_parameter(i))
-                    .unwrap_or(Value::Null);
-                append_expanded_literal(&mut out, &value);
-            } else {
-                out.push_str(&String::from_utf8_lossy(token.value));
-            }
-        }
-        out
-    }
-
     pub fn clear_bindings(&mut self) {
         self.state.clear_bindings();
     }
@@ -1551,40 +1506,6 @@ impl Statement {
     }
 }
 
-/// Appends `value` to `out` as a SQL literal, the way SQLite renders bound
-/// parameters into expanded SQL: NULL, decimal integers, floats, single-quoted
-/// text with embedded quotes doubled, and x'..' hex blobs.
-///
-/// This deliberately does not reuse Value::exec_quote: SQLite's quote() and
-/// its expanded-SQL rendering differ (quote() emits X'..' uppercase blobs and
-/// truncates text at an embedded NUL; expanded SQL emits x'..' lowercase).
-fn append_expanded_literal(out: &mut String, value: &Value) {
-    use std::fmt::Write;
-    match value {
-        Value::Null => out.push_str("NULL"),
-        Value::Text(t) => {
-            out.push('\'');
-            for ch in t.as_str().chars() {
-                if ch == '\'' {
-                    out.push('\'');
-                }
-                out.push(ch);
-            }
-            out.push('\'');
-        }
-        Value::Blob(b) => {
-            out.push_str("x'");
-            for byte in b.iter() {
-                let _ = write!(out, "{byte:02x}");
-            }
-            out.push('\'');
-        }
-        other => {
-            let _ = write!(out, "{other}");
-        }
-    }
-}
-
 impl Drop for Statement {
     fn drop(&mut self) {
         // Keep helper statements nested while drop-time reset/abort cleanup runs.
@@ -1616,55 +1537,6 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect()
-    }
-
-    #[test]
-    fn test_expanded_sql() {
-        let conn = open_test_connection().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT ?1, :nm, ':nm' /* ? */, -- ?\n?")
-            .unwrap();
-
-        // Unbound parameters render as NULL; markers inside string
-        // literals and comments are untouched.
-        assert_eq!(
-            stmt.expanded_sql(),
-            "SELECT NULL, NULL, ':nm' /* ? */, -- ?\nNULL"
-        );
-
-        stmt.bind_at(1.try_into().unwrap(), Value::from_i64(42))
-            .unwrap();
-        let nm = stmt.parameter_index(":nm").unwrap();
-        stmt.bind_at(nm, Value::build_text("it's")).unwrap();
-        stmt.bind_at(3.try_into().unwrap(), Value::from_blob(vec![1, 2]))
-            .unwrap();
-        assert_eq!(
-            stmt.expanded_sql(),
-            "SELECT 42, 'it''s', ':nm' /* ? */, -- ?\nx'0102'"
-        );
-
-        // Bindings survive reset; clear_bindings reverts them to NULL.
-        stmt.reset().unwrap();
-        assert_eq!(
-            stmt.expanded_sql(),
-            "SELECT 42, 'it''s', ':nm' /* ? */, -- ?\nx'0102'"
-        );
-        stmt.clear_bindings();
-        assert_eq!(
-            stmt.expanded_sql(),
-            "SELECT NULL, NULL, ':nm' /* ? */, -- ?\nNULL"
-        );
-
-        // A marker can occur several times and renders its value at every
-        // occurrence; a bare ? after ?2 takes index 3.
-        let mut stmt = conn.prepare("SELECT ?2, :a, ?2, ?").unwrap();
-        stmt.bind_at(2.try_into().unwrap(), Value::from_i64(7))
-            .unwrap();
-        stmt.bind_at(3.try_into().unwrap(), Value::build_text("x"))
-            .unwrap();
-        stmt.bind_at(4.try_into().unwrap(), Value::from_i64(9))
-            .unwrap();
-        assert_eq!(stmt.expanded_sql(), "SELECT 7, 'x', 7, 9");
     }
 
     #[test]

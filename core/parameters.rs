@@ -71,11 +71,14 @@ impl Parameters {
         self.present.contains(&index) && !self.index_to_name.contains_key(&index)
     }
 
-    /// The name of the parameter at `index`: the ":name"/"@name"/"$name"
-    /// text for named parameters, "?N" for explicit numbered ones, and None
-    /// for anonymous `?` slots, matching sqlite3_bind_parameter_name.
     pub fn name(&self, index: NonZero<usize>) -> Option<String> {
-        self.index_to_name.get(&index).cloned()
+        if let Some(name) = self.index_to_name.get(&index) {
+            Some(name.clone())
+        } else if self.present.contains(&index) {
+            Some(format!("?{index}"))
+        } else {
+            None
+        }
     }
 
     pub fn index(&self, name: impl AsRef<str>) -> Option<NonZero<usize>> {
