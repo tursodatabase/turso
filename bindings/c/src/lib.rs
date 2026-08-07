@@ -33,7 +33,8 @@ fn default_db_opts() -> DatabaseOpts {
         opts = opts
             .with_generated_columns(true)
             .with_vacuum(true)
-            .with_without_rowid(true);
+            .with_without_rowid(true)
+            .with_attach(true);
     }
     opts
 }

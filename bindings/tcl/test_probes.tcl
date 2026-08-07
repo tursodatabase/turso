@@ -1,9 +1,11 @@
 # Probe tests for the native Turso TCL extension (bindings/tcl/turso_tcl.c).
 #
-# Validates the three capabilities that the subprocess shim cannot provide:
+# Validates the capabilities that the subprocess shim cannot provide:
 #   1. Real engine error codes via [db errorcode].
 #   2. Accurate DML change counters via [db changes] / [db total_changes].
 #   3. In-process Tcl function registration via [db func].
+#   4. Rows from every statement of a multi-statement [db eval].
+#   5. ATTACH / DETACH, which the engine gates behind its experimental flag.
 #
 # Run via:
 #   LD_LIBRARY_PATH=target/debug tclsh bindings/tcl/test_probes.tcl
@@ -109,6 +111,20 @@ set multi_sql {
 }
 assert_eq "multi-statement db eval keeps rows from every statement" \
     {1 one 2 two 2} [db eval $multi_sql]
+
+# ---------------------------------------------------------------------------
+# Probe 5: ATTACH and DETACH.
+# The engine refuses ATTACH unless the database was opened with the attach
+# option, which the tursodb CLI spells --experimental-attach. The module turns
+# that option on for every database it opens, so the upstream attach*.test
+# files get a working ATTACH instead of an immediate "experimental feature"
+# error.
+# ---------------------------------------------------------------------------
+
+assert_eq "ATTACH is accepted" "" [db eval {ATTACH ':memory:' AS aux}]
+db eval {CREATE TABLE aux.t5(x); INSERT INTO aux.t5 VALUES (42);}
+assert_eq "attached database is queryable" 42 [db eval {SELECT x FROM aux.t5}]
+assert_eq "DETACH is accepted" "" [db eval {DETACH aux}]
 
 # ---------------------------------------------------------------------------
 # Summary
