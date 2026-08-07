@@ -56,6 +56,8 @@ enum Shape {
     FilteredColumns,
     /// SELECT g, COUNT(*) FROM t GROUP BY g
     Aggregate,
+    /// SELECT g, SUM(c) AS a0_sum, AVG(d) AS a1_avg FROM t GROUP BY g
+    AggregateFunctions,
     /// SELECT t.a, u.b FROM t JOIN u ON t.a = u.b
     Join,
     /// SELECT t.a AS c0, ... FROM t UNION ALL SELECT u.b AS c0, ... FROM u
@@ -138,6 +140,7 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
         (1, Shape::Star),
         (2, Shape::FilteredColumns),
         (1, Shape::Aggregate),
+        (1, Shape::AggregateFunctions),
         (1, Shape::ComplexFilterSelfJoin),
     ];
     if sources.len() >= 2 {
@@ -242,10 +245,19 @@ fn select_for_shape(
             vec![ColumnDef::new("cnt", DataType::Integer)],
         ))
         .boxed(),
+        Shape::AggregateFunctions if !filterable.is_empty() => {
+            let group = filterable[0].clone();
+            proptest::collection::vec(aggregate_call(filterable), 1..=3)
+                .prop_map(move |calls| aggregate_functions(&name, Some(&group), &calls))
+                .boxed()
+        }
         Shape::ComplexFilterSelfJoin if integer_columns >= 2 => (0..COMPLEX_PREDICATE_KINDS)
             .prop_map(move |kind| complex_filter_self_join(&source, kind))
             .boxed(),
-        Shape::Star | Shape::FilteredColumns | Shape::ComplexFilterSelfJoin => Just((
+        Shape::Star
+        | Shape::FilteredColumns
+        | Shape::AggregateFunctions
+        | Shape::ComplexFilterSelfJoin => Just((
             format!("SELECT * FROM {name}"),
             view_columns(&source.columns),
         ))
@@ -268,6 +280,84 @@ fn select_for_shape(
             .prop_map(move |other| union_all(&source, &other))
             .boxed(),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AggregateFunction {
+    Sum,
+    Avg,
+}
+
+/// TOTAL is left out because Turso refuses it in a materialized view.
+const AGGREGATE_FUNCTIONS: &[AggregateFunction] = &[AggregateFunction::Sum, AggregateFunction::Avg];
+
+impl AggregateFunction {
+    fn name(self) -> &'static str {
+        match self {
+            AggregateFunction::Sum => "sum",
+            AggregateFunction::Avg => "avg",
+        }
+    }
+
+    fn call(self, column: &str) -> String {
+        match self {
+            AggregateFunction::Sum => format!("SUM({column})"),
+            AggregateFunction::Avg => format!("AVG({column})"),
+        }
+    }
+
+    fn result_type(self, input: DataType) -> DataType {
+        match (self, input) {
+            (AggregateFunction::Sum, DataType::Integer) => DataType::Integer,
+            (AggregateFunction::Sum | AggregateFunction::Avg, _) => DataType::Real,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AggregateCall {
+    function: AggregateFunction,
+    column: ColumnDef,
+}
+
+fn aggregate_call(columns: Vec<ColumnDef>) -> BoxedStrategy<AggregateCall> {
+    (
+        proptest::sample::select(AGGREGATE_FUNCTIONS),
+        proptest::sample::select(columns),
+    )
+        .prop_map(|(function, column)| AggregateCall { function, column })
+        .boxed()
+}
+
+/// `SELECT g, f0(c0) AS a0_f0, ... FROM t [GROUP BY g]`.
+fn aggregate_functions(
+    table: &str,
+    group: Option<&ColumnDef>,
+    calls: &[AggregateCall],
+) -> (String, Vec<ColumnDef>) {
+    let mut projection: Vec<String> = group.iter().map(|g| g.name.clone()).collect();
+    let mut output_columns: Vec<ColumnDef> = group
+        .iter()
+        .map(|g| ColumnDef::new(g.name.clone(), g.data_type))
+        .collect();
+    for (i, call) in calls.iter().enumerate() {
+        let alias = format!("a{i}_{}", call.function.name());
+        projection.push(format!(
+            "{} AS {alias}",
+            call.function.call(&call.column.name)
+        ));
+        output_columns.push(ColumnDef::new(
+            alias,
+            call.function.result_type(call.column.data_type),
+        ));
+    }
+    let group_by = group
+        .map(|g| format!(" GROUP BY {}", g.name))
+        .unwrap_or_default();
+    (
+        format!("SELECT {} FROM {table}{group_by}", projection.join(", ")),
+        output_columns,
+    )
 }
 
 fn join(left: &Table, right: &Table) -> (String, Vec<ColumnDef>) {
@@ -554,6 +644,14 @@ mod tests {
         assert!(sqls.iter().any(|sql| sql.starts_with("SELECT * FROM")));
         assert!(sqls.iter().any(|sql| sql.contains(" WHERE ")));
         assert!(sqls.iter().any(|sql| sql.contains(" GROUP BY ")));
+        for function in AGGREGATE_FUNCTIONS {
+            let alias = format!("_{}", function.name());
+            assert!(
+                sqls.iter().any(|sql| sql.contains(&format!("{alias},"))
+                    || sql.contains(&format!("{alias} FROM"))),
+                "{alias}"
+            );
+        }
         assert!(sqls.iter().any(|sql| sql.contains("FROM mv_users")));
         assert!(
             sqls.iter()
