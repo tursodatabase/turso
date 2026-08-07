@@ -6,8 +6,9 @@ use turso::Connection;
 use turso::params::Params;
 
 use super::profile::{
-    Phase, Profile, WorkItem, checkpoint::Checkpoint, insert::InsertHeavy, mixed::Mixed,
-    read::ReadHeavy, recursive_cte::RecursiveCte, scan::ScanHeavy, series_blob::SeriesBlob,
+    Phase, Profile, WorkItem, checkpoint::Checkpoint, fts_query_churn::FtsQueryChurn,
+    fts_update_churn::FtsUpdateChurn, insert::InsertHeavy, mixed::Mixed, read::ReadHeavy,
+    recursive_cte::RecursiveCte, scan::ScanHeavy, series_blob::SeriesBlob,
     update_churn::UpdateChurn,
 };
 
@@ -35,6 +36,8 @@ pub enum WorkloadProfile {
     RecursiveCte,
     SeriesBlob,
     UpdateChurn,
+    FtsQueryChurn,
+    FtsUpdateChurn,
 }
 
 impl std::fmt::Display for WorkloadProfile {
@@ -47,6 +50,8 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::RecursiveCte => write!(f, "recursive-cte"),
             WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
             WorkloadProfile::UpdateChurn => write!(f, "update-churn"),
+            WorkloadProfile::FtsQueryChurn => write!(f, "fts-query-churn"),
+            WorkloadProfile::FtsUpdateChurn => write!(f, "fts-update-churn"),
         }
     }
 }
@@ -97,6 +102,8 @@ pub fn create_profile(
         WorkloadProfile::RecursiveCte => Box::new(RecursiveCte::new(iterations, batch_size)),
         WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
         WorkloadProfile::UpdateChurn => Box::new(UpdateChurn::new(iterations, batch_size)),
+        WorkloadProfile::FtsQueryChurn => Box::new(FtsQueryChurn::new(iterations, batch_size)),
+        WorkloadProfile::FtsUpdateChurn => Box::new(FtsUpdateChurn::new(iterations, batch_size)),
     };
 
     if checkpoint {
@@ -116,7 +123,10 @@ pub async fn run_workload(
     let mut profile = create_profile(cfg.workload, cfg.iterations, cfg.batch_size, cfg.checkpoint);
     let workload_name = profile.name().to_string();
 
-    let db = turso::Builder::new_local(db_path).build().await?;
+    let db = turso::Builder::new_local(db_path)
+        .experimental_index_method(true)
+        .build()
+        .await?;
 
     // Setup connection for schema/seeding and journal mode
     let setup_conn = db.connect()?;

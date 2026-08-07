@@ -89,18 +89,20 @@ mod tests {
         history.push(sql);
     }
 
-    /// Model-based FTS churn fuzzing.
+    /// Model-based FTS churn fuzzing shared by WAL and MVCC.
     ///
-    /// The vocabulary and queries are deliberately simple so the oracle does not
-    /// duplicate Tantivy's query parser. The generated operation stream stresses
-    /// index maintenance, transaction/savepoint rollback, cache invalidation,
-    /// explicit optimization, and visibility across connections.
-    #[test]
-    fn fts_index_maintenance_model_fuzz() {
-        let (mut rng, seed) = helpers::init_fuzz_test_tracing("fts_index_maintenance_model_fuzz");
-        let db = TempDatabase::builder()
-            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
-            .build();
+    /// The vocabulary and queries are deliberately simple so the oracle does
+    /// not duplicate Tantivy's query parser. The generated operation stream
+    /// stresses index maintenance, transaction/savepoint rollback, cache
+    /// validation, explicit optimization, and visibility across connections.
+    fn run_fts_index_maintenance_model_fuzz(test_name: &str, mvcc: bool) {
+        let (mut rng, seed) = helpers::init_fuzz_test_tracing(test_name);
+        let mut builder = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true));
+        if mvcc {
+            builder = builder.with_mvcc(true);
+        }
+        let db = builder.build();
         let writer = db.connect_limbo();
         let observer = db.connect_limbo();
 
@@ -116,22 +118,23 @@ mod tests {
         let mut in_transaction = false;
         let mut next_id = 1i64;
         let mut history = vec![
+            format!("journal_mode={}", if mvcc { "mvcc" } else { "wal" }),
             "CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)".to_string(),
             "CREATE INDEX docs_fts ON docs USING fts(content)".to_string(),
         ];
 
         let iterations = helpers::fuzz_iterations(300);
         for iteration in 0..iterations {
-            helpers::log_progress(
-                "fts_index_maintenance_model_fuzz",
-                iteration,
-                iterations,
-                20,
-            );
+            helpers::log_progress(test_name, iteration, iterations, 20);
 
             match rng.random_range(0..100) {
                 0..=7 if !in_transaction => {
-                    execute(&writer, "BEGIN".to_string(), &mut history);
+                    let begin = if mvcc && rng.random_bool(0.5) {
+                        "BEGIN CONCURRENT"
+                    } else {
+                        "BEGIN"
+                    };
+                    execute(&writer, begin.to_string(), &mut history);
                     in_transaction = true;
                 }
                 0..=3 if in_transaction => {
@@ -273,6 +276,103 @@ mod tests {
         for token in TOKENS {
             assert_matches_model(&writer, &visible, token, seed, &history, "writer");
             assert_matches_model(&observer, &visible, token, seed, &history, "observer");
+        }
+    }
+
+    #[test]
+    fn fts_index_maintenance_model_fuzz_wal() {
+        run_fts_index_maintenance_model_fuzz("fts_index_maintenance_model_fuzz_wal", false);
+    }
+
+    #[test]
+    fn fts_index_maintenance_model_fuzz_mvcc() {
+        run_fts_index_maintenance_model_fuzz("fts_index_maintenance_model_fuzz_mvcc", true);
+    }
+
+    #[test]
+    fn fts_same_index_writer_lease_model_fuzz_mvcc() {
+        let (mut rng, seed) =
+            helpers::init_fuzz_test_tracing("fts_same_index_writer_lease_model_fuzz_mvcc");
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(true)
+            .build();
+        let connections = [db.connect_limbo(), db.connect_limbo()];
+        connections[0]
+            .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)")
+            .unwrap();
+        connections[0]
+            .execute("CREATE INDEX docs_fts ON docs USING fts(content)")
+            .unwrap();
+
+        let mut committed = Model::new();
+        let mut history = vec![
+            "journal_mode=mvcc".to_string(),
+            "CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)".to_string(),
+            "CREATE INDEX docs_fts ON docs USING fts(content)".to_string(),
+        ];
+        let iterations = helpers::fuzz_iterations(100);
+        for iteration in 0..iterations {
+            helpers::log_progress(
+                "fts_same_index_writer_lease_model_fuzz_mvcc",
+                iteration,
+                iterations,
+                20,
+            );
+            let owner = rng.random_range(0..connections.len());
+            let contender = 1 - owner;
+            execute(
+                &connections[owner],
+                "BEGIN CONCURRENT".to_string(),
+                &mut history,
+            );
+            execute(
+                &connections[contender],
+                "BEGIN CONCURRENT".to_string(),
+                &mut history,
+            );
+
+            let committed_id = iteration as i64 * 2 + 1;
+            let rejected_id = committed_id + 1;
+            let token = TOKENS.choose(&mut rng).unwrap();
+            let content = Some((*token).to_string());
+            execute(
+                &connections[owner],
+                format!(
+                    "INSERT INTO docs VALUES ({committed_id}, {})",
+                    sql_text(&content)
+                ),
+                &mut history,
+            );
+            let contender_sql =
+                format!("INSERT INTO docs VALUES ({rejected_id}, 'should_not_commit')");
+            let conflict = connections[contender].execute(&contender_sql).unwrap_err();
+            history.push(format!("{contender_sql} -> {conflict}"));
+            assert!(
+                matches!(conflict, turso_core::LimboError::WriteWriteConflict),
+                "same-index contender returned {conflict}; seed={seed}\n{}",
+                helpers::history_tail(&history, 40)
+            );
+
+            execute(&connections[owner], "COMMIT".to_string(), &mut history);
+            committed.insert(committed_id, content);
+            assert_matches_model(
+                &connections[contender],
+                &committed,
+                token,
+                seed,
+                &history,
+                "contender",
+            );
+            assert!(
+                limbo_exec_rows(
+                    &connections[contender],
+                    &format!("SELECT id FROM docs WHERE id = {rejected_id}")
+                )
+                .is_empty(),
+                "lease loser published its base row; seed={seed}\n{}",
+                helpers::history_tail(&history, 40)
+            );
         }
     }
 }

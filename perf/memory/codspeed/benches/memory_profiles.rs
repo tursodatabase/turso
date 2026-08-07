@@ -28,7 +28,7 @@ use memory_benchmark::workload::{
 
 const MODES: [JournalMode; 2] = [JournalMode::Wal, JournalMode::Mvcc];
 
-const WORKLOADS: [WorkloadProfile; 7] = [
+const WORKLOADS: [WorkloadProfile; 9] = [
     WorkloadProfile::InsertHeavy,
     WorkloadProfile::ReadHeavy,
     WorkloadProfile::Mixed,
@@ -36,6 +36,8 @@ const WORKLOADS: [WorkloadProfile; 7] = [
     WorkloadProfile::RecursiveCte,
     WorkloadProfile::SeriesBlob,
     WorkloadProfile::UpdateChurn,
+    WorkloadProfile::FtsQueryChurn,
+    WorkloadProfile::FtsUpdateChurn,
 ];
 
 /// Workload scale series: the base iteration count is multiplied by each of
@@ -61,6 +63,7 @@ fn base_workload_size(workload: WorkloadProfile) -> (usize, usize) {
     match workload {
         WorkloadProfile::ScanHeavy => (5, 2),
         WorkloadProfile::RecursiveCte => (2, 100),
+        WorkloadProfile::FtsQueryChurn | WorkloadProfile::FtsUpdateChurn => (5, 10),
         _ => (10, 50),
     }
 }
@@ -72,22 +75,26 @@ fn bench_memory_profiles(c: &mut Criterion) {
 
     for mode in MODES {
         for workload in WORKLOADS {
-            for multiplier in SIZE_MULTIPLIERS {
-                bench_workload(c, &work_dir, mode, workload, multiplier, false);
+            let connection_counts: &[usize] = match workload {
+                WorkloadProfile::FtsQueryChurn | WorkloadProfile::FtsUpdateChurn => &[1, 4],
+                _ => &[1],
+            };
+            for &connections in connection_counts {
+                for multiplier in SIZE_MULTIPLIERS {
+                    bench_workload(c, &work_dir, mode, workload, connections, multiplier, false);
+                }
+                // Bigger checkpointed variant: low MVCC auto-checkpoint
+                // threshold plus a final explicit checkpoint.
+                bench_workload(
+                    c,
+                    &work_dir,
+                    mode,
+                    workload,
+                    connections,
+                    CHECKPOINT_SIZE_MULTIPLIER,
+                    true,
+                );
             }
-            // Bigger checkpointed variant: low MVCC auto-checkpoint threshold
-            // plus a final explicit `PRAGMA wal_checkpoint(TRUNCATE)` (the
-            // only guaranteed checkpoint in WAL mode, whose 1000-frame
-            // auto-checkpoint threshold is not configurable), so checkpoint
-            // memory behavior is part of the measurement.
-            bench_workload(
-                c,
-                &work_dir,
-                mode,
-                workload,
-                CHECKPOINT_SIZE_MULTIPLIER,
-                true,
-            );
         }
     }
 }
@@ -98,6 +105,7 @@ fn bench_workload(
     work_dir: &std::path::Path,
     mode: JournalMode,
     workload: WorkloadProfile,
+    connections: usize,
     multiplier: usize,
     checkpoint: bool,
 ) {
@@ -110,7 +118,7 @@ fn bench_workload(
         workload,
         iterations,
         batch_size,
-        connections: 1,
+        connections,
         timeout: Duration::from_millis(30_000),
         cache_size: None,
         checkpoint,
@@ -119,22 +127,27 @@ fn bench_workload(
         mvcc_gc_threshold: (matches!(mode, JournalMode::Mvcc)).then_some(16384i64),
     };
     let db_path = work_dir
-        .join(format!("{mode}_{workload}_{total_ops}{suffix}.db"))
+        .join(format!(
+            "{mode}_{workload}_{connections}-connections_{total_ops}{suffix}.db"
+        ))
         .to_string_lossy()
         .into_owned();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(connections)
         .build()
         .expect("failed to build tokio runtime");
 
-    c.bench_function(&format!("{mode}/{workload}/{total_ops}{suffix}"), |b| {
-        b.iter(|| {
-            clean_db_files(&db_path);
-            rt.block_on(run_workload(&db_path, &cfg, &mut ()))
-                .expect("workload failed");
-        });
-    });
+    c.bench_function(
+        &format!("{mode}/{workload}/{connections}-connections/{total_ops}{suffix}"),
+        |b| {
+            b.iter(|| {
+                clean_db_files(&db_path);
+                rt.block_on(run_workload(&db_path, &cfg, &mut ()))
+                    .expect("workload failed");
+            });
+        },
+    );
 
     clean_db_files(&db_path);
 }

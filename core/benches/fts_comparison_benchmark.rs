@@ -37,6 +37,51 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
 
+#[derive(Clone, Copy)]
+enum TursoBenchmarkMode {
+    Wal,
+    MvccDisabledCheckpoint,
+    MvccDefaultCheckpoint,
+    MvccForcedCheckpoint,
+}
+
+impl TursoBenchmarkMode {
+    const ALL: [Self; 4] = [
+        Self::Wal,
+        Self::MvccDisabledCheckpoint,
+        Self::MvccDefaultCheckpoint,
+        Self::MvccForcedCheckpoint,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wal => "turso_wal",
+            Self::MvccDisabledCheckpoint => "turso_mvcc_checkpoint_disabled",
+            Self::MvccDefaultCheckpoint => "turso_mvcc_checkpoint_default",
+            Self::MvccForcedCheckpoint => "turso_mvcc_checkpoint_forced",
+        }
+    }
+
+    fn configure(self, conn: &Arc<turso_core::Connection>) {
+        match self {
+            Self::Wal => {}
+            Self::MvccDisabledCheckpoint => {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                    .unwrap();
+            }
+            Self::MvccDefaultCheckpoint => {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            Self::MvccForcedCheckpoint => {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+                    .unwrap();
+            }
+        }
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -160,7 +205,7 @@ fn query_sqlite(conn: &rusqlite::Connection, sql: &str) -> usize {
     row_count
 }
 
-fn open_turso() -> TursoDatabase {
+fn open_turso(benchmark_mode: TursoBenchmarkMode) -> TursoDatabase {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("turso_fts.db");
     #[allow(clippy::arc_with_non_send_sync)]
@@ -176,6 +221,7 @@ fn open_turso() -> TursoDatabase {
     )
     .unwrap();
     let conn = db.connect().unwrap();
+    benchmark_mode.configure(&conn);
     execute_turso(
         &db,
         &conn,
@@ -332,18 +378,23 @@ fn bench_bulk_ingest(criterion: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     group.throughput(Throughput::Elements(INGEST_ROW_COUNT as u64));
 
-    group.bench_function(BenchmarkId::new("turso", INGEST_ROW_COUNT), |bencher| {
-        iter_custom_or_iter!(bencher, |iterations| {
-            let mut total = std::time::Duration::ZERO;
-            for _ in 0..iterations {
-                let database = open_turso();
-                let start = std::time::Instant::now();
-                populate_turso(&database, &batches);
-                total += start.elapsed();
-            }
-            total
-        });
-    });
+    for benchmark_mode in TursoBenchmarkMode::ALL {
+        group.bench_function(
+            BenchmarkId::new(benchmark_mode.label(), INGEST_ROW_COUNT),
+            |bencher| {
+                iter_custom_or_iter!(bencher, |iterations| {
+                    let mut total = std::time::Duration::ZERO;
+                    for _ in 0..iterations {
+                        let database = open_turso(benchmark_mode);
+                        let start = std::time::Instant::now();
+                        populate_turso(&database, &batches);
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            },
+        );
+    }
 
     if !cfg!(feature = "codspeed") {
         group.bench_function(
@@ -369,27 +420,35 @@ fn bench_bulk_ingest(criterion: &mut Criterion) {
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_queries(criterion: &mut Criterion) {
     let batches = insert_batches(QUERY_ROW_COUNT);
-    let turso = open_turso();
     let sqlite = open_sqlite();
-    populate_turso(&turso, &batches);
     populate_sqlite(&sqlite, &batches);
-    assert_workload_parity(&turso, &sqlite);
 
     let mut group = criterion.benchmark_group("FTS comparison - warm queries");
-    for workload in QUERY_WORKLOADS {
-        group.bench_function(BenchmarkId::new(workload.name, "turso"), |bencher| {
-            iter_custom_or_iter!(bencher, |iterations| {
-                let mut total = std::time::Duration::ZERO;
-                for _ in 0..iterations {
-                    let start = std::time::Instant::now();
-                    let row_count = query_turso(&turso.db, &turso.conn, workload.turso_sql);
-                    std::hint::black_box(row_count);
-                    total += start.elapsed();
-                }
-                total
-            });
-        });
+    for benchmark_mode in TursoBenchmarkMode::ALL {
+        let turso = open_turso(benchmark_mode);
+        populate_turso(&turso, &batches);
+        assert_workload_parity(&turso, &sqlite);
 
+        for workload in QUERY_WORKLOADS {
+            group.bench_function(
+                BenchmarkId::new(workload.name, benchmark_mode.label()),
+                |bencher| {
+                    iter_custom_or_iter!(bencher, |iterations| {
+                        let mut total = std::time::Duration::ZERO;
+                        for _ in 0..iterations {
+                            let start = std::time::Instant::now();
+                            let row_count = query_turso(&turso.db, &turso.conn, workload.turso_sql);
+                            std::hint::black_box(row_count);
+                            total += start.elapsed();
+                        }
+                        total
+                    });
+                },
+            );
+        }
+    }
+
+    for workload in QUERY_WORKLOADS {
         if !cfg!(feature = "codspeed") {
             group.bench_function(BenchmarkId::new(workload.name, "sqlite_fts5"), |bencher| {
                 iter_custom_or_iter!(bencher, |iterations| {
