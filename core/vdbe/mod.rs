@@ -112,8 +112,14 @@ type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 pub enum ViewDeltaCommitState {
     NotStarted,
     Processing {
-        views: Vec<String>, // view names (all materialized views have storage)
+        /// View names (all materialized views have storage), sources before the
+        /// views that read from them.
+        views: Vec<String>,
         current_index: usize,
+        /// Row changes the already-processed views made to themselves, keyed by
+        /// the view that made them. A view chained on top of another one reads its
+        /// source's entry the same way it reads a table delta.
+        cascade: HashMap<String, crate::incremental::dbsp::Delta>,
     },
     Done,
 }
@@ -2017,9 +2023,12 @@ impl Program {
                     // Not a rollback - proceed with processing
                     let schema = self.connection.schema.read();
 
-                    // Collect materialized views - they should all have storage
+                    // Collect materialized views - they should all have storage.
+                    // Views chained on top of these get no table delta of their
+                    // own, so pull them in and keep every view after its sources.
+                    let seeds = self.connection.view_transaction_states.get_view_names();
                     let mut views = Vec::new();
-                    for view_name in self.connection.view_transaction_states.get_view_names() {
+                    for view_name in schema.materialized_view_maintenance_order(&seeds) {
                         if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
                             let view = view_mutex.lock();
                             let root_page = view.get_root_page();
@@ -2038,12 +2047,14 @@ impl Program {
                     state.view_delta_state = ViewDeltaCommitState::Processing {
                         views,
                         current_index: 0,
+                        cascade: HashMap::default(),
                     };
                 }
 
                 ViewDeltaCommitState::Processing {
                     views,
                     current_index,
+                    cascade,
                 } => {
                     // At this point we know it's not a rollback
                     if *current_index >= views.len() {
@@ -2055,36 +2066,44 @@ impl Program {
 
                     let view_name = &views[*current_index];
 
-                    let table_deltas = self
-                        .connection
-                        .view_transaction_states
-                        .get(view_name)
-                        .expect("view should have transaction state")
-                        .get_table_deltas();
-
-                    let schema = self.connection.schema.read();
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
-                        let mut view = view_mutex.lock();
-
-                        // Create a DeltaSet from the per-table deltas
-                        let mut delta_set = crate::incremental::compiler::DeltaSet::new();
-                        for (table_name, delta) in table_deltas {
+                    // Deltas this view can read: the ones its source tables wrote
+                    // in this transaction, plus the ones its source views just
+                    // produced. The circuit picks the names its inputs are bound
+                    // to and ignores the rest.
+                    let mut delta_set = crate::incremental::compiler::DeltaSet::new();
+                    for (source_name, delta) in cascade.iter() {
+                        delta_set.insert(source_name.clone(), delta.clone());
+                    }
+                    if let Some(tx_state) = self.connection.view_transaction_states.get(view_name) {
+                        for (table_name, delta) in tx_state.get_table_deltas() {
                             delta_set.insert(table_name, delta);
                         }
+                    }
 
-                        // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
-                        match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
-                                // Move to next view
-                                state.view_delta_state = ViewDeltaCommitState::Processing {
-                                    views: views.clone(),
-                                    current_index: current_index + 1,
-                                };
+                    let schema = self.connection.schema.read();
+                    let view_mutex = schema
+                        .get_materialized_view(view_name)
+                        .expect("views were filtered to those with storage");
+                    let mut view = view_mutex.lock();
+
+                    // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
+                    match view.merge_delta(delta_set, pager.clone())? {
+                        // Nothing may change before this point: an IO return
+                        // re-enters at the same index and rebuilds the input.
+                        IOResult::Done(view_delta) => {
+                            let mut cascade = cascade.clone();
+                            if !view_delta.is_empty() {
+                                cascade.insert(view_name.clone(), view_delta);
                             }
-                            IOResult::IO(io) => {
-                                // Return I/O, will resume at same index
-                                return Ok(IOResult::IO(io));
-                            }
+                            state.view_delta_state = ViewDeltaCommitState::Processing {
+                                views: views.clone(),
+                                current_index: current_index + 1,
+                                cascade,
+                            };
+                        }
+                        IOResult::IO(io) => {
+                            // Return I/O, will resume at same index
+                            return Ok(IOResult::IO(io));
                         }
                     }
                 }

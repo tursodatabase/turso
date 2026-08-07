@@ -327,6 +327,70 @@ impl IncrementalView {
         }
     }
 
+    /// Names a stored `CREATE MATERIALIZED VIEW` statement reads from, taken
+    /// straight from the FROM and JOIN clauses. This runs before the sources are
+    /// in the schema, so it cannot resolve them like `from_stmt` does; it only
+    /// decides the order in which views are rebuilt when a database is opened.
+    pub fn source_names_from_sql(sql: &str) -> Result<Vec<String>> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd()?;
+        let cmd = cmd.expect("View is an empty statement");
+        let Cmd::Stmt(Stmt::CreateMaterializedView { select, .. }) = cmd else {
+            return Err(LimboError::ParseError(format!(
+                "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
+            )));
+        };
+        let mut names = Vec::new();
+        Self::collect_source_names(&select, &HashSet::default(), &mut names);
+        Ok(names)
+    }
+
+    fn collect_source_names(
+        select: &ast::Select,
+        parent_cte_names: &HashSet<String>,
+        names: &mut Vec<String>,
+    ) {
+        let mut cte_names = parent_cte_names.clone();
+        if let Some(ref with) = select.with {
+            for cte in &with.ctes {
+                cte_names.insert(cte.tbl_name.as_str().to_string());
+            }
+            for cte in &with.ctes {
+                Self::collect_source_names(&cte.select, &cte_names, names);
+            }
+        }
+
+        Self::collect_one_select_source_names(&select.body.select, &cte_names, names);
+        for compound in &select.body.compounds {
+            Self::collect_one_select_source_names(&compound.select, &cte_names, names);
+        }
+    }
+
+    fn collect_one_select_source_names(
+        select: &ast::OneSelect,
+        cte_names: &HashSet<String>,
+        names: &mut Vec<String>,
+    ) {
+        let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = select
+        else {
+            return;
+        };
+        let mut push = |table: &ast::SelectTable| {
+            if let ast::SelectTable::Table(name, _, _) = table {
+                let name = name.name.as_str();
+                if !cte_names.contains(name) {
+                    names.push(name.to_string());
+                }
+            }
+        };
+        push(from.select.as_ref());
+        for join in &from.joins {
+            push(join.table.as_ref());
+        }
+    }
+
     pub fn from_stmt(
         view_name: ast::QualifiedName,
         select: ast::Select,
@@ -1368,8 +1432,10 @@ impl IncrementalView {
         let table_name = self.referenced_tables[table_idx].name.clone();
         delta_set.insert(table_name, single_row_delta);
 
-        // Process through merge_delta
-        self.merge_delta(delta_set, pager)
+        // Process through merge_delta. Population only happens at CREATE time, so
+        // no view can be chained on top of this one yet and its delta has no reader.
+        return_if_io!(self.merge_delta(delta_set, pager));
+        Ok(IOResult::Done(()))
     }
 
     /// Extract rowid and values from a row
@@ -1398,23 +1464,25 @@ impl IncrementalView {
         }
     }
 
-    /// Merge a delta set of changes into the view's current state
+    /// Merge a delta set of changes into the view's current state, and return the
+    /// change this made to the view's own rows. Views built on top of this one
+    /// consume that as their input delta.
     pub fn merge_delta(
         &mut self,
         delta_set: DeltaSet,
         pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> crate::Result<IOResult<Delta>> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(Delta::new()));
         }
 
         // Use the circuit to process the deltas and write to btree
         let input_data = delta_set.into_map();
 
         // The circuit now handles all btree I/O internally with the provided pager
-        let _delta = return_if_io!(self.circuit.commit(input_data, pager));
-        Ok(IOResult::Done(()))
+        let delta = return_if_io!(self.circuit.commit(input_data, pager));
+        Ok(IOResult::Done(delta))
     }
 }
 
