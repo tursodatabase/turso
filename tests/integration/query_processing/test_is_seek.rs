@@ -50,6 +50,32 @@ fn is_operator_uses_index_seek() {
     );
 }
 
+#[test]
+fn is_true_and_false_do_not_use_equality_seeks() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(&conn, "CREATE TABLE t(x)");
+    limbo_exec_rows(&conn, "CREATE INDEX ti ON t(x)");
+    for literal in ["TRUE", "FALSE"] {
+        let plan = query_plan(&conn, &format!("SELECT * FROM t WHERE x IS {literal}"));
+        assert!(
+            plan.contains("SCAN t"),
+            "`IS {literal}` checks boolean value and cannot seek one key, got:\n{plan}"
+        );
+    }
+    for query in [
+        "SELECT * FROM t WHERE TRUE IS x",
+        "SELECT * FROM t WHERE x IS +TRUE",
+    ] {
+        let plan = query_plan(&conn, query);
+        assert!(
+            plan.contains("SEARCH t USING INDEX ti (x=?)"),
+            "expected an index seek for `{query}`, got:\n{plan}"
+        );
+    }
+}
+
 /// The seek must still find rows whose key component is NULL: `IS` compares
 /// NULLs as equal, so the NULL travels into the seek key instead of ending the
 /// loop the way an `=` seek does.

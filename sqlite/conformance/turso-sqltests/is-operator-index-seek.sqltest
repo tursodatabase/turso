@@ -142,6 +142,32 @@ expect {
     0
 }
 
+# TRUE and FALSE on the right of IS check boolean value, not equality. For
+# example, 2 and text '1' are true even though neither is equal to integer 1.
+# The special rule only applies when TRUE or FALSE is directly on the right.
+test is-true-and-false-keep-boolean-semantics-with-an-index {
+    CREATE TABLE t (x);
+    CREATE INDEX ti ON t (x);
+    INSERT INTO t VALUES (NULL), (0), (1), (2), (-1), ('1'), ('true'), ('x');
+
+    SELECT 'true', quote(x) FROM t WHERE x IS TRUE ORDER BY rowid;
+    SELECT 'false', quote(x) FROM t WHERE x IS FALSE ORDER BY rowid;
+
+    SELECT 'left', quote(x) FROM t WHERE TRUE IS x;
+    SELECT 'plus', quote(x) FROM t WHERE x IS +TRUE;
+}
+expect {
+    true|1
+    true|2
+    true|-1
+    true|'1'
+    false|0
+    false|'true'
+    false|'x'
+    left|1
+    plus|1
+}
+
 # The antijoin idiom. `e.id IS NULL` is TRUE for a null-extended row, so it must
 # not be pushed into the loop of the LEFT JOIN's right-hand table: doing so
 # removes the very rows whose absence produces the null extension, and every

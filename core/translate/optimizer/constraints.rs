@@ -504,6 +504,17 @@ pub fn constraints_from_where_clause(
 
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+                // `x IS TRUE` checks whether x is true; it does not compare x
+                // with 1. For example, `2 IS TRUE` is true, so an index lookup
+                // for 1 would miss that row. The same rule applies to FALSE.
+                if matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
+                    && matches!(
+                        rhs,
+                        ast::Expr::Literal(ast::Literal::True | ast::Literal::False)
+                    )
+                {
+                    continue;
+                }
                 // Resolve the comparison affinity once per term per SQLite's
                 // `comparisonAffinity` (see `Constraint::comparison_affinity`)
                 // and propagate it to every constraint derived from this term.
