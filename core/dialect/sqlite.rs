@@ -13,6 +13,12 @@ use crate::sync::Arc;
 use crate::vtab::{VirtualTable, VirtualTableType};
 use turso_ext::VTabKind;
 
+/// SQLite version reported by compatibility APIs.
+pub const SQLITE_VERSION: &str = "3.50.4";
+
+/// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
+pub const SQLITE_VERSION_NUMBER: i32 = 3_050_004;
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]

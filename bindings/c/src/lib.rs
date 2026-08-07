@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
+use turso_core::dialect::sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 use turso_core::SqliteDialect;
 use turso_core::{CheckpointMode, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
@@ -13,6 +14,7 @@ use turso_ext::Value as ExtValue;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
+static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
 
 /// Global B-tree search counter exposed to the TCL test harness as
 /// `sqlite_search_count`.
@@ -2946,12 +2948,16 @@ pub unsafe extern "C" fn sqlite3_threadsafe() -> ffi::c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_libversion() -> *const ffi::c_char {
-    c"3.42.0".as_ptr()
+    SQLITE_VERSION_C_STRING
+        .get_or_init(|| {
+            CString::new(SQLITE_VERSION).expect("SQLITE_VERSION must not contain a NUL byte")
+        })
+        .as_ptr()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_libversion_number() -> ffi::c_int {
-    3042000
+    SQLITE_VERSION_NUMBER
 }
 
 fn sqlite3_errstr_impl(rc: i32) -> *const ffi::c_char {
