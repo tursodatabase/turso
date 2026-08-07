@@ -14,7 +14,11 @@ use crate::translate::plan::{Plan, QueryDestination, RecursiveCtePlan, Recursive
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Insn};
-use crate::{emit_explain, LimboError, Result};
+use crate::{
+    emit_explain,
+    explain_plan::{PlanOp, RecursiveCtePhase},
+    LimboError, Result,
+};
 use turso_parser::ast::{NullsOrder, SortOrder};
 
 pub(crate) fn emit_recursive_cte(
@@ -161,7 +165,13 @@ pub(crate) fn emit_recursive_cte(
         &recursive_cte.offset,
     )?;
 
-    emit_explain!(program, true, "SETUP".to_owned());
+    emit_explain!(
+        program,
+        true,
+        PlanOp::RecursiveCte {
+            phase: RecursiveCtePhase::Setup
+        }
+    );
     emit_recursive_cte_query(program, resolver, &mut recursive_cte.initial_query)?;
     program.pop_current_parent_explain();
 
@@ -216,7 +226,13 @@ pub(crate) fn emit_recursive_cte(
     }
 
     program.preassign_label_to_next_insn(run_recursive_query);
-    emit_explain!(program, true, "RECURSIVE STEP".to_owned());
+    emit_explain!(
+        program,
+        true,
+        PlanOp::RecursiveCte {
+            phase: RecursiveCtePhase::RecursiveStep
+        }
+    );
     emit_recursive_cte_query(program, resolver, &mut recursive_cte.recursive_query)?;
     program.pop_current_parent_explain();
     program.emit_insn(Insn::Goto {

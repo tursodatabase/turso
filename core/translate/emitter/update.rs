@@ -15,7 +15,7 @@ use crate::{
     },
     sync::Arc,
     translate::{
-        display::format_eqp_detail,
+        display::plan_op_for_table,
         emitter::{
             check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
@@ -178,6 +178,7 @@ pub fn emit_program_for_update(
                 expression_index_usages: Vec::new(),
                 database_id: MAIN_DB_ID,
                 indexed: None,
+                estimated_rows: None,
             }],
             vec![],
         );
@@ -325,7 +326,7 @@ pub fn emit_program_for_update(
     // Emit EXPLAIN QUERY PLAN annotation (only for the direct path;
     // write-set UPDATE already emits EQP via emit_program_for_select).
     if !uses_write_set {
-        emit_explain!(program, true, format_eqp_detail(&plan.target_table));
+        emit_explain!(program, true, plan_op_for_table(&plan.target_table, false));
     }
 
     // Open the main loop

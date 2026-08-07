@@ -42,6 +42,7 @@ tracing = { workspace = true }
 turso-dbhash.workspace = true
 
 [dev-dependencies]
+serde_json = { workspace = true }
 similar-asserts.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }
 test-log = { version = "0.2.17", features = ["trace"] }

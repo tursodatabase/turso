@@ -1,6 +1,7 @@
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
+    explain_plan::PlanOp,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
@@ -203,7 +204,7 @@ pub fn emit_query<'a>(
         program.emit_insn(Insn::HashClear {
             hash_table_id: ctx.hash_table_id,
         });
-        emit_explain!(program, false, "USE HASH TABLE FOR DISTINCT".to_owned());
+        emit_explain!(program, false, PlanOp::Distinct { aggregate: None });
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
@@ -492,7 +493,9 @@ pub(crate) fn emit_materialized_build_inputs(
         emit_explain!(
             program,
             true,
-            format!("MATERIALIZE hash build input for {build_table_name}")
+            PlanOp::MaterializeHashBuildInput {
+                table: build_table_name.to_string(),
+            }
         );
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id,

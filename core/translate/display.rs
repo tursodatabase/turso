@@ -10,6 +10,7 @@ use turso_parser::{
 };
 
 use crate::{
+    explain_plan::{IndexAccess, PlanOp, SetOp, TableAccess, TableKind},
     schema::Table,
     translate::plan::{SeekKeyComponent, TableReferences},
     types::SeekOp,
@@ -39,111 +40,103 @@ fn fmt_order_by_item(
     }
 }
 
-/// Format the EXPLAIN QUERY PLAN detail string for a table operation.
-/// Used by DELETE/UPDATE emitters to emit EQP annotations.
-pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
+/// Build the machine-readable plan node for one table access.
+///
+/// Shared by every emitter that annotates a table access (SELECT, DELETE,
+/// UPDATE) so that all of them describe the same operation the same way.
+/// The `EXPLAIN QUERY PLAN` text is rendered from the returned node.
+pub(crate) fn plan_op_for_table(table: &JoinedTable, left_join: bool) -> PlanOp {
+    let access = TableAccess {
+        name: table.table.get_name().to_string(),
+        identifier: table.identifier.clone(),
+        kind: match &table.table {
+            Table::BTree(_) => TableKind::Table,
+            Table::Virtual(_) => TableKind::VirtualTable,
+            Table::FromClauseSubquery(_) => TableKind::Subquery,
+            Table::RecursiveCteInput(_) => TableKind::RecursiveCteInput,
+        },
+        estimated_rows: table.estimated_rows,
+    };
     match &table.op {
         Operation::Scan(scan) => {
-            let table_name = if table.table.get_name() == table.identifier {
-                table.identifier.clone()
-            } else {
-                format!("{} AS {}", table.table.get_name(), table.identifier)
+            let index = match scan {
+                Scan::BTreeTable { index, .. } => index.as_ref().map(|index| IndexAccess {
+                    name: index.name.clone(),
+                    covering: table.utilizes_covering_index(),
+                }),
+                Scan::VirtualTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCteInput => None,
             };
-            match scan {
-                Scan::BTreeTable { index, .. } => {
-                    if let Some(index) = index {
-                        if table.utilizes_covering_index() {
-                            format!("SCAN {table_name} USING COVERING INDEX {}", index.name)
-                        } else {
-                            format!("SCAN {table_name} USING INDEX {}", index.name)
-                        }
-                    } else {
-                        format!("SCAN {table_name}")
-                    }
-                }
-                Scan::VirtualTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCteInput => {
-                    format!("SCAN {table_name}")
-                }
+            PlanOp::Scan {
+                access,
+                index,
+                left_join,
             }
         }
-        Operation::Search(search) => match search {
-            Search::RowidEq { .. }
-            | Search::Seek { index: None, .. }
-            | Search::InSeek { index: None, .. } => {
-                format!(
-                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                    table.identifier
-                )
+        Operation::Search(search) => {
+            let (index, constraints) = match search {
+                Search::RowidEq { .. }
+                | Search::Seek { index: None, .. }
+                | Search::InSeek { index: None, .. } => (None, vec!["rowid=?".to_string()]),
+                Search::Seek {
+                    index: Some(index),
+                    seek_def,
+                } => (
+                    Some(IndexAccess {
+                        name: index.name.clone(),
+                        covering: table.utilizes_covering_index(),
+                    }),
+                    seek_constraints(index, seek_def),
+                ),
+                Search::InSeek {
+                    index: Some(index), ..
+                } => (
+                    Some(IndexAccess {
+                        name: index.name.clone(),
+                        covering: table.utilizes_covering_index(),
+                    }),
+                    index
+                        .columns
+                        .first()
+                        .map(|col| vec![format!("{}=?", col.name)])
+                        .unwrap_or_default(),
+                ),
+            };
+            PlanOp::Search {
+                access,
+                index,
+                constraints,
+                left_join,
             }
-            Search::Seek {
-                index: Some(index),
-                seek_def,
-            } => {
-                let constraints = seek_constraint_annotation(index, seek_def);
-                format!(
-                    "SEARCH {} USING INDEX {}{}",
-                    table.identifier, index.name, constraints
-                )
-            }
-            Search::InSeek {
-                index: Some(index), ..
-            } => {
-                let constraint = if let Some(col) = index.columns.first() {
-                    format!(" ({}=?)", col.name)
-                } else {
-                    String::new()
-                };
-                format!(
-                    "SEARCH {} USING INDEX {}{}",
-                    table.identifier, index.name, constraint
-                )
-            }
-        },
-        Operation::MultiIndexScan(multi_idx) => {
-            let index_names: Vec<&str> = multi_idx
+        }
+        Operation::MultiIndexScan(multi_idx) => PlanOp::MultiIndexScan {
+            access,
+            set_op: match multi_idx.set_op {
+                SetOperation::Union => SetOp::Union,
+                SetOperation::Intersection { .. } => SetOp::Intersection,
+            },
+            indexes: multi_idx
                 .branches
                 .iter()
-                .map(|b| {
-                    b.index
-                        .as_ref()
-                        .map(|i| i.name.as_str())
-                        .unwrap_or("PRIMARY KEY")
-                })
-                .collect();
-            format!(
-                "MULTI-INDEX {} {} ({})",
-                match multi_idx.set_op {
-                    SetOperation::Union => "OR",
-                    SetOperation::Intersection { .. } => "AND",
-                },
-                table.identifier,
-                index_names.join(", ")
-            )
-        }
-        Operation::IndexMethodQuery(query) => {
-            let index_method = query.index.index_method.as_ref().unwrap();
-            format!(
-                "QUERY INDEX METHOD {}",
-                index_method.definition().method_name
-            )
-        }
-        Operation::HashJoin(_) => {
-            let table_name = if table.table.get_name() == table.identifier {
-                table.identifier.clone()
-            } else {
-                format!("{} AS {}", table.table.get_name(), table.identifier)
-            };
-            format!("HASH JOIN {table_name}")
-        }
+                .map(|branch| branch.index.as_ref().map(|index| index.name.clone()))
+                .collect(),
+        },
+        Operation::IndexMethodQuery(query) => PlanOp::IndexMethodQuery {
+            access,
+            method: query
+                .index
+                .index_method
+                .as_ref()
+                .expect("IndexMethodQuery operation requires an index method")
+                .definition()
+                .method_name
+                .to_string(),
+        },
+        Operation::HashJoin(_) => PlanOp::HashJoin { access },
     }
 }
 
-/// Build SQLite-style constraint annotation string for an index seek.
-/// e.g. "(label=? AND fromId>?)"
-pub(crate) fn seek_constraint_annotation(
-    index: &crate::schema::Index,
-    seek_def: &SeekDef,
-) -> String {
+/// List the key parts an index seek pins down, e.g. `["label=?", "fromId>?"]`.
+pub(crate) fn seek_constraints(index: &crate::schema::Index, seek_def: &SeekDef) -> Vec<String> {
     let mut parts = Vec::new();
     // Equality prefix constraints
     for (i, _constraint) in seek_def.prefix.iter().enumerate() {
@@ -178,6 +171,13 @@ pub(crate) fn seek_constraint_annotation(
             parts.push(format!("{}{op_str}?", col.name));
         }
     }
+    parts
+}
+
+/// The same constraints as a parenthesised suffix, e.g. `" (label=? AND fromId>?)"`,
+/// or the empty string when the seek pins nothing down.
+fn fmt_seek_constraints(index: &crate::schema::Index, seek_def: &SeekDef) -> String {
+    let parts = seek_constraints(index, seek_def);
     if parts.is_empty() {
         String::new()
     } else {
@@ -310,7 +310,7 @@ impl Display for SelectPlan {
                             index: Some(index),
                             seek_def,
                         } => {
-                            let constraints = seek_constraint_annotation(index, seek_def);
+                            let constraints = fmt_seek_constraints(index, seek_def);
                             writeln!(
                                 f,
                                 "{indent}SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",

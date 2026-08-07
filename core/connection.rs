@@ -964,6 +964,42 @@ impl Connection {
         self._prepare(sql)
     }
 
+    /// Compiles `sql` and returns its query plan in machine-readable form.
+    ///
+    /// This is what `EXPLAIN QUERY PLAN <sql>` reports, except the steps come
+    /// back as structured values rather than English, so tools do not have to
+    /// parse the text. The statement itself is never run.
+    ///
+    /// `sql` is plain SQL: do not prefix it with `EXPLAIN QUERY PLAN`. An
+    /// `EXPLAIN` or `EXPLAIN QUERY PLAN` prefix is accepted and ignored, since
+    /// the plan of an EXPLAIN is just the plan of the statement it wraps.
+    pub fn query_plan(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+    ) -> Result<crate::explain_plan::QueryPlan> {
+        let sql = sql.as_ref();
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+        let Some(cmd) = cmd else {
+            return Err(LimboError::InvalidArgument(
+                "The supplied SQL string contains no statements".to_string(),
+            ));
+        };
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+            .expect("statement boundary always falls on a character boundary")
+            .trim();
+        let (program, _pager, _mode) = self.compile_cmd(
+            Cmd::ExplainQueryPlan(stmt),
+            input,
+            StatementOrigin::Root,
+            &PrepareOptions::default(),
+        )?;
+        Ok(program.query_plan())
+    }
+
     pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }

@@ -1615,6 +1615,30 @@ impl Program {
         &self.prepared
     }
 
+    /// Collects this program's `Explain` instructions into a machine-readable
+    /// query plan.
+    ///
+    /// Only a program compiled in [`QueryMode::ExplainQueryPlan`] emits those
+    /// instructions, so any other program yields a plan with no nodes.
+    pub fn query_plan(&self) -> crate::explain_plan::QueryPlan {
+        let nodes = self
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::Explain { p1, p2, op } => Some(crate::explain_plan::PlanNode {
+                    id: *p1,
+                    parent_id: *p2,
+                    op: (**op).clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        crate::explain_plan::QueryPlan {
+            sql: self.sql.clone(),
+            nodes,
+        }
+    }
+
     pub fn from_prepared(prepared: Arc<PreparedProgram>, connection: Arc<Connection>) -> Self {
         Self {
             prepared,
@@ -1804,7 +1828,7 @@ impl Program {
                 return Ok(StepResult::Done);
             }
 
-            let Insn::Explain { p1, p2, detail } = &self.insns[state.pc as usize].0 else {
+            let Insn::Explain { p1, p2, op } = &self.insns[state.pc as usize].0 else {
                 state.pc += 1;
                 continue;
             };
@@ -1813,7 +1837,7 @@ impl Program {
             state.registers[1] =
                 Register::Value(Value::from_i64(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
             state.registers[2].set_int(0);
-            state.registers[3].set_value(Value::from_text(detail.clone()));
+            state.registers[3].set_value(Value::from_text(op.to_string()));
             state.result_row = Some(Row {
                 values: &state.registers[0] as *const Register,
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),

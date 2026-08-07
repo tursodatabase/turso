@@ -576,12 +576,12 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid allocating a String if we are not in explain mode.
+/// because we want to avoid building the plan node if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
-    ($builder:expr, $push:expr, $detail:expr) => {
+    ($builder:expr, $push:expr, $op:expr) => {
         if let $crate::QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
-            $builder.emit_explain($push, $detail);
+            $builder.emit_explain($push, $op);
         }
     };
 }
@@ -1227,14 +1227,14 @@ impl ProgramBuilder {
         self.query_mode
     }
 
-    /// use emit_explain macro instead, because we don't want to allocate
-    /// String if we are not in explain mode
-    pub fn emit_explain(&mut self, push: bool, detail: String) {
+    /// use emit_explain macro instead, because we don't want to build a
+    /// [crate::explain_plan::PlanOp] if we are not in explain mode
+    pub fn emit_explain(&mut self, push: bool, op: crate::explain_plan::PlanOp) {
         if let QueryMode::ExplainQueryPlan = self.query_mode {
             self.emit_insn(Insn::Explain {
                 p1: self.insns.len(),
                 p2: self.current_parent_explain_idx,
-                detail,
+                op: Box::new(op),
             });
             if push {
                 self.current_parent_explain_idx = Some(self.insns.len() - 1);

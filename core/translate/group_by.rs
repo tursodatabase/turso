@@ -194,7 +194,14 @@ impl EmitGroupBy {
                 order_collations_nulls,
                 comparators,
             });
-            emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                crate::explain_plan::PlanOp::Sort {
+                    purpose: crate::explain_plan::SortPurpose::GroupBy,
+                    strategy: crate::explain_plan::SortStrategy::Sorter,
+                }
+            );
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
             GroupByRowSource::Sorter {
                 pseudo_cursor,
