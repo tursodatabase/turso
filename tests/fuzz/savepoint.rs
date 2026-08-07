@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod savepoint_tests {
     use std::panic::AssertUnwindSafe;
+    use std::sync::Arc;
 
     use rand::seq::IndexedRandom;
     use rand::Rng;
@@ -11,6 +12,8 @@ mod savepoint_tests {
     use core_tester::common::{
         limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase,
     };
+    use core_tester::queued_io::QueuedIo;
+    use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, SqliteDialect};
 
     const SAVEPOINT_NAMES: [&str; 8] = ["sp0", "sp1", "outer", "inner", "alpha", "beta", "x", "y"];
     const TAG_POOL: [&str; 8] = ["a", "b", "c", "d", "e", "foo", "bar", "baz"];
@@ -218,15 +221,65 @@ mod savepoint_tests {
     // differential rowid comparison invalid for auto-generated rowids.
     #[turso_macros::test]
     pub fn named_savepoint_differential_fuzz(db: TempDatabase) {
-        let (mut rng, seed) = helpers::init_fuzz_test("named_savepoint_differential_fuzz");
-
         let limbo_conn = db.connect_limbo();
+        run_named_savepoint_fuzz(
+            "named_savepoint_differential_fuzz",
+            &limbo_conn,
+            |stmt| limbo_exec_rows_fallible(&db, &limbo_conn, stmt).map(|_| ()),
+            None,
+        );
+    }
+
+    /// Every COMMIT and ROLLBACK here yields on IO before it finishes. A transaction that
+    /// writes only to the attached database leaves the main pager without a write
+    /// transaction, so only the end-of-transaction bookkeeping drops its savepoints.
+    #[test]
+    pub fn named_savepoint_differential_fuzz_with_yielding_commit() {
+        let db = Database::open_file_with_flags(
+            Arc::new(QueuedIo::new()),
+            "savepoint-fuzz-yielding-commit.db",
+            OpenFlags::default(),
+            DatabaseOpts::new().with_attach(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let limbo_conn = db.connect().unwrap();
+        run_named_savepoint_fuzz(
+            "named_savepoint_differential_fuzz_with_yielding_commit",
+            &limbo_conn,
+            |stmt| limbo_conn.execute(stmt),
+            Some("savepoint-fuzz-yielding-commit-aux.db"),
+        );
+    }
+
+    /// With `attached_db`, the statement mix also writes to a table in that attached
+    /// database and ends transactions with explicit BEGIN / COMMIT / ROLLBACK.
+    fn run_named_savepoint_fuzz(
+        test_name: &str,
+        limbo_conn: &Arc<Connection>,
+        run_limbo_stmt: impl Fn(&str) -> turso_core::Result<()>,
+        attached_db: Option<&str>,
+    ) {
+        let (mut rng, seed) = helpers::init_fuzz_test(test_name);
+
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         limbo_conn.execute("PRAGMA foreign_keys = ON").unwrap();
         sqlite_conn
             .execute("PRAGMA foreign_keys = ON", params![])
             .unwrap();
+
+        if let Some(attached_db) = attached_db {
+            limbo_conn
+                .execute(format!("ATTACH '{attached_db}' AS aux"))
+                .unwrap();
+            sqlite_conn
+                .execute("ATTACH ':memory:' AS aux", params![])
+                .unwrap();
+            limbo_conn.execute(AUX_SCHEMA).unwrap();
+            sqlite_conn.execute(AUX_SCHEMA, params![]).unwrap();
+        }
 
         for schema in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INT, v INT UNIQUE, tag TEXT)",
@@ -274,7 +327,7 @@ mod savepoint_tests {
 
         const STEPS: usize = 2000;
         let mut history = Vec::with_capacity(STEPS + 16);
-        let verify_queries = [
+        let mut verify_queries = vec![
             (
                 "t",
                 "SELECT id, grp, v, tag FROM t ORDER BY id, grp, v, tag",
@@ -287,14 +340,27 @@ mod savepoint_tests {
                  WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
             ),
         ];
+        if attached_db.is_some() {
+            verify_queries.push(("aux", "SELECT id, v FROM aux.a ORDER BY id"));
+        }
+        let stmt_kinds = if attached_db.is_some() {
+            0..185
+        } else {
+            0..100
+        };
 
         for step in 0..STEPS {
-            helpers::log_progress("named_savepoint_differential_fuzz", step, STEPS, 8);
+            helpers::log_progress(test_name, step, STEPS, 8);
 
-            let stmt = match rng.random_range(0..100) {
+            let stmt = match rng.random_range(stmt_kinds.clone()) {
                 0..=24 => random_dml_stmt(&mut rng),
                 25..=39 => random_fk_dml_stmt(&mut rng),
                 40..=49 => random_temp_ddl_stmt(&mut rng),
+                // A RELEASE that commits the transaction re-runs its Savepoint opcode when the
+                // commit yields on IO, and the second run no longer finds the savepoint.
+                50..=74 if attached_db.is_some() && sqlite_conn.is_autocommit() => {
+                    "BEGIN".to_string()
+                }
                 50..=74 => format!("SAVEPOINT {}", random_savepoint_name(&mut rng)),
                 75..=86 => {
                     let name = random_savepoint_name(&mut rng);
@@ -312,15 +378,15 @@ mod savepoint_tests {
                         format!("ROLLBACK TO SAVEPOINT {name}")
                     }
                 }
+                100..=159 => random_aux_dml_stmt(&mut rng),
+                160..=184 => random_txn_control_stmt(&mut rng).to_string(),
                 _ => unreachable!(),
             };
 
             history.push(stmt.clone());
 
             let sqlite_res = sqlite_conn.execute(&stmt, params![]);
-            let limbo_res = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                limbo_exec_rows_fallible(&db, &limbo_conn, &stmt)
-            }));
+            let limbo_res = std::panic::catch_unwind(AssertUnwindSafe(|| run_limbo_stmt(&stmt)));
             let limbo_res = match limbo_res {
                 Ok(res) => res,
                 Err(_) => {
@@ -341,10 +407,10 @@ mod savepoint_tests {
                 }
             }
 
-            for (label, verify_query) in verify_queries {
+            for &(label, verify_query) in &verify_queries {
                 let sqlite_rows = sqlite_exec_rows(&sqlite_conn, verify_query);
                 let limbo_rows = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    limbo_exec_rows(&limbo_conn, verify_query)
+                    limbo_exec_rows(limbo_conn, verify_query)
                 }));
                 let limbo_rows = match limbo_rows {
                     Ok(rows) => rows,
@@ -363,6 +429,30 @@ mod savepoint_tests {
                 );
             }
         }
+    }
+
+    const AUX_SCHEMA: &str = "CREATE TABLE aux.a (id INTEGER PRIMARY KEY, v INT)";
+
+    fn random_aux_dml_stmt(rng: &mut ChaCha8Rng) -> String {
+        let id = rng.random_range(1..=20);
+        match rng.random_range(0..3) {
+            0 => format!(
+                "INSERT OR REPLACE INTO aux.a(id, v) VALUES ({id}, {})",
+                random_nullable_int(rng, 1..=30)
+            ),
+            1 => format!(
+                "UPDATE aux.a SET v = {} WHERE id = {id}",
+                random_nullable_int(rng, 1..=30)
+            ),
+            2 => format!("DELETE FROM aux.a WHERE id = {id}"),
+            _ => unreachable!(),
+        }
+    }
+
+    fn random_txn_control_stmt(rng: &mut ChaCha8Rng) -> &'static str {
+        ["BEGIN", "BEGIN", "COMMIT", "COMMIT", "ROLLBACK"]
+            .choose(rng)
+            .unwrap()
     }
 
     #[turso_macros::test(mvcc)]
