@@ -533,7 +533,7 @@ pub fn try_substitute_parameters(
             }))
         }
         Expr::Variable(var) => {
-            if var.name.is_some() {
+            if !var.is_positional() {
                 return None;
             }
             let Ok(var) = i32::try_from(var.index.get()) else {
@@ -591,7 +591,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             Some(captured)
         }
         (Expr::Variable(var), expr) => {
-            if var.name.is_some() {
+            if !var.is_positional() {
                 return None;
             }
             let Ok(var) = i32::try_from(var.index.get()) else {

@@ -652,6 +652,14 @@ impl Variable {
             col_type: None,
         }
     }
+
+    /// True for the `?` and `?N` markers, which are bound by position.
+    /// `:name`, `@name` and `$name` markers are bound by name instead.
+    pub fn is_positional(&self) -> bool {
+        self.name
+            .as_deref()
+            .is_none_or(|name| name.starts_with('?'))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -5431,6 +5431,39 @@ mod tests {
     }
 
     #[test]
+    fn only_colon_at_and_dollar_markers_are_bound_by_name() {
+        for sql in ["SELECT ?", "SELECT ?1"] {
+            assert!(
+                parse_one_variable(sql).is_positional(),
+                "{sql} should be bound by position"
+            );
+        }
+        for sql in ["SELECT :a", "SELECT @a", "SELECT $a"] {
+            assert!(
+                !parse_one_variable(sql).is_positional(),
+                "{sql} should be bound by name"
+            );
+        }
+    }
+
+    fn parse_one_variable(sql: &str) -> Variable {
+        let mut p = Parser::new(sql.as_bytes());
+        let Some(Cmd::Stmt(Stmt::Select(select))) = p.next_cmd().unwrap() else {
+            panic!("expected a SELECT for {sql}");
+        };
+        let OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("expected a simple SELECT for {sql}");
+        };
+        let [ResultColumn::Expr(expr, _)] = columns.as_slice() else {
+            panic!("expected one result column for {sql}");
+        };
+        let Expr::Variable(variable) = expr.as_ref() else {
+            panic!("expected a variable for {sql}");
+        };
+        variable.clone()
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
