@@ -35,9 +35,8 @@ async fn main() -> turso_serverless::Result<()> {
 }
 ```
 
-For databases encrypted with a customer-managed key, pass the
-base64-encoded key with `Builder::with_remote_encryption_key`; it is sent
-as the `x-turso-encryption-key` header with every request.
+For a database encrypted with a customer-managed key, pass the
+base64-encoded key with `Builder::with_remote_encryption_key`.
 
 Interactive transactions span multiple HTTP requests; the server keeps the
 connection state alive between them:

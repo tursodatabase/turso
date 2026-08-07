@@ -71,9 +71,8 @@ impl Builder {
         self
     }
 
-    /// Set encryption key (base64-encoded) for the Turso Cloud database.
-    /// The key will be sent as the `x-turso-encryption-key` header with
-    /// every request.
+    /// Set the customer-managed encryption key (base64-encoded) for an
+    /// encrypted database.
     pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
         self.remote_encryption_key = Some(base64_key.into());
         self

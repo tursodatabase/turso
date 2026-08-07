@@ -60,9 +60,9 @@ import turso "turso.tech/database/tursogo-serverless"
 db := sql.OpenDB(turso.NewConnector(url, authToken))
 ```
 
-Databases encrypted with a customer-managed key need the key on every
-request. Pass it either as the `remote_encryption_key` query parameter in
-the connection string or through the connector:
+For a database encrypted with a customer-managed key, pass the key either
+as the `remote_encryption_key` query parameter in the connection string or
+through the connector:
 
 ```go
 db, err := sql.Open("turso-serverless", dsn+"&remote_encryption_key="+key)

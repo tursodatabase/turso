@@ -69,7 +69,7 @@ func (d *serverlessDriver) Open(dsn string) (driver.Conn, error) {
 // into a base URL, an auth token, and a remote encryption key. The URL can
 // use the turso://, libsql://, https://, or http:// scheme; other query
 // parameters are preserved.
-func parseDSN(dsn string) (string, string, string, error) {
+func parseDSN(dsn string) (baseURL, authToken, encryptionKey string, err error) {
 	if dsn == "" {
 		return "", "", "", errors.New("turso: empty DSN")
 	}
@@ -78,12 +78,12 @@ func parseDSN(dsn string) (string, string, string, error) {
 		return "", "", "", fmt.Errorf("turso: invalid DSN: %w", err)
 	}
 	q := u.Query()
-	token := q.Get("auth_token")
+	authToken = q.Get("auth_token")
 	q.Del("auth_token")
-	encryptionKey := q.Get("remote_encryption_key")
+	encryptionKey = q.Get("remote_encryption_key")
 	q.Del("remote_encryption_key")
 	u.RawQuery = q.Encode()
-	return normalizeURL(u.String()), token, encryptionKey, nil
+	return normalizeURL(u.String()), authToken, encryptionKey, nil
 }
 
 // --- driver.Connector ---
@@ -103,9 +103,8 @@ func NewConnector(url, authToken string) *Connector {
 	return &Connector{url: normalizeURL(url), authToken: authToken}
 }
 
-// WithRemoteEncryptionKey configures the connector to send the given
-// customer-managed encryption key with every request (see PROTOCOL.md
-// section 3.1) and returns the connector for chaining:
+// WithRemoteEncryptionKey sets the customer-managed encryption key for an
+// encrypted database and returns the connector for chaining:
 //
 //	db := sql.OpenDB(turso.NewConnector(url, token).WithRemoteEncryptionKey(key))
 func (c *Connector) WithRemoteEncryptionKey(key string) *Connector {

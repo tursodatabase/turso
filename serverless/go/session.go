@@ -14,8 +14,8 @@ import (
 	"strings"
 )
 
-// EncryptionKeyHeader is the HTTP header that carries the remote encryption
-// key on every request (section 3.1).
+// EncryptionKeyHeader is the HTTP header that carries the customer-managed
+// encryption key for an encrypted database.
 const EncryptionKeyHeader = "x-turso-encryption-key"
 
 // normalizeURL rewrites libsql:// and turso:// URLs to https:// and strips

@@ -364,8 +364,8 @@ def connect(
     Parameters:
     - url: Database URL (turso://, https://, http://, or libsql://)
     - auth_token: Authentication token
-    - remote_encryption_key: base64-encoded encryption key for encrypted
-      databases, sent as the `x-turso-encryption-key` header on every request
+    - remote_encryption_key: base64-encoded key for a database encrypted
+      with a customer-managed key
     - isolation_level: Transaction isolation level (default: DEFERRED)
     """
     session = Session(url, auth_token=auth_token, remote_encryption_key=remote_encryption_key)
