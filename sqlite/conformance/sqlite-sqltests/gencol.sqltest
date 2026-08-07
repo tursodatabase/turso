@@ -2273,6 +2273,79 @@ expect {
     5|10
 }
 
+# --- ORDER BY / GROUP BY on an indexed VIRTUAL column ---
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_order_by_nulls_first_limit {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v AS (a*2+b));
+    CREATE INDEX idx_v ON t1(v);
+    INSERT INTO t1(a,b) VALUES (1,1),(NULL,5),(2,0),(NULL,NULL),(4,4);
+    SELECT ifnull(v,'N') FROM t1 ORDER BY v LIMIT 3;
+}
+expect {
+    N
+    N
+    3
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_order_by_desc_nulls_last {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v AS (a*2+b));
+    CREATE INDEX idx_v ON t1(v);
+    INSERT INTO t1(a,b) VALUES (1,1),(NULL,5),(2,0),(NULL,NULL),(4,4);
+    SELECT ifnull(v,'N') FROM t1 ORDER BY v DESC;
+}
+expect {
+    12
+    4
+    3
+    N
+    N
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_group_by_null_group {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v AS (a*2+b));
+    CREATE INDEX idx_v ON t1(v);
+    INSERT INTO t1(a,b) VALUES (1,1),(NULL,5),(2,0),(NULL,NULL),(4,4);
+    SELECT ifnull(v,'N'), count(*) FROM t1 GROUP BY v;
+}
+expect {
+    N|2
+    3|1
+    4|1
+    12|1
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_min_max {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v AS (a*2+b));
+    CREATE INDEX idx_v ON t1(v);
+    INSERT INTO t1(a,b) VALUES (1,1),(NULL,5),(2,0),(NULL,NULL),(4,4);
+    SELECT max(v), min(v) FROM t1;
+}
+expect {
+    12|3
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_index_virtual_eq_prefix_order_by {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v AS (a*2+b));
+    CREATE INDEX idx_av ON t1(a, v);
+    INSERT INTO t1(a,b) VALUES (1,9),(1,1),(1,4),(2,0),(2,7);
+    SELECT v FROM t1 WHERE a = 1 ORDER BY v;
+}
+expect {
+    3
+    6
+    11
+}
+
 # --- Index UPDATE and integrity ---
 
 @cross-check-integrity
