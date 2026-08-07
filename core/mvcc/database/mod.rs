@@ -9125,11 +9125,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     Some(ValueRef::Text(v)) => Some(v.as_str()),
                                     _ => None,
                                 };
-                                let is_virtual_table = row_type == "table"
-                                    && sql.is_some_and(crate::util::sql_is_create_virtual_table);
                                 let has_btree = match row_type {
                                     "index" => true,
-                                    "table" => !is_virtual_table,
+                                    "table" => {
+                                        !sql.is_some_and(crate::util::sql_is_create_virtual_table)
+                                    }
                                     _ => false,
                                 };
                                 if has_btree {
