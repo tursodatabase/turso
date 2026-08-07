@@ -60,6 +60,16 @@ import turso "turso.tech/database/tursogo-serverless"
 db := sql.OpenDB(turso.NewConnector(url, authToken))
 ```
 
+Databases encrypted with a customer-managed key need the key on every
+request. Pass it either as the `remote_encryption_key` query parameter in
+the connection string or through the connector:
+
+```go
+db, err := sql.Open("turso-serverless", dsn+"&remote_encryption_key="+key)
+
+db := sql.OpenDB(turso.NewConnector(url, authToken).WithRemoteEncryptionKey(key))
+```
+
 Interactive transactions span multiple HTTP requests; the server keeps the
 connection state alive between them:
 

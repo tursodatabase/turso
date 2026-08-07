@@ -25,6 +25,7 @@ classifiers = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "hypothesis>=6.100",
 ]
 differential = [
     "pytest>=8.0",

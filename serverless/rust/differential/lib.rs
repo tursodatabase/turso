@@ -57,6 +57,27 @@ pub fn spec_unicode_options() -> &'static [JsonValue] {
     spec()["unicode_options"].as_array().unwrap()
 }
 
+/// The `tests.encryption_header` spec entry: the header name, the alphabet
+/// and length bounds for generated keys, and the number of examples to run.
+pub struct EncryptionHeaderSpec {
+    pub header: String,
+    pub key_alphabet: String,
+    pub key_min_len: usize,
+    pub key_max_len: usize,
+    pub num_examples: u64,
+}
+
+pub fn spec_encryption_header() -> EncryptionHeaderSpec {
+    let entry = &spec()["tests"]["encryption_header"];
+    EncryptionHeaderSpec {
+        header: entry["header"].as_str().unwrap().to_string(),
+        key_alphabet: entry["key_alphabet"].as_str().unwrap().to_string(),
+        key_min_len: entry["key_min_len"].as_u64().unwrap() as usize,
+        key_max_len: entry["key_max_len"].as_u64().unwrap() as usize,
+        num_examples: entry["num_examples"].as_u64().unwrap(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Operation vocabulary
 // ---------------------------------------------------------------------------
