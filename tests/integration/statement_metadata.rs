@@ -16,7 +16,6 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
-    use tempfile::TempDir;
     use turso_core::{ColumnTypeInfo, ColumnTypeKind, Statement};
 
     /// Helper: open a fresh DB with custom types + STRICT support enabled.
@@ -25,9 +24,11 @@ mod tests {
     /// same opt — every test that exercises the rich type-info path uses
     /// this constructor.
     fn fresh_db_with_custom_types(name: &str) -> TempDatabase {
-        let path = TempDir::new().unwrap().keep().join(name);
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
-        TempDatabase::new_with_existent_with_opts(&path, opts)
+        TempDatabase::builder()
+            .with_db_name(name)
+            .with_opts(opts)
+            .build()
     }
 
     /// Unwrap `Result<Option<ColumnTypeInfo>>` down to `ColumnTypeInfo`,

@@ -5965,11 +5965,12 @@ pub mod test {
         }
     }
 
+    /// The returned `TempDir` deletes the database directory when it drops, so
+    /// callers must hold it for as long as they use the database.
     #[allow(clippy::arc_with_non_send_sync)]
-    pub(crate) fn get_database() -> (Arc<Database>, std::path::PathBuf) {
-        let mut path = tempfile::tempdir().unwrap().keep();
-        let dbpath = path.clone();
-        path.push("test.db");
+    pub(crate) fn get_database() -> (Arc<Database>, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test.db");
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
             connection
@@ -5987,7 +5988,7 @@ pub mod test {
         )
         .unwrap();
         // db + tmp directory
-        (db, dbpath)
+        (db, temp_dir)
     }
 
     struct DeferredReadFile {
@@ -6118,9 +6119,7 @@ pub mod test {
     #[test]
     fn test_wal_truncate_checkpoint() {
         let (db, path) = get_database();
-        let mut walpath = path.clone().into_os_string().into_string().unwrap();
-        walpath.push_str("/test.db-wal");
-        let walpath = std::path::PathBuf::from(walpath);
+        let walpath = path.path().join("test.db-wal");
 
         let conn = db.connect().unwrap();
         conn.execute("create table test (id integer primary key, value text)")
@@ -6154,7 +6153,6 @@ pub mod test {
             bytes_after, 0,
             "WAL file should be truncated to 0 bytes, but is {bytes_after} bytes",
         );
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -6164,9 +6162,7 @@ pub mod test {
     )]
     fn test_shutdown_checkpoint_truncates_after_restart() {
         let (db, path) = get_database();
-        let mut walpath = path.clone().into_os_string().into_string().unwrap();
-        walpath.push_str("/test.db-wal");
-        let walpath = std::path::PathBuf::from(walpath);
+        let walpath = path.path().join("test.db-wal");
 
         let conn = db.connect().unwrap();
         conn.execute("create table test (id integer primary key, value text)")
@@ -6190,7 +6186,6 @@ pub mod test {
             bytes_after, 0,
             "Shutdown checkpoint should truncate WAL after RESTART, but WAL is {bytes_after} bytes",
         );
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     fn bulk_inserts(conn: &Arc<Connection>, n_txns: usize, rows_per_txn: usize) {
@@ -8363,7 +8358,7 @@ pub mod test {
     #[test]
     fn test_restart_checkpoint_clears_backfill_proof_and_later_replaces_it() {
         let (db, path) = get_database();
-        let wal_path = path.join("test.db-wal");
+        let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
         let conn = db.connect().unwrap();
         conn.wal_auto_actions_disable();
@@ -8451,7 +8446,7 @@ pub mod test {
     #[test]
     fn test_truncate_checkpoint_clears_backfill_proof_and_later_replaces_it() {
         let (db, path) = get_database();
-        let wal_path = path.join("test.db-wal");
+        let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
         let conn = db.connect().unwrap();
         conn.wal_auto_actions_disable();
@@ -9492,11 +9487,7 @@ pub mod test {
     fn restart_checkpoint_reset_wal_state_handling() {
         let (db, path) = get_database();
 
-        let walpath = {
-            let mut p = path.clone().into_os_string().into_string().unwrap();
-            p.push_str("/test.db-wal");
-            std::path::PathBuf::from(p)
-        };
+        let walpath = path.path().join("test.db-wal");
 
         let conn = db.connect().unwrap();
         conn.execute("create table test(id integer primary key, value text)")
@@ -9584,8 +9575,6 @@ pub mod test {
             .unwrap();
         let new_max = wal_shared.read().metadata.max_frame.load(Ordering::SeqCst);
         assert_eq!(new_max, 1, "first append after RESTART starts at frame 1");
-
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -9673,7 +9662,7 @@ pub mod test {
 
     #[test]
     fn test_wal_restart_blocks_readers() {
-        let (db, _) = get_database();
+        let (db, _temp_dir) = get_database();
         let conn1 = db.connect().unwrap();
         let conn2 = db.connect().unwrap();
 
@@ -10017,11 +10006,7 @@ pub mod test {
         let (db, path) = get_database();
         let conn = db.connect().unwrap();
 
-        let walpath = {
-            let mut p = path.clone().into_os_string().into_string().unwrap();
-            p.push_str("/test.db-wal");
-            std::path::PathBuf::from(p)
-        };
+        let walpath = path.path().join("test.db-wal");
 
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -10068,7 +10053,6 @@ pub mod test {
         assert_eq!(hdr.file_format, 3007000);
         assert_eq!(hdr.page_size, 4096, "invalid page size");
         assert_eq!(hdr.checkpoint_seq, 1, "invalid checkpoint_seq");
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -10076,11 +10060,7 @@ pub mod test {
         let (db, path) = get_database();
         let conn = db.connect().unwrap();
 
-        let walpath = {
-            let mut p = path.clone().into_os_string().into_string().unwrap();
-            p.push_str("/test.db-wal");
-            std::path::PathBuf::from(p)
-        };
+        let walpath = path.path().join("test.db-wal");
 
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -10145,7 +10125,6 @@ pub mod test {
             count, 1001,
             "we should have 1001 rows in the table all together"
         );
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     fn read_wal_header(path: &std::path::Path) -> sqlite3_ondisk::WalHeader {

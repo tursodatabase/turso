@@ -25,7 +25,7 @@ mod fuzz_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
-    use tempfile::{NamedTempFile, TempDir};
+    use tempfile::TempDir;
 
     use super::helpers;
     use core_tester::common::{
@@ -5651,10 +5651,11 @@ mod fuzz_tests {
 
             tracing::debug!(pending_byte_pgno, pending_byte);
 
-            let db_path = tempfile::NamedTempFile::new()?;
+            let temp_dir = tempfile::tempdir()?;
+            let db_path = temp_dir.path().join("test.db");
 
             {
-                let db = builder.clone().with_db_path(db_path.path()).build();
+                let db = builder.clone().with_db_path(&db_path).build();
 
                 let prev_pending_byte = TempDatabase::get_pending_byte();
                 tracing::debug!(prev_pending_byte);
@@ -5679,7 +5680,7 @@ mod fuzz_tests {
                 conn.close()?;
             }
 
-            rusqlite_integrity_check(db_path.path())?;
+            rusqlite_integrity_check(&db_path)?;
 
             TempDatabase::reset_pending_byte();
         }
@@ -7840,13 +7841,9 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test_tracing("test_data_layout_compatibility");
         const OUTER: usize = 100;
         const INNER: usize = 10;
-        let left = NamedTempFile::new().unwrap();
-        let right = NamedTempFile::new().unwrap();
-
-        let (_left, left) = left.keep().unwrap();
-        let (_right, right) = right.keep().unwrap();
-        // let left = left.path();
-        // let right = right.path();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let left = temp_dir.path().join("left.db");
+        let right = temp_dir.path().join("right.db");
 
         tracing::info!(
             "test_data_layout_compatibility seed: {}, left_path={:?}, right_path={:?}",
