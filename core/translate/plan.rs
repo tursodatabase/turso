@@ -2319,7 +2319,14 @@ impl Operation {
                 // All index columns must have equality constraints.
                 let num_index_cols = idx.columns.len();
                 let num_eq_prefix = seek_def.prefix.iter().filter(|c| c.eq.is_some()).count();
-                num_eq_prefix == num_index_cols
+                if num_eq_prefix != num_index_cols {
+                    return false;
+                }
+                // Only plain `=` components guarantee one row. An `IS`
+                // component matches NULL keys, and a UNIQUE index stores every
+                // NULL key separately, so e.g. `WHERE a IS NULL` can touch
+                // many rows.
+                (0..seek_def.prefix.len()).all(|i| !seek_def.is_null_matching_key_component(i))
             }
             // Table scans, hash joins, multi-index scans, etc. are not single-row.
             _ => false,

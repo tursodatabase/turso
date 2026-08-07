@@ -1,4 +1,4 @@
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 use rusqlite::types::Value;
 
 fn query_plan(conn: &std::sync::Arc<turso_core::Connection>, query: &str) -> String {
@@ -128,6 +128,81 @@ fn is_operator_seek_matches_null_key_components() {
         text(limbo_exec_rows(&conn, "SELECT c FROM t ORDER BY c")),
         vec!["c2".to_string(), "c3".to_string()]
     );
+}
+
+/// A UNIQUE index stores every NULL key separately, so `WHERE a IS NULL` can
+/// touch many rows even though the index is unique. The statement journal must
+/// stay enabled for such an UPDATE: if the statement fails halfway, the rows it
+/// already changed must be restored.
+#[test]
+fn failed_update_with_is_seek_on_unique_index_rolls_back_every_row() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(&conn, "CREATE TABLE t(a, b NOT NULL)");
+    limbo_exec_rows(&conn, "CREATE UNIQUE INDEX ta ON t(a)");
+    limbo_exec_rows(&conn, "INSERT INTO t VALUES (NULL, 1), (NULL, 2)");
+
+    limbo_exec_rows(&conn, "BEGIN");
+    // Row 1 gets b = 5, then row 2 hits the NOT NULL constraint. The whole
+    // statement must roll back, including the change to row 1 that was
+    // already applied.
+    let result = limbo_exec_rows_fallible(
+        &tmp_db,
+        &conn,
+        "UPDATE t SET b = CASE WHEN b = 1 THEN 5 ELSE NULL END WHERE a IS NULL",
+    );
+    assert!(
+        result.is_err(),
+        "expected the UPDATE to fail on NOT NULL, got {result:?}"
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT b FROM t ORDER BY rowid"),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]],
+        "the failed UPDATE must not leave row 1 changed"
+    );
+    limbo_exec_rows(&conn, "COMMIT");
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT b FROM t ORDER BY rowid"),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]],
+        "the change from the failed UPDATE must not survive COMMIT"
+    );
+}
+
+/// Same as above, but the many-NULL-rows key component sits at the end of a
+/// composite UNIQUE index behind an `IS <non-NULL>` component.
+#[test]
+fn failed_update_with_composite_is_seek_on_unique_index_rolls_back_every_row() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(&conn, "CREATE TABLE t(k1, k2, b NOT NULL)");
+    limbo_exec_rows(&conn, "CREATE UNIQUE INDEX tk ON t(k1, k2)");
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO t VALUES (1, NULL, 1), (1, NULL, 2), (2, 'x', 3)",
+    );
+
+    limbo_exec_rows(&conn, "BEGIN");
+    let result = limbo_exec_rows_fallible(
+        &tmp_db,
+        &conn,
+        "UPDATE t SET b = CASE WHEN b = 1 THEN 5 ELSE NULL END WHERE k1 IS 1 AND k2 IS NULL",
+    );
+    assert!(
+        result.is_err(),
+        "expected the UPDATE to fail on NOT NULL, got {result:?}"
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT b FROM t ORDER BY rowid"),
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)]
+        ],
+        "the failed UPDATE must not leave row 1 changed"
+    );
+    limbo_exec_rows(&conn, "COMMIT");
 }
 
 #[test]
