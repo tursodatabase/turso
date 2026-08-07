@@ -171,8 +171,8 @@ impl TursoExplainServer {
         }
     }
 
-    /// The tables and indexes in the database, so the page can offer them
-    /// while you type.
+    /// The tables in the database and their columns, so the page can show what
+    /// there is to query.
     fn schema_json(&self) -> Result<String> {
         let mut tables: Vec<(String, Vec<String>)> = Vec::new();
         for name in self.table_names()? {
