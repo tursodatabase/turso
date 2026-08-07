@@ -575,6 +575,59 @@ fn derive_initial_crc(salt: u64) -> u32 {
     crc32c::crc32c(&salt.to_le_bytes())
 }
 
+/// Outcome of a truncate's I/O completion, reported by the completion
+/// callback through a shared atomic (via the `u8` conversions below) and
+/// consumed by [`LogicalLog::settle_pending_truncate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TruncateIoOutcome {
+    /// Truncate completion has been issued but has not fired yet.
+    InFlight,
+    /// Truncate completion fired successfully: the file change is durable.
+    Succeeded,
+    /// Truncate completion fired with an error: the bytes never became durable.
+    Failed,
+}
+
+impl From<TruncateIoOutcome> for u8 {
+    fn from(outcome: TruncateIoOutcome) -> u8 {
+        match outcome {
+            TruncateIoOutcome::InFlight => 0,
+            TruncateIoOutcome::Succeeded => 1,
+            TruncateIoOutcome::Failed => 2,
+        }
+    }
+}
+
+impl From<u8> for TruncateIoOutcome {
+    fn from(value: u8) -> TruncateIoOutcome {
+        match value {
+            0 => TruncateIoOutcome::InFlight,
+            1 => TruncateIoOutcome::Succeeded,
+            2 => TruncateIoOutcome::Failed,
+            _ => unreachable!("invalid TruncateIoOutcome value: {value}"),
+        }
+    }
+}
+
+/// Post-truncate log state staged by [`LogicalLog::truncate_to_zero`].
+///
+/// The durable-extent offset and running CRC are what recovery trusts as
+/// "data is durable up to here", so they must not advance past a truncate the
+/// I/O layer has not confirmed (#7993). The new state (offset 0, header with a
+/// regenerated salt, CRC reseeded from that salt) is staged here and published
+/// by [`LogicalLog::settle_pending_truncate`] only once the truncate
+/// completion reports success; on failure it is discarded and the durable tail
+/// stays as-is.
+struct PendingTruncate {
+    /// Written by the truncate completion callback; holds a
+    /// [`TruncateIoOutcome`] encoded through its `u8` conversions.
+    outcome: Arc<crate::sync::atomic::AtomicU8>,
+    /// Header carrying the regenerated salt, published on success.
+    header: LogHeader,
+    /// Running CRC reseeded from the new salt, published on success.
+    running_crc: u32,
+}
+
 #[cfg_attr(feature = "aristo-instr", derive(aristo::instrument::Inspect))]
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
@@ -591,6 +644,9 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
+    /// Post-truncate state waiting for its truncate completion to confirm
+    /// durability. Published (or discarded) by `settle_pending_truncate`.
+    pending_truncate: Option<PendingTruncate>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -605,6 +661,18 @@ impl LogicalLog {
     /// Both underlying fields are already `pub`; this pairs them under the exact
     /// symbol the routed conformance tests expect.
     pub fn read_logicallog_offset_crc(&self) -> (u64, u32) {
+        // A truncate whose completion has confirmed durability but that has
+        // not been settled through a `&mut self` entry point yet already
+        // describes the durable tail: report the staged post-truncate state.
+        if let Some(pending) = &self.pending_truncate {
+            let outcome: TruncateIoOutcome = pending
+                .outcome
+                .load(crate::sync::atomic::Ordering::SeqCst)
+                .into();
+            if outcome == TruncateIoOutcome::Succeeded {
+                return (0, pending.running_crc);
+            }
+        }
         (self.offset, self.running_crc)
     }
 }
@@ -623,6 +691,7 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
+            pending_truncate: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -648,6 +717,7 @@ impl LogicalLog {
     }
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
+        self.settle_pending_truncate();
         self.running_crc = derive_initial_crc(header.salt);
         self.header = Some(header);
     }
@@ -673,6 +743,7 @@ impl LogicalLog {
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
+        self.settle_pending_truncate();
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
@@ -899,6 +970,7 @@ impl LogicalLog {
     }
 
     pub fn upgrade_header_for_log_tx(&mut self, tx: &LogRecord) -> Result<Option<Completion>> {
+        self.settle_pending_truncate();
         #[cfg(feature = "conn_raw_api")]
         let portable_changes_enabled =
             tx.portable_changes_enabled || !tx.portable_changes.is_empty();
@@ -945,6 +1017,7 @@ impl LogicalLog {
 
     #[aristo::intent("the in-memory log offset advances only after the corresponding frame pwrite has completed durably", id = "aristos:logical_log_inmemory_offset_advances_after_durable_write", verify = "full")]
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
+        self.settle_pending_truncate();
         self.offset = self
             .offset
             .checked_add(bytes)
@@ -1013,28 +1086,88 @@ impl LogicalLog {
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
+        self.settle_pending_truncate();
         let header = self.current_or_new_header()?;
         self.write_header(header)
     }
 
+    /// Publishes or discards the staged post-truncate state depending on
+    /// whether the truncate completion has fired.
+    ///
+    /// The durable-extent offset, running CRC, header, and
+    /// `max_appended_commit_ts` describe the durable tail of the log, so
+    /// every entry point that reads or mutates them must settle first:
+    /// - completion not fired yet: keep the durable tail untouched;
+    /// - completion succeeded: publish offset 0, the new-salt header, and the
+    ///   reseeded running CRC;
+    /// - completion failed: discard the staged state — the on-disk log still
+    ///   holds the old frames, so the durable tail stays where it was.
+    fn settle_pending_truncate(&mut self) {
+        use crate::sync::atomic::Ordering;
+        let Some(pending) = &self.pending_truncate else {
+            return;
+        };
+        match pending.outcome.load(Ordering::SeqCst).into() {
+            TruncateIoOutcome::InFlight => {}
+            TruncateIoOutcome::Succeeded => {
+                let pending = self
+                    .pending_truncate
+                    .take()
+                    .expect("pending truncate checked above");
+                self.header = Some(pending.header);
+                self.running_crc = pending.running_crc;
+                self.pending_running_crc = None;
+                self.offset = 0;
+                self.max_appended_commit_ts = 0;
+            }
+            TruncateIoOutcome::Failed => {
+                self.pending_truncate = None;
+            }
+        }
+    }
+
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
+        use crate::sync::atomic::{AtomicU8, Ordering};
+        self.settle_pending_truncate();
         // Regenerate salt so stale frames (from before truncation) cannot validate
-        // against the new CRC chain.
+        // against the new CRC chain. The new state (offset 0, new-salt header,
+        // reseeded running CRC) is only STAGED here: it is published by
+        // `settle_pending_truncate` once the completion confirms the truncate
+        // is durable. Advancing offset/CRC past an unconfirmed write would let
+        // a later read or recovery trust a position the data never reached
+        // (#7993).
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
-        self.running_crc = derive_initial_crc(header.salt);
-        self.pending_running_crc = None;
-        self.header = Some(header);
+        let running_crc = derive_initial_crc(header.salt);
 
-        let completion = Completion::new_trunc(move |result| {
-            if let Err(err) = result {
-                tracing::error!("logical_log_truncate failed: {}", err);
+        let outcome = Arc::new(AtomicU8::new(TruncateIoOutcome::InFlight.into()));
+        let completion = Completion::new_trunc({
+            let outcome = outcome.clone();
+            move |result| match result {
+                Ok(_) => outcome.store(TruncateIoOutcome::Succeeded.into(), Ordering::SeqCst),
+                Err(err) => {
+                    tracing::error!("logical_log_truncate failed: {}", err);
+                    outcome.store(TruncateIoOutcome::Failed.into(), Ordering::SeqCst);
+                }
             }
         });
-        let c = self.file.truncate(0, completion)?;
-        self.offset = 0;
-        self.max_appended_commit_ts = 0;
+        self.pending_truncate = Some(PendingTruncate {
+            outcome,
+            header,
+            running_crc,
+        });
+        let c = match self.file.truncate(0, completion) {
+            Ok(c) => c,
+            Err(err) => {
+                // The truncate was never issued; nothing to wait for.
+                self.pending_truncate = None;
+                return Err(err);
+            }
+        };
+        // Synchronous I/O layers (e.g. MemoryIO) complete inline: publish now
+        // so callers observing the log right after issuing see settled state.
+        self.settle_pending_truncate();
         Ok(c)
     }
 
@@ -1045,6 +1178,7 @@ impl LogicalLog {
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
         use super::LogicalLogTruncateOutcome;
+        self.settle_pending_truncate();
         if self.max_appended_commit_ts > checkpointed_through_ts {
             // Uncheckpointed frames remain — skip truncation.
             let c = Completion::new_trunc(|_| {});
@@ -1063,6 +1197,7 @@ impl LogicalLog {
     /// Either completion order leaves a header-sized file with the fresh header
     /// bytes at offset zero.
     pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
+        self.settle_pending_truncate();
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
         let mut header = self.current_or_new_header()?;
