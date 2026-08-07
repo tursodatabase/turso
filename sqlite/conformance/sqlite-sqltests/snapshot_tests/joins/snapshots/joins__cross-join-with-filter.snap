@@ -22,7 +22,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-`--SEARCH p USING INDEX ephemeral_products_t2 (category=?)
+`--SEARCH p USING COVERING INDEX ephemeral_products_t2 (category=?)
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4              p5  comment
