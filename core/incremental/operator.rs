@@ -315,7 +315,7 @@ mod tests {
                 // Get the blob data from column 3 (value column)
                 if let Some(Value::Blob(blob)) = values.get(3) {
                     // Deserialize the state
-                    match AggregateState::from_blob(blob) {
+                    match AggregateState::from_blob(blob, &agg.aggregates) {
                         Ok((state, group_key)) => {
                             // Should not have made it this far.
                             assert!(state.count != 0);
@@ -328,11 +328,7 @@ mod tests {
                             let output_row = HashableRow::new(rowid, output_values);
                             result.changes.push((output_row, 1));
                         }
-                        Err(e) => {
-                            // Log or handle the deserialization error
-                            // For now, we'll skip this entry
-                            eprintln!("Failed to deserialize aggregate state: {e}");
-                        }
+                        Err(e) => panic!("Failed to deserialize aggregate state: {e}"),
                     }
                 }
             }

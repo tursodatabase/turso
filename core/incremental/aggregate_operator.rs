@@ -97,10 +97,12 @@ const AGG_FUNC_MAX: i64 = 4;
 const AGG_FUNC_COUNT_DISTINCT: i64 = 5;
 const AGG_FUNC_SUM_DISTINCT: i64 = 6;
 const AGG_FUNC_AVG_DISTINCT: i64 = 7;
+const AGG_FUNC_COUNT_COLUMN: i64 = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggregateFunction {
     Count,
+    CountColumn(usize),   // COUNT(column_index), which skips NULLs
     CountDistinct(usize), // COUNT(DISTINCT column_index)
     Sum(usize),           // Column index
     SumDistinct(usize),   // SUM(DISTINCT column_index)
@@ -114,6 +116,7 @@ impl Display for AggregateFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AggregateFunction::Count => write!(f, "COUNT(*)"),
+            AggregateFunction::CountColumn(idx) => write!(f, "COUNT(col{idx})"),
             AggregateFunction::CountDistinct(idx) => write!(f, "COUNT(DISTINCT col{idx})"),
             AggregateFunction::Sum(idx) => write!(f, "SUM(col{idx})"),
             AggregateFunction::SumDistinct(idx) => write!(f, "SUM(DISTINCT col{idx})"),
@@ -137,6 +140,12 @@ impl AggregateFunction {
     pub fn to_values(&self) -> Vec<Value> {
         match self {
             AggregateFunction::Count => vec![Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT))],
+            AggregateFunction::CountColumn(idx) => {
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_COLUMN)),
+                    Value::from_i64(*idx as i64),
+                ]
+            }
             AggregateFunction::CountDistinct(idx) => {
                 vec![
                     Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_DISTINCT)),
@@ -193,6 +202,20 @@ impl AggregateFunction {
             Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT)) => {
                 *cursor += 1;
                 AggregateFunction::Count
+            }
+            Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_COLUMN)) => {
+                *cursor += 1;
+                let idx = values.get(*cursor).ok_or_else(|| {
+                    LimboError::InternalError("Missing COUNT(column) column index".into())
+                })?;
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
+                    *cursor += 1;
+                    AggregateFunction::CountColumn(*idx as usize)
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for COUNT(column) column index, got {idx:?}"
+                    )));
+                }
             }
             Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_DISTINCT)) => {
                 *cursor += 1;
@@ -311,7 +334,12 @@ impl AggregateFunction {
         match func {
             Func::Agg(agg_func) => {
                 match agg_func {
-                    AggFunc::Count | AggFunc::Count0 => Some(AggregateFunction::Count),
+                    AggFunc::Count0 => Some(AggregateFunction::Count),
+                    AggFunc::Count => {
+                        Some(input_column_idx.map_or(AggregateFunction::Count, |idx| {
+                            AggregateFunction::CountColumn(idx)
+                        }))
+                    }
                     AggFunc::Sum => input_column_idx.map(AggregateFunction::Sum),
                     AggFunc::Avg => input_column_idx.map(AggregateFunction::Avg),
                     AggFunc::Min => input_column_idx.map(AggregateFunction::Min),
@@ -591,6 +619,8 @@ impl SumAccumulator {
 pub struct AggregateState {
     // For COUNT: just the count
     pub count: i64,
+    // For COUNT(column): column_index -> number of non-NULL values
+    pub column_counts: HashMap<usize, i64>,
     // For SUM: column_index -> running sum
     pub sums: HashMap<usize, SumAccumulator>,
     // For AVG: column_index -> running sum, divided by its non-NULL count
@@ -742,9 +772,11 @@ impl AggregateEvalState {
                     } else if let Some(rowid) = rowid {
                         let key = SeekKey::TableRowId(*rowid);
                         // Regular aggregates - read the blob
-                        let state = return_if_io!(
-                            read_record_state.read_record(key, &mut cursors.table_cursor)
-                        );
+                        let state = return_if_io!(read_record_state.read_record(
+                            key,
+                            &mut cursors.table_cursor,
+                            &operator.aggregates
+                        ));
                         // Process the fetched state
                         if let Some(state) = state {
                             let mut old_row = group_key.clone();
@@ -912,6 +944,10 @@ impl AggregateState {
                             .to_values(),
                     );
                 }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = self.column_counts.get(col_idx).copied().unwrap_or(0);
+                    values.push(Value::from_i64(count));
+                }
                 AggregateFunction::AvgDistinct(col_idx) => {
                     // Store both the distinct count and sum for this column
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
@@ -941,10 +977,15 @@ impl AggregateState {
         values
     }
 
-    /// Reconstruct aggregate state from a vector of Values
-    pub fn from_value_vector(values: &[Value]) -> Result<Self> {
+    /// Reconstruct aggregate state from a vector of Values.
+    ///
+    /// `expected` is the aggregate list the compiler built for the view. State
+    /// written under a different list would be read into the wrong
+    /// accumulators, so any disagreement is an error.
+    pub fn from_value_vector(values: &[Value], expected: &[AggregateFunction]) -> Result<Self> {
         let mut cursor = 0;
         let mut state = Self::new();
+        let mut persisted = Vec::with_capacity(expected.len());
 
         // Read count
         let count = values
@@ -977,6 +1018,7 @@ impl AggregateState {
         for _ in 0..num_aggregates {
             // Deserialize the aggregate function metadata
             let agg_fn = AggregateFunction::from_values(values, &mut cursor)?;
+            persisted.push(agg_fn.clone());
 
             // Read the state for this aggregate
             match agg_fn {
@@ -1054,6 +1096,19 @@ impl AggregateState {
                     let sum = SumAccumulator::from_values(values, &mut cursor, "AVG")?;
                     state.avgs.insert(col_idx, sum);
                 }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = values.get(cursor).ok_or_else(|| {
+                        LimboError::InternalError("Missing COUNT(column) value".into())
+                    })?;
+                    if let Value::Numeric(Numeric::Integer(count)) = count {
+                        state.column_counts.insert(col_idx, *count);
+                        cursor += 1;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Expected Integer for COUNT(column) value, got {count:?}"
+                        )));
+                    }
+                }
                 AggregateFunction::Min(col_idx) => {
                     let has_value = values.get(cursor).ok_or_else(|| {
                         LimboError::InternalError("Missing MIN has_value flag".into())
@@ -1101,6 +1156,14 @@ impl AggregateState {
             }
         }
 
+        if persisted != expected {
+            return Err(LimboError::InternalError(format!(
+                "Persisted aggregate state was written for a different set of \
+                 aggregates (stored {persisted:?}, view expects {expected:?}). \
+                 Rebuild the view with REFRESH MATERIALIZED VIEW."
+            )));
+        }
+
         Ok(state)
     }
 
@@ -1119,7 +1182,7 @@ impl AggregateState {
         Ok(record.into_payload())
     }
 
-    pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
+    pub fn from_blob(blob: &[u8], expected: &[AggregateFunction]) -> Result<(Self, Vec<Value>)> {
         let record = ImmutableRecordRef::from_bin_record(blob);
         let mut all_values = record.get_values_owned()?;
 
@@ -1162,7 +1225,7 @@ impl AggregateState {
         let state_values = &all_values[group_key_count..];
 
         // Reconstruct the aggregate state
-        let state = Self::from_value_vector(state_values)?;
+        let state = Self::from_value_vector(state_values, expected)?;
 
         Ok((state, group_key))
     }
@@ -1256,6 +1319,13 @@ impl AggregateState {
                             .add(val, weight as i64);
                     }
                 }
+                AggregateFunction::CountColumn(col_idx) => {
+                    if let Some(val) = values.get(*col_idx) {
+                        if !matches!(val, Value::Null) {
+                            *self.column_counts.entry(*col_idx).or_insert(0) += weight as i64;
+                        }
+                    }
+                }
                 AggregateFunction::Min(_col_name) | AggregateFunction::Max(_col_name) => {
                     // MIN/MAX cannot be handled incrementally in apply_delta because:
                     //
@@ -1299,6 +1369,10 @@ impl AggregateState {
                 AggregateFunction::CountDistinct(col_idx) => {
                     // Return the computed DISTINCT count
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
+                    result.push(Value::from_i64(count));
+                }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = self.column_counts.get(col_idx).copied().unwrap_or(0);
                     result.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
@@ -3249,5 +3323,74 @@ impl MinMaxPersistState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_count(count: i64) -> AggregateState {
+        let mut state = AggregateState::new();
+        state.count = count;
+        state
+    }
+
+    /// A view created before count(x) had its own aggregate stored count(x) as
+    /// plain COUNT, without a per-column count. Read as CountColumn, the
+    /// count would restart from zero and a later INSERT would lower it.
+    #[test]
+    fn state_written_as_plain_count_is_rejected_for_count_column() {
+        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Count]);
+
+        let err =
+            AggregateState::from_value_vector(&persisted, &[AggregateFunction::CountColumn(1)])
+                .expect_err("must not read plain COUNT state into a CountColumn aggregate");
+        assert!(
+            err.to_string().contains("REFRESH MATERIALIZED VIEW"),
+            "the error must name the recovery, got: {err}"
+        );
+    }
+
+    #[test]
+    fn state_written_for_a_different_function_is_rejected() {
+        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Sum(1)]);
+
+        AggregateState::from_value_vector(&persisted, &[AggregateFunction::Avg(1)])
+            .expect_err("a different aggregate function must be rejected");
+    }
+
+    #[test]
+    fn state_written_for_a_different_number_of_aggregates_is_rejected() {
+        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Count]);
+
+        AggregateState::from_value_vector(
+            &persisted,
+            &[AggregateFunction::Count, AggregateFunction::CountColumn(1)],
+        )
+        .expect_err("a longer aggregate list must be rejected");
+    }
+
+    #[test]
+    fn state_for_the_same_aggregates_keeps_counting() {
+        let aggregates = vec![AggregateFunction::CountColumn(1), AggregateFunction::Count];
+        let mut state = state_with_count(3);
+        state.column_counts.insert(1, 2);
+
+        let mut restored =
+            AggregateState::from_value_vector(&state.to_value_vector(&aggregates), &aggregates)
+                .unwrap();
+        assert_eq!(restored.to_values(&aggregates)[0], Value::from_i64(2));
+
+        restored
+            .apply_delta(
+                &[Value::from_i64(4), Value::from_i64(9)],
+                1,
+                &aggregates,
+                &[],
+                &HashMap::default(),
+            )
+            .unwrap();
+        assert_eq!(restored.to_values(&aggregates)[0], Value::from_i64(3));
     }
 }

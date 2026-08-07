@@ -1,4 +1,4 @@
-use crate::incremental::operator::{AggregateState, DbspStateCursors};
+use crate::incremental::operator::{AggregateFunction, AggregateState, DbspStateCursors};
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::types::IOResultOr;
@@ -23,6 +23,7 @@ impl ReadRecord {
         &mut self,
         key: SeekKey,
         cursor: &mut BTreeCursor,
+        expected: &[AggregateFunction],
     ) -> IOResultOr<Option<AggregateState>> {
         loop {
             match self {
@@ -43,7 +44,7 @@ impl ReadRecord {
                         let blob = r.get_value(3)?.to_owned()?;
 
                         let (state, _group_key) = match blob {
-                            Value::Blob(blob) => AggregateState::from_blob(&blob),
+                            Value::Blob(blob) => AggregateState::from_blob(&blob, expected),
                             Value::Null => {
                                 // For plain DISTINCT, we store null value and just track weight
                                 // Return a minimal state indicating existence
