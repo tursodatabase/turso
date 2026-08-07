@@ -1715,6 +1715,28 @@ impl ProgramBuilder {
         self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
     }
 
+    /// Run `f` while reads for this table use `cursor_id`.
+    ///
+    /// This is used while an automatic index calculates a virtual column. The
+    /// new index does not have a row yet, so the calculation must read from the
+    /// source table. The old cursor is restored after `f` returns.
+    pub fn with_cursor_override<T>(
+        &mut self,
+        table_ref_id: TableInternalId,
+        cursor_id: CursorID,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let table_id = table_ref_id.into();
+        let old_cursor = self.cursor_overrides.insert(table_id, cursor_id);
+        let result = f(self);
+        if let Some(old_cursor) = old_cursor {
+            self.cursor_overrides.insert(table_id, old_cursor);
+        } else {
+            self.cursor_overrides.remove(&table_id);
+        }
+        result
+    }
+
     /// Clear the cursor override for a table.
     pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
         self.cursor_overrides.remove(&table_ref_id.into());
