@@ -257,7 +257,7 @@ test eqp-elide-composite-eq-prefix-trailing-nulls-last {
     EXPLAIN QUERY PLAN SELECT b FROM t WHERE a = 1 ORDER BY b NULLS LAST;
 }
 expect {
-    1|0|0|SEARCH t USING INDEX idx (a=?)
+    1|0|0|SEARCH t USING COVERING INDEX idx (a=?)
 }
 
 @setup single_data
@@ -451,7 +451,7 @@ test eqp-range-seek-on-nulls-last-index {
     EXPLAIN QUERY PLAN SELECT id FROM t WHERE a > 1;
 }
 expect {
-    1|0|0|SEARCH t USING INDEX idx (a>?)
+    1|0|0|SEARCH t USING COVERING INDEX idx (a>?)
 }
 
 @setup single_data
@@ -460,7 +460,7 @@ test eqp-upper-range-seek-on-nulls-last-index {
     EXPLAIN QUERY PLAN SELECT id FROM t WHERE a < 3;
 }
 expect {
-    1|0|0|SEARCH t USING INDEX idx (a<?)
+    1|0|0|SEARCH t USING COVERING INDEX idx (a<?)
 }
 
 @setup single_data
