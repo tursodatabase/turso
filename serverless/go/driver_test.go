@@ -689,6 +689,19 @@ func TestParseDSNEmpty(t *testing.T) {
 	}
 }
 
+func TestParseDSNErrorRedactsSecrets(t *testing.T) {
+	dsn := "turso://my-db.turso.io\x7f?auth_token=SECRETTOKEN&remote_encryption_key=SECRETKEY"
+	_, _, _, err := parseDSN(dsn)
+	if err == nil {
+		t.Fatal("expected error for DSN with control character")
+	}
+	for _, secret := range []string{"SECRETTOKEN", "SECRETKEY"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error message leaks %s: %q", secret, err)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Value encoding and decoding (no server needed)
 // ---------------------------------------------------------------------------

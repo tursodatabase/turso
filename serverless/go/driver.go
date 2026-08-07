@@ -75,6 +75,12 @@ func parseDSN(dsn string) (baseURL, authToken, encryptionKey string, err error) 
 	}
 	u, err := url.Parse(dsn)
 	if err != nil {
+		// A url.Error echoes the full DSN, which can carry the auth token
+		// and encryption key; report only the underlying reason.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
 		return "", "", "", fmt.Errorf("turso: invalid DSN: %w", err)
 	}
 	q := u.Query()
