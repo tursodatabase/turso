@@ -503,16 +503,25 @@ pub fn try_substitute_parameters(
             }))
         }
         Expr::Variable(var) => {
-            if var.name.is_some() {
-                return None;
-            }
-            let Ok(var) = i32::try_from(var.index.get()) else {
-                return None;
-            };
-            Some(Box::new(parameters.get(&var)?.clone()))
+            let index = pattern_parameter_index(var)?;
+            Some(Box::new(parameters.get(&index)?.clone()))
         }
         _ => Some(Box::new(pattern.clone())),
     }
+}
+
+/// Return the number used by a pattern parameter.
+///
+/// SQL keeps the text of `?1` as its name so bindings can read that text. It
+/// is still a numbered parameter when an index method uses it in a pattern.
+fn pattern_parameter_index(variable: &ast::Variable) -> Option<i32> {
+    if let Some(name) = variable.name.as_deref() {
+        let number = name.strip_prefix('?')?.parse::<u32>().ok()?;
+        if number != variable.index.get() {
+            return None;
+        }
+    }
+    i32::try_from(variable.index.get()).ok()
 }
 
 pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i32, Expr>> {
@@ -561,13 +570,8 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             Some(captured)
         }
         (Expr::Variable(var), expr) => {
-            if var.name.is_some() {
-                return None;
-            }
-            let Ok(var) = i32::try_from(var.index.get()) else {
-                return None;
-            };
-            captured.insert(var, expr.clone());
+            let index = pattern_parameter_index(var)?;
+            captured.insert(index, expr.clone());
             Some(captured)
         }
         (
@@ -5394,6 +5398,18 @@ pub mod tests {
         let expr1 = Expr::Variable(Variable::named(":a".to_string(), 1u32.try_into().unwrap()));
         let expr2 = Expr::Variable(Variable::named(":b".to_string(), 2u32.try_into().unwrap()));
         assert!(!exprs_are_equivalent(&expr1, &expr2));
+    }
+
+    #[test]
+    fn explicit_number_can_be_a_pattern_parameter() {
+        let pattern = Expr::Variable(Variable::named("?1", 1u32.try_into().unwrap()));
+        let value = Expr::Literal(Literal::String("rust".to_string()));
+
+        let parameters = try_capture_parameters(&pattern, &value).unwrap();
+        assert_eq!(
+            try_substitute_parameters(&pattern, &parameters),
+            Some(Box::new(value))
+        );
     }
 
     #[test]
