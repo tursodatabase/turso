@@ -1,4 +1,37 @@
 use crate::common::{limbo_exec_rows, TempDatabase};
+
+/// `h.v = 5 OR h.w = 7` can never be TRUE when every column of `h` is NULL,
+/// so the LEFT JOIN behaves like an inner join and must be rewritten to one —
+/// which in turn lets the OR term drive a multi-index scan, like SQLite does.
+#[test]
+fn null_rejecting_or_term_converts_left_join_and_uses_multi_index_scan() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(&conn, "CREATE TABLE g(id INTEGER PRIMARY KEY)");
+    limbo_exec_rows(&conn, "CREATE TABLE h(id INTEGER, v INTEGER, w INTEGER)");
+    limbo_exec_rows(&conn, "CREATE INDEX hv ON h(v)");
+    limbo_exec_rows(&conn, "CREATE INDEX hw ON h(w)");
+
+    let plan = {
+        let rows = limbo_exec_rows(
+            &conn,
+            "EXPLAIN QUERY PLAN SELECT * FROM g LEFT JOIN h ON g.id = h.id WHERE h.v = 5 OR h.w = 7",
+        );
+        rows.iter()
+            .filter_map(|row| match row.get(3) {
+                Some(rusqlite::types::Value::Text(plan)) => Some(plan.as_str().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        plan.contains("MULTI-INDEX OR"),
+        "expected the OR term to drive a multi-index scan after the join is \
+         rewritten to inner, got:\n{plan}"
+    );
+}
 use core_tester::common::sqlite_exec_rows;
 use rusqlite::types::Value;
 
