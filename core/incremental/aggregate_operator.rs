@@ -96,10 +96,12 @@ const AGG_FUNC_MAX: i64 = 4;
 const AGG_FUNC_COUNT_DISTINCT: i64 = 5;
 const AGG_FUNC_SUM_DISTINCT: i64 = 6;
 const AGG_FUNC_AVG_DISTINCT: i64 = 7;
+const AGG_FUNC_COUNT_COLUMN: i64 = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggregateFunction {
     Count,
+    CountColumn(usize),   // COUNT(column_index), which skips NULLs
     CountDistinct(usize), // COUNT(DISTINCT column_index)
     Sum(usize),           // Column index
     SumDistinct(usize),   // SUM(DISTINCT column_index)
@@ -113,6 +115,7 @@ impl Display for AggregateFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AggregateFunction::Count => write!(f, "COUNT(*)"),
+            AggregateFunction::CountColumn(idx) => write!(f, "COUNT(col{idx})"),
             AggregateFunction::CountDistinct(idx) => write!(f, "COUNT(DISTINCT col{idx})"),
             AggregateFunction::Sum(idx) => write!(f, "SUM(col{idx})"),
             AggregateFunction::SumDistinct(idx) => write!(f, "SUM(DISTINCT col{idx})"),
@@ -136,6 +139,12 @@ impl AggregateFunction {
     pub fn to_values(&self) -> Vec<Value> {
         match self {
             AggregateFunction::Count => vec![Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT))],
+            AggregateFunction::CountColumn(idx) => {
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_COLUMN)),
+                    Value::from_i64(*idx as i64),
+                ]
+            }
             AggregateFunction::CountDistinct(idx) => {
                 vec![
                     Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_DISTINCT)),
@@ -192,6 +201,20 @@ impl AggregateFunction {
             Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT)) => {
                 *cursor += 1;
                 AggregateFunction::Count
+            }
+            Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_COLUMN)) => {
+                *cursor += 1;
+                let idx = values.get(*cursor).ok_or_else(|| {
+                    LimboError::InternalError("Missing COUNT(column) column index".into())
+                })?;
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
+                    *cursor += 1;
+                    AggregateFunction::CountColumn(*idx as usize)
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for COUNT(column) column index, got {idx:?}"
+                    )));
+                }
             }
             Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_DISTINCT)) => {
                 *cursor += 1;
@@ -310,7 +333,12 @@ impl AggregateFunction {
         match func {
             Func::Agg(agg_func) => {
                 match agg_func {
-                    AggFunc::Count | AggFunc::Count0 => Some(AggregateFunction::Count),
+                    AggFunc::Count0 => Some(AggregateFunction::Count),
+                    AggFunc::Count => {
+                        Some(input_column_idx.map_or(AggregateFunction::Count, |idx| {
+                            AggregateFunction::CountColumn(idx)
+                        }))
+                    }
                     AggFunc::Sum => input_column_idx.map(AggregateFunction::Sum),
                     AggFunc::Avg => input_column_idx.map(AggregateFunction::Avg),
                     AggFunc::Min => input_column_idx.map(AggregateFunction::Min),
@@ -590,6 +618,8 @@ impl SumAccumulator {
 pub struct AggregateState {
     // For COUNT: just the count
     pub count: i64,
+    // For COUNT(column): column_index -> number of non-NULL values
+    pub column_counts: HashMap<usize, i64>,
     // For SUM: column_index -> running sum
     pub sums: HashMap<usize, SumAccumulator>,
     // For AVG: column_index -> running sum, divided by its non-NULL count
@@ -911,6 +941,10 @@ impl AggregateState {
                             .to_values(),
                     );
                 }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = self.column_counts.get(col_idx).copied().unwrap_or(0);
+                    values.push(Value::from_i64(count));
+                }
                 AggregateFunction::AvgDistinct(col_idx) => {
                     // Store both the distinct count and sum for this column
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
@@ -1052,6 +1086,19 @@ impl AggregateState {
                 AggregateFunction::Avg(col_idx) => {
                     let sum = SumAccumulator::from_values(values, &mut cursor, "AVG")?;
                     state.avgs.insert(col_idx, sum);
+                }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = values.get(cursor).ok_or_else(|| {
+                        LimboError::InternalError("Missing COUNT(column) value".into())
+                    })?;
+                    if let Value::Numeric(Numeric::Integer(count)) = count {
+                        state.column_counts.insert(col_idx, *count);
+                        cursor += 1;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Expected Integer for COUNT(column) value, got {count:?}"
+                        )));
+                    }
                 }
                 AggregateFunction::Min(col_idx) => {
                     let has_value = values.get(cursor).ok_or_else(|| {
@@ -1255,6 +1302,13 @@ impl AggregateState {
                             .add(val, weight as i64);
                     }
                 }
+                AggregateFunction::CountColumn(col_idx) => {
+                    if let Some(val) = values.get(*col_idx) {
+                        if !matches!(val, Value::Null) {
+                            *self.column_counts.entry(*col_idx).or_insert(0) += weight as i64;
+                        }
+                    }
+                }
                 AggregateFunction::Min(_col_name) | AggregateFunction::Max(_col_name) => {
                     // MIN/MAX cannot be handled incrementally in apply_delta because:
                     //
@@ -1298,6 +1352,10 @@ impl AggregateState {
                 AggregateFunction::CountDistinct(col_idx) => {
                     // Return the computed DISTINCT count
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
+                    result.push(Value::from_i64(count));
+                }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = self.column_counts.get(col_idx).copied().unwrap_or(0);
                     result.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
