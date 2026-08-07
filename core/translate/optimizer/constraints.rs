@@ -1387,40 +1387,50 @@ pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usiz
     ordered
 }
 
-pub(super) fn partial_index_predicate_terms(
+pub(crate) fn partial_index_can_use_query_term(
+    table_reference: &JoinedTable,
+    term: &WhereTerm,
+) -> bool {
+    let Some(join_info) = &table_reference.join_info else {
+        return true;
+    };
+    if join_info.is_full_outer() {
+        return false;
+    }
+    if join_info.is_outer() {
+        return term.from_outer_join == Some(table_reference.internal_id);
+    }
+    true
+}
+
+pub(crate) fn partial_index_predicate_conjuncts(
     index: &Index,
     table_reference: &JoinedTable,
-    query_where_clause: &[WhereTerm],
-) -> Option<SmallVec<[usize; 4]>> {
-    let index_where = index
-        .where_clause
-        .as_ref()
-        .expect("partial_index_predicate_terms requires a partial index");
-    let can_use_query_term = |term: &WhereTerm| -> bool {
-        let Some(join_info) = &table_reference.join_info else {
-            return true;
-        };
-        if join_info.is_full_outer() {
-            return false;
-        }
-        if join_info.is_outer() {
-            return term.from_outer_join == Some(table_reference.internal_id);
-        }
-        true
-    };
-    // Bind the index WHERE expression's column references to this query's
-    // table reference so it can be compared symmetrically against bound query
-    // WHERE terms. Each conjunct of the index WHERE must match some query
-    // WHERE term for the partial index to be safe to use.
+) -> Option<Vec<ast::Expr>> {
+    let index_where = index.where_clause.as_ref()?;
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
     rewrite_between_exprs(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
+    Some(index_conjuncts)
+}
+
+pub(super) fn partial_index_predicate_terms(
+    index: &Index,
+    table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
+) -> Option<SmallVec<[usize; 4]>> {
+    assert!(
+        index.where_clause.is_some(),
+        "partial_index_predicate_terms requires a partial index"
+    );
+    let index_conjuncts = partial_index_predicate_conjuncts(index, table_reference)?;
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
         let (term_idx, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && exprs_are_equivalent(index_conjunct, &term.expr)
+            partial_index_can_use_query_term(table_reference, term)
+                && exprs_are_equivalent(index_conjunct, &term.expr)
         })?;
         if !matched_terms.contains(&term_idx) {
             matched_terms.push(term_idx);

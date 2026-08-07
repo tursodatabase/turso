@@ -10,7 +10,9 @@ use crate::{
         emitter::UpdateRowSource,
         expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
-        optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
+        optimizer::constraints::{
+            partial_index_predicate_conjuncts, BinaryExprSide, SeekRangeConstraint,
+        },
         planner::determine_where_to_eval_term,
     },
     types::SeekOp,
@@ -1183,6 +1185,7 @@ pub struct JoinedTable {
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
     pub expression_index_usages: Vec<ExpressionIndexUsage>,
+    pub partial_index_predicate_usages: Vec<PartialIndexPredicateUsage>,
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
@@ -2134,6 +2137,12 @@ impl<T> TryFrom<u128> for BitSet<T> {
 }
 
 #[derive(Clone, Debug)]
+pub struct PartialIndexPredicateUsage {
+    pub predicate: Box<ast::Expr>,
+    pub column_counts: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ExpressionIndexUsage {
     /// Normalized (non-bound) ast of the expression as stored on an index column.
     /// Example: `lower(name)` for INDEX ON t(lower(name)).
@@ -2528,6 +2537,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
         })
@@ -2574,6 +2584,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
         })
@@ -2606,6 +2617,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
         })
@@ -2628,6 +2640,22 @@ impl JoinedTable {
     /// Clear any previously registered expression index usages.
     pub fn clear_expression_index_usages(&mut self) {
         self.expression_index_usages.clear();
+    }
+
+    pub fn clear_partial_index_predicate_usages(&mut self) {
+        self.partial_index_predicate_usages.clear();
+    }
+
+    pub fn register_partial_index_predicate_usage(
+        &mut self,
+        predicate: ast::Expr,
+        column_counts: Vec<usize>,
+    ) {
+        self.partial_index_predicate_usages
+            .push(PartialIndexPredicateUsage {
+                predicate: Box::new(predicate),
+                column_counts,
+            });
     }
 
     /// Example: SELECT a+b FROM t WHERE a+b=5 with INDEX ON t(a+b)
@@ -2696,6 +2724,51 @@ impl JoinedTable {
             // Only drop the requirement if *all* references to this column are
             // satisfied by expression-index values. If the column is also
             // selected or filtered directly, the table data is still needed.
+            if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
+                required_columns.clear(col_idx);
+            }
+        }
+    }
+
+    fn apply_partial_index_predicate_coverage(
+        &self,
+        index: &Index,
+        required_columns: &mut ColumnUsedMask,
+    ) {
+        let Some(index_conjuncts) = partial_index_predicate_conjuncts(index, self) else {
+            return;
+        };
+        let mut proven_usages = SmallVec::<[usize; 4]>::new();
+        for index_conjunct in index_conjuncts.iter() {
+            let Some(pos) = self
+                .partial_index_predicate_usages
+                .iter()
+                .position(|usage| exprs_are_equivalent(index_conjunct, &usage.predicate))
+            else {
+                return;
+            };
+            if !proven_usages.contains(&pos) {
+                proven_usages.push(pos);
+            }
+        }
+        let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
+        for pos in proven_usages {
+            for (col_idx, count) in self.partial_index_predicate_usages[pos]
+                .column_counts
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+            {
+                if col_idx >= coverage_counts.len() {
+                    coverage_counts.resize(col_idx + 1, 0);
+                }
+                coverage_counts[col_idx] += count;
+            }
+        }
+        for (col_idx, &covered) in coverage_counts.iter().enumerate() {
+            if covered == 0 {
+                continue;
+            }
             if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
                 required_columns.clear(col_idx);
             }
@@ -2830,16 +2903,23 @@ impl JoinedTable {
             return index.where_clause.is_none();
         }
 
-        if self.expression_index_usages.is_empty() {
-            Self::index_covers_columns(index, btree, &self.col_used_mask)
-        } else {
-            let mut required_columns = self.col_used_mask.clone();
-            self.apply_expression_index_coverage(index, &mut required_columns);
-            if required_columns.is_empty() {
-                return true;
-            }
-            Self::index_covers_columns(index, btree, &required_columns)
+        let has_expression_usages = !self.expression_index_usages.is_empty();
+        let has_partial_index_usages =
+            index.where_clause.is_some() && !self.partial_index_predicate_usages.is_empty();
+        if !has_expression_usages && !has_partial_index_usages {
+            return Self::index_covers_columns(index, btree, &self.col_used_mask);
         }
+        let mut required_columns = self.col_used_mask.clone();
+        if has_expression_usages {
+            self.apply_expression_index_coverage(index, &mut required_columns);
+        }
+        if has_partial_index_usages {
+            self.apply_partial_index_predicate_coverage(index, &mut required_columns);
+        }
+        if required_columns.is_empty() {
+            return true;
+        }
+        Self::index_covers_columns(index, btree, &required_columns)
     }
 
     fn index_covers_columns(
@@ -2896,6 +2976,12 @@ impl JoinedTable {
             return false;
         };
         self.index_is_covering(index.as_ref())
+    }
+
+    pub fn scan_skips_table_cursor(&self) -> bool {
+        self.op
+            .index()
+            .is_some_and(|index| !index.ephemeral && self.index_is_covering(index.as_ref()))
     }
 
     pub fn column_is_used(&self, index: usize) -> bool {

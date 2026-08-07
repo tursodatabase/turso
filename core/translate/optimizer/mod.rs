@@ -53,7 +53,8 @@ use crate::{
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     can_use_partial_index, constraints_from_where_clause, partial_index,
-    partial_index_predicate_terms, usable_constraints_for_join_order, Constraint, ConstraintRef,
+    partial_index_can_use_query_term, partial_index_predicate_terms,
+    usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
 use cost::Cost;
 use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinPlanningContext};
@@ -1607,6 +1608,69 @@ fn register_expression_index_usages_for_plan(
     }
 }
 
+fn count_single_table_column_refs(
+    expr: &ast::Expr,
+    table_id: TableInternalId,
+    column_count: usize,
+) -> Option<Vec<usize>> {
+    use super::expr::{walk_expr, WalkControl};
+    let mut counts = vec![0usize; column_count];
+    let mut single_table = true;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        match e {
+            Expr::Column { table, column, .. } => {
+                if *table != table_id {
+                    single_table = false;
+                    return Ok(WalkControl::SkipChildren);
+                }
+                if let Some(count) = counts.get_mut(*column) {
+                    *count += 1;
+                }
+            }
+            Expr::RowId { table, .. } => {
+                if *table != table_id {
+                    single_table = false;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    single_table.then_some(counts)
+}
+
+fn register_partial_index_predicate_usages_for_plan(
+    table_references: &mut TableReferences,
+    available_indexes: &AvailableIndexes,
+    where_clause: &[WhereTerm],
+) {
+    for table in table_references.joined_tables_mut() {
+        table.clear_partial_index_predicate_usages();
+        if !matches!(table.table, Table::BTree(_)) {
+            continue;
+        }
+        let has_partial_index = available_indexes
+            .indexes_for_table(table.internal_id)
+            .is_some_and(|indexes| indexes.iter().any(|index| index.where_clause.is_some()));
+        if !has_partial_index {
+            continue;
+        }
+        let column_count = table.columns().len();
+        let usages = where_clause
+            .iter()
+            .filter(|term| partial_index_can_use_query_term(table, term))
+            .filter_map(|term| {
+                count_single_table_column_refs(&term.expr, table.internal_id, column_count)
+                    .map(|counts| (term.expr.clone(), counts))
+            })
+            .collect::<Vec<_>>();
+        for (predicate, counts) in usages {
+            table.register_partial_index_predicate_usage(predicate, counts);
+        }
+    }
+}
+
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
 fn base_row_estimate(
     schema: &Schema,
@@ -1990,6 +2054,12 @@ fn optimize_table_access(
             params,
         )?;
     }
+
+    register_partial_index_predicate_usages_for_plan(
+        table_references,
+        available_indexes,
+        where_clause,
+    );
 
     // Enforce INDEXED BY / NOT INDEXED after outer-join rewrites settle, because
     // a null-rejecting WHERE term can turn a LEFT JOIN into an INNER JOIN and

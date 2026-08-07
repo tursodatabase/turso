@@ -270,7 +270,7 @@ impl Display for SelectPlan {
                     match scan {
                         Scan::BTreeTable { index, .. } => {
                             if let Some(index) = index {
-                                if reference.utilizes_covering_index() {
+                                if reference.scan_skips_table_cursor() {
                                     writeln!(
                                         f,
                                         "{indent}SCAN {table_name} USING COVERING INDEX {}",
@@ -296,6 +296,11 @@ impl Display for SelectPlan {
                 }
                 Operation::Search(search) => {
                     let left_join_suffix = if member.is_outer { " LEFT-JOIN" } else { "" };
+                    let index_kind = if reference.scan_skips_table_cursor() {
+                        "COVERING INDEX"
+                    } else {
+                        "INDEX"
+                    };
                     match search {
                         Search::RowidEq { .. }
                         | Search::Seek { index: None, .. }
@@ -313,7 +318,7 @@ impl Display for SelectPlan {
                             let constraints = seek_constraint_annotation(index, seek_def);
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                                "{indent}SEARCH {} USING {index_kind} {}{constraints}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }
@@ -327,7 +332,7 @@ impl Display for SelectPlan {
                             };
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
+                                "{indent}SEARCH {} USING {index_kind} {}{constraint}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }

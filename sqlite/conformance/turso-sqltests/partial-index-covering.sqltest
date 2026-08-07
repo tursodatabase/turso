@@ -1,0 +1,98 @@
+@database :memory:
+
+# A partial index only holds rows that pass its own WHERE clause, so a query that
+# repeats that clause never evaluates the term and never reads the columns it
+# used. SQLite reports a plain "USING INDEX" for these; Turso can cover them.
+
+test partial-index-covers-when-predicate-column-is-only-in-where {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    EXPLAIN QUERY PLAN SELECT seq, owner FROM t WHERE removed_at IS NULL AND seq > 10 AND seq < 20 ORDER BY seq;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (seq>? AND seq<?)
+}
+
+test partial-index-covers-scan-without-a-seek {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    EXPLAIN QUERY PLAN SELECT seq, owner FROM t WHERE removed_at IS NULL;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+}
+
+test partial-index-covers-rowid-alias-from-the-index-key {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    EXPLAIN QUERY PLAN SELECT id, seq, owner FROM t WHERE removed_at IS NULL AND seq > 10 ORDER BY seq;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (seq>?)
+}
+
+test partial-index-covers-an-in-seek {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    EXPLAIN QUERY PLAN SELECT seq, owner FROM t WHERE removed_at IS NULL AND seq IN (1, 2, 3);
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (seq=?)
+}
+
+test partial-index-covers-with-a-multi-term-predicate {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, tag TEXT, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL AND tag = 'a';
+    EXPLAIN QUERY PLAN SELECT seq, owner FROM t WHERE removed_at IS NULL AND tag = 'a' AND seq > 10 ORDER BY seq;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (seq>?)
+}
+
+test predicate-column-in-the-select-list-blocks-covering {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    EXPLAIN QUERY PLAN SELECT seq, owner, removed_at FROM t WHERE removed_at IS NULL AND seq > 10 ORDER BY seq;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx (seq>?)
+}
+
+test duplicate-predicate-term-blocks-covering {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    EXPLAIN QUERY PLAN SELECT seq, owner FROM t WHERE removed_at IS NULL AND removed_at IS NULL AND seq > 10 ORDER BY seq;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx (seq>?)
+}
+
+test unmatched-term-on-another-column-blocks-covering {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, tag TEXT, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    EXPLAIN QUERY PLAN SELECT seq, owner FROM t WHERE removed_at IS NULL AND tag = 'a' AND seq > 10 ORDER BY seq;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx (seq>?)
+}
+
+test predicate-column-still-readable-when-selected {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO t VALUES (1, 10, 1, NULL), (2, 20, 2, 'gone'), (3, 30, 3, NULL);
+    SELECT seq, owner, quote(removed_at) FROM t WHERE removed_at IS NULL AND seq > 5 ORDER BY seq;
+}
+expect {
+    10|1|NULL
+    30|3|NULL
+}
+
+test covering-partial-index-returns-the-same-rows {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX idx ON t (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO t VALUES (1, 10, 1, NULL), (2, 20, 2, 'gone'), (3, 30, 3, NULL), (4, 40, 4, 'gone'), (5, 50, 5, NULL);
+    SELECT id, seq, owner FROM t WHERE removed_at IS NULL AND seq > 10 AND seq < 50 ORDER BY seq;
+}
+expect {
+    3|30|3
+}

@@ -3074,6 +3074,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
         });
@@ -3170,6 +3171,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
         });
@@ -3283,6 +3285,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
         });
@@ -3476,6 +3479,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
         }

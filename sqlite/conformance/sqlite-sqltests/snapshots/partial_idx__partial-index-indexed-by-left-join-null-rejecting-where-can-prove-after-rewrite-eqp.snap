@@ -17,4 +17,4 @@ info:
 ---
 QUERY PLAN
 |--SCAN left_items
-`--SEARCH right_items USING INDEX right_marker_five_idx (id=?)
+`--SEARCH right_items USING COVERING INDEX right_marker_five_idx (id=?)

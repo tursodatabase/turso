@@ -10,7 +10,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH measurements USING INDEX idx_measurements_category_value (category=?)
+`--SEARCH measurements USING COVERING INDEX idx_measurements_category_value (category=?)
 
 BYTECODE
 addr  opcode       p1  p2  p3  p4           p5  comment
