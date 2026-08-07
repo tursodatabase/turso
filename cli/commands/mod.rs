@@ -4,7 +4,7 @@ pub mod import;
 use args::{
     CwdArgs, DbConfigArgs, DbtotxtArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs,
     LoadExtensionArgs, ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs,
-    ParameterArgs, ReadArgs, SchemaArgs, SetOutputArgs, StatsArgs, TablesArgs, TimerArgs,
+    ParameterArgs, PlanArgs, ReadArgs, SchemaArgs, SetOutputArgs, StatsArgs, TablesArgs, TimerArgs,
 };
 use clap::Parser;
 use import::ImportArgs;
@@ -105,6 +105,9 @@ pub enum Command {
     Parameter(ParameterArgs),
     #[command(name = "dbtotxt", display_name = ".dbtotxt")]
     Dbtotxt(DbtotxtArgs),
+    /// Print the query plan of a statement as JSON
+    #[command(name = "plan", display_name = ".plan")]
+    Plan(PlanArgs),
 }
 
 const _HELP_TEMPLATE: &str = "{before-help}{name}

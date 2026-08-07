@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Turso query plan viewer</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <h1>Query plan viewer</h1>
+      </div>
+      <div class="db" id="db-name">connecting…</div>
+    </header>
+
+    <main class="layout">
+      <section class="editor-pane" aria-label="Query">
+        <label class="field-label" for="sql">SQL</label>
+        <textarea
+          id="sql"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="SELECT * FROM users WHERE age > 30"
+        ></textarea>
+        <div class="editor-actions">
+          <button id="explain" class="primary" type="button">
+            Explain <kbd>Ctrl</kbd><kbd>↵</kbd>
+          </button>
+          <button id="copy-json" class="ghost" type="button">Copy JSON</button>
+        </div>
+        <p class="error" id="error" role="alert" hidden></p>
+
+        <div class="sidebar-section">
+          <h2>Examples</h2>
+          <ul class="examples" id="examples"></ul>
+        </div>
+
+        <div class="sidebar-section">
+          <h2>Schema</h2>
+          <ul class="schema" id="schema">
+            <li class="muted">loading…</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="plan-pane" aria-label="Plan">
+        <div class="plan-toolbar">
+          <div class="legend" role="list" aria-label="Node kinds">
+            <span class="legend-item" role="listitem"
+              ><i class="swatch swatch-scan"></i>Scan — reads every row</span
+            >
+            <span class="legend-item" role="listitem"
+              ><i class="swatch swatch-seek"></i>Seek — jumps to matching rows</span
+            >
+            <span class="legend-item" role="listitem"
+              ><i class="swatch swatch-flow"></i>Query structure</span
+            >
+          </div>
+          <div class="plan-controls">
+            <button id="fit" class="ghost" type="button">Fit</button>
+            <button id="toggle-table" class="ghost" type="button" aria-pressed="false">
+              Table view
+            </button>
+          </div>
+        </div>
+
+        <div class="canvas-wrap" id="canvas-wrap">
+          <svg id="canvas" role="img" aria-label="Query plan diagram"></svg>
+          <p class="empty" id="empty">Write a query and press Explain.</p>
+        </div>
+
+        <div class="table-view" id="table-view" hidden>
+          <table>
+            <caption>
+              Every plan step, in the order the compiler emitted them.
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">#</th>
+                <th scope="col">Parent</th>
+                <th scope="col">Kind</th>
+                <th scope="col">Step</th>
+                <th scope="col" class="num">Est. rows</th>
+              </tr>
+            </thead>
+            <tbody id="table-body"></tbody>
+          </table>
+        </div>
+
+        <aside class="details" id="details" hidden aria-live="polite">
+          <button class="close" id="details-close" type="button" aria-label="Close details">
+            ×
+          </button>
+          <h2 id="details-title"></h2>
+          <p class="details-detail" id="details-detail"></p>
+          <dl id="details-fields"></dl>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

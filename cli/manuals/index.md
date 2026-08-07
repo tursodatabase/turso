@@ -39,6 +39,13 @@ Build similarity search and semantic search applications using vector embeddings
 .manual vector
 ```
 
+### query-plan - Query Plans, as JSON and as a Diagram
+Export a query plan in machine-readable form with `.plan`, or draw it in a local browser viewer with `--explain-server`.
+
+```
+.manual query-plan
+```
+
 ### materialized-views - Live Materialized Views
 Create automatically updating views that use Incremental View Maintenance to stay current with minimal overhead.
 

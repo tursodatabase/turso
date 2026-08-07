@@ -84,6 +84,14 @@ pub struct Opts {
         help = "Start sync server instead of interactive shell and listen at given address (e.g. 0.0.0.0:8080)"
     )]
     pub sync_server: Option<String>,
+    #[clap(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "127.0.0.1:8375",
+        value_name = "ADDRESS",
+        help = "Serve the graphical query plan viewer at the given address instead of starting the interactive shell (default 127.0.0.1:8375)"
+    )]
+    pub explain_server: Option<String>,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
@@ -333,7 +341,7 @@ impl Limbo {
 
     fn first_run(&mut self, has_sql: bool, quiet: bool) -> Result<(), LimboError> {
         // Skip startup messages and SQL execution in MCP/SyncServer mode
-        if self.is_mcp_mode() || self.is_sync_server_mode() {
+        if self.is_mcp_mode() || self.is_sync_server_mode() || self.is_explain_server_mode() {
             return Ok(());
         }
 
@@ -450,6 +458,10 @@ impl Limbo {
 
     pub fn is_sync_server_mode(&self) -> bool {
         self.opts.sync_server_address.is_some()
+    }
+
+    pub fn is_explain_server_mode(&self) -> bool {
+        self.opts.explain_server_address.is_some()
     }
 
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {
@@ -966,6 +978,17 @@ impl Limbo {
                 Command::Dbtotxt(args) => {
                     if let Err(e) = self.dump_database_as_text(args.page_no) {
                         let _ = self.writeln_fmt(format_args!("ERROR:{e}"));
+                    }
+                }
+                Command::Plan(args) => {
+                    let sql = args.sql.join(" ");
+                    match self.conn.query_plan(&sql) {
+                        Ok(plan) => {
+                            let _ = self.writeln(plan.to_json());
+                        }
+                        Err(e) => {
+                            let _ = self.writeln_fmt(format_args!("Error: {e}"));
+                        }
                     }
                 }
             },
