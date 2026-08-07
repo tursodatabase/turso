@@ -2421,6 +2421,9 @@ impl IndexInfo {
         index: &Index,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
+        // A backing_btree stores the index method's complete opaque key. Unlike
+        // an ordinary secondary index, it must not append the base-table rowid.
+        let has_rowid = index.has_rowid && !index.is_backing_btree_index();
         let key_info = index
             .columns
             .iter()
@@ -2429,15 +2432,15 @@ impl IndexInfo {
                 collation: c.collation.unwrap_or_default(),
                 nulls_order: c.nulls_order,
             })
-            .chain(index.has_rowid.then_some(KeyInfo {
+            .chain(has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::Binary,
                 nulls_order: None,
             }));
         Self::new_in(
             key_info,
-            index.has_rowid,
-            index.columns.len() + (index.has_rowid as usize),
+            has_rowid,
+            index.columns.len() + (has_rowid as usize),
             index.unique,
             alloc,
         )
