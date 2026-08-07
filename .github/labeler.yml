@@ -48,6 +48,10 @@ bindings/java:
   - changed-files:
       - any-glob-to-any-file: "bindings/java/**/*"
 
+bindings/swift:
+  - changed-files:
+      - any-glob-to-any-file: "bindings/swift/**/*"
+
 parser:
   - changed-files:
       - any-glob-to-any-file: "vendored/sqlite3-parser/*"
