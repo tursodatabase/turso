@@ -4851,11 +4851,7 @@ pub fn op_auto_commit(
             res,
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
-            if !*rollback {
-                conn.index_methods_on_transaction_committed();
-            }
-            conn.clear_tx_poison();
-            conn.clear_named_savepoints();
+            finish_ended_txn(&conn, pager, mv_store.is_some(), !*rollback)?;
         }
         return res;
     }
@@ -4980,7 +4976,26 @@ pub fn op_auto_commit(
         res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
     };
 
-    if mv_store.is_none() {
+    finish_ended_txn(&conn, pager, mv_store.is_some(), !*rollback)?;
+
+    // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
+    if fk_on {
+        conn.clear_deferred_foreign_key_violations();
+    }
+
+    Ok(res)
+}
+
+/// Connection and pager state that must be reset once a COMMIT or ROLLBACK has
+/// finally succeeded. Both the straight-through path and the re-entry path taken
+/// after the commit yielded on IO end here, so they leave the same state behind.
+fn finish_ended_txn(
+    conn: &Arc<Connection>,
+    pager: &Arc<Pager>,
+    has_mv_store: bool,
+    is_commit: bool,
+) -> Result<()> {
+    if !has_mv_store {
         pager.clear_savepoints()?;
         // Non-main pagers (temp + attached) accumulate savepoints from the
         // mirror path; they're not cleared by the main pager's commit/
@@ -4996,20 +5011,14 @@ pub fn op_auto_commit(
         })?;
     }
 
-    // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
-    if fk_on {
-        conn.clear_deferred_foreign_key_violations();
-    }
-
-    // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
-    if matches!(tx_op, TxOp::Commit) {
+    if is_commit {
         conn.index_methods_on_transaction_committed();
     }
     conn.clear_tx_poison();
     conn.clear_named_savepoints();
 
-    Ok(res)
+    Ok(())
 }
 
 pub fn op_savepoint(
