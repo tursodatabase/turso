@@ -1040,6 +1040,18 @@ pub fn find_equijoin_conditions(
             continue;
         }
 
+        // An ON-clause term of an outer join decides what counts as a match
+        // for that join only. A term that belongs to a *different* join's ON
+        // clause may legally mention only these two tables (an ON clause can
+        // reference any table to its left), but it must not become this
+        // join's key — it filters the rows of its own join instead.
+        if where_term
+            .from_outer_join
+            .is_some_and(|owner| owner != probe_table_id)
+        {
+            continue;
+        }
+
         let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
             continue;
         };
