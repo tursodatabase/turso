@@ -1051,6 +1051,7 @@ impl Fuzzer {
             let turso = DifferentialOracle::execute_turso(&self.turso_conn(), &sql);
             let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, &sql);
             let failure = match (&turso, &sqlite) {
+                _ if Self::only_sqlite_sum_overflows(&turso, &sqlite) => None,
                 (QueryResult::Error(_), _) | (_, QueryResult::Error(_)) => Some("read error"),
                 _ if turso != sqlite => Some("data mismatch"),
                 _ => None,
@@ -1062,6 +1063,14 @@ impl Fuzzer {
             }
         }
         Ok(())
+    }
+
+    /// SQLite fails `SUM()` with "integer overflow" when an integer sum leaves
+    /// the i64 range, where a Turso materialized view returns a REAL. Such a
+    /// view cannot be compared until its sums fit again.
+    fn only_sqlite_sum_overflows(turso: &QueryResult, sqlite: &QueryResult) -> bool {
+        matches!(sqlite, QueryResult::Error(e) if e == "integer overflow")
+            && !matches!(turso, QueryResult::Error(_))
     }
 
     /// After a DDL statement, a plain view on SQLite stops working when a table
@@ -1724,6 +1733,40 @@ mod tests {
         assert!(err.starts_with("Matview data mismatch in 'v'"), "{err}");
         assert!(err.contains("SQLite integrity check failed"), "{err}");
         assert_eq!(stats.oracle_failures, 2);
+    }
+
+    #[test]
+    fn a_sum_that_overflows_only_on_sqlite_is_not_compared() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        for sql in [
+            "CREATE TABLE big(x INTEGER)",
+            "INSERT INTO big VALUES (9223372036854775807), (1)",
+        ] {
+            fuzzer.execute_on_both(sql, &mut executed_sql);
+        }
+        let select = "SELECT SUM(x) AS s FROM big";
+        fuzzer
+            .turso_conn()
+            .execute(format!("CREATE MATERIALIZED VIEW v AS {select}"))
+            .unwrap();
+        fuzzer
+            .sqlite_conn
+            .execute(&format!("CREATE VIEW v AS {select}"), [])
+            .unwrap();
+        let matviews = Matviews::from([(
+            "v".to_string(),
+            vec![sql_gen_prop::ColumnDef::new(
+                "s",
+                sql_gen_prop::DataType::Integer,
+            )],
+        )]);
+
+        fuzzer
+            .verify_matviews(&matviews, &mut stats, &mut executed_sql)
+            .unwrap();
+
+        assert_eq!(stats.oracle_failures, 0);
     }
 
     #[test]

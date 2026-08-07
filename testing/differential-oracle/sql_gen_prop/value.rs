@@ -22,17 +22,18 @@ pub struct ValueProfile {
     pub blob_max_size: usize,
     /// Pattern for text generation (regex pattern).
     pub text_pattern: String,
-    /// Small domain that most integer and text values come from, so that
+    /// Small domain that most integer, real and text values come from, so that
     /// separate statements hit the same values.
     pub narrow: Option<NarrowValueProfile>,
 }
 
-/// A small integer and text domain, drawn with `narrow_weight` against
+/// A small integer, real and text domain, drawn with `narrow_weight` against
 /// `full_weight` for the full domain.
 #[derive(Debug, Clone)]
 pub struct NarrowValueProfile {
     pub text_pattern: String,
     pub integer_range: RangeInclusive<i64>,
+    pub reals: Vec<f64>,
     pub narrow_weight: u32,
     pub full_weight: u32,
 }
@@ -69,13 +70,14 @@ impl ValueProfile {
         }
     }
 
-    /// Builder method to draw 85 % of integer and text values from `-5..=5`
-    /// and `[a-c]{1,2}`.
+    /// Builder method to draw 85 % of integer, real and text values from
+    /// `-5..=5`, a few small reals and `[a-c]{1,2}`.
     pub fn narrow(self) -> Self {
         Self {
             narrow: Some(NarrowValueProfile {
                 text_pattern: "[a-c]{1,2}".to_string(),
                 integer_range: -5..=5,
+                reals: vec![-2.5, -1.0, 0.5, 1.0, 2.0],
                 narrow_weight: 85,
                 full_weight: 15,
             }),
@@ -202,6 +204,20 @@ pub fn real_value() -> impl Strategy<Value = SqlValue> {
     any::<f64>().prop_map(SqlValue::Real)
 }
 
+/// Generate a real value. A narrow profile draws only multiples of 0.25 below
+/// 2^29, so that a sum of them is exact in any order of addition and removal.
+fn real_value_for_profile(value_profile: &ValueProfile) -> BoxedStrategy<SqlValue> {
+    match &value_profile.narrow {
+        Some(narrow) => prop_oneof![
+            narrow.narrow_weight => proptest::sample::select(narrow.reals.clone()),
+            narrow.full_weight => any::<i32>().prop_map(|i| f64::from(i) / 4.0),
+        ]
+        .prop_map(SqlValue::Real)
+        .boxed(),
+        None => real_value().boxed(),
+    }
+}
+
 /// Generate a text value with profile-controlled parameters.
 pub fn text_value(profile: &StatementProfile) -> BoxedStrategy<SqlValue> {
     let value_profile = &profile.generation.value;
@@ -236,7 +252,7 @@ pub fn value_for_type(
 ) -> BoxedStrategy<SqlValue> {
     let base: BoxedStrategy<SqlValue> = match data_type {
         DataType::Integer => integer_value(&profile.generation.value),
-        DataType::Real => real_value().boxed(),
+        DataType::Real => real_value_for_profile(&profile.generation.value),
         DataType::Text => text_value(profile),
         DataType::Blob => blob_value(profile).boxed(),
         DataType::Null => null_value().boxed(),
@@ -261,5 +277,18 @@ mod tests {
         assert_eq!(SqlValue::Text("it's".to_string()).to_string(), "'it''s'");
         assert_eq!(SqlValue::Blob(vec![0xDE, 0xAD]).to_string(), "X'DEAD'");
         assert_eq!(SqlValue::Null.to_string(), "NULL");
+    }
+
+    #[test]
+    fn narrow_reals_are_quarters_small_enough_to_add_up_exactly() {
+        let strategy = real_value_for_profile(&ValueProfile::default().narrow());
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        for _ in 0..1000 {
+            let SqlValue::Real(r) = strategy.new_tree(&mut runner).unwrap().current() else {
+                panic!("a real strategy made a non-real value");
+            };
+            assert_eq!((r * 4.0).fract(), 0.0, "{r}");
+            assert!(r.abs() < 2f64.powi(29), "{r}");
+        }
     }
 }

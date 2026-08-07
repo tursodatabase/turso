@@ -811,6 +811,7 @@ mod tests {
         let mut matviews = Matviews::new();
         let mut runner = TestRunner::deterministic();
         let (mut same_name_joins, mut self_joins) = (0, 0);
+        let mut aggregate_function_views = 0;
         for _ in 0..200 {
             let mut builder = SchemaBuilder::new();
             for (_, table) in &tables {
@@ -834,8 +835,10 @@ mod tests {
             );
             same_name_joins += usize::from(turso_sql.contains("_l, "));
             self_joins += usize::from(turso_sql.contains(" AS sjk, "));
+            aggregate_function_views += usize::from(turso_sql.contains(" AS a0_"));
             matviews.insert(create.view_name, create.output_columns);
         }
         assert!(same_name_joins > 0 && self_joins > 0);
+        assert!(aggregate_function_views > 0);
     }
 }
