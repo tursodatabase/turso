@@ -100,6 +100,55 @@ fn from_bytes(bytes: &[u8]) -> String {
     unsafe { str::from_utf8_unchecked(bytes).to_owned() }
 }
 
+/// The error for an expression that is nested deeper than [`MAX_EXPR_DEPTH`].
+///
+/// Kept out of the expression parsing functions so that the string formatting
+/// it needs doesn't inflate their stack frames, which are paid once per level
+/// of expression nesting (see issue #6655).
+#[cold]
+#[inline(never)]
+fn err_expr_too_large() -> Error {
+    Error::ParseError(format!(
+        "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
+    ))
+}
+
+/// Maps a token to the plain binary [`Operator`] it introduces, if any.
+///
+/// Used by `parse_expr_inner` so that all of these operators go through a
+/// single `Expr::Binary` construction site: unoptimized builds give every
+/// temporary in a function body a distinct stack slot, and one inline `Expr`
+/// construction per operator arm made that recursive function's stack frame
+/// large enough for moderately nested expressions to overflow the stack
+/// (see issue #6655).
+fn binary_operator_from_token(token_type: TokenType, value: &[u8]) -> Option<Operator> {
+    Some(match token_type {
+        TK_OR => Operator::Or,
+        TK_AND => Operator::And,
+        TK_EQ => Operator::Equals,
+        TK_NE => Operator::NotEquals,
+        TK_LT => Operator::Less,
+        TK_GT => Operator::Greater,
+        TK_LE => Operator::LessEquals,
+        TK_GE => Operator::GreaterEquals,
+        TK_BITAND => Operator::BitwiseAnd,
+        TK_BITOR => Operator::BitwiseOr,
+        TK_LSHIFT => Operator::LeftShift,
+        TK_RSHIFT => Operator::RightShift,
+        TK_PLUS => Operator::Add,
+        TK_MINUS => Operator::Subtract,
+        TK_STAR => Operator::Multiply,
+        TK_SLASH => Operator::Divide,
+        TK_REM => Operator::Modulus,
+        TK_ARRAY_CONTAINS => Operator::ArrayContains,
+        TK_ARRAY_OVERLAP => Operator::ArrayOverlap,
+        TK_CONCAT => Operator::Concat,
+        TK_PTR if value.len() == 2 => Operator::ArrowRight,
+        TK_PTR => Operator::ArrowRightShift,
+        _ => return None,
+    })
+}
+
 #[inline]
 fn join_type_from_bytes(s: &[u8]) -> Result<JoinType> {
     match_ignore_ascii_case!(match s {
@@ -1677,361 +1726,429 @@ impl<'a> Parser<'a> {
             TK_DEFAULT,
         );
 
+        // NOTE: this function is on the expression recursion path, so it must
+        // keep its stack frame small. Unoptimized builds give every temporary
+        // in a function body a distinct stack slot; with all arm bodies inlined
+        // here the frame grew to ~60 KiB and moderately nested expressions
+        // overflowed the stack (see issue #6655). Keep this a thin dispatcher
+        // and put each arm body in its own `#[inline(never)]` helper.
         match tok.token_type {
-            TK_DEFAULT => {
-                eat_assert!(self, TK_DEFAULT);
-                Ok(Box::new(Expr::Default))
+            TK_LP => self.parse_expr_operand_parens(),
+            TK_CAST => self.parse_expr_operand_cast(),
+            // NOT precedence is 2, the other unary operators bind at 11.
+            TK_NOT => self.parse_expr_operand_unary(UnaryOperator::Not, 2),
+            TK_BITNOT => self.parse_expr_operand_unary(UnaryOperator::BitwiseNot, 11),
+            TK_PLUS => self.parse_expr_operand_unary(UnaryOperator::Positive, 11),
+            TK_MINUS => self.parse_expr_operand_unary(UnaryOperator::Negative, 11),
+            TK_EXISTS => self.parse_expr_operand_exists(),
+            TK_CASE => self.parse_expr_operand_case(),
+            TK_RAISE => self.parse_expr_operand_raise(),
+            TK_LBRACKET => self.parse_expr_operand_bracket_name(),
+            TK_DEFAULT | TK_NULL | TK_BLOB | TK_FLOAT | TK_INTEGER | TK_VARIABLE | TK_CTIME_KW => {
+                self.parse_expr_operand_literal()
             }
-            TK_LP => {
-                eat_assert!(self, TK_LP);
-                match self.peek_no_eof()?.token_type {
-                    TK_WITH | TK_SELECT | TK_VALUES => {
-                        let select = self.parse_select()?;
-                        eat_expect!(self, TK_RP);
-                        // Subquery is compiled separately: a leaf for height.
-                        self.last_expr_height = 1;
-                        Ok(Box::new(Expr::Subquery(select)))
-                    }
-                    _ => {
-                        let exprs = self.parse_nexpr_list()?;
-                        eat_expect!(self, TK_RP);
-                        // `parse_nexpr_list` left the tallest element's height.
-                        self.last_expr_height += 1;
-                        Ok(Box::new(Expr::Parenthesized(exprs)))
-                    }
-                }
-            }
-            TK_NULL => {
-                eat_assert!(self, TK_NULL);
-                Ok(Box::new(Expr::Literal(Literal::Null)))
-            }
-            TK_BLOB => {
-                let tok = eat_assert!(self, TK_BLOB);
-                Ok(Box::new(Expr::Literal(Literal::Blob(from_bytes(
-                    tok.value,
-                )))))
-            }
-            TK_FLOAT => {
-                let tok = eat_assert!(self, TK_FLOAT);
-                Ok(Box::new(Expr::Literal(Literal::Numeric(from_bytes(
-                    tok.value,
-                )))))
-            }
-            TK_INTEGER => {
-                let tok = eat_assert!(self, TK_INTEGER);
-                Ok(Box::new(Expr::Literal(Literal::Numeric(from_bytes(
-                    tok.value,
-                )))))
-            }
-            TK_VARIABLE => {
-                let tok = eat_assert!(self, TK_VARIABLE);
-                Ok(Box::new(self.create_variable(tok.value)?))
-            }
-            TK_CAST => {
-                eat_assert!(self, TK_CAST);
-                eat_expect!(self, TK_LP);
-                let expr = self.parse_expr(0)?;
-                eat_expect!(self, TK_AS);
-                let typ = self.parse_type()?;
-                eat_expect!(self, TK_RP);
-                self.last_expr_height += 1;
-                Ok(Box::new(Expr::Cast {
-                    expr,
-                    type_name: typ,
-                }))
-            }
-            TK_CTIME_KW => {
-                let tok = eat_assert!(self, TK_CTIME_KW);
-                match_ignore_ascii_case!(match tok.value {
-                    b"CURRENT_DATE" => Ok(Box::new(Expr::Literal(Literal::CurrentDate))),
-                    b"CURRENT_TIME" => Ok(Box::new(Expr::Literal(Literal::CurrentTime))),
-                    b"CURRENT_TIMESTAMP" => Ok(Box::new(Expr::Literal(Literal::CurrentTimestamp))),
-                    _ => unreachable!(),
-                })
-            }
-            TK_NOT => {
-                eat_assert!(self, TK_NOT);
-                let expr = self.parse_expr(2)?; // NOT precedence is 2
-                self.last_expr_height += 1;
-                Ok(Box::new(Expr::Unary(UnaryOperator::Not, expr)))
-            }
-            TK_BITNOT => {
-                eat_assert!(self, TK_BITNOT);
-                let expr = self.parse_expr(11)?; // BITNOT precedence is 11
-                self.last_expr_height += 1;
-                Ok(Box::new(Expr::Unary(UnaryOperator::BitwiseNot, expr)))
-            }
-            TK_PLUS => {
-                eat_assert!(self, TK_PLUS);
-                let expr = self.parse_expr(11)?; // PLUS precedence is 11
-                self.last_expr_height += 1;
-                Ok(Box::new(Expr::Unary(UnaryOperator::Positive, expr)))
-            }
-            TK_MINUS => {
-                eat_assert!(self, TK_MINUS);
-                let expr = self.parse_expr(11)?; // MINUS precedence is 11
-                self.last_expr_height += 1;
-                Ok(Box::new(Expr::Unary(UnaryOperator::Negative, expr)))
-            }
-            TK_EXISTS => {
-                eat_assert!(self, TK_EXISTS);
-                eat_expect!(self, TK_LP);
+            _ => self.parse_expr_operand_name(),
+        }
+    }
+
+    /// `(expr, ...)` or `(SELECT ...)` operand.
+    #[inline(never)]
+    fn parse_expr_operand_parens(&mut self) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_LP);
+        match self.peek_no_eof()?.token_type {
+            TK_WITH | TK_SELECT | TK_VALUES => {
                 let select = self.parse_select()?;
                 eat_expect!(self, TK_RP);
                 // Subquery is compiled separately: a leaf for height.
                 self.last_expr_height = 1;
-                Ok(Box::new(Expr::Exists(select)))
-            }
-            TK_CASE => {
-                eat_assert!(self, TK_CASE);
-                // Tallest of the base/when/then/else sub-expressions.
-                let mut max_h = 0usize;
-                let base = if self.peek_no_eof()?.token_type != TK_WHEN {
-                    let base = self.parse_expr(0)?;
-                    max_h = max_h.max(self.last_expr_height);
-                    Some(base)
-                } else {
-                    None
-                };
-
-                eat_expect!(self, TK_WHEN);
-                let first_when = self.parse_expr(0)?;
-                max_h = max_h.max(self.last_expr_height);
-                eat_expect!(self, TK_THEN);
-                let first_then = self.parse_expr(0)?;
-                max_h = max_h.max(self.last_expr_height);
-                let mut when_then_pairs = vec![(first_when, first_then)];
-
-                while let Some(tok) = self.peek()? {
-                    if tok.token_type != TK_WHEN {
-                        break;
-                    }
-
-                    eat_assert!(self, TK_WHEN);
-                    let when = self.parse_expr(0)?;
-                    max_h = max_h.max(self.last_expr_height);
-                    eat_expect!(self, TK_THEN);
-                    let then = self.parse_expr(0)?;
-                    max_h = max_h.max(self.last_expr_height);
-                    when_then_pairs.push((when, then));
-                }
-
-                let else_expr = if let Some(ok) = self.peek()? {
-                    if ok.token_type == TK_ELSE {
-                        eat_assert!(self, TK_ELSE);
-                        let else_expr = self.parse_expr(0)?;
-                        max_h = max_h.max(self.last_expr_height);
-                        Some(else_expr)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                eat_expect!(self, TK_END);
-                self.last_expr_height = 1 + max_h;
-                Ok(Box::new(Expr::Case {
-                    base,
-                    when_then_pairs,
-                    else_expr,
-                }))
-            }
-            TK_RAISE => {
-                eat_assert!(self, TK_RAISE);
-                eat_expect!(self, TK_LP);
-
-                let (resolve, shorthand) = match self.peek_no_eof()?.token_type {
-                    TK_IGNORE => {
-                        eat_assert!(self, TK_IGNORE);
-                        (ResolveType::Ignore, false)
-                    }
-                    // RAISE('message') shorthand — defaults to ABORT
-                    TK_STRING => (ResolveType::Abort, true),
-                    _ => (self.parse_raise_type()?, false),
-                };
-
-                let expr = if resolve != ResolveType::Ignore {
-                    if !shorthand {
-                        eat_expect!(self, TK_COMMA);
-                    }
-                    Some(self.parse_expr(0)?)
-                } else {
-                    None
-                };
-
-                eat_expect!(self, TK_RP);
-                if expr.is_some() {
-                    self.last_expr_height += 1;
-                }
-                Ok(Box::new(Expr::Raise(resolve, expr)))
-            }
-            TK_LBRACKET => {
-                // Bracket-quoted identifier: [name] or [multi word name],
-                // optionally qualified: [tbl].[col] or [db].[tbl].[col]
-                let name = self.parse_bracket_quoted_name()?;
-                let second_name = if self.peek()?.is_some_and(|t| t.token_type == TK_DOT) {
-                    eat_assert!(self, TK_DOT);
-                    Some(self.parse_nm()?)
-                } else {
-                    None
-                };
-                let third_name = if second_name.is_some()
-                    && self.peek()?.is_some_and(|t| t.token_type == TK_DOT)
-                {
-                    eat_assert!(self, TK_DOT);
-                    Some(self.parse_nm()?)
-                } else {
-                    None
-                };
-                match (second_name, third_name) {
-                    (Some(second), Some(third)) => {
-                        Ok(Box::new(Expr::DoublyQualified(name, second, third)))
-                    }
-                    (Some(second), None) => Ok(Box::new(Expr::Qualified(name, second))),
-                    _ => Ok(Box::new(Expr::Id(name))),
-                }
+                Ok(Box::new(Expr::Subquery(select)))
             }
             _ => {
-                let can_be_lit_str = tok.token_type == TK_STRING;
-
-                // can be either Literal::String or Name - so we parse raw value early and decide later
-                let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
-                let name = tok.value;
-
-                // Check for ARRAY[...] literal
-                if name.eq_ignore_ascii_case(b"array") {
-                    if let Some(tok) = self.peek()? {
-                        if tok.token_type == TK_LBRACKET {
-                            eat_assert!(self, TK_LBRACKET);
-                            let elements = self.parse_expr_list()?;
-                            eat_expect!(self, TK_RBRACKET);
-                            // `parse_expr_list` left the tallest element's height.
-                            self.last_expr_height += 1;
-                            // Desugar ARRAY[...] into array(...) function call
-                            return Ok(Box::new(Expr::FunctionCall {
-                                name: Name::from_bytes(b"array"),
-                                distinctness: None,
-                                args: elements,
-                                order_by: vec![],
-                                within_group: vec![],
-                                filter_over: FunctionTail {
-                                    filter_clause: None,
-                                    over_clause: None,
-                                },
-                            }));
-                        }
-                    }
-                }
-
-                let second_name = if let Some(tok) = self.peek()? {
-                    if tok.token_type == TK_DOT {
-                        eat_assert!(self, TK_DOT);
-                        Some(self.parse_nm()?)
-                    } else if tok.token_type == TK_LP {
-                        if can_be_lit_str {
-                            let token = self.peek_no_eof()?;
-                            let token_text = token.to_utf8();
-                            let offset = self.offset();
-                            return Err(Error::ParseUnexpectedToken {
-                                parsed_offset: (self.offset() - name.len(), name.len()).into(),
-                                got: TK_STRING,
-                                expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
-                                token_text,
-                                offset,
-                                expected_display: crate::token::TokenType::format_expected_tokens(
-                                    &[TK_ID, TK_INDEXED, TK_JOIN_KW],
-                                ),
-                            });
-                        } // can not be literal string in function name
-
-                        eat_assert!(self, TK_LP);
-                        let tok = self.peek_no_eof()?;
-                        match tok.token_type {
-                            TK_STAR => {
-                                eat_assert!(self, TK_STAR);
-                                eat_expect!(self, TK_RP);
-                                let filter_over = self.parse_filter_over()?;
-                                // No arguments, but later passes still walk any
-                                // FILTER/OVER sub-expressions, so fold their
-                                // height into this node's height.
-                                self.last_expr_height += 1;
-                                return Ok(Box::new(Expr::FunctionCallStar {
-                                    name: Name::from_bytes(name),
-                                    filter_over,
-                                }));
-                            }
-                            _ => {
-                                let distinct = self.parse_distinct()?;
-                                let exprs = self.parse_expr_list()?;
-                                // Height is the tallest sub-expression later
-                                // passes can descend into: the arguments plus the
-                                // ORDER BY / WITHIN GROUP / FILTER / OVER clauses.
-                                let mut clause_height = self.last_expr_height;
-                                let order_by = self.parse_order_by()?;
-                                clause_height = clause_height.max(self.last_expr_height);
-                                eat_expect!(self, TK_RP);
-                                let within_group = self.parse_within_group()?;
-                                clause_height = clause_height.max(self.last_expr_height);
-                                let filter_over = self.parse_filter_over()?;
-                                clause_height = clause_height.max(self.last_expr_height);
-                                self.last_expr_height = 1 + clause_height;
-                                return Ok(Box::new(Expr::FunctionCall {
-                                    name: Name::from_bytes(name),
-                                    distinctness: distinct,
-                                    args: exprs,
-                                    order_by,
-                                    within_group,
-                                    filter_over,
-                                }));
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let third_name = if let Some(tok) = self.peek()? {
-                    if tok.token_type == TK_DOT {
-                        debug_assert!(second_name.is_some());
-                        eat_assert!(self, TK_DOT);
-                        Some(self.parse_nm()?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(second_name) = second_name {
-                    if let Some(third_name) = third_name {
-                        Ok(Box::new(Expr::DoublyQualified(
-                            Name::from_bytes(name),
-                            second_name,
-                            third_name,
-                        )))
-                    } else {
-                        Ok(Box::new(Expr::Qualified(
-                            Name::from_bytes(name),
-                            second_name,
-                        )))
-                    }
-                } else if can_be_lit_str {
-                    Ok(Box::new(Expr::Literal(Literal::String(from_bytes(name)))))
-                } else {
-                    match_ignore_ascii_case!(match name {
-                        b"true" => {
-                            Ok(Box::new(Expr::Literal(Literal::True)))
-                        }
-                        b"false" => {
-                            Ok(Box::new(Expr::Literal(Literal::False)))
-                        }
-                        _ => Ok(Box::new(Expr::Id(Name::from_bytes(name)))),
-                    })
-                }
+                let exprs = self.parse_nexpr_list()?;
+                eat_expect!(self, TK_RP);
+                // `parse_nexpr_list` left the tallest element's height.
+                self.last_expr_height += 1;
+                Ok(Box::new(Expr::Parenthesized(exprs)))
             }
+        }
+    }
+
+    /// Literal and other leaf operands (`NULL`, blob/number literals, bound
+    /// variables, `CURRENT_TIME` and friends, `DEFAULT`).
+    #[inline(never)]
+    fn parse_expr_operand_literal(&mut self) -> Result<Box<Expr>> {
+        let tok = eat_assert!(
+            self,
+            TK_DEFAULT,
+            TK_NULL,
+            TK_BLOB,
+            TK_FLOAT,
+            TK_INTEGER,
+            TK_VARIABLE,
+            TK_CTIME_KW,
+        );
+        match tok.token_type {
+            TK_DEFAULT => Ok(Box::new(Expr::Default)),
+            TK_NULL => Ok(Box::new(Expr::Literal(Literal::Null))),
+            TK_BLOB => Ok(Box::new(Expr::Literal(Literal::Blob(from_bytes(
+                tok.value,
+            ))))),
+            TK_FLOAT | TK_INTEGER => Ok(Box::new(Expr::Literal(Literal::Numeric(from_bytes(
+                tok.value,
+            ))))),
+            TK_VARIABLE => Ok(Box::new(self.create_variable(tok.value)?)),
+            TK_CTIME_KW => match_ignore_ascii_case!(match tok.value {
+                b"CURRENT_DATE" => Ok(Box::new(Expr::Literal(Literal::CurrentDate))),
+                b"CURRENT_TIME" => Ok(Box::new(Expr::Literal(Literal::CurrentTime))),
+                b"CURRENT_TIMESTAMP" => Ok(Box::new(Expr::Literal(Literal::CurrentTimestamp))),
+                _ => unreachable!(),
+            }),
+            _ => unreachable!(),
+        }
+    }
+
+    /// `CAST (expr AS type)` operand.
+    #[inline(never)]
+    fn parse_expr_operand_cast(&mut self) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_CAST);
+        eat_expect!(self, TK_LP);
+        let expr = self.parse_expr(0)?;
+        eat_expect!(self, TK_AS);
+        let typ = self.parse_type()?;
+        eat_expect!(self, TK_RP);
+        self.last_expr_height += 1;
+        Ok(Box::new(Expr::Cast {
+            expr,
+            type_name: typ,
+        }))
+    }
+
+    /// Unary operator (`NOT`, `~`, `+`, `-`) operand.
+    #[inline(never)]
+    fn parse_expr_operand_unary(&mut self, op: UnaryOperator, precedence: u8) -> Result<Box<Expr>> {
+        let tok = eat_assert!(self, TK_NOT, TK_BITNOT, TK_PLUS, TK_MINUS);
+        debug_assert!(matches!(
+            (tok.token_type, op),
+            (TK_NOT, UnaryOperator::Not)
+                | (TK_BITNOT, UnaryOperator::BitwiseNot)
+                | (TK_PLUS, UnaryOperator::Positive)
+                | (TK_MINUS, UnaryOperator::Negative)
+        ));
+        let expr = self.parse_expr(precedence)?;
+        self.last_expr_height += 1;
+        Ok(Box::new(Expr::Unary(op, expr)))
+    }
+
+    /// `EXISTS (SELECT ...)` operand.
+    #[inline(never)]
+    fn parse_expr_operand_exists(&mut self) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_EXISTS);
+        eat_expect!(self, TK_LP);
+        let select = self.parse_select()?;
+        eat_expect!(self, TK_RP);
+        // Subquery is compiled separately: a leaf for height.
+        self.last_expr_height = 1;
+        Ok(Box::new(Expr::Exists(select)))
+    }
+
+    /// `CASE ... WHEN ... THEN ... [ELSE ...] END` operand.
+    #[inline(never)]
+    fn parse_expr_operand_case(&mut self) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_CASE);
+        // Tallest of the base/when/then/else sub-expressions.
+        let mut max_h = 0usize;
+        let base = if self.peek_no_eof()?.token_type != TK_WHEN {
+            let base = self.parse_expr(0)?;
+            max_h = max_h.max(self.last_expr_height);
+            Some(base)
+        } else {
+            None
+        };
+
+        eat_expect!(self, TK_WHEN);
+        let first_when = self.parse_expr(0)?;
+        max_h = max_h.max(self.last_expr_height);
+        eat_expect!(self, TK_THEN);
+        let first_then = self.parse_expr(0)?;
+        max_h = max_h.max(self.last_expr_height);
+        let mut when_then_pairs = vec![(first_when, first_then)];
+
+        while let Some(tok) = self.peek()? {
+            if tok.token_type != TK_WHEN {
+                break;
+            }
+
+            eat_assert!(self, TK_WHEN);
+            let when = self.parse_expr(0)?;
+            max_h = max_h.max(self.last_expr_height);
+            eat_expect!(self, TK_THEN);
+            let then = self.parse_expr(0)?;
+            max_h = max_h.max(self.last_expr_height);
+            when_then_pairs.push((when, then));
+        }
+
+        let else_expr = if let Some(ok) = self.peek()? {
+            if ok.token_type == TK_ELSE {
+                eat_assert!(self, TK_ELSE);
+                let else_expr = self.parse_expr(0)?;
+                max_h = max_h.max(self.last_expr_height);
+                Some(else_expr)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        eat_expect!(self, TK_END);
+        self.last_expr_height = 1 + max_h;
+        Ok(Box::new(Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        }))
+    }
+
+    /// `RAISE (...)` operand.
+    #[inline(never)]
+    fn parse_expr_operand_raise(&mut self) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_RAISE);
+        eat_expect!(self, TK_LP);
+
+        let (resolve, shorthand) = match self.peek_no_eof()?.token_type {
+            TK_IGNORE => {
+                eat_assert!(self, TK_IGNORE);
+                (ResolveType::Ignore, false)
+            }
+            // RAISE('message') shorthand — defaults to ABORT
+            TK_STRING => (ResolveType::Abort, true),
+            _ => (self.parse_raise_type()?, false),
+        };
+
+        let expr = if resolve != ResolveType::Ignore {
+            if !shorthand {
+                eat_expect!(self, TK_COMMA);
+            }
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+
+        eat_expect!(self, TK_RP);
+        if expr.is_some() {
+            self.last_expr_height += 1;
+        }
+        Ok(Box::new(Expr::Raise(resolve, expr)))
+    }
+
+    /// Bracket-quoted identifier operand: `[name]` or `[multi word name]`,
+    /// optionally qualified: `[tbl].[col]` or `[db].[tbl].[col]`.
+    #[inline(never)]
+    fn parse_expr_operand_bracket_name(&mut self) -> Result<Box<Expr>> {
+        let name = self.parse_bracket_quoted_name()?;
+        let second_name = if self.peek()?.is_some_and(|t| t.token_type == TK_DOT) {
+            eat_assert!(self, TK_DOT);
+            Some(self.parse_nm()?)
+        } else {
+            None
+        };
+        let third_name =
+            if second_name.is_some() && self.peek()?.is_some_and(|t| t.token_type == TK_DOT) {
+                eat_assert!(self, TK_DOT);
+                Some(self.parse_nm()?)
+            } else {
+                None
+            };
+        match (second_name, third_name) {
+            (Some(second), Some(third)) => Ok(Box::new(Expr::DoublyQualified(name, second, third))),
+            (Some(second), None) => Ok(Box::new(Expr::Qualified(name, second))),
+            _ => Ok(Box::new(Expr::Id(name))),
+        }
+    }
+
+    /// Identifier, string literal, (possibly qualified) column reference, or
+    /// function call operand.
+    ///
+    /// NOTE: this is on the expression recursion path, because a function call
+    /// recurses into its arguments (`abs(abs(...))`), so it must keep its stack
+    /// frame small. Unoptimized builds give every temporary in a function body
+    /// a distinct stack slot, so keep this a thin dispatcher and put each arm
+    /// body in its own `#[inline(never)]` helper (see issue #6655).
+    #[inline(never)]
+    fn parse_expr_operand_name(&mut self) -> Result<Box<Expr>> {
+        let can_be_lit_str = self.peek_no_eof()?.token_type == TK_STRING;
+
+        // can be either Literal::String or Name - so we parse raw value early and decide later
+        let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
+        let name = tok.value;
+
+        // Check for ARRAY[...] literal
+        if name.eq_ignore_ascii_case(b"array")
+            && self
+                .peek()?
+                .is_some_and(|tok| tok.token_type == TK_LBRACKET)
+        {
+            return self.parse_expr_operand_array_literal();
+        }
+
+        if self.peek()?.is_some_and(|tok| tok.token_type == TK_LP) {
+            return self.parse_expr_operand_function_call(name, can_be_lit_str);
+        }
+
+        self.parse_expr_operand_qualified_name(name, can_be_lit_str)
+    }
+
+    /// `ARRAY[expr, ...]` literal, desugared into an `array(...)` function call.
+    ///
+    /// Kept out of [Self::parse_expr_operand_name] so its locals don't inflate
+    /// the per-recursion-level stack frame of expression parsing (#6655).
+    #[inline(never)]
+    fn parse_expr_operand_array_literal(&mut self) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_LBRACKET);
+        let elements = self.parse_expr_list()?;
+        eat_expect!(self, TK_RBRACKET);
+        // `parse_expr_list` left the tallest element's height.
+        self.last_expr_height += 1;
+        Ok(Box::new(Expr::FunctionCall {
+            name: Name::from_bytes(b"array"),
+            distinctness: None,
+            args: elements,
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        }))
+    }
+
+    /// `name(...)` or `name(*)`, with the optional `ORDER BY` / `WITHIN GROUP` /
+    /// `FILTER` / `OVER` clauses.
+    ///
+    /// Kept out of [Self::parse_expr_operand_name] so its locals don't inflate
+    /// the per-recursion-level stack frame of expression parsing (#6655).
+    #[inline(never)]
+    fn parse_expr_operand_function_call(
+        &mut self,
+        name: &[u8],
+        can_be_lit_str: bool,
+    ) -> Result<Box<Expr>> {
+        if can_be_lit_str {
+            // can not be literal string in function name
+            return self.err_string_used_as_function_name(name.len());
+        }
+
+        eat_assert!(self, TK_LP);
+        if self.peek_no_eof()?.token_type == TK_STAR {
+            eat_assert!(self, TK_STAR);
+            eat_expect!(self, TK_RP);
+            let filter_over = self.parse_filter_over()?;
+            // No arguments, but later passes still walk any FILTER/OVER
+            // sub-expressions, so fold their height into this node's height.
+            self.last_expr_height += 1;
+            return Ok(Box::new(Expr::FunctionCallStar {
+                name: Name::from_bytes(name),
+                filter_over,
+            }));
+        }
+
+        let distinct = self.parse_distinct()?;
+        let exprs = self.parse_expr_list()?;
+        // Height is the tallest sub-expression later passes can descend into:
+        // the arguments plus the ORDER BY / WITHIN GROUP / FILTER / OVER
+        // clauses.
+        let mut clause_height = self.last_expr_height;
+        let order_by = self.parse_order_by()?;
+        clause_height = clause_height.max(self.last_expr_height);
+        eat_expect!(self, TK_RP);
+        let within_group = self.parse_within_group()?;
+        clause_height = clause_height.max(self.last_expr_height);
+        let filter_over = self.parse_filter_over()?;
+        clause_height = clause_height.max(self.last_expr_height);
+        self.last_expr_height = 1 + clause_height;
+        Ok(Box::new(Expr::FunctionCall {
+            name: Name::from_bytes(name),
+            distinctness: distinct,
+            args: exprs,
+            order_by,
+            within_group,
+            filter_over,
+        }))
+    }
+
+    /// The error for a string literal in function name position, e.g. `'x'(1)`.
+    ///
+    /// Kept out of [Self::parse_expr_operand_function_call] so building the
+    /// error value doesn't inflate the per-recursion-level stack frame of
+    /// expression parsing (#6655).
+    #[inline(never)]
+    fn err_string_used_as_function_name(&mut self, name_len: usize) -> Result<Box<Expr>> {
+        let token = self.peek_no_eof()?;
+        let token_text = token.to_utf8();
+        let offset = self.offset();
+        Err(Error::ParseUnexpectedToken {
+            parsed_offset: (self.offset() - name_len, name_len).into(),
+            got: TK_STRING,
+            expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
+            token_text,
+            offset,
+            expected_display: crate::token::TokenType::format_expected_tokens(&[
+                TK_ID, TK_INDEXED, TK_JOIN_KW,
+            ]),
+        })
+    }
+
+    /// A name operand that is not a function call: `x`, `t.x`, `db.t.x`, a
+    /// string literal, or the `TRUE` / `FALSE` keywords.
+    ///
+    /// Kept out of [Self::parse_expr_operand_name] so its locals don't inflate
+    /// the per-recursion-level stack frame of expression parsing (#6655).
+    #[inline(never)]
+    fn parse_expr_operand_qualified_name(
+        &mut self,
+        name: &[u8],
+        can_be_lit_str: bool,
+    ) -> Result<Box<Expr>> {
+        let second_name = if self.peek()?.is_some_and(|tok| tok.token_type == TK_DOT) {
+            eat_assert!(self, TK_DOT);
+            Some(self.parse_nm()?)
+        } else {
+            None
+        };
+
+        let third_name = if self.peek()?.is_some_and(|tok| tok.token_type == TK_DOT) {
+            debug_assert!(second_name.is_some());
+            eat_assert!(self, TK_DOT);
+            Some(self.parse_nm()?)
+        } else {
+            None
+        };
+
+        if let Some(second_name) = second_name {
+            if let Some(third_name) = third_name {
+                Ok(Box::new(Expr::DoublyQualified(
+                    Name::from_bytes(name),
+                    second_name,
+                    third_name,
+                )))
+            } else {
+                Ok(Box::new(Expr::Qualified(
+                    Name::from_bytes(name),
+                    second_name,
+                )))
+            }
+        } else if can_be_lit_str {
+            Ok(Box::new(Expr::Literal(Literal::String(from_bytes(name)))))
+        } else {
+            match_ignore_ascii_case!(match name {
+                b"true" => {
+                    Ok(Box::new(Expr::Literal(Literal::True)))
+                }
+                b"false" => {
+                    Ok(Box::new(Expr::Literal(Literal::False)))
+                }
+                _ => Ok(Box::new(Expr::Id(Name::from_bytes(name)))),
+            })
         }
     }
 
@@ -2070,9 +2187,7 @@ impl<'a> Parser<'a> {
         self.expr_nesting_depth += 1;
         if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
             self.expr_nesting_depth -= 1;
-            return Err(Error::ParseError(format!(
-                "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
-            )));
+            return Err(err_expr_too_large());
         }
         let result = self.parse_expr_inner(precedence);
         self.expr_nesting_depth -= 1;
@@ -2087,9 +2202,7 @@ impl<'a> Parser<'a> {
         // limit on its own without being followed by an operator.
         let mut result_height = self.last_expr_height;
         if result_height > MAX_EXPR_DEPTH {
-            return Err(Error::ParseError(format!(
-                "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
-            )));
+            return Err(err_expr_too_large());
         }
 
         loop {
@@ -2111,399 +2224,50 @@ impl<'a> Parser<'a> {
                 );
                 not = true;
             }
+            let tt = tok.token_type;
+            let tok_value = tok.value;
 
-            result = match tok.token_type {
-                TK_NULL => {
-                    // special case `NOT NULL`
-                    debug_assert!(not); // FIXME: not always true because of current_token_precedence
-                    eat_assert!(self, TK_NULL);
-                    Box::new(Expr::NotNull(result))
-                }
-                TK_OR => {
-                    eat_assert!(self, TK_OR);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Or,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_AND => {
-                    eat_assert!(self, TK_AND);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::And,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_EQ => {
-                    eat_assert!(self, TK_EQ);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Equals,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_NE => {
-                    eat_assert!(self, TK_NE);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::NotEquals,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_IS => {
-                    eat_assert!(self, TK_IS);
-
-                    let not = match self.peek_no_eof()?.token_type {
-                        TK_NOT => {
-                            eat_assert!(self, TK_NOT);
-                            true
-                        }
-                        _ => false,
-                    };
-
-                    let op = match self.peek_no_eof()?.token_type {
-                        TK_DISTINCT => {
-                            eat_assert!(self, TK_DISTINCT);
-                            eat_expect!(self, TK_FROM);
-                            if not {
-                                Operator::Is
-                            } else {
-                                Operator::IsNot
-                            }
-                        }
-                        _ => {
-                            if not {
-                                Operator::IsNot
-                            } else {
-                                Operator::Is
-                            }
-                        }
-                    };
-
-                    Box::new(Expr::Binary(result, op, self.parse_expr(pre + 1)?))
-                }
-                TK_BETWEEN => {
-                    eat_assert!(self, TK_BETWEEN);
-                    let start = self.parse_expr(pre)?;
-                    let start_height = self.last_expr_height;
-                    eat_expect!(self, TK_AND);
-                    // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
-                    // bind to the whole BETWEEN expression, not just the end value
-                    let end = self.parse_expr(pre + 1)?;
-                    self.last_expr_height = start_height.max(self.last_expr_height);
-                    Box::new(Expr::Between {
-                        lhs: result,
-                        not,
-                        start,
-                        end,
-                    })
-                }
-                TK_IN => {
-                    eat_assert!(self, TK_IN);
-                    let tok = self.peek_no_eof()?;
-                    match tok.token_type {
-                        TK_LP => {
-                            eat_assert!(self, TK_LP);
-                            let tok = self.peek_no_eof()?;
-                            match tok.token_type {
-                                TK_SELECT | TK_WITH | TK_VALUES => {
-                                    let select = self.parse_select()?;
-                                    eat_expect!(self, TK_RP);
-                                    // The subquery is compiled separately, so it
-                                    // counts as a leaf for this expression's height.
-                                    self.last_expr_height = 1;
-                                    Box::new(Expr::InSelect {
-                                        lhs: result,
-                                        not,
-                                        rhs: select,
-                                    })
-                                }
-                                _ => {
-                                    let exprs = self.parse_expr_list()?;
-                                    eat_expect!(self, TK_RP);
-                                    // Expressions in the form:
-                                    // lhs IN ()
-                                    // lhs NOT IN ()
-                                    // can be simplified to constants 0 (false) and 1 (true), respectively.
-                                    //
-                                    // todo: should check if lhs has a function. If so, this optimization cannot
-                                    // be done.
-                                    if exprs.is_empty() {
-                                        let name = if not { "1" } else { "0" };
-                                        // Simplified to a constant leaf.
-                                        leaf = true;
-                                        Box::new(Expr::Literal(Literal::Numeric(name.into())))
-                                    } else if exprs.len() == 1 && is_bare_subquery(&exprs[0]) {
-                                        // `x IN ((SELECT ...))` is subquery membership,
-                                        // the same as `x IN (SELECT ...)`: an empty
-                                        // subquery yields 0/1, not NULL. This matches
-                                        // SQLite. A list of two or more values, or a
-                                        // subquery embedded in a larger expression, stays
-                                        // a value list.
-                                        self.last_expr_height = 1;
-                                        Box::new(Expr::InSelect {
-                                            lhs: result,
-                                            not,
-                                            rhs: into_bare_subquery(
-                                                exprs.into_iter().next().expect("one element"),
-                                            ),
-                                        })
-                                    } else {
-                                        Box::new(Expr::InList {
-                                            lhs: result,
-                                            rhs: exprs,
-                                            not,
-                                        })
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            let name = self.parse_fullname(false)?;
-                            let mut exprs = vec![];
-                            if let Some(tok) = self.peek()? {
-                                if tok.token_type == TK_LP {
-                                    eat_assert!(self, TK_LP);
-                                    exprs = self.parse_expr_list()?;
-                                    eat_expect!(self, TK_RP);
-                                }
-                            }
-
-                            Box::new(Expr::InTable {
-                                lhs: result,
-                                not,
-                                rhs: name,
-                                args: exprs,
-                            })
-                        }
+            // NOTE: this function is on the expression recursion path, so it
+            // must keep its stack frame small. Unoptimized builds give every
+            // temporary in a function body a distinct stack slot; with one
+            // inline `Expr` construction per operator the frame grew to
+            // ~48 KiB and moderately nested expressions overflowed the stack
+            // (see issue #6655). All plain binary operators share the single
+            // construction site below and the remaining arms delegate to
+            // `#[inline(never)]` helpers.
+            result = if let Some(op) = binary_operator_from_token(tt, tok_value) {
+                let eaten = self.eat_no_eof()?;
+                debug_assert_eq!(eaten.token_type, tt);
+                Box::new(Expr::Binary(result, op, self.parse_expr(pre + 1)?))
+            } else {
+                match tt {
+                    TK_NULL => {
+                        // special case `NOT NULL`
+                        debug_assert!(not); // FIXME: not always true because of current_token_precedence
+                        eat_assert!(self, TK_NULL);
+                        Box::new(Expr::NotNull(result))
                     }
-                }
-                TK_MATCH | TK_LIKE_KW => {
-                    let tok = eat_assert!(self, TK_MATCH, TK_LIKE_KW);
-                    let op = match tok.token_type {
-                        TK_MATCH => LikeOperator::Match,
-                        TK_LIKE_KW => match_ignore_ascii_case!(match tok.value {
-                            b"LIKE" => LikeOperator::Like,
-                            b"GLOB" => LikeOperator::Glob,
-                            b"REGEXP" => LikeOperator::Regexp,
-                            _ => unreachable!(),
-                        }),
-                        _ => unreachable!(),
-                    };
-
-                    // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
-                    // bind to the whole LIKE expression, not just the pattern
-                    let expr = self.parse_expr(pre + 1)?;
-                    let rhs_height = self.last_expr_height;
-                    let escape = if let Some(tok) = self.peek()? {
-                        if tok.token_type == TK_ESCAPE {
-                            eat_assert!(self, TK_ESCAPE);
-                            let escape = self.parse_expr(pre + 1)?;
-                            self.last_expr_height = rhs_height.max(self.last_expr_height);
-                            Some(escape)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    Box::new(Expr::Like {
-                        lhs: result,
-                        not,
-                        op,
-                        rhs: expr,
-                        escape,
-                    })
-                }
-                TK_ISNULL => {
-                    eat_assert!(self, TK_ISNULL);
-                    Box::new(Expr::IsNull(result))
-                }
-                TK_NOTNULL => {
-                    eat_assert!(self, TK_NOTNULL);
-                    Box::new(Expr::NotNull(result))
-                }
-                TK_LT => {
-                    eat_assert!(self, TK_LT);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Less,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_GT => {
-                    eat_assert!(self, TK_GT);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Greater,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_LE => {
-                    eat_assert!(self, TK_LE);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::LessEquals,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_GE => {
-                    eat_assert!(self, TK_GE);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::GreaterEquals,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_ESCAPE => unreachable!(),
-                TK_BITAND => {
-                    eat_assert!(self, TK_BITAND);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::BitwiseAnd,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_BITOR => {
-                    eat_assert!(self, TK_BITOR);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::BitwiseOr,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_LSHIFT => {
-                    eat_assert!(self, TK_LSHIFT);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::LeftShift,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_RSHIFT => {
-                    eat_assert!(self, TK_RSHIFT);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::RightShift,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_PLUS => {
-                    eat_assert!(self, TK_PLUS);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Add,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_MINUS => {
-                    eat_assert!(self, TK_MINUS);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Subtract,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_STAR => {
-                    eat_assert!(self, TK_STAR);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Multiply,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_SLASH => {
-                    eat_assert!(self, TK_SLASH);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Divide,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_REM => {
-                    eat_assert!(self, TK_REM);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Modulus,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_ARRAY_CONTAINS => {
-                    eat_assert!(self, TK_ARRAY_CONTAINS);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::ArrayContains,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_ARRAY_OVERLAP => {
-                    eat_assert!(self, TK_ARRAY_OVERLAP);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::ArrayOverlap,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_CONCAT => {
-                    eat_assert!(self, TK_CONCAT);
-                    Box::new(Expr::Binary(
-                        result,
-                        Operator::Concat,
-                        self.parse_expr(pre + 1)?,
-                    ))
-                }
-                TK_PTR => {
-                    let tok = eat_assert!(self, TK_PTR);
-                    let op = if tok.value.len() == 2 {
-                        Operator::ArrowRight
-                    } else {
-                        Operator::ArrowRightShift
-                    };
-
-                    Box::new(Expr::Binary(result, op, self.parse_expr(pre + 1)?))
-                }
-                TK_COLLATE => Box::new(Expr::Collate(result, self.parse_collate()?.unwrap())),
-                TK_LBRACKET => {
-                    eat_assert!(self, TK_LBRACKET);
-                    let first = self.parse_expr(0)?;
-                    let first_height = self.last_expr_height;
-                    // Slice syntax: expr[start:end]
-                    if self.peek()?.is_some_and(|t| t.token_type == TK_COLON) {
-                        eat_assert!(self, TK_COLON);
-                        let second = self.parse_expr(0)?;
-                        self.last_expr_height = first_height.max(self.last_expr_height);
-                        eat_expect!(self, TK_RBRACKET);
-                        // Desugar to array_slice(expr, start, end)
-                        Box::new(Expr::FunctionCall {
-                            name: Name::from_bytes(b"array_slice"),
-                            distinctness: None,
-                            args: vec![result, first, second],
-                            order_by: vec![],
-                            within_group: vec![],
-                            filter_over: FunctionTail {
-                                filter_clause: None,
-                                over_clause: None,
-                            },
-                        })
-                    } else {
-                        // Desugar expr[index] into array_element(expr, index)
-                        eat_expect!(self, TK_RBRACKET);
-                        Box::new(Expr::FunctionCall {
-                            name: Name::from_bytes(b"array_element"),
-                            distinctness: None,
-                            args: vec![result, first],
-                            order_by: vec![],
-                            within_group: vec![],
-                            filter_over: FunctionTail {
-                                filter_clause: None,
-                                over_clause: None,
-                            },
-                        })
+                    TK_ISNULL => {
+                        eat_assert!(self, TK_ISNULL);
+                        Box::new(Expr::IsNull(result))
                     }
+                    TK_NOTNULL => {
+                        eat_assert!(self, TK_NOTNULL);
+                        Box::new(Expr::NotNull(result))
+                    }
+                    TK_IS => self.parse_expr_infix_is(result, pre)?,
+                    TK_BETWEEN => self.parse_expr_infix_between(result, not, pre)?,
+                    TK_IN => {
+                        let (expr, is_leaf) = self.parse_expr_infix_in(result, not)?;
+                        leaf = is_leaf;
+                        expr
+                    }
+                    TK_MATCH | TK_LIKE_KW => self.parse_expr_infix_like(result, not, pre)?,
+                    TK_COLLATE => Box::new(Expr::Collate(result, self.parse_collate()?.unwrap())),
+                    TK_LBRACKET => self.parse_expr_infix_subscript(result)?,
+                    TK_ESCAPE => unreachable!(),
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             };
             // Each iteration wraps the previous `result` in a new node, growing
             // the tree by one level; `last_expr_height` holds the height of the
@@ -2514,14 +2278,250 @@ impl<'a> Parser<'a> {
                 1 + result_height.max(self.last_expr_height)
             };
             if result_height > MAX_EXPR_DEPTH {
-                return Err(Error::ParseError(format!(
-                    "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
-                )));
+                return Err(err_expr_too_large());
             }
         }
 
         self.last_expr_height = result_height;
         Ok(result)
+    }
+
+    /// `lhs IS [NOT] [DISTINCT FROM] rhs`.
+    #[inline(never)]
+    fn parse_expr_infix_is(&mut self, lhs: Box<Expr>, pre: u8) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_IS);
+
+        let not = match self.peek_no_eof()?.token_type {
+            TK_NOT => {
+                eat_assert!(self, TK_NOT);
+                true
+            }
+            _ => false,
+        };
+
+        let op = match self.peek_no_eof()?.token_type {
+            TK_DISTINCT => {
+                eat_assert!(self, TK_DISTINCT);
+                eat_expect!(self, TK_FROM);
+                if not {
+                    Operator::Is
+                } else {
+                    Operator::IsNot
+                }
+            }
+            _ => {
+                if not {
+                    Operator::IsNot
+                } else {
+                    Operator::Is
+                }
+            }
+        };
+
+        Ok(Box::new(Expr::Binary(lhs, op, self.parse_expr(pre + 1)?)))
+    }
+
+    /// `lhs [NOT] BETWEEN start AND end`.
+    #[inline(never)]
+    fn parse_expr_infix_between(
+        &mut self,
+        lhs: Box<Expr>,
+        not: bool,
+        pre: u8,
+    ) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_BETWEEN);
+        let start = self.parse_expr(pre)?;
+        let start_height = self.last_expr_height;
+        eat_expect!(self, TK_AND);
+        // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
+        // bind to the whole BETWEEN expression, not just the end value
+        let end = self.parse_expr(pre + 1)?;
+        self.last_expr_height = start_height.max(self.last_expr_height);
+        Ok(Box::new(Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        }))
+    }
+
+    /// `lhs [NOT] IN (...)` / `lhs [NOT] IN table_or_function`. The returned
+    /// flag is true when the expression was simplified to a fresh leaf, so the
+    /// caller must reset its running height.
+    #[inline(never)]
+    fn parse_expr_infix_in(&mut self, lhs: Box<Expr>, not: bool) -> Result<(Box<Expr>, bool)> {
+        eat_assert!(self, TK_IN);
+        let tok = self.peek_no_eof()?;
+        match tok.token_type {
+            TK_LP => {
+                eat_assert!(self, TK_LP);
+                let tok = self.peek_no_eof()?;
+                match tok.token_type {
+                    TK_SELECT | TK_WITH | TK_VALUES => {
+                        let select = self.parse_select()?;
+                        eat_expect!(self, TK_RP);
+                        // The subquery is compiled separately, so it
+                        // counts as a leaf for this expression's height.
+                        self.last_expr_height = 1;
+                        Ok((
+                            Box::new(Expr::InSelect {
+                                lhs,
+                                not,
+                                rhs: select,
+                            }),
+                            false,
+                        ))
+                    }
+                    _ => {
+                        let exprs = self.parse_expr_list()?;
+                        eat_expect!(self, TK_RP);
+                        // Expressions in the form:
+                        // lhs IN ()
+                        // lhs NOT IN ()
+                        // can be simplified to constants 0 (false) and 1 (true), respectively.
+                        //
+                        // todo: should check if lhs has a function. If so, this optimization cannot
+                        // be done.
+                        if exprs.is_empty() {
+                            let name = if not { "1" } else { "0" };
+                            // Simplified to a constant leaf.
+                            Ok((Box::new(Expr::Literal(Literal::Numeric(name.into()))), true))
+                        } else if exprs.len() == 1 && is_bare_subquery(&exprs[0]) {
+                            // `x IN ((SELECT ...))` is subquery membership,
+                            // the same as `x IN (SELECT ...)`: an empty
+                            // subquery yields 0/1, not NULL. This matches
+                            // SQLite. A list of two or more values, or a
+                            // subquery embedded in a larger expression, stays
+                            // a value list.
+                            self.last_expr_height = 1;
+                            Ok((
+                                Box::new(Expr::InSelect {
+                                    lhs,
+                                    not,
+                                    rhs: into_bare_subquery(
+                                        exprs.into_iter().next().expect("one element"),
+                                    ),
+                                }),
+                                false,
+                            ))
+                        } else {
+                            Ok((
+                                Box::new(Expr::InList {
+                                    lhs,
+                                    rhs: exprs,
+                                    not,
+                                }),
+                                false,
+                            ))
+                        }
+                    }
+                }
+            }
+            _ => {
+                let name = self.parse_fullname(false)?;
+                let mut exprs = vec![];
+                if let Some(tok) = self.peek()? {
+                    if tok.token_type == TK_LP {
+                        eat_assert!(self, TK_LP);
+                        exprs = self.parse_expr_list()?;
+                        eat_expect!(self, TK_RP);
+                    }
+                }
+
+                Ok((
+                    Box::new(Expr::InTable {
+                        lhs,
+                        not,
+                        rhs: name,
+                        args: exprs,
+                    }),
+                    false,
+                ))
+            }
+        }
+    }
+
+    /// `lhs [NOT] LIKE/GLOB/REGEXP/MATCH rhs [ESCAPE expr]`.
+    #[inline(never)]
+    fn parse_expr_infix_like(&mut self, lhs: Box<Expr>, not: bool, pre: u8) -> Result<Box<Expr>> {
+        let tok = eat_assert!(self, TK_MATCH, TK_LIKE_KW);
+        let op = match tok.token_type {
+            TK_MATCH => LikeOperator::Match,
+            TK_LIKE_KW => match_ignore_ascii_case!(match tok.value {
+                b"LIKE" => LikeOperator::Like,
+                b"GLOB" => LikeOperator::Glob,
+                b"REGEXP" => LikeOperator::Regexp,
+                _ => unreachable!(),
+            }),
+            _ => unreachable!(),
+        };
+
+        // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
+        // bind to the whole LIKE expression, not just the pattern
+        let expr = self.parse_expr(pre + 1)?;
+        let rhs_height = self.last_expr_height;
+        let escape = if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_ESCAPE {
+                eat_assert!(self, TK_ESCAPE);
+                let escape = self.parse_expr(pre + 1)?;
+                self.last_expr_height = rhs_height.max(self.last_expr_height);
+                Some(escape)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(Box::new(Expr::Like {
+            lhs,
+            not,
+            op,
+            rhs: expr,
+            escape,
+        }))
+    }
+
+    /// `lhs[index]` / `lhs[start:end]` subscript, desugared to
+    /// `array_element` / `array_slice` calls.
+    #[inline(never)]
+    fn parse_expr_infix_subscript(&mut self, lhs: Box<Expr>) -> Result<Box<Expr>> {
+        eat_assert!(self, TK_LBRACKET);
+        let first = self.parse_expr(0)?;
+        let first_height = self.last_expr_height;
+        // Slice syntax: expr[start:end]
+        if self.peek()?.is_some_and(|t| t.token_type == TK_COLON) {
+            eat_assert!(self, TK_COLON);
+            let second = self.parse_expr(0)?;
+            self.last_expr_height = first_height.max(self.last_expr_height);
+            eat_expect!(self, TK_RBRACKET);
+            // Desugar to array_slice(expr, start, end)
+            Ok(Box::new(Expr::FunctionCall {
+                name: Name::from_bytes(b"array_slice"),
+                distinctness: None,
+                args: vec![lhs, first, second],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            }))
+        } else {
+            // Desugar expr[index] into array_element(expr, index)
+            eat_expect!(self, TK_RBRACKET);
+            Ok(Box::new(Expr::FunctionCall {
+                name: Name::from_bytes(b"array_element"),
+                distinctness: None,
+                args: vec![lhs, first],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            }))
+        }
     }
 
     fn parse_collate(&mut self) -> Result<Option<Name>> {
