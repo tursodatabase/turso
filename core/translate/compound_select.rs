@@ -12,7 +12,11 @@ use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectP
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
-use crate::{emit_explain, LimboError};
+use crate::{
+    emit_explain,
+    explain_plan::{CompoundOp, PlanOp, SortPurpose, SortStrategy},
+    LimboError,
+};
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 
@@ -167,7 +171,7 @@ pub fn emit_program_for_compound_select(
         }
     };
 
-    emit_explain!(program, true, "COMPOUND QUERY".to_owned());
+    emit_explain!(program, true, PlanOp::CompoundQuery);
 
     // The compound query's result columns are the leftmost subselect's result columns
     // (per SQLite semantics). Save them so we can install them on `program` after
@@ -325,7 +329,13 @@ fn emit_compound_select(
                     right_most_ctx.reg_offset = offset_reg;
                 }
 
-                emit_explain!(program, true, "UNION ALL".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    PlanOp::CompoundOperator {
+                        op: CompoundOp::UnionAll
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -373,7 +383,13 @@ fn emit_compound_select(
                     is_delete: false,
                 };
 
-                emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    PlanOp::CompoundOperator {
+                        op: CompoundOp::Union
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -426,7 +442,13 @@ fn emit_compound_select(
                     query_destination,
                 )?;
 
-                emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    PlanOp::CompoundOperator {
+                        op: CompoundOp::Intersect
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -477,7 +499,13 @@ fn emit_compound_select(
                     affinity_str: None,
                     is_delete: true,
                 };
-                emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    PlanOp::CompoundOperator {
+                        op: CompoundOp::Except
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -504,7 +532,7 @@ fn emit_compound_select(
                 right_most.offset.clone_from(offset);
                 right_most_ctx.reg_offset = offset_reg;
             }
-            emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
+            emit_explain!(program, true, PlanOp::CompoundLeftMost);
             right_most_ctx.materialized_build_inputs =
                 emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
             emit_query(program, right_most, &mut right_most_ctx)?;
@@ -1036,7 +1064,14 @@ fn emit_compound_order_by(
         .transpose()?;
 
     // Sort and emit results
-    emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+    emit_explain!(
+        program,
+        false,
+        PlanOp::Sort {
+            purpose: SortPurpose::OrderBy,
+            strategy: SortStrategy::Sorter,
+        }
+    );
 
     let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
         column_count: sorter_column_count,

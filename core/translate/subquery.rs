@@ -8,6 +8,7 @@ use turso_parser::ast::{self, SortOrder, SubqueryType};
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
+    explain_plan::{PlanOp, SubqueryKind},
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
@@ -24,8 +25,8 @@ use crate::{
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
-            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryEvalPhase,
-            SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            NonFromClauseSubquery, OuterQueryReference, Plan, SubqueryEvalPhase, SubqueryOrigin,
+            SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -42,7 +43,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
+    plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 
@@ -1363,7 +1364,7 @@ pub fn emit_from_clause_subqueries(
     join_order: &[JoinOrderMember],
 ) -> Result<()> {
     if tables.joined_tables().is_empty() {
-        emit_explain!(program, false, "SCAN CONSTANT ROW".to_owned());
+        emit_explain!(program, false, PlanOp::ConstantRow);
     }
 
     // FIRST PASS: Pre-materialize all recursively reachable multi-ref / hinted CTEs
@@ -1395,123 +1396,12 @@ pub fn emit_from_clause_subqueries(
         .try_collect()?;
 
     for table_index in visit_order {
+        let is_outer = outer_table_set.get(table_index);
         let table_reference = &mut tables.joined_tables_mut()[table_index];
-        let left_join_suffix = if outer_table_set.get(table_index) {
-            " LEFT-JOIN"
-        } else {
-            ""
-        };
         emit_explain!(
             program,
             true,
-            match &table_reference.op {
-                Operation::Scan(scan) => {
-                    let table_name =
-                        if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
-                        } else {
-                            format!(
-                                "{} AS {}",
-                                table_reference.table.get_name(),
-                                table_reference.identifier
-                            )
-                        };
-
-                    match scan {
-                        Scan::BTreeTable { index, .. } => {
-                            if let Some(index) = index {
-                                if table_reference.utilizes_covering_index() {
-                                    format!("SCAN {table_name} USING COVERING INDEX {}", index.name)
-                                } else {
-                                    format!("SCAN {table_name} USING INDEX {}", index.name)
-                                }
-                            } else {
-                                format!("SCAN {table_name}")
-                            }
-                        }
-                        Scan::VirtualTable { .. }
-                        | Scan::Subquery { .. }
-                        | Scan::RecursiveCteInput => {
-                            format!("SCAN {table_name}")
-                        }
-                    }
-                }
-                Operation::Search(search) => match search {
-                    Search::RowidEq { .. }
-                    | Search::Seek { index: None, .. }
-                    | Search::InSeek { index: None, .. } => {
-                        format!(
-                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
-                            table_reference.identifier
-                        )
-                    }
-                    Search::Seek {
-                        index: Some(index),
-                        seek_def,
-                    } => {
-                        let constraints =
-                            super::display::seek_constraint_annotation(index, seek_def);
-                        format!(
-                            "SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
-                            table_reference.identifier, index.name
-                        )
-                    }
-                    Search::InSeek {
-                        index: Some(index), ..
-                    } => {
-                        let constraint = if let Some(col) = index.columns.first() {
-                            format!(" ({}=?)", col.name)
-                        } else {
-                            String::new()
-                        };
-                        format!(
-                            "SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
-                            table_reference.identifier, index.name
-                        )
-                    }
-                },
-                Operation::IndexMethodQuery(query) => {
-                    let index_method = query.index.index_method.as_ref().unwrap();
-                    format!(
-                        "QUERY INDEX METHOD {}",
-                        index_method.definition().method_name
-                    )
-                }
-                Operation::HashJoin(_) => {
-                    let table_name =
-                        if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
-                        } else {
-                            format!(
-                                "{} AS {}",
-                                table_reference.table.get_name(),
-                                table_reference.identifier
-                            )
-                        };
-                    format!("HASH JOIN {table_name}")
-                }
-                Operation::MultiIndexScan(multi_idx) => {
-                    let index_names: Vec<&str> = multi_idx
-                        .branches
-                        .iter()
-                        .map(|b| {
-                            b.index
-                                .as_ref()
-                                .map(|i| i.name.as_str())
-                                .unwrap_or("PRIMARY KEY")
-                        })
-                        .collect();
-                    format!(
-                        "MULTI-INDEX {} {} ({})",
-                        match multi_idx.set_op {
-                            SetOperation::Union => "OR",
-                            SetOperation::Intersection { .. } => "AND",
-                        },
-                        table_reference.identifier,
-                        index_names.join(", ")
-                    )
-                }
-            }
+            super::display::plan_op_for_table(table_reference, is_outer)
         );
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
@@ -1934,7 +1824,6 @@ pub fn emit_non_from_clause_subquery(
 ) -> Result<()> {
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
-        let correlated_prefix = if is_correlated { "CORRELATED " } else { "" };
         match query_type {
             SubqueryType::Exists { .. } => {
                 // EXISTS subqueries don't get a separate EQP annotation in SQLite;
@@ -1944,14 +1833,22 @@ pub fn emit_non_from_clause_subquery(
                 emit_explain!(
                     program,
                     true,
-                    format!("{correlated_prefix}LIST SUBQUERY {subquery_id}")
+                    PlanOp::Subquery {
+                        kind: SubqueryKind::List,
+                        id: subquery_id,
+                        correlated: is_correlated,
+                    }
                 );
             }
             SubqueryType::RowValue { .. } => {
                 emit_explain!(
                     program,
                     true,
-                    format!("{correlated_prefix}SCALAR SUBQUERY {subquery_id}")
+                    PlanOp::Subquery {
+                        kind: SubqueryKind::Scalar,
+                        id: subquery_id,
+                        correlated: is_correlated,
+                    }
                 );
             }
         }

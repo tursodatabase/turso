@@ -1187,6 +1187,12 @@ pub struct JoinedTable {
     pub database_id: usize,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
     pub indexed: Option<ast::Indexed>,
+    /// How many rows the optimizer expects this table to contribute per row of
+    /// the tables before it in the join order. Set when the join optimizer
+    /// picks an access method; `None` for tables it never costed (DML targets,
+    /// internal helper plans). Reported by the machine-readable query plan and
+    /// read by nothing else, so it can never change a query's behavior.
+    pub estimated_rows: Option<f64>,
 }
 
 impl JoinedTable {
@@ -2530,6 +2536,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            estimated_rows: None,
         })
     }
 
@@ -2576,6 +2583,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            estimated_rows: None,
         })
     }
 
@@ -2608,6 +2616,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            estimated_rows: None,
         })
     }
 

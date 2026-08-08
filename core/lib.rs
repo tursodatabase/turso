@@ -16,6 +16,7 @@ pub mod alloc;
 pub mod busy;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
+pub mod explain_plan;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod functions;
 pub mod index_method;

@@ -216,6 +216,13 @@ pub enum HeadersMode {
 }
 
 #[derive(Debug, Clone, clap::Parser)]
+pub struct PlanArgs {
+    /// The statement to plan. Do not prefix it with EXPLAIN QUERY PLAN.
+    #[clap(trailing_var_arg = true, required = true)]
+    pub sql: Vec<String>,
+}
+
+#[derive(Debug, Clone, clap::Parser)]
 pub struct DbtotxtArgs {
     #[clap(long = "page")]
     pub page_no: Option<i64>,

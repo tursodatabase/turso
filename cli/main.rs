@@ -2,6 +2,7 @@
 mod app;
 mod commands;
 mod config;
+mod explain_server;
 mod helper;
 mod input;
 mod manual;
@@ -21,6 +22,7 @@ use std::{
     sync::{atomic::Ordering, LazyLock},
 };
 
+use crate::explain_server::TursoExplainServer;
 use crate::sync_server::TursoSyncServer;
 
 #[cfg(all(feature = "mimalloc", not(target_family = "wasm"), not(miri)))]
@@ -57,6 +59,15 @@ fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
     sync_server.run()
 }
 
+fn run_explain_server(app: app::Limbo) -> anyhow::Result<()> {
+    let address = app.opts.explain_server_address.clone().unwrap();
+    let db_path = app.opts.db_file.clone();
+    let conn = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+
+    TursoExplainServer::new(address, db_path, conn, interrupt_count).run()
+}
+
 fn main() -> anyhow::Result<()> {
     #[cfg(feature = "mvcc_repl")]
     {
@@ -80,6 +91,9 @@ fn main() -> anyhow::Result<()> {
     }
     if app.is_sync_server_mode() {
         return run_sync_server(app);
+    }
+    if app.is_explain_server_mode() {
+        return run_explain_server(app);
     }
 
     let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());

@@ -2188,6 +2188,10 @@ fn optimize_table_access(
         ) {
             continue;
         }
+        // Record what the optimizer expected from this table so the
+        // machine-readable query plan can report it. Nothing else reads it.
+        table_references.joined_tables_mut()[table_idx].estimated_rows =
+            Some(access_methods_arena[best_access_methods[i]].estimated_rows_per_outer_row);
         let access_method = &mut access_methods_arena[best_access_methods[i]];
         match &mut access_method.params {
             AccessMethodParams::BTreeTable {

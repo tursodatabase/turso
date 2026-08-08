@@ -1,0 +1,587 @@
+/* Turso query plan viewer.
+ *
+ * Three node colors, and no more: scan, seek, and everything else. Every node
+ * also spells out what it is, so the color is a grouping cue rather than the
+ * only way to tell nodes apart. Both palettes were checked for colorblind
+ * separation against their own surface.
+ */
+
+:root {
+  color-scheme: light;
+
+  --surface: #fcfcfb;
+  --plane: #f9f9f7;
+  --raised: #ffffff;
+
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --ink-muted: #898781;
+
+  --hairline: #e1e0d9;
+  --rule: #c3c2b7;
+  --ring: rgba(11, 11, 11, 0.1);
+
+  --scan: #eb6834;
+  --seek: #1baf7a;
+  --flow: #2a78d6;
+  --critical: #d03b3b;
+
+  --node-w: 268px;
+  --radius: 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme='light'])) {
+    color-scheme: dark;
+
+    --surface: #1a1a19;
+    --plane: #0d0d0d;
+    --raised: #222221;
+
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --ink-muted: #898781;
+
+    --hairline: #2c2c2a;
+    --rule: #383835;
+    --ring: rgba(255, 255, 255, 0.1);
+
+    --scan: #d95926;
+    --seek: #199e70;
+    --flow: #3987e5;
+    --critical: #d03b3b;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Several panes set `display`, which would otherwise beat the hidden attribute. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- top bar ---------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--hairline);
+  flex: 0 0 auto;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-mark {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--flow);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--flow) 18%, transparent);
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.db {
+  color: var(--ink-muted);
+  font-size: 12.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45vw;
+}
+
+/* ---------- layout ---------- */
+
+.layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(300px, 27%) 1fr;
+}
+
+.editor-pane {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+  background: var(--surface);
+  border-right: 1px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.field-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+textarea#sql {
+  width: 100%;
+  min-height: 148px;
+  resize: vertical;
+  padding: 11px 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--raised);
+  color: var(--ink);
+  font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  tab-size: 2;
+}
+
+textarea#sql:focus-visible {
+  outline: 2px solid var(--flow);
+  outline-offset: 1px;
+  border-color: transparent;
+}
+
+.editor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  font: inherit;
+  font-size: 13px;
+  border-radius: 8px;
+  padding: 7px 13px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+button.primary {
+  background: var(--flow);
+  color: #fff;
+  font-weight: 550;
+}
+
+button.primary:hover {
+  filter: brightness(1.08);
+}
+
+button.ghost {
+  background: transparent;
+  border-color: var(--rule);
+  color: var(--ink-2);
+}
+
+button.ghost:hover {
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+
+button.ghost[aria-pressed='true'] {
+  background: color-mix(in srgb, var(--flow) 14%, transparent);
+  border-color: var(--flow);
+  color: var(--ink);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--flow);
+  outline-offset: 2px;
+}
+
+kbd {
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 4px;
+  padding: 3px 4px;
+}
+
+.error {
+  margin: 0;
+  padding: 9px 11px;
+  border-radius: 8px;
+  border-left: 3px solid var(--critical);
+  background: color-mix(in srgb, var(--critical) 10%, transparent);
+  color: var(--ink);
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.sidebar-section h2 {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.examples,
+.schema {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.examples button {
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.4;
+  display: block;
+}
+
+.examples button:hover {
+  background: color-mix(in srgb, var(--flow) 10%, transparent);
+  color: var(--ink);
+}
+
+.schema li {
+  font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--ink-2);
+  padding: 2px 0;
+}
+
+.schema .cols {
+  color: var(--ink-muted);
+  font-size: 11.5px;
+}
+
+.muted {
+  color: var(--ink-muted);
+}
+
+/* ---------- plan pane ---------- */
+
+.plan-pane {
+  position: relative;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--plane);
+}
+
+.plan-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface);
+}
+
+.legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex: 0 0 auto;
+}
+
+.swatch-scan {
+  background: var(--scan);
+}
+.swatch-seek {
+  background: var(--seek);
+}
+.swatch-flow {
+  background: var(--flow);
+}
+
+.plan-controls {
+  display: flex;
+  gap: 8px;
+}
+
+.canvas-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  cursor: grab;
+}
+
+.canvas-wrap.panning {
+  cursor: grabbing;
+}
+
+svg#canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  margin: 0;
+  color: var(--ink-muted);
+  pointer-events: none;
+}
+
+/* ---------- nodes ---------- */
+
+.node {
+  cursor: pointer;
+}
+
+.node-card {
+  fill: var(--raised);
+  stroke: var(--ring);
+  stroke-width: 1;
+}
+
+.node.selected .node-card {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.node:hover .node-card {
+  stroke: var(--accent);
+}
+
+.node-rail {
+  fill: var(--accent);
+}
+
+.node-title {
+  fill: var(--ink);
+  font-size: 12.5px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.node-subtitle {
+  fill: var(--ink-2);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.node-badge-bg {
+  fill: color-mix(in srgb, var(--accent) 14%, transparent);
+  stroke: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+.node-badge-text {
+  fill: var(--ink-2);
+  font-size: 10.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.rows-label {
+  fill: var(--ink-2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-anchor: end;
+}
+
+.rows-track {
+  fill: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
+.rows-fill {
+  fill: var(--accent);
+}
+
+.edge {
+  fill: none;
+  stroke: var(--rule);
+  stroke-width: 2;
+}
+
+.edge.highlight {
+  stroke: var(--flow);
+}
+
+.arrow-head {
+  fill: var(--rule);
+}
+
+/* ---------- table view ---------- */
+
+.table-view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px;
+}
+
+.table-view table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.table-view caption {
+  text-align: left;
+  padding-bottom: 8px;
+  color: var(--ink-muted);
+  font-size: 12.5px;
+}
+
+.table-view th,
+.table-view td {
+  text-align: left;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 12.5px;
+  vertical-align: top;
+}
+
+.table-view th {
+  color: var(--ink-muted);
+  font-weight: 600;
+  font-size: 11.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.table-view td.step {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.table-view .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.kind-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.kind-pill i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--pill);
+}
+
+/* ---------- details ---------- */
+
+.details {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  width: min(360px, calc(100% - 32px));
+  max-height: 58%;
+  overflow-y: auto;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
+}
+
+.details h2 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.details .close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 8px;
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.details-detail {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--plane);
+  color: var(--ink-2);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-word;
+}
+
+.details dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+}
+
+.details dt {
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.details dd {
+  margin: 0;
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-word;
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  .editor-pane {
+    border-right: none;
+    border-bottom: 1px solid var(--hairline);
+    max-height: 46vh;
+  }
+}

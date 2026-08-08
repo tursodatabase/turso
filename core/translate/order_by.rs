@@ -347,9 +347,23 @@ impl EmitOrderBy {
             + remappings.iter().filter(|r| !r.deduplicated).count();
 
         if use_heap_sort {
-            emit_explain!(program, false, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                crate::explain_plan::PlanOp::Sort {
+                    purpose: crate::explain_plan::SortPurpose::OrderBy,
+                    strategy: crate::explain_plan::SortStrategy::TempBTree,
+                }
+            );
         } else {
-            emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                crate::explain_plan::PlanOp::Sort {
+                    purpose: crate::explain_plan::SortPurpose::OrderBy,
+                    strategy: crate::explain_plan::SortStrategy::Sorter,
+                }
+            );
         }
 
         let cursor_id = if !use_heap_sort {

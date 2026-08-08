@@ -1302,6 +1302,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            estimated_rows: None,
         }
     }
 

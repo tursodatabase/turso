@@ -280,6 +280,7 @@ fn translate_integrity_check_impl(
                 expression_index_usages: Vec::new(),
                 database_id,
                 indexed: None,
+                estimated_rows: None,
             }],
             vec![],
         );

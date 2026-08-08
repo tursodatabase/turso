@@ -874,6 +874,7 @@ mod tests {
             join_info: None,
             table,
             indexed: None,
+            estimated_rows: None,
         });
 
         table_references
@@ -918,6 +919,7 @@ mod tests {
                 None,
             ))),
             indexed: None,
+            estimated_rows: None,
         });
         // Right table t2(id=2)
         let columns = vec![Column::new(
@@ -953,6 +955,7 @@ mod tests {
                 None,
             ))),
             indexed: None,
+            estimated_rows: None,
         });
         table_references
     }
@@ -1003,6 +1006,7 @@ mod tests {
                 vec![],
                 None,
             ))),
+            estimated_rows: None,
         });
         table_references
     }

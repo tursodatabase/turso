@@ -383,6 +383,22 @@ impl Statement {
         self.query_mode
     }
 
+    /// The machine-readable query plan for a statement prepared as
+    /// `EXPLAIN QUERY PLAN`, or `None` for any other statement.
+    ///
+    /// This is the same tree `EXPLAIN QUERY PLAN` returns as rows, except the
+    /// steps come back as structured values instead of English. Reading it
+    /// does not run the statement.
+    ///
+    /// See [`Connection::query_plan`](crate::Connection::query_plan) for
+    /// getting the plan of a statement you have as plain SQL.
+    pub fn query_plan(&self) -> Option<crate::explain_plan::QueryPlan> {
+        if self.query_mode != QueryMode::ExplainQueryPlan {
+            return None;
+        }
+        Some(self.program.query_plan())
+    }
+
     pub fn get_program(&self) -> &vdbe::Program {
         &self.program
     }
