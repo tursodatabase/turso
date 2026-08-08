@@ -656,31 +656,49 @@ func TestParseDSN(t *testing.T) {
 		dsn       string
 		wantURL   string
 		wantToken string
+		wantKey   string
 	}{
-		{"http://localhost:8080", "http://localhost:8080", ""},
-		{"http://localhost:8080?auth_token=mytoken", "http://localhost:8080", "mytoken"},
-		{"turso://my-db.turso.io?auth_token=xyz", "https://my-db.turso.io", "xyz"},
-		{"libsql://my-db.turso.io?auth_token=abc", "https://my-db.turso.io", "abc"},
-		{"turso://my-db.turso.io:443?auth_token=tok", "https://my-db.turso.io:443", "tok"},
-		{"https://my-db.turso.io/v1/db", "https://my-db.turso.io/v1/db", ""},
-		{"http://localhost:8080?auth_token=tok&other=val", "http://localhost:8080?other=val", "tok"},
-		{"http://localhost:8080?auth_token=", "http://localhost:8080", ""},
+		{"http://localhost:8080", "http://localhost:8080", "", ""},
+		{"http://localhost:8080?auth_token=mytoken", "http://localhost:8080", "mytoken", ""},
+		{"turso://my-db.turso.io?auth_token=xyz", "https://my-db.turso.io", "xyz", ""},
+		{"libsql://my-db.turso.io?auth_token=abc", "https://my-db.turso.io", "abc", ""},
+		{"turso://my-db.turso.io:443?auth_token=tok", "https://my-db.turso.io:443", "tok", ""},
+		{"https://my-db.turso.io/v1/db", "https://my-db.turso.io/v1/db", "", ""},
+		{"http://localhost:8080?auth_token=tok&other=val", "http://localhost:8080?other=val", "tok", ""},
+		{"http://localhost:8080?auth_token=", "http://localhost:8080", "", ""},
+		{"turso://my-db.turso.io?remote_encryption_key=c2VjcmV0", "https://my-db.turso.io", "", "c2VjcmV0"},
+		{"turso://my-db.turso.io?auth_token=tok&remote_encryption_key=a%2Bb%2Fc%3D", "https://my-db.turso.io", "tok", "a+b/c="},
+		{"http://localhost:8080?remote_encryption_key=", "http://localhost:8080", "", ""},
 	}
 	for _, c := range cases {
-		url, token, err := parseDSN(c.dsn)
+		url, token, key, err := parseDSN(c.dsn)
 		if err != nil {
 			t.Errorf("parseDSN(%q): %v", c.dsn, err)
 			continue
 		}
-		if url != c.wantURL || token != c.wantToken {
-			t.Errorf("parseDSN(%q) = (%q, %q), want (%q, %q)", c.dsn, url, token, c.wantURL, c.wantToken)
+		if url != c.wantURL || token != c.wantToken || key != c.wantKey {
+			t.Errorf("parseDSN(%q) = (%q, %q, %q), want (%q, %q, %q)",
+				c.dsn, url, token, key, c.wantURL, c.wantToken, c.wantKey)
 		}
 	}
 }
 
 func TestParseDSNEmpty(t *testing.T) {
-	if _, _, err := parseDSN(""); err == nil {
+	if _, _, _, err := parseDSN(""); err == nil {
 		t.Fatal("expected error for empty DSN")
+	}
+}
+
+func TestParseDSNErrorRedactsSecrets(t *testing.T) {
+	dsn := "turso://my-db.turso.io\x7f?auth_token=SECRETTOKEN&remote_encryption_key=SECRETKEY"
+	_, _, _, err := parseDSN(dsn)
+	if err == nil {
+		t.Fatal("expected error for DSN with control character")
+	}
+	for _, secret := range []string{"SECRETTOKEN", "SECRETKEY"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error message leaks %s: %q", secret, err)
+		}
 	}
 }
 

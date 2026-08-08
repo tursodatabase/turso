@@ -29,6 +29,17 @@ for row in conn.execute("SELECT id, name FROM users"):
 conn.close()
 ```
 
+For a database encrypted with a customer-managed key, pass the
+base64-encoded key as `remote_encryption_key`:
+
+```python
+conn = turso_serverless.connect(
+    "libsql://my-db.turso.io",
+    auth_token="...",
+    remote_encryption_key="...",
+)
+```
+
 Interactive transactions span multiple HTTP requests; the server keeps the
 connection state alive between them:
 
@@ -68,3 +79,12 @@ $ uv run --extra differential pytest differential
 The embedded driver is built from `bindings/python`, so a Rust toolchain
 is required. `HEGEL_NUM_RUNS` tunes iterations per property (default 10,
 sized for a remote database over the network).
+
+The encryption header property test
+([`differential/test_encryption_header.py`](differential/test_encryption_header.py))
+is the exception: it runs against a local stub server and needs no
+database, no environment variables, and no embedded driver:
+
+```console
+$ uv run --extra dev pytest differential/test_encryption_header.py
+```

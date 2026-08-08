@@ -39,6 +39,7 @@ pub use column::Column;
 pub use connection::Connection;
 pub use error::{BoxError, Error, Result};
 pub use params::{params_from_iter, IntoParams, IntoValue, Params};
+pub use protocol::ENCRYPTION_KEY_HEADER;
 pub use rows::{Row, Rows};
 pub use statement::Statement;
 pub use transaction::{Transaction, TransactionBehavior};
@@ -48,6 +49,7 @@ pub use value::{FromValue, Value};
 pub struct Builder {
     url: String,
     auth_token: Option<String>,
+    remote_encryption_key: Option<String>,
 }
 
 impl Builder {
@@ -58,6 +60,7 @@ impl Builder {
         Self {
             url: url.into(),
             auth_token: None,
+            remote_encryption_key: None,
         }
     }
 
@@ -68,11 +71,19 @@ impl Builder {
         self
     }
 
+    /// Set the customer-managed encryption key (base64-encoded) for an
+    /// encrypted database.
+    pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
+        self.remote_encryption_key = Some(base64_key.into());
+        self
+    }
+
     /// Build the database handle.
     pub async fn build(self) -> Result<Database> {
         Ok(Database {
             url: self.url,
             auth_token: self.auth_token,
+            remote_encryption_key: self.remote_encryption_key,
         })
     }
 }
@@ -85,6 +96,7 @@ impl Builder {
 pub struct Database {
     url: String,
     auth_token: Option<String>,
+    remote_encryption_key: Option<String>,
 }
 
 impl std::fmt::Debug for Database {
@@ -96,6 +108,10 @@ impl std::fmt::Debug for Database {
 impl Database {
     /// Create a new connection to the database.
     pub fn connect(&self) -> Result<Connection> {
-        Ok(Connection::new(&self.url, self.auth_token.clone()))
+        Ok(Connection::new(
+            &self.url,
+            self.auth_token.clone(),
+            self.remote_encryption_key.clone(),
+        ))
     }
 }
