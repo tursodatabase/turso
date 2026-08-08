@@ -596,6 +596,8 @@ impl ProgramBuilder {
             .expect("variable index must be non-zero");
         if let Some(name) = variable.name.as_deref() {
             self.parameters.push_named_at(name, index);
+        } else if variable.numbered {
+            self.parameters.push_numbered(index);
         } else {
             self.parameters.push_index(index);
         }

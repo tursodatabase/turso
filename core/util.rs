@@ -503,7 +503,9 @@ pub fn try_substitute_parameters(
             }))
         }
         Expr::Variable(var) => {
-            if var.name.is_some() {
+            // Named parameters (:x) are not placeholders; positional ones —
+            // bare ? and explicit ?N — are.
+            if !var.is_positional() {
                 return None;
             }
             let Ok(var) = i32::try_from(var.index.get()) else {
@@ -561,7 +563,9 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             Some(captured)
         }
         (Expr::Variable(var), expr) => {
-            if var.name.is_some() {
+            // Named parameters (:x) are not placeholders; positional ones —
+            // bare ? and explicit ?N — are.
+            if !var.is_positional() {
                 return None;
             }
             let Ok(var) = i32::try_from(var.index.get()) else {
@@ -6759,5 +6763,27 @@ pub mod tests {
         assert_eq!(cast_real_to_integer(f64::INFINITY), Err(()));
         assert_eq!(cast_real_to_integer(f64::NEG_INFINITY), Err(()));
         assert_eq!(cast_real_to_integer(f64::NAN), Err(()));
+    }
+
+    #[test]
+    fn capture_parameters_treats_numbered_markers_as_placeholders() {
+        use turso_parser::ast::{Literal, Variable};
+        // Index-method patterns use ?N to share one captured argument
+        // across several call sites (fts_score/fts_match); a numbered
+        // marker carries its "?N" spelling as its name and must still
+        // capture. Named parameters are not placeholders.
+        let query = Expr::Literal(Literal::String("'x'".to_string()));
+
+        let numbered = Expr::Variable(Variable::numbered(1.try_into().unwrap()));
+        let captured = try_capture_parameters(&numbered, &query).unwrap();
+        assert_eq!(captured.get(&1), Some(&query));
+
+        let anonymous = Expr::Variable(Variable::indexed(1.try_into().unwrap()));
+        assert!(try_capture_parameters(&anonymous, &query)
+            .unwrap()
+            .contains_key(&1));
+
+        let named = Expr::Variable(Variable::named(":x", 1.try_into().unwrap()));
+        assert!(try_capture_parameters(&named, &query).is_none());
     }
 }

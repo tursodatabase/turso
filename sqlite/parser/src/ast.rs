@@ -622,6 +622,10 @@ pub struct Variable {
     pub name: Option<Box<str>>,
     /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
     pub col_type: Option<Box<str>>,
+    /// True for an explicit `?N` marker. Numbered markers carry no allocated
+    /// name; their "?N" spelling is derived from the index on demand.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub numbered: bool,
 }
 
 impl Variable {
@@ -630,6 +634,17 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            numbered: false,
+        }
+    }
+
+    /// An explicit `?N` marker.
+    pub fn numbered(index: NonZeroU32) -> Self {
+        Self {
+            index,
+            name: None,
+            col_type: None,
+            numbered: true,
         }
     }
 
@@ -642,6 +657,7 @@ impl Variable {
             } else {
                 Some(col_type.into())
             },
+            numbered: false,
         }
     }
 
@@ -650,7 +666,15 @@ impl Variable {
             index,
             name: Some(name.into()),
             col_type: None,
+            numbered: false,
         }
+    }
+
+    /// True for positional parameters — a bare `?` or an explicit `?N` —
+    /// and false for named ones (`:x`, `@x`, `$x`). Positional markers
+    /// carry no allocated name.
+    pub fn is_positional(&self) -> bool {
+        self.name.is_none()
     }
 }
 
