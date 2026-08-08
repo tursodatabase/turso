@@ -120,6 +120,8 @@ api_table! {
     sqlite3_data_count: unsafe extern "C" fn(*mut c_void) -> c_int,
     sqlite3_column_name: unsafe extern "C" fn(*mut c_void, c_int) -> *const c_char,
     sqlite3_libversion_number: unsafe extern "C" fn() -> c_int,
+    sqlite3_mprintf: unsafe extern "C" fn(*const c_char, ...) -> *mut c_char,
+    sqlite3_snprintf: unsafe extern "C" fn(c_int, *mut c_char, *const c_char, ...) -> *mut c_char,
     sqlite3_free: unsafe extern "C" fn(*mut c_void),
 }
 
@@ -432,6 +434,152 @@ unsafe fn compare_introspection(ctx: &mut Ctx, s: &mut Session, t: &mut Session,
     );
 }
 
+/// mprintf/snprintf share core's printf engine with the SQL
+/// printf()/format() functions, so comparing them against libsqlite3 also
+/// differentially verifies that engine. Call shapes are fixed (va_arg arity
+/// is static per call site); values are randomized. %p is excluded: it
+/// renders a pointer, which legitimately differs between processes.
+type PrintfShape<'a> = &'a dyn Fn(&Api) -> *mut c_char;
+
+unsafe fn compare_printf(ctx: &mut Ctx, rng: &mut Rng, sqlite: &Api, turso: &Api) {
+    let grab = |api: &Api, f: &CStr, call: &dyn Fn(&Api) -> *mut c_char| {
+        let p = call(api);
+        let s = if p.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+        };
+        if !p.is_null() {
+            (api.sqlite3_free)(p as *mut c_void);
+        }
+        let _ = f;
+        s
+    };
+    for round in 0..4 {
+        let text = match random_value(rng) {
+            Val::Text(t) => t,
+            _ => "it's".to_string(),
+        };
+        let ctext = CString::new(text.clone()).unwrap_or_else(|_| CString::new("x").unwrap());
+        let tp: *const c_char = if rng.chance(15) {
+            std::ptr::null()
+        } else {
+            ctext.as_ptr()
+        };
+        // Precision counts bytes and the reference emits partial code points
+        // when it splits one; turso floors to a character boundary (Text is
+        // UTF-8). Precision shapes therefore use ASCII-only input.
+        let ascii = if text.is_ascii() {
+            text.clone()
+        } else {
+            "ab'cdef".to_string()
+        };
+        let cascii = CString::new(ascii).unwrap_or_else(|_| CString::new("x").unwrap());
+        let ap: *const c_char = if tp.is_null() { tp } else { cascii.as_ptr() };
+        let iv = rng.next() as i64;
+        let dv = [0.0f64, 3.5, -2.25, 0.1, 1e15, 12345.6789][rng.below(6)];
+        let shapes: &[(&str, PrintfShape)] = &[
+            ("%q", &|a: &Api| (a.sqlite3_mprintf)(c"%q".as_ptr(), tp)),
+            ("'%q'", &|a: &Api| (a.sqlite3_mprintf)(c"'%q'".as_ptr(), tp)),
+            ("%Q", &|a: &Api| (a.sqlite3_mprintf)(c"%Q".as_ptr(), tp)),
+            ("%w", &|a: &Api| (a.sqlite3_mprintf)(c"%w".as_ptr(), tp)),
+            ("%.3q", &|a: &Api| (a.sqlite3_mprintf)(c"%.3q".as_ptr(), ap)),
+            ("%8.3q", &|a: &Api| {
+                (a.sqlite3_mprintf)(c"%8.3q".as_ptr(), ap)
+            }),
+            ("%d|%lld", &|a: &Api| {
+                (a.sqlite3_mprintf)(c"%d|%lld".as_ptr(), iv as c_int, iv)
+            }),
+            ("%u:%x:%X:%o", &|a: &Api| {
+                (a.sqlite3_mprintf)(
+                    c"%u:%x:%X:%o".as_ptr(),
+                    iv as c_int,
+                    iv as c_int,
+                    iv as c_int,
+                    iv as c_int,
+                )
+            }),
+            ("%f/%e/%g", &|a: &Api| {
+                (a.sqlite3_mprintf)(c"%f/%e/%g".as_ptr(), dv, dv, dv)
+            }),
+            ("%08.3f", &|a: &Api| {
+                (a.sqlite3_mprintf)(c"%08.3f".as_ptr(), dv)
+            }),
+            ("%-10s|%10s|", &|a: &Api| {
+                (a.sqlite3_mprintf)(c"%-10s|%10s|".as_ptr(), tp, tp)
+            }),
+            ("%*d", &|a: &Api| {
+                (a.sqlite3_mprintf)(c"%*d".as_ptr(), (rng_width(iv)) as c_int, iv as c_int)
+            }),
+            ("%c", &|a: &Api| {
+                (a.sqlite3_mprintf)(c"%c".as_ptr(), (65 + (iv.rem_euclid(26))) as c_int)
+            }),
+            ("100%%", &|a: &Api| (a.sqlite3_mprintf)(c"100%%".as_ptr())),
+        ];
+        let (label, call) = &shapes[rng.below(shapes.len())];
+        ctx.log(format!(
+            "printf round {round}: {label} text={text:?} null={} iv={iv} dv={dv}",
+            tp.is_null()
+        ));
+        let out_s = grab(sqlite, c"", call);
+        let out_t = grab(turso, c"", call);
+        ctx.check(&format!("mprintf {label}"), out_s, out_t);
+
+        // snprintf: same engine through the bounded-buffer contract. On
+        // overflow only the contract is compared — truncation within n and
+        // NUL termination, output a prefix of the full rendering, no write
+        // past n-1 — because which truncated bytes land is an accumulator
+        // staging artifact in the reference (short conversions part-fill
+        // the remaining space, oversized ones are dropped wholesale).
+        let full = grab(sqlite, c"", &|a: &Api| {
+            (a.sqlite3_mprintf)(c"'%q'".as_ptr(), tp)
+        })
+        .unwrap_or_default();
+        let mut buf_s = [0x7fu8; 24];
+        let mut buf_t = [0x7fu8; 24];
+        let n = rng.below(24) as c_int;
+        let r_s =
+            (sqlite.sqlite3_snprintf)(n, buf_s.as_mut_ptr() as *mut c_char, c"'%q'".as_ptr(), tp);
+        let r_t =
+            (turso.sqlite3_snprintf)(n, buf_t.as_mut_ptr() as *mut c_char, c"'%q'".as_ptr(), tp);
+        ctx.check(
+            "snprintf returns buf",
+            r_s == buf_s.as_mut_ptr() as *mut c_char,
+            r_t == buf_t.as_mut_ptr() as *mut c_char,
+        );
+        if full.len() < n as usize {
+            ctx.check(&format!("snprintf n={n}"), buf_s, buf_t);
+        } else {
+            for (label, buf) in [("sqlite", &buf_s), ("turso", &buf_t)] {
+                if n > 0 {
+                    let content = &buf[..n as usize];
+                    let nul = content.iter().position(|&b| b == 0);
+                    ctx.check(
+                        &format!("snprintf overflow NUL ({label}, n={n})"),
+                        true,
+                        nul.is_some(),
+                    );
+                    let prefix = &content[..nul.unwrap_or(0)];
+                    ctx.check(
+                        &format!("snprintf overflow prefix ({label}, n={n})"),
+                        true,
+                        full.as_bytes().starts_with(prefix),
+                    );
+                }
+                ctx.check(
+                    &format!("snprintf overflow no-write-past-n ({label}, n={n})"),
+                    true,
+                    buf[n.max(0) as usize..].iter().all(|&b| b == 0x7f),
+                );
+            }
+        }
+    }
+}
+
+fn rng_width(iv: i64) -> i64 {
+    iv.rem_euclid(12)
+}
+
 unsafe fn run_scenario(ctx: &mut Ctx, rng: &mut Rng, sqlite: &Api, turso: &Api) {
     let mut s = Session::open(sqlite);
     let mut t = Session::open(turso);
@@ -615,6 +763,8 @@ unsafe fn run_scenario(ctx: &mut Ctx, rng: &mut Rng, sqlite: &Api, turso: &Api) 
             (turso.sqlite3_last_insert_rowid)(t.db),
         );
     }
+
+    compare_printf(ctx, rng, sqlite, turso);
 
     // Read everything back in lockstep and compare types and values. The
     // SELECT is sometimes prepared from a multi-statement buffer with an

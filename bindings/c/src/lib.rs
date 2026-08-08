@@ -1517,10 +1517,130 @@ pub unsafe extern "C" fn sqlite3_interrupt(db: *mut sqlite3) {
 }
 
 extern "C" {
-    /// Variadic implementation in varargs.c; decodes the va_list and calls
-    /// turso_db_config_int below. Declared argument-less because it is only
-    /// referenced as a `sym` jump target, never called from Rust.
+    /// Variadic implementations in varargs.c; each decodes its va_list and
+    /// calls the turso_* backends below. Declared argument-less because they
+    /// are only referenced as `sym` jump targets, never called from Rust.
     fn turso_sqlite3_db_config_va();
+    fn turso_sqlite3_mprintf_va();
+    fn turso_sqlite3_snprintf_va();
+}
+
+/// Exported trampolines for the variadic sqlite3_mprintf/sqlite3_snprintf;
+/// same mechanism as sqlite3_db_config below.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_mprintf(_fmt: *const ffi::c_char) -> *mut ffi::c_char {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    core::arch::naked_asm!("jmp {}", sym turso_sqlite3_mprintf_va);
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    core::arch::naked_asm!("b {}", sym turso_sqlite3_mprintf_va);
+}
+
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_snprintf(
+    _n: ffi::c_int,
+    _buf: *mut ffi::c_char,
+    _fmt: *const ffi::c_char,
+) -> *mut ffi::c_char {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    core::arch::naked_asm!("jmp {}", sym turso_sqlite3_snprintf_va);
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    core::arch::naked_asm!("b {}", sym turso_sqlite3_snprintf_va);
+}
+
+extern "C" {
+    // One-line va_arg pumps in varargs.c: only C can read a va_list, and
+    // these are the only pieces that need to.
+    fn turso_va_i32(ap: *mut ffi::c_void) -> i32;
+    fn turso_va_i64(ap: *mut ffi::c_void) -> i64;
+    fn turso_va_f64(ap: *mut ffi::c_void) -> f64;
+    fn turso_va_ptr(ap: *mut ffi::c_void) -> *mut ffi::c_void;
+}
+
+/// Formats a sqlite3_mprintf-style call through core's printf engine — the
+/// implementation backing the SQL printf()/format() functions, so the C API
+/// and SQL formatting cannot diverge. `ap` is a pointer to the caller's
+/// va_list; core's printf_c_arg_plan (derived from the engine's own
+/// specifier grammar) dictates the C type pulled for each argument slot.
+/// Returns a malloc'd NUL-terminated string for sqlite3_free, or NULL when
+/// fmt is NULL or allocation fails.
+#[no_mangle]
+#[deny(unsafe_op_in_unsafe_fn)]
+pub unsafe extern "C" fn turso_printf_va(
+    fmt: *const ffi::c_char,
+    ap: *mut ffi::c_void,
+) -> *mut ffi::c_char {
+    if fmt.is_null() || ap.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: fmt checked non-null; caller guarantees a NUL-terminated string.
+    let fmt_str = unsafe { CStr::from_ptr(fmt) };
+    let fmt_str = String::from_utf8_lossy(fmt_str.to_bytes()).into_owned();
+
+    let mut args = Vec::new();
+    for slot in turso_core::printf_c_arg_plan(&fmt_str) {
+        use turso_core::PrintfCArg;
+        // SAFETY: the plan mirrors the engine's specifier grammar, so each
+        // pump reads the C type the caller passed for that slot.
+        let value = unsafe {
+            match slot {
+                PrintfCArg::Int32 => turso_core::Value::from_i64(turso_va_i32(ap) as i64),
+                PrintfCArg::Uint32 => turso_core::Value::from_i64(turso_va_i32(ap) as u32 as i64),
+                PrintfCArg::Int64 => turso_core::Value::from_i64(turso_va_i64(ap)),
+                PrintfCArg::Double => turso_core::Value::from_f64(turso_va_f64(ap)),
+                PrintfCArg::Text | PrintfCArg::OwnedText => {
+                    let s = turso_va_ptr(ap) as *const ffi::c_char;
+                    // A NULL string pointer becomes Value::Null: the engine
+                    // renders it as (NULL) for %q, NULL for %Q, "" for %s.
+                    let value = if s.is_null() {
+                        turso_core::Value::Null
+                    } else {
+                        let text = String::from_utf8_lossy(CStr::from_ptr(s).to_bytes());
+                        turso_core::Value::build_text(text.into_owned())
+                    };
+                    if slot == PrintfCArg::OwnedText {
+                        // %z: the caller yields the pointer.
+                        libc::free(s as *mut ffi::c_void);
+                    }
+                    value
+                }
+                // %c takes a character code in the C API, converted at
+                // extraction — as SQLite's C path does before its shared
+                // engine runs; the SQL printf('%c', x) takes the first
+                // character of x's text form, from the same engine.
+                PrintfCArg::CharCode => {
+                    let c = u32::try_from(turso_va_i32(ap))
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{fffd}');
+                    turso_core::Value::build_text(c.to_string())
+                }
+            }
+        };
+        args.push(value);
+    }
+
+    let fmt_value = turso_core::Value::build_text(fmt_str);
+    let arg_refs: Vec<&turso_core::Value> = args.iter().collect();
+    let rendered = match turso_core::exec_printf_values(&fmt_value, &arg_refs) {
+        // The SQL function returns NULL for an empty format or an unknown
+        // specifier before any output; the C API returns "" there.
+        Ok(turso_core::Value::Text(t)) => t.as_str().to_string(),
+        Ok(_) => String::new(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let n = rendered.len();
+    // SAFETY: fresh allocation of n + 1 bytes, copied then NUL-terminated.
+    unsafe {
+        let buf = libc::malloc(n + 1) as *mut ffi::c_char;
+        if buf.is_null() {
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(rendered.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+        buf
+    }
 }
 
 /// Exported trampoline for the variadic sqlite3_db_config. rustc exports
