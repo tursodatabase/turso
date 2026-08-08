@@ -1,0 +1,118 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8200
+#
+# An aggregate query with a HAVING clause but no GROUP BY must treat the
+# whole table as a single group. When the HAVING clause references a bare
+# table column, Turso returned no rows while SQLite returns the aggregate
+# row (upstream select3-3.3).
+
+setup logs {
+    CREATE TABLE t1 (log int);
+    INSERT INTO t1 VALUES (1), (2), (3);
+}
+
+@setup logs
+test having-bare-column-true {
+    SELECT count(*) FROM t1 HAVING log != 400;
+}
+expect {
+    3
+}
+
+@setup logs
+test having-bare-column-false {
+    SELECT count(*) FROM t1 HAVING log = 400;
+}
+expect {
+}
+
+@setup logs
+test having-aggregate-no-group-by {
+    SELECT max(log) FROM t1 HAVING count(*) > 2;
+}
+expect {
+    3
+}
+
+@setup logs
+test having-aggregate-on-column {
+    SELECT count(*) FROM t1 HAVING min(log) > 0;
+}
+expect {
+    3
+}
+
+@setup logs
+test having-bare-column-and-non-aggregate-result-column {
+    SELECT log, count(*) FROM t1 HAVING log < 2;
+}
+expect {
+    1|3
+}
+
+@setup logs
+test having-bare-column-with-where-filter {
+    SELECT count(*) FROM t1 WHERE log > 1 HAVING log = 2;
+}
+expect {
+    2
+}
+
+# A hash join turns the expression-to-register cache on while emitting the loop
+# body. The registers for the bare columns must not be visible in that cache
+# yet, or the aggregate arguments read them instead of the current row: sum()
+# would then add up NULLs and every one of these queries would return no row.
+setup join {
+    CREATE TABLE a (x int, y int);
+    INSERT INTO a VALUES (1, 10), (2, 20), (3, 30);
+    CREATE TABLE b (x int, z int);
+    INSERT INTO b VALUES (1, 100), (2, 200), (3, 300);
+}
+
+@setup join
+test having-bare-column-of-joined-table {
+    SELECT sum(b.z) FROM a JOIN b ON a.x = b.x HAVING b.z != 400;
+}
+expect {
+    600
+}
+
+@setup join
+test having-bare-column-of-other-joined-table {
+    SELECT count(*), sum(a.y) FROM a JOIN b ON a.x = b.x HAVING b.z != 400;
+}
+expect {
+    3|60
+}
+
+@setup join
+test joined-bare-column-inside-aggregate-result-column {
+    SELECT CASE WHEN sum(b.z) THEN b.z ELSE 0 END FROM a JOIN b ON a.x = b.x;
+}
+expect {
+    100
+}
+
+# A correlated subquery reuses the same bytecode for every outer row. The
+# column pre-read for HAVING happens on the first loop iteration, so when a
+# later outer row filters out every inner row, the pre-read registers must be
+# nulled instead of keeping the previous outer row's values. Here a=1 leaves
+# y=500 behind; for a=2 the subquery scans no rows, so HAVING must see y as
+# NULL and return no row (NULL), not reuse 500 and return 0.
+setup correlated {
+    CREATE TABLE outer_t (a int);
+    INSERT INTO outer_t VALUES (1), (2);
+    CREATE TABLE inner_t (x int, y int);
+    INSERT INTO inner_t VALUES (1, 500);
+}
+
+@setup correlated
+test having-correlated-subquery-no-stale-columns {
+    SELECT a, (SELECT count(*) FROM inner_t WHERE x = a HAVING y != 400)
+    FROM outer_t ORDER BY a;
+}
+expect {
+    1|1
+    2|
+}
