@@ -1046,12 +1046,7 @@ impl Connection {
         stmt: ast::Stmt,
         input: &str,
     ) -> Result<Statement> {
-        self.prepare_stmt_with_input_and_origin(
-            stmt,
-            input,
-            StatementOrigin::Root,
-            &PrepareOptions::default(),
-        )
+        self.prepare_translated_cmd(ast::Cmd::Stmt(stmt), input)
     }
 
     pub fn prepare_translated_stmt_with_options(
@@ -1060,13 +1055,32 @@ impl Connection {
         input: &str,
         prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
-        self.prepare_stmt_with_input_and_origin(stmt, input, StatementOrigin::Root, prepare_options)
+        self.prepare_translated_cmd_with_options(ast::Cmd::Stmt(stmt), input, prepare_options)
+    }
+
+    /// Prepare an already-translated command while keeping the original SQL
+    /// text.
+    pub fn prepare_translated_cmd(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
+        input: &str,
+    ) -> Result<Statement> {
+        self.prepare_translated_cmd_with_options(cmd, input, &PrepareOptions::default())
+    }
+
+    pub fn prepare_translated_cmd_with_options(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
+        input: &str,
+        prepare_options: &PrepareOptions,
+    ) -> Result<Statement> {
+        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options)
     }
 
     #[turso_macros::trace_stack]
-    fn prepare_stmt_with_input_and_origin(
+    fn prepare_cmd_with_input_and_origin(
         self: &Arc<Connection>,
-        stmt: ast::Stmt,
+        cmd: ast::Cmd,
         input: &str,
         origin: StatementOrigin,
         prepare_options: &PrepareOptions,
@@ -1079,8 +1093,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) =
-                self.compile_cmd(Cmd::Stmt(stmt), input, origin, prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
