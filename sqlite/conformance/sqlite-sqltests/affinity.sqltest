@@ -735,3 +735,59 @@ test affinity-sum-of-text-i64-min {
 expect {
     integer|-9223372036854775808
 }
+
+# ============================================
+# CASE x WHEN y: the base value is compared against each WHEN term with the
+# same affinity a plain `x = y` comparison would use
+# ============================================
+@cross-check-integrity
+test affinity-case-base-vs-when-term {
+    CREATE TABLE o (t TEXT, n INTEGER, r REAL);
+    INSERT INTO o VALUES ('5', 5, 5.0);
+    SELECT CASE o.t WHEN 5 THEN 'y' ELSE 'n' END FROM o;
+    SELECT CASE o.n WHEN '5' THEN 'y' ELSE 'n' END FROM o;
+    SELECT CASE o.r WHEN '5' THEN 'y' ELSE 'n' END FROM o;
+    SELECT CASE 5 WHEN o.t THEN 'y' ELSE 'n' END FROM o;
+}
+expect {
+    y
+    y
+    y
+    y
+}
+
+@cross-check-integrity
+test affinity-case-base-text-affinity-is-not-a-blind-coercion {
+    CREATE TABLE o (t TEXT);
+    INSERT INTO o VALUES ('5');
+    SELECT CASE o.t WHEN 5.0 THEN 'y' ELSE 'n' END FROM o;
+    SELECT CASE o.t WHEN 'x' THEN 'y' ELSE 'n' END FROM o;
+}
+expect {
+    n
+    n
+}
+
+@cross-check-integrity
+test affinity-case-base-picks-the-matching-when-branch {
+    CREATE TABLE o (t TEXT);
+    INSERT INTO o VALUES ('5');
+    SELECT CASE o.t WHEN 4 THEN 'four' WHEN 5 THEN 'five' ELSE 'none' END FROM o;
+    SELECT CASE o.t WHEN NULL THEN 'null' WHEN 5 THEN 'five' ELSE 'none' END FROM o;
+}
+expect {
+    five
+    five
+}
+
+@cross-check-integrity
+test affinity-case-base-no-affinity-on-either-side {
+    CREATE TABLE o (b BLOB);
+    INSERT INTO o VALUES ('5');
+    SELECT CASE o.b WHEN 5 THEN 'y' ELSE 'n' END FROM o;
+    SELECT CASE o.b WHEN '5' THEN 'y' ELSE 'n' END FROM o;
+}
+expect {
+    n
+    y
+}

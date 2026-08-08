@@ -456,16 +456,12 @@ pub fn translate_expr(
             // Only allocate a reg to hold the base expression if one was provided.
             // And base_reg then becomes the flag we check to see which sort of
             // case statement we're processing.
-            let base_reg = base.as_ref().map(|_| program.alloc_register());
+            let base_reg = base
+                .as_ref()
+                .map(|base_expr| (base_expr.as_ref(), program.alloc_register()));
             let expr_reg = program.alloc_register();
-            if let Some(base_expr) = base {
-                translate_expr(
-                    program,
-                    referenced_tables,
-                    base_expr,
-                    base_reg.unwrap(),
-                    resolver,
-                )?;
+            if let Some((base_expr, base_reg)) = base_reg {
+                translate_expr(program, referenced_tables, base_expr, base_reg, resolver)?;
             };
             for (when_expr, then_expr) in when_then_pairs {
                 translate_expr_no_constant_opt(
@@ -478,12 +474,21 @@ pub fn translate_expr(
                 )?;
                 match base_reg {
                     // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
-                    Some(base_reg) => program.emit_insn(Insn::Ne {
+                    Some((base_expr, base_reg)) => program.emit_insn(Insn::Ne {
                         lhs: base_reg,
                         rhs: expr_reg,
                         target_pc: next_case_label,
                         // A NULL result is considered untrue when evaluating WHEN terms.
-                        flags: CmpInsFlags::default().jump_if_null(),
+                        // The base value is compared against each WHEN term with the same
+                        // affinity a plain `base = when` comparison would use.
+                        flags: CmpInsFlags::default().jump_if_null().with_affinity(
+                            comparison_affinity(
+                                base_expr,
+                                when_expr,
+                                referenced_tables,
+                                Some(resolver),
+                            ),
+                        ),
                         collation: program.curr_collation(),
                     }),
                     // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
