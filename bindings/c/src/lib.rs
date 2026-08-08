@@ -1170,8 +1170,7 @@ pub unsafe extern "C" fn sqlite3_exec(
             );
             if rc != SQLITE_OK {
                 if !err.is_null() {
-                    let err_msg = format!("Prepare failed: {rc}");
-                    *err = CString::new(err_msg).unwrap().into_raw();
+                    *err = dup_db_errmsg(db);
                 }
                 return rc;
             }
@@ -1183,8 +1182,7 @@ pub unsafe extern "C" fn sqlite3_exec(
                     _ => {
                         sqlite3_finalize(stmt_ptr);
                         if !err.is_null() {
-                            let err_msg = format!("Step failed: {step_rc}");
-                            *err = CString::new(err_msg).unwrap().into_raw();
+                            *err = dup_db_errmsg(db);
                         }
                         return step_rc;
                     }
@@ -1275,8 +1273,7 @@ unsafe fn execute_query_with_callback(
 
     if rc != SQLITE_OK {
         if !err.is_null() {
-            let err_msg = format!("Prepare failed: {rc}");
-            *err = CString::new(err_msg).unwrap().into_raw();
+            *err = dup_db_errmsg(db);
         }
         return rc;
     }
@@ -1342,8 +1339,7 @@ unsafe fn execute_query_with_callback(
             _ => {
                 sqlite3_finalize(stmt_ptr);
                 if !err.is_null() {
-                    let err_msg = format!("Step failed: {step_rc}");
-                    *err = CString::new(err_msg).unwrap().into_raw();
+                    *err = dup_db_errmsg(db);
                 }
                 return step_rc;
             }
@@ -3676,19 +3672,57 @@ fn limbo_err_code(err: &LimboError) -> i32 {
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     let code = limbo_err_code(&err);
     if !container.is_null() {
-        let err_msg = format!("{err}");
+        let err_msg = sqlite_bare_message(&err);
         unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
     }
     code
 }
 
 /// Store a LimboError on the database handle, returning the SQLite error code.
+/// SQLite's sqlite3_errmsg returns a bare message ("no such table: t"),
+/// while turso_core's Display decorates errors with a category prefix
+/// ("Parse error: ...") that the CLI relies on. Strip a leading
+/// "<Category> error: " so the C API matches SQLite; other consumers keep
+/// the decorated form.
+fn sqlite_bare_message(err: &LimboError) -> String {
+    const PREFIXES: [&str; 8] = [
+        "Parse error: ",
+        "Transaction error: ",
+        "Runtime error: ",
+        "Planning error: ",
+        "Locking error: ",
+        "Conversion error: ",
+        "Extension error: ",
+        "Internal error: ",
+    ];
+    let msg = err.to_string();
+    for p in PREFIXES {
+        if let Some(rest) = msg.strip_prefix(p) {
+            return rest.to_string();
+        }
+    }
+    msg
+}
+
+/// Duplicates the connection's current error text into a fresh
+/// sqlite3_malloc-style CString for sqlite3_exec's errmsg out-parameter,
+/// or an empty string if none is set.
+unsafe fn dup_db_errmsg(db: *mut sqlite3) -> *mut ffi::c_char {
+    let msg = sqlite3_errmsg(db);
+    let bytes = if msg.is_null() {
+        &b""[..]
+    } else {
+        CStr::from_ptr(msg).to_bytes()
+    };
+    CString::new(bytes).unwrap_or_default().into_raw()
+}
+
 unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
     if !db.p_err.is_null() {
         let _ = CString::from_raw(db.p_err as *mut ffi::c_char);
     }
     let code = limbo_err_code(&err);
-    let err_msg = format!("{err}");
+    let err_msg = sqlite_bare_message(&err);
     db.p_err = CString::new(err_msg).unwrap().into_raw() as *mut ffi::c_void;
     db.err_code = code;
     code
