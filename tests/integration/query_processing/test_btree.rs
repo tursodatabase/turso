@@ -10,6 +10,12 @@
 //! stream of writes applied to identical copies of the file. Every attempt
 //! picks its own page size, so layouts are exercised at each size SQLite
 //! supports (except 65536, see PAGE_SIZES).
+//!
+//! The corrupt variants (`test_btree_corrupt_*`) reuse the generator but
+//! flip a small fraction of fields while serializing pages: off-by-one
+//! lengths, pointers to wrong or nonexistent pages, garbage bytes. A corrupt
+//! file has no "right answer", so those tests only demand that turso answers
+//! every query with either rows or an error: no panic, no crash, no hang.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -23,7 +29,7 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::{Buffer, Completion, File, OpenFlags, PlatformIO, IO};
 use zerocopy::big_endian::{U16, U32, U64};
 
-use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase};
 
 /// Page sizes the generator picks from. 65536 is excluded: the format
 /// special-cases it (a 0 in two-byte header fields means 65536) and the
@@ -276,26 +282,158 @@ fn random_payload(rng: &mut ChaCha8Rng, page_size: usize) -> Vec<u8> {
     payload
 }
 
+/// Per-field corruption chances, in permille (checked once per field while
+/// serializing pages). Zero everywhere means the generated file stays valid.
+#[derive(Clone, Copy, Debug, Default)]
+struct CorruptionProfile {
+    /// +-1 on length-like fields: cell counts, content area, cell and
+    /// freeblock offsets, size varints, the header page count.
+    off_by_one_permille: u32,
+    /// Page pointers (child, right, overflow) replaced with 0, page 1, a
+    /// page past EOF, a random u32, or a wrong-but-existing page (which can
+    /// create cycles). In-page offsets replaced with random values.
+    bad_pointer_permille: u32,
+    /// Random bytes over the fragmentation counter or a random page region.
+    garbage_permille: u32,
+}
+
+impl CorruptionProfile {
+    const NONE: Self = Self {
+        off_by_one_permille: 0,
+        bad_pointer_permille: 0,
+        garbage_permille: 0,
+    };
+
+    fn enabled(&self) -> bool {
+        self.off_by_one_permille + self.bad_pointer_permille + self.garbage_permille > 0
+    }
+}
+
 struct BTreeGenerator<'a> {
     rng: &'a mut ChaCha8Rng,
     page_size: usize,
     max_interior_keys: usize,
     max_leaf_keys: usize,
+    profile: CorruptionProfile,
+    /// Human-readable description of every corruption applied.
+    corruptions: Vec<String>,
 }
 
 impl BTreeGenerator<'_> {
+    fn chance(&mut self, permille: u32) -> bool {
+        permille > 0 && self.rng.next_u32() % 1000 < permille
+    }
+
+    /// +-1 on a two-byte field (wrapping, so 0 becomes 65535).
+    fn corrupt_u16_off_by_one(&mut self, page_no: u32, what: &str, value: u16) -> u16 {
+        if !self.chance(self.profile.off_by_one_permille) {
+            return value;
+        }
+        let corrupted = if self.rng.next_u32() % 2 == 0 {
+            value.wrapping_add(1)
+        } else {
+            value.wrapping_sub(1)
+        };
+        self.corruptions
+            .push(format!("page {page_no}: {what} {value} -> {corrupted}"));
+        corrupted
+    }
+
+    /// Replace an in-page offset with a random value (may point into the
+    /// header, into another cell, or past the end of the page).
+    fn corrupt_u16_offset(&mut self, page_no: u32, what: &str, value: u16) -> u16 {
+        if !self.chance(self.profile.bad_pointer_permille) {
+            return value;
+        }
+        let corrupted = (self.rng.next_u32() % (self.page_size as u32 * 2)) as u16;
+        self.corruptions
+            .push(format!("page {page_no}: {what} {value} -> {corrupted}"));
+        corrupted
+    }
+
+    /// Replace a page pointer with one that must not be followed blindly.
+    fn corrupt_page_pointer(&mut self, page_no: u32, what: &str, value: u32, max_page: u32) -> u32 {
+        if !self.chance(self.profile.bad_pointer_permille) {
+            return value;
+        }
+        let corrupted = match self.rng.next_u32() % 5 {
+            0 => 0,
+            1 => 1,
+            2 => max_page + 1 + self.rng.next_u32() % 100,
+            3 => self.rng.next_u32(),
+            // wrong-but-existing page: cross-links and possible cycles
+            _ => 2 + self.rng.next_u32() % max_page.saturating_sub(1).max(1),
+        };
+        self.corruptions
+            .push(format!("page {page_no}: {what} {value} -> {corrupted}"));
+        corrupted
+    }
+
+    /// +-1 on a varint-encoded value, only when the re-encoded varint keeps
+    /// its length so the rest of the cell stays in place.
+    fn corrupt_varint_off_by_one(&mut self, page_no: u32, what: &str, value: u64) -> u64 {
+        if !self.chance(self.profile.off_by_one_permille) {
+            return value;
+        }
+        let corrupted = if self.rng.next_u32() % 2 == 0 {
+            value.wrapping_add(1)
+        } else {
+            value.wrapping_sub(1)
+        };
+        if length_varint(corrupted) != length_varint(value) {
+            return value;
+        }
+        self.corruptions
+            .push(format!("page {page_no}: {what} {value} -> {corrupted}"));
+        corrupted
+    }
+
+    fn corrupt_u8_garbage(&mut self, page_no: u32, what: &str, value: u8) -> u8 {
+        if !self.chance(self.profile.garbage_permille) {
+            return value;
+        }
+        let corrupted = (self.rng.next_u32() & 0xff) as u8;
+        self.corruptions
+            .push(format!("page {page_no}: {what} {value} -> {corrupted}"));
+        corrupted
+    }
+
+    /// Splat 8..=64 random bytes over a random region of the page.
+    fn corrupt_garbage_region(&mut self, page_no: u32, data: &mut [u8]) {
+        if !self.chance(self.profile.garbage_permille) {
+            return;
+        }
+        let len = 8 + self.rng.next_u32() as usize % 57;
+        let start = self.rng.next_u32() as usize % (data.len() - len);
+        for byte in &mut data[start..start + len] {
+            *byte = (self.rng.next_u32() & 0xff) as u8;
+        }
+        self.corruptions.push(format!(
+            "page {page_no}: garbage over bytes {start}..{}",
+            start + len
+        ));
+    }
+
     pub fn create_page(
-        &self,
+        &mut self,
+        page_no: u32,
+        max_page: u32,
         page: &BTreePageData,
         page_numbers: &HashMap<*const BTreePageData, u32>,
     ) -> Vec<u8> {
         match page {
-            BTreePageData::Table(page) => self.create_btree_page(page, page_numbers),
-            BTreePageData::Overflow(page) => self.create_overflow_page(page, page_numbers),
+            BTreePageData::Table(page) => {
+                self.create_btree_page(page_no, max_page, page, page_numbers)
+            }
+            BTreePageData::Overflow(page) => {
+                self.create_overflow_page(page_no, max_page, page, page_numbers)
+            }
         }
     }
     pub fn create_overflow_page(
-        &self,
+        &mut self,
+        page_no: u32,
+        max_page: u32,
         page: &BTreeOverflowPageData,
         page_numbers: &HashMap<*const BTreePageData, u32>,
     ) -> Vec<u8> {
@@ -305,12 +443,17 @@ impl BTreeGenerator<'_> {
         } else {
             0
         };
+        let first_4bytes =
+            self.corrupt_page_pointer(page_no, "overflow next pointer", first_4bytes, max_page);
         data[0..4].copy_from_slice(&U32::new(first_4bytes).to_bytes());
         data[4..4 + page.payload.len()].copy_from_slice(&page.payload);
+        self.corrupt_garbage_region(page_no, &mut data);
         data
     }
     pub fn create_btree_page(
-        &self,
+        &mut self,
+        page_no: u32,
+        max_page: u32,
         page: &BTreeTablePageData,
         page_numbers: &HashMap<*const BTreePageData, u32>,
     ) -> Vec<u8> {
@@ -320,33 +463,46 @@ impl BTreeGenerator<'_> {
             BTreePageType::Interior => 0x05,
             BTreePageType::Leaf => 0x0d,
         };
-        data[1..3].copy_from_slice(
-            &U16::new(page.free_blocks.first().map(|x| x.offset).unwrap_or(0)).to_bytes(),
-        );
-        data[3..5].copy_from_slice(&U16::new(page.cells.len() as u16).to_bytes());
-        data[5..7].copy_from_slice(&U16::new(page.cell_content_area).to_bytes());
-        data[7] = page.fragmented_free_bytes;
+        let first_free_block = page.free_blocks.first().map(|x| x.offset).unwrap_or(0);
+        let first_free_block =
+            self.corrupt_u16_off_by_one(page_no, "first freeblock offset", first_free_block);
+        let first_free_block =
+            self.corrupt_u16_offset(page_no, "first freeblock offset", first_free_block);
+        data[1..3].copy_from_slice(&U16::new(first_free_block).to_bytes());
+        let cell_count =
+            self.corrupt_u16_off_by_one(page_no, "cell count", page.cells.len() as u16);
+        data[3..5].copy_from_slice(&U16::new(cell_count).to_bytes());
+        let content_area =
+            self.corrupt_u16_off_by_one(page_no, "content area", page.cell_content_area);
+        data[5..7].copy_from_slice(&U16::new(content_area).to_bytes());
+        data[7] = self.corrupt_u8_garbage(page_no, "fragmented bytes", page.fragmented_free_bytes);
         let mut offset = 8;
         if page.page_type == BTreePageType::Interior {
             let cell_right_pointer = page.cell_right_pointer.as_ref().unwrap();
             let cell_right_pointer = Rc::as_ptr(cell_right_pointer);
-            let cell_right_pointer = page_numbers.get(&cell_right_pointer).unwrap();
-            data[8..12].copy_from_slice(&U32::new(*cell_right_pointer).to_bytes());
+            let cell_right_pointer = *page_numbers.get(&cell_right_pointer).unwrap();
+            let cell_right_pointer =
+                self.corrupt_page_pointer(page_no, "right pointer", cell_right_pointer, max_page);
+            data[8..12].copy_from_slice(&U32::new(cell_right_pointer).to_bytes());
             offset = 12;
         }
 
         for (i, (pointer, _)) in page.cells.iter().enumerate() {
+            let pointer = self.corrupt_u16_off_by_one(page_no, "cell pointer", *pointer);
+            let pointer = self.corrupt_u16_offset(page_no, "cell pointer", pointer);
             data[offset + 2 * i..offset + 2 * (i + 1)]
-                .copy_from_slice(&U16::new(*pointer).to_bytes());
+                .copy_from_slice(&U16::new(pointer).to_bytes());
         }
 
         for i in 0..page.free_blocks.len() {
             let offset = page.free_blocks[i].offset as usize;
-            data[offset..offset + 2].copy_from_slice(
-                &U16::new(page.free_blocks.get(i + 1).map(|x| x.offset).unwrap_or(0)).to_bytes(),
-            );
-            data[offset + 2..offset + 4]
-                .copy_from_slice(&U16::new(page.free_blocks[i].size).to_bytes());
+            let next = page.free_blocks.get(i + 1).map(|x| x.offset).unwrap_or(0);
+            let next = self.corrupt_u16_off_by_one(page_no, "freeblock next offset", next);
+            let next = self.corrupt_u16_offset(page_no, "freeblock next offset", next);
+            data[offset..offset + 2].copy_from_slice(&U16::new(next).to_bytes());
+            let size =
+                self.corrupt_u16_off_by_one(page_no, "freeblock size", page.free_blocks[i].size);
+            data[offset + 2..offset + 4].copy_from_slice(&U16::new(size).to_bytes());
         }
 
         for (pointer, cell) in page.cells.iter() {
@@ -354,25 +510,43 @@ impl BTreeGenerator<'_> {
             match cell {
                 BTreeCell::Interior(cell) => {
                     let left_child_pointer = Rc::as_ptr(&cell.left_child_pointer);
-                    let left_child_pointer = page_numbers.get(&left_child_pointer).unwrap();
-                    data[p..p + 4].copy_from_slice(&U32::new(*left_child_pointer).to_bytes());
+                    let left_child_pointer = *page_numbers.get(&left_child_pointer).unwrap();
+                    let left_child_pointer = self.corrupt_page_pointer(
+                        page_no,
+                        "child pointer",
+                        left_child_pointer,
+                        max_page,
+                    );
+                    data[p..p + 4].copy_from_slice(&U32::new(left_child_pointer).to_bytes());
                     p += 4;
-                    _ = write_varint(&mut data[p..], cell.rowid);
+                    let rowid =
+                        self.corrupt_varint_off_by_one(page_no, "interior rowid", cell.rowid);
+                    _ = write_varint(&mut data[p..], rowid);
                 }
                 BTreeCell::Leaf(cell) => {
-                    p += write_varint(&mut data[p..], cell.size as u64);
-                    p += write_varint(&mut data[p..], cell.rowid);
+                    let size =
+                        self.corrupt_varint_off_by_one(page_no, "payload size", cell.size as u64);
+                    p += write_varint(&mut data[p..], size);
+                    let rowid = self.corrupt_varint_off_by_one(page_no, "leaf rowid", cell.rowid);
+                    p += write_varint(&mut data[p..], rowid);
                     data[p..p + cell.on_page_data.len()].copy_from_slice(&cell.on_page_data);
                     p += cell.on_page_data.len();
                     if let Some(overflow_page) = &cell.overflow_page {
                         let overflow_page = Rc::as_ptr(overflow_page);
-                        let overflow_page = page_numbers.get(&overflow_page).unwrap();
-                        data[p..p + 4].copy_from_slice(&U32::new(*overflow_page).to_bytes());
+                        let overflow_page = *page_numbers.get(&overflow_page).unwrap();
+                        let overflow_page = self.corrupt_page_pointer(
+                            page_no,
+                            "overflow pointer",
+                            overflow_page,
+                            max_page,
+                        );
+                        data[p..p + 4].copy_from_slice(&U32::new(overflow_page).to_bytes());
                     }
                 }
             }
         }
 
+        self.corrupt_garbage_region(page_no, &mut data);
         data
     }
 
@@ -521,12 +695,27 @@ impl BTreeGenerator<'_> {
             .unwrap();
 
         assert_eq!(file.size().unwrap(), (self.page_size * 2) as u64);
+        let max_page = (1 + pages.len()) as u32;
         for (i, page) in pages.iter().enumerate() {
-            let page = self.create_page(page, &page_numbers);
+            let page = self.create_page(start_page + i as u32, max_page, page, &page_numbers);
             write_at(&io, file.as_ref(), self.page_size * (i + 1), &page);
         }
-        let size = 1 + pages.len();
-        let size_bytes = U32::new(size as u32).to_bytes();
+        let mut size = (1 + pages.len()) as u32;
+        // The corrupt tests need at least one corruption even for tiny trees
+        // where no per-field check fired; fall back to the header page count.
+        if self.chance(self.profile.off_by_one_permille)
+            || (self.profile.enabled() && self.corruptions.is_empty())
+        {
+            let corrupted = if self.rng.next_u32() % 2 == 0 {
+                size + 1
+            } else {
+                size.saturating_sub(1)
+            };
+            self.corruptions
+                .push(format!("header: page count {size} -> {corrupted}"));
+            size = corrupted;
+        }
+        let size_bytes = U32::new(size).to_bytes();
         write_at(&io, file.as_ref(), 28, &size_bytes);
     }
 }
@@ -698,6 +887,8 @@ fn run_attempt(
         page_size,
         max_interior_keys,
         max_leaf_keys: 4096,
+        profile: CorruptionProfile::NONE,
+        corruptions: Vec::new(),
     };
     let root = generator.generate_btree(depth, 0, MAX_ROWID);
     generator.write_btree(&turso_path, &root, 2);
@@ -801,6 +992,125 @@ fn run_attempt(
     assert_eq!(turso_check, ok, "{ctx}: turso integrity_check after writes");
 }
 
+/// Corrupt-mode attempt: generate a tree, corrupt it while serializing, then
+/// throw read queries at turso. Every query may return rows or an error; the
+/// only failure is a panic, crash or hang inside turso.
+fn run_corrupt_attempt(
+    rng: &mut ChaCha8Rng,
+    seed: u64,
+    depth: usize,
+    attempt: usize,
+    profile: CorruptionProfile,
+    opts: turso_core::DatabaseOpts,
+    flags: OpenFlags,
+) {
+    let page_size = PAGE_SIZES[rng.next_u32() as usize % PAGE_SIZES.len()];
+    let ctx = format!("seed={seed} depth={depth} attempt={attempt} page_size={page_size}");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("btree-corrupt.db");
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "page_size", page_size as i64)
+            .unwrap();
+        conn.pragma_update(None, "journal_mode", "wal").unwrap();
+        conn.execute("create table test (k INTEGER PRIMARY KEY, b BLOB)", [])
+            .unwrap();
+    }
+
+    let max_interior_keys = 2 + rng.next_u32() as usize % 5;
+    let mut generator = BTreeGenerator {
+        rng,
+        page_size,
+        max_interior_keys,
+        max_leaf_keys: 4096,
+        profile,
+        corruptions: Vec::new(),
+    };
+    let root = generator.generate_btree(depth, 0, MAX_ROWID);
+    generator.write_btree(&db_path, &root, 2);
+    let corruptions = std::mem::take(&mut generator.corruptions);
+
+    let mut known = Vec::new();
+    collect_rowids(&root, &mut known);
+    known.sort_unstable();
+
+    for corruption in &corruptions {
+        log::debug!("{ctx}: corrupted {corruption}");
+    }
+
+    let db = TempDatabase::builder()
+        .with_db_path(&db_path)
+        .with_opts(opts)
+        .with_flags(flags)
+        .build();
+    let conn = db.connect_limbo();
+
+    let mut queries = vec![
+        "PRAGMA integrity_check".to_string(),
+        "SELECT k, b FROM test ORDER BY k".to_string(),
+    ];
+    for _ in 0..6 {
+        let (l, r) = random_range(rng, &known);
+        queries.push(format!(
+            "SELECT SUM(LENGTH(b)) FROM test WHERE k >= {l} AND k <= {r}"
+        ));
+    }
+    for _ in 0..2 {
+        let (l, r) = random_range(rng, &known);
+        for order in ["ASC", "DESC"] {
+            queries.push(format!(
+                "SELECT k, b FROM test WHERE k >= {l} AND k <= {r} ORDER BY k {order} LIMIT 32"
+            ));
+        }
+    }
+    for _ in 0..4 {
+        let k = if rng.next_u32() % 2 == 0 && !known.is_empty() {
+            known[rng.next_u32() as usize % known.len()]
+        } else {
+            rng.next_u64() % MAX_ROWID
+        };
+        queries.push(format!("SELECT b FROM test WHERE k = {k}"));
+    }
+
+    let (mut ok_count, mut err_count) = (0, 0);
+    for query in &queries {
+        match limbo_exec_rows_fallible(&db, &conn, query) {
+            Ok(_) => ok_count += 1,
+            Err(err) => {
+                err_count += 1;
+                log::debug!("{ctx}: `{query}` -> {err}");
+            }
+        }
+    }
+    log::info!(
+        "{ctx}: {} corruptions, {ok_count} queries ok, {err_count} queries failed",
+        corruptions.len()
+    );
+}
+
+fn run_corruption_test(tmp_db: TempDatabase, profile: CorruptionProfile) {
+    let _ = env_logger::try_init();
+    let seed = std::env::var("BTREE_TEST_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    for depth in 0..4 {
+        for attempt in 0..4 {
+            run_corrupt_attempt(
+                &mut rng,
+                seed,
+                depth,
+                attempt,
+                profile,
+                tmp_db.db_opts,
+                tmp_db.db_flags,
+            );
+        }
+    }
+}
+
 // TODO: currently fails with MVCC
 #[turso_macros::test]
 fn test_btree(tmp_db: TempDatabase) {
@@ -823,4 +1133,49 @@ fn test_btree(tmp_db: TempDatabase) {
             );
         }
     }
+}
+
+#[turso_macros::test]
+fn test_btree_corrupt_off_by_one(tmp_db: TempDatabase) {
+    run_corruption_test(
+        tmp_db,
+        CorruptionProfile {
+            off_by_one_permille: 10,
+            ..CorruptionProfile::NONE
+        },
+    );
+}
+
+#[turso_macros::test]
+fn test_btree_corrupt_pointers(tmp_db: TempDatabase) {
+    run_corruption_test(
+        tmp_db,
+        CorruptionProfile {
+            bad_pointer_permille: 10,
+            ..CorruptionProfile::NONE
+        },
+    );
+}
+
+#[turso_macros::test]
+fn test_btree_corrupt_garbage(tmp_db: TempDatabase) {
+    run_corruption_test(
+        tmp_db,
+        CorruptionProfile {
+            garbage_permille: 25,
+            ..CorruptionProfile::NONE
+        },
+    );
+}
+
+#[turso_macros::test]
+fn test_btree_corrupt_mixed(tmp_db: TempDatabase) {
+    run_corruption_test(
+        tmp_db,
+        CorruptionProfile {
+            off_by_one_permille: 5,
+            bad_pointer_permille: 5,
+            garbage_permille: 10,
+        },
+    );
 }
