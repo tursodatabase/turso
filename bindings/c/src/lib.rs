@@ -476,16 +476,20 @@ pub unsafe extern "C" fn sqlite3_open(
         Ok(s) => s,
         Err(_) => return SQLITE_MISUSE,
     };
-    let io: Arc<dyn turso_core::IO> = match filename_str {
-        ":memory:" => Arc::new(turso_core::MemoryIO::new()),
-        _ => match turso_core::PlatformIO::new() {
+    // An empty filename requests a private temporary database, backed here
+    // by a private in-memory database (see sqlite3_open_v2).
+    let is_memory = filename_str == ":memory:" || filename_str.is_empty();
+    let io: Arc<dyn turso_core::IO> = if is_memory {
+        Arc::new(turso_core::MemoryIO::new())
+    } else {
+        match turso_core::PlatformIO::new() {
             Ok(io) => Arc::new(io),
             Err(_) => return SQLITE_CANTOPEN,
-        },
+        }
     };
     match turso_core::Database::open_file_with_flags(
         io.clone(),
-        filename_str,
+        if is_memory { ":memory:" } else { filename_str },
         turso_core::OpenFlags::default(),
         default_db_opts(),
         None,
@@ -493,9 +497,10 @@ pub unsafe extern "C" fn sqlite3_open(
     ) {
         Ok(db) => {
             let conn = db.connect().unwrap();
-            let filename = match filename_str {
-                ":memory:" => CString::new("".to_string()).unwrap(),
-                _ => CString::from(filename_cstr),
+            let filename = if is_memory {
+                CString::new("".to_string()).unwrap()
+            } else {
+                CString::from(filename_cstr)
             };
             *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn, filename)));
             SQLITE_OK
@@ -641,7 +646,14 @@ pub unsafe extern "C" fn sqlite3_open_v2(
                 Ok(result) => result,
                 Err(()) => return SQLITE_CANTOPEN,
             }
-        } else if (flags & SQLITE_OPEN_MEMORY) != 0 || filename_str == ":memory:" {
+        } else if (flags & SQLITE_OPEN_MEMORY) != 0
+            || filename_str == ":memory:"
+            || filename_str.is_empty()
+        {
+            // An empty filename requests a private temporary database. SQLite
+            // backs it with a temp file; a private in-memory database is the
+            // same "private and discarded on close" contract, differing only
+            // in storage medium.
             (":memory:".to_string(), true, false)
         } else {
             (filename_str.to_string(), false, false)
