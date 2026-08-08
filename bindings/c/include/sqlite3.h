@@ -3,25 +3,43 @@
 
 #include <stdint.h>
 
-#define SQLITE_OK 0
+#define SQLITE_VERSION        "3.42.0"
+#define SQLITE_VERSION_NUMBER 3042000
 
-#define SQLITE_ERROR 1
+/* SQLite C extension loading is not supported: Turso extensions are a
+** different mechanism. Consumers (e.g. PHP's ext/sqlite3) compile their
+** loadExtension paths out cleanly under this define. */
+#define SQLITE_OMIT_LOAD_EXTENSION 1
 
-#define SQLITE_ABORT 4
-
-#define SQLITE_BUSY 5
-
-#define SQLITE_NOMEM 7
-
-#define SQLITE_INTERRUPT 9
-
-#define SQLITE_NOTFOUND 12
-
-#define SQLITE_CANTOPEN 14
-
+#define SQLITE_OK          0
+#define SQLITE_ERROR       1
+#define SQLITE_INTERNAL    2
+#define SQLITE_PERM        3
+#define SQLITE_ABORT       4
+#define SQLITE_BUSY        5
+#define SQLITE_LOCKED      6
+#define SQLITE_NOMEM       7
+#define SQLITE_READONLY    8
+#define SQLITE_INTERRUPT   9
+#define SQLITE_IOERR      10
+#define SQLITE_CORRUPT    11
+#define SQLITE_NOTFOUND   12
+#define SQLITE_FULL       13
+#define SQLITE_CANTOPEN   14
+#define SQLITE_PROTOCOL   15
+#define SQLITE_EMPTY      16
+#define SQLITE_SCHEMA     17
+#define SQLITE_TOOBIG     18
 #define SQLITE_CONSTRAINT 19
-
-#define SQLITE_MISUSE 21
+#define SQLITE_MISMATCH   20
+#define SQLITE_MISUSE     21
+#define SQLITE_NOLFS      22
+#define SQLITE_AUTH       23
+#define SQLITE_FORMAT     24
+#define SQLITE_RANGE      25
+#define SQLITE_NOTADB     26
+#define SQLITE_NOTICE     27
+#define SQLITE_WARNING    28
 
 #define SQLITE_ROW 100
 
@@ -34,6 +52,19 @@
 #define SQLITE_STATE_SICK 186
 
 #define SQLITE_STATE_BUSY 109
+
+/* Flags for sqlite3_open_v2 */
+#define SQLITE_OPEN_READONLY      0x00000001
+#define SQLITE_OPEN_READWRITE     0x00000002
+#define SQLITE_OPEN_CREATE        0x00000004
+#define SQLITE_OPEN_URI           0x00000040
+#define SQLITE_OPEN_MEMORY        0x00000080
+#define SQLITE_OPEN_NOMUTEX       0x00008000
+#define SQLITE_OPEN_FULLMUTEX     0x00010000
+#define SQLITE_OPEN_SHAREDCACHE   0x00020000
+#define SQLITE_OPEN_PRIVATECACHE  0x00040000
+#define SQLITE_OPEN_NOFOLLOW      0x01000000
+#define SQLITE_OPEN_EXRESCODE     0x02000000
 
 #define SQLITE_CHECKPOINT_PASSIVE 0
 
@@ -57,6 +88,22 @@ typedef void (*sqlite3_destructor_type)(void*);
 typedef struct sqlite3 sqlite3;
 
 typedef struct sqlite3_stmt sqlite3_stmt;
+typedef struct sqlite3_context sqlite3_context;
+typedef struct sqlite3_value sqlite3_value;
+typedef struct sqlite3_blob sqlite3_blob;
+typedef struct sqlite3_backup sqlite3_backup;
+
+/* Text encodings and function flags for sqlite3_create_function */
+#define SQLITE_UTF8           1
+#define SQLITE_UTF16LE        2
+#define SQLITE_UTF16BE        3
+#define SQLITE_UTF16          4
+#define SQLITE_ANY            5
+#define SQLITE_UTF16_ALIGNED  8
+#define SQLITE_DETERMINISTIC  0x000000800
+#define SQLITE_DIRECTONLY     0x000080000
+#define SQLITE_SUBTYPE        0x000100000
+#define SQLITE_INNOCUOUS      0x000200000
 typedef int64_t sqlite3_int64;
 typedef sqlite3_int64 sqlite_int64;
 
@@ -133,7 +180,7 @@ int sqlite3_set_authorizer(sqlite3 *db,
 #define SQLITE_COPY                  0
 #define SQLITE_RECURSIVE            33
 
-void *sqlite3_context_db_handle(void *_context);
+sqlite3 *sqlite3_context_db_handle(sqlite3_context *context);
 
 int sqlite3_prepare_v2(sqlite3 *db, const char *sql, int _len, sqlite3_stmt **out_stmt, const char **_tail);
 
@@ -232,17 +279,17 @@ int sqlite3_errcode(sqlite3 *_db);
 
 const char *sqlite3_errstr(int _err);
 
-void *sqlite3_user_data(void *_context);
+void *sqlite3_user_data(sqlite3_context *context);
 
-void *sqlite3_backup_init(sqlite3 *_dest_db, const char *_dest_name, sqlite3 *_source_db, const char *_source_name);
+sqlite3_backup *sqlite3_backup_init(sqlite3 *dest_db, const char *dest_name, sqlite3 *source_db, const char *source_name);
 
-int sqlite3_backup_step(void *_backup, int _n_pages);
+int sqlite3_backup_step(sqlite3_backup *backup, int n_pages);
 
-int sqlite3_backup_remaining(void *_backup);
+int sqlite3_backup_remaining(sqlite3_backup *backup);
 
-int sqlite3_backup_pagecount(void *_backup);
+int sqlite3_backup_pagecount(sqlite3_backup *backup);
 
-int sqlite3_backup_finish(void *_backup);
+int sqlite3_backup_finish(sqlite3_backup *backup);
 
 const char *sqlite3_sql(sqlite3_stmt *stmt);
 
@@ -262,9 +309,9 @@ int sqlite3_bind_int64(sqlite3_stmt *_stmt, int _idx, int64_t _val);
 
 int sqlite3_bind_double(sqlite3_stmt *_stmt, int _idx, double _val);
 
-int sqlite3_bind_text(sqlite3_stmt *_stmt, int _idx, const char *_text, int _len, void *_destroy);
+int sqlite3_bind_text(sqlite3_stmt *stmt, int idx, const char *text, int len, sqlite3_destructor_type destroy);
 
-int sqlite3_bind_blob(sqlite3_stmt *_stmt, int _idx, const void *_blob, int _len, void *_destroy);
+int sqlite3_bind_blob(sqlite3_stmt *stmt, int idx, const void *blob, int len, sqlite3_destructor_type destroy);
 
 int sqlite3_column_type(sqlite3_stmt *_stmt, int _idx);
 
@@ -284,25 +331,25 @@ const void *sqlite3_column_blob(sqlite3_stmt *_stmt, int _idx);
 
 int sqlite3_column_bytes(sqlite3_stmt *_stmt, int _idx);
 
-void *sqlite3_column_value(sqlite3_stmt *_stmt, int _idx);
+sqlite3_value *sqlite3_column_value(sqlite3_stmt *stmt, int idx);
 
-int sqlite3_value_type(void *value);
+int sqlite3_value_type(sqlite3_value *value);
 
-int64_t sqlite3_value_int64(void *value);
+int64_t sqlite3_value_int64(sqlite3_value *value);
 
-int sqlite3_value_int(void *value);
+int sqlite3_value_int(sqlite3_value *value);
 
-double sqlite3_value_double(void *value);
+double sqlite3_value_double(sqlite3_value *value);
 
-const unsigned char *sqlite3_value_text(void *value);
+const unsigned char *sqlite3_value_text(sqlite3_value *value);
 
-const void *sqlite3_value_blob(void *value);
+const void *sqlite3_value_blob(sqlite3_value *value);
 
-int sqlite3_value_bytes(void *value);
+int sqlite3_value_bytes(sqlite3_value *value);
 
-void *sqlite3_value_dup(void *value);
+sqlite3_value *sqlite3_value_dup(sqlite3_value *value);
 
-void sqlite3_value_free(void *value);
+void sqlite3_value_free(sqlite3_value *value);
 
 const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int idx);
 
@@ -312,25 +359,25 @@ int sqlite3_get_table(sqlite3 *db, const char *sql, char ***paz_result, int *pn_
 
 void sqlite3_free_table(char **az_result);
 
-void sqlite3_result_null(void *_context);
+void sqlite3_result_null(sqlite3_context *context);
 
-void sqlite3_result_int64(void *_context, int64_t _val);
+void sqlite3_result_int64(sqlite3_context *context, int64_t val);
 
-void sqlite3_result_int(void *_context, int _val);
+void sqlite3_result_int(sqlite3_context *context, int val);
 
-void sqlite3_result_double(void *_context, double _val);
+void sqlite3_result_double(sqlite3_context *context, double val);
 
-void sqlite3_result_text(void *_context, const char *_text, int _len, void *_destroy);
+void sqlite3_result_text(sqlite3_context *context, const char *text, int len, sqlite3_destructor_type destroy);
 
-void sqlite3_result_blob(void *_context, const void *_blob, int _len, void *_destroy);
+void sqlite3_result_blob(sqlite3_context *context, const void *blob, int len, sqlite3_destructor_type destroy);
 
-void sqlite3_result_error_nomem(void *_context);
+void sqlite3_result_error_nomem(sqlite3_context *context);
 
-void sqlite3_result_error_toobig(void *_context);
+void sqlite3_result_error_toobig(sqlite3_context *context);
 
-void sqlite3_result_error(void *_context, const char *_err, int _len);
+void sqlite3_result_error(sqlite3_context *context, const char *err, int len);
 
-void *sqlite3_aggregate_context(void *_context, int _n);
+void *sqlite3_aggregate_context(sqlite3_context *context, int n);
 
 int sqlite3_blob_open(sqlite3 *_db,
                       const char *_db_name,
@@ -338,34 +385,49 @@ int sqlite3_blob_open(sqlite3 *_db,
                       const char *_column_name,
                       int64_t _rowid,
                       int _flags,
-                      void **_blob_out);
+                      sqlite3_blob **blob_out);
 
-int sqlite3_blob_read(void *_blob, void *_data, int _n, int _offset);
+int sqlite3_blob_read(sqlite3_blob *blob, void *data, int n, int offset);
 
-int sqlite3_blob_write(void *_blob, const void *_data, int _n, int _offset);
+int sqlite3_blob_write(sqlite3_blob *blob, const void *data, int n, int offset);
 
-int sqlite3_blob_bytes(void *_blob);
+int sqlite3_blob_bytes(sqlite3_blob *blob);
 
-int sqlite3_blob_close(void *_blob);
+int sqlite3_blob_close(sqlite3_blob *blob);
 
 int sqlite3_stricmp(const char *_a, const char *_b);
 
-int sqlite3_create_collation_v2(sqlite3 *_db,
-                                const char *_name,
-                                int _enc,
-                                void *_context,
-                                int (*_cmp)(void),
-                                void (*_destroy)(void));
+int sqlite3_create_collation(sqlite3 *db,
+                             const char *name,
+                             int enc,
+                             void *context,
+                             int (*xCompare)(void*, int, const void*, int, const void*));
 
-int sqlite3_create_function_v2(sqlite3 *_db,
-                               const char *_name,
-                               int _n_args,
-                               int _enc,
-                               void *_context,
-                               void (*_func)(void),
-                               void (*_step)(void),
-                               void (*_final_)(void),
-                               void (*_destroy)(void));
+int sqlite3_create_collation_v2(sqlite3 *db,
+                                const char *name,
+                                int enc,
+                                void *context,
+                                int (*xCompare)(void*, int, const void*, int, const void*),
+                                void (*xDestroy)(void*));
+
+int sqlite3_create_function(sqlite3 *db,
+                            const char *name,
+                            int n_args,
+                            int enc,
+                            void *context,
+                            void (*xFunc)(sqlite3_context*, int, sqlite3_value**),
+                            void (*xStep)(sqlite3_context*, int, sqlite3_value**),
+                            void (*xFinal)(sqlite3_context*));
+
+int sqlite3_create_function_v2(sqlite3 *db,
+                               const char *name,
+                               int n_args,
+                               int enc,
+                               void *context,
+                               void (*xFunc)(sqlite3_context*, int, sqlite3_value**),
+                               void (*xStep)(sqlite3_context*, int, sqlite3_value**),
+                               void (*xFinal)(sqlite3_context*),
+                               void (*xDestroy)(void*));
 
 int sqlite3_create_window_function(sqlite3 *_db,
                                    const char *_name,

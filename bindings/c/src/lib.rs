@@ -67,12 +67,6 @@ fn default_db_opts() -> DatabaseOpts {
     opts
 }
 
-macro_rules! stub {
-    () => {
-        todo!("{} is not implemented", stringify!($fn));
-    };
-}
-
 /* generic error-codes */
 pub const SQLITE_OK: ffi::c_int = 0; /* Successful result */
 pub const SQLITE_ERROR: ffi::c_int = 1; /* Generic error */
@@ -753,6 +747,10 @@ pub unsafe extern "C" fn sqlite3_db_filename(
     inner.filename.as_ptr()
 }
 
+// Unimplemented entry points return their contract's failure value (or a
+// harmless no-op where the contract has no failure signal) instead of
+// panicking: a panic across the extern "C" boundary aborts the host
+// process.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_trace_v2(
     _db: *mut sqlite3,
@@ -762,7 +760,7 @@ pub unsafe extern "C" fn sqlite3_trace_v2(
     >,
     _context: *mut ffi::c_void,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 #[no_mangle]
@@ -1515,7 +1513,7 @@ pub unsafe extern "C" fn sqlite3_serialize(
     _out_bytes: *mut ffi::c_int,
     _flags: ffi::c_uint,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 #[no_mangle]
@@ -1526,7 +1524,7 @@ pub unsafe extern "C" fn sqlite3_deserialize(
     _in_bytes: ffi::c_int,
     _flags: ffi::c_uint,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 #[no_mangle]
@@ -1762,7 +1760,7 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_sleep(_ms: ffi::c_int) {
-    stub!();
+    std::thread::sleep(std::time::Duration::from_millis(_ms.max(0) as u64));
 }
 
 #[no_mangle]
@@ -1771,7 +1769,7 @@ pub unsafe extern "C" fn sqlite3_limit(
     _id: ffi::c_int,
     _new_value: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    -1
 }
 
 #[no_mangle]
@@ -1857,7 +1855,7 @@ pub unsafe extern "C" fn sqlite3_backup_init(
     _source_db: *mut sqlite3,
     _source_name: *const ffi::c_char,
 ) -> *mut ffi::c_void {
-    stub!();
+    std::ptr::null_mut()
 }
 
 #[no_mangle]
@@ -1865,22 +1863,22 @@ pub unsafe extern "C" fn sqlite3_backup_step(
     _backup: *mut ffi::c_void,
     _n_pages: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_remaining(_backup: *mut ffi::c_void) -> ffi::c_int {
-    stub!();
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_pagecount(_backup: *mut ffi::c_void) -> ffi::c_int {
-    stub!();
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_finish(_backup: *mut ffi::c_void) -> ffi::c_int {
-    stub!();
+    SQLITE_OK
 }
 
 /// Returns the statement's original SQL text. The pointer is owned by the
@@ -2823,7 +2821,7 @@ pub unsafe extern "C" fn sqlite3_aggregate_context(
     _context: *mut ffi::c_void,
     _n: ffi::c_int,
 ) -> *mut ffi::c_void {
-    stub!();
+    std::ptr::null_mut()
 }
 
 // `unsafe_op_in_unsafe_fn`: opt this FFI entry point out of the legacy rule that an
@@ -3022,6 +3020,19 @@ pub unsafe extern "C" fn sqlite3_stricmp(
     a.len() as ffi::c_int - b.len() as ffi::c_int
 }
 
+/// The pre-v2 registration entry point: identical to
+/// sqlite3_create_collation_v2 without a destructor.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_create_collation(
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
+    enc: ffi::c_int,
+    context: *mut ffi::c_void,
+    cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
+) -> ffi::c_int {
+    sqlite3_create_collation_v2(db, name, enc, context, cmp, None)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_collation_v2(
     _db: *mut sqlite3,
@@ -3031,7 +3042,23 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     _cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
     _destroy: Option<unsafe extern "C" fn()>,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
+}
+
+/// The pre-v2 registration entry point: identical to
+/// sqlite3_create_function_v2 without a destructor.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_create_function(
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
+    n_args: ffi::c_int,
+    enc: ffi::c_int,
+    context: *mut ffi::c_void,
+    func: Option<unsafe extern "C" fn()>,
+    step: Option<unsafe extern "C" fn()>,
+    final_: Option<unsafe extern "C" fn()>,
+) -> ffi::c_int {
+    sqlite3_create_function_v2(db, name, n_args, enc, context, func, step, final_, None)
 }
 
 #[no_mangle]
@@ -3144,7 +3171,7 @@ pub unsafe extern "C" fn sqlite3_create_window_function(
     _x_inverse: Option<unsafe extern "C" fn()>,
     _destroy: Option<unsafe extern "C" fn()>,
 ) -> ffi::c_int {
-    stub!();
+    SQLITE_ERROR
 }
 
 /// Returns the error message for the most recent failed API call to connection.
