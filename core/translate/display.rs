@@ -311,9 +311,14 @@ impl Display for SelectPlan {
                             seek_def,
                         } => {
                             let constraints = seek_constraint_annotation(index, seek_def);
+                            let covering = if reference.utilizes_covering_index() {
+                                "COVERING "
+                            } else {
+                                ""
+                            };
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                                "{indent}SEARCH {} USING {covering}INDEX {}{constraints}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }
@@ -325,9 +330,14 @@ impl Display for SelectPlan {
                             } else {
                                 String::new()
                             };
+                            let covering = if reference.utilizes_covering_index() {
+                                "COVERING "
+                            } else {
+                                ""
+                            };
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
+                                "{indent}SEARCH {} USING {covering}INDEX {}{constraint}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }

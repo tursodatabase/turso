@@ -70,7 +70,7 @@ fn is_true_and_false_do_not_use_equality_seeks() {
     ] {
         let plan = query_plan(&conn, query);
         assert!(
-            plan.contains("SEARCH t USING INDEX ti (x=?)"),
+            plan.contains("SEARCH t USING COVERING INDEX ti (x=?)"),
             "expected an index seek for `{query}`, got:\n{plan}"
         );
     }
