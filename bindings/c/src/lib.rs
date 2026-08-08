@@ -2243,10 +2243,16 @@ pub unsafe extern "C" fn sqlite3_column_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
+    if stmt.is_null() || idx < 0 {
+        return std::ptr::null();
+    }
     let stmt = &mut *stmt;
+    // Out-of-range column: SQLite returns NULL rather than erroring.
+    if idx as usize >= stmt.stmt.num_columns() {
+        return std::ptr::null();
+    }
 
-    let binding = stmt.stmt.get_column_name(idx).into_owned();
+    let binding = stmt.stmt.get_column_name(idx as usize).into_owned();
     let val = binding.as_str();
 
     if val.is_empty() {
