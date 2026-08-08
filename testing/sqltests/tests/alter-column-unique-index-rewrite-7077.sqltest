@@ -1,0 +1,123 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/7077
+# ALTER COLUMN rewrote table rows but not secondary index entries, leaving
+# stale index keys that later caused DELETE/UPDATE corruption errors.
+#
+# A column-level UNIQUE (or single-column PRIMARY KEY) constraint is enforced
+# by an automatic index, and ALTER COLUMN replaces the column definition,
+# which cannot carry the constraint. Allowing the ALTER would orphan the
+# sqlite_autoindex_* schema row (SQLite reports "malformed database schema
+# ... orphan index" and Turso fails to reload the schema), so it is rejected.
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+@cross-check-integrity
+test alter-column-column-level-unique-rejected {
+    CREATE TABLE p(a, b UNIQUE);
+    INSERT INTO p VALUES(1, 10);
+    ALTER TABLE p ALTER COLUMN b TO g AS (a + 1);
+}
+expect error {
+    cannot alter column "b": UNIQUE
+}
+
+# A composite PRIMARY KEY is a table-level constraint that survives the ALTER
+# with the column renamed, so altering a member is allowed in general — but a
+# generated column cannot be part of the PRIMARY KEY: allowing it would write
+# a schema that neither Turso nor SQLite can reload ("malformed database
+# schema ... generated columns cannot be part of the PRIMARY KEY").
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+@cross-check-integrity
+test alter-column-composite-pk-member-to-generated-rejected {
+    CREATE TABLE p(a, b, c, PRIMARY KEY(b, c));
+    INSERT INTO p VALUES(1, 10, 20);
+    ALTER TABLE p ALTER COLUMN b TO g AS (a + 1);
+}
+expect error {
+    generated column "g" cannot be part of the PRIMARY KEY
+}
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+@cross-check-integrity
+test alter-column-composite-pk-member-affinity-change-ok {
+    CREATE TABLE p(a, b, c, PRIMARY KEY(b, c));
+    INSERT INTO p VALUES(1, 10, 20);
+    ALTER TABLE p ALTER COLUMN b TO b2 TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 'p';
+    DELETE FROM p;
+    SELECT count(*) FROM p;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE p (a, b2 TEXT, c, PRIMARY KEY (b2, c))
+    0
+    ok
+}
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+@cross-check-integrity
+test alter-column-single-column-pk-rejected {
+    CREATE TABLE p(a, b TEXT PRIMARY KEY);
+    INSERT INTO p VALUES(1, 'x');
+    ALTER TABLE p ALTER COLUMN b TO g AS (a + 1);
+}
+expect error {
+    cannot alter column "b": PRIMARY KEY
+}
+
+# Explicit indexes on the altered column must be rebuilt from the post-ALTER
+# column values; stale entries previously made DELETE fail with
+# "Corrupt database: IdxDelete: no matching index entry found".
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+@cross-check-integrity
+test alter-column-unique-index-delete-no-corruption {
+    CREATE TABLE p(a, b);
+    CREATE UNIQUE INDEX p_b ON p(b);
+    INSERT INTO p VALUES(1, 10);
+    ALTER TABLE p ALTER COLUMN b TO g AS (a + 1);
+    SELECT rowid, a, g FROM p;
+    DELETE FROM p;
+    SELECT count(*) FROM p;
+}
+expect {
+    1|1|2
+    0
+}
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+@cross-check-integrity
+test alter-column-unique-index-update-no-corruption {
+    CREATE TABLE p(a, b);
+    CREATE UNIQUE INDEX p_b ON p(b);
+    INSERT INTO p VALUES(1, 10);
+    ALTER TABLE p ALTER COLUMN b TO g AS (a + 1);
+    UPDATE p SET a = 5;
+    SELECT rowid, a, g FROM p;
+    PRAGMA integrity_check;
+}
+expect {
+    1|5|6
+    ok
+}
+
+# A table-level UNIQUE constraint survives the ALTER (renamed in the table
+# SQL), so its automatic index stays valid and must be rebuilt from the
+# post-ALTER column values.
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+@cross-check-integrity
+test alter-column-table-level-unique-autoindex-rebuilt {
+    CREATE TABLE p(a, b, UNIQUE(b));
+    INSERT INTO p VALUES(1, 10);
+    ALTER TABLE p ALTER COLUMN b TO g AS (a + 1);
+    SELECT sql FROM sqlite_schema WHERE name = 'p';
+    SELECT rowid, a, g FROM p;
+    DELETE FROM p;
+    SELECT count(*) FROM p;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE p (a, g AS (a + 1), UNIQUE (g))
+    1|1|2
+    0
+    ok
+}
