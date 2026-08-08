@@ -229,9 +229,18 @@ pub(super) fn comparison_affinity_from_info(
             Affinity::Blob
         }
     } else if lhs.has_affinity {
-        lhs.affinity
+        // A lone numeric affinity still collapses to NUMERIC.
+        if lhs.affinity.is_numeric() {
+            Affinity::Numeric
+        } else {
+            lhs.affinity
+        }
     } else if rhs.has_affinity {
-        rhs.affinity
+        if rhs.affinity.is_numeric() {
+            Affinity::Numeric
+        } else {
+            rhs.affinity
+        }
     } else {
         Affinity::Blob
     }
@@ -247,4 +256,97 @@ pub(crate) fn compare_affinity(
         other,
         get_expr_affinity_info(expr, referenced_tables, resolver),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_sides_have_affinity_numeric_wins() {
+        assert_eq!(
+            comparison_affinity_from_info(
+                ExprAffinityInfo::with_affinity(Affinity::Real),
+                ExprAffinityInfo::with_affinity(Affinity::Text),
+            ),
+            Affinity::Numeric
+        );
+    }
+
+    #[test]
+    fn both_sides_have_affinity_neither_numeric_is_blob() {
+        assert_eq!(
+            comparison_affinity_from_info(
+                ExprAffinityInfo::with_affinity(Affinity::Text),
+                ExprAffinityInfo::with_affinity(Affinity::Blob),
+            ),
+            Affinity::Blob
+        );
+    }
+
+    #[test]
+    fn only_lhs_has_real_affinity_collapses_to_numeric() {
+        assert_eq!(
+            comparison_affinity_from_info(
+                ExprAffinityInfo::with_affinity(Affinity::Real),
+                ExprAffinityInfo::no_affinity(),
+            ),
+            Affinity::Numeric
+        );
+    }
+
+    #[test]
+    fn only_lhs_has_integer_affinity_collapses_to_numeric() {
+        assert_eq!(
+            comparison_affinity_from_info(
+                ExprAffinityInfo::with_affinity(Affinity::Integer),
+                ExprAffinityInfo::no_affinity(),
+            ),
+            Affinity::Numeric
+        );
+    }
+
+    #[test]
+    fn only_rhs_has_real_affinity_collapses_to_numeric() {
+        assert_eq!(
+            comparison_affinity_from_info(
+                ExprAffinityInfo::no_affinity(),
+                ExprAffinityInfo::with_affinity(Affinity::Real),
+            ),
+            Affinity::Numeric
+        );
+    }
+
+    #[test]
+    fn only_lhs_has_text_affinity_is_preserved() {
+        assert_eq!(
+            comparison_affinity_from_info(
+                ExprAffinityInfo::with_affinity(Affinity::Text),
+                ExprAffinityInfo::no_affinity(),
+            ),
+            Affinity::Text
+        );
+    }
+
+    #[test]
+    fn only_rhs_has_text_affinity_is_preserved() {
+        assert_eq!(
+            comparison_affinity_from_info(
+                ExprAffinityInfo::no_affinity(),
+                ExprAffinityInfo::with_affinity(Affinity::Text),
+            ),
+            Affinity::Text
+        );
+    }
+
+    #[test]
+    fn neither_side_has_affinity_is_blob() {
+        assert_eq!(
+            comparison_affinity_from_info(
+                ExprAffinityInfo::no_affinity(),
+                ExprAffinityInfo::no_affinity(),
+            ),
+            Affinity::Blob
+        );
+    }
 }
