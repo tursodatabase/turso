@@ -304,6 +304,55 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     assert!(!run(&tmp_db, || reader.query_next()).unwrap());
 }
 
+#[turso_macros::test(mvcc)]
+fn test_vector_sparse_ivf_mvcc_sql(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors(id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO vectors VALUES \
+         (1, vector32_sparse('[1, 0, 0]')), \
+         (2, vector32_sparse('[0, 1, 0]'))",
+    )
+    .unwrap();
+
+    let nearest = |vector: &str| {
+        limbo_exec_rows(
+            &conn,
+            &format!(
+                "SELECT id FROM vectors \
+                 ORDER BY vector_distance_jaccard(embedding, vector32_sparse('{vector}')) \
+                 LIMIT 1"
+            ),
+        )
+    };
+    assert_eq!(
+        nearest("[1, 0, 0]"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE vectors SET embedding = vector32_sparse('[0, 0, 1]') WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        nearest("[0, 0, 1]"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        nearest("[1, 0, 0]"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        nearest("[0, 1, 0]"),
+        vec![vec![rusqlite::types::Value::Integer(2)]]
+    );
+}
+
 // TODO: cannot use MVCC as we use indexes here
 #[turso_macros::test]
 fn test_vector_sparse_ivf_fuzz(tmp_db: TempDatabase) {
