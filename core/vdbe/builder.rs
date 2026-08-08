@@ -1,6 +1,7 @@
 use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
+use std::ops::Range;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -257,7 +258,9 @@ pub struct ProgramBuilder {
     /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
+    free_register_ranges: Vec<Range<usize>>,
     next_free_cursor_id: usize,
+    free_cursor_ids: Vec<usize>,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
     /// Current parsing nesting level
@@ -656,7 +659,9 @@ impl ProgramBuilder {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
+            free_register_ranges: Vec::new(),
             next_free_cursor_id: 0,
+            free_cursor_ids: Vec::new(),
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
@@ -943,16 +948,66 @@ impl ProgramBuilder {
         self.constant_spans.truncate(idx);
     }
 
-    pub const fn alloc_register(&mut self) -> usize {
-        let reg = self.next_free_register;
-        self.next_free_register += 1;
-        reg
+    pub fn alloc_register(&mut self) -> usize {
+        self.alloc_registers(1)
     }
 
-    pub const fn alloc_registers(&mut self, amount: usize) -> usize {
+    pub fn alloc_registers(&mut self, amount: usize) -> usize {
+        if amount == 0 {
+            return self.next_free_register;
+        }
+        if let Some(index) = self
+            .free_register_ranges
+            .iter()
+            .position(|range| range.len() >= amount)
+        {
+            let reg = self.free_register_ranges[index].start;
+            self.free_register_ranges[index].start += amount;
+            if self.free_register_ranges[index].is_empty() {
+                self.free_register_ranges.remove(index);
+            }
+            return reg;
+        }
         let reg = self.next_free_register;
         self.next_free_register += amount;
         reg
+    }
+
+    /// Allow later code to use registers that a removed plan had reserved.
+    pub(crate) fn release_registers(&mut self, start: usize, amount: usize) {
+        if amount == 0 {
+            return;
+        }
+        let end = start.checked_add(amount).expect("register range overflow");
+        turso_assert!(start > 0 && end <= self.next_free_register);
+        self.free_register_ranges.push(start..end);
+        self.free_register_ranges
+            .sort_unstable_by_key(|range| range.start);
+
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(self.free_register_ranges.len());
+        for range in self.free_register_ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                turso_assert!(last.end <= range.start, "register range released twice");
+                if last.end == range.start {
+                    last.end = range.end;
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        self.free_register_ranges = merged;
+
+        while self
+            .free_register_ranges
+            .last()
+            .is_some_and(|range| range.end == self.next_free_register)
+        {
+            let range = self
+                .free_register_ranges
+                .pop()
+                .expect("last register range was present");
+            self.next_free_register = range.start;
+        }
     }
 
     /// Returns the next register that will be allocated by alloc_register/alloc_registers.
@@ -1029,11 +1084,40 @@ impl ProgramBuilder {
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
+        if let Some(cursor) = self.free_cursor_ids.pop() {
+            self.cursor_ref[cursor] = (key, cursor_type);
+            return cursor;
+        }
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
         turso_assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
+    }
+
+    /// Allow later code to use a cursor that a removed plan had reserved.
+    pub(crate) fn release_cursor_id(&mut self, cursor_id: usize) {
+        turso_assert!(cursor_id < self.next_free_cursor_id);
+        turso_assert!(!self.free_cursor_ids.contains(&cursor_id));
+
+        if cursor_id + 1 == self.next_free_cursor_id {
+            self.cursor_ref.pop();
+            self.next_free_cursor_id -= 1;
+            while let Some(index) = self
+                .free_cursor_ids
+                .iter()
+                .position(|id| *id + 1 == self.next_free_cursor_id)
+            {
+                self.free_cursor_ids.remove(index);
+                self.cursor_ref.pop();
+                self.next_free_cursor_id -= 1;
+            }
+            return;
+        }
+
+        self.free_cursor_ids.push(cursor_id);
+        self.free_cursor_ids
+            .sort_unstable_by(|left, right| right.cmp(left));
     }
 
     pub fn add_pragma_result_column(&mut self, col_name: String) {
@@ -1629,6 +1713,28 @@ impl ProgramBuilder {
     /// the override cursor will be used instead of the normal resolution.
     pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
         self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
+    }
+
+    /// Run `f` while reads for this table use `cursor_id`.
+    ///
+    /// This is used while an automatic index calculates a virtual column. The
+    /// new index does not have a row yet, so the calculation must read from the
+    /// source table. The old cursor is restored after `f` returns.
+    pub fn with_cursor_override<T>(
+        &mut self,
+        table_ref_id: TableInternalId,
+        cursor_id: CursorID,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let table_id = table_ref_id.into();
+        let old_cursor = self.cursor_overrides.insert(table_id, cursor_id);
+        let result = f(self);
+        if let Some(old_cursor) = old_cursor {
+            self.cursor_overrides.insert(table_id, old_cursor);
+        } else {
+            self.cursor_overrides.remove(&table_id);
+        }
+        result
     }
 
     /// Clear the cursor override for a table.

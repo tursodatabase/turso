@@ -238,6 +238,7 @@ fn prepare_window_subquery(
         non_from_clause_subqueries: vec![],
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
     };

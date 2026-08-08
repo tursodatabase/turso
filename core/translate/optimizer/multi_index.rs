@@ -12,7 +12,7 @@ use crate::stats::AnalyzeStats;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
-    BranchReadMode, ChosenInSeekCandidate, ResidualConstraintMode,
+    BranchReadMode, ChosenInSeekCandidate,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
@@ -21,7 +21,7 @@ use crate::translate::optimizer::constraints::{
 };
 use crate::translate::optimizer::cost::{
     estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
-    AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
+    where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::optimizer::AvailableIndexes;
@@ -668,6 +668,19 @@ fn evaluate_multi_index_branches(
     let mut branch_params = Vec::with_capacity(branches.len());
 
     for branch in branches {
+        let where_cost = branch
+            .union_prepost_filters
+            .as_ref()
+            .map(|filters| {
+                let pre_steps: usize = filters.pre_filter_exprs.iter().map(where_expr_steps).sum();
+                let post_steps: usize =
+                    filters.post_filter_exprs.iter().map(where_expr_steps).sum();
+                Cost(
+                    (pre_steps as f64 + branch.estimated_rows * post_steps as f64)
+                        * params.cpu_cost_per_where_step,
+                )
+            })
+            .unwrap_or(Cost(0.0));
         let post_filter_exprs = branch
             .union_prepost_filters
             .as_ref()
@@ -705,7 +718,7 @@ fn evaluate_multi_index_branches(
             residuals: branch.union_prepost_filters,
         };
 
-        branch_costs.push(branch.cost);
+        branch_costs.push(branch.cost + where_cost);
         branch_rows.push(params_for_branch.estimated_rows);
         branch_params.push(params_for_branch);
     }
@@ -753,7 +766,6 @@ fn evaluate_multi_index_branches(
         Some(AccessMethod {
             cost: multi_index_cost,
             estimated_rows_per_outer_row: estimated_rows,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
             consumed_where_terms,
             params: AccessMethodParams::MultiIndexScan {
                 branches: branch_params,

@@ -397,17 +397,9 @@ impl OpenLoop {
                                             None,
                                         );
                                     }
-                                    MaterializedFromClauseSubqueryStorage::DirectIndex => {
-                                        let index = index.as_ref().expect(
-                                            "direct-index materialized subquery requires index",
-                                        );
-                                        emit_materialized_subquery_result_columns(
-                                            program,
-                                            from_clause_subquery,
-                                            index_cursor_id,
-                                            Some(index.as_ref()),
-                                        );
-                                    }
+                                    // Expressions read direct index columns when they need them.
+                                    // Copying all columns here would only write unused registers.
+                                    MaterializedFromClauseSubqueryStorage::DirectIndex => {}
                                 }
                             } else {
                                 // Only emit DeferredSeek for non-subquery tables

@@ -4991,3 +4991,23 @@ test update-or-virtual-deferred-seek-no-panic-explicit-index {
 expect error {
     UNIQUE constraint failed
 }
+
+setup gencol_autoindex_virtual_column_setup {
+    CREATE TABLE rhs_items(base TEXT, value TEXT AS (base) VIRTUAL);
+    CREATE TABLE lhs_items(marker TEXT);
+    INSERT INTO rhs_items(base) VALUES ('gorgeous_sugar'), ('diplomatic_thwaite');
+    INSERT INTO lhs_items(marker) VALUES ('dynamic_hine');
+}
+
+@setup gencol_autoindex_virtual_column_setup
+test gencol-autoindex-virtual-column-reads-source-table {
+    SELECT DISTINCT lhs_items.marker, rhs_items.base
+    FROM lhs_items
+    JOIN rhs_items ON lhs_items.marker = 'dynamic_hine'
+    WHERE rhs_items.value < 'gorgeovHrOTvcD'
+    ORDER BY 2;
+}
+expect {
+    dynamic_hine|diplomatic_thwaite
+    dynamic_hine|gorgeous_sugar
+}
