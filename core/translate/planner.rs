@@ -110,11 +110,66 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
     Ok(definitions)
 }
 
-/// Collect all table names referenced in a SELECT's FROM clause.
-/// Used to determine which earlier CTEs a CTE directly depends on.
+struct LocalCteReferences {
+    name: String,
+    references: Vec<String>,
+}
+
+/// Collect table names needed from the surrounding scope, including dependencies
+/// of local CTEs reachable from the SELECT body.
 fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
-    collect_from_select_body(&select.body, out);
-    collect_subquery_table_refs_in_select_exprs(select, out);
+    let local_ctes = select
+        .with
+        .as_ref()
+        .map(|with| {
+            with.ctes
+                .iter()
+                .map(|cte| {
+                    let mut references = Vec::new();
+                    collect_from_clause_table_refs(&cte.select, &mut references);
+                    LocalCteReferences {
+                        name: normalize_ident(cte.tbl_name.as_str()),
+                        references,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut direct_references = Vec::new();
+    collect_from_select_body(&select.body, &mut direct_references);
+    collect_subquery_table_refs_in_select_exprs(select, &mut direct_references);
+
+    let mut visiting = Vec::new();
+    for reference in direct_references {
+        expand_local_cte_references(&reference, &local_ctes, &mut visiting, out);
+    }
+}
+
+fn expand_local_cte_references(
+    name: &str,
+    local_ctes: &[LocalCteReferences],
+    visiting: &mut Vec<usize>,
+    out: &mut Vec<String>,
+) {
+    let Some((index, local_cte)) = local_ctes
+        .iter()
+        .enumerate()
+        .find(|(_, cte)| cte.name == name)
+    else {
+        out.push(name.to_string());
+        return;
+    };
+
+    if visiting.contains(&index) {
+        return;
+    }
+
+    visiting.push(index);
+    for reference in &local_cte.references {
+        expand_local_cte_references(reference, local_ctes, visiting, out);
+    }
+    visiting.pop();
 }
 
 fn collect_from_select_body(body: &ast::SelectBody, out: &mut Vec<String>) {

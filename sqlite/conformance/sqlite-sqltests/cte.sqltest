@@ -1202,8 +1202,78 @@ expect {
 }
 
 # =============================================================================
+# Nested CTE dependencies
+# =============================================================================
+
+test cte-nested-reads-outer-cte {
+    WITH a AS (SELECT 1),
+         b AS (WITH c AS (SELECT * FROM a) SELECT * FROM c)
+    SELECT * FROM b;
+}
+expect {
+    1
+}
+
+test cte-nested-dependency-chain-reads-outer-cte {
+    WITH a AS (SELECT 1),
+         b AS (
+             WITH d AS (SELECT * FROM a),
+                  c AS (SELECT * FROM d)
+             SELECT * FROM c
+         )
+    SELECT * FROM b;
+}
+expect {
+    1
+}
+
+test cte-forward-nested-dependency-chain-reads-outer-cte {
+    WITH a AS (SELECT 1),
+         b AS (
+             WITH c AS (SELECT * FROM d),
+                  d AS (SELECT * FROM a)
+             SELECT * FROM c
+         )
+    SELECT * FROM b;
+}
+expect {
+    1
+}
+
+test cte-unused-nested-cte-does-not-read-outer-cte {
+    WITH a AS (SELECT * FROM no_such_table),
+         b AS (WITH unused AS (SELECT * FROM a) SELECT 1)
+    SELECT * FROM b;
+}
+expect {
+    1
+}
+
+# =============================================================================
 # CTE name shadowing in nested scopes
 # =============================================================================
+
+test cte-shadow-does-not-plan-outer-cte {
+    WITH a AS (SELECT * FROM no_such_table),
+         b AS (WITH a AS (SELECT 1) SELECT * FROM a)
+    SELECT * FROM b;
+}
+expect {
+    1
+}
+
+test cte-forward-shadow-does-not-plan-outer-cte {
+    WITH a AS (SELECT * FROM no_such_table),
+         b AS (
+             WITH c AS (SELECT * FROM a),
+                  a AS (SELECT 1)
+             SELECT * FROM c
+         )
+    SELECT * FROM b;
+}
+expect {
+    1
+}
 
 # Inner CTE shadows outer CTE in EXISTS subquery
 test cte-shadow-in-exists {
