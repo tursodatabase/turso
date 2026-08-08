@@ -1,0 +1,97 @@
+# Bytecode parity tests for parenthesized FROM clauses.
+#
+# Each pair (paren / no-paren) below should produce byte-identical EXPLAIN
+# output after the planner's Sub-flattening pass. If a future change makes the
+# parenthesized form generate a different plan than the unparenthesized form,
+# the corresponding `.snap` files will diverge and CI will fail.
+#
+# Pair convention: <name>__paren and <name>__no_paren capture the same query
+# in two surface syntaxes; the snapshot bodies under BYTECODE / QUERY PLAN
+# are expected to be textually identical.
+
+@database :memory:
+@skip-file-if mvcc "mvcc has different cursor ids"
+
+setup schema {
+    -- Indexes on the join columns force an index-based plan instead of a
+    -- hash join, keeping the bytecode free of the environment-dependent
+    -- `budget=N` literal that HashBuild emits.
+    CREATE TABLE a (x INTEGER PRIMARY KEY);
+    CREATE TABLE b (y INTEGER PRIMARY KEY, ax INTEGER);
+    CREATE INDEX idx_b_ax ON b(ax);
+    CREATE TABLE c (z INTEGER PRIMARY KEY, by_ INTEGER);
+    CREATE INDEX idx_c_by ON c(by_);
+}
+
+# Pair 1: paren wraps an INNER JOIN at the top of FROM.
+@setup schema
+snapshot inner_join__paren {
+    SELECT a.x, b.y FROM (a INNER JOIN b ON a.x = b.ax);
+}
+
+@setup schema
+snapshot inner_join__no_paren {
+    SELECT a.x, b.y FROM a INNER JOIN b ON a.x = b.ax;
+}
+
+# Pair 2: paren wraps two-table INNER JOIN, with an outer INNER JOIN added.
+@setup schema
+snapshot three_way__paren {
+    SELECT a.x, b.y, c.z
+    FROM (a INNER JOIN b ON a.x = b.ax)
+    INNER JOIN c ON c.by_ = b.y;
+}
+
+@setup schema
+snapshot three_way__no_paren {
+    SELECT a.x, b.y, c.z
+    FROM a
+    INNER JOIN b ON a.x = b.ax
+    INNER JOIN c ON c.by_ = b.y;
+}
+
+# Pair 3: paren wraps a LEFT JOIN at the top of FROM (no enclosing JOIN, safe to flatten).
+@setup schema
+snapshot left_join__paren {
+    SELECT a.x, b.y FROM (a LEFT JOIN b ON a.x = b.ax);
+}
+
+@setup schema
+snapshot left_join__no_paren {
+    SELECT a.x, b.y FROM a LEFT JOIN b ON a.x = b.ax;
+}
+
+# Pair 4: paren wraps a single table — Sub appears as the right side of an
+# outer LEFT JOIN. Single-table inner is always safe regardless of outer type.
+@setup schema
+snapshot left_join_single_table_inner__paren {
+    SELECT a.x, b.y FROM a LEFT JOIN (b) ON a.x = b.ax;
+}
+
+@setup schema
+snapshot left_join_single_table_inner__no_paren {
+    SELECT a.x, b.y FROM a LEFT JOIN b ON a.x = b.ax;
+}
+
+# Pair 5: paren wraps a multi-table FROM at the comma-join position.
+# Comma is non-OUTER so the multi-table inner is safe to flatten.
+@setup schema
+snapshot comma_join_multi_table_inner__paren {
+    SELECT a.x, b.y, c.z FROM a, (b INNER JOIN c ON b.y = c.by_);
+}
+
+@setup schema
+snapshot comma_join_multi_table_inner__no_paren {
+    SELECT a.x, b.y, c.z FROM a, b INNER JOIN c ON b.y = c.by_;
+}
+
+# Pair 6: nested parens - sanity-check that the iterative flatten handles depth > 1.
+@setup schema
+snapshot double_paren__paren {
+    SELECT a.x, b.y FROM ((a INNER JOIN b ON a.x = b.ax));
+}
+
+@setup schema
+snapshot double_paren__no_paren {
+    SELECT a.x, b.y FROM a INNER JOIN b ON a.x = b.ax;
+}
