@@ -1,3 +1,16 @@
+//! Differential test over hand-written B-tree files.
+//!
+//! The generator below writes raw B-tree pages (interior/leaf cells, free
+//! blocks, fragmented bytes, overflow chains, shuffled physical placement)
+//! straight into a database file. The layouts are valid per the SQLite file
+//! format but unusual: stale divider keys, pages far from how a real writer
+//! would balance them, gaps filled with 0xFF. The test then compares Turso
+//! against SQLite on the same file: integrity_check, full-content reads,
+//! range scans in both directions, point lookups, and finally an identical
+//! stream of writes applied to identical copies of the file. Every attempt
+//! picks its own page size, so layouts are exercised at each size SQLite
+//! supports (except 65536, see PAGE_SIZES).
+
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -11,6 +24,24 @@ use turso_core::{Buffer, Completion, File, OpenFlags, PlatformIO, IO};
 use zerocopy::big_endian::{U16, U32, U64};
 
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
+
+/// Page sizes the generator picks from. 65536 is excluded: the format
+/// special-cases it (a 0 in two-byte header fields means 65536) and the
+/// generator's two-byte offset arithmetic does not model that.
+const PAGE_SIZES: &[usize] = &[512, 1024, 2048, 4096, 8192, 16384, 32768];
+/// Largest rowid the generator hands out (rowids are signed in SQL).
+const MAX_ROWID: u64 = i64::MAX as u64;
+
+/// Largest table-leaf payload stored fully in-page: usable - 35. The whole
+/// page is usable: the generator assumes no reserved space.
+fn leaf_max_local(page_size: usize) -> usize {
+    page_size - 35
+}
+
+/// Smallest in-page part of an overflowing payload: (usable-12)*32/255 - 23.
+fn leaf_min_local(page_size: usize) -> usize {
+    (page_size - 12) * 32 / 255 - 23
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum BTreePageType {
@@ -76,7 +107,6 @@ pub struct BTreeTablePageData {
 #[derive(Debug)]
 pub enum BTreePageData {
     Table(BTreeTablePageData),
-    #[allow(dead_code)]
     Overflow(BTreeOverflowPageData),
 }
 
@@ -103,6 +133,20 @@ pub fn list_pages(root: &Rc<BTreePageData>, pages: &mut Vec<Rc<BTreePageData>>) 
             if let Some(next) = &root.next {
                 list_pages(next, pages);
             }
+        }
+    }
+}
+
+fn collect_rowids(root: &Rc<BTreePageData>, rowids: &mut Vec<u64>) {
+    if let BTreePageData::Table(page) = root.as_ref() {
+        for (_, cell) in &page.cells {
+            match cell {
+                BTreeCell::Interior(cell) => collect_rowids(&cell.left_child_pointer, rowids),
+                BTreeCell::Leaf(cell) => rowids.push(cell.rowid),
+            }
+        }
+        if let Some(right) = &page.cell_right_pointer {
+            collect_rowids(right, rowids);
         }
     }
 }
@@ -165,10 +209,17 @@ fn write_blob_column(header: &mut Vec<u8>, data: &mut Vec<u8>, value: &[u8]) {
     data.extend_from_slice(value);
 }
 
-fn create_simple_record(value: u64, payload: &[u8]) -> Vec<u8> {
+fn create_simple_record(value: u64, payload: &[u8], key_as_null: bool) -> Vec<u8> {
     let mut header = Vec::new();
     let mut data = Vec::new();
-    write_u64_column(&mut header, &mut data, value);
+    if key_as_null {
+        // SQLite itself stores NULL for an INTEGER PRIMARY KEY column and
+        // substitutes the rowid on read. Storing the integer instead (the
+        // else-branch) is a layout SQLite tolerates but never produces.
+        header.push(0);
+    } else {
+        write_u64_column(&mut header, &mut data, value);
+    }
     write_blob_column(&mut header, &mut data, payload);
     let header_len = header.len() + 1;
     assert!(header_len <= 127);
@@ -180,11 +231,56 @@ fn create_simple_record(value: u64, payload: &[u8]) -> Vec<u8> {
     result
 }
 
+/// How many payload bytes stay on the leaf page; the rest go to overflow
+/// pages. Mirrors the SQLite table-leaf formula.
+fn leaf_local_size(payload_size: usize, page_size: usize) -> usize {
+    let max_local = leaf_max_local(page_size);
+    if payload_size <= max_local {
+        return payload_size;
+    }
+    let min_local = leaf_min_local(page_size);
+    let surplus = min_local + (payload_size - min_local) % (page_size - 4);
+    if surplus <= max_local {
+        surplus
+    } else {
+        min_local
+    }
+}
+
+fn build_overflow_chain(payload: &[u8], page_size: usize) -> Rc<BTreePageData> {
+    let mut next = None;
+    for chunk in payload.chunks(page_size - 4).rev() {
+        next = Some(Rc::new(BTreePageData::Overflow(BTreeOverflowPageData {
+            next,
+            payload: chunk.to_vec(),
+        })));
+    }
+    next.expect("overflow chain needs at least one page")
+}
+
+/// Payload sizes come in three classes: small (most rows), medium (fills
+/// pages with just a few cells, still mostly in-page) and large (straddles
+/// the in-page threshold, so most of these records need overflow chains).
+fn random_payload(rng: &mut ChaCha8Rng, page_size: usize) -> Vec<u8> {
+    let max_local = leaf_max_local(page_size);
+    let class = rng.next_u32() % 100;
+    let len = if class < 60 {
+        rng.next_u32() as usize % 128
+    } else if class < 85 {
+        128 + rng.next_u32() as usize % (max_local - 128)
+    } else {
+        max_local.saturating_sub(page_size / 8) + rng.next_u32() as usize % (page_size * 3)
+    };
+    let mut payload = vec![0u8; len];
+    rng.fill_bytes(&mut payload);
+    payload
+}
+
 struct BTreeGenerator<'a> {
     rng: &'a mut ChaCha8Rng,
+    page_size: usize,
     max_interior_keys: usize,
     max_leaf_keys: usize,
-    max_payload_size: usize,
 }
 
 impl BTreeGenerator<'_> {
@@ -203,7 +299,7 @@ impl BTreeGenerator<'_> {
         page: &BTreeOverflowPageData,
         page_numbers: &HashMap<*const BTreePageData, u32>,
     ) -> Vec<u8> {
-        let mut data = [255u8; 4096];
+        let mut data = vec![255u8; self.page_size];
         let first_4bytes = if let Some(next) = &page.next {
             *page_numbers.get(&Rc::as_ptr(next)).unwrap()
         } else {
@@ -211,14 +307,14 @@ impl BTreeGenerator<'_> {
         };
         data[0..4].copy_from_slice(&U32::new(first_4bytes).to_bytes());
         data[4..4 + page.payload.len()].copy_from_slice(&page.payload);
-        data.to_vec()
+        data
     }
     pub fn create_btree_page(
         &self,
         page: &BTreeTablePageData,
         page_numbers: &HashMap<*const BTreePageData, u32>,
     ) -> Vec<u8> {
-        let mut data = [255u8; 4096];
+        let mut data = vec![255u8; self.page_size];
 
         data[0] = match page.page_type {
             BTreePageType::Interior => 0x05,
@@ -277,7 +373,7 @@ impl BTreeGenerator<'_> {
             }
         }
 
-        data.into()
+        data
     }
 
     fn generate_btree(&mut self, depth: usize, mut l: u64, r: u64) -> Rc<BTreePageData> {
@@ -309,13 +405,22 @@ impl BTreeGenerator<'_> {
             it += 1;
 
             let cell = if depth == 0 {
-                let length = self.rng.next_u32() as usize % self.max_payload_size;
-                let record = create_simple_record(rowid, &vec![1u8; length]);
+                let payload = random_payload(self.rng, self.page_size);
+                let key_as_null = self.rng.next_u32() % 2 == 0;
+                let record = create_simple_record(rowid, &payload, key_as_null);
+                let total_size = record.len();
+                let local_size = leaf_local_size(total_size, self.page_size);
+                let (on_page_data, overflow_page) = if local_size < total_size {
+                    let chain = build_overflow_chain(&record[local_size..], self.page_size);
+                    (record[..local_size].to_vec(), Some(chain))
+                } else {
+                    (record, None)
+                };
                 BTreeCell::Leaf(BTreeLeafCell {
-                    size: record.len(),
+                    size: total_size,
                     rowid,
-                    on_page_data: record,
-                    overflow_page: None,
+                    on_page_data,
+                    overflow_page,
                 })
             } else {
                 BTreeCell::Interior(BTreeInteriorCell {
@@ -323,7 +428,7 @@ impl BTreeGenerator<'_> {
                     rowid,
                 })
             };
-            if cells_size + 2 + cell.size() > 4096 {
+            if cells_size + 2 + cell.size() > self.page_size as u16 {
                 break;
             }
             cells_size += 2 + cell.size();
@@ -336,9 +441,9 @@ impl BTreeGenerator<'_> {
         cells.shuffle(&mut self.rng);
 
         let mut cells_with_offset = Vec::new();
-        let mut fragmentation_budget = 4096 - cells_size;
+        let mut fragmentation_budget = self.page_size as u16 - cells_size;
         let mut pointer_offset = header_offset;
-        let mut content_offset = 4096;
+        let mut content_offset = self.page_size as u16;
         let mut fragmented_free_bytes = 0;
         let mut free_blocks = vec![];
 
@@ -415,10 +520,10 @@ impl BTreeGenerator<'_> {
             .open_file(path.to_str().unwrap(), OpenFlags::None, true)
             .unwrap();
 
-        assert_eq!(file.size().unwrap(), 4096 * 2);
+        assert_eq!(file.size().unwrap(), (self.page_size * 2) as u64);
         for (i, page) in pages.iter().enumerate() {
             let page = self.create_page(page, &page_numbers);
-            write_at(&io, file.as_ref(), 4096 * (i + 1), &page);
+            write_at(&io, file.as_ref(), self.page_size * (i + 1), &page);
         }
         let size = 1 + pages.len();
         let size_bytes = U32::new(size as u32).to_bytes();
@@ -440,57 +545,282 @@ fn write_at<F: File + ?Sized>(io: &impl IO, file: &F, offset: usize, data: &[u8]
     }
 }
 
+fn to_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+fn value_brief(value: &rusqlite::types::Value) -> String {
+    match value {
+        rusqlite::types::Value::Blob(blob) => format!(
+            "blob(len={}, prefix={:02x?})",
+            blob.len(),
+            &blob[..blob.len().min(8)]
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
+fn assert_rows_eq(
+    sqlite_rows: &[Vec<rusqlite::types::Value>],
+    turso_rows: &[Vec<rusqlite::types::Value>],
+    query: &str,
+    ctx: &str,
+) {
+    if sqlite_rows == turso_rows {
+        return;
+    }
+    let mismatch = sqlite_rows
+        .iter()
+        .zip(turso_rows.iter())
+        .position(|(sqlite_row, turso_row)| sqlite_row != turso_row)
+        .unwrap_or(sqlite_rows.len().min(turso_rows.len()));
+    let brief = |rows: &[Vec<rusqlite::types::Value>]| -> String {
+        rows.get(mismatch).map_or("<no row>".to_string(), |row| {
+            row.iter().map(value_brief).collect::<Vec<_>>().join(", ")
+        })
+    };
+    panic!(
+        "{ctx}: `{query}` diverged: sqlite returned {} rows, turso returned {} rows, \
+         first difference at row {mismatch}:\n  sqlite: {}\n  turso:  {}",
+        sqlite_rows.len(),
+        turso_rows.len(),
+        brief(sqlite_rows),
+        brief(turso_rows),
+    );
+}
+
+fn compare_query(
+    sqlite_conn: &rusqlite::Connection,
+    turso_conn: &Arc<turso_core::Connection>,
+    query: &str,
+    ctx: &str,
+) {
+    let sqlite_rows = sqlite_exec_rows(sqlite_conn, query);
+    let turso_rows = limbo_exec_rows(turso_conn, query);
+    assert_rows_eq(&sqlite_rows, &turso_rows, query, ctx);
+}
+
+/// Half the ranges are uniform over the whole keyspace (mostly wide), half
+/// hug existing rowids so scans start and stop at exact keys and near-misses.
+fn random_range(rng: &mut ChaCha8Rng, known: &[u64]) -> (u64, u64) {
+    if known.is_empty() || rng.next_u32() % 2 == 0 {
+        let mut l = rng.next_u64() % MAX_ROWID;
+        let mut r = rng.next_u64() % MAX_ROWID;
+        if l > r {
+            (l, r) = (r, l);
+        }
+        (l, r)
+    } else {
+        let i = rng.next_u32() as usize % known.len();
+        let j = (i + rng.next_u32() as usize % 16).min(known.len() - 1);
+        (
+            known[i].saturating_sub(1),
+            known[j].saturating_add(1).min(MAX_ROWID),
+        )
+    }
+}
+
+/// Window over a few adjacent known rowids, so DELETE/UPDATE ranges touch a
+/// handful of rows instead of the whole table.
+fn known_window(rng: &mut ChaCha8Rng, known: &[u64]) -> (u64, u64) {
+    let i = rng.next_u32() as usize % known.len();
+    let j = (i + rng.next_u32() as usize % 8).min(known.len() - 1);
+    (known[i], known[j])
+}
+
+/// `known` stays sorted and only grows; deletes may turn later windows into
+/// no-ops, which is fine.
+fn random_write_stmt(rng: &mut ChaCha8Rng, known: &mut Vec<u64>, page_size: usize) -> String {
+    match rng.next_u32() % 4 {
+        0 | 1 => {
+            let k = if rng.next_u32() % 2 == 0 {
+                known[rng.next_u32() as usize % known.len()]
+            } else {
+                rng.next_u64() % MAX_ROWID
+            };
+            let payload = random_payload(rng, page_size);
+            if let Err(pos) = known.binary_search(&k) {
+                known.insert(pos, k);
+            }
+            format!(
+                "INSERT OR REPLACE INTO test VALUES ({k}, X'{}')",
+                to_hex(&payload)
+            )
+        }
+        2 => {
+            let (a, b) = known_window(rng, known);
+            format!("DELETE FROM test WHERE k BETWEEN {a} AND {b}")
+        }
+        _ => {
+            let (a, b) = known_window(rng, known);
+            let payload = random_payload(rng, page_size);
+            format!(
+                "UPDATE test SET b = X'{}' WHERE k BETWEEN {a} AND {b}",
+                to_hex(&payload)
+            )
+        }
+    }
+}
+
+fn run_attempt(
+    rng: &mut ChaCha8Rng,
+    seed: u64,
+    depth: usize,
+    attempt: usize,
+    opts: turso_core::DatabaseOpts,
+    flags: OpenFlags,
+) {
+    let page_size = PAGE_SIZES[rng.next_u32() as usize % PAGE_SIZES.len()];
+    let ctx = format!("seed={seed} depth={depth} attempt={attempt} page_size={page_size}");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let turso_path = temp_dir.path().join("btree-turso.db");
+    let sqlite_path = temp_dir.path().join("btree-sqlite.db");
+
+    // A real SQLite writer lays down the header and schema; closing the
+    // connection checkpoints the WAL, leaving exactly two pages on disk.
+    // The page size must be set before the first write to the fresh file.
+    {
+        let conn = rusqlite::Connection::open(&turso_path).unwrap();
+        conn.pragma_update(None, "page_size", page_size as i64)
+            .unwrap();
+        conn.pragma_update(None, "journal_mode", "wal").unwrap();
+        conn.execute("create table test (k INTEGER PRIMARY KEY, b BLOB)", [])
+            .unwrap();
+    }
+
+    let max_interior_keys = 2 + rng.next_u32() as usize % 5;
+    let mut generator = BTreeGenerator {
+        rng,
+        page_size,
+        max_interior_keys,
+        max_leaf_keys: 4096,
+    };
+    let root = generator.generate_btree(depth, 0, MAX_ROWID);
+    generator.write_btree(&turso_path, &root, 2);
+
+    let mut known = Vec::new();
+    collect_rowids(&root, &mut known);
+    known.sort_unstable();
+    log::info!(
+        "{ctx}: fanout={max_interior_keys} rows={} file={} bytes",
+        known.len(),
+        std::fs::metadata(&turso_path).unwrap().len(),
+    );
+
+    // Each engine gets its own identical copy of the generated file, so the
+    // write phase can diverge only through engine behavior.
+    std::fs::copy(&turso_path, &sqlite_path).unwrap();
+
+    // Open turso only after the raw file is fully written.
+    let db = TempDatabase::builder()
+        .with_db_path(&turso_path)
+        .with_opts(opts)
+        .with_flags(flags)
+        .build();
+    let turso_conn = db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+
+    // The generated file must look like a valid database to both engines.
+    compare_query(&sqlite_conn, &turso_conn, "PRAGMA integrity_check", &ctx);
+
+    // Read phase: full contents (walks every overflow chain), range scans in
+    // both directions, and point lookups on hits and misses.
+    compare_query(
+        &sqlite_conn,
+        &turso_conn,
+        "SELECT k, b FROM test ORDER BY k",
+        &ctx,
+    );
+    for _ in 0..8 {
+        let (l, r) = random_range(rng, &known);
+        let query = format!("SELECT SUM(LENGTH(b)) FROM test WHERE k >= {l} AND k <= {r}");
+        compare_query(&sqlite_conn, &turso_conn, &query, &ctx);
+    }
+    for _ in 0..3 {
+        let (l, r) = random_range(rng, &known);
+        for order in ["ASC", "DESC"] {
+            let query = format!(
+                "SELECT k, b FROM test WHERE k >= {l} AND k <= {r} ORDER BY k {order} LIMIT 32"
+            );
+            compare_query(&sqlite_conn, &turso_conn, &query, &ctx);
+        }
+    }
+    for _ in 0..4 {
+        let k = if rng.next_u32() % 2 == 0 && !known.is_empty() {
+            known[rng.next_u32() as usize % known.len()]
+        } else {
+            rng.next_u64() % MAX_ROWID
+        };
+        let query = format!("SELECT b FROM test WHERE k = {k}");
+        compare_query(&sqlite_conn, &turso_conn, &query, &ctx);
+    }
+
+    // Write phase: the same statement stream runs on both engines, churning
+    // the weird pages (free-block reuse, defragmentation, overflow chains
+    // created and freed, balancing around stale divider keys).
+    for i in 0..24 {
+        let stmt = random_write_stmt(rng, &mut known, page_size);
+        log::debug!("{ctx}: write {i}: {}", &stmt[..stmt.len().min(100)]);
+        let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &stmt);
+        let turso_rows = limbo_exec_rows(&turso_conn, &stmt);
+        assert_rows_eq(&sqlite_rows, &turso_rows, &stmt, &ctx);
+        if i % 4 == 3 {
+            compare_query(
+                &sqlite_conn,
+                &turso_conn,
+                "SELECT COUNT(*), SUM(LENGTH(b)) FROM test",
+                &ctx,
+            );
+        }
+    }
+
+    // After the writes both databases must hold identical content and each
+    // must still pass its own integrity check.
+    compare_query(
+        &sqlite_conn,
+        &turso_conn,
+        "SELECT k, b FROM test ORDER BY k",
+        &ctx,
+    );
+    for _ in 0..4 {
+        let (l, r) = random_range(rng, &known);
+        let query = format!("SELECT SUM(LENGTH(b)) FROM test WHERE k >= {l} AND k <= {r}");
+        compare_query(&sqlite_conn, &turso_conn, &query, &ctx);
+    }
+    let ok = vec![vec![rusqlite::types::Value::Text("ok".to_string())]];
+    let sqlite_check = sqlite_exec_rows(&sqlite_conn, "PRAGMA integrity_check");
+    assert_eq!(
+        sqlite_check, ok,
+        "{ctx}: sqlite integrity_check after writes"
+    );
+    let turso_check = limbo_exec_rows(&turso_conn, "PRAGMA integrity_check");
+    assert_eq!(turso_check, ok, "{ctx}: turso integrity_check after writes");
+}
+
 // TODO: currently fails with MVCC
 #[turso_macros::test]
 fn test_btree(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
-    let mut rng = ChaCha8Rng::seed_from_u64(0);
-    let opts = tmp_db.db_opts;
-    let flags = tmp_db.db_flags;
+    // Deterministic by default; set BTREE_TEST_SEED to explore other trees.
+    let seed = std::env::var("BTREE_TEST_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     for depth in 0..4 {
-        for attempt in 0..16 {
-            let db = TempDatabase::builder()
-                .with_flags(flags)
-                .with_opts(opts)
-                .with_init_sql("create table test (k INTEGER PRIMARY KEY, b BLOB);")
-                .build();
-            log::info!(
-                "depth: {}, attempt: {}, path: {:?}",
+        for attempt in 0..6 {
+            run_attempt(
+                &mut rng,
+                seed,
                 depth,
                 attempt,
-                db.path
+                tmp_db.db_opts,
+                tmp_db.db_flags,
             );
-
-            let mut generator = BTreeGenerator {
-                rng: &mut rng,
-                max_interior_keys: 3,
-                max_leaf_keys: 4096,
-                max_payload_size: 100,
-            };
-            let root = generator.generate_btree(depth, 0, i64::MAX as u64);
-            generator.write_btree(&db.path, &root, 2);
-
-            for _ in 0..16 {
-                let mut l = rng.next_u64() % (i64::MAX as u64);
-                let mut r = rng.next_u64() % (i64::MAX as u64);
-                if l > r {
-                    (l, r) = (r, l);
-                }
-
-                let query = format!("SELECT SUM(LENGTH(b)) FROM test WHERE k >= {l} AND k <= {r}");
-                let sqlite_sum = {
-                    let conn = rusqlite::Connection::open(&db.path).unwrap();
-                    sqlite_exec_rows(&conn, &query)
-                };
-                let limbo_sum = {
-                    let conn = db.connect_limbo();
-                    limbo_exec_rows(&conn, &query)
-                };
-                assert_eq!(
-                    limbo_sum, sqlite_sum,
-                    "query={query}, limbo={limbo_sum:?}, sqlite={sqlite_sum:?}"
-                );
-            }
         }
     }
 }
