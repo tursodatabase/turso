@@ -803,7 +803,7 @@ impl OrderConsumption {
 ///
 /// A `DESC` target on the seek column would need a reverse walk (`Last`/`Prev`
 /// plus `SeekLE`/`IdxLT`), which this access path does not emit, so we bail.
-fn in_seek_order_consumed(
+pub(super) fn in_seek_order_consumed(
     table_ref: &JoinedTable,
     index: Option<&Index>,
     seek_key_collation: Option<CollationSeq>,

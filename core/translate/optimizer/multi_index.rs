@@ -412,6 +412,9 @@ fn choose_multi_index_branch_access(
         params,
         in_seek_threshold,
         BranchReadMode::RowIdOnly,
+        // A multi-index branch only harvests rowids into a RowSet, so the order
+        // it visits them in buys the caller nothing.
+        None,
     )? {
         let Some(source) = in_seek_source_from_expr(
             &branch_terms[chosen_in_seek.constraint_idx].expr,

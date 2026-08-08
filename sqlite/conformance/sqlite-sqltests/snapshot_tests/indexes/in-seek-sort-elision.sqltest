@@ -46,6 +46,15 @@ setup text_schema {
     INSERT INTO t VALUES ('B', 1), ('a', 2), ('A', 3), ('b', 4);
 }
 
+# Two indexes to choose between: `t_w` answers the `w` equality more cheaply,
+# but only `t_kj` can drive an IN-seek that also delivers the ORDER BY order.
+setup two_index_schema {
+    CREATE TABLE t (k INTEGER, j INTEGER, w INTEGER, pad TEXT);
+    CREATE INDEX t_kj ON t (k, j);
+    CREATE INDEX t_w ON t (w);
+    INSERT INTO t VALUES (1, 10, 7, 'a'), (2, 20, 7, 'b'), (3, 30, 8, 'c'), (1, 11, 7, 'd');
+}
+
 # ══════════════════════════════════════════════════════════════════
 # Results: the rows must come out in the requested order
 # ══════════════════════════════════════════════════════════════════
@@ -303,4 +312,38 @@ snapshot-eqp eqp-order-by-other-collation-not-elided {
 @setup asc_schema
 snapshot-eqp eqp-in-seek-inner-loop-of-join-not-elided {
     SELECT o.id, t.k FROM o, t WHERE t.k IN (3, 1, 2) ORDER BY t.k, o.id;
+}
+
+# ══════════════════════════════════════════════════════════════════
+# An IN-seek that delivers the order is worth paying a little more for
+# ══════════════════════════════════════════════════════════════════
+#
+# These two differ only in the ORDER BY. Without it the cheaper `t_w` seek
+# wins. With it, the IN-seek on `t_kj` is allowed to cost up to the sort it
+# saves, so it wins instead and no sorter is emitted. If the pair ever
+# reports the same index, the ordering credit stopped reaching the IN-seek.
+
+@setup two_index_schema
+snapshot-eqp eqp-cheaper-unordered-index-wins-without-order-by {
+    SELECT k, j, pad FROM t
+    WHERE k IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20) AND w = 7;
+}
+
+@setup two_index_schema
+snapshot-eqp eqp-ordered-in-seek-wins-with-order-by {
+    SELECT k, j, pad FROM t
+    WHERE k IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20) AND w = 7
+    ORDER BY k, j;
+}
+
+@setup two_index_schema
+test ordered-in-seek-returns-the-same-rows {
+    SELECT k, j, pad FROM t
+    WHERE k IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20) AND w = 7
+    ORDER BY k, j;
+}
+expect {
+    1|10|a
+    1|11|d
+    2|20|b
 }

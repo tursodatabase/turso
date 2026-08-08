@@ -43,8 +43,8 @@ use super::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
     order::{
-        btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
-        EqualityPrefixScope, OrderTarget,
+        btree_access_order_consumed, in_seek_order_consumed, subquery_intrinsic_order_consumed,
+        ColumnTarget, EqualityPrefixScope, OrderTarget,
     },
     AvailableIndexes,
 };
@@ -181,6 +181,24 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) constraint_refs: Vec<RangeConstraintRef>,
     pub(super) base_row_count: RowCountEstimate,
     pub(super) cost: Cost,
+    /// Whether this candidate already emits the order target's order. An
+    /// alternative access path only saves a sort if this is false.
+    pub(super) is_ordered: bool,
+}
+
+/// What candidate scoring needs in order to tell whether an `InSeek` would save
+/// a sort. Absent when the caller has no order target, or when the result is
+/// consumed in an order the caller does not care about (multi-index branches
+/// only harvest rowids into a RowSet).
+pub(super) struct InSeekOrderContext<'a> {
+    pub(super) order_target: &'a OrderTarget,
+    pub(super) where_clause: &'a [WhereTerm],
+    pub(super) subqueries: &'a [NonFromClauseSubquery],
+    pub(super) schema: &'a Schema,
+    /// Whether the access path this `InSeek` would replace already emits the
+    /// target order. If it does, switching saves no sort and there is no bonus
+    /// to hand out.
+    pub(super) incumbent_is_ordered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +264,7 @@ pub(super) fn choose_best_btree_candidate(
         constraint_refs: vec![],
         base_row_count,
         cost: best_cost,
+        is_ordered: false,
     };
     let mut best_adjusted_output = f64::MAX;
     let mut best_is_ordered = false;
@@ -470,6 +489,7 @@ pub(super) fn choose_best_btree_candidate(
                 constraint_refs: usable_constraint_refs.clone(),
                 base_row_count: candidate_base_row_count,
                 cost,
+                is_ordered: is_index_ordered,
             };
         }
     }
@@ -535,6 +555,7 @@ pub(super) fn choose_best_in_seek_candidate(
     params: &CostModelParams,
     best_cost: Cost,
     read_mode: BranchReadMode,
+    order_ctx: Option<InSeekOrderContext<'_>>,
 ) -> Result<Option<ChosenInSeekCandidate>> {
     let Table::BTree(btree) = &rhs_table.table else {
         return Err(LimboError::InternalError(
@@ -552,6 +573,9 @@ pub(super) fn choose_best_in_seek_candidate(
     };
     let mut best_in_seek = None;
     let mut best_in_seek_cost = best_cost;
+    let mut best_in_seek_is_ordered = order_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.incumbent_is_ordered);
 
     for candidate in rhs_constraints.candidates.iter() {
         let first_col_pos = candidate
@@ -633,9 +657,41 @@ pub(super) fn choose_best_in_seek_candidate(
                 rows_per_seek,
                 params,
             );
-            if in_cost >= best_in_seek_cost {
+
+            // Rows this loop emits per outer row, which is how big a sorter on
+            // top of it would be. Same two factors `estimate_index_cost` uses.
+            let rows_out = (estimated_values * rows_per_seek).max(1.0);
+            let satisfies_order = order_ctx.as_ref().is_some_and(|ctx| {
+                let Some(where_term) = ctx.where_clause.get(constraint.where_clause_pos.0) else {
+                    return false;
+                };
+                let seek_key_collation =
+                    in_seek_key_collation(where_term, ctx.subqueries, candidate.index.as_deref());
+                in_seek_order_consumed(
+                    rhs_table,
+                    candidate.index.as_deref(),
+                    seek_key_collation,
+                    ctx.order_target,
+                    0,
+                    ctx.schema,
+                )
+                .consumed
+                    == ctx.order_target.columns.len()
+            });
+            // An `InSeek` that already delivers the target order lets a later
+            // sorter be dropped, so let it pay up to the sort it saves. Only
+            // claim that when the path it would replace is not already ordered
+            // -- swapping one ordered path for another saves nothing. Sorting
+            // is O(n log n) over the rows this loop emits.
+            let order_bonus = if satisfies_order && !best_in_seek_is_ordered {
+                Cost(rows_out * rows_out.max(1.0).log2() * params.sort_cpu_per_row)
+            } else {
+                Cost(0.0)
+            };
+            if in_cost >= best_in_seek_cost + order_bonus {
                 continue;
             }
+            best_in_seek_is_ordered = satisfies_order;
 
             let affinity = if let Some(col_pos) = constraint.table_col_pos {
                 btree
@@ -713,12 +769,16 @@ fn in_seek_key_collation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consider_in_seek_access_method(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     where_clause: &[WhereTerm],
     subqueries: &[NonFromClauseSubquery],
+    maybe_order_target: Option<&OrderTarget>,
+    incumbent_is_ordered: bool,
+    schema: &Schema,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -733,6 +793,13 @@ fn consider_in_seek_access_method(
         params,
         best_cost,
         BranchReadMode::FullRow,
+        maybe_order_target.map(|order_target| InSeekOrderContext {
+            order_target,
+            where_clause,
+            subqueries,
+            schema,
+            incumbent_is_ordered,
+        }),
     )?
     .map(|chosen| {
         let seek_key_collation = where_clause
@@ -891,6 +958,7 @@ fn find_best_access_method_for_btree(
     .expect("btree candidate selection must always consider the rowid candidate");
 
     let access_base_row_count = best.base_row_count;
+    let best_is_ordered = best.is_ordered;
     let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
         *access_base_row_count
     } else {
@@ -967,6 +1035,9 @@ fn find_best_access_method_for_btree(
             &lhs_mask,
             where_clause,
             subqueries,
+            maybe_order_target,
+            best_is_ordered,
+            schema,
             input_cardinality,
             base_row_count,
             params,
