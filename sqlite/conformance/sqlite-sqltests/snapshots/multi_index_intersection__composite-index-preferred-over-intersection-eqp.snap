@@ -10,4 +10,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH t USING INDEX idx_ab (a=? AND b=?)
+`--SEARCH t USING COVERING INDEX idx_ab (a=? AND b=?)

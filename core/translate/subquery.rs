@@ -1420,7 +1420,7 @@ pub fn emit_from_clause_subqueries(
                     match scan {
                         Scan::BTreeTable { index, .. } => {
                             if let Some(index) = index {
-                                if table_reference.utilizes_covering_index() {
+                                if table_reference.scan_skips_table_cursor() {
                                     format!("SCAN {table_name} USING COVERING INDEX {}", index.name)
                                 } else {
                                     format!("SCAN {table_name} USING INDEX {}", index.name)
@@ -1436,40 +1436,47 @@ pub fn emit_from_clause_subqueries(
                         }
                     }
                 }
-                Operation::Search(search) => match search {
-                    Search::RowidEq { .. }
-                    | Search::Seek { index: None, .. }
-                    | Search::InSeek { index: None, .. } => {
-                        format!(
-                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
-                            table_reference.identifier
-                        )
+                Operation::Search(search) => {
+                    let index_kind = if table_reference.scan_skips_table_cursor() {
+                        "COVERING INDEX"
+                    } else {
+                        "INDEX"
+                    };
+                    match search {
+                        Search::RowidEq { .. }
+                        | Search::Seek { index: None, .. }
+                        | Search::InSeek { index: None, .. } => {
+                            format!(
+                                "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
+                                table_reference.identifier
+                            )
+                        }
+                        Search::Seek {
+                            index: Some(index),
+                            seek_def,
+                        } => {
+                            let constraints =
+                                super::display::seek_constraint_annotation(index, seek_def);
+                            format!(
+                                "SEARCH {} USING {index_kind} {}{constraints}{left_join_suffix}",
+                                table_reference.identifier, index.name
+                            )
+                        }
+                        Search::InSeek {
+                            index: Some(index), ..
+                        } => {
+                            let constraint = if let Some(col) = index.columns.first() {
+                                format!(" ({}=?)", col.name)
+                            } else {
+                                String::new()
+                            };
+                            format!(
+                                "SEARCH {} USING {index_kind} {}{constraint}{left_join_suffix}",
+                                table_reference.identifier, index.name
+                            )
+                        }
                     }
-                    Search::Seek {
-                        index: Some(index),
-                        seek_def,
-                    } => {
-                        let constraints =
-                            super::display::seek_constraint_annotation(index, seek_def);
-                        format!(
-                            "SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
-                            table_reference.identifier, index.name
-                        )
-                    }
-                    Search::InSeek {
-                        index: Some(index), ..
-                    } => {
-                        let constraint = if let Some(col) = index.columns.first() {
-                            format!(" ({}=?)", col.name)
-                        } else {
-                            String::new()
-                        };
-                        format!(
-                            "SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
-                            table_reference.identifier, index.name
-                        )
-                    }
-                },
+                }
                 Operation::IndexMethodQuery(query) => {
                     let index_method = query.index.index_method.as_ref().unwrap();
                     format!(

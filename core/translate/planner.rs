@@ -1821,6 +1821,7 @@ fn parse_table(
                     col_used_mask: ColumnUsedMask::default(),
                     column_use_counts: Vec::new(),
                     expression_index_usages: Vec::new(),
+                    partial_index_predicate_usages: Vec::new(),
                     database_id,
                     indexed: None,
                 });
@@ -1857,6 +1858,7 @@ fn parse_table(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id,
             indexed,
         });
@@ -1967,6 +1969,7 @@ fn parse_table(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
+            partial_index_predicate_usages: Vec::new(),
             database_id,
             indexed: None,
         });
@@ -1991,6 +1994,7 @@ fn parse_table(
                     col_used_mask: ColumnUsedMask::default(),
                     column_use_counts: Vec::new(),
                     expression_index_usages: Vec::new(),
+                    partial_index_predicate_usages: Vec::new(),
                     database_id,
                     indexed: None,
                 });

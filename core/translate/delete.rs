@@ -211,6 +211,7 @@ pub fn prepare_delete_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
+        partial_index_predicate_usages: Vec::new(),
         database_id,
         indexed,
     }];

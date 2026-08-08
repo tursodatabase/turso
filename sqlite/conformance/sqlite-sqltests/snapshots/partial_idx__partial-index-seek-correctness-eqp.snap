@@ -10,4 +10,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH samples USING INDEX samples_pidx (name=?)
+`--SEARCH samples USING COVERING INDEX samples_pidx (name=?)

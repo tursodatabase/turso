@@ -176,6 +176,7 @@ pub fn emit_program_for_update(
                 col_used_mask: Default::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
+                partial_index_predicate_usages: Vec::new(),
                 database_id: MAIN_DB_ID,
                 indexed: None,
             }],

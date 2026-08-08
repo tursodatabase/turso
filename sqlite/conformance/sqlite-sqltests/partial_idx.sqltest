@@ -1164,7 +1164,7 @@ test plan-partial-index-and-where-eq-seek {
         WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'foo';
 }
 expect {
-    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+    1|0|0|SEARCH samples USING COVERING INDEX samples_pidx (name=?)
 }
 
 @skip-if sqlite "query plan explanation output is different in sqlite"
@@ -1176,7 +1176,7 @@ test plan-partial-index-and-where-reversed-order {
         WHERE attack_score IS NOT NULL AND library_id IS NULL AND name = 'foo';
 }
 expect {
-    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+    1|0|0|SEARCH samples USING COVERING INDEX samples_pidx (name=?)
 }
 
 # Partial index WHERE uses qualified column references; query references the same columns unqualified.
@@ -1190,7 +1190,7 @@ test plan-partial-index-qualified-where-matches {
         WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'foo';
 }
 expect {
-    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+    1|0|0|SEARCH samples USING COVERING INDEX samples_pidx (name=?)
 }
 
 # Partial index drives a full scan when the query WHERE matches the index
@@ -1204,7 +1204,7 @@ test plan-partial-index-full-scan-when-where-matched {
         WHERE library_id IS NULL AND attack_score IS NOT NULL;
 }
 expect {
-    1|0|0|SCAN samples USING INDEX samples_user_processed_idx
+    1|0|0|SCAN samples USING COVERING INDEX samples_user_processed_idx
 }
 
 # Partial index must NOT be used when the query only satisfies a subset of the
@@ -1229,7 +1229,7 @@ test plan-partial-index-equality-predicate {
         SELECT id FROM products WHERE status = 'active' AND sku = 'X';
 }
 expect {
-    1|0|0|SEARCH products USING INDEX idx_active_sku (sku=?)
+    1|0|0|SEARCH products USING COVERING INDEX idx_active_sku (sku=?)
 }
 
 # Partial index with range predicate in WHERE.
@@ -1240,7 +1240,7 @@ test plan-partial-index-range-predicate {
     EXPLAIN QUERY PLAN SELECT id FROM products WHERE price > 100 AND sku = 'X';
 }
 expect {
-    1|0|0|SEARCH products USING INDEX idx_expensive (sku=?)
+    1|0|0|SEARCH products USING COVERING INDEX idx_expensive (sku=?)
 }
 
 # Partial index whose WHERE predicate is *not* implied by the query → fallback
@@ -1549,4 +1549,102 @@ test partial-index-qualified-where-update-with-cte-named-like-target {
 }
 expect {
     5|1
+}
+
+@cross-check-integrity
+test partial-index-predicate-column-only-in-where {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX t_live ON t (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO t VALUES (1, 10, 1, NULL), (2, 20, 2, 'gone'), (3, 30, 3, NULL), (4, 40, 4, 'gone'), (5, 50, 5, NULL);
+    SELECT id, seq, owner FROM t WHERE removed_at IS NULL AND seq > 10 AND seq < 50 ORDER BY seq;
+}
+expect {
+    3|30|3
+}
+
+@cross-check-integrity
+test partial-index-predicate-column-also-selected {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX t_live ON t (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO t VALUES (1, 10, 1, NULL), (2, 20, 2, 'gone'), (3, 30, 3, NULL);
+    SELECT seq, owner, quote(removed_at) FROM t WHERE removed_at IS NULL AND seq > 5 ORDER BY seq;
+}
+expect {
+    10|1|NULL
+    30|3|NULL
+}
+
+@cross-check-integrity
+test partial-index-predicate-repeated-twice-in-where {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX t_live ON t (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO t VALUES (1, 10, 1, NULL), (2, 20, 2, 'gone'), (3, 30, 3, NULL);
+    SELECT seq, owner FROM t WHERE removed_at IS NULL AND removed_at IS NULL AND seq > 5 ORDER BY seq;
+}
+expect {
+    10|1
+    30|3
+}
+
+@cross-check-integrity
+test partial-index-predicate-column-in-a-leftover-filter {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX t_live ON t (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO t VALUES (1, 10, 1, NULL), (2, 20, 2, 'gone'), (3, 30, 3, NULL);
+    SELECT seq, owner FROM t WHERE removed_at IS NULL AND (removed_at IS NULL OR seq > 25) AND seq > 5 ORDER BY seq;
+}
+expect {
+    10|1
+    30|3
+}
+
+@cross-check-integrity
+test partial-index-predicate-with-multiple-conjuncts {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, tag TEXT, removed_at TEXT);
+    CREATE INDEX t_live_a ON t (seq, owner) WHERE removed_at IS NULL AND tag = 'a';
+    INSERT INTO t VALUES (1, 10, 1, 'a', NULL), (2, 20, 2, 'b', NULL), (3, 30, 3, 'a', 'gone'), (4, 40, 4, 'a', NULL);
+    SELECT seq, owner FROM t WHERE removed_at IS NULL AND tag = 'a' AND seq > 5 ORDER BY seq;
+}
+expect {
+    10|1
+    40|4
+}
+
+@cross-check-integrity
+test partial-index-predicate-on-outer-join-right-side {
+    CREATE TABLE l (id INTEGER PRIMARY KEY, seq INTEGER);
+    CREATE TABLE r (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX r_live ON r (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO l VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO r VALUES (1, 10, 100, NULL), (2, 20, 200, 'gone');
+    SELECT l.seq, r.owner, quote(r.removed_at) FROM l LEFT JOIN r ON r.seq = l.seq AND r.removed_at IS NULL ORDER BY l.seq;
+}
+expect {
+    10|100|NULL
+    20||NULL
+    30||NULL
+}
+
+@cross-check-integrity
+test partial-index-predicate-column-used-by-order-by {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX t_live ON t (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO t VALUES (1, 10, 1, NULL), (2, 20, 2, NULL), (3, 30, 3, NULL);
+    SELECT seq, owner FROM t WHERE removed_at IS NULL AND seq > 5 ORDER BY removed_at, seq DESC;
+}
+expect {
+    30|3
+    20|2
+    10|1
+}
+
+@cross-check-integrity
+test partial-index-predicate-column-used-by-an-aggregate {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, seq INTEGER, owner INTEGER, removed_at TEXT);
+    CREATE INDEX t_live ON t (seq, owner) WHERE removed_at IS NULL;
+    INSERT INTO t VALUES (1, 10, 1, NULL), (2, 20, 2, 'gone'), (3, 30, 3, NULL);
+    SELECT count(*), count(removed_at) FROM t WHERE removed_at IS NULL;
+}
+expect {
+    2|0
 }
