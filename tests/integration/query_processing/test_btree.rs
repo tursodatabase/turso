@@ -18,10 +18,13 @@
 //! every query with either rows or an error: no panic, no crash, no hang.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    panic::AssertUnwindSafe,
     path::Path,
     rc::Rc,
-    sync::Arc,
+    sync::{mpsc, Arc, Mutex, Once, OnceLock},
+    thread::{self, ThreadId},
+    time::Duration,
 };
 
 use rand::{seq::SliceRandom, RngCore, SeedableRng};
@@ -992,11 +995,71 @@ fn run_attempt(
     assert_eq!(turso_check, ok, "{ctx}: turso integrity_check after writes");
 }
 
-/// Corrupt-mode attempt: generate a tree, corrupt it while serializing, then
-/// throw read queries at turso. Every query may return rows or an error; the
-/// only failure is a panic, crash or hang inside turso.
-fn run_corrupt_attempt(
-    rng: &mut ChaCha8Rng,
+/// Name given to every worker thread that drives a corrupt attempt, so the
+/// panic hook can tell our intentional panics apart from everyone else's.
+const CORRUPT_THREAD: &str = "btree-corrupt-worker";
+/// A single corrupt attempt must finish within this budget; overrunning it is
+/// treated as a hang (a bug), not as a slow machine.
+const CORRUPT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Thread-local scratch where the panic hook stashes the source location of
+/// the panic, keyed by thread, so the worker can read it back after
+/// `catch_unwind` (the unwind payload carries the message but not the location).
+fn panic_locations() -> &'static Mutex<HashMap<ThreadId, String>> {
+    static MAP: OnceLock<Mutex<HashMap<ThreadId, String>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Install (once) a panic hook that records the location of panics happening
+/// on our worker threads and swallows their output, while leaving panics from
+/// every other thread to the previous hook. Without this, each caught panic
+/// would dump a message and backtrace, drowning the final summary.
+fn install_corrupt_panic_hook() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let current = thread::current();
+            if current.name() == Some(CORRUPT_THREAD) {
+                let location = info
+                    .location()
+                    .map(|l| format!("{}:{}", l.file(), l.line()))
+                    .unwrap_or_else(|| "unknown".to_string());
+                panic_locations()
+                    .lock()
+                    .unwrap()
+                    .insert(current.id(), location);
+            } else {
+                previous(info);
+            }
+        }));
+    });
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// What happened when we threw queries at one corrupt file.
+enum AttemptOutcome {
+    /// turso answered every query with rows or a clean error.
+    Clean,
+    /// turso panicked; a bug.
+    Panicked { location: String, message: String },
+    /// turso did not finish within the budget; a hang, also a bug.
+    Hung,
+}
+
+/// Build one corrupt file and run a fixed battery of read queries against it.
+/// Returns the number of queries turso rejected with an error (expected and
+/// fine). Panics propagate to the caller's `catch_unwind`.
+fn corrupt_attempt_body(
     seed: u64,
     depth: usize,
     attempt: usize,
@@ -1004,8 +1067,14 @@ fn run_corrupt_attempt(
     opts: turso_core::DatabaseOpts,
     flags: OpenFlags,
 ) {
+    // Derive an independent, reproducible rng for this attempt.
+    let attempt_seed = seed
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add((depth as u64) << 32)
+        .wrapping_add(attempt as u64);
+    let mut rng = ChaCha8Rng::seed_from_u64(attempt_seed);
+
     let page_size = PAGE_SIZES[rng.next_u32() as usize % PAGE_SIZES.len()];
-    let ctx = format!("seed={seed} depth={depth} attempt={attempt} page_size={page_size}");
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("btree-corrupt.db");
 
@@ -1020,7 +1089,7 @@ fn run_corrupt_attempt(
 
     let max_interior_keys = 2 + rng.next_u32() as usize % 5;
     let mut generator = BTreeGenerator {
-        rng,
+        rng: &mut rng,
         page_size,
         max_interior_keys,
         max_leaf_keys: 4096,
@@ -1029,15 +1098,10 @@ fn run_corrupt_attempt(
     };
     let root = generator.generate_btree(depth, 0, MAX_ROWID);
     generator.write_btree(&db_path, &root, 2);
-    let corruptions = std::mem::take(&mut generator.corruptions);
 
     let mut known = Vec::new();
     collect_rowids(&root, &mut known);
     known.sort_unstable();
-
-    for corruption in &corruptions {
-        log::debug!("{ctx}: corrupted {corruption}");
-    }
 
     let db = TempDatabase::builder()
         .with_db_path(&db_path)
@@ -1051,13 +1115,13 @@ fn run_corrupt_attempt(
         "SELECT k, b FROM test ORDER BY k".to_string(),
     ];
     for _ in 0..6 {
-        let (l, r) = random_range(rng, &known);
+        let (l, r) = random_range(&mut rng, &known);
         queries.push(format!(
             "SELECT SUM(LENGTH(b)) FROM test WHERE k >= {l} AND k <= {r}"
         ));
     }
     for _ in 0..2 {
-        let (l, r) = random_range(rng, &known);
+        let (l, r) = random_range(&mut rng, &known);
         for order in ["ASC", "DESC"] {
             queries.push(format!(
                 "SELECT k, b FROM test WHERE k >= {l} AND k <= {r} ORDER BY k {order} LIMIT 32"
@@ -1073,47 +1137,139 @@ fn run_corrupt_attempt(
         queries.push(format!("SELECT b FROM test WHERE k = {k}"));
     }
 
-    let (mut ok_count, mut err_count) = (0, 0);
+    // A clean error is fine; only a panic (unwinds out of here) or a hang
+    // (caught by the caller's timeout) counts as a bug.
     for query in &queries {
-        match limbo_exec_rows_fallible(&db, &conn, query) {
-            Ok(_) => ok_count += 1,
-            Err(err) => {
-                err_count += 1;
-                log::debug!("{ctx}: `{query}` -> {err}");
-            }
-        }
+        let _ = limbo_exec_rows_fallible(&db, &conn, query);
     }
-    log::info!(
-        "{ctx}: {} corruptions, {ok_count} queries ok, {err_count} queries failed",
-        corruptions.len()
-    );
 }
 
-fn run_corruption_test(tmp_db: TempDatabase, profile: CorruptionProfile) {
-    let _ = env_logger::try_init();
+/// Run one corrupt attempt on a worker thread bounded by a timeout, so a hang
+/// becomes an observable outcome instead of stalling the suite.
+fn run_corrupt_attempt(
+    seed: u64,
+    depth: usize,
+    attempt: usize,
+    profile: CorruptionProfile,
+    opts: turso_core::DatabaseOpts,
+    flags: OpenFlags,
+) -> AttemptOutcome {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name(CORRUPT_THREAD.to_string())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                corrupt_attempt_body(seed, depth, attempt, profile, opts, flags)
+            }));
+            let outcome = match result {
+                Ok(()) => AttemptOutcome::Clean,
+                Err(payload) => {
+                    let location = panic_locations()
+                        .lock()
+                        .unwrap()
+                        .remove(&thread::current().id())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    AttemptOutcome::Panicked {
+                        location,
+                        message: panic_message(&*payload),
+                    }
+                }
+            };
+            let _ = tx.send(outcome);
+        })
+        .expect("spawn corrupt worker");
+
+    // If the worker hangs we abandon it (std threads can't be killed); it dies
+    // with the process. The test is going to fail and exit anyway.
+    match rx.recv_timeout(CORRUPT_ATTEMPT_TIMEOUT) {
+        Ok(outcome) => outcome,
+        Err(_) => AttemptOutcome::Hung,
+    }
+}
+
+/// A distinct bug turso exhibited on corrupt input, plus one example of the
+/// attempt that triggered it so it can be reproduced.
+struct CorruptBug {
+    location: String,
+    message: String,
+    example: String,
+}
+
+fn run_corruption_test(profile_name: &str, profile: CorruptionProfile) {
+    install_corrupt_panic_hook();
     let seed = std::env::var("BTREE_TEST_SEED")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+    // Distinct bugs keyed by panic location (or "hang"); first trigger wins.
+    let mut bugs: BTreeMap<String, CorruptBug> = BTreeMap::new();
+    let (mut attempts, mut clean) = (0usize, 0usize);
     for depth in 0..4 {
         for attempt in 0..4 {
-            run_corrupt_attempt(
-                &mut rng,
+            attempts += 1;
+            let example = format!(
+                "BTREE_TEST_SEED={seed} profile={profile_name} depth={depth} attempt={attempt}"
+            );
+            match run_corrupt_attempt(
                 seed,
                 depth,
                 attempt,
                 profile,
-                tmp_db.db_opts,
-                tmp_db.db_flags,
-            );
+                default_corrupt_opts(),
+                OpenFlags::default(),
+            ) {
+                AttemptOutcome::Clean => clean += 1,
+                AttemptOutcome::Panicked { location, message } => {
+                    bugs.entry(location.clone()).or_insert(CorruptBug {
+                        location,
+                        message,
+                        example,
+                    });
+                }
+                AttemptOutcome::Hung => {
+                    bugs.entry("hang".to_string()).or_insert(CorruptBug {
+                        location: "hang".to_string(),
+                        message: format!("no result within {CORRUPT_ATTEMPT_TIMEOUT:?}"),
+                        example,
+                    });
+                }
+            }
         }
     }
+
+    if bugs.is_empty() {
+        return;
+    }
+
+    let mut report = format!(
+        "turso mishandled corrupt input in profile '{profile_name}': {}/{attempts} attempts clean, \
+         {} distinct crash/hang site(s):\n",
+        clean,
+        bugs.len()
+    );
+    for bug in bugs.values() {
+        report.push_str(&format!(
+            "  - {} :: {}\n      reproduce with: {}\n",
+            bug.location, bug.message, bug.example
+        ));
+    }
+    panic!("{report}");
+}
+
+/// Options matching what the `#[turso_macros::test]` harness builds, but usable
+/// off the macro (the corrupt attempts run on plain worker threads).
+fn default_corrupt_opts() -> turso_core::DatabaseOpts {
+    turso_core::DatabaseOpts::new()
+        .with_index_method(true)
+        .with_encryption(true)
+        .with_attach(true)
+        .with_generated_columns(true)
 }
 
 // TODO: currently fails with MVCC
 #[turso_macros::test]
-fn test_btree(tmp_db: TempDatabase) {
+fn test_btree_valid(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     // Deterministic by default; set BTREE_TEST_SEED to explore other trees.
     let seed = std::env::var("BTREE_TEST_SEED")
@@ -1135,10 +1291,13 @@ fn test_btree(tmp_db: TempDatabase) {
     }
 }
 
-#[turso_macros::test]
-fn test_btree_corrupt_off_by_one(tmp_db: TempDatabase) {
+// The corrupt variants run each attempt on a bounded worker thread (see
+// `run_corrupt_attempt`), so they are plain `#[test]`s rather than
+// `#[turso_macros::test]` and build their own databases.
+#[test]
+fn test_btree_corrupt_off_by_one() {
     run_corruption_test(
-        tmp_db,
+        "off_by_one",
         CorruptionProfile {
             off_by_one_permille: 10,
             ..CorruptionProfile::NONE
@@ -1146,10 +1305,10 @@ fn test_btree_corrupt_off_by_one(tmp_db: TempDatabase) {
     );
 }
 
-#[turso_macros::test]
-fn test_btree_corrupt_pointers(tmp_db: TempDatabase) {
+#[test]
+fn test_btree_corrupt_pointers() {
     run_corruption_test(
-        tmp_db,
+        "pointers",
         CorruptionProfile {
             bad_pointer_permille: 10,
             ..CorruptionProfile::NONE
@@ -1157,10 +1316,10 @@ fn test_btree_corrupt_pointers(tmp_db: TempDatabase) {
     );
 }
 
-#[turso_macros::test]
-fn test_btree_corrupt_garbage(tmp_db: TempDatabase) {
+#[test]
+fn test_btree_corrupt_garbage() {
     run_corruption_test(
-        tmp_db,
+        "garbage",
         CorruptionProfile {
             garbage_permille: 25,
             ..CorruptionProfile::NONE
@@ -1168,10 +1327,10 @@ fn test_btree_corrupt_garbage(tmp_db: TempDatabase) {
     );
 }
 
-#[turso_macros::test]
-fn test_btree_corrupt_mixed(tmp_db: TempDatabase) {
+#[test]
+fn test_btree_corrupt_mixed() {
     run_corruption_test(
-        tmp_db,
+        "mixed",
         CorruptionProfile {
             off_by_one_permille: 5,
             bad_pointer_permille: 5,
