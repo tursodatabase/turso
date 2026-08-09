@@ -61,6 +61,7 @@ pub(super) fn translate_in_list(
     let lhs_reg = program.alloc_registers(lhs_arity);
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let mut check_null_reg = 0;
+    let mut row_null_reg = 0;
     let label_ok = program.allocate_label();
 
     // Compute the affinity for the IN comparison based on the LHS expression
@@ -76,21 +77,30 @@ pub(super) fn translate_in_list(
             dest: check_null_reg,
         });
     }
+    if lhs_arity > 1 {
+        // Scratch register that tracks, per candidate row, whether every
+        // component compared so far was a genuine non-NULL match. Needed
+        // independently of check_null_reg: even when the caller collapses
+        // FALSE and NULL together (e.g. a plain WHERE filter), a candidate
+        // row with a NULL component that isn't otherwise disqualified must
+        // not be mistaken for a definite match.
+        row_null_reg = program.alloc_register();
+    }
 
     for (i, expr) in rhs.iter().enumerate() {
         let last_condition = i == rhs.len() - 1;
         let rhs_reg = program.alloc_registers(lhs_arity);
         let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
 
-        if check_null_reg != 0 && expr.can_be_null() {
-            program.emit_insn(Insn::BitAnd {
-                lhs: check_null_reg,
-                rhs: rhs_reg,
-                dest: check_null_reg,
-            });
-        }
-
         if lhs_arity == 1 {
+            if check_null_reg != 0 && expr.can_be_null() {
+                program.emit_insn(Insn::BitAnd {
+                    lhs: check_null_reg,
+                    rhs: rhs_reg,
+                    dest: check_null_reg,
+                });
+            }
+
             // Scalar comparison path
             if !last_condition
                 || condition_metadata.jump_target_when_false
@@ -124,61 +134,90 @@ pub(super) fn translate_in_list(
                     target_pc: condition_metadata.jump_target_when_false,
                 });
             }
-        } else {
-            // Row-valued comparison path: compare each component
-            if !last_condition
-                || condition_metadata.jump_target_when_false
-                    != condition_metadata.jump_target_when_null
-            {
-                // If all components match, jump to label_ok; otherwise skip to next RHS item
-                let skip_label = program.allocate_label();
-                for j in 0..lhs_arity {
-                    let (aff, collation) = row_component_affinity_collation(
-                        lhs,
-                        expr,
-                        j,
-                        referenced_tables,
-                        Some(resolver),
-                    )?;
-                    let flags = CmpInsFlags::default().with_affinity(aff);
-                    if j < lhs_arity - 1 {
-                        program.emit_insn(Insn::Ne {
-                            lhs: lhs_reg + j,
-                            rhs: rhs_reg + j,
-                            target_pc: skip_label,
-                            flags,
-                            collation,
-                        });
-                    } else {
-                        program.emit_insn(Insn::Eq {
-                            lhs: lhs_reg + j,
-                            rhs: rhs_reg + j,
-                            target_pc: label_ok,
-                            flags,
-                            collation,
-                        });
-                    }
-                }
-                program.preassign_label_to_next_insn(skip_label);
-            } else {
-                // Last condition, simple case: jump to false if any component doesn't match
-                for j in 0..lhs_arity {
-                    let (aff, collation) = row_component_affinity_collation(
-                        lhs,
-                        expr,
-                        j,
-                        referenced_tables,
-                        Some(resolver),
-                    )?;
-                    let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
-                    program.emit_insn(Insn::Ne {
-                        lhs: lhs_reg + j,
+        } else if !last_condition
+            || condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null
+        {
+            // Row-valued comparison path. SQL row equality is an AND across
+            // components, so a single non-NULL mismatch definitively
+            // disqualifies the row regardless of NULLs elsewhere in it
+            // (FALSE dominates NULL/UNKNOWN in three-valued AND) -- the Ne
+            // below jumps straight to skip_label for that case, short-
+            // circuiting before any later, irrelevant NULL component is
+            // even examined. If instead every component either matches
+            // exactly or involves a NULL, row_null_reg ends up NULL iff at
+            // least one of those components was actually NULL, in which
+            // case this row's contribution is "unknown" rather than a
+            // proven match.
+            let skip_label = program.allocate_label();
+            for j in 0..lhs_arity {
+                let (aff, collation) = row_component_affinity_collation(
+                    lhs,
+                    expr,
+                    j,
+                    referenced_tables,
+                    Some(resolver),
+                )?;
+                let flags = CmpInsFlags::default().with_affinity(aff);
+                program.emit_insn(Insn::Ne {
+                    lhs: lhs_reg + j,
+                    rhs: rhs_reg + j,
+                    target_pc: skip_label,
+                    flags,
+                    collation,
+                });
+                if j == 0 {
+                    program.emit_insn(Insn::BitAnd {
+                        lhs: lhs_reg,
+                        rhs: rhs_reg,
+                        dest: row_null_reg,
+                    });
+                } else {
+                    program.emit_insn(Insn::BitAnd {
+                        lhs: row_null_reg,
+                        rhs: lhs_reg + j,
+                        dest: row_null_reg,
+                    });
+                    program.emit_insn(Insn::BitAnd {
+                        lhs: row_null_reg,
                         rhs: rhs_reg + j,
-                        target_pc: condition_metadata.jump_target_when_false,
-                        flags,
-                        collation,
+                        dest: row_null_reg,
                     });
                 }
+            }
+            // Nothing jumped to skip_label: every component matched or was
+            // NULL-involved. If row_null_reg is still non-NULL, every
+            // component was a genuine non-NULL match, so this row is a
+            // definite TRUE.
+            program.emit_insn(Insn::NotNull {
+                reg: row_null_reg,
+                target_pc: label_ok,
+            });
+            if check_null_reg != 0 {
+                program.emit_insn(Insn::BitAnd {
+                    lhs: check_null_reg,
+                    rhs: row_null_reg,
+                    dest: check_null_reg,
+                });
+            }
+            program.preassign_label_to_next_insn(skip_label);
+        } else {
+            // Last condition, simple case: jump to false if any component doesn't match
+            for j in 0..lhs_arity {
+                let (aff, collation) = row_component_affinity_collation(
+                    lhs,
+                    expr,
+                    j,
+                    referenced_tables,
+                    Some(resolver),
+                )?;
+                let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
+                program.emit_insn(Insn::Ne {
+                    lhs: lhs_reg + j,
+                    rhs: rhs_reg + j,
+                    target_pc: condition_metadata.jump_target_when_false,
+                    flags,
+                    collation,
+                });
             }
         }
     }

@@ -161,3 +161,75 @@ expect {
     m5|-1
     m6|-1
 }
+
+# Regression tests for three-valued NULL handling in row-value IN/NOT IN
+# against a *literal list* (issue #8255). A NULL component that is not
+# otherwise disqualified by a definite mismatch elsewhere in the row must
+# make the comparison's result NULL, not silently coerce to TRUE/FALSE.
+
+setup null_component_schema {
+    CREATE TABLE w(a, b);
+    INSERT INTO w VALUES (NULL,1),(1,1),(2,NULL),(2,2);
+}
+
+@setup null_component_schema
+test row-value-in-literal-null-component-excludes-unknown-row {
+    SELECT a, b FROM w WHERE (a,b) IN ((1,1),(2,2)) ORDER BY 1,2;
+}
+expect {
+    1|1
+    2|2
+}
+
+@setup null_component_schema
+test row-value-not-in-literal-null-component-excludes-unknown-row {
+    SELECT a, b FROM w WHERE (a,b) NOT IN ((1,1),(2,2)) ORDER BY 1,2;
+}
+expect {
+}
+
+test row-value-in-null-component-first-position-is-null {
+    SELECT ((NULL,1) IN ((1,1))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-in-null-component-second-position-is-null {
+    SELECT ((2,NULL) IN ((2,2))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-not-in-null-component-is-null {
+    SELECT ((2,NULL) NOT IN ((2,2))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-in-three-columns-middle-null-is-null {
+    SELECT ((1,NULL,3) IN ((1,2,3))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-in-null-component-second-candidate-is-null {
+    SELECT ((NULL,1) IN ((9,9),(1,1))) IS NULL;
+}
+expect {
+    1
+}
+
+# A non-NULL component mismatch must still definitively disqualify a
+# candidate row, even when another component of the same row is NULL --
+# the result is FALSE, not NULL, because a proven mismatch dominates an
+# unrelated unknown.
+test row-value-in-null-component-already-disqualified-by-other-component {
+    SELECT (2,NULL) IN ((1,1));
+}
+expect {
+    0
+}
