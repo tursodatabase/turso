@@ -3138,8 +3138,6 @@ impl Pager {
 
                     wal.end_write_tx();
                     wal.end_read_tx();
-                    // we do not set TransactionState::None here - because caller can decide that nothing should be done for this connection
-                    // and skip next calls of the commit_tx methods after IO
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
@@ -3151,6 +3149,16 @@ impl Pager {
                         complete_commit();
                         self.clear_savepoints()?;
                         return Ok(IOResult::Done(()));
+                    }
+
+                    // The commit is durable and the WAL locks are released; only
+                    // the auto-checkpoint remains. Clear the transaction state now
+                    // so an abort during the checkpoint does not try to roll back
+                    // the committed transaction. Savepoints stay until the
+                    // checkpoint finishes: a re-entered RELEASE must still find
+                    // them (see release_named_savepoint).
+                    if update_transaction_state {
+                        connection.set_tx_state(TransactionState::None);
                     }
                 }
             }
