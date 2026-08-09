@@ -16,6 +16,11 @@
 //! lengths, pointers to wrong or nonexistent pages, garbage bytes. A corrupt
 //! file has no "right answer", so those tests only demand that turso answers
 //! every query with either rows or an error: no panic, no crash, no hang.
+//!
+//! Env knobs: `BTREE_TEST_SEED` picks the random seed; `BTREE_TEST_TARGET_SIZE`
+//! sets an approximate generated-database size (e.g. `512KB`, `500MB`, `2GB`,
+//! or a raw byte count), converted internally to a blob-length scale. Writing
+//! stays memory-bounded at any size; reads that pull whole blobs do not.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -32,7 +37,7 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::{Buffer, Completion, File, OpenFlags, PlatformIO, IO};
 use zerocopy::big_endian::{U16, U32, U64};
 
-use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
 
 /// Page sizes the generator picks from. 65536 is excluded: the format
 /// special-cases it (a 0 in two-byte header fields means 65536) and the
@@ -40,6 +45,10 @@ use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows,
 const PAGE_SIZES: &[usize] = &[512, 1024, 2048, 4096, 8192, 16384, 32768];
 /// Largest rowid the generator hands out (rowids are signed in SQL).
 const MAX_ROWID: u64 = i64::MAX as u64;
+/// Target size of the buffer the writer accumulates before flushing to disk,
+/// so large files cost a handful of big writes instead of one syscall per page
+/// while memory stays bounded (rounded down to whole pages at write time).
+const FLUSH_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Largest table-leaf payload stored fully in-page: usable - 35. The whole
 /// page is usable: the generator assumes no reserved space.
@@ -64,16 +73,35 @@ struct BTreeFreeBlock {
     size: u16,
 }
 
+/// An overflow chain, described rather than materialized: the blob bytes
+/// [blob_offset .. blob_offset + byte_len) come from `payload_byte(seed, ..)`,
+/// and the chain occupies `overflow_page_count` pages. Keeping this a plain
+/// descriptor (instead of a linked list of page nodes) is what bounds the
+/// generator's working set: the tree never holds the blob bytes, and there is
+/// no long node chain to recurse over or drop.
+#[derive(Debug)]
+pub struct OverflowRun {
+    seed: u64,
+    blob_offset: usize,
+    byte_len: usize,
+}
+
+impl OverflowRun {
+    fn page_count(&self, page_size: usize) -> u32 {
+        self.byte_len.div_ceil(page_size - 4) as u32
+    }
+}
+
 #[derive(Debug)]
 pub struct BTreeLeafCell {
     size: usize,
     rowid: u64,
     on_page_data: Vec<u8>,
-    overflow_page: Option<Rc<BTreePageData>>,
+    overflow: Option<OverflowRun>,
 }
 #[derive(Debug)]
 pub struct BTreeInteriorCell {
-    left_child_pointer: Rc<BTreePageData>,
+    left_child_pointer: Rc<BTreeTablePageData>,
     rowid: u64,
 }
 
@@ -91,72 +119,45 @@ impl BTreeCell {
                 (length_varint(cell.size as u64)
                     + length_varint(cell.rowid)
                     + cell.on_page_data.len()
-                    + cell.overflow_page.as_ref().map(|_| 4).unwrap_or(0)) as u16
+                    + cell.overflow.as_ref().map(|_| 4).unwrap_or(0)) as u16
             }
         }
     }
-}
-
-#[derive(Debug)]
-pub struct BTreeOverflowPageData {
-    next: Option<Rc<BTreePageData>>,
-    payload: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub struct BTreeTablePageData {
     page_type: BTreePageType,
     cell_content_area: u16,
-    cell_right_pointer: Option<Rc<BTreePageData>>,
+    cell_right_pointer: Option<Rc<BTreeTablePageData>>,
     fragmented_free_bytes: u8,
     cells: Vec<(u16, BTreeCell)>,
     free_blocks: Vec<BTreeFreeBlock>,
 }
 
-#[derive(Debug)]
-pub enum BTreePageData {
-    Table(BTreeTablePageData),
-    Overflow(BTreeOverflowPageData),
-}
-
-pub fn list_pages(root: &Rc<BTreePageData>, pages: &mut Vec<Rc<BTreePageData>>) {
+/// Collect the table pages (interior + leaf) in a stable pre-order. Recursion
+/// depth equals tree depth (bounded), never the overflow chain length.
+fn list_table_pages(root: &Rc<BTreeTablePageData>, pages: &mut Vec<Rc<BTreeTablePageData>>) {
     pages.push(root.clone());
-    match root.as_ref() {
-        BTreePageData::Table(root) => {
-            for (_, cell) in &root.cells {
-                match cell {
-                    BTreeCell::Interior(cell) => list_pages(&cell.left_child_pointer, pages),
-                    BTreeCell::Leaf(cell) => {
-                        let Some(overflow_page) = &cell.overflow_page else {
-                            continue;
-                        };
-                        list_pages(overflow_page, pages);
-                    }
-                }
-            }
-            if let Some(right) = &root.cell_right_pointer {
-                list_pages(right, pages);
-            }
+    for (_, cell) in &root.cells {
+        if let BTreeCell::Interior(cell) = cell {
+            list_table_pages(&cell.left_child_pointer, pages);
         }
-        BTreePageData::Overflow(root) => {
-            if let Some(next) = &root.next {
-                list_pages(next, pages);
-            }
-        }
+    }
+    if let Some(right) = &root.cell_right_pointer {
+        list_table_pages(right, pages);
     }
 }
 
-fn collect_rowids(root: &Rc<BTreePageData>, rowids: &mut Vec<u64>) {
-    if let BTreePageData::Table(page) = root.as_ref() {
-        for (_, cell) in &page.cells {
-            match cell {
-                BTreeCell::Interior(cell) => collect_rowids(&cell.left_child_pointer, rowids),
-                BTreeCell::Leaf(cell) => rowids.push(cell.rowid),
-            }
+fn collect_rowids(root: &Rc<BTreeTablePageData>, rowids: &mut Vec<u64>) {
+    for (_, cell) in &root.cells {
+        match cell {
+            BTreeCell::Interior(cell) => collect_rowids(&cell.left_child_pointer, rowids),
+            BTreeCell::Leaf(cell) => rowids.push(cell.rowid),
         }
-        if let Some(right) = &page.cell_right_pointer {
-            collect_rowids(right, rowids);
-        }
+    }
+    if let Some(right) = &root.cell_right_pointer {
+        collect_rowids(right, rowids);
     }
 }
 
@@ -211,33 +212,47 @@ fn write_u64_column(header: &mut Vec<u8>, data: &mut Vec<u8>, value: u64) {
     data.extend_from_slice(&U64::new(value).to_bytes());
 }
 
-fn write_blob_column(header: &mut Vec<u8>, data: &mut Vec<u8>, value: &[u8]) {
-    let mut buf = [0u8; 10];
-    let buf_len = write_varint(&mut buf, (value.len() * 2 + 12) as u64);
-    header.extend_from_slice(&buf[0..buf_len]);
-    data.extend_from_slice(value);
+/// Deterministic pseudo-random blob byte at a given index, derived purely from
+/// a per-cell seed. Lets a payload of any size be regenerated one slice at a
+/// time (at write) without ever holding the whole blob in memory (splitmix64).
+fn payload_byte(seed: u64, index: usize) -> u8 {
+    let mut x = seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (x ^ (x >> 31)) as u8
 }
 
-fn create_simple_record(value: u64, payload: &[u8], key_as_null: bool) -> Vec<u8> {
+fn fill_payload(seed: u64, start: usize, dst: &mut [u8]) {
+    for (i, byte) in dst.iter_mut().enumerate() {
+        *byte = payload_byte(seed, start + i);
+    }
+}
+
+/// Everything in a table-leaf record except the blob bytes: the header-length
+/// varint, the serial-type header, and the (fixed-size) rowid column. The blob
+/// bytes follow this prefix and are generated lazily via `payload_byte`.
+fn record_prefix(rowid: u64, blob_len: usize, key_as_null: bool) -> Vec<u8> {
     let mut header = Vec::new();
-    let mut data = Vec::new();
+    let mut key_data = Vec::new();
     if key_as_null {
         // SQLite itself stores NULL for an INTEGER PRIMARY KEY column and
         // substitutes the rowid on read. Storing the integer instead (the
         // else-branch) is a layout SQLite tolerates but never produces.
         header.push(0);
     } else {
-        write_u64_column(&mut header, &mut data, value);
+        write_u64_column(&mut header, &mut key_data, rowid);
     }
-    write_blob_column(&mut header, &mut data, payload);
+    let mut buf = [0u8; 10];
+    let buf_len = write_varint(&mut buf, (blob_len * 2 + 12) as u64);
+    header.extend_from_slice(&buf[0..buf_len]);
+
     let header_len = header.len() + 1;
     assert!(header_len <= 127);
-    let mut buf = [0u8; 10];
     let buf_len = write_varint(&mut buf, header_len as u64);
-    let mut result = buf[0..buf_len].to_vec();
-    result.extend_from_slice(&header);
-    result.extend_from_slice(&data);
-    result
+    let mut prefix = buf[0..buf_len].to_vec();
+    prefix.extend_from_slice(&header);
+    prefix.extend_from_slice(&key_data);
+    prefix
 }
 
 /// How many payload bytes stay on the leaf page; the rest go to overflow
@@ -256,30 +271,106 @@ fn leaf_local_size(payload_size: usize, page_size: usize) -> usize {
     }
 }
 
-fn build_overflow_chain(payload: &[u8], page_size: usize) -> Rc<BTreePageData> {
-    let mut next = None;
-    for chunk in payload.chunks(page_size - 4).rev() {
-        next = Some(Rc::new(BTreePageData::Overflow(BTreeOverflowPageData {
-            next,
-            payload: chunk.to_vec(),
-        })));
+/// Build a leaf cell for `rowid` carrying a blob of `blob_len` bytes derived
+/// from `blob_seed`. The local (in-page) portion is materialized (bounded by
+/// the page size); the overflow portion is a chain of pages that only remember
+/// which blob slice they cover, so the blob bytes never live in memory.
+fn build_leaf_cell(
+    rowid: u64,
+    blob_len: usize,
+    blob_seed: u64,
+    key_as_null: bool,
+    page_size: usize,
+) -> BTreeLeafCell {
+    let prefix = record_prefix(rowid, blob_len, key_as_null);
+    let total_size = prefix.len() + blob_len;
+    let local_size = leaf_local_size(total_size, page_size);
+
+    // Local bytes = record prefix followed by the first blob bytes.
+    let local_blob = local_size - prefix.len();
+    let mut on_page_data = prefix;
+    let start = on_page_data.len();
+    on_page_data.resize(local_size, 0);
+    fill_payload(blob_seed, 0, &mut on_page_data[start..]);
+
+    // The rest of the blob (if any) becomes an overflow descriptor, expanded to
+    // pages only at write time.
+    let overflow = (local_size < total_size).then(|| OverflowRun {
+        seed: blob_seed,
+        blob_offset: local_blob,
+        byte_len: blob_len - local_blob,
+    });
+
+    BTreeLeafCell {
+        size: total_size,
+        rowid,
+        on_page_data,
+        overflow,
     }
-    next.expect("overflow chain needs at least one page")
 }
 
-/// Payload sizes come in three classes: small (most rows), medium (fills
-/// pages with just a few cells, still mostly in-page) and large (straddles
-/// the in-page threshold, so most of these records need overflow chains).
-fn random_payload(rng: &mut ChaCha8Rng, page_size: usize) -> Vec<u8> {
+/// Rough size of a representative database at scale 1.0. Used only to turn a
+/// requested target size into a blob-length scale. The mapping is approximate:
+/// a run spans several depths, fanouts and page sizes, so individual attempts
+/// land above and below the target, and the largest (depth-3) attempts track it
+/// most closely.
+const REFERENCE_DB_BYTES: f64 = 1024.0 * 1024.0;
+
+/// Blob-length multiplier for this run. Set `BTREE_TEST_TARGET_SIZE` to an
+/// approximate database size (`512KB`, `500MB`, `2GB`, `2GiB`, or a raw byte
+/// count) and it is converted to a scale internally; unset means scale 1.0.
+/// Generation stays memory-bounded at any size, but queries that read whole
+/// blobs use more memory the larger the target.
+fn size_scale() -> f64 {
+    match env_target_bytes() {
+        Some(target) => (target as f64 / REFERENCE_DB_BYTES).max(f64::MIN_POSITIVE),
+        None => 1.0,
+    }
+}
+
+/// Parse `BTREE_TEST_TARGET_SIZE`. Accepts a raw byte count or a number with a
+/// K/M/G/T suffix (optionally `B`/`iB`); all suffixes are 1024-based.
+fn env_target_bytes() -> Option<u64> {
+    let raw = std::env::var("BTREE_TEST_TARGET_SIZE").ok()?;
+    let raw = raw.trim();
+    let digits_end = raw
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(raw.len());
+    let (num, suffix) = raw.split_at(digits_end);
+    let num: f64 = num.parse().ok()?;
+    let mult: f64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((num * mult) as u64)
+}
+
+/// Blob length classes: small (most rows), medium (fills pages with just a few
+/// cells, still mostly in-page) and large (straddles the in-page threshold, so
+/// most of these records spill into overflow chains). `scale` stretches every
+/// class so the generated file size can be dialed up (see `size_scale`).
+fn random_blob_len(rng: &mut ChaCha8Rng, page_size: usize, scale: f64) -> usize {
     let max_local = leaf_max_local(page_size);
     let class = rng.next_u32() % 100;
-    let len = if class < 60 {
+    let base = if class < 60 {
         rng.next_u32() as usize % 128
     } else if class < 85 {
         128 + rng.next_u32() as usize % (max_local - 128)
     } else {
         max_local.saturating_sub(page_size / 8) + rng.next_u32() as usize % (page_size * 3)
     };
+    (base as f64 * scale) as usize
+}
+
+/// Materialized random blob, for the SQL write phase where the bytes go into a
+/// statement rather than a generated page. Bounded by the query, not the file,
+/// so it is never scaled up.
+fn random_payload(rng: &mut ChaCha8Rng, page_size: usize) -> Vec<u8> {
+    let len = random_blob_len(rng, page_size, 1.0);
     let mut payload = vec![0u8; len];
     rng.fill_bytes(&mut payload);
     payload
@@ -317,6 +408,8 @@ struct BTreeGenerator<'a> {
     page_size: usize,
     max_interior_keys: usize,
     max_leaf_keys: usize,
+    /// Blob-length multiplier; see `size_scale`.
+    blob_scale: f64,
     profile: CorruptionProfile,
     /// Human-readable description of every corruption applied.
     corruptions: Vec<String>,
@@ -417,48 +510,39 @@ impl BTreeGenerator<'_> {
         ));
     }
 
-    pub fn create_page(
+    /// Serialize one page of an overflow chain. `page_no` is this page's number,
+    /// `next_page` the following page in the chain (0 if last), and the blob
+    /// slice is regenerated straight into the buffer from the run's seed.
+    fn create_overflow_page(
         &mut self,
         page_no: u32,
         max_page: u32,
-        page: &BTreePageData,
-        page_numbers: &HashMap<*const BTreePageData, u32>,
-    ) -> Vec<u8> {
-        match page {
-            BTreePageData::Table(page) => {
-                self.create_btree_page(page_no, max_page, page, page_numbers)
-            }
-            BTreePageData::Overflow(page) => {
-                self.create_overflow_page(page_no, max_page, page, page_numbers)
-            }
-        }
-    }
-    pub fn create_overflow_page(
-        &mut self,
-        page_no: u32,
-        max_page: u32,
-        page: &BTreeOverflowPageData,
-        page_numbers: &HashMap<*const BTreePageData, u32>,
+        next_page: u32,
+        run: &OverflowRun,
+        chunk_index: u32,
     ) -> Vec<u8> {
         let mut data = vec![255u8; self.page_size];
-        let first_4bytes = if let Some(next) = &page.next {
-            *page_numbers.get(&Rc::as_ptr(next)).unwrap()
-        } else {
-            0
-        };
-        let first_4bytes =
-            self.corrupt_page_pointer(page_no, "overflow next pointer", first_4bytes, max_page);
-        data[0..4].copy_from_slice(&U32::new(first_4bytes).to_bytes());
-        data[4..4 + page.payload.len()].copy_from_slice(&page.payload);
+        let next_page =
+            self.corrupt_page_pointer(page_no, "overflow next pointer", next_page, max_page);
+        data[0..4].copy_from_slice(&U32::new(next_page).to_bytes());
+        let start = chunk_index as usize * (self.page_size - 4);
+        let len = (run.byte_len - start).min(self.page_size - 4);
+        fill_payload(run.seed, run.blob_offset + start, &mut data[4..4 + len]);
         self.corrupt_garbage_region(page_no, &mut data);
         data
     }
-    pub fn create_btree_page(
+
+    /// Serialize a table page. `overflow_first` gives, per leaf cell that has an
+    /// overflow chain (in cell order), the page number where its chain starts;
+    /// `run_cursor` walks that slice as cells are visited.
+    fn create_btree_page(
         &mut self,
         page_no: u32,
         max_page: u32,
         page: &BTreeTablePageData,
-        page_numbers: &HashMap<*const BTreePageData, u32>,
+        page_numbers: &HashMap<*const BTreeTablePageData, u32>,
+        overflow_first: &[u32],
+        run_cursor: &mut usize,
     ) -> Vec<u8> {
         let mut data = vec![255u8; self.page_size];
 
@@ -534,16 +618,12 @@ impl BTreeGenerator<'_> {
                     p += write_varint(&mut data[p..], rowid);
                     data[p..p + cell.on_page_data.len()].copy_from_slice(&cell.on_page_data);
                     p += cell.on_page_data.len();
-                    if let Some(overflow_page) = &cell.overflow_page {
-                        let overflow_page = Rc::as_ptr(overflow_page);
-                        let overflow_page = *page_numbers.get(&overflow_page).unwrap();
-                        let overflow_page = self.corrupt_page_pointer(
-                            page_no,
-                            "overflow pointer",
-                            overflow_page,
-                            max_page,
-                        );
-                        data[p..p + 4].copy_from_slice(&U32::new(overflow_page).to_bytes());
+                    if cell.overflow.is_some() {
+                        let first = overflow_first[*run_cursor];
+                        *run_cursor += 1;
+                        let first =
+                            self.corrupt_page_pointer(page_no, "overflow pointer", first, max_page);
+                        data[p..p + 4].copy_from_slice(&U32::new(first).to_bytes());
                     }
                 }
             }
@@ -553,7 +633,7 @@ impl BTreeGenerator<'_> {
         data
     }
 
-    fn generate_btree(&mut self, depth: usize, mut l: u64, r: u64) -> Rc<BTreePageData> {
+    fn generate_btree(&mut self, depth: usize, mut l: u64, r: u64) -> Rc<BTreeTablePageData> {
         let mut cells = vec![];
         let cells_max_limit = if depth == 0 {
             self.max_leaf_keys
@@ -582,23 +662,16 @@ impl BTreeGenerator<'_> {
             it += 1;
 
             let cell = if depth == 0 {
-                let payload = random_payload(self.rng, self.page_size);
+                let blob_len = random_blob_len(self.rng, self.page_size, self.blob_scale);
                 let key_as_null = self.rng.next_u32() % 2 == 0;
-                let record = create_simple_record(rowid, &payload, key_as_null);
-                let total_size = record.len();
-                let local_size = leaf_local_size(total_size, self.page_size);
-                let (on_page_data, overflow_page) = if local_size < total_size {
-                    let chain = build_overflow_chain(&record[local_size..], self.page_size);
-                    (record[..local_size].to_vec(), Some(chain))
-                } else {
-                    (record, None)
-                };
-                BTreeCell::Leaf(BTreeLeafCell {
-                    size: total_size,
+                let blob_seed = self.rng.next_u64();
+                BTreeCell::Leaf(build_leaf_cell(
                     rowid,
-                    on_page_data,
-                    overflow_page,
-                })
+                    blob_len,
+                    blob_seed,
+                    key_as_null,
+                    self.page_size,
+                ))
             } else {
                 BTreeCell::Interior(BTreeInteriorCell {
                     left_child_pointer: self.generate_btree(depth - 1, l, rowid),
@@ -659,16 +732,16 @@ impl BTreeGenerator<'_> {
         free_blocks.sort_by_key(|x| x.offset);
 
         if depth == 0 {
-            Rc::new(BTreePageData::Table(BTreeTablePageData {
+            Rc::new(BTreeTablePageData {
                 page_type: BTreePageType::Leaf,
                 cell_content_area: content_offset,
                 cell_right_pointer: None,
                 fragmented_free_bytes: fragmented_free_bytes as u8,
                 cells,
                 free_blocks,
-            }))
+            })
         } else {
-            Rc::new(BTreePageData::Table(BTreeTablePageData {
+            Rc::new(BTreeTablePageData {
                 page_type: BTreePageType::Interior,
                 cell_content_area: content_offset,
                 cell_right_pointer: if l <= r {
@@ -679,31 +752,85 @@ impl BTreeGenerator<'_> {
                 fragmented_free_bytes: fragmented_free_bytes as u8,
                 cells,
                 free_blocks,
-            }))
+            })
         }
     }
 
-    fn write_btree(&mut self, path: &Path, root: &Rc<BTreePageData>, start_page: u32) {
-        let mut pages = Vec::new();
-        list_pages(root, &mut pages);
-        pages[1..].shuffle(&mut self.rng);
+    fn write_btree(&mut self, path: &Path, root: &Rc<BTreeTablePageData>, start_page: u32) {
+        // Only the table pages (interior + leaf) are materialized as nodes;
+        // there are few of them (bounded by depth and fanout). Overflow pages
+        // exist only as descriptors and are expanded to bytes at write time.
+        let mut table_pages = Vec::new();
+        list_table_pages(root, &mut table_pages);
+        table_pages[1..].shuffle(&mut self.rng);
+        let n_table = table_pages.len();
         let mut page_numbers = HashMap::default();
-        for (page, page_no) in pages.iter().zip(start_page..) {
+        for (page, page_no) in table_pages.iter().zip(start_page..) {
             page_numbers.insert(Rc::as_ptr(page), page_no);
         }
+
+        // Lay overflow chains out in contiguous page-number blocks that follow
+        // the table pages, in the order leaf cells are visited. `overflow_first`
+        // records each chain's starting page (for the leaf cell's pointer);
+        // `runs` records where to write the chain pages themselves.
+        let mut next_overflow = start_page + n_table as u32;
+        let mut overflow_first = Vec::new();
+        let mut runs: Vec<(u32, &OverflowRun)> = Vec::new();
+        for page in &table_pages {
+            for (_, cell) in &page.cells {
+                if let BTreeCell::Leaf(cell) = cell {
+                    if let Some(run) = &cell.overflow {
+                        overflow_first.push(next_overflow);
+                        runs.push((next_overflow, run));
+                        next_overflow += run.page_count(self.page_size);
+                    }
+                }
+            }
+        }
+        // Highest page number in use == total page count (numbers are 1-based
+        // and contiguous: page 1, then table pages, then overflow pages).
+        let total_pages = next_overflow - 1;
+        let max_page = total_pages;
 
         let io = PlatformIO::new().unwrap();
         let file = io
             .open_file(path.to_str().unwrap(), OpenFlags::None, true)
             .unwrap();
-
         assert_eq!(file.size().unwrap(), (self.page_size * 2) as u64);
-        let max_page = (1 + pages.len()) as u32;
-        for (i, page) in pages.iter().enumerate() {
-            let page = self.create_page(start_page + i as u32, max_page, page, &page_numbers);
-            write_at(&io, file.as_ref(), self.page_size * (i + 1), &page);
+
+        // Pages go to sequential offsets from `start_page` (page 2 onward), so
+        // a single chunk writer streams table pages then overflow pages in one
+        // increasing run. Page 1 (header + schema) was written by the sqlite
+        // bootstrap and is left untouched, except for the page-count field.
+        let base_offset = (start_page as usize - 1) * self.page_size;
+        let mut writer = ChunkWriter::new(&io, file.as_ref(), self.page_size, base_offset);
+
+        // Table pages, in page-number order (index i -> page start_page + i).
+        let mut run_cursor = 0usize;
+        for (i, page) in table_pages.iter().enumerate() {
+            let bytes = self.create_btree_page(
+                start_page + i as u32,
+                max_page,
+                page,
+                &page_numbers,
+                &overflow_first,
+                &mut run_cursor,
+            );
+            writer.push(&bytes);
         }
-        let mut size = (1 + pages.len()) as u32;
+        // Overflow chains, in the same order they were numbered above.
+        for (first, run) in &runs {
+            let count = run.page_count(self.page_size);
+            for j in 0..count {
+                let page_no = first + j;
+                let next_page = if j + 1 < count { page_no + 1 } else { 0 };
+                let bytes = self.create_overflow_page(page_no, max_page, next_page, run, j);
+                writer.push(&bytes);
+            }
+        }
+        writer.finish();
+
+        let mut size = total_pages;
         // The corrupt tests need at least one corruption even for tiny trees
         // where no per-field check fired; fall back to the header page count.
         if self.chance(self.profile.off_by_one_permille)
@@ -720,6 +847,60 @@ impl BTreeGenerator<'_> {
         }
         let size_bytes = U32::new(size).to_bytes();
         write_at(&io, file.as_ref(), 28, &size_bytes);
+    }
+}
+
+/// Accumulates serialized pages and flushes them to disk in bounded chunks
+/// (~`FLUSH_CHUNK_BYTES`), so a large file costs a handful of big sequential
+/// writes while the writer's memory stays capped regardless of file size.
+struct ChunkWriter<'a, F: File + ?Sized> {
+    io: &'a PlatformIO,
+    file: &'a F,
+    page_size: usize,
+    base_offset: usize,
+    pages_per_chunk: usize,
+    chunk: Vec<u8>,
+    /// Index (0-based, relative to base_offset) of the first page in `chunk`.
+    chunk_first_page: usize,
+    /// Total pages pushed so far.
+    pushed: usize,
+}
+
+impl<'a, F: File + ?Sized> ChunkWriter<'a, F> {
+    fn new(io: &'a PlatformIO, file: &'a F, page_size: usize, base_offset: usize) -> Self {
+        let pages_per_chunk = (FLUSH_CHUNK_BYTES / page_size).max(1);
+        Self {
+            io,
+            file,
+            page_size,
+            base_offset,
+            pages_per_chunk,
+            chunk: Vec::with_capacity(pages_per_chunk * page_size),
+            chunk_first_page: 0,
+            pushed: 0,
+        }
+    }
+
+    fn push(&mut self, page: &[u8]) {
+        self.chunk.extend_from_slice(page);
+        self.pushed += 1;
+        if self.chunk.len() >= self.pages_per_chunk * self.page_size {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.chunk.is_empty() {
+            return;
+        }
+        let offset = self.base_offset + self.chunk_first_page * self.page_size;
+        write_at(self.io, self.file, offset, &self.chunk);
+        self.chunk_first_page = self.pushed;
+        self.chunk.clear();
+    }
+
+    fn finish(&mut self) {
+        self.flush();
     }
 }
 
@@ -794,6 +975,85 @@ fn compare_query(
     let sqlite_rows = sqlite_exec_rows(sqlite_conn, query);
     let turso_rows = limbo_exec_rows(turso_conn, query);
     assert_rows_eq(&sqlite_rows, &turso_rows, query, ctx);
+}
+
+/// One turso row converted to the rusqlite value representation, so the two
+/// engines can be compared with a single owned row in flight at a time.
+fn turso_row_values(row: &turso_core::Row) -> Vec<rusqlite::types::Value> {
+    row.get_values()
+        .map(|x| match x {
+            turso_core::Value::Null => rusqlite::types::Value::Null,
+            turso_core::Value::Numeric(turso_core::Numeric::Integer(x)) => {
+                rusqlite::types::Value::Integer(*x)
+            }
+            turso_core::Value::Numeric(turso_core::Numeric::Float(x)) => {
+                rusqlite::types::Value::Real(f64::from(*x))
+            }
+            turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
+            turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+        })
+        .collect()
+}
+
+fn sqlite_row_values(row: &rusqlite::Row) -> Vec<rusqlite::types::Value> {
+    let mut values = Vec::new();
+    for i in 0.. {
+        match row.get::<_, rusqlite::types::Value>(i) {
+            Ok(value) => values.push(value),
+            Err(rusqlite::Error::InvalidColumnIndex(_)) => break,
+            Err(err) => panic!("unexpected rusqlite error: {err}"),
+        }
+    }
+    values
+}
+
+/// Compare a query's full result row-by-row in lockstep, without collecting
+/// either side into a `Vec`. Only one row from each engine is held at a time,
+/// so a full-table `SELECT k, b` scan stays bounded by the largest single row
+/// instead of the whole table. Use this for the big content scans; the small
+/// aggregate/point queries can keep using `compare_query`.
+fn compare_query_streaming(
+    sqlite_conn: &rusqlite::Connection,
+    turso_conn: &Arc<turso_core::Connection>,
+    query: &str,
+    ctx: &str,
+) {
+    let mut sqlite_stmt = sqlite_conn.prepare(query).unwrap();
+    let mut sqlite_rows = sqlite_stmt.query([]).unwrap();
+    let mut row_index = 0usize;
+
+    let mut turso_stmt = turso_conn.prepare(query).unwrap();
+    turso_stmt
+        .run_with_row_callback(|turso_row| {
+            let turso_values = turso_row_values(turso_row);
+            match sqlite_rows.next().unwrap() {
+                Some(sqlite_row) => {
+                    let sqlite_values = sqlite_row_values(sqlite_row);
+                    if sqlite_values != turso_values {
+                        panic!(
+                            "{ctx}: `{query}` diverged at row {row_index}:\n  sqlite: {}\n  turso:  {}",
+                            sqlite_values.iter().map(value_brief).collect::<Vec<_>>().join(", "),
+                            turso_values.iter().map(value_brief).collect::<Vec<_>>().join(", "),
+                        );
+                    }
+                }
+                None => panic!(
+                    "{ctx}: `{query}` diverged: turso produced row {row_index} but sqlite ended:\n  turso: {}",
+                    turso_values.iter().map(value_brief).collect::<Vec<_>>().join(", "),
+                ),
+            }
+            row_index += 1;
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{ctx}: `{query}` failed on turso: {e}"));
+
+    if let Some(sqlite_row) = sqlite_rows.next().unwrap() {
+        let sqlite_values = sqlite_row_values(sqlite_row);
+        panic!(
+            "{ctx}: `{query}` diverged: sqlite produced row {row_index} but turso ended:\n  sqlite: {}",
+            sqlite_values.iter().map(value_brief).collect::<Vec<_>>().join(", "),
+        );
+    }
 }
 
 /// Half the ranges are uniform over the whole keyspace (mostly wide), half
@@ -890,6 +1150,7 @@ fn run_attempt(
         page_size,
         max_interior_keys,
         max_leaf_keys: 4096,
+        blob_scale: size_scale(),
         profile: CorruptionProfile::NONE,
         corruptions: Vec::new(),
     };
@@ -922,8 +1183,10 @@ fn run_attempt(
     compare_query(&sqlite_conn, &turso_conn, "PRAGMA integrity_check", &ctx);
 
     // Read phase: full contents (walks every overflow chain), range scans in
-    // both directions, and point lookups on hits and misses.
-    compare_query(
+    // both directions, and point lookups on hits and misses. The full-content
+    // scan is compared streaming, so a large target size does not materialize
+    // the whole table on the harness side.
+    compare_query_streaming(
         &sqlite_conn,
         &turso_conn,
         "SELECT k, b FROM test ORDER BY k",
@@ -974,7 +1237,7 @@ fn run_attempt(
 
     // After the writes both databases must hold identical content and each
     // must still pass its own integrity check.
-    compare_query(
+    compare_query_streaming(
         &sqlite_conn,
         &turso_conn,
         "SELECT k, b FROM test ORDER BY k",
@@ -1093,6 +1356,7 @@ fn corrupt_attempt_body(
         page_size,
         max_interior_keys,
         max_leaf_keys: 4096,
+        blob_scale: size_scale(),
         profile,
         corruptions: Vec::new(),
     };
@@ -1138,10 +1402,22 @@ fn corrupt_attempt_body(
     }
 
     // A clean error is fine; only a panic (unwinds out of here) or a hang
-    // (caught by the caller's timeout) counts as a bug.
+    // (caught by the caller's timeout) counts as a bug. Rows are streamed and
+    // discarded so a large target size cannot exhaust the worker's memory.
     for query in &queries {
-        let _ = limbo_exec_rows_fallible(&db, &conn, query);
+        let _ = run_query_discard(&conn, query);
     }
+}
+
+/// Drive a query on turso and discard its rows without collecting them, so a
+/// huge result set does not blow up memory. Returns a clean SQL error as `Err`;
+/// panics and hangs propagate to the caller (catch_unwind / timeout).
+fn run_query_discard(
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Result<(), turso_core::LimboError> {
+    let mut stmt = conn.prepare(query)?;
+    stmt.run_with_row_callback(|_row| Ok(()))
 }
 
 /// Run one corrupt attempt on a worker thread bounded by a timeout, so a hang
