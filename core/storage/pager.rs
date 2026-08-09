@@ -228,6 +228,19 @@ impl PageInner {
         self.read_u8(BTREE_PAGE_TYPE).try_into()
     }
 
+    /// Read the `idx`-th entry of the cell-pointer array, bounds-checking the
+    /// slot against the page. `cell_count` is read off the page and cannot be
+    /// trusted, so this keeps a corrupt count (or an over-large index derived
+    /// from one) from indexing past the buffer. Returns the cell's start offset.
+    #[inline]
+    pub fn read_cell_pointer(&self, idx: usize) -> crate::Result<usize> {
+        let pos = self.header_size() + idx * CELL_PTR_SIZE_BYTES;
+        if self.offset() + pos + CELL_PTR_SIZE_BYTES > self.as_ptr().len() {
+            crate::bail_corrupt_error!("cell pointer {idx} lies past the end of the page");
+        }
+        Ok(self.read_u16(pos) as usize)
+    }
+
     /// Read a u16 from the page content at the given absolute offset (no db header offset).
     #[inline]
     pub fn read_u16_no_offset(&self, pos: usize) -> u16 {
@@ -382,9 +395,7 @@ impl PageInner {
             "cell_get: idx out of bounds",
             {"idx": idx, "ncells": ncells}
         );
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
 
         let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
         read_btree_cell(static_buf, self, cell_pointer, usable_size)
@@ -394,9 +405,7 @@ impl PageInner {
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
         let (rowid, _) = read_varint(crate::slice_in_bounds_or_corrupt!(
             buf,
@@ -412,9 +421,7 @@ impl PageInner {
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         crate::assert_or_bail_corrupt!(
             cell_pointer + 4 <= buf.len(),
             "cell pointer {} out of bounds for page size {}",
@@ -433,9 +440,7 @@ impl PageInner {
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         let mut pos = cell_pointer;
         let (_, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
         pos += nr;
@@ -458,9 +463,7 @@ impl PageInner {
         usable_size: usize,
     ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_offset = self.read_u16(cell_pointer) as usize;
+        let cell_offset = self.read_cell_pointer(idx)?;
 
         let page_type = self.page_type()?;
         let (payload_size, payload_start) = match page_type {
@@ -594,6 +597,17 @@ impl PageInner {
     ) -> crate::Result<(usize, usize)> {
         let buf = self.as_ptr();
         turso_assert_less_than!(idx, cell_count);
+        // `cell_count` is read from the page and can be corrupt, making the
+        // cell-pointer array claim to extend past the page. Bounds-check the
+        // pointer slot before reading it so a bogus count yields a corruption
+        // error instead of an out-of-bounds panic (this guards the cursor and
+        // integrity-check paths alike).
+        let cell_ptr_pos = self.cell_pointer_array_offset() + idx * CELL_PTR_SIZE_BYTES;
+        if cell_ptr_pos + CELL_PTR_SIZE_BYTES > buf.len() {
+            crate::bail_corrupt_error!(
+                "cell pointer {idx} is outside the page (cell count {cell_count} too large)"
+            );
+        }
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
             PageType::IndexInterior => {
@@ -3311,6 +3325,13 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
+        // Page numbers are 1-based; page 0 never names a real page. Internal
+        // code never asks for it, so a 0 here came from a page pointer read out
+        // of a corrupt database. Report corruption instead of tripping the
+        // `page_idx > 0` assertion deeper in the storage layer.
+        if page_idx == 0 {
+            crate::bail_corrupt_error!("attempted to read page 0 (corrupt page pointer)");
+        }
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
         #[cfg(test)]
         if self.spill_yield.should_yield_for(page_idx) {
