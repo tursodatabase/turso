@@ -1,0 +1,87 @@
+@database :memory:
+
+# A plain column with no COLLATE clause has default BINARY collation, and per
+# SQLite's multiSelectCollSeq the left arm's collation governs the compound
+# comparison whenever the left expression yields one at all. A left arm that is
+# an implicit-BINARY column must therefore NOT defer to the right arm's NOCASE;
+# only literals and function calls yield no collation and fall through
+# rightward. https://github.com/tursodatabase/turso/issues/8272
+#
+# All expected outputs verified against SQLite 3.50.
+
+setup schema {
+    CREATE TABLE q(x, y TEXT);
+    INSERT INTO q VALUES(1,'a'),(2,'B'),(NULL,'c'),('3','z');
+    CREATE TABLE p(x, y TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES(1,'A'),(2,'b'),(NULL,'C'),(3,NULL),(2,'B'),(1.0,'a');
+}
+
+@setup schema
+test intersect-left-implicit-binary-governs {
+    SELECT y FROM q INTERSECT SELECT y FROM p ORDER BY 1;
+}
+expect {
+    B
+    a
+}
+
+@setup schema
+test except-left-implicit-binary-governs {
+    SELECT y FROM q EXCEPT SELECT y FROM p ORDER BY 1;
+}
+expect {
+    c
+    z
+}
+
+@setup schema
+test union-left-implicit-binary-governs {
+    SELECT y FROM q WHERE y IS NOT NULL UNION SELECT y FROM p WHERE y IS NOT NULL ORDER BY 1;
+}
+expect {
+    A
+    B
+    C
+    a
+    b
+    c
+    z
+}
+
+@setup schema
+test union-all-order-by-left-implicit-binary-governs {
+    SELECT y FROM q WHERE y IS NOT NULL UNION ALL SELECT y FROM p WHERE y IS NOT NULL ORDER BY 1;
+}
+expect {
+    A
+    B
+    B
+    C
+    a
+    a
+    b
+    c
+    z
+}
+
+# Explicit COLLATE BINARY on the left must behave identically to the implicit
+# default -- this already worked and guards against over-correction.
+@setup schema
+test intersect-left-explicit-binary-parity {
+    SELECT y COLLATE BINARY FROM q INTERSECT SELECT y FROM p ORDER BY 1;
+}
+expect {
+    B
+    a
+}
+
+# A literal on the left yields no collation, so the right arm's NOCASE governs
+# and 'a'/'A' deduplicate to a single row -- SQLite parity for the
+# defer-rightward case.
+@setup schema
+test union-left-literal-defers-to-right-nocase {
+    SELECT count(*) FROM (SELECT 'a' UNION SELECT y FROM p WHERE y = 'A');
+}
+expect {
+    1
+}

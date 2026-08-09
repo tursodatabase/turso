@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::get_collseq_from_expr;
+use crate::translate::collate::{CollationSeq, get_expr_collation_ctx_with_symbols};
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
@@ -517,6 +517,35 @@ fn emit_compound_select(
     Ok(())
 }
 
+/// Resolve the collation for one result column of a compound select, per
+/// SQLite's `multiSelectCollSeq` rules: the left arm's collation wins whenever
+/// the left expression yields one at all. Crucially, a plain column reference
+/// yields its *default* BINARY collation (like `sqlite3ExprCollSeq`, which
+/// returns a non-NULL CollSeq for any column), so an implicit-BINARY column on
+/// the left must NOT defer to the right arm — only literals and function calls
+/// yield no collation and fall through rightward.
+fn compound_column_collation(
+    left_select: &SelectPlan,
+    right_select: &SelectPlan,
+    i: usize,
+) -> crate::Result<Option<CollationSeq>> {
+    let left_collation = get_expr_collation_ctx_with_symbols(
+        &left_select.result_columns[i].expr,
+        &left_select.table_references,
+        None,
+    )?
+    .map(|(collation, _)| collation);
+    if left_collation.is_some() {
+        return Ok(left_collation);
+    }
+    Ok(get_expr_collation_ctx_with_symbols(
+        &right_select.result_columns[i].expr,
+        &right_select.table_references,
+        None,
+    )?
+    .map(|(collation, _)| collation))
+}
+
 // Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
 fn create_dedupe_index(
     program: &mut ProgramBuilder,
@@ -537,21 +566,7 @@ fn create_dedupe_index(
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        // Left precedence
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
+        column.collation = compound_column_collation(left_select, right_select, i)?;
     }
 
     let dedupe_index = Arc::new(Index {
@@ -761,20 +776,7 @@ fn create_collection_index(
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
+        column.collation = compound_column_collation(left_select, right_select, i)?;
     }
 
     let index = Arc::new(Index {
