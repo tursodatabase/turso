@@ -3490,16 +3490,25 @@ impl Wal for WalFile {
             "frame_watermark must be <= than current WAL max_frame value"
         );
 
-        // we can guarantee correctness of the method, only if frame_watermark is strictly after the current checkpointed prefix
+        // A watermark-read is only correct while frame_watermark is at or after the
+        // checkpointed prefix: pages in WAL range [frame_watermark..nbackfills] have already
+        // been folded into the DB file, so the version at frame_watermark is no longer
+        // recoverable from the WAL.
         //
-        // if it's not, than pages from WAL range [frame_watermark..nBackfill] are already in the DB file,
-        // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page
+        // Unlike the `<= max_frame` check above (a future watermark IS a caller bug), this is
+        // NOT an invariant: a concurrent checkpoint can advance nbackfills past a watermark a
+        // sync revert-read is still holding. That is a recoverable race outcome, so surface it
+        // as a typed error the watermark-read wrapper turns into a skip, rather than aborting.
         let nbackfills = self.load_coordination_snapshot().nbackfills;
-        turso_assert!(
-            frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
-            "frame_watermark must be >= than current WAL backfill amount",
-            { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
-        );
+        match frame_watermark {
+            Some(w) if w < nbackfills => {
+                return Err(crate::LimboError::WatermarkBelowBackfill {
+                    frame_watermark: w,
+                    nbackfills,
+                });
+            }
+            _ => {}
+        }
 
         // if we are holding read_lock 0 and didn't write anything to the WAL, skip and read right from db file.
         //
@@ -6278,6 +6287,52 @@ pub mod test {
             wal_shared.read().metadata.nbackfills.load(Ordering::SeqCst),
             0,
             "SyncMode::Off must not publish positive nbackfills as durable shared state"
+        );
+    }
+
+    /// The stock free-threading crash, made deterministic and single-threaded: a sync
+    /// revert-read at a watermark a concurrent checkpoint has backfilled past must return a
+    /// recoverable error, not abort the worker. Capture watermark W, extend the WAL past it,
+    /// passive-checkpoint (no reader pinned) so nbackfills overruns W, then read at W. Before
+    /// the fix this tripped the `frame_watermark >= nbackfills` assert and panicked; now it
+    /// returns LimboError::WatermarkBelowBackfill, which the watermark-read wrapper turns into
+    /// a skip. Needs `conn_raw_api` (the Some(frame_watermark) read path).
+    #[test]
+    #[cfg(feature = "conn_raw_api")]
+    fn test_watermark_read_below_backfill_returns_error_not_panic() {
+        let (db, _path) = get_database();
+        let wal_shared = db.shared_wal.clone();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+
+        bulk_inserts(&conn, 2, 4);
+        let watermark = wal_shared.read().metadata.max_frame.load(Ordering::SeqCst);
+        assert!(watermark > 0, "need a positive watermark to read at");
+
+        bulk_inserts(&conn, 4, 8);
+        let pager = conn.pager.load();
+        let _ = run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        let nbackfills = wal_shared.read().metadata.nbackfills.load(Ordering::SeqCst);
+        assert!(
+            nbackfills > watermark,
+            "checkpoint must overrun the watermark for this repro (nbackfills={nbackfills}, watermark={watermark})"
+        );
+
+        let wal = pager.wal.as_ref().unwrap();
+        let result = wal.find_frame(2, Some(watermark));
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::WatermarkBelowBackfill { frame_watermark, nbackfills: nb })
+                    if frame_watermark == watermark && nb == nbackfills
+            ),
+            "expected graceful WatermarkBelowBackfill, got {result:?}"
         );
     }
 
