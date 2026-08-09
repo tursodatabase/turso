@@ -63,9 +63,11 @@ fn sql_argument_runtime_error_returns_nonzero() {
     assert_eq!(status.code(), Some(1));
 }
 
-/// A5: Fail-fast on runtime/step failure — statements after constraint violation do not execute
+/// A5: Runtime/step failure does NOT stop the rest of the line — matches
+/// sqlite3, unlike a prepare/parse failure (A3), which does.
+/// Regression test for https://github.com/tursodatabase/turso/issues/8256
 #[test]
-fn sql_argument_runtime_error_stops_execution() {
+fn sql_argument_runtime_error_does_not_stop_execution() {
     let sql = "create table t(x integer primary key); \
                insert into t values(1); \
                insert into t values(1); \
@@ -78,10 +80,83 @@ fn sql_argument_runtime_error_stops_execution() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains("after"),
-        "query after runtime error should not execute"
+        stdout.contains("after"),
+        "query after a runtime error on the same line should still execute, like sqlite3, stdout: {stdout}"
+    );
+    // The run still had an error, so the exit code must still be non-zero.
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A5b: The issue's own reproducer — an integer-overflow runtime error must
+/// not swallow the rest of the line.
+/// Regression test for https://github.com/tursodatabase/turso/issues/8256
+#[test]
+fn sql_argument_runtime_error_reproducer_from_issue_8256() {
+    let sql = "SELECT abs(-9223372036854775808); SELECT 'after';";
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .arg(sql)
+        .output()
+        .expect("failed to run tursodb");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("after"),
+        "query after the overflow error should still execute, stdout: {stdout}"
     );
     assert_eq!(output.status.code(), Some(1));
+}
+
+/// A5c: A single-line `BEGIN; ...; COMMIT;` must still reach COMMIT after an
+/// earlier statement fails at runtime -- the concrete consequence called out
+/// in issue #8256 (losing COMMIT silently rolls the transaction back on exit).
+#[test]
+fn sql_argument_runtime_error_mid_transaction_still_reaches_commit() {
+    let sql = "create table t(x integer primary key); \
+               begin; \
+               insert into t values(1); \
+               insert into t values(1); \
+               insert into t values(2); \
+               commit;";
+    let status = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .arg(sql)
+        .status()
+        .expect("failed to run tursodb");
+    assert_eq!(status.code(), Some(1));
+
+    // Re-open the same on-disk database and confirm the successful insert
+    // before the failed one was committed, not rolled back.
+    let db_path = std::env::temp_dir().join(format!(
+        "limbo_test_runtime_error_commit_{}.db",
+        std::process::id()
+    ));
+    std::fs::remove_file(&db_path).ok();
+
+    let setup_sql = "create table t(x integer primary key); \
+                      begin; \
+                      insert into t values(1); \
+                      insert into t values(1); \
+                      insert into t values(2); \
+                      commit;";
+    Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(&db_path)
+        .arg(setup_sql)
+        .status()
+        .expect("failed to run tursodb");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(&db_path)
+        .arg("select x from t order by x;")
+        .output()
+        .expect("failed to run tursodb");
+    std::fs::remove_file(&db_path).ok();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('1') && stdout.contains('2'),
+        "both successful inserts must have been committed, stdout: {stdout}"
+    );
 }
 
 /// A6: Syntax error returns non-zero

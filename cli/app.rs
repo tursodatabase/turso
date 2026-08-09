@@ -565,7 +565,6 @@ impl Limbo {
 
         let conn = self.conn.clone();
         let runner = conn.query_runner(input.as_bytes());
-        let had_error_before = self.had_query_error;
         let capture_stats = self.opts.stats;
         let mut last_stmt_metrics = None;
         for mut output in runner {
@@ -574,10 +573,18 @@ impl Limbo {
                     output = Err(err);
                 }
             }
+            // Only a prepare-time failure (this statement itself is malformed,
+            // surfaced as `output: Err(..)` and propagated by `?` out of
+            // print_query_result) aborts the remaining statements sharing this
+            // input line, matching sqlite3's CLI. A runtime error while
+            // stepping a successfully-prepared statement is handled inside
+            // print_query_result (which sets had_query_error and still
+            // returns Ok(())), and must not stop the rest of the line -- e.g.
+            // a single-line `BEGIN; ...; COMMIT;` must still reach COMMIT
+            // after an earlier statement fails at runtime.
             if self
                 .print_query_result(input, &mut output, stats.as_mut())
                 .is_err()
-                || self.had_query_error != had_error_before
             {
                 self.had_query_error = true;
                 break;
