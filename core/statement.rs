@@ -178,7 +178,7 @@ fn infer_expression_primitive(
     expr: &turso_parser::ast::Expr,
     referenced_tables: Option<&translate::plan::TableReferences>,
 ) -> Option<&'static str> {
-    use turso_parser::ast::{Expr, Operator};
+    use turso_parser::ast::{Expr, Operator, UnaryOperator};
 
     match expr {
         // Bare literal: read the parsed concrete value type.
@@ -195,11 +195,14 @@ fn infer_expression_primitive(
             infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
         }
         Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
-        Expr::Unary(_, inner) => {
-            // Unary +/-/NOT preserve the operand's primitive (NOT on INTEGER
-            // is still INTEGER in SQLite).
-            infer_expression_primitive(inner, referenced_tables)
-        }
+        Expr::Unary(op, inner) => match op {
+            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
+            UnaryOperator::Negative => Some(combine_arithmetic_primitive(
+                Some("INTEGER"),
+                infer_expression_primitive(inner, referenced_tables),
+            )),
+            UnaryOperator::Positive => infer_expression_primitive(inner, referenced_tables),
+        },
         Expr::Binary(left, op, right) => match op {
             // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
             // with REAL becomes REAL, fall through to NUMERIC otherwise.
