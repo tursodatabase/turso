@@ -1,0 +1,52 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/8254
+#
+# ALTER TABLE ... ADD COLUMN reconstructs the stored CREATE TABLE text from
+# the parsed schema, and the reconstruction dropped an explicit COLLATE from
+# existing columns -- CHECK, NOT NULL, DEFAULT, UNIQUE, PRIMARY KEY and
+# REFERENCES all already survived it. A column that loses its COLLATE
+# silently reverts to BINARY comparisons for every connection that opens the
+# database afterwards.
+#
+# Expected outputs verified against SQLite 3.50.
+
+@database :memory:
+
+test alter-add-column-preserves-collate-in-schema {
+    CREATE TABLE tbl(col1 TEXT COLLATE NOCASE);
+    ALTER TABLE tbl ADD COLUMN extra TEXT;
+    SELECT count(*) FROM sqlite_master WHERE name = 'tbl' AND sql LIKE '%col1 TEXT COLLATE NOCASE%';
+}
+expect {
+    1
+}
+
+test alter-add-column-collate-nocase-still-compares-case-insensitively {
+    CREATE TABLE tbl(col1 TEXT COLLATE NOCASE);
+    INSERT INTO tbl VALUES ('ABC');
+    ALTER TABLE tbl ADD COLUMN extra TEXT;
+    SELECT count(*) FROM tbl WHERE col1 = 'abc';
+}
+expect {
+    1
+}
+
+# Guard against over-correction: a column with no explicit COLLATE must not
+# gain a synthesized "COLLATE BINARY" after the rewrite.
+test alter-add-column-does-not-synthesize-collate-for-plain-column {
+    CREATE TABLE tbl(col1 TEXT);
+    ALTER TABLE tbl ADD COLUMN extra TEXT;
+    SELECT count(*) FROM sqlite_master WHERE name = 'tbl' AND sql LIKE '%COLLATE%';
+}
+expect {
+    0
+}
+
+# RTRIM collation alongside another column-level constraint, matching SQLite.
+test alter-add-column-preserves-collate-alongside-not-null {
+    CREATE TABLE t2(x TEXT COLLATE RTRIM NOT NULL, y INTEGER PRIMARY KEY);
+    ALTER TABLE t2 ADD COLUMN z TEXT DEFAULT 'd';
+    SELECT count(*) FROM sqlite_master WHERE name = 't2' AND sql LIKE '%x TEXT COLLATE RTRIM NOT NULL%';
+}
+expect {
+    1
+}

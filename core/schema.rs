@@ -3620,6 +3620,24 @@ impl BTreeTable {
                     sql.push_str("[]");
                 }
             }
+            // Only an explicit `COLLATE` in the column definition sets this
+            // (absence means the type's default collation applies), so this
+            // reconstructs exactly the clauses the user wrote -- never
+            // synthesizes a redundant "COLLATE BINARY" for a plain column.
+            // Custom collations can't reach here: they're rejected during
+            // CREATE TABLE parsing ("custom collations are not supported in
+            // schema definitions"), so only the three built-in sequences and
+            // locale collations are possible.
+            if let Some(collation) = column.collation_opt() {
+                let collation_name = match collation {
+                    CollationSeq::Binary => "BINARY".to_string(),
+                    CollationSeq::NoCase => "NOCASE".to_string(),
+                    CollationSeq::Rtrim => "RTRIM".to_string(),
+                    _ => collation.name(),
+                };
+                sql.push_str(" COLLATE ");
+                sql.push_str(&collation_name);
+            }
             if column.notnull()
                 && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
             {
