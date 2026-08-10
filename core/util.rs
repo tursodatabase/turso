@@ -130,6 +130,16 @@ pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")
 }
 
+/// Format a table reference for error messages the way SQLite does: the name
+/// as the user wrote it with quotes stripped, keeping any database prefix.
+/// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.
+pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
+    match &name.db_name {
+        Some(db) => format!("{}.{}", db.as_str(), name.name.as_str()),
+        None => name.name.as_str().to_owned(),
+    }
+}
+
 /// Quote a SQL identifier with double quotes when necessary.
 /// Always safe to call — returns the bare name when no quoting is needed.
 pub fn quote_identifier(name: &str) -> String {

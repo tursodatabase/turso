@@ -875,7 +875,8 @@ pub fn translate_alter_table(
 
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(table_name)) else {
         return Err(LimboError::ParseError(format!(
-            "no such table: {table_name}"
+            "no such table: {}",
+            crate::util::table_name_for_error(&qualified_name)
         )));
     };
     if let Some(tbl) = table.virtual_table() {
