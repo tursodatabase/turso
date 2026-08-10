@@ -940,12 +940,14 @@ async function loadSchema() {
 
 /* Examples */
 const EXAMPLES = [
+  ["Kitchen sink: CTE + EXISTS + subqueries + group/sort", "WITH big_spenders AS (\n  SELECT user_id, sum(amount) AS total\n  FROM orders GROUP BY user_id\n)\nSELECT c.name, count(*) AS n\nFROM users u\nJOIN cities c ON c.id = u.city_id\nLEFT JOIN orders o ON o.user_id = u.id\nWHERE u.age IN (SELECT age FROM users WHERE city_id = 3)\n  AND EXISTS (SELECT 1 FROM big_spenders s WHERE s.user_id = u.id)\n  AND u.id > (SELECT avg(user_id) FROM big_spenders)\nGROUP BY c.name\nORDER BY n DESC;"],
   ["Index search + left join + sort", "SELECT u.name, o.amount\nFROM users u\nLEFT JOIN orders o ON o.user_id = u.id\nWHERE u.age > 21\nORDER BY o.amount DESC;"],
   ["Shared CTE used twice", "WITH spenders AS (\n  SELECT user_id, sum(amount) AS total\n  FROM orders GROUP BY user_id\n)\nSELECT u.name, s1.total\nFROM users u\nJOIN spenders s1 ON s1.user_id = u.id\nJOIN spenders s2 ON s2.user_id = u.city_id;"],
   ["Coroutine subquery + group by", "SELECT city_id, avg(age)\nFROM (SELECT * FROM users WHERE age > 18)\nGROUP BY city_id\nORDER BY avg(age);"],
   ["UNION with sort", "SELECT name FROM users WHERE age > 30\nUNION\nSELECT name FROM cities\nORDER BY name;"],
   ["Correlated + IN subqueries", "SELECT u.name,\n  (SELECT count(*) FROM orders o WHERE o.user_id = u.id)\nFROM users u\nWHERE u.age IN (SELECT age FROM users WHERE city_id = 3);"],
   ["EXISTS (semi join)", "SELECT * FROM users u\nWHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);"],
+  ["Hash join (no usable index)", "SELECT u.name, s.device\nFROM users u\nJOIN sessions s ON s.session_key = 'sk_' || u.id\nJOIN events e ON e.session_key = s.session_key;"],
   ["Multi-index OR", "SELECT * FROM users WHERE id = 5 OR age = 30;"],
   ["Recursive CTE", "WITH RECURSIVE cnt(x) AS (\n  SELECT 1\n  UNION ALL\n  SELECT x + 1 FROM cnt WHERE x < 10\n)\nSELECT x FROM cnt;"],
   ["Window function", "SELECT name,\n  row_number() OVER (PARTITION BY city_id ORDER BY age)\nFROM users;"],
