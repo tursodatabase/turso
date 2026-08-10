@@ -3618,6 +3618,44 @@ mod tests {
     use super::*;
     use std::ptr;
 
+    /// sqlite3_errmsg must return the bare message SQLite produces — no
+    /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3
+    /// shell decoration, not part of the message.
+    #[test]
+    fn test_sqlite3_errmsg_constraint_failure_matches_sqlite() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE u(a UNIQUE); INSERT INTO u VALUES (1);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO u VALUES (1)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_CONSTRAINT);
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+            assert_eq!(msg, "UNIQUE constraint failed: u.a");
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
     #[test]
     fn test_sqlite3_stmt_status_rows_read_written() {
         unsafe {
