@@ -605,6 +605,8 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             return TCL_ERROR;
         }
 
+        bind_tcl_variables(interp, stmt);
+
         Tcl_Obj *result = Tcl_NewStringObj(null_str, -1);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             result = column_to_obj(stmt, 0, null_str);
@@ -629,6 +631,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             Tcl_SetResult(interp, (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
             return TCL_ERROR;
         }
+        bind_tcl_variables(interp, stmt);
         int exists = (sqlite3_step(stmt) == SQLITE_ROW) ? 1 : 0;
         sqlite3_finalize(stmt);
         Tcl_SetObjResult(interp, Tcl_NewBooleanObj(exists));

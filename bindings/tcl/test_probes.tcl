@@ -127,6 +127,24 @@ assert_eq "attached database is queryable" 42 [db eval {SELECT x FROM aux.t5}]
 assert_eq "DETACH is accepted" "" [db eval {DETACH aux}]
 
 # ---------------------------------------------------------------------------
+# Probe 6: TCL variable binding in [db one] and [db exists].
+# Both prepare their statement directly (bypassing the eval path), so they
+# must bind TCL variables themselves; without that, $var silently binds NULL
+# and the query returns an empty result.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE tv(x);}
+db eval {INSERT INTO tv VALUES (7), (8);}
+
+set want 7
+assert_eq "db one binds \$var from the caller scope" 7 \
+    [db one {SELECT x FROM tv WHERE x = $want}]
+assert_eq "db exists binds \$var from the caller scope" 1 \
+    [db exists {SELECT 1 FROM tv WHERE x = $want}]
+assert_eq "db exists is false for a non-matching \$var" 0 \
+    [db exists {SELECT 1 FROM tv WHERE x = $want + 100}]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
