@@ -764,7 +764,7 @@ impl<'a> Parser<'a> {
         let name = String::from_utf8_lossy(raw).into_owned();
         // Advance lexer past the closing `]`
         self.lexer.offset = start + end_pos + 1;
-        Ok(Name::exact(name))
+        Ok(Name::bracketed(name))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {

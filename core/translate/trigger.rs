@@ -151,7 +151,10 @@ pub fn translate_create_trigger(
         if if_not_exists {
             return Ok(());
         }
-        bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
+        bail_parse_error!(
+            "trigger {} already exists",
+            crate::util::identifier_token_for_error(&trigger_name.name)
+        );
     }
 
     // Verify the table exists (use the table's database, not the trigger's).

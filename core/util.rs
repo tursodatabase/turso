@@ -130,6 +130,17 @@ pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")
 }
 
+/// Format an identifier for error messages the way SQLite's `%T` does: the
+/// token exactly as the user wrote it, keeping the original quote characters.
+/// `CREATE TABLE "t"` reports an existing table as `table "t" already exists`.
+pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
+    if name.quoted() {
+        name.as_ident()
+    } else {
+        name.as_str().to_owned()
+    }
+}
+
 /// Format a table reference for error messages the way SQLite does: the name
 /// as the user wrote it with quotes stripped, keeping any database prefix.
 /// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.

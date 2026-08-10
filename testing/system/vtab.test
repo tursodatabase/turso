@@ -23,17 +23,17 @@ load_extension test_ext
 do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-1 {
     CREATE VIRTUAL TABLE t1 USING kv_store;
     CREATE VIRTUAL TABLE t1 USING kv_store;
-} {Table t1 already exists}
+} {table t1 already exists}
 
 do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-2 {
     CREATE TABLE t2 (col INTEGER);
     CREATE VIRTUAL TABLE t2 USING kv_store;
-} {Table t2 already exists}
+} {table t2 already exists}
 
 do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-3 {
     CREATE VIRTUAL TABLE t3 USING kv_store;
     CREATE TABLE t3 (col INTEGER);
-} {Table t3 already exists}
+} {table t3 already exists}
 
 do_execsql_test_on_specific_db {:memory:} create-virtual-table-if-not-exists-1 {
     CREATE TABLE t2 (col INTEGER);
