@@ -2194,9 +2194,18 @@ impl Program {
             tx_state,
         );
         if matches!(program_state.commit_state, CommitState::Committing) {
-            let TransactionState::Write { .. } = tx_state else {
-                unreachable!("invalid state for write commit step")
-            };
+            // Normally a resumed commit still has an open write transaction.
+            // The exception is the post-commit auto-checkpoint: commit_tx has
+            // already committed the WAL, released the locks and cleared the
+            // transaction state, and only the checkpoint is still in flight,
+            // so the state is None.
+            turso_assert!(
+                matches!(
+                    tx_state,
+                    TransactionState::Write { .. } | TransactionState::None
+                ),
+                "invalid state for write commit step: {tx_state:?}"
+            );
             self.step_end_write_txn(&pager, &connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
