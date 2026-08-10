@@ -734,7 +734,7 @@ fn target_matches_index_column(
         return false;
     }
     match (&target_col.target, &idx_col.expr) {
-        (ColumnTarget::Column(col_no), None) => idx_col.pos_in_table == *col_no,
+        (ColumnTarget::Column(col_no), _) => idx_col.pos_in_table == *col_no,
         (ColumnTarget::Expr(expr), Some(idx_expr)) => {
             let target_expr = unsafe { &**expr };
             if exprs_are_equivalent(target_expr, idx_expr) {
