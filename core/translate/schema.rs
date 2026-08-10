@@ -738,7 +738,7 @@ fn validate(
             let col_i = &columns[i];
             for constraint in &col_i.constraints {
                 match &constraint.constraint {
-                    ast::ColumnConstraint::Check(expr) => {
+                    ast::ColumnConstraint::Check { expr, .. } => {
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Generated { .. }
@@ -775,7 +775,7 @@ fn validate(
             }
         }
         for constraint in constraints {
-            if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
+            if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
                 validate_check_expr(expr, table_name, &column_names, resolver)?;
             }
         }
@@ -860,13 +860,13 @@ fn validate(
             let col_refs: Vec<&ast::ColumnDefinition> = columns.iter().collect();
             for col in columns {
                 for constraint in &col.constraints {
-                    if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                    if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
                         validate_check_types_in_expr(expr, &col_refs, resolver)?;
                     }
                 }
             }
             for constraint in constraints {
-                if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
+                if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
                     validate_check_types_in_expr(expr, &col_refs, resolver)?;
                 }
             }

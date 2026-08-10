@@ -1520,7 +1520,14 @@ pub enum ColumnConstraint {
     /// `UNIQUE`
     Unique(Option<ResolveType>),
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the AST was built programmatically.
+        source: Option<String>,
+    },
     /// `DEFAULT`
     Default(Box<Expr>),
     /// `COLLATE`
@@ -1587,7 +1594,14 @@ pub enum TableConstraint {
         conflict_clause: Option<ResolveType>,
     },
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the AST was built programmatically.
+        source: Option<String>,
+    },
     /// `FOREIGN KEY`
     ForeignKey {
         /// columns

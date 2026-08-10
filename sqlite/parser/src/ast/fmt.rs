@@ -1824,10 +1824,20 @@ impl ToTokens for ColumnConstraint {
                 }
                 Ok(())
             }
-            Self::Check(expr) => {
+            Self::Check { expr, source } => {
                 s.append(TK_CHECK, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens(s, context)?;
+                match source {
+                    // Emit the expression exactly as the user wrote it so the
+                    // spelling survives the canonical re-render (SQLite
+                    // reports failed CHECKs with this text). A comment cannot
+                    // be re-embedded safely: a line comment would swallow the
+                    // closing paren.
+                    Some(src) if !src.is_empty() && !src.contains("--") && !src.contains("/*") => {
+                        s.append(TK_ID, Some(src))?;
+                    }
+                    _ => expr.to_tokens(s, context)?,
+                }
                 s.append(TK_RP, None)
             }
             Self::Default(expr) => {
@@ -1924,10 +1934,20 @@ impl ToTokens for TableConstraint {
                 }
                 Ok(())
             }
-            Self::Check(expr) => {
+            Self::Check { expr, source } => {
                 s.append(TK_CHECK, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens(s, context)?;
+                match source {
+                    // Emit the expression exactly as the user wrote it so the
+                    // spelling survives the canonical re-render (SQLite
+                    // reports failed CHECKs with this text). A comment cannot
+                    // be re-embedded safely: a line comment would swallow the
+                    // closing paren.
+                    Some(src) if !src.is_empty() && !src.contains("--") && !src.contains("/*") => {
+                        s.append(TK_ID, Some(src))?;
+                    }
+                    _ => expr.to_tokens(s, context)?,
+                }
                 s.append(TK_RP, None)
             }
             Self::ForeignKey {

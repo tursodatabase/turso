@@ -3393,9 +3393,26 @@ impl<'a> Parser<'a> {
     fn parse_check_table_constraint(&mut self) -> Result<TableConstraint> {
         eat_assert!(self, TK_CHECK);
         eat_expect!(self, TK_LP);
+        let start = self.offset();
         let expr = self.parse_expr(0)?;
+        let source = self.check_constraint_source(start);
         eat_expect!(self, TK_RP);
-        Ok(TableConstraint::Check(expr))
+        Ok(TableConstraint::Check { expr, source })
+    }
+
+    /// The text between a CHECK constraint's parens exactly as the user wrote
+    /// it, whitespace-trimmed, the way SQLite keeps it for constraint error
+    /// messages. `start` is the offset right after the opening paren; the
+    /// expression must already be parsed so the closing paren is the peeked
+    /// token.
+    fn check_constraint_source(&self, start: usize) -> Option<String> {
+        let end = self.offset();
+        let raw = self.lexer.input.get(start..end)?;
+        let text = std::str::from_utf8(raw).ok()?;
+        Some(
+            text.trim_matches(|c: char| c.is_ascii_whitespace())
+                .to_owned(),
+        )
     }
 
     fn parse_foreign_key_table_constraint(&mut self) -> Result<TableConstraint> {
@@ -3931,9 +3948,11 @@ impl<'a> Parser<'a> {
     fn parse_check_column_constraint(&mut self) -> Result<ColumnConstraint> {
         eat_assert!(self, TK_CHECK);
         eat_expect!(self, TK_LP);
+        let start = self.offset();
         let expr = self.parse_expr(0)?;
+        let source = self.check_constraint_source(start);
         eat_expect!(self, TK_RP);
-        Ok(ColumnConstraint::Check(expr))
+        Ok(ColumnConstraint::Check { expr, source })
     }
 
     fn parse_ref_act(&mut self) -> Result<RefAct> {
@@ -10918,9 +10937,10 @@ mod tests {
                         constraints: vec![
                             NamedColumnConstraint {
                                 name: None,
-                                constraint: ColumnConstraint::Check(
-                                    Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                ),
+                                constraint: ColumnConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                     }),
@@ -10940,9 +10960,10 @@ mod tests {
                         constraints: vec![
                             NamedColumnConstraint {
                                 name: None,
-                                constraint: ColumnConstraint::Check(
-                                    Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                ),
+                                constraint: ColumnConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                     }),
@@ -11764,9 +11785,10 @@ mod tests {
                         constraints: vec![
                             NamedTableConstraint {
                                 name: None,
-                                constraint: TableConstraint::Check(Box::new(
-                                    Expr::Literal(Literal::Numeric("1".to_owned()))
-                                )),
+                                constraint: TableConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                         options: TableOptions::empty(),
@@ -11827,9 +11849,10 @@ mod tests {
                             },
                             NamedTableConstraint {
                                 name: None,
-                                constraint: TableConstraint::Check(Box::new(
-                                    Expr::Literal(Literal::Numeric("1".to_owned()))
-                                )),
+                                constraint: TableConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                         options: TableOptions::empty(),
