@@ -1545,6 +1545,9 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Shared CTEs materialized before the main query, for EXPLAIN QUERY PLAN
+    /// consumers. Empty outside EXPLAIN QUERY PLAN mode.
+    pub cte_materializations: Vec<crate::translate::eqp::EqpCteMaterialization>,
 }
 
 #[derive(Clone)]
@@ -1813,7 +1816,7 @@ impl Program {
             state.registers[1] =
                 Register::Value(Value::from_i64(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
             state.registers[2].set_int(0);
-            state.registers[3].set_value(Value::from_text(detail.clone()));
+            state.registers[3].set_value(Value::from_text(detail.to_string()));
             state.result_row = Some(Row {
                 values: &state.registers[0] as *const Register,
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),

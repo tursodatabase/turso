@@ -16,6 +16,7 @@ mod compound_select;
 pub(crate) mod delete;
 pub(crate) mod display;
 pub(crate) mod emitter;
+pub mod eqp;
 pub(crate) mod expr;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;

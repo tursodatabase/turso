@@ -4,13 +4,13 @@ use crate::{
     schema::{BTreeTable, ColumnLayout},
     sync::Arc,
     translate::{
-        display::format_eqp_detail,
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_program_for_select,
             get_triggers_including_temp, has_triggers_including_temp, init_limit, OperationMode,
             TriggerTime,
         },
+        eqp::eqp_detail_for_table_op,
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
@@ -225,7 +225,11 @@ pub fn emit_program_for_delete(
             .joined_tables()
             .first()
             .expect("DELETE always has one joined table");
-        emit_explain!(program, true, format_eqp_detail(table_ref));
+        emit_explain!(
+            program,
+            true,
+            eqp_detail_for_table_op(table_ref, None, None)
+        );
 
         // Set up main query execution loop
         OpenLoop::emit(

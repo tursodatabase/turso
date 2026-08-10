@@ -16,6 +16,7 @@ use crate::{
             emit_materialized_build_inputs, emit_program_for_select,
             emit_program_for_select_with_resolver, emit_query,
         },
+        eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
         expr::{
             compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
             WalkControl,
@@ -24,7 +25,7 @@ use crate::{
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
-            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryEvalPhase,
+            JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan, SubqueryEvalPhase,
             SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
@@ -42,7 +43,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
+    plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 
@@ -1292,6 +1293,7 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                         identifier = %table_reference.identifier,
                         "pre-materializing shared CTE"
                     );
+                    let insns_before_materialization = program.insn_count();
                     let (result_columns_start, cte_cursor_id, cte_table) =
                         emit_materialized_subquery_table(
                             program,
@@ -1299,6 +1301,11 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                             t_ctx,
                             &from_clause_subquery.columns,
                         )?;
+                    program.record_cte_materialization_eqp(
+                        cte_id,
+                        &from_clause_subquery.name,
+                        insns_before_materialization,
+                    );
                     program.register_materialized_cte(
                         cte_id,
                         MaterializedCteInfo {
@@ -1316,6 +1323,38 @@ fn pre_materialize_multi_ref_ctes_in_tables(
         }
     }
     Ok(())
+}
+
+/// Describe how a FROM-clause subquery reference will be executed, for
+/// EXPLAIN QUERY PLAN consumers. Returns None for plain tables.
+fn eqp_subquery_info(
+    program: &ProgramBuilder,
+    table_reference: &JoinedTable,
+    execution_mode: Option<&FromClauseSubqueryExecutionMode>,
+) -> Option<EqpSubquery> {
+    let Table::FromClauseSubquery(from_clause_subquery) = &table_reference.table else {
+        return None;
+    };
+    let cte_id = from_clause_subquery.cte_id();
+    let already_materialized = cte_id.is_some_and(|id| program.get_materialized_cte(id).is_some());
+    let exec = if already_materialized {
+        EqpSubqueryExec::MaterializedReuse
+    } else {
+        match execution_mode {
+            Some(FromClauseSubqueryExecutionMode::Coroutine) | None => EqpSubqueryExec::Coroutine,
+            Some(FromClauseSubqueryExecutionMode::MaterializedTable) => {
+                EqpSubqueryExec::Materialized
+            }
+            Some(FromClauseSubqueryExecutionMode::DirectMaterializedIndex(_)) => {
+                EqpSubqueryExec::IndexedMaterialized
+            }
+        }
+    };
+    Some(EqpSubquery {
+        exec,
+        cte_id,
+        recursive: matches!(from_clause_subquery.plan.as_ref(), Plan::RecursiveCte(_)),
+    })
 }
 
 fn choose_from_clause_subquery_execution_mode(
@@ -1363,7 +1402,7 @@ pub fn emit_from_clause_subqueries(
     join_order: &[JoinOrderMember],
 ) -> Result<()> {
     if tables.joined_tables().is_empty() {
-        emit_explain!(program, false, "SCAN CONSTANT ROW".to_owned());
+        emit_explain!(program, false, EqpDetail::ConstantRow);
     }
 
     // FIRST PASS: Pre-materialize all recursively reachable multi-ref / hinted CTEs
@@ -1396,132 +1435,34 @@ pub fn emit_from_clause_subqueries(
 
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
-        let left_join_suffix = if outer_table_set.get(table_index) {
-            " LEFT-JOIN"
-        } else {
-            ""
+        // Decide how a FROM-clause subquery will be executed before emitting the
+        // EXPLAIN QUERY PLAN node, so the node can describe the execution mode.
+        let execution_mode = match &table_reference.table {
+            Table::FromClauseSubquery(from_clause_subquery) => {
+                Some(choose_from_clause_subquery_execution_mode(
+                    &table_reference.op,
+                    from_clause_subquery.as_ref(),
+                ))
+            }
+            _ => None,
         };
+        let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode.as_ref());
         emit_explain!(
             program,
             true,
-            match &table_reference.op {
-                Operation::Scan(scan) => {
-                    let table_name =
-                        if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
-                        } else {
-                            format!(
-                                "{} AS {}",
-                                table_reference.table.get_name(),
-                                table_reference.identifier
-                            )
-                        };
-
-                    match scan {
-                        Scan::BTreeTable { index, .. } => {
-                            if let Some(index) = index {
-                                if table_reference.utilizes_covering_index() {
-                                    format!("SCAN {table_name} USING COVERING INDEX {}", index.name)
-                                } else {
-                                    format!("SCAN {table_name} USING INDEX {}", index.name)
-                                }
-                            } else {
-                                format!("SCAN {table_name}")
-                            }
-                        }
-                        Scan::VirtualTable { .. }
-                        | Scan::Subquery { .. }
-                        | Scan::RecursiveCteInput => {
-                            format!("SCAN {table_name}")
-                        }
-                    }
-                }
-                Operation::Search(search) => match search {
-                    Search::RowidEq { .. }
-                    | Search::Seek { index: None, .. }
-                    | Search::InSeek { index: None, .. } => {
-                        format!(
-                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
-                            table_reference.identifier
-                        )
-                    }
-                    Search::Seek {
-                        index: Some(index),
-                        seek_def,
-                    } => {
-                        let constraints =
-                            super::display::seek_constraint_annotation(index, seek_def);
-                        format!(
-                            "SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
-                            table_reference.identifier, index.name
-                        )
-                    }
-                    Search::InSeek {
-                        index: Some(index), ..
-                    } => {
-                        let constraint = if let Some(col) = index.columns.first() {
-                            format!(" ({}=?)", col.name)
-                        } else {
-                            String::new()
-                        };
-                        format!(
-                            "SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
-                            table_reference.identifier, index.name
-                        )
-                    }
-                },
-                Operation::IndexMethodQuery(query) => {
-                    let index_method = query.index.index_method.as_ref().unwrap();
-                    format!(
-                        "QUERY INDEX METHOD {}",
-                        index_method.definition().method_name
-                    )
-                }
-                Operation::HashJoin(_) => {
-                    let table_name =
-                        if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
-                        } else {
-                            format!(
-                                "{} AS {}",
-                                table_reference.table.get_name(),
-                                table_reference.identifier
-                            )
-                        };
-                    format!("HASH JOIN {table_name}")
-                }
-                Operation::MultiIndexScan(multi_idx) => {
-                    let index_names: Vec<&str> = multi_idx
-                        .branches
-                        .iter()
-                        .map(|b| {
-                            b.index
-                                .as_ref()
-                                .map(|i| i.name.as_str())
-                                .unwrap_or("PRIMARY KEY")
-                        })
-                        .collect();
-                    format!(
-                        "MULTI-INDEX {} {} ({})",
-                        match multi_idx.set_op {
-                            SetOperation::Union => "OR",
-                            SetOperation::Intersection { .. } => "AND",
-                        },
-                        table_reference.identifier,
-                        index_names.join(", ")
-                    )
-                }
-            }
+            eqp_detail_for_table_op(
+                table_reference,
+                EqpJoin::from_join_info(
+                    table_reference.join_info.as_ref(),
+                    outer_table_set.get(table_index),
+                ),
+                eqp_subquery,
+            )
         );
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
-            let execution_mode = {
-                let from_clause_subquery = from_clause_subquery.as_ref();
-                choose_from_clause_subquery_execution_mode(
-                    &table_reference.op,
-                    from_clause_subquery,
-                )
-            };
+            let execution_mode =
+                execution_mode.expect("execution mode was computed above for subquery tables");
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
             // Check if this is a CTE that's already materialized
             if let Some(cte_id) = from_clause_subquery.cte_id() {
@@ -1934,7 +1875,6 @@ pub fn emit_non_from_clause_subquery(
 ) -> Result<()> {
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
-        let correlated_prefix = if is_correlated { "CORRELATED " } else { "" };
         match query_type {
             SubqueryType::Exists { .. } => {
                 // EXISTS subqueries don't get a separate EQP annotation in SQLite;
@@ -1944,14 +1884,20 @@ pub fn emit_non_from_clause_subquery(
                 emit_explain!(
                     program,
                     true,
-                    format!("{correlated_prefix}LIST SUBQUERY {subquery_id}")
+                    EqpDetail::ListSubquery {
+                        id: subquery_id,
+                        correlated: is_correlated,
+                    }
                 );
             }
             SubqueryType::RowValue { .. } => {
                 emit_explain!(
                     program,
                     true,
-                    format!("{correlated_prefix}SCALAR SUBQUERY {subquery_id}")
+                    EqpDetail::ScalarSubquery {
+                        id: subquery_id,
+                        correlated: is_correlated,
+                    }
                 );
             }
         }

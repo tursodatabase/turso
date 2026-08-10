@@ -15,7 +15,6 @@ use crate::{
     },
     sync::Arc,
     translate::{
-        display::format_eqp_detail,
         emitter::{
             check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
@@ -23,6 +22,7 @@ use crate::{
             emit_index_column_value_old_image, emit_make_record, emit_program_for_select,
             init_limit, OperationMode, Resolver, UpdateRowSource,
         },
+        eqp::eqp_detail_for_table_op,
         expr::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
             emit_table_column, restore_returning_row_image_in_cache,
@@ -325,7 +325,11 @@ pub fn emit_program_for_update(
     // Emit EXPLAIN QUERY PLAN annotation (only for the direct path;
     // write-set UPDATE already emits EQP via emit_program_for_select).
     if !uses_write_set {
-        emit_explain!(program, true, format_eqp_detail(&plan.target_table));
+        emit_explain!(
+            program,
+            true,
+            eqp_detail_for_table_op(&plan.target_table, None, None)
+        );
     }
 
     // Open the main loop

@@ -27,6 +27,7 @@ turso_sdk_kit = { path = "../sdk-kit" }
 turso = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rusqlite.workspace = true
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 log = "0.4.22"
 assert_cmd = "^2"

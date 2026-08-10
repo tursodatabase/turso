@@ -10,6 +10,7 @@ use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     Resolver, TranslateCtx,
 };
+use crate::translate::eqp::EqpDetail;
 use crate::translate::plan::{Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey};
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
@@ -161,7 +162,7 @@ pub(crate) fn emit_recursive_cte(
         &recursive_cte.offset,
     )?;
 
-    emit_explain!(program, true, "SETUP".to_owned());
+    emit_explain!(program, true, EqpDetail::RecursiveSetup);
     emit_recursive_cte_query(program, resolver, &mut recursive_cte.initial_query)?;
     program.pop_current_parent_explain();
 
@@ -216,7 +217,7 @@ pub(crate) fn emit_recursive_cte(
     }
 
     program.preassign_label_to_next_insn(run_recursive_query);
-    emit_explain!(program, true, "RECURSIVE STEP".to_owned());
+    emit_explain!(program, true, EqpDetail::RecursiveStep);
     emit_recursive_cte_query(program, resolver, &mut recursive_cte.recursive_query)?;
     program.pop_current_parent_explain();
     program.emit_insn(Insn::Goto {

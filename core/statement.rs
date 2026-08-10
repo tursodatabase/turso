@@ -387,6 +387,16 @@ impl Statement {
         &self.program
     }
 
+    /// Machine-readable version of the EXPLAIN QUERY PLAN output, as JSON.
+    /// See [`crate::translate::eqp::program_plan_json`] for the shape.
+    ///
+    /// Returns None unless the statement was prepared as EXPLAIN QUERY PLAN.
+    /// Does not execute anything: the plan is fully known after preparation.
+    pub fn query_plan_json(&self) -> Option<String> {
+        (self.query_mode == QueryMode::ExplainQueryPlan)
+            .then(|| crate::translate::eqp::program_plan_json(&self.program))
+    }
+
     pub fn get_pager(&self) -> &Arc<Pager> {
         &self.pager
     }

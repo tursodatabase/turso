@@ -277,6 +277,9 @@ pub struct ProgramBuilder {
     next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
+    /// Shared CTEs materialized before the main query, for EXPLAIN QUERY PLAN
+    /// consumers. Empty outside EXPLAIN QUERY PLAN mode.
+    cte_materializations: Vec<crate::translate::eqp::EqpCteMaterialization>,
     /// Write-context for union-typed columns: tells `union_value('tag', val)`
     /// which union TypeDef to resolve the tag against.
     ///
@@ -576,7 +579,8 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid allocating a String if we are not in explain mode.
+/// because we want to avoid building the plan step data if we are not in
+/// explain mode.
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
@@ -697,6 +701,7 @@ impl ProgramBuilder {
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
+            cte_materializations: Vec::new(),
             target_union_type: None,
         }
     }
@@ -1229,19 +1234,50 @@ impl ProgramBuilder {
         self.query_mode
     }
 
-    /// use emit_explain macro instead, because we don't want to allocate
-    /// String if we are not in explain mode
-    pub fn emit_explain(&mut self, push: bool, detail: String) {
+    /// use emit_explain macro instead, because we don't want to build the
+    /// plan step data if we are not in explain mode
+    pub fn emit_explain(&mut self, push: bool, detail: crate::translate::eqp::EqpDetail) {
         if let QueryMode::ExplainQueryPlan = self.query_mode {
             self.emit_insn(Insn::Explain {
                 p1: self.insns.len(),
                 p2: self.current_parent_explain_idx,
-                detail,
+                detail: Box::new(detail),
             });
             if push {
                 self.current_parent_explain_idx = Some(self.insns.len() - 1);
             }
         }
+    }
+
+    /// Link the EXPLAIN QUERY PLAN nodes emitted since `insns_start` to a
+    /// shared CTE's materialization, so plan consumers can connect them to the
+    /// scans that later read the CTE. No-op outside EXPLAIN QUERY PLAN mode.
+    pub fn record_cte_materialization_eqp(
+        &mut self,
+        cte_id: usize,
+        name: &str,
+        insns_start: usize,
+    ) {
+        if !matches!(self.query_mode, QueryMode::ExplainQueryPlan) {
+            return;
+        }
+        let node_ids: Vec<usize> = (insns_start..self.insns.len())
+            .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
+            .collect();
+        if !node_ids.is_empty() {
+            self.cte_materializations
+                .push(crate::translate::eqp::EqpCteMaterialization {
+                    cte_id,
+                    name: name.to_string(),
+                    node_ids,
+                });
+        }
+    }
+
+    /// Number of instructions emitted so far. Pair with
+    /// [`Self::record_cte_materialization_eqp`] to bracket an emission range.
+    pub fn insn_count(&self) -> usize {
+        self.insns.len()
     }
 
     pub fn pop_current_parent_explain(&mut self) {
@@ -1334,6 +1370,12 @@ impl ProgramBuilder {
 
                 *p1 = i;
                 *p2 = new_p2;
+            }
+
+            for cte in self.cte_materializations.iter_mut() {
+                for node_id in cte.node_ids.iter_mut() {
+                    *node_id = old_to_new[*node_id];
+                }
             }
         }
     }
@@ -2121,6 +2163,7 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            cte_materializations: self.cte_materializations,
         };
         Ok(prepared)
     }

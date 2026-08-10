@@ -2436,7 +2436,7 @@ pub fn insn_to_row(
                 *p1 as i64,
                 p2.as_ref().map(|p| *p).unwrap_or(0) as i64,
                 0,
-                Value::build_text(detail.clone()),
+                Value::build_text(detail.to_string()),
                 0,
                 String::new(),
             ),
