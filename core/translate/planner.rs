@@ -602,7 +602,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 distinctness,
                             )?;
                         } else {
-                            crate::bail_parse_error!("misuse of window function: {}()", f);
+                            crate::bail_parse_error!("misuse of window function {}()", f);
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
@@ -689,7 +689,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 Distinctness::NonDistinct,
                             )?;
                         } else {
-                            crate::bail_parse_error!("misuse of window function: {}()", f);
+                            crate::bail_parse_error!("misuse of window function {}()", f);
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
@@ -864,7 +864,7 @@ fn link_with_window(
             AccumulatorFunc::Agg(f) => f.as_str().to_string(),
             AccumulatorFunc::Window(f) => f.to_string(),
         };
-        crate::bail_parse_error!("misuse of window function: {}()", func_name);
+        crate::bail_parse_error!("misuse of window function {}()", func_name);
     }
     Ok(())
 }
