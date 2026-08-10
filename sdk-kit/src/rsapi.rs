@@ -2114,7 +2114,7 @@ mod tests {
         match error {
             TursoError::Error(message) => assert_eq!(
                 message,
-                "Invalid argument supplied: external page codecs are not supported with experimental multiprocess WAL"
+                "external page codecs are not supported with experimental multiprocess WAL"
             ),
             error => panic!("expected multiprocess WAL rejection, got {error:?}"),
         }

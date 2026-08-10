@@ -5328,7 +5328,7 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "Invalid argument supplied: cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
+            "cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
         );
     }
 
