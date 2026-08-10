@@ -1913,7 +1913,8 @@ pub enum Insn {
     Explain {
         p1: usize,         // P1: address of instruction
         p2: Option<usize>, // P2: address of parent explain instruction
-        detail: String,    // P4: detail text
+        /// P4: structured plan step; its Display form is the detail text
+        detail: Box<crate::translate::eqp::EqpDetail>,
     },
     // Increment a "constraint counter" by P2 (P2 may be negative or positive).
     // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).
