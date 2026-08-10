@@ -168,3 +168,18 @@ test quote-ident-wrong-arity-errors {
     SELECT quote_ident();
 }
 expect error {}
+
+test pg-get-expr-  {
+    DROP TABLE IF EXISTS demo;
+    CREATE TABLE demo (id int DEFAULT 7, label text);
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef;
+}
+expect {
+    7
+}
+
+test pg-get-expr-null-expressions-is-null {
+    SELECT pg_get_expr(NULL, 1);
+}
+expect {
+}
