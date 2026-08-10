@@ -50,8 +50,8 @@ use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, 
 use super::sqlite3_ondisk::read_varint;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
-    FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
-    FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
+    FREELIST_TRUNK_HEADER_SIZE, FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR,
+    FREELIST_TRUNK_OFFSET_LEAF_COUNT, FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
 };
 use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
@@ -5214,7 +5214,16 @@ impl Pager {
                         None => return_if_io!(self.read_page(page_id as i64)),
                     };
                     page.get().overflow_cells.clear();
-                    header.freelist_pages = (header.freelist_pages.get() + 1).into();
+                    // A saturated count means the header's freelist count is
+                    // already corrupt (e.g. a prior underflow wrapped it); adding
+                    // to it would overflow, so surface corruption instead.
+                    let freelist_pages =
+                        header.freelist_pages.get().checked_add(1).ok_or_else(|| {
+                            LimboError::Corrupt(
+                                "freelist page count overflow while freeing a page".to_string(),
+                            )
+                        })?;
+                    header.freelist_pages = freelist_pages.into();
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
@@ -5480,6 +5489,18 @@ impl Pager {
                     }
 
                     let first_freelist_trunk_page_id = header.freelist_trunk_page.get();
+                    // The trunk pointer comes from the (possibly corrupt) db
+                    // header; a value outside [2, db_size] would send the walk
+                    // into the header page or past EOF, so reject it as corrupt
+                    // before following it (mirrors free_page's validation).
+                    if first_freelist_trunk_page_id != 0
+                        && (first_freelist_trunk_page_id < 2
+                            || first_freelist_trunk_page_id > header.database_size.get())
+                    {
+                        return Err(LimboError::Corrupt(format!(
+                            "freelist trunk page {first_freelist_trunk_page_id} out of range"
+                        )));
+                    }
                     if first_freelist_trunk_page_id == 0 {
                         *state = AllocatePageState::AllocateNewPage {
                             current_db_size: new_db_size,
@@ -5509,12 +5530,37 @@ impl Pager {
                     let number_of_freelist_leaves =
                         page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
 
+                    // The leaf count is read off a possibly-corrupt trunk page.
+                    // Bound it by how many pointers actually fit, otherwise the
+                    // leaf-array shift below would read/copy past the page.
+                    let max_leaves = (page_contents
+                        .as_ptr()
+                        .len()
+                        .saturating_sub(FREELIST_TRUNK_HEADER_SIZE)
+                        / FREELIST_LEAF_PTR_SIZE) as u32;
+                    if number_of_freelist_leaves > max_leaves {
+                        return Err(LimboError::Corrupt(format!(
+                            "freelist trunk page {} has invalid leaf count {number_of_freelist_leaves} (max {max_leaves})",
+                            trunk_page.get().id
+                        )));
+                    }
+
                     // There are leaf pointers on this trunk page, so we can reuse one of the pages
                     // for the allocation.
                     if number_of_freelist_leaves != 0 {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
+                        // A leaf pointer outside [2, db_size] would reuse the
+                        // header page or a nonexistent page as free space; the
+                        // former corrupts the cache (two pages, same id).
+                        if (next_leaf_page_id as usize) < 2
+                            || next_leaf_page_id > header.database_size.get()
+                        {
+                            return Err(LimboError::Corrupt(format!(
+                                "freelist leaf page {next_leaf_page_id} out of range"
+                            )));
+                        }
                         // Pin + state-advance happen only on `Done` so a
                         // spill yield doesn't double-pin the leaf page.
                         let (leaf_page, c) =
@@ -5544,7 +5590,16 @@ impl Pager {
                     // Reuse the trunk page itself (even if this is the last trunk).
                     // Update the database's first freelist trunk page to the next trunk page (may be 0 if there are no more trunk pages).
                     header.freelist_trunk_page = next_trunk_page_id.into();
-                    header.freelist_pages = (header.freelist_pages.get() - 1).into();
+                    // See the leaf-reuse path below: a zero count here means the
+                    // header's freelist is inconsistent with its trunk pointer.
+                    let freelist_pages =
+                        header.freelist_pages.get().checked_sub(1).ok_or_else(|| {
+                            LimboError::Corrupt(
+                                "freelist trunk consumed but header freelist count is 0"
+                                    .to_string(),
+                            )
+                        })?;
+                    header.freelist_pages = freelist_pages.into();
                     self.add_dirty(trunk_page)?;
                     // zero out the page
                     turso_assert!(
@@ -5620,7 +5675,16 @@ impl Pager {
                         remaining_leaves_count as u32,
                     );
 
-                    header.freelist_pages = (header.freelist_pages.get() - 1).into();
+                    // The count comes from the (possibly corrupt) db header; a
+                    // freelist with a trunk pointer but a zero page count is
+                    // inconsistent, so report corruption instead of underflowing.
+                    let freelist_pages =
+                        header.freelist_pages.get().checked_sub(1).ok_or_else(|| {
+                            LimboError::Corrupt(
+                                "freelist page consumed but header freelist count is 0".to_string(),
+                            )
+                        })?;
+                    header.freelist_pages = freelist_pages.into();
                     // Unpin both pages before returning - caller takes ownership of leaf_page
                     trunk_page.unpin();
                     leaf_page.unpin();
@@ -5659,6 +5723,15 @@ impl Pager {
                         self.add_dirty(&page)?;
 
                         let page_key = PageCacheKey::new(page.get().id as usize);
+                        // A freshly allocated page id must not already be live.
+                        // If it is, the header's database_size understates the
+                        // pages actually in use (corrupt file); reusing the id
+                        // would collide with the live page, so report corruption.
+                        if self.page_cache.read().contains_key(&page_key) {
+                            return Err(LimboError::Corrupt(format!(
+                                "allocated page {new_db_size} is already in use (corrupt database size)"
+                            )));
+                        }
                         self.page_cache
                             .write()
                             .force_insert_page(page_key, page.clone())?;

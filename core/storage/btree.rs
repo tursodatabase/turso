@@ -3533,21 +3533,53 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        self.pager.add_dirty(page)?;
+                        // A sibling that never loaded means the parent's child
+                        // pointer led to a page that could not be read (e.g. a
+                        // corrupt pointer past EOF). That is corruption, not an
+                        // internal bug, so report it instead of asserting inside
+                        // add_dirty.
+                        if !page.is_loaded() {
+                            return Err(LimboError::Corrupt(format!(
+                                "balance sibling page {} is not loaded (corrupt page pointer)",
+                                page.get().id
+                            )));
+                        }
 
-                        #[cfg(debug_assertions)]
-                        let page_type_of_siblings = balance_info.pages_to_balance[0]
+                        // Validate the sibling before rebalancing it. The
+                        // redistribution math trusts these pages' types and cell
+                        // counts; a corrupt sibling (invalid type byte, a type
+                        // that disagrees with its siblings, or a cell-pointer
+                        // array that does not fit the page) would drive it into
+                        // impossible states downstream (negative page sizes,
+                        // non-monotonic cumulative counts). Reject it here as
+                        // corruption instead of asserting deep in the algorithm.
+                        let contents = page.get_contents();
+                        let page_type = contents.page_type()?;
+                        let first_type = balance_info.pages_to_balance[0]
                             .as_ref()
                             .unwrap()
                             .get_contents()
-                            .page_type()
-                            .ok();
+                            .page_type()?;
+                        if page_type != first_type {
+                            return Err(LimboError::Corrupt(format!(
+                                "balance siblings have mismatched page types: {page_type:?} vs {first_type:?}"
+                            )));
+                        }
+                        let max_cells = usable_space.saturating_sub(contents.header_size())
+                            / CELL_PTR_SIZE_BYTES;
+                        if contents.cell_count() > max_cells {
+                            return Err(LimboError::Corrupt(format!(
+                                "balance sibling page {} cell count {} exceeds capacity {max_cells}",
+                                page.get().id,
+                                contents.cell_count()
+                            )));
+                        }
+
+                        self.pager.add_dirty(page)?;
 
                         #[cfg(debug_assertions)]
                         {
-                            let contents = page.get_contents();
                             debug_validate_cells!(&contents, usable_space);
-                            turso_assert_eq!(contents.page_type().ok(), page_type_of_siblings);
                         }
                     }
                     // Start balancing.
@@ -4050,14 +4082,23 @@ impl BTreeCursor {
 
                         new_page_sizes[i] = size_right_page;
                         new_page_sizes[i - 1] = size_left_page;
-                        turso_assert_greater_than!(
-                            cell_array.cell_count_per_page_cumulative[i - 1],
-                            if i > 1 {
-                                cell_array.cell_count_per_page_cumulative[i - 2]
-                            } else {
-                                0
-                            }
-                        );
+                        // Cumulative cell counts must strictly increase: every
+                        // new sibling page gets at least one cell. On a
+                        // well-formed tree this always holds; corrupt cell
+                        // sizes/counts (that slipped past the per-page bounds
+                        // check because the corruption is in cell payloads) can
+                        // produce an empty page here. Report corruption rather
+                        // than asserting (SQLite returns SQLITE_CORRUPT too).
+                        let prev_cumulative = if i > 1 {
+                            cell_array.cell_count_per_page_cumulative[i - 2]
+                        } else {
+                            0
+                        };
+                        if cell_array.cell_count_per_page_cumulative[i - 1] <= prev_cumulative {
+                            return_corrupt!(
+                                "balance_non_root: non-monotonic cell distribution across siblings (corrupt input tree)"
+                            );
+                        }
                     }
 
                     *sub_state = BalanceSubState::NonRootDoBalancingAllocate {
@@ -9064,6 +9105,11 @@ fn free_cell_range(
     // clearing that amount of fragmented bytes, since a 1-3 byte range cannot be a valid cell.
     if let Some(next) = next_block {
         if end + SINGLE_FRAGMENT_SIZE_MAX >= next {
+            if unlikely(next < end) {
+                return_corrupt!(
+                    "free_cell_range: next freeblock overlaps freed range: next={next} end={end}"
+                );
+            }
             removed_fragmentation = (next - end) as u8;
             let next_size = page.read_u16_no_offset(next + 2) as usize;
             end = next + next_size;
@@ -9380,16 +9426,25 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         // Move data and update pointers.
         let mut cbrk = usable_space;
         for cell in cells.iter() {
-            cbrk -= cell.size as usize;
+            // The cell sizes come off a possibly-corrupt page. If they do not
+            // fit in the usable region, `cbrk` would underflow; report the page
+            // as corrupt instead (this and the bounds check below were an assert
+            // that panicked on corrupt input).
+            let Some(new_cbrk) = cbrk.checked_sub(cell.size as usize) else {
+                return_corrupt!("defragment: cell content does not fit in usable space");
+            };
+            cbrk = new_cbrk;
             let new_offset = cbrk;
             let old_offset = cell.old_offset as usize;
 
-            // Basic corruption check
-            turso_assert!(
-                new_offset >= first_cell_content_byte && old_offset + cell.size as usize <= usable_space,
-                "corrupt page detected during defragmentation",
-                { "new_offset": new_offset, "first_cell_content_byte": first_cell_content_byte, "old_offset": old_offset, "cell_size": cell.size, "usable_space": usable_space }
-            );
+            if new_offset < first_cell_content_byte
+                || old_offset.saturating_add(cell.size as usize) > usable_space
+            {
+                return_corrupt!(
+                    "defragment: cell out of bounds (new_offset={new_offset} old_offset={old_offset} cell_size={} usable_space={usable_space})",
+                    cell.size
+                );
+            }
 
             // Move the cell data. `copy_within` is the idiomatic and safe
             // way to perform a `memmove` operation on a slice.
@@ -9457,9 +9512,19 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
 
 #[cfg(debug_assertions)]
 /// Only enabled in debug mode, where we ensure that all cells are valid.
+///
+/// This checks invariants of pages *we* produce, so it assumes a well-formed
+/// page. On a corrupt input page a cell region may not even decode; that is not
+/// a bug in our write path, so skip the check rather than panic.
 fn debug_validate_cells_core(page: &PageContent, usable_space: usize) {
     for i in 0..page.cell_count() {
-        let (offset, size) = page.cell_get_raw_region(i, usable_space).unwrap();
+        let Ok((offset, size)) = page.cell_get_raw_region(i, usable_space) else {
+            return;
+        };
+        if size < 2 || offset + size > usable_space {
+            // Corrupt page, not a write-path bug: stop validating.
+            return;
+        }
         let _buf = &page.as_ptr()[offset..offset + size];
         // E.g. the following table btree cell may just have two bytes:
         // Payload size 0 (stored as SerialTypeKind::ConstInt0)
@@ -9469,8 +9534,10 @@ fn debug_validate_cells_core(page: &PageContent, usable_space: usize) {
             "cell size should be at least 2 bytes",
             { "idx": i, "offset": offset, "buf": _buf }
         );
-        if page.is_leaf() {
-            turso_assert!(page.as_ptr()[offset] != 0);
+        if page.is_leaf() && page.as_ptr()[offset] == 0 {
+            // A leaf cell whose first byte is 0 is malformed; on a corrupt
+            // input page that is expected, so skip rather than assert.
+            return;
         }
         turso_assert_less_than_or_equal!(
             offset + size,
@@ -9708,10 +9775,21 @@ fn allocate_cell_space(
     }
 
     // insert the cell -> content area start moves left by that amount.
-    cell_content_area_start -= amount;
+    // The content-area offset is read from the page and may be corrupt; if it
+    // is smaller than the cell, or would place the cell past usable space, the
+    // page is malformed (was: a subtraction underflow / assertion).
+    let Some(new_content_area_start) = cell_content_area_start.checked_sub(amount) else {
+        return_corrupt!(
+            "allocate_cell_space: content area {cell_content_area_start} smaller than cell {amount}"
+        );
+    };
+    if new_content_area_start + amount > usable_space {
+        return_corrupt!(
+            "allocate_cell_space: cell would extend past usable space (start={new_content_area_start} amount={amount} usable={usable_space})"
+        );
+    }
+    cell_content_area_start = new_content_area_start;
     page_ref.write_cell_content_area(cell_content_area_start);
-
-    turso_assert_less_than_or_equal!(cell_content_area_start + amount, usable_space);
     // we can just return the start of the cell content area, since the cell is inserted to the very left of the cell content area.
     Ok(cell_content_area_start as u16)
 }

@@ -21,6 +21,12 @@
 //! sets an approximate generated-database size (e.g. `512KB`, `500MB`, `2GB`,
 //! or a raw byte count), converted internally to a blob-length scale. Writing
 //! stays memory-bounded at any size; reads that pull whole blobs do not.
+//! `BTREE_TEST_CORRUPT_WRITES` additionally runs a write phase in the corrupt
+//! profiles (INSERT/DELETE/UPDATE), exercising the allocator and balance paths
+//! against corrupt files. It is opt-in and release-only: debug builds trip
+//! internal balance self-assertions that assume a well-formed tree, so the
+//! meaningful "does the production binary crash on a crafted file?" check is
+//! `cargo test --release` with the env var set.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -389,6 +395,10 @@ struct CorruptionProfile {
     bad_pointer_permille: u32,
     /// Random bytes over the fragmentation counter or a random page region.
     garbage_permille: u32,
+    /// Corrupt the database-header freelist fields (trunk pointer + page
+    /// count). A generated file has an empty freelist, so this is what lets the
+    /// write phase reach the page allocator's freelist-reuse path.
+    header_permille: u32,
 }
 
 impl CorruptionProfile {
@@ -396,10 +406,15 @@ impl CorruptionProfile {
         off_by_one_permille: 0,
         bad_pointer_permille: 0,
         garbage_permille: 0,
+        header_permille: 0,
     };
 
     fn enabled(&self) -> bool {
-        self.off_by_one_permille + self.bad_pointer_permille + self.garbage_permille > 0
+        self.off_by_one_permille
+            + self.bad_pointer_permille
+            + self.garbage_permille
+            + self.header_permille
+            > 0
     }
 }
 
@@ -847,6 +862,32 @@ impl BTreeGenerator<'_> {
         }
         let size_bytes = U32::new(size).to_bytes();
         write_at(&io, file.as_ref(), 28, &size_bytes);
+
+        // Optionally corrupt the database-header freelist fields (page 1):
+        // bytes 32..36 = first freelist trunk page, bytes 36..40 = freelist
+        // page count. A generated file has both zero (empty freelist), so
+        // pointing the trunk at some page makes the write phase's allocator
+        // walk the freelist; pairing it with an inconsistent count reaches the
+        // freelist-reuse arithmetic (see the `_corrupt_freelist_*` variant).
+        if self.chance(self.profile.header_permille) {
+            let trunk = match self.rng.next_u32() % 4 {
+                0 => 1,                                            // the header page itself
+                1 => total_pages,                                  // last real page
+                2 => total_pages.saturating_add(1),                // just past EOF
+                _ => 2 + self.rng.next_u32() % total_pages.max(1), // some existing page
+            };
+            let count = match self.rng.next_u32() % 4 {
+                0 => 0,                   // inconsistent with a non-zero trunk
+                1 => u32::MAX,            // absurdly large
+                2 => 1,                   // plausible but usually wrong
+                _ => self.rng.next_u32(), // garbage
+            };
+            self.corruptions.push(format!(
+                "header: freelist trunk -> {trunk}, freelist count -> {count}"
+            ));
+            write_at(&io, file.as_ref(), 32, &U32::new(trunk).to_bytes());
+            write_at(&io, file.as_ref(), 36, &U32::new(count).to_bytes());
+        }
     }
 }
 
@@ -1407,6 +1448,52 @@ fn corrupt_attempt_body(
     for query in &queries {
         let _ = run_query_discard(&conn, query);
     }
+
+    // Write phase (opt-in): exercise the mutation/allocation paths against the
+    // corrupt file. INSERTs (some large enough to allocate overflow pages) and
+    // DELETEs (which free pages onto the freelist) reach the page allocator, so
+    // a corrupt freelist header or page pointer is exercised on write, not just
+    // read. Same rule as above: errors are fine, panics/hangs are bugs.
+    //
+    // Gated behind BTREE_TEST_CORRUPT_WRITES because the B-tree balance path is
+    // not yet hardened against arbitrary corruption (its invariants assume a
+    // well-formed input tree); writing to a corrupt tree still trips a spread
+    // of balance-path assertions/overflows. The freelist-allocator and page-0 /
+    // cell-bounds classes *are* fixed, so this is runnable to reproduce and
+    // track the remaining balance-path frontier.
+    if !corrupt_writes_enabled() {
+        return;
+    }
+    for stmt in [
+        "INSERT INTO test VALUES (1, X'01')".to_string(),
+        format!(
+            "INSERT INTO test VALUES (2, X'{}')",
+            to_hex(&random_payload(&mut rng, page_size))
+        ),
+        format!(
+            "INSERT INTO test VALUES (3, X'{}')",
+            to_hex(&vec![0xab; 8 * page_size]) // forces overflow-page allocation
+        ),
+        "DELETE FROM test WHERE k >= 0".to_string(), // frees pages onto the freelist
+        format!(
+            "INSERT INTO test VALUES (4, X'{}')",
+            to_hex(&vec![0xcd; 8 * page_size])
+        ), // reuse freelist
+        "UPDATE test SET b = X'ff' WHERE k >= 0".to_string(),
+    ] {
+        let _ = run_query_discard(&conn, &stmt);
+    }
+}
+
+/// Whether the corrupt-mode write phase runs. Opt-in via
+/// `BTREE_TEST_CORRUPT_WRITES`, and only in release builds: debug builds carry
+/// internal balance/page self-assertions that (by design) assume a well-formed
+/// tree and therefore fire on corrupt input, which would mask the production
+/// behavior this phase is meant to check — that a release binary never panics,
+/// hangs, or corrupts further when writing to a crafted file. Run it with:
+/// `BTREE_TEST_CORRUPT_WRITES=1 cargo test -p core_tester --release test_btree_corrupt`.
+fn corrupt_writes_enabled() -> bool {
+    std::env::var_os("BTREE_TEST_CORRUPT_WRITES").is_some() && !cfg!(debug_assertions)
 }
 
 /// Drive a query on turso and discard its rows without collecting them, so a
@@ -1611,6 +1698,22 @@ fn test_btree_corrupt_mixed() {
             off_by_one_permille: 5,
             bad_pointer_permille: 5,
             garbage_permille: 10,
+            header_permille: 20,
+        },
+    );
+}
+
+/// Corrupts the database-header freelist fields specifically. Combined with the
+/// write phase, this drives the page allocator's freelist-reuse path over an
+/// inconsistent freelist (the class of bug the read-only profiles could never
+/// reach: a trunk pointer with a mismatched or absurd page count).
+#[test]
+fn test_btree_corrupt_freelist() {
+    run_corruption_test(
+        "freelist",
+        CorruptionProfile {
+            header_permille: 700,
+            ..CorruptionProfile::NONE
         },
     );
 }
