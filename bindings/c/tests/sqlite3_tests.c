@@ -26,6 +26,7 @@ void test_sqlite3_db_config();
 void test_sqlite3_extended_result_codes();
 void test_sqlite3_sql_introspection();
 void test_sqlite3_mprintf();
+void test_sqlite3_exec_null_values();
 
 int allocated = 0;
 
@@ -51,6 +52,7 @@ int main(void)
     test_sqlite3_extended_result_codes();
     test_sqlite3_sql_introspection();
     test_sqlite3_mprintf();
+    test_sqlite3_exec_null_values();
     return 0;
 }
 
@@ -1130,4 +1132,32 @@ void test_sqlite3_mprintf()
     assert(strcmp(buf, "'ab'") == 0);
 
     printf("test_sqlite3_mprintf test passed\n");
+}
+
+static int exec_null_cb(void *ctx, int argc, char **argv, char **colv)
+{
+    (void)colv;
+    assert(argc == 2);
+    /* SQL NULL arrives as a NULL pointer, like SQLite; other values as text. */
+    assert(argv[0] == NULL);
+    assert(argv[1] != NULL && strcmp(argv[1], "1") == 0);
+    *(int *)ctx += 1;
+    return 0;
+}
+
+void test_sqlite3_exec_null_values()
+{
+    sqlite3 *db;
+    int rows = 0;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+
+    rc = sqlite3_exec(db, "SELECT NULL, 1;", exec_null_cb, &rows, NULL);
+    assert(rc == SQLITE_OK);
+    assert(rows == 1);
+
+    sqlite3_close(db);
+    printf("test_sqlite3_exec_null_values test passed\n");
 }

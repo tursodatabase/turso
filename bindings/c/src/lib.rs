@@ -1255,17 +1255,27 @@ unsafe fn execute_query_with_callback(
                 // Safety: checked earlier
                 let callback = callback.unwrap();
 
-                let mut values: Vec<CString> = Vec::with_capacity(n_cols as usize);
+                let mut values: Vec<Option<CString>> = Vec::with_capacity(n_cols as usize);
                 let mut value_ptrs: Vec<*mut ffi::c_char> = Vec::with_capacity(n_cols as usize);
                 let mut col_ptrs: Vec<*mut ffi::c_char> = Vec::with_capacity(n_cols as usize);
 
                 for i in 0..n_cols {
                     let val = stmt_ref.stmt.row().unwrap().get_value(i as usize);
-                    values.push(CString::new(val.to_string().as_bytes()).unwrap());
+                    // SQL NULL is passed to the callback as a NULL pointer,
+                    // as in SQLite, not as an empty string.
+                    if matches!(val, Value::Null) {
+                        values.push(None);
+                    } else {
+                        values.push(Some(CString::new(val.to_string().as_bytes()).unwrap()));
+                    }
                 }
 
                 for value in &values {
-                    value_ptrs.push(value.as_ptr() as *mut ffi::c_char);
+                    value_ptrs.push(
+                        value
+                            .as_ref()
+                            .map_or(std::ptr::null_mut(), |v| v.as_ptr() as *mut ffi::c_char),
+                    );
                 }
                 for name in &column_names {
                     col_ptrs.push(name.as_ptr() as *mut ffi::c_char);
