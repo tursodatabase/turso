@@ -10,7 +10,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH items USING INDEX idx_items_cat (category=?)
+`--SEARCH items USING COVERING INDEX idx_items_cat (category=?)
 
 BYTECODE
 addr  opcode         p1  p2  p3  p4        p5  comment
