@@ -578,10 +578,11 @@ fn emit_add_virtual_column_validation(
     let check_constraints: Vec<CheckConstraint> = constraints
         .iter()
         .filter_map(|c| {
-            if let ast::ColumnConstraint::Check(expr) = &c.constraint {
+            if let ast::ColumnConstraint::Check { expr, source } = &c.constraint {
                 Some(CheckConstraint::new(
                     c.name.as_ref(),
                     expr,
+                    source.as_deref(),
                     column.name.as_deref(),
                 ))
             } else {
@@ -736,12 +737,13 @@ fn emit_add_column_check_validation(
 
     // Collect CHECK constraints from column-level constraints + domain CHECKs.
     // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
-    let mut all_checks: Vec<(Option<String>, Box<ast::Expr>)> = constraints
+    let mut all_checks: Vec<(Option<String>, Option<String>, Box<ast::Expr>)> = constraints
         .iter()
         .filter_map(|c| {
-            if let ast::ColumnConstraint::Check(expr) = &c.constraint {
+            if let ast::ColumnConstraint::Check { expr, source } = &c.constraint {
                 Some((
                     c.name.as_ref().map(|n| n.as_str().to_string()),
+                    source.clone(),
                     expr.clone(),
                 ))
             } else {
@@ -759,7 +761,7 @@ fn emit_add_column_check_validation(
                 for dc in &td.domain_checks {
                     let rewritten =
                         crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
-                    all_checks.push((dc.name.clone(), rewritten));
+                    all_checks.push((dc.name.clone(), None, rewritten));
                 }
             }
         }
@@ -787,7 +789,7 @@ fn emit_add_column_check_validation(
     });
 
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (constraint_name, check_expr) in &all_checks {
+    for (constraint_name, check_source, check_expr) in &all_checks {
         let mut substituted = *check_expr.clone();
 
         // Replace references to the new column with the default value expression.
@@ -828,10 +830,12 @@ fn emit_add_column_check_validation(
             jump_if_null: false,
         });
 
-        // CHECK failed -- halt with constraint error.
-        let name = match constraint_name {
-            Some(name) => name.clone(),
-            None => format!("{check_expr}"),
+        // CHECK failed -- halt with constraint error. SQLite reports the
+        // constraint name, or the expression's source text as written.
+        let name = match (constraint_name, check_source) {
+            (Some(name), _) => name.clone(),
+            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, None) => format!("{check_expr}"),
         };
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_CHECK,
@@ -1395,7 +1399,7 @@ pub fn translate_alter_table(
                         };
                         btree.foreign_keys.push(Arc::new(fk));
                     }
-                    ast::ColumnConstraint::Check(expr) => {
+                    ast::ColumnConstraint::Check { expr, source } => {
                         let column_names: Vec<&str> = btree
                             .columns()
                             .iter()
@@ -1405,6 +1409,7 @@ pub fn translate_alter_table(
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
+                            source.as_deref(),
                             Some(&new_column_name),
                         ));
                     }

@@ -1512,7 +1512,17 @@ pub enum ColumnConstraint {
     /// `UNIQUE`
     Unique(Option<ResolveType>),
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the constraint did not come from this
+        /// parser — the PostgreSQL frontend's translator builds these nodes
+        /// from its own AST — or after an ALTER TABLE rewrite changed the
+        /// expression out from under the captured text.
+        source: Option<String>,
+    },
     /// `DEFAULT`
     Default(Box<Expr>),
     /// `COLLATE`
@@ -1579,7 +1589,17 @@ pub enum TableConstraint {
         conflict_clause: Option<ResolveType>,
     },
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the constraint did not come from this
+        /// parser — the PostgreSQL frontend's translator builds these nodes
+        /// from its own AST — or after an ALTER TABLE rewrite changed the
+        /// expression out from under the captured text.
+        source: Option<String>,
+    },
     /// `FOREIGN KEY`
     ForeignKey {
         /// columns

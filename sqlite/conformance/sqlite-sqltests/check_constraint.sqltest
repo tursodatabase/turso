@@ -1908,3 +1908,58 @@ test check_constraint_integer_affinity_coercion_violation {
 expect error {
     CHECK constraint failed: val > 5
 }
+
+# SQLite reports an unnamed failed CHECK with the expression's source text
+# exactly as the user wrote it between the parens (whitespace-trimmed), not a
+# re-rendering of the parsed expression: CHECK(x<5) fails with `CHECK
+# constraint failed: x<5`, never `x < 5`. Turso used to pretty-print the
+# expression.
+
+@cross-check-integrity
+test check_constraint_error_reports_verbatim_source_text {
+    CREATE TABLE t(x INT CHECK(x<5));
+    INSERT INTO t VALUES (10);
+}
+expect error {
+    CHECK constraint failed: x<5
+}
+
+@cross-check-integrity
+test check_constraint_error_verbatim_text_table_level {
+    CREATE TABLE t(x INT, CHECK(x<5 AND x>0));
+    INSERT INTO t VALUES (10);
+}
+expect error {
+    CHECK constraint failed: x<5 AND x>0
+}
+
+@cross-check-integrity
+test check_constraint_error_verbatim_text_survives_reopen {
+    CREATE TABLE t(x INT CHECK(x<5));
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (10);
+}
+expect error {
+    CHECK constraint failed: x<5
+}
+
+# Named constraints are reported by name, not by expression text.
+@cross-check-integrity
+test check_constraint_error_reports_constraint_name {
+    CREATE TABLE t(x INT CONSTRAINT xsmall CHECK(x  <  5));
+    INSERT INTO t VALUES (10);
+}
+expect error {
+    CHECK constraint failed: xsmall
+}
+
+# SQLite dequotes the captured text: when it starts with a quote character,
+# only the first quoted token survives in the message.
+@cross-check-integrity
+test check_constraint_error_dequotes_leading_quoted_token {
+    CREATE TABLE t(xy INT CHECK("xy" < +5));
+    INSERT INTO t VALUES (10);
+}
+expect error {
+    CHECK constraint failed: xy
+}

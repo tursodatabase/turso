@@ -10683,26 +10683,34 @@ pub fn op_function(
                                 // (e.g. t1.a > 0 → t2.a > 0)
                                 if this_table == rename_from {
                                     for c in &mut constraints {
-                                        if let ast::TableConstraint::Check(ref mut expr) =
-                                            c.constraint
+                                        if let ast::TableConstraint::Check {
+                                            ref mut expr,
+                                            ref mut source,
+                                        } = c.constraint
                                         {
                                             rewrite_check_expr_table_refs(
                                                 expr,
                                                 &rename_from,
                                                 &rename_to,
                                             );
+                                            // The captured source text no longer
+                                            // matches the rewritten expression.
+                                            *source = None;
                                         }
                                     }
                                     for col in &mut columns {
                                         for cc in &mut col.constraints {
-                                            if let ast::ColumnConstraint::Check(ref mut expr) =
-                                                cc.constraint
+                                            if let ast::ColumnConstraint::Check {
+                                                ref mut expr,
+                                                ref mut source,
+                                            } = cc.constraint
                                             {
                                                 rewrite_check_expr_table_refs(
                                                     expr,
                                                     &rename_from,
                                                     &rename_to,
                                                 );
+                                                *source = None;
                                             }
                                         }
                                     }
@@ -11033,12 +11041,16 @@ pub fn op_function(
                                                     column_def.col_name.as_str(),
                                                 );
                                             }
-                                            ast::TableConstraint::Check(ref mut expr) => {
+                                            ast::TableConstraint::Check {
+                                                ref mut expr,
+                                                ref mut source,
+                                            } => {
                                                 rename_identifiers(
                                                     expr,
                                                     &rename_from,
                                                     column_def.col_name.as_str(),
                                                 );
+                                                *source = None;
                                             }
                                         }
                                     }
@@ -15879,6 +15891,9 @@ pub fn op_rename_table(
                         &normalized_from,
                         &normalized_to,
                     );
+                    // The captured source text no longer matches the
+                    // rewritten expression.
+                    check.source = None;
                 }
 
                 normalized_to.clone_into(&mut btree.name);
@@ -16375,6 +16390,9 @@ pub fn op_alter_column(
         let old_col_normalized = normalize_ident(&old_column_name);
         for check in &mut btree.check_constraints {
             rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
+            // The captured source text no longer matches the rewritten
+            // expression.
+            check.source = None;
             if let Some(ref mut col) = check.column {
                 if col.eq_ignore_ascii_case(&old_column_name) {
                     col.clone_from(&new_name);

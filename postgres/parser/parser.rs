@@ -1946,7 +1946,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenType::LeftParen)?;
                 let expr = self.parse_expression()?;
                 self.expect(TokenType::RightParen)?;
-                Ok(ColumnConstraint::Check(expr))
+                Ok(ColumnConstraint::Check { expr, source: None })
             }
             TokenType::Default => {
                 self.advance()?;
@@ -2004,7 +2004,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenType::LeftParen)?;
                 let expr = self.parse_expression()?;
                 self.expect(TokenType::RightParen)?;
-                Ok(TableConstraint::Check(expr))
+                Ok(TableConstraint::Check { expr, source: None })
             }
             _ => Err(Error::SyntaxError(format!(
                 "Unexpected table constraint: {:?}",
