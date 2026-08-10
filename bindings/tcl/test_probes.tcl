@@ -273,6 +273,29 @@ assert_eq "btree_varint_test round-trips 9-byte encodings" "" \
     [btree_varint_test 0x10000000 0x10000000 5000 50000000]
 
 # ---------------------------------------------------------------------------
+# Probe 12: the [sqlite3_blob_*] commands over the incremental blob C API.
+# blob_open sets VARNAME to a handle on success and raises the symbolic
+# result code on failure; read/write/bytes/close operate on the handle.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE tb(x BLOB); INSERT INTO tb(rowid, x) VALUES (1, zeroblob(10));}
+
+sqlite3_blob_open db main tb x 1 1 B
+assert_eq "blob_bytes reports the blob size" 10 [sqlite3_blob_bytes $B]
+assert_eq "blob_write stores bytes" "" [sqlite3_blob_write $B 0 hello 5]
+assert_eq "blob_read returns written bytes" "hello" [sqlite3_blob_read $B 0 5]
+assert_eq "blob_read honors the offset" "ello" [sqlite3_blob_read $B 1 4]
+assert_eq "blob_close succeeds" "" [sqlite3_blob_close $B]
+assert_eq "blob_write persisted through the SQL layer" \
+    68656C6C6F0000000000 [db one {SELECT hex(x) FROM tb WHERE rowid = 1}]
+
+set boerr [catch {sqlite3_blob_open db main tb x 99 0 B2} bomsg]
+assert_eq "blob_open raises the symbolic code on a missing row" 1 $boerr
+assert_ne "blob_open error is a symbolic result code" "" $bomsg
+set brerr [catch {sqlite3_blob_read $B 0 5} brmsg]
+assert_eq "blob commands reject a closed handle" 1 $brerr
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

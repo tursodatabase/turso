@@ -949,6 +949,228 @@ static int TursoConnectionPointerCmd(ClientData cd, Tcl_Interp *interp,
 }
 
 /* ------------------------------------------------------------------ */
+/* sqlite3_blob_* commands                                              */
+/* ------------------------------------------------------------------ */
+
+/* Symbolic name of a primary result code, as upstream sqlite3ErrName;
+ * the blob tests match on these (e.g. {1 SQLITE_ERROR}). */
+static const char *turso_err_name(int rc)
+{
+    switch (rc & 0xff) {
+    case 0:   return "SQLITE_OK";
+    case 1:   return "SQLITE_ERROR";
+    case 2:   return "SQLITE_INTERNAL";
+    case 3:   return "SQLITE_PERM";
+    case 4:   return "SQLITE_ABORT";
+    case 5:   return "SQLITE_BUSY";
+    case 6:   return "SQLITE_LOCKED";
+    case 7:   return "SQLITE_NOMEM";
+    case 8:   return "SQLITE_READONLY";
+    case 9:   return "SQLITE_INTERRUPT";
+    case 10:  return "SQLITE_IOERR";
+    case 11:  return "SQLITE_CORRUPT";
+    case 12:  return "SQLITE_NOTFOUND";
+    case 13:  return "SQLITE_FULL";
+    case 14:  return "SQLITE_CANTOPEN";
+    case 17:  return "SQLITE_SCHEMA";
+    case 18:  return "SQLITE_TOOBIG";
+    case 19:  return "SQLITE_CONSTRAINT";
+    case 20:  return "SQLITE_MISMATCH";
+    case 21:  return "SQLITE_MISUSE";
+    case 25:  return "SQLITE_RANGE";
+    case 100: return "SQLITE_ROW";
+    case 101: return "SQLITE_DONE";
+    default:  return "SQLITE_ERROR";
+    }
+}
+
+/* Open blob handles, keyed by a generated name so a stale or garbage
+ * handle argument is a clean TCL error instead of a wild pointer. */
+typedef struct BlobHandle {
+    void              *blob;
+    char               name[24];
+    struct BlobHandle *next;
+} BlobHandle;
+
+static BlobHandle *blob_handles      = NULL;
+static int         blob_handle_seq   = 0;
+
+static BlobHandle *find_blob_handle(Tcl_Interp *interp, Tcl_Obj *name_obj)
+{
+    const char *name = Tcl_GetString(name_obj);
+    BlobHandle *h;
+    for (h = blob_handles; h; h = h->next) {
+        if (strcmp(h->name, name) == 0) return h;
+    }
+    Tcl_AppendResult(interp, "no such blob handle: ", name, NULL);
+    return NULL;
+}
+
+/*
+ * sqlite3_blob_open DB DBNAME TABLE COLUMN ROWID FLAGS VARNAME
+ *
+ * The upstream test1.c command over the sqlite3_blob_open C API: on
+ * success VARNAME is set to a handle for the other sqlite3_blob_*
+ * commands; on failure the symbolic result code is raised as the TCL
+ * error, which is what the tests match on.
+ */
+static int TursoBlobOpenCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+
+    if (objc != 8) {
+        Tcl_WrongNumArgs(interp, 1, objv,
+                         "DB DBNAME TABLE COLUMN ROWID FLAGS VARNAME");
+        return TCL_ERROR;
+    }
+
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        /* Upstream reports a non-database first argument as misuse. */
+        Tcl_SetResult(interp, (char *)"SQLITE_MISUSE", TCL_STATIC);
+        return TCL_ERROR;
+    }
+
+    Tcl_WideInt rowid;
+    int         flags;
+    if (Tcl_GetWideIntFromObj(interp, objv[5], &rowid) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetIntFromObj(interp, objv[6], &flags) != TCL_OK) return TCL_ERROR;
+
+    void *blob = NULL;
+    int rc = sqlite3_blob_open(tdb->db, Tcl_GetString(objv[2]),
+                               Tcl_GetString(objv[3]), Tcl_GetString(objv[4]),
+                               (int64_t)rowid, flags, &blob);
+    if (rc != 0) {
+        Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
+        return TCL_ERROR;
+    }
+
+    BlobHandle *h = (BlobHandle *)Tcl_Alloc(sizeof(BlobHandle));
+    h->blob = blob;
+    snprintf(h->name, sizeof(h->name), "incrblob_%d", ++blob_handle_seq);
+    h->next = blob_handles;
+    blob_handles = h;
+
+    if (Tcl_SetVar2Ex(interp, Tcl_GetString(objv[7]), NULL,
+                      Tcl_NewStringObj(h->name, -1),
+                      TCL_LEAVE_ERR_MSG) == NULL) {
+        return TCL_ERROR;
+    }
+    Tcl_ResetResult(interp);
+    return TCL_OK;
+}
+
+/* sqlite3_blob_bytes HANDLE */
+static int TursoBlobBytesCmd(ClientData cd, Tcl_Interp *interp,
+                             int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "HANDLE");
+        return TCL_ERROR;
+    }
+    BlobHandle *h = find_blob_handle(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_blob_bytes(h->blob)));
+    return TCL_OK;
+}
+
+/* sqlite3_blob_read HANDLE OFFSET N — returns N bytes as a byte array */
+static int TursoBlobReadCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 4) {
+        Tcl_WrongNumArgs(interp, 1, objv, "HANDLE OFFSET N");
+        return TCL_ERROR;
+    }
+    BlobHandle *h = find_blob_handle(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+
+    int offset, n;
+    if (Tcl_GetIntFromObj(interp, objv[2], &offset) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetIntFromObj(interp, objv[3], &n) != TCL_OK) return TCL_ERROR;
+    if (n < 0) {
+        Tcl_SetResult(interp, (char *)"SQLITE_ERROR", TCL_STATIC);
+        return TCL_ERROR;
+    }
+
+    unsigned char *buf = (unsigned char *)Tcl_Alloc(n > 0 ? n : 1);
+    int rc = sqlite3_blob_read(h->blob, buf, n, offset);
+    if (rc != 0) {
+        Tcl_Free((char *)buf);
+        Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(buf, n));
+    Tcl_Free((char *)buf);
+    return TCL_OK;
+}
+
+/* sqlite3_blob_write HANDLE OFFSET DATA ?NDATA? */
+static int TursoBlobWriteCmd(ClientData cd, Tcl_Interp *interp,
+                             int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 4 && objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "HANDLE OFFSET DATA ?NDATA?");
+        return TCL_ERROR;
+    }
+    BlobHandle *h = find_blob_handle(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+
+    int offset;
+    if (Tcl_GetIntFromObj(interp, objv[2], &offset) != TCL_OK) return TCL_ERROR;
+
+    Tcl_Size        data_len;
+    unsigned char  *data = Tcl_GetByteArrayFromObj(objv[3], &data_len);
+    int             n    = (int)data_len;
+    if (objc == 5) {
+        if (Tcl_GetIntFromObj(interp, objv[4], &n) != TCL_OK) return TCL_ERROR;
+        if (n > (int)data_len) n = (int)data_len;
+    }
+
+    int rc = sqlite3_blob_write(h->blob, data, n, offset);
+    if (rc != 0) {
+        Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
+/* sqlite3_blob_close HANDLE */
+static int TursoBlobCloseCmd(ClientData cd, Tcl_Interp *interp,
+                             int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "HANDLE");
+        return TCL_ERROR;
+    }
+    BlobHandle *h = find_blob_handle(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+
+    int rc = sqlite3_blob_close(h->blob);
+
+    /* The handle is spent even when close reports an error. */
+    BlobHandle **pp;
+    for (pp = &blob_handles; *pp; pp = &(*pp)->next) {
+        if (*pp == h) {
+            *pp = h->next;
+            break;
+        }
+    }
+    Tcl_Free((char *)h);
+
+    if (rc != 0) {
+        Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* btree_varint_test command                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1355,6 +1577,17 @@ int Tursotcl_Init(Tcl_Interp *interp)
 
     Tcl_CreateObjCommand(interp, "btree_varint_test",
                          TursoBtreeVarintTestCmd, NULL, NULL);
+
+    Tcl_CreateObjCommand(interp, "sqlite3_blob_open",
+                         TursoBlobOpenCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_blob_bytes",
+                         TursoBlobBytesCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_blob_read",
+                         TursoBlobReadCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_blob_write",
+                         TursoBlobWriteCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_blob_close",
+                         TursoBlobCloseCmd, NULL, NULL);
 
     Tcl_CreateObjCommand(interp, "sqlite3_mprintf_int",
                          TursoMprintfIntCmd, NULL, NULL);
