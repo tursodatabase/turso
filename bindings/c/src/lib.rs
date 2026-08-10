@@ -1071,7 +1071,13 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     let db = &mut *stmt.db;
-    let mut db_inner = db.inner.lock().unwrap();
+    // Do not hold the handle lock across the step. A user-defined function
+    // invoked mid-step may re-enter the C API on the same handle (SQLite
+    // allows e.g. a nested prepare/step from inside a scalar callback), and
+    // re-locking the non-reentrant mutex on the same thread deadlocks.
+    // Nothing here needs the lock while stepping: core's Connection is
+    // internally synchronized, and the statement itself was never protected
+    // by the handle lock to begin with.
     let res = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
     let rc = match res {
         Ok(Some(_)) => {
@@ -1084,7 +1090,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         }
         Err(LimboError::Busy) => SQLITE_BUSY,
         Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
-        Err(err) => set_db_err(&mut db_inner, err),
+        Err(err) => {
+            let mut db_inner = db.inner.lock().unwrap();
+            set_db_err(&mut db_inner, err)
+        }
     };
     let current = stmt.stmt.metrics().search_count;
     let delta = current - stmt.prev_search_count;

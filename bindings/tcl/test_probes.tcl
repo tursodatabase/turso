@@ -296,6 +296,17 @@ set brerr [catch {sqlite3_blob_read $B 0 5} brmsg]
 assert_eq "blob commands reject a closed handle" 1 $brerr
 
 # ---------------------------------------------------------------------------
+# Probe 13: re-entering the database from inside a [db func] callback.
+# SQLite allows a scalar function to run its own statements on the calling
+# connection; this used to deadlock because sqlite3_step held the handle
+# lock across the whole step.
+# ---------------------------------------------------------------------------
+
+db func nested_probe {} { db one {SELECT 40 + 2} }
+assert_eq "db func callback can run a nested statement" 42 \
+    [db one {SELECT nested_probe()}]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
