@@ -871,12 +871,6 @@ pub struct DeletePlan {
     pub result_columns: Vec<ResultSetColumn>,
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Vec<WhereTerm>,
-    /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
-    /// limit clause
-    pub limit: Option<Box<Expr>>,
-    /// offset clause
-    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
@@ -946,8 +940,6 @@ pub struct UpdatePlan {
     /// SET clause assignments
     pub set_clauses: Vec<UpdateSetClause>,
     pub where_clause: Vec<WhereTerm>,
-    pub limit: Option<Box<Expr>>,
-    pub offset: Option<Box<Expr>>,
     /// Optional RETURNING clause.
     pub returning: Option<Vec<ResultSetColumn>>,
     /// Whether the WHERE clause is always false.

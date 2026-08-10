@@ -561,22 +561,12 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
                     return true;
                 }
             }
-            if walk_result_columns(&mut update.returning, f) {
-                return true;
-            }
-            for sc in &mut update.order_by {
-                if walk_expr(&mut sc.expr, f) {
-                    return true;
-                }
-            }
-            walk_limit(&mut update.limit, f)
+            walk_result_columns(&mut update.returning, f)
         }
         Stmt::Delete {
             with,
             where_clause,
             returning,
-            order_by,
-            limit,
             ..
         } => {
             if let Some(with) = with {
@@ -591,15 +581,7 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
                     return true;
                 }
             }
-            if walk_result_columns(returning, f) {
-                return true;
-            }
-            for sc in order_by {
-                if walk_expr(&mut sc.expr, f) {
-                    return true;
-                }
-            }
-            walk_limit(limit, f)
+            walk_result_columns(returning, f)
         }
         _ => false,
     }

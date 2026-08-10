@@ -481,8 +481,6 @@ impl ToTokens for Stmt {
                 indexed,
                 where_clause,
                 returning,
-                order_by,
-                limit,
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -500,14 +498,6 @@ impl ToTokens for Stmt {
                 if !returning.is_empty() {
                     s.append(TK_RETURNING, None)?;
                     comma(returning, s, context)?;
-                }
-                if !order_by.is_empty() {
-                    s.append(TK_ORDER, None)?;
-                    s.append(TK_BY, None)?;
-                    comma(order_by, s, context)?;
-                }
-                if let Some(limit) = limit {
-                    limit.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -653,8 +643,6 @@ impl ToTokens for Stmt {
                 from,
                 where_clause,
                 returning,
-                order_by,
-                limit,
             }) => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -681,14 +669,6 @@ impl ToTokens for Stmt {
                 if !returning.is_empty() {
                     s.append(TK_RETURNING, None)?;
                     comma(returning, s, context)?;
-                }
-                if !order_by.is_empty() {
-                    s.append(TK_ORDER, None)?;
-                    s.append(TK_BY, None)?;
-                    comma(order_by, s, context)?;
-                }
-                if let Some(limit) = limit {
-                    limit.to_tokens(s, context)?;
                 }
                 Ok(())
             }

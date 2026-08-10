@@ -973,8 +973,6 @@ impl PostgreSQLTranslator {
             indexed: None,
             where_clause: None,
             returning: vec![],
-            order_by: vec![],
-            limit: None,
         })
     }
 
@@ -1373,8 +1371,6 @@ impl PostgreSQLTranslator {
             from,
             where_clause,
             returning,
-            order_by: vec![],
-            limit: None,
         }))
     }
 
@@ -1405,8 +1401,6 @@ impl PostgreSQLTranslator {
             indexed: None,
             where_clause,
             returning,
-            order_by: vec![],
-            limit: None,
         })
     }
 

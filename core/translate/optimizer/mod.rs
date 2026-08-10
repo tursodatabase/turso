@@ -877,6 +877,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
         optimize_select_plan(rowset_plan, resolver)?;
     }
 
+    let mut order_by = vec![];
     let _ = optimize_table_access(
         schema,
         resolver,
@@ -884,12 +885,12 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
         &mut plan.table_references,
         &available_indexes,
         &mut plan.where_clause,
-        &mut plan.order_by,
+        &mut order_by,
         &mut None,
         None,
         &plan.non_from_clause_subqueries,
-        &mut plan.limit,
-        &mut plan.offset,
+        &mut None,
+        &mut None,
         1.0,
     )?;
 
@@ -950,8 +951,8 @@ fn optimize_update_plan(
         &mut None,
         None,
         &plan.non_from_clause_subqueries,
-        &mut plan.limit,
-        &mut plan.offset,
+        &mut None,
+        &mut None,
         1.0,
     )?;
     plan.target_table = target_tables

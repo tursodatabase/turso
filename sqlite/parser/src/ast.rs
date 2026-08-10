@@ -59,10 +59,6 @@ pub struct Update {
     pub where_clause: Option<Box<Expr>>,
     /// `RETURNING`
     pub returning: Vec<ResultColumn>,
-    /// `ORDER BY`
-    pub order_by: Vec<SortedColumn>,
-    /// `LIMIT`
-    pub limit: Option<Limit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,10 +217,6 @@ pub enum Stmt {
         where_clause: Option<Box<Expr>>,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
-        /// `ORDER BY`
-        order_by: Vec<SortedColumn>,
-        /// `LIMIT`
-        limit: Option<Limit>,
     },
     /// `DETACH DATABASE`: db name
     Detach {

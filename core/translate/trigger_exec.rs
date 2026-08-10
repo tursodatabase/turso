@@ -362,8 +362,6 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 from: from_clone,
                 where_clause: where_clause_clone,
                 returning: vec![],
-                order_by: vec![],
-                limit: None,
             }))
         }
         ast::TriggerCmd::Delete {
@@ -383,10 +381,8 @@ fn trigger_cmd_to_stmt_for_subprogram(
                     alias: None,
                 },
                 where_clause: where_clause_clone,
-                limit: None,
                 returning: vec![],
                 indexed: None,
-                order_by: vec![],
                 with: None,
             })
         }
