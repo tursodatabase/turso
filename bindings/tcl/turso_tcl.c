@@ -1171,6 +1171,131 @@ static int TursoBlobCloseCmd(ClientData cd, Tcl_Interp *interp,
 }
 
 /* ------------------------------------------------------------------ */
+/* sqlite3BitvecBuiltinTest command                                     */
+/* ------------------------------------------------------------------ */
+
+#define BV_SETBIT(p, n)  ((p)[(n) >> 3] |= (unsigned char)(1 << ((n) & 7)))
+#define BV_CLEARBIT(p, n) ((p)[(n) >> 3] &= (unsigned char)~(1 << ((n) & 7)))
+#define BV_TESTBIT(p, n) (((p)[(n) >> 3] >> ((n) & 7)) & 1)
+
+/* Deterministic stand-in for sqlite3_randomness in the bitvec test
+ * program; the expected results do not depend on the values drawn. */
+static unsigned int bitvec_rand(void)
+{
+    static unsigned int state = 0x9e3779b9u;
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+/*
+ * sqlite3BitvecBuiltinTest SIZE PROGRAM
+ *
+ * Faithful port of upstream sqlite3BitvecBuiltinTest (bitvec.c): runs
+ * the PROGRAM opcodes against a bitmap under test and a reference
+ * bitmap, then returns 0 if they agree or the index of the first
+ * mismatched bit. Turso has no C Bitvec object, so unlike upstream
+ * this validates the harness's program interpreter (opcode 5 writes
+ * only the reference, which is how bitvec.test checks that deliberate
+ * mismatches are detected), not an engine data structure. It exists
+ * so bitvec.test runs instead of aborting.
+ *
+ * Opcodes: 1=set linear, 2=clear linear, 3=set random, 4=clear random,
+ * 5=set reference only; each instruction is {op count start incr} for
+ * linear ops and {op count} for random ops, 0 terminates.
+ */
+static int TursoBitvecBuiltinTestCmd(ClientData cd, Tcl_Interp *interp,
+                                     int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "SIZE PROGRAM");
+        return TCL_ERROR;
+    }
+
+    int sz;
+    if (Tcl_GetIntFromObj(interp, objv[1], &sz) != TCL_OK) return TCL_ERROR;
+    if (sz < 1) {
+        Tcl_AppendResult(interp, "SIZE must be at least 1", NULL);
+        return TCL_ERROR;
+    }
+
+    Tcl_Size  prog_len;
+    Tcl_Obj **prog_objs;
+    if (Tcl_ListObjGetElements(interp, objv[2],
+                               &prog_len, &prog_objs) != TCL_OK) {
+        return TCL_ERROR;
+    }
+
+    /* Mutable copy: the interpreter advances the start operand of linear
+     * instructions in place, as upstream does. Zero-padded so a program
+     * truncated mid-instruction reads harmless zeros instead of running
+     * off the end. */
+    int *ops = (int *)Tcl_Alloc((prog_len + 4) * sizeof(int));
+    memset(ops, 0, (prog_len + 4) * sizeof(int));
+    Tcl_Size k;
+    for (k = 0; k < prog_len; k++) {
+        if (Tcl_GetIntFromObj(interp, prog_objs[k], &ops[k]) != TCL_OK) {
+            Tcl_Free((char *)ops);
+            return TCL_ERROR;
+        }
+    }
+
+    size_t         nbytes = (size_t)(sz + 7) / 8 + 1;
+    unsigned char *bv     = (unsigned char *)Tcl_Alloc(nbytes);
+    unsigned char *ref    = (unsigned char *)Tcl_Alloc(nbytes);
+    memset(bv, 0, nbytes);
+    memset(ref, 0, nbytes);
+
+    int pc = 0;
+    unsigned int i = 0;
+    int op;
+    while (pc <= (int)prog_len && (op = ops[pc]) != 0) {
+        int nx;
+        switch (op) {
+        case 1:
+        case 2:
+        case 5:
+            nx = 4;
+            i = (unsigned int)(ops[pc + 2] - 1);
+            ops[pc + 2] += ops[pc + 3];
+            break;
+        default:
+            nx = 2;
+            i = bitvec_rand();
+            break;
+        }
+        if (--ops[pc + 1] > 0) nx = 0;
+        pc += nx;
+        i = (i & 0x7fffffff) % (unsigned int)sz;
+        if (op & 1) {
+            BV_SETBIT(ref, i + 1);
+            if (op != 5) BV_SETBIT(bv, i + 1);
+        } else {
+            BV_CLEARBIT(ref, i + 1);
+            BV_CLEARBIT(bv, i + 1);
+        }
+    }
+
+    int rc = 0;
+    int bit;
+    for (bit = 1; bit <= sz; bit++) {
+        if (BV_TESTBIT(ref, bit) != BV_TESTBIT(bv, bit)) {
+            rc = bit;
+            break;
+        }
+    }
+
+    Tcl_Free((char *)ops);
+    Tcl_Free((char *)bv);
+    Tcl_Free((char *)ref);
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* btree_varint_test command                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1577,6 +1702,8 @@ int Tursotcl_Init(Tcl_Interp *interp)
 
     Tcl_CreateObjCommand(interp, "btree_varint_test",
                          TursoBtreeVarintTestCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3BitvecBuiltinTest",
+                         TursoBitvecBuiltinTestCmd, NULL, NULL);
 
     Tcl_CreateObjCommand(interp, "sqlite3_blob_open",
                          TursoBlobOpenCmd, NULL, NULL);

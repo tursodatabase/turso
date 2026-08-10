@@ -307,6 +307,24 @@ assert_eq "db func callback can run a nested statement" 42 \
     [db one {SELECT nested_probe()}]
 
 # ---------------------------------------------------------------------------
+# Probe 14: [sqlite3BitvecBuiltinTest].
+# Returns 0 when the tested bitmap matches the reference, and the index of
+# the first mismatch otherwise (opcode 5 writes only the reference, which
+# is how bitvec.test verifies deliberate errors are detected).
+# ---------------------------------------------------------------------------
+
+assert_eq "bitvec test detects a deliberate mismatch at bit 1" 1 \
+    [sqlite3BitvecBuiltinTest 400 {5 1 1 1 0}]
+assert_eq "bitvec test reports the first mismatched index" 234 \
+    [sqlite3BitvecBuiltinTest 400 {5 1 234 1 0}]
+assert_eq "bitvec test passes a linear fill" 0 \
+    [sqlite3BitvecBuiltinTest 4000 {1 4000 1 1 0}]
+assert_eq "bitvec test passes fill then clear" 0 \
+    [sqlite3BitvecBuiltinTest 4000 {1 4000 1 1 2 4000 1 1 0}]
+assert_eq "bitvec test passes random set and clear" 0 \
+    [sqlite3BitvecBuiltinTest 4000 {3 1000 4 1000 0}]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
