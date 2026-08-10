@@ -2030,7 +2030,10 @@ fn parse_table(
         );
     }
 
-    crate::bail_parse_error!("no such table: {}", normalized_qualified_name);
+    crate::bail_parse_error!(
+        "no such table: {}",
+        crate::util::table_name_for_error(qualified_name)
+    );
 }
 
 fn transform_args_into_where_terms(

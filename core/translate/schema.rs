@@ -1819,7 +1819,10 @@ pub fn translate_drop_table(
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!("No such table: {name}");
+        bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        );
     };
     validate_drop_table(resolver, database_id, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys

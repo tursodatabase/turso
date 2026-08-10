@@ -246,7 +246,10 @@ fn prepare_update_plan(
     let target_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
         Some(table) => table,
-        None => bail_parse_error!("Parse error: no such table: {}", target_name),
+        None => bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&body.tbl_name)
+        ),
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         bail_parse_error!(
