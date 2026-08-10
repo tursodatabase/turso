@@ -360,6 +360,8 @@ impl Builder {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: Default::default(),
         };
 
         let url = if let Some(remote_url) = &self.remote_url {

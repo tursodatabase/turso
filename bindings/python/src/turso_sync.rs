@@ -182,6 +182,8 @@ pub fn py_turso_sync_new(
         vfs: IoBackend::Default,
         io: None,
         db_file: None,
+        page_codec: None,
+        open_flags: Default::default(),
     };
     // calculate and set reserved_bytes from cipher if necessary
     let reserved_bytes = sync_config
