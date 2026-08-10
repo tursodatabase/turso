@@ -920,6 +920,34 @@ static int TursoExecCmd(ClientData cd, Tcl_Interp *interp,
     return TCL_OK;
 }
 
+/*
+ * sqlite3_connection_pointer DB
+ *
+ * Upstream test1.c returns the C-level sqlite3* for a TCL database
+ * handle so tests can hand it to C-API-level commands ("set DB
+ * [sqlite3_connection_pointer db]"). Our C-API commands resolve
+ * handles by command name, so the name itself is the pointer:
+ * validate that it names a database and return it unchanged.
+ */
+static int TursoConnectionPointerCmd(ClientData cd, Tcl_Interp *interp,
+                                     int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB");
+        return TCL_ERROR;
+    }
+
+    const char *db_name = Tcl_GetString(objv[1]);
+    if (!find_turso_db(interp, db_name)) {
+        Tcl_AppendResult(interp, "no such database: ", db_name, NULL);
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, objv[1]);
+    return TCL_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* sqlite3 open command                                                 */
 /* ------------------------------------------------------------------ */
@@ -977,6 +1005,8 @@ int Tursotcl_Init(Tcl_Interp *interp)
 
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer",
+                         TursoConnectionPointerCmd, NULL, NULL);
 
     /* Link the global B-tree search counter so TCL tests can read/reset it. */
     Tcl_LinkVar(interp, "sqlite_search_count",

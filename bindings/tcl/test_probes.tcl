@@ -206,6 +206,18 @@ set execerr [catch {sqlite3_exec nosuchdb {SELECT 1}} execmsg]
 assert_eq "sqlite3_exec errors on an unknown handle" 1 $execerr
 
 # ---------------------------------------------------------------------------
+# Probe 9: [sqlite3_connection_pointer].
+# Returns a value that identifies the database to C-API-level harness
+# commands (here, the handle name itself), and errors on a non-database.
+# ---------------------------------------------------------------------------
+
+set DB [sqlite3_connection_pointer db]
+assert_eq "sqlite3_connection_pointer result works as a DB argument" \
+    {0 {one 1}} [sqlite3_exec $DB {SELECT 1 AS one}]
+set ptrerr [catch {sqlite3_connection_pointer nosuchdb} ptrmsg]
+assert_eq "sqlite3_connection_pointer errors on an unknown handle" 1 $ptrerr
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
