@@ -203,7 +203,7 @@ pub fn emit_query<'a>(
         program.emit_insn(Insn::HashClear {
             hash_table_id: ctx.hash_table_id,
         });
-        emit_explain!(program, false, "USE HASH TABLE FOR DISTINCT".to_owned());
+        emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
@@ -442,15 +442,6 @@ pub(crate) fn emit_materialized_build_inputs(
     // Now we emit each of the materialization subplans into an ephemeral table.
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
-        let build_table_name = if build_table.table.get_name() == build_table.identifier {
-            build_table.identifier.clone()
-        } else {
-            format!(
-                "{} AS {}",
-                build_table.table.get_name(),
-                build_table.identifier
-            )
-        };
         let internal_id = program.table_reference_counter.next();
         let columns = match &spec.mode {
             MaterializedBuildInputMode::RowidOnly => {
@@ -492,7 +483,9 @@ pub(crate) fn emit_materialized_build_inputs(
         emit_explain!(
             program,
             true,
-            format!("MATERIALIZE hash build input for {build_table_name}")
+            crate::translate::eqp::EqpDetail::HashBuild {
+                table: crate::translate::eqp::EqpTable::from_joined(build_table),
+            }
         );
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id,
