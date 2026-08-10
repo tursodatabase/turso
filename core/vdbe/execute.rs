@@ -3423,16 +3423,16 @@ pub fn halt(
     let constraint_error = match err_code {
         0 => None,
         SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
-            "UNIQUE constraint failed: {description} (19)"
+            "UNIQUE constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
-            "CHECK constraint failed: {description} (19)"
+            "CHECK constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
-            "NOT NULL constraint failed: {description} (19)"
+            "NOT NULL constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
-            "UNIQUE constraint failed: {description} (19)"
+            "UNIQUE constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_FOREIGNKEY => {
             Some(LimboError::ForeignKeyConstraint(description.to_string()))

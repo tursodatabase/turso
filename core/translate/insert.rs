@@ -3494,7 +3494,7 @@ pub(crate) fn halt_desc_and_on_error(
     }
     match effective {
         ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {raw_desc} (19)"),
+            format!("UNIQUE constraint failed: {raw_desc}"),
             Some(effective),
         ),
         _ => (raw_desc.to_string(), None),

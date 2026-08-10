@@ -1963,3 +1963,14 @@ test check_constraint_error_dequotes_leading_quoted_token {
 expect error {
     CHECK constraint failed: xy
 }
+
+# sqlite3_errmsg carries no result-code suffix; the "(19)" the sqlite3 shell
+# shows is added by the shell. Turso used to bake " (19)" into the message.
+@cross-check-integrity
+test check_constraint_error_has_no_result_code_suffix {
+    CREATE TABLE t(x INT CHECK(x<5));
+    INSERT INTO t VALUES (10);
+}
+expect error {
+    ^CHECK constraint failed: x<5$
+}
