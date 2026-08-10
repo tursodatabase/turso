@@ -22,6 +22,32 @@ static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
 #[allow(non_upper_case_globals)]
 pub static mut sqlite3_search_count: ffi::c_int = 0;
 
+/// Test-only export of core's SQLite varint encoder for the TCL harness's
+/// btree_varint_test command (upstream test3.c). `buf` must have room for
+/// 9 bytes. Returns the number of bytes written. Not part of the sqlite3
+/// API.
+#[no_mangle]
+pub unsafe extern "C" fn turso_test_put_varint(buf: *mut u8, value: u64) -> ffi::c_int {
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf, 9) };
+    turso_core::storage::sqlite3_ondisk::write_varint(buf, value) as ffi::c_int
+}
+
+/// Test-only export of core's SQLite varint decoder, the counterpart of
+/// [`turso_test_put_varint`]. `buf` must hold at least 9 readable bytes.
+/// Returns the number of bytes consumed and stores the decoded value in
+/// `*out`, or returns 0 if the bytes are not a valid varint.
+#[no_mangle]
+pub unsafe extern "C" fn turso_test_get_varint(buf: *const u8, out: *mut u64) -> ffi::c_int {
+    let buf = unsafe { std::slice::from_raw_parts(buf, 9) };
+    match turso_core::storage::sqlite3_ondisk::read_varint(buf) {
+        Ok((value, n)) => {
+            unsafe { *out = value };
+            n as ffi::c_int
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Enable all experimental features for databases opened after this call.
 #[no_mangle]
 pub extern "C" fn turso_enable_experimental() {

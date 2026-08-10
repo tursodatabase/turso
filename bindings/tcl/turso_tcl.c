@@ -949,6 +949,77 @@ static int TursoConnectionPointerCmd(ClientData cd, Tcl_Interp *interp,
 }
 
 /* ------------------------------------------------------------------ */
+/* btree_varint_test command                                            */
+/* ------------------------------------------------------------------ */
+
+/* Test-only varint codec exports from the sqlite3 Rust crate
+ * (bindings/c/src/lib.rs); both operate on 9-byte buffers. */
+extern int turso_test_put_varint(unsigned char *buf,
+                                 unsigned long long value);
+extern int turso_test_get_varint(const unsigned char *buf,
+                                 unsigned long long *out);
+
+/*
+ * btree_varint_test START MULTIPLIER COUNT INCREMENT
+ *
+ * The upstream test3.c command: starting from START*MULTIPLIER and
+ * stepping by INCREMENT, write each value with the engine's varint
+ * encoder, read it back with the decoder, and verify byte count and
+ * value survive the round trip. Returns nothing on success and an
+ * error describing the first mismatch otherwise. Here the codec under
+ * test is core's write_varint/read_varint — the one the storage layer
+ * uses for every cell — not a harness reimplementation.
+ */
+static int TursoBtreeVarintTestCmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+
+    Tcl_WideInt args[4];
+    int i;
+    if (objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "START MULTIPLIER COUNT INCREMENT");
+        return TCL_ERROR;
+    }
+    for (i = 0; i < 4; i++) {
+        if (Tcl_GetWideIntFromObj(interp, objv[i + 1], &args[i]) != TCL_OK) {
+            return TCL_ERROR;
+        }
+    }
+
+    unsigned long long in   = (unsigned int)args[0];
+    unsigned long long incr = (unsigned int)args[3];
+    Tcl_WideInt        count = args[2];
+    in *= (unsigned int)args[1];
+
+    Tcl_WideInt iter;
+    for (iter = 0; iter < count; iter++) {
+        unsigned char      buf[16];
+        unsigned long long out = 0;
+
+        int n1 = turso_test_put_varint(buf, in);
+        if (n1 < 1 || n1 > 9) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                "putVarint returned %d - should be between 1 and 9", n1));
+            return TCL_ERROR;
+        }
+        int n2 = turso_test_get_varint(buf, &out);
+        if (n1 != n2) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                "putVarint returned %d and getVarint returned %d", n1, n2));
+            return TCL_ERROR;
+        }
+        if (in != out) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                "Wrote 0x%016llx and got back 0x%016llx", in, out));
+            return TCL_ERROR;
+        }
+        in += incr;
+    }
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* sqlite3_mprintf / sqlite3_snprintf test-harness commands             */
 /* ------------------------------------------------------------------ */
 
@@ -1281,6 +1352,9 @@ int Tursotcl_Init(Tcl_Interp *interp)
     Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer",
                          TursoConnectionPointerCmd, NULL, NULL);
+
+    Tcl_CreateObjCommand(interp, "btree_varint_test",
+                         TursoBtreeVarintTestCmd, NULL, NULL);
 
     Tcl_CreateObjCommand(interp, "sqlite3_mprintf_int",
                          TursoMprintfIntCmd, NULL, NULL);

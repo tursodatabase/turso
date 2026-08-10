@@ -260,6 +260,19 @@ assert_eq "snprintf_str truncates to SIZE-1 characters" \
     {x10 1} [sqlite3_snprintf_str 6 {x%d %d %s} 10 10 {This is the string}]
 
 # ---------------------------------------------------------------------------
+# Probe 11: [btree_varint_test].
+# Round-trips values through core's varint encoder/decoder; returns "" on
+# success. The ranges cover 1-byte, mid-size, and 9-byte encodings.
+# ---------------------------------------------------------------------------
+
+assert_eq "btree_varint_test round-trips small values" "" \
+    [btree_varint_test 0 1 5000 1]
+assert_eq "btree_varint_test round-trips large steps" "" \
+    [btree_varint_test 100 1000000 5000 50000000]
+assert_eq "btree_varint_test round-trips 9-byte encodings" "" \
+    [btree_varint_test 0x10000000 0x10000000 5000 50000000]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
