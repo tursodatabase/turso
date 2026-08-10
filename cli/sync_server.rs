@@ -37,6 +37,7 @@ const MVCC_TX_HEADER_SIZE: usize = 24;
 const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
 
 pub struct TursoSyncServer {
     address: String,
@@ -121,23 +122,31 @@ impl TursoSyncServer {
             if n == 0 {
                 break;
             }
+            // Bytes before this offset hold no terminator, and one can still
+            // straddle the last three of them.
+            let unscanned = request_data.len().saturating_sub(3);
             request_data.extend_from_slice(&buffer[..n]);
 
-            if let Some(header_end) = find_header_end(&request_data) {
-                let headers = String::from_utf8_lossy(&request_data[..header_end]);
-                if let Some(content_length) = parse_content_length(&headers) {
-                    let body_start = header_end + 4;
-                    let total_expected = body_start + content_length;
-                    while request_data.len() < total_expected {
-                        let n = stream.read(&mut buffer)?;
-                        if n == 0 {
-                            break;
-                        }
-                        request_data.extend_from_slice(&buffer[..n]);
-                    }
+            let Some(header_end) = find_header_end(&request_data, unscanned) else {
+                if request_data.len() > MAX_HEADER_BYTES {
+                    return Err(anyhow!(
+                        "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
+                    ));
                 }
-                break;
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request_data[..header_end]);
+            if let Some(content_length) = parse_content_length(&headers) {
+                let total_expected = request_end(header_end, content_length)?;
+                while request_data.len() < total_expected {
+                    let n = stream.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    request_data.extend_from_slice(&buffer[..n]);
+                }
             }
+            break;
         }
 
         let (method, path, body) = parse_http_request(&request_data)?;
@@ -1133,8 +1142,16 @@ fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..32].try_into().unwrap())
 }
 
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    (0..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
+/// A client controls Content-Length, so the end of the body has to be
+/// computed without trusting it to fit.
+fn request_end(header_end: usize, content_length: usize) -> Result<usize> {
+    (header_end + 4)
+        .checked_add(content_length)
+        .ok_or_else(|| anyhow!("HTTP request length overflows: {content_length}"))
+}
+
+fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
+    (start..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
 }
 
 fn parse_content_length(headers: &str) -> Option<usize> {
@@ -1149,7 +1166,7 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 }
 
 fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
-    let header_end = find_header_end(data).ok_or_else(|| anyhow!("Invalid HTTP request"))?;
+    let header_end = find_header_end(data, 0).ok_or_else(|| anyhow!("Invalid HTTP request"))?;
     let headers = String::from_utf8_lossy(&data[..header_end]);
 
     let first_line = headers
@@ -1235,5 +1252,38 @@ fn convert_core_to_value(value: CoreValue) -> Value {
         CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors the read loop: the terminator must be found whatever the chunk
+    /// boundaries, including when it straddles two reads.
+    #[test]
+    fn finds_header_end_across_read_boundaries() {
+        let request = b"POST / HTTP/1.1\r\nHost: x\r\n\r\nbody".to_vec();
+        let expected = find_header_end(&request, 0).expect("terminator is present");
+
+        for chunk in 1..=request.len() {
+            let mut data = Vec::new();
+            let mut found = None;
+            for piece in request.chunks(chunk) {
+                let unscanned = data.len().saturating_sub(3);
+                data.extend_from_slice(piece);
+                if let Some(end) = find_header_end(&data, unscanned) {
+                    found = Some(end);
+                    break;
+                }
+            }
+            assert_eq!(found, Some(expected), "missed terminator at chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn rejects_content_length_that_overflows() {
+        assert!(request_end(0, usize::MAX).is_err());
+        assert_eq!(request_end(10, 5).unwrap(), 19);
     }
 }
