@@ -186,6 +186,26 @@ assert_eq "inner transaction rolls back to its savepoint only" \
     {1 3 4} [db eval {SELECT x FROM tt ORDER BY x}]
 
 # ---------------------------------------------------------------------------
+# Probe 8: the [sqlite3_exec] test-harness command.
+# Returns {rc results} where results is column names followed by row values
+# (first row supplies the names), or {rc errmsg} on failure. %HH escapes in
+# the SQL decode to raw bytes, as in upstream test1.c.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE te(a, b); INSERT INTO te VALUES (1, 2), (3, 4);}
+
+assert_eq "sqlite3_exec returns rc 0 plus names and rows" \
+    {0 {a b 1 2 3 4}} [sqlite3_exec db {SELECT * FROM te ORDER BY a}]
+assert_eq "sqlite3_exec renders NULL as the string NULL" \
+    {0 {x NULL}} [sqlite3_exec db {SELECT NULL AS x}]
+assert_eq "sqlite3_exec decodes %HH escapes" \
+    {0 {x 41}} [sqlite3_exec db {SELECT hex('%41') AS x}]
+assert_eq "sqlite3_exec reports SQL errors via rc" \
+    1 [lindex [sqlite3_exec db {SELECT * FROM no_such_table}] 0]
+set execerr [catch {sqlite3_exec nosuchdb {SELECT 1}} execmsg]
+assert_eq "sqlite3_exec errors on an unknown handle" 1 $execerr
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

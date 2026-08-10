@@ -800,6 +800,127 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
 }
 
 /* ------------------------------------------------------------------ */
+/* sqlite3_exec command                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Resolve a database handle name (e.g. "db") to its TursoDb state, or
+ * NULL if the name is not a database command created by [sqlite3]. */
+static TursoDb *find_turso_db(Tcl_Interp *interp, const char *name)
+{
+    Tcl_CmdInfo info;
+    if (!Tcl_GetCommandInfo(interp, name, &info)) return NULL;
+    if (info.objProc != TursoDbCmd) return NULL;
+    return (TursoDb *)info.objClientData;
+}
+
+static int hex_to_int(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Row callback for TursoExecCmd: mirrors upstream test1.c exec_printf_cb.
+ * The first row appends the column names, then every row appends its
+ * values, with NULL rendered as the string "NULL". */
+typedef struct ExecCbState {
+    Tcl_Interp *interp;
+    Tcl_Obj    *list;
+    int         seen_row;
+} ExecCbState;
+
+static int exec_collect_cb(void *ctx, int argc, char **argv, char **colv)
+{
+    ExecCbState *s = (ExecCbState *)ctx;
+    int i;
+    if (!s->seen_row) {
+        for (i = 0; i < argc; i++) {
+            Tcl_ListObjAppendElement(s->interp, s->list,
+                Tcl_NewStringObj(colv[i] ? colv[i] : "", -1));
+        }
+        s->seen_row = 1;
+    }
+    for (i = 0; i < argc; i++) {
+        Tcl_ListObjAppendElement(s->interp, s->list,
+            Tcl_NewStringObj(argv[i] ? argv[i] : "NULL", -1));
+    }
+    return 0;
+}
+
+/*
+ * sqlite3_exec DB SQL
+ *
+ * The upstream test-harness command from test1.c: runs SQL through the
+ * sqlite3_exec C API and returns a two-element list {rc results}, where
+ * results is column names followed by row values on success, or the error
+ * message on failure. "%HH" sequences in the SQL are decoded to raw bytes
+ * first, which is how upstream tests inject invalid UTF-8 into statements.
+ */
+static int TursoExecCmd(ClientData cd, Tcl_Interp *interp,
+                        int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB SQL");
+        return TCL_ERROR;
+    }
+
+    const char *db_name = Tcl_GetString(objv[1]);
+    TursoDb *tdb = find_turso_db(interp, db_name);
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", db_name, NULL);
+        return TCL_ERROR;
+    }
+
+    /* Copy the SQL, decoding %HH escapes. Unlike upstream, only decode
+     * when two hex digits follow, so a stray '%' (e.g. a LIKE pattern)
+     * passes through unchanged. */
+    Tcl_Size    in_len;
+    const char *in  = Tcl_GetStringFromObj(objv[2], &in_len);
+    char       *sql = Tcl_Alloc(in_len + 1);
+    Tcl_Size    i, j;
+    for (i = j = 0; i < in_len;) {
+        if (in[i] == '%' && i + 2 < in_len &&
+            hex_to_int(in[i + 1]) >= 0 && hex_to_int(in[i + 2]) >= 0) {
+            sql[j++] = (char)((hex_to_int(in[i + 1]) << 4)
+                              | hex_to_int(in[i + 2]));
+            i += 3;
+        } else {
+            sql[j++] = in[i++];
+        }
+    }
+    sql[j] = '\0';
+
+    ExecCbState st;
+    st.interp   = interp;
+    st.list     = Tcl_NewListObj(0, NULL);
+    st.seen_row = 0;
+    Tcl_IncrRefCount(st.list);
+
+    char *zerr = NULL;
+    int rc = sqlite3_exec(tdb->db, sql, exec_collect_cb, &st, &zerr);
+    Tcl_Free(sql);
+
+    Tcl_Obj *result = Tcl_NewListObj(0, NULL);
+    Tcl_ListObjAppendElement(interp, result, Tcl_NewIntObj(rc));
+    if (rc == 0) {
+        Tcl_ListObjAppendElement(interp, result, st.list);
+    } else {
+        Tcl_ListObjAppendElement(interp, result,
+            Tcl_NewStringObj(zerr ? zerr : sqlite3_errmsg(tdb->db), -1));
+    }
+    Tcl_DecrRefCount(st.list);
+    if (zerr) sqlite3_free(zerr);
+
+    /* Like upstream, an SQL error is reported through the returned rc, not
+     * as a TCL error, so tests can match on {1 {error message}}. */
+    Tcl_SetObjResult(interp, result);
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* sqlite3 open command                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -855,6 +976,7 @@ int Tursotcl_Init(Tcl_Interp *interp)
     turso_enable_experimental();
 
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
 
     /* Link the global B-tree search counter so TCL tests can read/reset it. */
     Tcl_LinkVar(interp, "sqlite_search_count",
