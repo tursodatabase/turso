@@ -3407,8 +3407,31 @@ impl BTreeCursor {
                     // start loading right page first
                     let mut pgno: u32 =
                         unsafe { right_pointer.cast::<u32>().read_unaligned().swap_bytes() };
+                    // Sibling page numbers come from the parent's child pointers,
+                    // which may be corrupt. A valid child is an allocated page in
+                    // [2, database_size]; anything else (0, the header page, or a
+                    // page past EOF) is corruption. Validate deterministically
+                    // before reading — this is what catches the bad pointer,
+                    // rather than inferring corruption from whether the read
+                    // happened to leave the page loaded (which is ambiguous under
+                    // the async re-entry / `pending_reads` path). Page 1 is
+                    // cached during any write, so this block() does not do IO.
+                    let database_size = self
+                        .pager
+                        .io
+                        .block(|| self.pager.with_header(|header| header.database_size))?
+                        .get();
                     let current_sibling = sibling_pointer;
                     for i in (0..=current_sibling).rev() {
+                        if pgno < 2 || pgno > database_size {
+                            self.pager
+                                .io
+                                .drain_completions(pending_sibling_load_completions)?;
+                            pending_sibling_load_completions.clear();
+                            return Err(LimboError::Corrupt(format!(
+                                "balance: sibling child pointer {pgno} out of range [2, {database_size}]"
+                            )));
+                        }
                         match self.pager.read_page(pgno as i64) {
                             Err(e) => {
                                 mark_unlikely();
@@ -3533,17 +3556,14 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        // A sibling that never loaded means the parent's child
-                        // pointer led to a page that could not be read (e.g. a
-                        // corrupt pointer past EOF). That is corruption, not an
-                        // internal bug, so report it instead of asserting inside
-                        // add_dirty.
-                        if !page.is_loaded() {
-                            return Err(LimboError::Corrupt(format!(
-                                "balance sibling page {} is not loaded (corrupt page pointer)",
-                                page.get().id
-                            )));
-                        }
+                        // Sibling child pointers were range-checked before the
+                        // read (see NonRootPickSiblings), so a loaded page is
+                        // expected here; this stays an internal invariant.
+                        turso_assert!(
+                            page.is_loaded(),
+                            "balance sibling page not loaded after range-checked read",
+                            { "page_id": page.get().id }
+                        );
 
                         // Validate the sibling before rebalancing it. The
                         // redistribution math trusts these pages' types and cell
