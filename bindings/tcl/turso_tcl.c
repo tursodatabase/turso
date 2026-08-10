@@ -15,6 +15,7 @@
  *   errmsg                      — most recent error message
  *   null ?value?                — get/set NULL representation string
  *   func name ?arg...? body     — register a Tcl-backed scalar SQL function
+ *   transaction ?type? script   — run script inside a transaction
  *   close                       — close database and delete command
  *   limit ...                   — stub returning a default value
  */
@@ -47,6 +48,7 @@ typedef struct TursoDb {
     Tcl_Obj    *null_obj;   /* replacement string for NULL values */
     CachedStmt  stmt_cache[STMT_CACHE_SIZE];
     int         cache_count;
+    int         txn_depth;  /* nesting depth of [db transaction] scripts */
 } TursoDb;
 
 /* ------------------------------------------------------------------ */
@@ -401,13 +403,13 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     static const char *cmds[] = {
         "eval", "one", "exists", "changes", "total_changes",
         "last_insert_rowid", "errorcode", "errmsg", "null", "nullvalue",
-        "func", "function", "close", "limit",
+        "func", "function", "close", "limit", "transaction",
         NULL
     };
     enum {
         CMD_EVAL, CMD_ONE, CMD_EXISTS, CMD_CHANGES, CMD_TOTAL_CHANGES,
         CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL, CMD_NULLVALUE,
-        CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT
+        CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT, CMD_TRANSACTION
     };
     int cmdIdx;
 
@@ -470,6 +472,79 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     case CMD_LIMIT:
         Tcl_SetObjResult(interp, Tcl_NewIntObj(1000000));
         return TCL_OK;
+
+    /* ---- transaction ---- */
+
+    case CMD_TRANSACTION: {
+        /*
+         * db transaction ?deferred|immediate|exclusive? script
+         *
+         * Runs the script inside a transaction, committing on success and
+         * rolling back if the script raises an error. Follows upstream
+         * tclsqlite: a nested [db transaction] uses a savepoint so only the
+         * outermost level owns the real BEGIN/COMMIT.
+         */
+        static const char *types[] = {
+            "deferred", "exclusive", "immediate", NULL
+        };
+        static const char *begins[] = {
+            "BEGIN", "BEGIN EXCLUSIVE", "BEGIN IMMEDIATE"
+        };
+
+        const char *begin_sql = "BEGIN";
+        Tcl_Obj    *script;
+
+        if (objc == 3) {
+            script = objv[2];
+        } else if (objc == 4) {
+            int type_idx;
+            if (Tcl_GetIndexFromObj(interp, objv[2], types, "transaction type",
+                                    0, &type_idx) != TCL_OK) {
+                return TCL_ERROR;
+            }
+            begin_sql = begins[type_idx];
+            script = objv[3];
+        } else {
+            Tcl_WrongNumArgs(interp, 2, objv, "?TYPE? SCRIPT");
+            return TCL_ERROR;
+        }
+
+        if (tdb->txn_depth > 0) {
+            begin_sql = "SAVEPOINT _tcl_transaction";
+        }
+
+        if (sqlite3_exec(tdb->db, begin_sql, NULL, NULL, NULL) != SQLITE_OK) {
+            Tcl_SetResult(interp, (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
+            return TCL_ERROR;
+        }
+
+        tdb->txn_depth++;
+        int rc = Tcl_EvalObjEx(interp, script, 0);
+        tdb->txn_depth--;
+
+        const char *end_sql;
+        if (rc == TCL_ERROR) {
+            end_sql = tdb->txn_depth > 0
+                ? "ROLLBACK TO _tcl_transaction; RELEASE _tcl_transaction"
+                : "ROLLBACK";
+        } else {
+            end_sql = tdb->txn_depth > 0
+                ? "RELEASE _tcl_transaction"
+                : "COMMIT";
+        }
+
+        if (sqlite3_exec(tdb->db, end_sql, NULL, NULL, NULL) != SQLITE_OK) {
+            /* The commit (or release) itself failed: surface that error and
+             * abandon the transaction so the connection is usable again. */
+            if (rc != TCL_ERROR) {
+                Tcl_SetResult(interp, (char *)sqlite3_errmsg(tdb->db),
+                              TCL_VOLATILE);
+                rc = TCL_ERROR;
+            }
+            sqlite3_exec(tdb->db, "ROLLBACK", NULL, NULL, NULL);
+        }
+        return rc;
+    }
 
     /* ---- eval ---- */
 
@@ -756,6 +831,7 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
     tdb->interp      = interp;
     tdb->null_obj    = NULL;
     tdb->cache_count = 0;
+    tdb->txn_depth   = 0;
 
     Tcl_CreateObjCommand(interp, handle_name, TursoDbCmd,
                          (ClientData)tdb, TursoDbFree);

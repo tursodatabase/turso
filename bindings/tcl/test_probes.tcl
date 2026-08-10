@@ -145,6 +145,47 @@ assert_eq "db exists is false for a non-matching \$var" 0 \
     [db exists {SELECT 1 FROM tv WHERE x = $want + 100}]
 
 # ---------------------------------------------------------------------------
+# Probe 7: [db transaction].
+# The script runs inside a transaction: committed on success, rolled back
+# when the script raises an error. Nested transactions use a savepoint, so
+# an inner failure undoes only the inner work.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE tt(x);}
+
+db transaction {
+    db eval {INSERT INTO tt VALUES (1);}
+}
+assert_eq "transaction commits on success" 1 [db one {SELECT count(*) FROM tt}]
+
+set txerr [catch {
+    db transaction {
+        db eval {INSERT INTO tt VALUES (2);}
+        error "boom"
+    }
+} txmsg]
+assert_eq "transaction propagates the script error" 1 $txerr
+assert_eq "transaction error message survives" "boom" $txmsg
+assert_eq "transaction rolls back on error" 1 [db one {SELECT count(*) FROM tt}]
+
+db transaction immediate {
+    db eval {INSERT INTO tt VALUES (3);}
+}
+assert_eq "transaction accepts a type argument" 2 [db one {SELECT count(*) FROM tt}]
+
+db transaction {
+    db eval {INSERT INTO tt VALUES (4);}
+    catch {
+        db transaction {
+            db eval {INSERT INTO tt VALUES (5);}
+            error "inner boom"
+        }
+    }
+}
+assert_eq "inner transaction rolls back to its savepoint only" \
+    {1 3 4} [db eval {SELECT x FROM tt ORDER BY x}]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
