@@ -1936,33 +1936,33 @@ async fn test_typed_numeric_row_conversions() {
     assert!(matches!(
         row.get::<i32>(0),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
     assert_eq!(row.get::<i32>(1).unwrap(), i32::MIN);
     assert_eq!(row.get::<i32>(2).unwrap(), i32::MAX);
     assert!(matches!(
         row.get::<i32>(3),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
 
     assert!(matches!(
         row.get::<u32>(4),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
     assert_eq!(row.get::<u32>(5).unwrap(), 0);
     assert_eq!(row.get::<u32>(6).unwrap(), u32::MAX);
     assert!(matches!(
         row.get::<u32>(7),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
 
     assert!(matches!(
         row.get::<u64>(4),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
     assert_eq!(row.get::<u64>(8).unwrap(), i64::MAX as u64);
 

@@ -43,23 +43,23 @@ pub enum LimboError {
     InvalidArgument(String),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
-    #[error("Runtime error: {0}")]
+    #[error("{0}")]
     Constraint(String),
-    #[error("Runtime error: {0}")]
+    #[error("{0}")]
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
-    #[error("Runtime error: {1}")]
+    #[error("{1}")]
     Raise(turso_parser::ast::ResolveType, String),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
     ExtensionError(String),
-    #[error("Runtime error: integer overflow")]
+    #[error("integer overflow")]
     IntegerOverflow,
-    #[error("Runtime error: string or blob too big")]
+    #[error("string or blob too big")]
     TooBig,
-    #[error("Runtime error: database table is locked")]
+    #[error("database table is locked")]
     TableLocked,
     #[error("Error: Resource is read-only")]
     ReadOnly,
@@ -107,7 +107,7 @@ pub enum LimboError {
     /// (or its table) was modified after the handle was opened. Mirrors SQLite's
     /// expired blob handles: every subsequent read/write must fail with
     /// SQLITE_ABORT until the handle is closed.
-    #[error("Runtime error: blob handle expired")]
+    #[error("blob handle expired")]
     BlobHandleExpired,
     #[error("Planning error: {0}")]
     PlanningError(String),
@@ -117,6 +117,27 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+}
+
+impl LimboError {
+    /// The primary SQLite result code for this error, e.g. what the sqlite3
+    /// shell appends after a runtime error message ("... (19)").
+    pub fn sqlite_result_code(&self) -> i32 {
+        match self {
+            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
+            Self::TableLocked => 6,
+            Self::ReadOnly => 8,
+            Self::Interrupt => 9,
+            Self::Corrupt(_) => 11,
+            Self::DatabaseFull(_) => 13,
+            Self::SchemaUpdated | Self::SchemaConflict => 17,
+            Self::TooBig => 18,
+            Self::NotADB => 26,
+            Self::BlobHandleExpired => 4,
+            _ => 1,
+        }
+    }
 }
 
 impl From<crate::alloc::AllocError> for LimboError {
