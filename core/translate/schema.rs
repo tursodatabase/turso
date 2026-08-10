@@ -1186,12 +1186,22 @@ pub fn translate_create_table(
                 return Ok(());
             }
             _ => {
-                let type_str = match object_type {
-                    SchemaObjectType::Table => "table",
-                    SchemaObjectType::View => "view",
-                    SchemaObjectType::Index => "index",
-                };
-                bail_parse_error!("{} {} already exists", type_str, normalized_tbl_name);
+                // SQLite echoes the new table's name token as written
+                // (`table "t" already exists`), except when the name clashes
+                // with an index, which gets its own message shape.
+                let token = crate::util::identifier_token_for_error(&tbl_name.name);
+                match object_type {
+                    SchemaObjectType::Table => {
+                        bail_parse_error!("table {} already exists", token)
+                    }
+                    SchemaObjectType::View => {
+                        bail_parse_error!("view {} already exists", token)
+                    }
+                    SchemaObjectType::Index => bail_parse_error!(
+                        "there is already an index named {}",
+                        tbl_name.name.as_str()
+                    ),
+                }
             }
         }
     }
@@ -1703,7 +1713,10 @@ pub fn translate_create_virtual_table(
         if *if_not_exists {
             return Ok(());
         }
-        bail_parse_error!("Table {} already exists", tbl_name);
+        bail_parse_error!(
+            "table {} already exists",
+            crate::util::identifier_token_for_error(&tbl_name.name)
+        );
     }
 
     let opts = ProgramBuilderOpts::new(2, 40, 2);

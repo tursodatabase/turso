@@ -1246,7 +1246,7 @@ impl Schema {
 
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) -> Result<()> {
-        self.check_object_name_conflict(&view.name)?;
+        self.check_object_name_conflict(&view.name, SchemaObjectType::View)?;
         let name = normalize_ident(&view.name);
         self.views.insert(name, Arc::new(view));
         Ok(())
@@ -1379,7 +1379,7 @@ impl Schema {
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name)?;
+        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         #[cfg(feature = "conn_raw_api")]
         self.table_names_by_root_page
@@ -1389,7 +1389,7 @@ impl Schema {
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name)?;
+        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
         Ok(())
@@ -1453,7 +1453,7 @@ impl Schema {
     }
 
     pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
-        self.check_object_name_conflict(&index.name)?;
+        self.check_object_name_conflict(&index.name, SchemaObjectType::Index)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -2592,16 +2592,23 @@ impl Schema {
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
-    fn check_object_name_conflict(&self, name: &str) -> Result<()> {
-        if let Some(object_type) = self.get_object_type(name) {
-            let type_str = match object_type {
-                SchemaObjectType::Table => "table",
-                SchemaObjectType::View => "view",
-                SchemaObjectType::Index => "index",
+    fn check_object_name_conflict(&self, name: &str, creating: SchemaObjectType) -> Result<()> {
+        if let Some(existing) = self.get_object_type(name) {
+            // Match SQLite's message shapes: indexes and tables/views live in
+            // different namespaces, so a cross-namespace clash names the other
+            // side ("there is already a ...") instead of "already exists".
+            let msg = match (creating, existing) {
+                (SchemaObjectType::Index, SchemaObjectType::Index) => {
+                    format!("index {name} already exists")
+                }
+                (SchemaObjectType::Index, _) => format!("there is already a table named {name}"),
+                (_, SchemaObjectType::Index) => {
+                    format!("there is already an index named {name}")
+                }
+                (_, SchemaObjectType::Table) => format!("table {name} already exists"),
+                (_, SchemaObjectType::View) => format!("view {name} already exists"),
             };
-            return Err(crate::LimboError::ParseError(format!(
-                "{type_str} \"{name}\" already exists"
-            )));
+            return Err(crate::LimboError::ParseError(msg));
         }
         Ok(())
     }
