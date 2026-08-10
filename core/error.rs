@@ -10,6 +10,12 @@ pub enum LimboError {
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
+    /// An error raised by emitted bytecode (`Insn::Halt` with SQLITE_ERROR),
+    /// e.g. ALTER TABLE validation or window-function argument checks.
+    /// Displayed bare, like sqlite3_errmsg. Kept distinct from `Constraint`
+    /// so `abort()` does not apply ON CONFLICT resolution to it.
+    #[error("{0}")]
+    SqlError(String),
     #[error(transparent)]
     CacheError(#[from] CacheError),
     #[error("Database is full: {0}")]
