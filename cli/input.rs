@@ -91,6 +91,7 @@ pub struct Settings {
     pub headers: bool,
     pub mcp: bool,
     pub sync_server_address: Option<String>,
+    pub planviz_address: Option<String>,
     pub stats: bool,
 }
 
@@ -120,6 +121,7 @@ impl From<Opts> for Settings {
             headers: false,
             mcp: opts.mcp,
             sync_server_address: opts.sync_server,
+            planviz_address: opts.planviz,
             stats: false,
         }
     }

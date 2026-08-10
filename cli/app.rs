@@ -84,6 +84,12 @@ pub struct Opts {
         help = "Start sync server instead of interactive shell and listen at given address (e.g. 0.0.0.0:8080)"
     )]
     pub sync_server: Option<String>,
+    #[clap(
+        long,
+        value_name = "ADDRESS",
+        help = "Serve the query plan visualizer web UI instead of the interactive shell, listening at the given address (e.g. 127.0.0.1:8080)"
+    )]
+    pub planviz: Option<String>,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
@@ -450,6 +456,10 @@ impl Limbo {
 
     pub fn is_sync_server_mode(&self) -> bool {
         self.opts.sync_server_address.is_some()
+    }
+
+    pub fn is_planviz_mode(&self) -> bool {
+        self.opts.planviz_address.is_some()
     }
 
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {

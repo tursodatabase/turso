@@ -7,6 +7,7 @@ mod input;
 mod manual;
 mod mcp_server;
 mod opcodes_dictionary;
+mod planviz_server;
 mod read_state_machine;
 mod sync_server;
 
@@ -47,6 +48,15 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
     mcp_server.run()
 }
 
+fn run_planviz_server(app: app::Limbo) -> anyhow::Result<()> {
+    let address = app.opts.planviz_address.clone().unwrap();
+    let db_path = app.opts.db_file.clone();
+    let conn = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+    let server = planviz_server::PlanVizServer::new(address, db_path, conn, interrupt_count);
+    server.run()
+}
+
 fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
     let address = app.opts.sync_server_address.clone().unwrap();
     let conn = app.get_connection();
@@ -80,6 +90,10 @@ fn main() -> anyhow::Result<()> {
     }
     if app.is_sync_server_mode() {
         return run_sync_server(app);
+    }
+
+    if app.is_planviz_mode() {
+        return run_planviz_server(app);
     }
 
     let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());

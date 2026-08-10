@@ -1,0 +1,977 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turso Plan Visualizer</title>
+<style>
+  :root {
+    --bg: #0b1120;
+    --panel: #0f172a;
+    --panel-2: #131e33;
+    --card: #182642;
+    --card-hi: #1e2f52;
+    --border: rgba(148, 163, 184, .22);
+    --border-strong: rgba(148, 163, 184, .4);
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --text-faint: #64748b;
+    --teal: #4ff8d2;
+    --amber: #fbbf24;
+    --emerald: #34d399;
+    --indigo: #818cf8;
+    --violet: #a78bfa;
+    --purple: #c084fc;
+    --pink: #f472b6;
+    --rose: #fb7185;
+    --cyan: #22d3ee;
+    --sky: #38bdf8;
+    --slate: #94a3b8;
+    font-size: 14px;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex: none;
+  }
+  header .logo { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: .2px; }
+  header .logo .mark {
+    width: 22px; height: 22px; border-radius: 6px;
+    background: radial-gradient(120% 120% at 20% 15%, #59fadd 0%, #14b8a6 55%, #0f766e 100%);
+    box-shadow: 0 0 14px rgba(79, 248, 210, .45);
+  }
+  header .logo span em { color: var(--teal); font-style: normal; }
+  header .db { color: var(--text-dim); font-size: .86rem; font-family: ui-monospace, Menlo, monospace;
+    background: var(--panel-2); padding: 3px 10px; border-radius: 99px; border: 1px solid var(--border); }
+  header .spacer { flex: 1; }
+  main { flex: 1; display: flex; min-height: 0; }
+
+  /* ---------- sidebar ---------- */
+  aside {
+    width: 360px; flex: none; display: flex; flex-direction: column;
+    border-right: 1px solid var(--border); background: var(--panel); min-height: 0;
+  }
+  .sqlbox { padding: 12px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--border); }
+  textarea {
+    width: 100%; height: 168px; resize: vertical;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+    font-family: ui-monospace, "Cascadia Code", Menlo, monospace; font-size: .86rem; line-height: 1.45;
+    padding: 10px; outline: none;
+  }
+  textarea:focus { border-color: rgba(79, 248, 210, .5); }
+  .controls { display: flex; gap: 8px; align-items: center; }
+  button {
+    background: linear-gradient(180deg, #14b8a6, #0d9488); color: #04211c; font-weight: 650;
+    border: 0; border-radius: 8px; padding: 7px 16px; cursor: pointer; font-size: .9rem;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border); font-weight: 500; }
+  select {
+    flex: 1; background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 8px; font-size: .84rem; min-width: 0;
+  }
+  .hint { color: var(--text-faint); font-size: .76rem; }
+  #error {
+    display: none; white-space: pre-wrap; color: #fda4af; background: rgba(251, 113, 133, .08);
+    border: 1px solid rgba(251, 113, 133, .35); border-radius: 8px; padding: 8px 10px;
+    font-family: ui-monospace, monospace; font-size: .8rem;
+  }
+  #schema { flex: 1; overflow-y: auto; padding: 10px 12px 20px; }
+  #schema h3 { font-size: .74rem; text-transform: uppercase; letter-spacing: .12em; color: var(--text-faint); margin: 8px 0; }
+  .tbl { margin-bottom: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); overflow: hidden; }
+  .tbl > .name {
+    display: flex; gap: 8px; align-items: center; padding: 6px 10px; cursor: pointer;
+    font-family: ui-monospace, monospace; font-size: .84rem;
+  }
+  .tbl > .name:hover { background: var(--card); }
+  .tbl .tag { font-size: .66rem; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--border-strong); color: var(--text-dim); }
+  .tbl .cols { color: var(--text-faint); font-size: .76rem; padding: 0 10px 6px; font-family: ui-monospace, monospace; }
+  .tbl .idx { display: flex; gap: 8px; align-items: center; padding: 4px 10px 4px 22px; color: var(--text-dim);
+    font-family: ui-monospace, monospace; font-size: .78rem; border-top: 1px dashed var(--border); }
+  .tbl .idx::before { content: "⌕"; color: var(--emerald); }
+
+  /* ---------- canvas ---------- */
+  #canvas-wrap { flex: 1; position: relative; min-width: 0; background:
+      radial-gradient(1000px 500px at 75% -10%, rgba(20, 184, 166, .07), transparent 60%),
+      var(--bg); }
+  svg { width: 100%; height: 100%; display: block; cursor: grab; }
+  svg.panning { cursor: grabbing; }
+  #graph-controls { position: absolute; top: 12px; right: 12px; display: flex; gap: 6px; }
+  #graph-controls button { padding: 5px 11px; font-size: .8rem; }
+  #rawtree {
+    position: absolute; inset: auto 12px 12px auto; max-width: 46%; max-height: 60%; overflow: auto;
+    background: rgba(11, 17, 32, .93); border: 1px solid var(--border-strong); border-radius: 10px;
+    color: var(--text-dim); font-family: ui-monospace, Menlo, monospace; font-size: .78rem; line-height: 1.5;
+    padding: 12px 16px; display: none;
+  }
+  #details {
+    position: absolute; left: 12px; bottom: 12px; width: 380px; max-height: 46%; overflow: auto; display: none;
+    background: rgba(15, 23, 42, .96); border: 1px solid var(--border-strong); border-radius: 10px; padding: 12px 14px;
+  }
+  #details h4 { font-size: .8rem; color: var(--teal); margin-bottom: 6px; font-family: ui-monospace, monospace; }
+  #details pre { font-family: ui-monospace, monospace; font-size: .76rem; color: var(--text-dim); white-space: pre-wrap; }
+  #details .close { position: absolute; top: 6px; right: 10px; cursor: pointer; color: var(--text-faint); }
+  #legend {
+    position: absolute; left: 12px; top: 12px; display: flex; flex-wrap: wrap; gap: 5px 10px; max-width: 65%;
+    font-size: .72rem; color: var(--text-dim); background: rgba(11,17,32,.75); padding: 7px 10px;
+    border-radius: 8px; border: 1px solid var(--border);
+  }
+  #legend .k { display: flex; align-items: center; gap: 5px; }
+  #legend .sw { width: 9px; height: 9px; border-radius: 3px; }
+  #empty {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--text-faint); font-size: .95rem; flex-direction: column; gap: 8px; pointer-events: none;
+  }
+
+  /* ---------- svg node styles ---------- */
+  .card-box { fill: var(--card); stroke: var(--border-strong); rx: 10px; }
+  .node:hover .card-box { fill: var(--card-hi); }
+  .node { cursor: pointer; }
+  .kind-label { font-size: 9.5px; font-weight: 700; letter-spacing: .14em; }
+  .title { font-size: 12.5px; font-weight: 600; fill: var(--text); }
+  .sub { font-size: 10.5px; fill: var(--text-dim); font-family: ui-monospace, Menlo, monospace; }
+  .badge-box { rx: 7px; }
+  .badge-text { font-size: 9px; font-weight: 700; letter-spacing: .06em; }
+  .edge { fill: none; stroke: #3b4d6e; stroke-width: 1.6; }
+  .edge.ref { stroke-dasharray: 5 4; stroke: #52658c; }
+  .edge-label { font-size: 9.5px; fill: var(--text-faint); }
+  .panel-box { fill: rgba(56, 189, 248, .045); stroke: rgba(56, 189, 248, .35); stroke-dasharray: 6 4; rx: 12px; }
+  .panel-box.mat { fill: rgba(192, 132, 252, .05); stroke: rgba(192, 132, 252, .4); }
+  .panel-box.arm { fill: rgba(251, 113, 133, .04); stroke: rgba(251, 113, 133, .3); }
+  .panel-box.rec { fill: rgba(74, 222, 128, .04); stroke: rgba(74, 222, 128, .35); }
+  .panel-title { font-size: 10px; font-weight: 700; letter-spacing: .12em; }
+  .arrow { fill: #3b4d6e; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><div class="mark"></div><span>Turso <em>·</em> Plan Visualizer</span></div>
+  <div class="db" id="dbpath">…</div>
+  <div class="spacer"></div>
+  <span class="hint">EXPLAIN QUERY PLAN, drawn as a dataflow graph — data flows bottom → top</span>
+</header>
+<main>
+  <aside>
+    <div class="sqlbox">
+      <textarea id="sql" spellcheck="false" placeholder="SELECT u.name, o.amount&#10;FROM users u&#10;JOIN orders o ON o.user_id = u.id&#10;WHERE u.age > 21;"></textarea>
+      <div class="controls">
+        <button id="explain">Explain</button>
+        <select id="examples"><option value="">Examples…</option></select>
+      </div>
+      <div class="hint">Ctrl/⌘+Enter runs. Nothing is executed — the statement is only planned.</div>
+      <div id="error"></div>
+    </div>
+    <div id="schema"></div>
+  </aside>
+  <div id="canvas-wrap">
+    <svg id="canvas"></svg>
+    <div id="legend"></div>
+    <div id="graph-controls">
+      <button class="ghost" id="fit">Fit</button>
+      <button class="ghost" id="raw-toggle">EQP text</button>
+    </div>
+    <pre id="rawtree"></pre>
+    <div id="details"><span class="close" id="details-close">✕</span><h4 id="details-title"></h4><pre id="details-body"></pre></div>
+    <div id="empty"><div style="font-size:2.2rem">◇</div><div>Write a query and press Explain</div></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+/* ================================================================
+ *  Node kind styling
+ * ================================================================ */
+const KIND_STYLE = {
+  scan_full:   { color: "var(--amber)",   label: "SCAN" },
+  scan_index:  { color: "var(--emerald)", label: "SCAN · INDEX" },
+  scan_sub:    { color: "var(--sky)",     label: "SCAN · SUBQUERY" },
+  scan_vtab:   { color: "var(--cyan)",    label: "SCAN · VIRTUAL" },
+  search:      { color: "var(--emerald)", label: "SEARCH" },
+  multi_index: { color: "var(--indigo)",  label: "MULTI-INDEX" },
+  index_method:{ color: "var(--indigo)",  label: "INDEX METHOD" },
+  join:        { color: "var(--slate)",   label: "JOIN" },
+  hash_join:   { color: "var(--cyan)",    label: "HASH JOIN" },
+  hash_build:  { color: "var(--purple)",  label: "HASH BUILD" },
+  sort:        { color: "var(--violet)",  label: "SORT" },
+  group:       { color: "var(--purple)",  label: "GROUP" },
+  distinct:    { color: "var(--pink)",    label: "DISTINCT" },
+  merge:       { color: "var(--rose)",    label: "SET OP" },
+  subquery:    { color: "var(--sky)",     label: "SUBQUERY" },
+  queue:       { color: "var(--emerald)", label: "QUEUE" },
+  constant:    { color: "var(--slate)",   label: "CONSTANT" },
+  result:      { color: "var(--teal)",    label: "RESULT" },
+};
+const LEGEND = [
+  ["var(--amber)", "full table scan"],
+  ["var(--emerald)", "index scan / search"],
+  ["var(--indigo)", "multi-index"],
+  ["var(--cyan)", "hash join"],
+  ["var(--sky)", "subquery / coroutine"],
+  ["var(--purple)", "materialize"],
+  ["var(--violet)", "sort / group"],
+  ["var(--rose)", "compound set op"],
+  ["var(--teal)", "result"],
+];
+
+const CARD_W = 216, PAD = 12, GAP_X = 30, GAP_Y = 52, PANEL_PAD = 16, PANEL_TITLE = 22;
+
+/* ================================================================
+ *  Build a tree out of the flat node list
+ * ================================================================ */
+function buildTree(plan) {
+  const byId = new Map();
+  for (const n of plan.nodes) byId.set(n.id, { ...n, children: [] });
+  const roots = [];
+  for (const n of byId.values()) {
+    if (n.parent !== null && byId.has(n.parent)) byId.get(n.parent).children.push(n);
+    else roots.push(n);
+  }
+  return { roots, byId };
+}
+
+/* ================================================================
+ *  Visual element model
+ *  el = { card, panel, inputs: [el], inEdges: [{label, dashed}], refKey }
+ * ================================================================ */
+let elIdCounter = 0;
+function el(card, inputs = [], inEdges = []) {
+  return { uid: ++elIdCounter, card, panel: null, inputs, inEdges };
+}
+
+function tableTitle(op) {
+  return op.alias ? `${op.table} AS ${op.alias}` : op.table;
+}
+
+function joinBadges(op) {
+  const b = [];
+  if (op.join === "left") b.push(["LEFT JOIN", "var(--amber)"]);
+  if (op.join === "full") b.push(["FULL JOIN", "var(--amber)"]);
+  if (op.join === "semi") b.push(["EXISTS", "var(--sky)"]);
+  if (op.join === "anti") b.push(["NOT EXISTS", "var(--rose)"]);
+  if (op.join === "cross") b.push(["CROSS", "var(--slate)"]);
+  return b;
+}
+
+/* Card for one table access node (scan / search / …). */
+function accessCard(node) {
+  const op = node.op;
+  let kind, title, subs = [], badges = [];
+  switch (op.type) {
+    case "scan": {
+      const src = op.source;
+      kind = src === "subquery" ? "scan_sub"
+           : src === "virtual_table" ? "scan_vtab"
+           : src === "recursive_cte_input" ? "scan_sub"
+           : op.index ? "scan_index" : "scan_full";
+      title = tableTitle(op);
+      if (op.index) subs.push((op.index.covering ? "covering " : "") + "index " + op.index.name);
+      else if (src === "table") subs.push("full table scan");
+      if (src === "recursive_cte_input") { subs.push("reads recursion queue"); badges.push(["RECURSIVE", "var(--emerald)"]); }
+      if (op.backwards) badges.push(["BACKWARDS", "var(--violet)"]);
+      if (op.index && op.index.covering) badges.push(["COVERING", "var(--teal)"]);
+      break;
+    }
+    case "search": {
+      kind = "search";
+      title = tableTitle(op);
+      const target = op.index ? "index " + op.index.name : "integer primary key";
+      subs.push(target);
+      if (op.constraints && op.constraints.length) subs.push(op.constraints.join(" AND "));
+      if (op.search_kind === "rowid_eq") badges.push(["POINT LOOKUP", "var(--teal)"]);
+      if (op.search_kind === "in_seek") badges.push(["IN-SEEK", "var(--sky)"]);
+      if (op.index && op.index.ephemeral) badges.push(["EPHEMERAL", "var(--purple)"]);
+      if (op.backwards) badges.push(["BACKWARDS", "var(--violet)"]);
+      break;
+    }
+    case "multi_index": {
+      kind = "multi_index";
+      title = tableTitle(op);
+      subs.push((op.set_op === "or" ? "OR" : "AND") + " over " + op.indexes.length + " indexes");
+      break;
+    }
+    case "index_method": {
+      kind = "index_method"; title = op.method; subs.push("pluggable index method");
+      break;
+    }
+    case "hash_join": {
+      kind = "hash_join"; title = tableTitle(op);
+      break;
+    }
+    case "constant_row": {
+      kind = "constant"; title = "constant row"; subs.push("no FROM clause");
+      break;
+    }
+    default: {
+      kind = "join"; title = node.detail; break;
+    }
+  }
+  const card = { kind, title, subs, badges, planNode: node };
+  const e = el(card);
+
+  // Multi-index branches fan in from small index cards.
+  if (op.type === "multi_index") {
+    for (const idx of op.indexes) {
+      e.inputs.push(el({ kind: "scan_index", title: idx, subs: ["rowid set"], badges: [], mini: true }));
+      e.inEdges.push({ label: "" });
+    }
+  }
+
+  // Subquery body (children of the access node) renders inside a panel.
+  const sub = op.subquery;
+  if (node.children.length && op.type !== "list_subquery" && op.type !== "scalar_subquery") {
+    if (sub && sub.recursive) {
+      const p = recursivePanel(node);
+      e.inputs.push(p); e.inEdges.push({ label: "rows out", dashed: false });
+    } else {
+      const body = buildFlow(node.children, null);
+      const mat = sub && sub.execution !== "coroutine";
+      const p = panelEl(
+        mat ? (sub.execution === "indexed_materialized" ? "MATERIALIZE → EPHEMERAL INDEX" : "MATERIALIZE") : "CO-ROUTINE",
+        mat ? "mat" : "sub", body);
+      if (sub && sub.cte_id !== undefined) p.provideKey = "cte:" + sub.cte_id;
+      e.inputs.push(p);
+      e.inEdges.push({ label: mat ? "run once, store" : "yield row by row", dashed: true });
+    }
+  }
+  // A reader of a shared CTE links back to its materialization panel.
+  if (sub && sub.execution === "materialized_reuse") {
+    e.card.subs.push("reads materialized CTE");
+    if (sub.cte_id !== undefined) {
+      e.refKey = "cte:" + sub.cte_id;
+      e.refLabel = "reads shared result";
+    }
+  }
+  return e;
+}
+
+function panelEl(title, cls, inner) {
+  const p = el(null, [inner], [{ label: "" }]);
+  p.panel = { title, cls };
+  return p;
+}
+
+/* Recursive CTE: SETUP and RECURSIVE STEP feed a queue; the step loops. */
+function recursivePanel(node) {
+  const setup = node.children.find(c => c.op.type === "recursive_setup");
+  const step = node.children.find(c => c.op.type === "recursive_step");
+  const queue = el({ kind: "queue", title: "recursion queue", subs: ["rows to process"], badges: [], planNode: node });
+  if (setup) {
+    const flow = panelEl("SETUP · INITIAL ROWS", "rec", buildFlow(setup.children, null));
+    queue.inputs.push(flow); queue.inEdges.push({ label: "seed rows" });
+  }
+  if (step) {
+    const flow = panelEl("RECURSIVE STEP · UNTIL QUEUE EMPTY", "rec", buildFlow(step.children, null));
+    flow.provideKey = "recstep:" + node.id;
+    queue.inputs.push(flow); queue.inEdges.push({ label: "append new rows" });
+    queue.refKey = "recstep:" + node.id;
+    queue.refLabel = "next queued row ↺";
+  }
+  const p = panelEl("RECURSIVE CTE", "rec", queue);
+  return p;
+}
+
+function stageCard(node) {
+  const op = node.op;
+  let kind, title, subs = [];
+  switch (op.type) {
+    case "order_by":
+      kind = "sort"; title = "sort rows";
+      subs.push(op.method === "temp_btree" ? "in-memory b-tree, keeps order" : "external merge sorter");
+      break;
+    case "group_by":
+      kind = "group"; title = "group + aggregate"; subs.push("sorter groups equal keys");
+      break;
+    case "distinct":
+      kind = "distinct"; title = "distinct rows"; subs.push("hash table de-dupe");
+      break;
+    case "distinct_aggregate":
+      kind = "distinct"; title = op.function + "(DISTINCT …)"; subs.push("hash table de-dupes input");
+      break;
+    default:
+      kind = "join"; title = node.detail;
+  }
+  return el({ kind, title, subs, badges: [], planNode: node });
+}
+
+/* Side input: LIST / SCALAR subquery evaluated for the main flow. */
+function sideSubqueryEl(node) {
+  const op = node.op;
+  const isList = op.type === "list_subquery";
+  const card = {
+    kind: "subquery",
+    title: (isList ? "IN-list subquery " : "scalar subquery ") + "#" + op.subquery_id,
+    subs: [isList ? "materialized into ephemeral index" : "produces a single value"],
+    badges: op.correlated ? [["CORRELATED ↻", "var(--amber)"]] : [["RUNS ONCE", "var(--teal)"]],
+    planNode: node,
+  };
+  const e = el(card);
+  if (node.children.length) {
+    const p = panelEl(isList ? "LIST SUBQUERY" : "SCALAR SUBQUERY", "sub", buildFlow(node.children, null));
+    e.inputs.push(p); e.inEdges.push({ label: "" });
+  }
+  return e;
+}
+
+const ACCESS_TYPES = new Set(["scan", "search", "multi_index", "index_method", "hash_join", "constant_row"]);
+const STAGE_TYPES = new Set(["order_by", "group_by", "distinct", "distinct_aggregate"]);
+const SIDE_TYPES = new Set(["list_subquery", "scalar_subquery"]);
+
+/* ================================================================
+ *  Turn one level of EQP children into a dataflow element.
+ * ================================================================ */
+function buildFlow(nodeList, resultColumns) {
+  const access = [], stages = [], sides = [], hashBuilds = [];
+  let compound = null;
+  for (const n of nodeList) {
+    const t = n.op.type;
+    if (t === "compound") compound = n;
+    else if (t === "hash_build") hashBuilds.push(n);
+    else if (ACCESS_TYPES.has(t)) access.push(n);
+    else if (STAGE_TYPES.has(t)) stages.push(n);
+    else if (SIDE_TYPES.has(t)) sides.push(n);
+    else access.push(n); // unknown types participate as sources
+  }
+
+  let base = null;
+  if (compound) {
+    base = compoundEl(compound);
+  } else if (access.length) {
+    // A HASH JOIN node is the join's build side: its table's rows go into an
+    // in-memory hash table (fed by a MATERIALIZE node when the input needs a
+    // subplan), and the driving side probes it per row. It can appear before
+    // the driving table in EQP order, so buffer until the base is known.
+    const pendingHash = [];
+    const applyHash = (hj) => {
+      const hashCard = accessCard(hj);
+      hashCard.card.subs.push("in-memory hash of its rows");
+      const buildIdx = hashBuilds.findIndex(h => h.op.table === hj.op.table && h.op.alias === hj.op.alias);
+      if (buildIdx >= 0) {
+        const buildNode = hashBuilds.splice(buildIdx, 1)[0];
+        const p = panelEl("MATERIALIZE · HASH BUILD INPUT", "mat", buildFlow(buildNode.children, null));
+        hashCard.inputs.push(p);
+        hashCard.inEdges.push({ label: "build input (once)", dashed: true });
+      }
+      base = el(
+        { kind: "hash_join", title: "probe + match", subs: [], badges: joinBadges(hj.op), planNode: hj },
+        [base, hashCard],
+        [{ label: "probe per row" }, { label: "hash lookup" }]
+      );
+    };
+    for (const node of access) {
+      if (node.op.type === "hash_join") {
+        if (base) applyHash(node); else pendingHash.push(node);
+        continue;
+      }
+      const right = accessCard(node);
+      if (!base) {
+        base = right;
+        if (base.card && access.length > 1) base.card.badges.unshift(["DRIVES THE LOOP", "var(--teal)"]);
+        while (pendingHash.length) applyHash(pendingHash.shift());
+        continue;
+      }
+      const rop = node.op;
+      let title = "nested loop";
+      if (rop.join === "semi") title = "semi join";
+      else if (rop.join === "anti") title = "anti join";
+      else if (rop.join === "left" || rop.join === "full") title = "outer nested loop";
+      base = el(
+        { kind: "join", title, subs: [], badges: joinBadges(rop), planNode: node },
+        [base, right],
+        [{ label: "outer rows" }, { label: "per outer row ↻" }]
+      );
+    }
+    // Defensive: a plan that is nothing but hash-join nodes.
+    while (pendingHash.length) {
+      const hj = pendingHash.shift();
+      if (base) applyHash(hj);
+      else base = accessCard(hj);
+    }
+  } else {
+    base = el({ kind: "constant", title: "no row source", subs: [], badges: [] });
+  }
+
+  // Leftover hash-build nodes (defensive) render as standalone panels.
+  for (const hb of hashBuilds) {
+    const p = panelEl("MATERIALIZE · HASH BUILD INPUT", "mat", buildFlow(hb.children, null));
+    base.inputs.push(p); base.inEdges.push({ label: "build hash (once)", dashed: true });
+  }
+
+  // WHERE-level and per-row subqueries hang off the loop they feed.
+  for (const s of sides) {
+    base.inputs.push(sideSubqueryEl(s));
+    base.inEdges.push({ label: s.op.correlated ? "per row ↻" : "once, before loop", dashed: true });
+  }
+
+  // Pipeline stages apply in the order they appear.
+  for (const st of stages) {
+    const stage = stageCard(st);
+    stage.inputs = [base];
+    stage.inEdges = [{ label: "" }];
+    base = stage;
+  }
+
+  if (resultColumns) {
+    let cols = resultColumns.join(", ");
+    if (cols.length > 58) cols = cols.slice(0, 55) + "…";
+    base = el({ kind: "result", title: "result", subs: cols ? [cols] : [], badges: [] }, [base], [{ label: "" }]);
+  }
+  return base;
+}
+
+function compoundEl(node) {
+  const arms = node.children.filter(c => c.op.type === "compound_arm");
+  const armLabel = {
+    left_most: "FIRST ARM", union_all: "UNION ALL ARM", union: "UNION ARM",
+    intersect: "INTERSECT ARM", except: "EXCEPT ARM",
+  };
+  // The merge semantics come from the last non-leftmost arm operator.
+  const ops = arms.map(a => a.op.op).filter(o => o !== "left_most");
+  const mergeTitles = {
+    union_all: ["append arms", "UNION ALL — no dedupe"],
+    union: ["merge + dedupe", "UNION via temp b-tree"],
+    intersect: ["keep matching rows", "INTERSECT via temp b-trees"],
+    except: ["subtract rows", "EXCEPT via temp b-tree"],
+  };
+  const which = mergeTitles[ops[ops.length - 1]] || ["combine arms", ""];
+  const merge = el({ kind: "merge", title: which[0], subs: which[1] ? [which[1]] : [], badges: [], planNode: node });
+  arms.forEach((arm, i) => {
+    const flow = buildFlow(arm.children, null);
+    const p = panelEl(armLabel[arm.op.op] || arm.detail, "arm", flow);
+    merge.inputs.push(p);
+    merge.inEdges.push({ label: "arm " + (i + 1) });
+  });
+  return merge;
+}
+
+/* Top level: main flow plus shared-CTE materialization clusters. */
+function buildGraph(plan) {
+  elIdCounter = 0;
+  const { roots } = buildTree(plan);
+  const cteIds = new Set();
+  const clusters = [];
+  for (const cte of plan.cte_materializations || []) {
+    for (const id of cte.nodes) cteIds.add(id);
+  }
+  // Cluster the root-level nodes that belong to each pre-materialized CTE.
+  for (const cte of plan.cte_materializations || []) {
+    const mine = roots.filter(r => cte.nodes.includes(r.id));
+    if (!mine.length) continue;
+    const flow = buildFlow(mine, null);
+    const p = panelEl("MATERIALIZE CTE · " + cte.name, "mat", flow);
+    p.provideKey = "cte:" + cte.cte_id;
+    p.panel.subtitle = "run once, shared";
+    clusters.push(p);
+  }
+  const mainRoots = roots.filter(r => !cteIds.has(r.id));
+  const main = buildFlow(mainRoots, plan.result_columns || []);
+  return { main, clusters };
+}
+
+/* ================================================================
+ *  Layout: size every element, then place it (root on top).
+ * ================================================================ */
+function textWidth(s, px) { return s.length * px * 0.62; }
+
+function measure(e) {
+  if (e.card) {
+    const c = e.card;
+    const lines = 1 + (c.subs ? c.subs.length : 0);
+    const st = KIND_STYLE[c.kind] || KIND_STYLE.join;
+    let w = Math.max(
+      130,
+      st.label.length * 8.6 + 30,
+      textWidth(c.title, 13) + 30,
+      ...(c.subs || []).map(s => textWidth(s, 11) + 30),
+      (c.badges || []).reduce((acc, b) => acc + textWidth(b[0], 9) + 24, 10)
+    );
+    w = Math.min(Math.max(w, c.mini ? 130 : CARD_W * 0.72), 330);
+    let h = 16 + 15 + lines * 15 + ((c.badges && c.badges.length) ? 20 : 0);
+    e.cw = w; e.ch = h;
+  } else { e.cw = 0; e.ch = 0; }
+
+  let inW = 0, inH = 0;
+  for (const inp of e.inputs) {
+    measure(inp);
+    inW += inp.tw;
+    inH = Math.max(inH, inp.th);
+  }
+  if (e.inputs.length) inW += GAP_X * (e.inputs.length - 1);
+
+  if (e.panel) {
+    // Panel wraps its single input flow.
+    e.pw = inW + PANEL_PAD * 2;
+    e.ph = inH + PANEL_PAD * 2 + PANEL_TITLE;
+    const panelHeading = e.panel.title + (e.panel.subtitle ? "  ·  " + e.panel.subtitle : "");
+    e.pw = Math.max(e.pw, panelHeading.length * 8.6 + 50);
+    e.tw = e.pw; e.th = e.ph;
+  } else {
+    e.tw = Math.max(e.cw, inW);
+    e.th = e.ch + (e.inputs.length ? GAP_Y + inH : 0);
+  }
+}
+
+/* Position: (x, y) is the top-left of the element's bounding box. */
+function place(e, x, y) {
+  e.x = x; e.y = y;
+  if (e.panel) {
+    const inp = e.inputs[0];
+    place(inp, x + (e.pw - inp.tw) / 2, y + PANEL_TITLE + PANEL_PAD);
+    return;
+  }
+  e.cardX = x + (e.tw - e.cw) / 2;
+  e.cardY = y;
+  let cx = x + (e.tw - (e.inputs.reduce((a, i) => a + i.tw, 0) + GAP_X * Math.max(0, e.inputs.length - 1))) / 2;
+  for (const inp of e.inputs) {
+    place(inp, cx, y + e.ch + GAP_Y);
+    cx += inp.tw + GAP_X;
+  }
+}
+
+/* Anchor where edges attach. */
+function topAnchor(e) {
+  if (e.panel) return { x: e.x + e.pw / 2, y: e.y };
+  return { x: e.cardX + e.cw / 2, y: e.cardY };
+}
+function bottomAnchor(e) {
+  if (e.panel) return { x: e.x + e.pw / 2, y: e.y + e.ph };
+  return { x: e.cardX + e.cw / 2, y: e.cardY + e.ch };
+}
+
+/* ================================================================
+ *  SVG rendering
+ * ================================================================ */
+const svgNS = "http://www.w3.org/2000/svg";
+function make(tag, attrs, parent) {
+  const n = document.createElementNS(svgNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+
+let providers = {}, refEdges = [], gRoot = null;
+
+function renderEl(e, g) {
+  if (e.provideKey) providers[e.provideKey] = e;
+
+  // Edges from inputs up into this element.
+  e.inputs.forEach((inp, i) => {
+    renderEl(inp, g);
+    const from = topAnchor(inp);
+    const to = e.panel ? { x: from.x, y: e.y + e.ph } /* unused */ : { x: e.cardX + e.cw / 2, y: e.cardY + e.ch };
+    if (!e.panel) {
+      const spread = e.inputs.length > 1
+        ? (i - (e.inputs.length - 1) / 2) * Math.min(44, (e.cw * 0.8) / (e.inputs.length - 1))
+        : 0;
+      const tx = to.x + spread;
+      const edge = e.inEdges[i] || {};
+      const midY = (from.y + to.y) / 2;
+      const path = make("path", {
+        d: `M ${from.x} ${from.y} C ${from.x} ${midY}, ${tx} ${midY}, ${tx} ${to.y + 3}`,
+        class: "edge" + (edge.dashed ? " ref" : ""),
+        "marker-end": "url(#arrow)",
+      }, g);
+      if (edge.label) {
+        make("text", { x: (from.x + tx) / 2 + 5, y: midY - 4 + (i % 2) * 14, class: "edge-label", "text-anchor": "start" }, g)
+          .textContent = edge.label;
+      }
+    }
+  });
+
+  if (e.panel) {
+    const cls = "panel-box " + (e.panel.cls || "");
+    make("rect", { x: e.x, y: e.y, width: e.pw, height: e.ph, class: cls }, g);
+    const colors = { mat: "var(--purple)", sub: "var(--sky)", arm: "var(--rose)", rec: "var(--emerald)" };
+    const t = make("text", { x: e.x + 12, y: e.y + 15, class: "panel-title", fill: colors[e.panel.cls] || "var(--sky)" }, g);
+    t.textContent = e.panel.title + (e.panel.subtitle ? "  ·  " + e.panel.subtitle : "");
+    if (e.loopsBackToQueue) e.inputs.forEach(() => {});
+    return;
+  }
+  if (!e.card) return;
+
+  const c = e.card;
+  const st = KIND_STYLE[c.kind] || KIND_STYLE.join;
+  const node = make("g", { class: "node" }, g);
+  make("rect", { x: e.cardX, y: e.cardY, width: e.cw, height: e.ch, rx: 10, class: "card-box" }, node);
+  make("rect", { x: e.cardX, y: e.cardY + 6, width: 3.5, height: e.ch - 12, rx: 2, fill: st.color }, node);
+  make("text", { x: e.cardX + 13, y: e.cardY + 15, class: "kind-label", fill: st.color }, node)
+    .textContent = st.label;
+  make("text", { x: e.cardX + 13, y: e.cardY + 31, class: "title" }, node).textContent = c.title;
+  (c.subs || []).forEach((s, i) => {
+    make("text", { x: e.cardX + 13, y: e.cardY + 46 + i * 15, class: "sub" }, node).textContent = s;
+  });
+  if (c.badges && c.badges.length) {
+    let bx = e.cardX + 13;
+    const by = e.cardY + e.ch - 17;
+    for (const [label, color] of c.badges) {
+      const bw = textWidth(label, 9) + 20;
+      make("rect", { x: bx, y: by, width: bw, height: 14, class: "badge-box", fill: "none", stroke: color, "stroke-width": 1 }, node);
+      make("text", { x: bx + bw / 2, y: by + 10, class: "badge-text", fill: color, "text-anchor": "middle" }, node)
+        .textContent = label;
+      bx += bw + 6;
+    }
+  }
+  if (c.planNode) {
+    node.addEventListener("click", (ev) => { ev.stopPropagation(); showDetails(c.planNode); });
+  }
+  if (e.refKey) refEdges.push({ from: e, key: e.refKey, label: e.refLabel });
+}
+
+function drawRefEdges(g) {
+  refEdges.forEach((r, i) => {
+    const target = providers[r.key];
+    if (!target) return;
+    const targetTop = target.panel ? target.y : target.cardY;
+    const fromBottom = r.from.card ? r.from.cardY + r.from.ch : r.from.y + (r.from.ph || 0);
+    if (targetTop > fromBottom) {
+      // Provider below the reader (recursive step): drop into the panel top.
+      const fx = r.from.card ? r.from.cardX + r.from.cw - 18 : r.from.x + r.from.tw / 2;
+      const tx = target.x + target.pw * 0.82;
+      const midY = (fromBottom + targetTop) / 2;
+      make("path", {
+        d: `M ${fx} ${fromBottom} C ${fx + 30} ${midY}, ${tx} ${midY}, ${tx} ${targetTop - 4}`,
+        class: "edge ref", "marker-end": "url(#arrow)",
+      }, g);
+      make("text", { x: Math.max(fx, tx) + 14, y: midY + 4, class: "edge-label", "text-anchor": "start" }, g)
+        .textContent = r.label || "";
+      return;
+    }
+    // Provider beside the reader (shared CTE cluster): curve left into its side.
+    const from = r.from.card
+      ? { x: r.from.cardX, y: r.from.cardY + r.from.ch / 2 }
+      : bottomAnchor(r.from);
+    const tx = target.panel ? target.x + target.pw : target.cardX + target.cw;
+    const ty = (target.panel ? target.y : target.cardY) + 30 + i * 22;
+    const bend = Math.max(50, Math.abs(from.x - tx) * 0.25);
+    make("path", {
+      d: `M ${from.x} ${from.y} C ${from.x - bend} ${from.y}, ${tx + bend} ${ty}, ${tx + 4} ${ty}`,
+      class: "edge ref", "marker-end": "url(#arrow)",
+    }, g);
+    make("text", { x: tx + bend * 0.7, y: ty - 7 + (i % 2) * 26, class: "edge-label", "text-anchor": "start" }, g)
+      .textContent = r.label || "reads shared result";
+  });
+}
+
+/* ================================================================
+ *  Viewport (pan / zoom / fit)
+ * ================================================================ */
+const svg = document.getElementById("canvas");
+let view = { x: 0, y: 0, w: 1200, h: 800 };
+let contentBox = { x: 0, y: 0, w: 1200, h: 800 };
+function applyView() { svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`); }
+function fit() {
+  const m = 40, rect = svg.getBoundingClientRect();
+  const ar = rect.width / rect.height;
+  let w = contentBox.w + m * 2, h = contentBox.h + m * 2;
+  if (w / h > ar) h = w / ar; else w = h * ar;
+  view = { x: contentBox.x - m - (w - contentBox.w - m * 2) / 2, y: contentBox.y - m - (h - contentBox.h - m * 2) / 2, w, h };
+  applyView();
+}
+svg.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  const rect = svg.getBoundingClientRect();
+  const mx = view.x + (ev.clientX - rect.left) / rect.width * view.w;
+  const my = view.y + (ev.clientY - rect.top) / rect.height * view.h;
+  const f = ev.deltaY > 0 ? 1.12 : 1 / 1.12;
+  view = { x: mx - (mx - view.x) * f, y: my - (my - view.y) * f, w: view.w * f, h: view.h * f };
+  applyView();
+}, { passive: false });
+let panning = null;
+svg.addEventListener("mousedown", (ev) => { panning = { x: ev.clientX, y: ev.clientY }; svg.classList.add("panning"); });
+window.addEventListener("mousemove", (ev) => {
+  if (!panning) return;
+  const rect = svg.getBoundingClientRect();
+  view.x -= (ev.clientX - panning.x) / rect.width * view.w;
+  view.y -= (ev.clientY - panning.y) / rect.height * view.h;
+  panning = { x: ev.clientX, y: ev.clientY };
+  applyView();
+});
+window.addEventListener("mouseup", () => { panning = null; svg.classList.remove("panning"); });
+
+/* ================================================================
+ *  Render entry point
+ * ================================================================ */
+let currentPlan = null;
+function renderPlan(plan) {
+  currentPlan = plan;
+  svg.innerHTML = "";
+  providers = {}; refEdges = [];
+  document.getElementById("empty").style.display = plan.nodes.length ? "none" : "flex";
+  if (!plan.nodes.length) {
+    document.querySelector("#empty div:last-child").textContent = "This statement has no plan steps (DDL / pragma).";
+    return;
+  }
+
+  const defs = make("defs", {}, svg);
+  const marker = make("marker", { id: "arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, defs);
+  make("path", { d: "M 0 0 L 10 5 L 0 10 z", class: "arrow" }, marker);
+
+  gRoot = make("g", {}, svg);
+  const { main, clusters } = buildGraph(plan);
+
+  measure(main);
+  clusters.forEach(measure);
+
+  // Main flow in the middle, materialization clusters on the left.
+  let x = 0, maxH = main.th;
+  const placed = [];
+  for (const cl of clusters) { placed.push([cl, x]); x += cl.tw + 70; maxH = Math.max(maxH, cl.th); }
+  const mainX = x;
+  for (const [cl, cx] of placed) place(cl, cx, Math.max(0, (main.th - cl.th) * 0.15));
+  place(main, mainX, 0);
+
+  for (const [cl] of placed) renderEl(cl, gRoot);
+  renderEl(main, gRoot);
+  drawRefEdges(gRoot);
+
+  const bb = gRoot.getBBox();
+  contentBox = { x: bb.x, y: bb.y, w: bb.width, h: bb.height };
+  fit();
+  renderRawTree(plan);
+}
+
+/* ASCII tree, same shape the CLI prints. */
+function renderRawTree(plan) {
+  const { roots } = buildTree(plan);
+  const lines = ["QUERY PLAN"];
+  const walk = (nodes, prefix) => {
+    nodes.forEach((n, i) => {
+      const last = i === nodes.length - 1;
+      lines.push(prefix + (last ? "`--" : "|--") + n.detail);
+      walk(n.children, prefix + (last ? "   " : "|  "));
+    });
+  };
+  walk(roots, "");
+  document.getElementById("rawtree").textContent = lines.join("\n");
+}
+
+function showDetails(node) {
+  const d = document.getElementById("details");
+  document.getElementById("details-title").textContent = node.detail;
+  document.getElementById("details-body").textContent =
+    "id " + node.id + (node.parent !== null ? "  ·  parent " + node.parent : "  ·  root") +
+    "\n\n" + JSON.stringify(node.op, null, 2);
+  d.style.display = "block";
+}
+document.getElementById("details-close").onclick = () => document.getElementById("details").style.display = "none";
+
+/* ================================================================
+ *  App wiring
+ * ================================================================ */
+const sqlInput = document.getElementById("sql");
+const errBox = document.getElementById("error");
+
+async function explain(push = true) {
+  const sql = sqlInput.value.trim();
+  if (!sql) return;
+  errBox.style.display = "none";
+  try {
+    const res = await fetch("/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sql }) });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    renderPlan(data);
+    if (push) history.replaceState(null, "", "#sql=" + encodeURIComponent(sql));
+  } catch (e) {
+    errBox.textContent = String(e.message || e);
+    errBox.style.display = "block";
+  }
+}
+document.getElementById("explain").onclick = () => explain();
+sqlInput.addEventListener("keydown", (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === "Enter") { ev.preventDefault(); explain(); }
+});
+document.getElementById("fit").onclick = fit;
+document.getElementById("raw-toggle").onclick = () => {
+  const el = document.getElementById("rawtree");
+  el.style.display = el.style.display === "block" ? "none" : "block";
+};
+window.addEventListener("resize", fit);
+
+/* Legend */
+document.getElementById("legend").innerHTML =
+  LEGEND.map(([c, t]) => `<span class="k"><span class="sw" style="background:${c}"></span>${t}</span>`).join("");
+
+/* Schema sidebar */
+function columnsFromCreate(sql) {
+  const m = sql && sql.match(/\(([\s\S]*)\)/);
+  if (!m) return "";
+  return m[1].split(",").map(c => c.trim().split(/\s+/)[0]).filter(c => c && !/^(PRIMARY|UNIQUE|CHECK|FOREIGN|CONSTRAINT)$/i.test(c)).join(", ");
+}
+async function loadSchema() {
+  try {
+    const res = await fetch("/schema");
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    document.getElementById("dbpath").textContent = data.database;
+    const tables = data.entries.filter(e => e.type === "table" || e.type === "view");
+    const indexes = data.entries.filter(e => e.type === "index");
+    const box = document.getElementById("schema");
+    box.innerHTML = "<h3>Schema</h3>";
+    if (!tables.length) box.innerHTML += '<div class="hint">No tables yet — open a database with a schema.</div>';
+    for (const t of tables) {
+      const div = document.createElement("div");
+      div.className = "tbl";
+      const cols = columnsFromCreate(t.sql);
+      div.innerHTML = `<div class="name" title="${(t.sql || "").replace(/"/g, "&quot;")}">` +
+        `<span class="tag">${t.type}</span>${t.name}</div>` +
+        (cols ? `<div class="cols">${cols}</div>` : "");
+      for (const ix of indexes.filter(i => i.tbl_name === t.name)) {
+        const d = document.createElement("div");
+        d.className = "idx"; d.textContent = ix.name; d.title = ix.sql || "";
+        div.appendChild(d);
+      }
+      div.querySelector(".name").addEventListener("click", () => {
+        sqlInput.value = `SELECT * FROM ${t.name} LIMIT 10;`;
+      });
+      box.appendChild(div);
+    }
+  } catch (e) {
+    document.getElementById("dbpath").textContent = "schema unavailable: " + (e.message || e);
+  }
+}
+
+/* Examples */
+const EXAMPLES = [
+  ["Index search + left join + sort", "SELECT u.name, o.amount\nFROM users u\nLEFT JOIN orders o ON o.user_id = u.id\nWHERE u.age > 21\nORDER BY o.amount DESC;"],
+  ["Shared CTE used twice", "WITH spenders AS (\n  SELECT user_id, sum(amount) AS total\n  FROM orders GROUP BY user_id\n)\nSELECT u.name, s1.total\nFROM users u\nJOIN spenders s1 ON s1.user_id = u.id\nJOIN spenders s2 ON s2.user_id = u.city_id;"],
+  ["Coroutine subquery + group by", "SELECT city_id, avg(age)\nFROM (SELECT * FROM users WHERE age > 18)\nGROUP BY city_id\nORDER BY avg(age);"],
+  ["UNION with sort", "SELECT name FROM users WHERE age > 30\nUNION\nSELECT name FROM cities\nORDER BY name;"],
+  ["Correlated + IN subqueries", "SELECT u.name,\n  (SELECT count(*) FROM orders o WHERE o.user_id = u.id)\nFROM users u\nWHERE u.age IN (SELECT age FROM users WHERE city_id = 3);"],
+  ["EXISTS (semi join)", "SELECT * FROM users u\nWHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);"],
+  ["Multi-index OR", "SELECT * FROM users WHERE id = 5 OR age = 30;"],
+  ["Recursive CTE", "WITH RECURSIVE cnt(x) AS (\n  SELECT 1\n  UNION ALL\n  SELECT x + 1 FROM cnt WHERE x < 10\n)\nSELECT x FROM cnt;"],
+  ["Window function", "SELECT name,\n  row_number() OVER (PARTITION BY city_id ORDER BY age)\nFROM users;"],
+];
+const sel = document.getElementById("examples");
+EXAMPLES.forEach(([name, sql], i) => {
+  const o = document.createElement("option");
+  o.value = i; o.textContent = name;
+  sel.appendChild(o);
+});
+sel.addEventListener("change", () => {
+  if (sel.value === "") return;
+  sqlInput.value = EXAMPLES[+sel.value][1];
+  explain();
+  sel.value = "";
+});
+
+loadSchema();
+function runFromHash() {
+  if (location.hash.startsWith("#sql=")) {
+    sqlInput.value = decodeURIComponent(location.hash.slice(5));
+    explain(false);
+  }
+}
+window.addEventListener("hashchange", runFromHash);
+runFromHash();
+</script>
+</body>
+</html>
