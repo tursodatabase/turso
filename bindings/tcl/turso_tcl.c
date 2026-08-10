@@ -949,6 +949,280 @@ static int TursoConnectionPointerCmd(ClientData cd, Tcl_Interp *interp,
 }
 
 /* ------------------------------------------------------------------ */
+/* sqlite3_mprintf / sqlite3_snprintf test-harness commands             */
+/* ------------------------------------------------------------------ */
+
+/* The upstream test1.c printf commands: each formats through the real
+ * sqlite3_mprintf/sqlite3_snprintf C API (backed by core's printf
+ * engine), so the printf.test expectations exercise turso's formatter
+ * rather than a reimplementation. */
+
+static void mprintf_result(Tcl_Interp *interp, char *z)
+{
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(z ? z : "", -1));
+    if (z) sqlite3_free(z);
+}
+
+/* Parse a TCL integer that may exceed 32 bits (e.g. 0xffffffff),
+ * wrapping to the C type at the call site like upstream's Tcl_GetInt. */
+static int get_wide(Tcl_Interp *interp, Tcl_Obj *obj, Tcl_WideInt *out)
+{
+    return Tcl_GetWideIntFromObj(interp, obj, out);
+}
+
+/* sqlite3_mprintf_int FORMAT INT INT INT */
+static int TursoMprintfIntCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    Tcl_WideInt a[3];
+    int i;
+    if (objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FORMAT INT INT INT");
+        return TCL_ERROR;
+    }
+    for (i = 0; i < 3; i++) {
+        if (get_wide(interp, objv[i + 2], &a[i]) != TCL_OK) return TCL_ERROR;
+    }
+    mprintf_result(interp, sqlite3_mprintf(Tcl_GetString(objv[1]),
+        (int)a[0], (int)a[1], (int)a[2]));
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_int64 FORMAT INT INT INT */
+static int TursoMprintfInt64Cmd(ClientData cd, Tcl_Interp *interp,
+                                int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    Tcl_WideInt a[3];
+    int i;
+    if (objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FORMAT INT INT INT");
+        return TCL_ERROR;
+    }
+    for (i = 0; i < 3; i++) {
+        if (get_wide(interp, objv[i + 2], &a[i]) != TCL_OK) return TCL_ERROR;
+    }
+    mprintf_result(interp, sqlite3_mprintf(Tcl_GetString(objv[1]),
+        (long long)a[0], (long long)a[1], (long long)a[2]));
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_long FORMAT INT INT INT
+ * As in upstream, each argument is truncated to 32 bits before being
+ * passed as a C long, so 0xffffffff formats as 4294967295 via %lu. */
+static int TursoMprintfLongCmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    Tcl_WideInt a[3];
+    long v[3];
+    int i;
+    if (objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FORMAT INT INT INT");
+        return TCL_ERROR;
+    }
+    for (i = 0; i < 3; i++) {
+        if (get_wide(interp, objv[i + 2], &a[i]) != TCL_OK) return TCL_ERROR;
+        v[i] = (long)(a[i] & 0xffffffffLL);
+    }
+    mprintf_result(interp, sqlite3_mprintf(Tcl_GetString(objv[1]),
+        v[0], v[1], v[2]));
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_str FORMAT INT INT ?STRING? */
+static int TursoMprintfStrCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    Tcl_WideInt a[2];
+    int i;
+    if (objc != 4 && objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FORMAT INT INT ?STRING?");
+        return TCL_ERROR;
+    }
+    for (i = 0; i < 2; i++) {
+        if (get_wide(interp, objv[i + 2], &a[i]) != TCL_OK) return TCL_ERROR;
+    }
+    mprintf_result(interp, sqlite3_mprintf(Tcl_GetString(objv[1]),
+        (int)a[0], (int)a[1], objc == 5 ? Tcl_GetString(objv[4]) : NULL));
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_stronly FORMAT STRING */
+static int TursoMprintfStronlyCmd(ClientData cd, Tcl_Interp *interp,
+                                  int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FORMAT STRING");
+        return TCL_ERROR;
+    }
+    mprintf_result(interp,
+        sqlite3_mprintf(Tcl_GetString(objv[1]), Tcl_GetString(objv[2])));
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_double FORMAT INT INT DOUBLE */
+static int TursoMprintfDoubleCmd(ClientData cd, Tcl_Interp *interp,
+                                 int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    Tcl_WideInt a[2];
+    double r;
+    int i;
+    if (objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FORMAT INT INT DOUBLE");
+        return TCL_ERROR;
+    }
+    for (i = 0; i < 2; i++) {
+        if (get_wide(interp, objv[i + 2], &a[i]) != TCL_OK) return TCL_ERROR;
+    }
+    if (Tcl_GetDoubleFromObj(interp, objv[4], &r) != TCL_OK) return TCL_ERROR;
+    mprintf_result(interp, sqlite3_mprintf(Tcl_GetString(objv[1]),
+        (int)a[0], (int)a[1], r));
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_scaled FORMAT DOUBLE DOUBLE
+ * Formats the product of the two doubles; the tests use this to reach
+ * magnitudes (e.g. 1e308) that TCL literals cannot spell exactly. */
+static int TursoMprintfScaledCmd(ClientData cd, Tcl_Interp *interp,
+                                 int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    double r[2];
+    int i;
+    if (objc != 4) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FORMAT DOUBLE DOUBLE");
+        return TCL_ERROR;
+    }
+    for (i = 0; i < 2; i++) {
+        if (Tcl_GetDoubleFromObj(interp, objv[i + 2], &r[i]) != TCL_OK) {
+            return TCL_ERROR;
+        }
+    }
+    mprintf_result(interp,
+        sqlite3_mprintf(Tcl_GetString(objv[1]), r[0] * r[1]));
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_hexdouble FORMAT HEX
+ * HEX is the 16-hex-digit IEEE-754 bit pattern of the double to format,
+ * so tests can name exact values like Inf and denormals. */
+static int TursoMprintfHexdoubleCmd(ClientData cd, Tcl_Interp *interp,
+                                    int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FORMAT HEX");
+        return TCL_ERROR;
+    }
+    const char *hex = Tcl_GetString(objv[2]);
+    unsigned long long bits = 0;
+    int i;
+    for (i = 0; hex[i]; i++) {
+        int d = hex_to_int(hex[i]);
+        if (d < 0 || i >= 16) {
+            Tcl_AppendResult(interp, "invalid hex double: ", hex, NULL);
+            return TCL_ERROR;
+        }
+        bits = (bits << 4) | (unsigned)d;
+    }
+    double r;
+    memcpy(&r, &bits, sizeof(r));
+    mprintf_result(interp, sqlite3_mprintf(Tcl_GetString(objv[1]), r));
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_z_test SEPARATOR ARG0 ARG1 ...
+ * Joins the arguments with the separator by repeatedly growing the
+ * result through the %z (format-and-free) specifier. */
+static int TursoMprintfZCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    char *result = NULL;
+    int i;
+    if (objc < 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "SEPARATOR ?ARG...?");
+        return TCL_ERROR;
+    }
+    for (i = 2; i < objc && (i == 2 || result); i++) {
+        result = sqlite3_mprintf("%z%s%s", result,
+            Tcl_GetString(objv[1]), Tcl_GetString(objv[i]));
+    }
+    mprintf_result(interp, result);
+    return TCL_OK;
+}
+
+/* sqlite3_mprintf_n_test STRING
+ * Returns the character count that a trailing %n reports. */
+static int TursoMprintfNCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    int n = 0;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "STRING");
+        return TCL_ERROR;
+    }
+    char *z = sqlite3_mprintf("%s%n", Tcl_GetString(objv[1]), &n);
+    if (z) sqlite3_free(z);
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(n));
+    return TCL_OK;
+}
+
+/* sqlite3_snprintf_int SIZE FORMAT INT
+ * The buffer is pre-filled with the alphabet so tests can verify that
+ * SIZE 0 leaves the buffer untouched. */
+static int TursoSnprintfIntCmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    char buf[100];
+    int n, x;
+    if (objc != 4) {
+        Tcl_WrongNumArgs(interp, 1, objv, "SIZE FORMAT INT");
+        return TCL_ERROR;
+    }
+    if (Tcl_GetIntFromObj(interp, objv[1], &n) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetIntFromObj(interp, objv[3], &x) != TCL_OK) return TCL_ERROR;
+    if (n > (int)sizeof(buf)) n = (int)sizeof(buf);
+    strcpy(buf, "abcdefghijklmnopqrstuvwxyz");
+    sqlite3_snprintf(n, buf, Tcl_GetString(objv[2]), x);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(buf, -1));
+    return TCL_OK;
+}
+
+/* sqlite3_snprintf_str SIZE FORMAT INT INT STRING */
+static int TursoSnprintfStrCmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    char buf[100];
+    int n, a0, a1;
+    if (objc != 6) {
+        Tcl_WrongNumArgs(interp, 1, objv, "SIZE FORMAT INT INT STRING");
+        return TCL_ERROR;
+    }
+    if (Tcl_GetIntFromObj(interp, objv[1], &n) != TCL_OK) return TCL_ERROR;
+    if (n < 0) {
+        Tcl_AppendResult(interp, "SIZE must be non-negative", NULL);
+        return TCL_ERROR;
+    }
+    if (Tcl_GetIntFromObj(interp, objv[3], &a0) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetIntFromObj(interp, objv[4], &a1) != TCL_OK) return TCL_ERROR;
+    if (n > (int)sizeof(buf)) n = (int)sizeof(buf);
+    buf[0] = '\0';
+    sqlite3_snprintf(n, buf, Tcl_GetString(objv[2]), a0, a1,
+                     Tcl_GetString(objv[5]));
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(buf, -1));
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* sqlite3 open command                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -1007,6 +1281,31 @@ int Tursotcl_Init(Tcl_Interp *interp)
     Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer",
                          TursoConnectionPointerCmd, NULL, NULL);
+
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_int",
+                         TursoMprintfIntCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_int64",
+                         TursoMprintfInt64Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_long",
+                         TursoMprintfLongCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_str",
+                         TursoMprintfStrCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_stronly",
+                         TursoMprintfStronlyCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_double",
+                         TursoMprintfDoubleCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_scaled",
+                         TursoMprintfScaledCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_hexdouble",
+                         TursoMprintfHexdoubleCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_z_test",
+                         TursoMprintfZCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_mprintf_n_test",
+                         TursoMprintfNCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_snprintf_int",
+                         TursoSnprintfIntCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_snprintf_str",
+                         TursoSnprintfStrCmd, NULL, NULL);
 
     /* Link the global B-tree search counter so TCL tests can read/reset it. */
     Tcl_LinkVar(interp, "sqlite_search_count",

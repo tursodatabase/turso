@@ -218,6 +218,48 @@ set ptrerr [catch {sqlite3_connection_pointer nosuchdb} ptrmsg]
 assert_eq "sqlite3_connection_pointer errors on an unknown handle" 1 $ptrerr
 
 # ---------------------------------------------------------------------------
+# Probe 10: the [sqlite3_mprintf_*] / [sqlite3_snprintf_*] commands.
+# Each formats through the real sqlite3_mprintf/sqlite3_snprintf C API, so
+# these expectations (taken from upstream printf.test) exercise the engine's
+# printf implementation.
+# ---------------------------------------------------------------------------
+
+assert_eq "mprintf_int formats three ints" \
+    {This is a test 1,2,3} \
+    [sqlite3_mprintf_int {This is a test %d,%d,%d} 1 2 3]
+assert_eq "mprintf_int honors width and zero-pad flags" \
+    {abc: (000012) (00000d) (000016) :xyz} \
+    [sqlite3_mprintf_int {abc: (%06d) (%06x) (%06o) :xyz} 12 13 14]
+assert_eq "mprintf_int64 formats past 32 bits" \
+    {2147483647 2147483648 4294967296} \
+    [sqlite3_mprintf_int64 {%lld %lld %lld} 2147483647 2147483648 4294967296]
+assert_eq "mprintf_long truncates each argument to 32 bits" \
+    {2147483647 2147483648 4294967295} \
+    [sqlite3_mprintf_long {%lu %lu %lu} 0x7fffffff 0x80000000 0xffffffff]
+assert_eq "mprintf_str formats two ints and a string" \
+    {1 2 A String: (This is the string)} \
+    [sqlite3_mprintf_str {%d %d A String: (%s)} 1 2 {This is the string}]
+assert_eq "mprintf_str passes NULL when the string is omitted" \
+    {1 2 A NULL pointer in %q: '(NULL)'} \
+    [sqlite3_mprintf_str {%d %d A NULL pointer in %%q: '%q'} 1 2]
+assert_eq "mprintf_stronly quotes via %q" \
+    {Hi Y''all} [sqlite3_mprintf_stronly %q {Hi Y'all}]
+assert_eq "mprintf_double formats two ints and a double" \
+    {1 2 3.5} [sqlite3_mprintf_double {%d %d %g} 1 2 3.5]
+assert_eq "mprintf_scaled formats the product of its doubles" \
+    {A double: 1e+308} [sqlite3_mprintf_scaled {A double: %g} 1.0e307 10.0]
+assert_eq "mprintf_hexdouble decodes an IEEE-754 bit pattern" \
+    {10.00000000000000000000} [sqlite3_mprintf_hexdouble %.20f 4024000000000000]
+assert_eq "mprintf_z_test joins arguments via %z" \
+    {,one,two,three} [sqlite3_mprintf_z_test , one two three]
+assert_eq "snprintf_int truncates to SIZE-1 characters" \
+    {1234} [sqlite3_snprintf_int 5 {12345} 0]
+assert_eq "snprintf_int leaves the buffer alone when SIZE is 0" \
+    {abcdefghijklmnopqrstuvwxyz} [sqlite3_snprintf_int 0 {} 0]
+assert_eq "snprintf_str truncates to SIZE-1 characters" \
+    {x10 1} [sqlite3_snprintf_str 6 {x%d %d %s} 10 10 {This is the string}]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
