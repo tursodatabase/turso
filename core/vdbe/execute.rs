@@ -3440,8 +3440,9 @@ pub fn halt(
         SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
         SQLITE_FULL => Some(LimboError::DatabaseFull(description.to_string())),
         // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
-        // Use InternalError so abort() doesn't apply ON CONFLICT resolution to it.
-        SQLITE_ERROR => Some(LimboError::InternalError(description.to_string())),
+        // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
+        // ON CONFLICT resolution to it.
+        SQLITE_ERROR => Some(LimboError::SqlError(description.to_string())),
         _ => Some(LimboError::Constraint(format!(
             "undocumented halt error code {description}"
         ))),
