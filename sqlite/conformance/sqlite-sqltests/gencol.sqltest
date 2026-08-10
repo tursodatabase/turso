@@ -2531,6 +2531,114 @@ expect @js {
     test|4658494526751244000|4658494526751244126
 }
 
+@skip-if sqlite "sqlite doesn't use covering indexes with virtual columns"
+test gencol_index_on_virtual_is_covering_query_plan {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v INTEGER AS (a * 2 + b));
+    CREATE INDEX idx_v ON t1(v);
+    EXPLAIN QUERY PLAN SELECT v FROM t1;
+    EXPLAIN QUERY PLAN SELECT v FROM t1 WHERE v > 5;
+}
+expect {
+    1|0|0|SCAN t1 USING COVERING INDEX idx_v
+    1|0|0|SEARCH t1 USING INDEX idx_v (v>?)
+}
+
+@skip-if sqlite "sqlite doesn't use covering indexes with virtual columns"
+test gencol_composite_index_with_virtual_is_covering_query_plan {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v INTEGER AS (a * 2 + b));
+    CREATE INDEX idx_va ON t1(v, a);
+    EXPLAIN QUERY PLAN SELECT v, a FROM t1 WHERE v > 5;
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX idx_va (v>?)
+}
+
+@cross-check-integrity
+test gencol_indexed_virtual_read_values {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v INTEGER AS (a * 2 + b));
+    CREATE INDEX idx_v ON t1(v);
+    INSERT INTO t1(a, b) VALUES (1, 2), (3, 4), (NULL, 7), (2, NULL);
+    SELECT v, typeof(v) FROM t1 WHERE v > 5;
+    SELECT count(*) FROM t1 WHERE v IS NULL;
+    SELECT v FROM t1 WHERE v IS NOT NULL ORDER BY v;
+}
+expect {
+    10|integer
+    2
+    4
+    10
+}
+
+@cross-check-integrity
+test gencol_composite_index_with_virtual_read_values {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v INTEGER AS (a * 2 + b));
+    CREATE INDEX idx_va ON t1(v, a);
+    INSERT INTO t1(a, b) VALUES (1, 2), (3, 4), (10, 5);
+    SELECT v, a FROM t1 WHERE v > 5 ORDER BY v;
+    SELECT v, a, b FROM t1 WHERE v BETWEEN 4 AND 30 ORDER BY v;
+}
+expect {
+    10|3
+    25|10
+    4|1|2
+    10|3|4
+    25|10|5
+}
+
+@cross-check-integrity
+test gencol_indexed_virtual_real_affinity_read {
+    CREATE TABLE t1(x REAL, w REAL AS (x + 1));
+    CREATE INDEX idx_w ON t1(w);
+    INSERT INTO t1(x) VALUES (1), (2.5), (7);
+    SELECT w, typeof(w) FROM t1 WHERE w > 0 ORDER BY w;
+}
+expect {
+    2.0|real
+    3.5|real
+    8.0|real
+}
+expect @js {
+    2|real
+    3.5|real
+    8|real
+}
+
+@cross-check-integrity
+test gencol_indexed_virtual_text_affinity_read {
+    CREATE TABLE t1(p TEXT, q TEXT AS (upper(p)));
+    CREATE INDEX idx_q ON t1(q);
+    INSERT INTO t1(p) VALUES ('abc'), ('Zed'), (NULL);
+    SELECT q, typeof(q) FROM t1 WHERE q > '' ORDER BY q;
+}
+expect {
+    ABC|text
+    ZED|text
+}
+
+test gencol_indexed_virtual_left_join_unmatched_is_null {
+    CREATE TABLE probe(k INTEGER);
+    CREATE TABLE t1(m INTEGER, n INTEGER AS (coalesce(m, 42)));
+    CREATE INDEX idx_n ON t1(n);
+    INSERT INTO t1(m) VALUES (1), (NULL), (5);
+    INSERT INTO probe VALUES (5), (10);
+    SELECT probe.k, t1.n FROM probe LEFT JOIN t1 INDEXED BY idx_n ON t1.n = probe.k ORDER BY probe.k;
+}
+expect {
+    5|5
+    10|
+}
+
+@cross-check-integrity
+test gencol_indexed_virtual_aggregate_over_index {
+    CREATE TABLE t1(a INTEGER, b INTEGER, v INTEGER AS (a * 2 + b));
+    CREATE INDEX idx_v ON t1(v);
+    INSERT INTO t1(a, b) VALUES (1, 2), (3, 4), (10, 5);
+    SELECT sum(v), count(v), max(v) FROM t1 WHERE v > 4;
+}
+expect {
+    35|2|25
+}
+
 # --- Expression indexes on VIRTUAL columns ---
 
 @cross-check-integrity

@@ -2375,26 +2375,12 @@ pub fn translate_expr(
                         let is_btree_index = index_cursor_id.is_some_and(|cid| {
                             program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
                         });
-                        // For non-outer-scope reads: an index can supply a
-                        // column's value only when the index actually
-                        // stores it. Presence in the index's column list
-                        // (`column_table_pos_to_index_pos`) is necessary
-                        // but not sufficient for VIRTUAL generated
-                        // columns — the index has a slot but the value
-                        // is only materialized when the index is
-                        // covering. For stored columns the slot implies
-                        // the value, so any in-index hit is fine.
                         let read_from_index = if is_from_outer_query_scope {
                             is_btree_index
                         } else if is_btree_index {
-                            let column_is_in_index = index.as_ref().is_some_and(|idx| {
+                            index.as_ref().is_some_and(|idx| {
                                 idx.column_table_pos_to_index_pos(*column).is_some()
-                            });
-                            let column_is_virtual = matches!(
-                                table.get_column_at(*column).map(|c| c.generated_type()),
-                                Some(GeneratedType::Virtual { .. })
-                            );
-                            column_is_in_index && (!column_is_virtual || use_covering_index)
+                            })
                         } else {
                             false
                         };
