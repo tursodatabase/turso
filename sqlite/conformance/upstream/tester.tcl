@@ -75,6 +75,15 @@ if {![info exists ::tcl_precision]} {
 proc breakpoint {} {}
 proc do_not_use_codec {} {}
 
+# Name of the current test permutation, as in upstream tester.tcl. We only
+# run the default configuration, so this is "" unless a permutation script
+# sets G(perm:name).
+proc permutation {} {
+  set perm ""
+  catch {set perm $::G(perm:name)}
+  set perm
+}
+
 # Modern SQLite builds default to schema file format 4; upstream tests
 # read this to decide format-dependent expectations.
 if {![info exists ::SQLITE_DEFAULT_FILE_FORMAT]} {
