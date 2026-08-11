@@ -558,17 +558,37 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
         // root_page -> table_id reverse lookup snapshot-consistent. See `retired_rootpages`.
         let snapshot_ts = db.read_snapshot_ts(tx_id);
-        let table_id = if connection.experimental_mvcc_passive_checkpoint_enabled() {
-            // Under PASSIVE checkpointing a transaction can capture a schema cookie older than
-            // the drop committed within its own snapshot (the drop publishes its cookie after
-            // the transaction reads the header, even though the drop's commit ts precedes the
-            // transaction's begin ts). The compiled cursor then points at a positive root page
-            // its snapshot already sees dropped. That is a stale-schema read, not an invariant
-            // violation: reprepare against the current schema instead of panicking.
-            db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
-                .ok_or(LimboError::SchemaUpdated)?
-        } else {
-            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+        // Resolve the positive root page to a table id. An absent binding must NOT panic at this
+        // public-API boundary, but the two checkpoint modes reach it with different semantics:
+        //
+        //   - PASSIVE checkpointing has a documented window where a transaction captures a schema
+        //     cookie older than a drop committed within its own snapshot (the drop publishes its
+        //     cookie after the transaction reads the header, even though the drop's commit ts
+        //     precedes the transaction's begin ts). The compiled cursor then points at a positive
+        //     root page its snapshot already sees dropped. That is a *recoverable* stale-schema
+        //     read: `SchemaUpdated` reprepares against the current schema and succeeds.
+        //
+        //   - Without passive checkpointing there is no such window. Ordinary schema changes bump
+        //     `schema_version` and checkpoint root republication is caught by
+        //     `mvcc_schema_requires_reprepare_before_tx`, both of which force reprepare *before*
+        //     transaction state is opened; and rootpage-mapping GC only reclaims bindings below
+        //     every live reader's snapshot. So a live reader reaching here with no binding is an
+        //     internal-consistency violation (or unsupported concurrent-engine access to one
+        //     file), not a stale read. Reporting `SchemaUpdated` would be wrong: reprepare would
+        //     regenerate the same cursor against the same missing binding and loop forever. Surface
+        //     a typed error so the operation fails inside the engine's `Result` contract instead.
+        let table_id = match db
+            .try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+        {
+            Some(table_id) => table_id,
+            None if connection.experimental_mvcc_passive_checkpoint_enabled() => {
+                return Err(LimboError::SchemaUpdated);
+            }
+            None => {
+                return Err(LimboError::InternalError(format!(
+                    "positive root page {root_page_or_table_id} has no table-id binding at snapshot {snapshot_ts}"
+                )));
+            }
         };
         Ok(Self {
             db,
