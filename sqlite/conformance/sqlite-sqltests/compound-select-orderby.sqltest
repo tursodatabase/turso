@@ -595,6 +595,26 @@ expect {
     80
 }
 
+@setup schema
+test union-all-order-by-qualified-result-column {
+    SELECT t1.b FROM t1
+    UNION ALL
+    SELECT t2.b FROM t2
+    ORDER BY t1.b;
+}
+expect {
+    apple
+    banana
+    banana
+    cherry
+    date
+    date
+    elderberry
+    fig
+    grape
+    honeydew
+}
+
 # ===== Compound with NULLs + ORDER BY =====
 
 @setup schema

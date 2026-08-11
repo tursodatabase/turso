@@ -1460,6 +1460,7 @@ fn prepare_recursive_cte_plan(
         &select.order_by,
         &initial_query,
         &recursive_query,
+        resolver,
     )?;
     let (limit, offset) = select
         .limit
