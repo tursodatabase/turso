@@ -31,6 +31,59 @@ test('in-memory-db-async', async () => {
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
 })
 
+test('busy timeout gives up on time when the write lock is never released', async () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        const conn1 = await connect(path);
+        await conn1.exec("CREATE TABLE t(x)");
+        const conn2 = await connect(path, { timeout: 200 });
+
+        await conn1.exec("BEGIN");
+        await conn1.exec("INSERT INTO t VALUES (1)");
+
+        // conn1 never commits, so conn2 must retry for the whole 200ms budget
+        // and then surface the busy error — not fail fast, not hang. The
+        // backoff sleeps add up to exactly 200ms (measured ~205ms with timer
+        // slop); the upper bound only leaves room for slow CI timers.
+        const start = performance.now();
+        await expect(conn2.exec("INSERT INTO t VALUES (2)")).rejects.toThrow(/locked/);
+        const elapsed = performance.now() - start;
+        expect(elapsed).toBeGreaterThanOrEqual(190);
+        expect(elapsed).toBeLessThan(500);
+
+        await conn1.exec("ROLLBACK");
+    } finally {
+        unlinkSync(path);
+        unlinkSync(`${path}-wal`);
+    }
+})
+
+test('busy timeout sleeps instead of blocking the event loop', async () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        const conn1 = await connect(path);
+        await conn1.exec("CREATE TABLE t(x)");
+        const conn2 = await connect(path, { timeout: 5000 });
+
+        await conn1.exec("BEGIN");
+        await conn1.exec("INSERT INTO t VALUES (1)");
+
+        // conn2 hits conn1's write lock. Its step loop must park on a timer
+        // (STEP_SLEEP) and yield the event loop, or the timer below never
+        // fires, the lock is never released, and this test times out.
+        const blocked = conn2.exec("INSERT INTO t VALUES (2)");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await conn1.exec("COMMIT");
+        await blocked;
+
+        const stmt = await conn1.prepare("SELECT COUNT(*) as cnt FROM t");
+        expect(await stmt.all()).toEqual([{ cnt: 2 }]);
+    } finally {
+        unlinkSync(path);
+        unlinkSync(`${path}-wal`);
+    }
+})
+
 test('exec multiple statements', async () => {
     const db = await connect(":memory:");
     await db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
