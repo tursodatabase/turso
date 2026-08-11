@@ -48,38 +48,50 @@ function mainImports(worker: Worker, completeOpfs: (c: any, r: any) => void): Br
             return false;
         },
         write_async(handle, ptr, len, offset, c) {
+            ioNotifier.opStarted();
             writeFileAtWorker(worker, handle, ptr, len, offset)
                 .then(result => {
+                    ioNotifier.opFinished();
                     completeOpfs(c, result);
                 }, err => {
                     console.error('write_async', err);
+                    ioNotifier.opFinished();
                     completeOpfs(c, -1);
                 });
         },
         sync_async(handle, c) {
+            ioNotifier.opStarted();
             syncFileAtWorker(worker, handle)
                 .then(result => {
+                    ioNotifier.opFinished();
                     completeOpfs(c, result);
                 }, err => {
                     console.error('sync_async', err);
+                    ioNotifier.opFinished();
                     completeOpfs(c, -1);
                 });
         },
         read_async(handle, ptr, len, offset, c) {
+            ioNotifier.opStarted();
             readFileAtWorker(worker, handle, ptr, len, offset)
                 .then(result => {
+                    ioNotifier.opFinished();
                     completeOpfs(c, result);
                 }, err => {
                     console.error('read_async', err);
+                    ioNotifier.opFinished();
                     completeOpfs(c, -1);
                 });
         },
         truncate_async(handle, len, c) {
+            ioNotifier.opStarted();
             truncateFileAtWorker(worker, handle, len)
                 .then(result => {
+                    ioNotifier.opFinished();
                     completeOpfs(c, result);
                 }, err => {
                     console.error('truncate_async', err);
+                    ioNotifier.opFinished();
                     completeOpfs(c, -1);
                 });
         },
@@ -463,10 +475,32 @@ async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Pr
     return __napiModule;
 }
 
+// Wakes up statements that returned STEP_IO and are waiting for OPFS I/O.
+//
+// Core can also return an I/O step result when no OPFS operation is in
+// flight and it just wants to be stepped again — for example while a busy
+// handler waits for its timeout. In that case no completion is coming, so
+// parking the caller on the waiter list would hang the statement forever
+// (https://github.com/tursodatabase/turso/issues/8171). The notifier counts
+// operations that are in flight; when there are none, waitForCompletion()
+// yields to the event loop with setTimeout(0) so the caller re-steps the
+// statement instead of parking.
 class IONotifier {
     private waiters: Array<() => void> = [];
+    private pendingOps: number = 0;
+
+    opStarted() {
+        this.pendingOps += 1;
+    }
+
+    opFinished() {
+        this.pendingOps -= 1;
+    }
 
     waitForCompletion(): Promise<void> {
+        if (this.pendingOps === 0) {
+            return new Promise(resolve => setTimeout(resolve, 0));
+        }
         return new Promise(resolve => {
             this.waiters.push(resolve);
         });
