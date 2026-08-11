@@ -72,3 +72,31 @@ test strict-not-null-still-enforced {
 }
 expect error {
 }
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test strict-combined-with-without-rowid {
+    CREATE TABLE t7 (a INT PRIMARY KEY, b TEXT) WITHOUT ROWID, STRICT;
+    INSERT INTO t7 VALUES (1, 'x');
+    SELECT a, b FROM t7;
+}
+expect {
+    1|x
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test strict-combined-with-without-rowid-reverse-order {
+    CREATE TABLE t8 (a INT PRIMARY KEY, b TEXT) STRICT, WITHOUT ROWID;
+    INSERT INTO t8 VALUES (1, 'x');
+    SELECT a, b FROM t8;
+}
+expect {
+    1|x
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test strict-type-check-enforced-on-without-rowid-table {
+    CREATE TABLE t9 (a INT PRIMARY KEY, b TEXT) WITHOUT ROWID, STRICT;
+    INSERT INTO t9 VALUES ('abc', 'x');
+}
+expect error {
+}

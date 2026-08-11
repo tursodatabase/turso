@@ -292,3 +292,33 @@ fn test_drop_broken_legacy_view_row() -> anyhow::Result<()> {
     assert_eq!(rows, vec![(42,)]);
     Ok(())
 }
+
+/// WITHOUT ROWID tables are not supported in MVCC mode. The CREATE must be
+/// rejected up front; rejecting only at cursor-open time used to leave a
+/// schema row for a table that could never be opened.
+#[test]
+fn test_create_without_rowid_table_rejected_in_mvcc() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let conn = tmp_db.connect_limbo();
+
+    for sql in [
+        "CREATE TABLE t (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID",
+        "CREATE TABLE t (key TEXT PRIMARY KEY, value TEXT) STRICT, WITHOUT ROWID",
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("WITHOUT ROWID tables are not supported in MVCC mode"),
+            "{err}"
+        );
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM sqlite_schema WHERE name = 't'");
+        assert_eq!(
+            rows,
+            vec![(0,)],
+            "failed CREATE must not leave a schema row"
+        );
+    }
+    Ok(())
+}
