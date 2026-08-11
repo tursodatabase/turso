@@ -1,8 +1,10 @@
 use crate::schema::Index;
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
+use turso_parser::ast;
 
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;
@@ -12,6 +14,40 @@ use super::cost_params::CostModelParams;
 /// This is used to estimate the cost of scans, seeks, and joins.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Cost(pub f64);
+
+/// Count the operations needed to check one `WHERE` expression.
+pub fn where_expr_steps(expr: &ast::Expr) -> usize {
+    let mut steps = 0;
+    walk_expr(expr, &mut |expr| {
+        steps += where_node_steps(expr);
+        Ok(WalkControl::Continue)
+    })
+    .expect("counting WHERE operations cannot fail");
+    steps.max(1)
+}
+
+pub fn where_node_steps(expr: &ast::Expr) -> usize {
+    match expr {
+        ast::Expr::Between { .. } => 2,
+        ast::Expr::InList { rhs, .. } => rhs.len().max(1),
+        ast::Expr::Case {
+            when_then_pairs, ..
+        } => when_then_pairs.len().max(1),
+        ast::Expr::Register(_)
+        | ast::Expr::Collate(..)
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Id(_)
+        | ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Literal(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::Parenthesized(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Variable(_)
+        | ast::Expr::Default => 0,
+        _ => 1,
+    }
+}
 
 impl std::ops::Add for Cost {
     type Output = Cost;
@@ -96,6 +132,27 @@ fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelPar
     let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
 
     Cost(io_cost + cpu_cost)
+}
+
+/// Estimate the work to add every row to a new in-memory index.
+///
+/// Each insert searches the part of the index that was already built. A
+/// balanced index needs about log2(rows) comparisons per insert.
+pub(super) fn estimate_ephemeral_index_build_cost(
+    row_count: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let comparisons_per_row = row_count.max(2.0).log2();
+    Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek)
+}
+
+/// Estimate how many B-tree levels an index search reads.
+pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
+    if row_count <= 1.0 {
+        1.0
+    } else {
+        (row_count.ln() / rows_per_page.ln()).ceil().max(1.0)
+    }
 }
 
 /// Estimate IO and CPU cost for index-based access.
@@ -350,13 +407,7 @@ pub fn estimate_cost_for_scan_or_seek(
 ) -> Cost {
     let base_row_count = *base_row_count;
 
-    let tree_depth = if base_row_count <= 1.0 {
-        1.0
-    } else {
-        (base_row_count.ln() / params.rows_per_table_page.ln())
-            .ceil()
-            .max(1.0)
-    };
+    let tree_depth = estimate_btree_depth(base_row_count, params.rows_per_table_page);
 
     let Some(index_info) = index_info else {
         // Full table scan (no index)

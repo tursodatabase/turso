@@ -1,4 +1,4 @@
-use crate::schema::{impl_effective_nulls_order, IndexColumn, Table};
+use crate::schema::{impl_effective_nulls_order, Table};
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
@@ -6,12 +6,14 @@ use crate::{
         collate::{get_collseq_from_expr, CollationSeq},
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
-        optimizer::constraints::RangeConstraintRef,
+        optimizer::constraints::{
+            usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
+        },
         plan::{
             GroupBy, HashJoinType, IterationDirection, JoinedTable, Operation, Plan, Scan,
             SimpleAggregate, TableReferences,
         },
-        planner::table_mask_from_expr,
+        planner::{table_mask_from_expr, TableMask},
     },
     util::exprs_are_equivalent,
 };
@@ -240,6 +242,7 @@ pub fn plan_satisfies_order_target(
     plan: &JoinN,
     access_methods_arena: &[AccessMethod],
     joined_tables: &[JoinedTable],
+    table_constraints: &[TableConstraints],
     order_target: &OrderTarget,
     schema: &Schema,
 ) -> bool {
@@ -254,6 +257,7 @@ pub fn plan_satisfies_order_target(
     }
 
     let mut target_col_idx = 0;
+    let mut prior_tables = TableMask::default();
     let num_cols_in_order_target = order_target.columns.len();
     for (loop_pos, (table_index, access_method_index)) in plan.data.iter().enumerate() {
         let access_method = &access_methods_arena[*access_method_index];
@@ -279,17 +283,37 @@ pub fn plan_satisfies_order_target(
             AccessMethodParams::BTreeTable {
                 iter_dir,
                 index: index_opt,
+                build_index,
                 constraint_refs,
-            } => btree_access_order_consumed(
-                table_ref,
-                *iter_dir,
-                index_opt.as_deref(),
-                constraint_refs,
-                order_target,
-                target_col_idx,
-                schema,
-                EqualityPrefixScope::ConstantEquality,
-            ),
+            } => {
+                if *build_index {
+                    let constraint_refs = usable_constraints_for_lhs_mask(
+                        &table_constraints[*table_index].constraints,
+                        &table_constraints[*table_index].temporary_index_terms,
+                        &prior_tables,
+                        *table_index,
+                    );
+                    temporary_index_order_consumed(
+                        table_ref,
+                        *iter_dir,
+                        &constraint_refs,
+                        order_target,
+                        target_col_idx,
+                        schema,
+                    )
+                } else {
+                    btree_access_order_consumed(
+                        table_ref,
+                        *iter_dir,
+                        index_opt.as_deref(),
+                        constraint_refs,
+                        order_target,
+                        target_col_idx,
+                        schema,
+                        EqualityPrefixScope::ConstantEquality,
+                    )
+                }
+            }
             AccessMethodParams::MaterializedSubquery {
                 index,
                 constraint_refs,
@@ -352,6 +376,9 @@ pub fn plan_satisfies_order_target(
         {
             return false;
         }
+        prior_tables
+            .set(*table_index)
+            .expect("a plan cannot contain more than the table limit");
     }
     target_col_idx == num_cols_in_order_target
 }
@@ -374,9 +401,13 @@ fn access_method_emits_unique_order_prefix(
     match &access_method.params {
         AccessMethodParams::BTreeTable {
             index,
+            build_index,
             constraint_refs,
             ..
-        } => is_unique_point_lookup(index_info_for_access(index.as_deref()), constraint_refs),
+        } => {
+            !*build_index
+                && is_unique_point_lookup(index_info_for_access(index.as_deref()), constraint_refs)
+        }
         AccessMethodParams::MaterializedSubquery {
             index,
             constraint_refs,
@@ -725,15 +756,39 @@ fn expr_to_column_order(
     })
 }
 
-fn target_matches_index_column(
+/// The index column values needed to check its row order.
+#[derive(Clone, Copy)]
+struct IndexOrderColumn<'a> {
+    pos_in_table: usize,
+    order: SortOrder,
+    nulls_order: Option<ast::NullsOrder>,
+    collation: Option<CollationSeq>,
+    expr: Option<&'a ast::Expr>,
+}
+
+impl IndexOrderColumn<'_> {
+    /// Return the NULL order for this scan direction.
+    fn nulls_order(self, iter_dir: IterationDirection) -> ast::NullsOrder {
+        let nulls_order = self
+            .nulls_order
+            .unwrap_or_else(|| ast::NullsOrder::default_for(self.order));
+        match iter_dir {
+            IterationDirection::Forwards => nulls_order,
+            IterationDirection::Backwards => nulls_order.reverse(),
+        }
+    }
+}
+
+/// Return true when an order term names this index column.
+fn target_matches_order_column(
     target_col: &ColumnOrder,
-    idx_col: &IndexColumn,
+    idx_col: IndexOrderColumn<'_>,
     table_ref: &JoinedTable,
 ) -> bool {
     if target_col.table_id != table_ref.internal_id {
         return false;
     }
-    match (&target_col.target, &idx_col.expr) {
+    match (&target_col.target, idx_col.expr) {
         (ColumnTarget::Column(col_no), _) => idx_col.pos_in_table == *col_no,
         (ColumnTarget::Expr(expr), Some(idx_expr)) => {
             let target_expr = unsafe { &**expr };
@@ -830,122 +885,197 @@ pub(super) fn btree_access_order_consumed(
                 includes_rowid: correct_order,
             }
         }
-        Some(index) => {
-            let mut col_idx = 0;
-            let mut idx_pos = 0;
-            let mut includes_rowid = false;
-            let target_is_rowid = |target_col: &ColumnOrder| match target_col.target {
-                ColumnTarget::RowId => true,
-                ColumnTarget::Column(col_no) => rowid_alias_col == Some(col_no),
-                ColumnTarget::Expr(_) => false,
-            };
-            while col_idx < target_columns.len() && idx_pos < index.columns.len() {
-                let target_col = &target_columns[col_idx];
-                if target_col.table_id != table_ref.internal_id {
-                    break;
-                }
+        Some(index) => index_columns_order_consumed(
+            table_ref,
+            iter_dir,
+            constraint_refs,
+            order_target,
+            target_columns,
+            schema,
+            equality_prefix_scope,
+            index.columns.iter().map(|column| IndexOrderColumn {
+                pos_in_table: column.pos_in_table,
+                order: column.order,
+                nulls_order: column.nulls_order,
+                collation: column.collation,
+                expr: column.expr.as_deref(),
+            }),
+            index.columns.len(),
+            index.has_rowid,
+            rowid_alias_col,
+        ),
+    }
+}
 
-                let idx_col = &index.columns[idx_pos];
-                let eq_prefix_usable = constraint_refs.iter().any(|constraint| {
-                    constraint.index_col_pos == idx_pos
-                        && constraint.eq.as_ref().is_some_and(|eq| {
-                            equality_prefix_scope == EqualityPrefixScope::AnyEquality || eq.is_const
-                        })
-                });
-                if eq_prefix_usable {
-                    // Equality-constrained prefix columns produce a single value
-                    // per seek, so they do not disturb the ordering of the
-                    // remaining suffix. If the ORDER BY / GROUP BY also mentions
-                    // the same column with the same collation, that target term
-                    // is satisfied trivially and can be consumed here too.
-                    if target_matches_index_column(target_col, idx_col, table_ref) {
-                        let same_collation =
-                            target_col.collation == idx_col.collation.unwrap_or_default();
-                        if !same_collation {
-                            break;
-                        }
-                        col_idx += 1;
-                    }
-                    idx_pos += 1;
-                    continue;
-                }
+/// Check the order supplied by a temporary index without building its columns.
+fn temporary_index_order_consumed(
+    table_ref: &JoinedTable,
+    iter_dir: IterationDirection,
+    constraint_refs: &[RangeConstraintRef],
+    order_target: &OrderTarget,
+    start_col: usize,
+    schema: &Schema,
+) -> OrderConsumption {
+    let target_columns = &order_target.columns[start_col..];
+    if target_columns.is_empty() {
+        return OrderConsumption::NONE;
+    }
+    let columns = table_ref.columns();
+    let column_count = columns
+        .iter()
+        .enumerate()
+        .filter(|(column_idx, _)| table_ref.column_is_used(*column_idx))
+        .count();
+    let rowid_alias_col = columns.iter().position(|column| column.is_rowid_alias());
+    let key_columns = constraint_refs.iter().map(|constraint| {
+        constraint
+            .table_col_pos
+            .expect("a temporary index key must name a table column")
+    });
+    let other_columns = columns
+        .iter()
+        .enumerate()
+        .filter(|(column_pos, _)| table_ref.column_is_used(*column_pos))
+        .filter(|(column_pos, _)| {
+            !constraint_refs
+                .iter()
+                .any(|constraint| constraint.table_col_pos == Some(*column_pos))
+        })
+        .map(|(column_pos, _)| column_pos);
+    let index_columns = key_columns.chain(other_columns).map(|column_pos| {
+        let column = &columns[column_pos];
+        IndexOrderColumn {
+            pos_in_table: column_pos,
+            order: SortOrder::Asc,
+            nulls_order: None,
+            collation: column.collation_opt(),
+            expr: column.generated_expr(),
+        }
+    });
 
-                if !target_matches_index_column(target_col, idx_col, table_ref) {
-                    break;
-                }
+    index_columns_order_consumed(
+        table_ref,
+        iter_dir,
+        constraint_refs,
+        order_target,
+        target_columns,
+        schema,
+        EqualityPrefixScope::ConstantEquality,
+        index_columns,
+        column_count,
+        table_ref.table.btree().is_some_and(|table| table.has_rowid),
+        rowid_alias_col,
+    )
+}
 
-                // Custom type columns store encoded blobs. The B-tree's bytewise
-                // ordering does not match the custom type's semantic ordering, so
-                // the index cannot satisfy ORDER BY for those columns.
-                if let ColumnTarget::Column(col_no) = &target_col.target {
-                    if let Some(col) = table_ref.table.columns().get(*col_no) {
-                        if schema
-                            .get_type_def(&col.ty_str, table_ref.table.is_strict())
-                            .is_some()
-                        {
-                            break;
-                        }
-                    }
-                }
-
+/// Return how many order terms these index columns supply.
+#[allow(clippy::too_many_arguments)]
+fn index_columns_order_consumed<'a>(
+    table_ref: &JoinedTable,
+    iter_dir: IterationDirection,
+    constraint_refs: &[RangeConstraintRef],
+    order_target: &OrderTarget,
+    target_columns: &[ColumnOrder],
+    schema: &Schema,
+    equality_prefix_scope: EqualityPrefixScope,
+    index_columns: impl Iterator<Item = IndexOrderColumn<'a>>,
+    column_count: usize,
+    has_rowid: bool,
+    rowid_alias_col: Option<usize>,
+) -> OrderConsumption {
+    let mut col_idx = 0;
+    let mut matched_columns = 0;
+    let mut index_columns = index_columns.enumerate();
+    let mut includes_rowid = false;
+    let target_is_rowid = |target_col: &ColumnOrder| match target_col.target {
+        ColumnTarget::RowId => true,
+        ColumnTarget::Column(col_no) => rowid_alias_col == Some(col_no),
+        ColumnTarget::Expr(_) => false,
+    };
+    while col_idx < target_columns.len() {
+        let Some((idx_pos, idx_col)) = index_columns.next() else {
+            break;
+        };
+        let target_col = &target_columns[col_idx];
+        if target_col.table_id != table_ref.internal_id {
+            break;
+        }
+        let eq_prefix_usable = constraint_refs.iter().any(|constraint| {
+            constraint.index_col_pos == idx_pos
+                && constraint.eq.as_ref().is_some_and(|eq| {
+                    equality_prefix_scope == EqualityPrefixScope::AnyEquality || eq.is_const
+                })
+        });
+        if eq_prefix_usable {
+            if target_matches_order_column(target_col, idx_col, table_ref) {
                 if target_col.collation != idx_col.collation.unwrap_or_default() {
                     break;
                 }
+                col_idx += 1;
+            }
+            matched_columns += 1;
+            continue;
+        }
 
-                let correct_order_for_direction = if iter_dir == IterationDirection::Forwards {
-                    target_col.order == idx_col.order
-                } else {
-                    target_col.order != idx_col.order
-                };
-                if !correct_order_for_direction {
+        if !target_matches_order_column(target_col, idx_col, table_ref) {
+            break;
+        }
+
+        // Custom type columns store encoded blobs. The B-tree's byte order
+        // does not match the custom type's order.
+        if let ColumnTarget::Column(col_no) = &target_col.target {
+            if let Some(col) = table_ref.table.columns().get(*col_no) {
+                if schema
+                    .get_type_def(&col.ty_str, table_ref.table.is_strict())
+                    .is_some()
+                {
                     break;
                 }
-
-                // An index scan delivers NULLs in a known position: by
-                // default NULLs come first on a forward scan and last on a
-                // reverse scan, and an explicit NULLS FIRST/LAST on the index
-                // column flips that. If the scan delivers NULLs in a different
-                // position than the query requests, the index cannot satisfy
-                // the ordering and we must fall back to a sorter. MIN/MAX skip
-                // NULLs entirely, so for them the position does not matter.
-                if !order_target.is_extremum() {
-                    let requested_nulls = target_col.effective_nulls_order();
-                    let effective_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
-                    if requested_nulls != effective_nulls {
-                        break;
-                    }
-                }
-
-                if target_is_rowid(target_col) {
-                    // The index explicitly contains the rowid alias column.
-                    includes_rowid = true;
-                }
-                col_idx += 1;
-                idx_pos += 1;
-            }
-
-            // SQLite-style rowid tables keep equal secondary-index keys ordered
-            // by rowid. That implicit suffix can satisfy one extra ORDER BY term.
-            if col_idx < target_columns.len() && idx_pos == index.columns.len() && index.has_rowid {
-                let target_col = &target_columns[col_idx];
-                let correct_order = if iter_dir == IterationDirection::Forwards {
-                    target_col.order == SortOrder::Asc
-                } else {
-                    target_col.order == SortOrder::Desc
-                };
-                if target_col.table_id == table_ref.internal_id
-                    && target_is_rowid(target_col)
-                    && correct_order
-                {
-                    col_idx += 1;
-                    includes_rowid = true;
-                }
-            }
-
-            OrderConsumption {
-                consumed: col_idx,
-                includes_rowid,
             }
         }
+
+        if target_col.collation != idx_col.collation.unwrap_or_default() {
+            break;
+        }
+        let correct_order = if iter_dir == IterationDirection::Forwards {
+            target_col.order == idx_col.order
+        } else {
+            target_col.order != idx_col.order
+        };
+        if !correct_order {
+            break;
+        }
+        if !order_target.is_extremum()
+            && target_col.effective_nulls_order() != idx_col.nulls_order(iter_dir)
+        {
+            break;
+        }
+        if target_is_rowid(target_col) {
+            includes_rowid = true;
+        }
+        col_idx += 1;
+        matched_columns += 1;
+    }
+
+    // Rowid tables keep equal secondary-index keys ordered by rowid.
+    if col_idx < target_columns.len() && matched_columns == column_count && has_rowid {
+        let target_col = &target_columns[col_idx];
+        let correct_order = if iter_dir == IterationDirection::Forwards {
+            target_col.order == SortOrder::Asc
+        } else {
+            target_col.order == SortOrder::Desc
+        };
+        if target_col.table_id == table_ref.internal_id
+            && target_is_rowid(target_col)
+            && correct_order
+        {
+            col_idx += 1;
+            includes_rowid = true;
+        }
+    }
+
+    OrderConsumption {
+        consumed: col_idx,
+        includes_rowid,
     }
 }

@@ -5373,8 +5373,9 @@ impl Column {
 
     #[inline]
     pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
+        self.raw &= !COLL_MASK;
         if let Some(c) = c {
-            self.raw = (self.raw & !COLL_MASK) | (((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK);
+            self.raw |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
         }
     }
 

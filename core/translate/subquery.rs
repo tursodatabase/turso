@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::alloc::{TryClone, TursoSliceExt};
 
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, SortOrder, SubqueryType};
+use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use crate::{
     alloc::TursoIteratorExt,
@@ -265,6 +265,7 @@ pub fn plan_subqueries_from_select_plan(
         None => Vec::new(),
     };
     let mut cse_map: Vec<(ast::Expr, ast::Expr)> = Vec::new();
+    let mut same_query_map: Vec<(ast::Expr, TableInternalId, SubqueryOrigin)> = Vec::new();
     // WHERE
     {
         crate::stack::trace_stack!("select_where");
@@ -279,6 +280,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectWhere,
             SubqueryPosition::Where.allow_correlated(),
             &mut cse_map,
+            &mut same_query_map,
             &[],
         )?;
     }
@@ -298,6 +300,7 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryOrigin::SelectGroupBy,
                 SubqueryPosition::GroupBy.allow_correlated(),
                 &mut cse_map,
+                &mut same_query_map,
                 &shared_subqueries,
             )?;
         }
@@ -314,6 +317,7 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryOrigin::SelectHaving,
                 !group_by.exprs.is_empty(),
                 &mut cse_map,
+                &mut same_query_map,
                 &[],
             )?;
         }
@@ -333,6 +337,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectList,
             SubqueryPosition::ResultColumn.allow_correlated(),
             &mut cse_map,
+            &mut same_query_map,
             &shared_subqueries,
         )?;
     }
@@ -351,6 +356,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectOrderBy,
             SubqueryPosition::OrderBy.allow_correlated(),
             &mut cse_map,
+            &mut same_query_map,
             &[],
         )?;
     }
@@ -369,6 +375,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectLimitOffset,
             false,
             &mut cse_map,
+            &mut same_query_map,
             &[],
         );
         // Limit
@@ -432,6 +439,7 @@ pub fn plan_subqueries_from_where_clause(
         SubqueryOrigin::DmlWhere,
         SubqueryPosition::Where.allow_correlated(),
         &mut Vec::new(),
+        &mut Vec::new(),
         &[],
     )?;
 
@@ -462,6 +470,7 @@ pub fn plan_subqueries_from_values(
         SubqueryOrigin::SelectList,
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
+        &mut Vec::new(),
         &[],
     )?;
 
@@ -490,6 +499,7 @@ pub fn plan_subqueries_from_update_sets(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
         &mut Vec::new(),
         &[],
     )?;
@@ -527,6 +537,7 @@ pub fn plan_subqueries_from_returning(
         SubqueryOrigin::DmlReturning,
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
+        &mut Vec::new(),
         &[],
     )?;
 
@@ -557,6 +568,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         SubqueryOrigin::TriggerWhen,
         false,
         &mut Vec::new(),
+        &mut Vec::new(),
         &[],
     )
 }
@@ -575,6 +587,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
     origin: SubqueryOrigin,
     allow_correlated: bool,
     cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
@@ -635,6 +648,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
         origin,
         allow_correlated,
         cse_map,
+        same_query_map,
         shared,
     );
     for expr in exprs {
@@ -676,6 +690,7 @@ fn get_subquery_parser<'a>(
     origin: SubqueryOrigin,
     allow_correlated: bool,
     cse_map: &'a mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &'a mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &'a [ast::Expr],
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
     let handle_unsupported_correlation =
@@ -737,11 +752,14 @@ fn get_subquery_parser<'a>(
                 // rows, which matches SQLite.
                 plan.order_by.clear();
                 plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
-                optimize_select_plan(&mut plan, resolver)?;
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                if !correlated || origin.is_write_statement() {
+                    optimize_select_plan(&mut plan, resolver)?;
+                }
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
+                    same_query: None,
                     query_type: subquery_type,
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(Plan::Select(plan))),
@@ -774,6 +792,10 @@ fn get_subquery_parser<'a>(
                 } else {
                     origin
                 };
+                let same_query = same_query_map.iter().find_map(|(query, id, query_origin)| {
+                    (*query_origin == effective_origin && *query == *expr).then_some(*id)
+                });
+                let same_query_key = same_query.is_none().then(|| expr.clone());
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
@@ -810,7 +832,11 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver)?;
+                let correlated = select_plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                if !correlated || origin.is_write_statement() {
+                    optimize_select_plan(&mut plan, resolver)?;
+                }
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
@@ -865,12 +891,11 @@ fn get_subquery_parser<'a>(
                 };
                 *result_reg_start = reg_start;
                 *num_regs = reg_count;
-
-                let correlated = select_plan_has_outer_scope_dependency(&plan);
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                let subquery_id = *subquery_id;
 
                 out_subqueries.push(NonFromClauseSubquery {
-                    internal_id: *subquery_id,
+                    internal_id: subquery_id,
+                    same_query,
                     query_type: SubqueryType::RowValue {
                         result_reg_start: reg_start,
                         num_regs: reg_count,
@@ -884,6 +909,9 @@ fn get_subquery_parser<'a>(
                 });
                 if let Some(key) = cse_key {
                     cse_map.push((key, expr.clone()));
+                }
+                if let Some(query) = same_query_key {
+                    same_query_map.push((query, subquery_id, effective_origin));
                 }
                 Ok(WalkControl::Continue)
             }
@@ -908,32 +936,25 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                let mut plan = match plan {
-                    Plan::Select(mut select_plan) => {
-                        optimize_select_plan(&mut select_plan, resolver)?;
-                        Plan::Select(select_plan)
-                    }
-                    Plan::CompoundSelect {
-                        mut left,
-                        mut right_most,
-                        limit,
-                        offset,
-                        order_by,
-                    } => {
-                        optimize_select_plan(&mut right_most, resolver)?;
-                        for (select_plan, _) in left.iter_mut() {
+                let mut plan = plan;
+                let correlated = plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                if !correlated || origin.is_write_statement() {
+                    match &mut plan {
+                        Plan::Select(select_plan) => {
                             optimize_select_plan(select_plan, resolver)?;
                         }
                         Plan::CompoundSelect {
-                            left,
-                            right_most,
-                            limit,
-                            offset,
-                            order_by,
+                            left, right_most, ..
+                        } => {
+                            optimize_select_plan(right_most, resolver)?;
+                            for (select_plan, _) in left.iter_mut() {
+                                optimize_select_plan(select_plan, resolver)?;
+                            }
                         }
+                        _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
                     }
-                    _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
-                };
+                }
                 let result_columns = plan.select_result_columns();
                 let table_references = plan.select_table_references();
                 // e.g. (x,y) IN (SELECT ...)
@@ -1013,7 +1034,6 @@ fn get_subquery_parser<'a>(
                     affinity_str: Some(in_affinity_str.clone()),
                     is_delete: false,
                 };
-
                 *expr = ast::Expr::SubqueryResult {
                     subquery_id,
                     lhs: Some(lhs),
@@ -1024,11 +1044,9 @@ fn get_subquery_parser<'a>(
                     },
                 };
 
-                let correlated = plan_has_outer_scope_dependency(&plan);
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
-
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
+                    same_query: None,
                     query_type: SubqueryType::In {
                         cursor_id,
                         affinity_str: in_affinity_str,
@@ -1586,9 +1604,11 @@ pub fn emit_from_clause_subqueries(
             }
 
             let result_columns_start = match execution_mode {
-                FromClauseSubqueryExecutionMode::Coroutine => {
-                    emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?
-                }
+                FromClauseSubqueryExecutionMode::Coroutine => Some(emit_from_clause_subquery(
+                    program,
+                    from_clause_subquery.plan.as_mut(),
+                    t_ctx,
+                )?),
                 FromClauseSubqueryExecutionMode::MaterializedTable => {
                     let (result_columns_start, cte_cursor_id, cte_table) =
                         emit_materialized_subquery_table(
@@ -1608,7 +1628,7 @@ pub fn emit_from_clause_subqueries(
                             },
                         );
                     }
-                    result_columns_start
+                    Some(result_columns_start)
                 }
                 FromClauseSubqueryExecutionMode::DirectMaterializedIndex(direct_index) => {
                     emit_indexed_materialized_subquery(
@@ -1618,13 +1638,15 @@ pub fn emit_from_clause_subqueries(
                         table_reference.internal_id,
                         direct_index.index,
                         direct_index.affinity_str,
-                        from_clause_subquery.columns.len(),
-                    )?
+                    )?;
+                    None
                 }
             };
 
-            from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-            program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
+            from_clause_subquery.result_columns_start_reg = result_columns_start;
+            if let Some(result_columns_start) = result_columns_start {
+                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
+            }
         }
 
         program.pop_current_parent_explain();
@@ -1753,11 +1775,9 @@ fn emit_indexed_materialized_subquery(
     internal_id: ast::TableInternalId,
     index: Arc<Index>,
     affinity_str: Option<Arc<String>>,
-    num_columns: usize,
-) -> Result<usize> {
+) -> Result<()> {
     let cursor_id = program
         .alloc_cursor_index_if_not_exists(CursorKey::index(internal_id, index.clone()), &index)?;
-    let result_columns_start_reg = program.alloc_registers(num_columns);
 
     if let Some(dest) = plan.select_query_destination_mut() {
         *dest = QueryDestination::EphemeralIndex {
@@ -1768,6 +1788,15 @@ fn emit_indexed_materialized_subquery(
         };
     }
 
+    let build_end = if plan_is_correlated(plan) {
+        None
+    } else {
+        let label = program.allocate_label();
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: label,
+        });
+        Some(label)
+    };
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id,
         is_table: false,
@@ -1822,7 +1851,11 @@ fn emit_indexed_materialized_subquery(
         }
     }
 
-    Ok(result_columns_start_reg)
+    if let Some(build_end) = build_end {
+        program.preassign_label_to_next_insn(build_end);
+    }
+
+    Ok(())
 }
 
 fn emit_materialized_subquery_table(

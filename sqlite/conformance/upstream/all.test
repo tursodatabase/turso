@@ -68,7 +68,7 @@ set test_files {
   autoindex1           fail
   autoindex2           fail
   autoindex3           fail
-  autoindex4           fail
+  autoindex4           pass
   autoindex5           fail
   autovacuum           fail
   autovacuum2          fail
@@ -816,7 +816,7 @@ set test_files {
   whereB               pass
   whereC               pass
   whereD               fail
-  whereE               fail
+  whereE               pass
   whereF               fail
   whereG               fail
   whereH               fail
