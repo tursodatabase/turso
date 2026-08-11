@@ -25,8 +25,8 @@ mod stmt_journal;
 mod stmt_readonly;
 mod storage;
 mod trigger;
-mod views;
 mod unreliable_io;
+mod views;
 mod wal;
 
 #[cfg(test)]
