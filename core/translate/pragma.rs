@@ -507,8 +507,32 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
-            // Check if autovacuum is enabled in database opts
-            if !connection.db.opts.enable_autovacuum {
+            // SQLite spells the three modes either by name or by number, and
+            // treats the two spellings as the same thing.
+            let requested_mode = match &value {
+                Expr::Name(name) => {
+                    let name = name.as_str().as_bytes();
+                    match_ignore_ascii_case!(match name {
+                        b"none" => Some(AutoVacuumMode::None),
+                        b"full" => Some(AutoVacuumMode::Full),
+                        b"incremental" => Some(AutoVacuumMode::Incremental),
+                        _ => None,
+                    })
+                }
+                _ => match parse_signed_number(&value) {
+                    Ok(Value::Numeric(Numeric::Integer(n @ 0..=2))) => {
+                        Some(AutoVacuumMode::from(n as u8))
+                    }
+                    _ => None,
+                },
+            };
+
+            // Auto-vacuum is off unless the experimental flag turns it on, so
+            // asking for NONE only restates the state the database is already
+            // in. Requiring the flag to switch the feature off would make every
+            // `PRAGMA auto_vacuum=NONE` in portable SQL fail for no reason.
+            if requested_mode != Some(AutoVacuumMode::None) && !connection.db.opts.enable_autovacuum
+            {
                 return Err(LimboError::InvalidArgument(
                     "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
                         .to_string(),
@@ -529,36 +553,12 @@ fn update_pragma(
                 return Ok(TransactionMode::None);
             }
 
-            let auto_vacuum_mode = match value {
-                Expr::Name(name) => {
-                    let name = name.as_str().as_bytes();
-                    match_ignore_ascii_case!(match name {
-                        b"none" => 0,
-                        b"full" => 1,
-                        b"incremental" => 2,
-                        _ => {
-                            return Err(LimboError::InvalidArgument(
-                                "invalid auto vacuum mode".to_string(),
-                            ));
-                        }
-                    })
-                }
-                _ => {
-                    return Err(LimboError::InvalidArgument(
-                        "invalid auto vacuum mode".to_string(),
-                    ));
-                }
+            let Some(auto_vacuum_mode) = requested_mode else {
+                return Err(LimboError::InvalidArgument(
+                    "invalid auto vacuum mode".to_string(),
+                ));
             };
-            match auto_vacuum_mode {
-                0 => pager.persist_auto_vacuum_mode(AutoVacuumMode::None)?,
-                1 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Full)?,
-                2 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Incremental)?,
-                _ => {
-                    return Err(LimboError::InvalidArgument(
-                        "invalid auto vacuum mode".to_string(),
-                    ));
-                }
-            }
+            pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
@@ -581,7 +581,7 @@ fn update_pragma(
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::IncrementalVacuum,
-                value: auto_vacuum_mode - 1,
+                value: i32::from(u8::from(auto_vacuum_mode)) - 1,
                 p5: 0,
             });
             Ok(TransactionMode::None)
@@ -1464,6 +1464,7 @@ fn query_pragma(
                 value: auto_vacuum_mode_i64,
             });
             program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => {
