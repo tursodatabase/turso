@@ -1506,7 +1506,7 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {

@@ -16878,7 +16878,7 @@ fn test_auto_checkpoint_refreshes_index_metadata_after_schema_change() {
                 break;
             }
             StepResult::Done => break,
-            StepResult::IO => conn_b.db.io.step().unwrap(),
+            StepResult::IO | StepResult::Sleep { .. } => conn_b.db.io.step().unwrap(),
             StepResult::Row | StepResult::Busy | StepResult::Interrupt => {}
         }
     }

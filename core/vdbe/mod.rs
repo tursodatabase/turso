@@ -180,6 +180,12 @@ pub enum StepResult {
     /// still drive the event loop (`io.step()`) between steps so progress that depends on
     /// other threads' I/O is not starved.
     Yield,
+    /// The statement asks the caller to wait for `duration` before stepping again,
+    /// e.g. because a busy handler decided to retry after a delay. Callers that don't
+    /// track time may treat this exactly like `IO`: drive the event loop and step again.
+    Sleep {
+        duration: std::time::Duration,
+    },
 }
 
 #[derive(Debug)]

@@ -116,7 +116,7 @@ fn drive_stmt_to_completion(db: &Database, stmt: &mut Statement) -> usize {
                 black_box(stmt.row());
                 rows += 1;
             }
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step().unwrap();
             }
             StepResult::Done => break,

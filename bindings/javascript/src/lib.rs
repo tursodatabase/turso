@@ -205,7 +205,11 @@ fn step_sync(stmt: &StatementHandle) -> napi::Result<u32> {
         .ok_or_else(|| create_generic_error("statement has been finalized"))?;
     match core_stmt.step() {
         Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
-        Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => Ok(STEP_IO),
+        Ok(
+            turso_core::StepResult::IO
+            | turso_core::StepResult::Yield
+            | turso_core::StepResult::Sleep { .. },
+        ) => Ok(STEP_IO),
         Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
         Ok(turso_core::StepResult::Interrupt) => {
             Err(create_generic_error("statement was interrupted"))
