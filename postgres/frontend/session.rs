@@ -1,4 +1,5 @@
 use std::num::NonZero;
+use std::path::Path;
 use std::str;
 use std::sync::{Arc, Mutex};
 
@@ -7,12 +8,12 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    is_comment_on, is_refresh_matview, try_extract_copy, try_extract_create_schema,
+    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCopyStmt,
+    PgCopyToStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
 };
 
-use crate::copy::parse_copy_text_format;
+use crate::copy::{parse_copy_format, CopyToWriter};
 
 #[derive(Clone)]
 pub struct PgConnection {
@@ -281,11 +282,21 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if let Some(stmt) = try_extract_copy_from(&parse_result) {
-        let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
-        let stmt = noop_statement(&pg_conn.conn)?;
-        stmt.set_n_change(rows_inserted as i64);
-        return Ok(Some(stmt));
+    if let Some(stmt) = try_extract_copy(&parse_result) {
+        match stmt {
+            PgCopyStmt::From(from) => {
+                let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &from)?;
+                let stmt = noop_statement(&pg_conn.conn)?;
+                stmt.set_n_change(rows_inserted as i64);
+                return Ok(Some(stmt));
+            }
+            PgCopyStmt::To(to) => {
+                let rows_copied = handle_copy_pg_to(pg_conn, &to)?;
+                let stmt = noop_statement(&pg_conn.conn)?;
+                stmt.set_n_change(rows_copied as i64);
+                return Ok(Some(stmt));
+            }
+        }
     }
 
     Ok(None)
@@ -405,9 +416,70 @@ fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Resul
     Ok(())
 }
 
+fn handle_copy_pg_to(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyToStmt) -> Result<usize> {
+    let conn = &pg_conn.conn;
+    let table_name = match &stmt.schema_name {
+        Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
+        None => format!("\"{}\"", stmt.table_name),
+    };
+    let column_names = get_table_columns(conn, &stmt.table_name, stmt.schema_name.as_deref())?;
+    if column_names.is_empty() {
+        return Err(LimboError::ParseError(format!(
+            "COPY TO: table '{}' not found or has no columns",
+            stmt.table_name
+        )));
+    }
+
+    let columns: &Vec<String> = stmt.columns.as_ref().unwrap_or(&column_names);
+    let col_list = columns
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select_sql = format!("SELECT {col_list} FROM {table_name}");
+
+    let mut select_stmt = prepare_statement(pg_conn, &select_sql)?;
+
+    let target = Path::new(&stmt.file_path);
+    let parent = copy_to_temp_parent(target);
+
+    let mut count = 0;
+    // Write beside the target first so a failed COPY TO leaves the old file intact.
+    let mut tmp =
+        tempfile::NamedTempFile::new_in(parent).map_err(|e| LimboError::Conflict(e.to_string()))?;
+    {
+        let mut writer = CopyToWriter::new(tmp.as_file_mut(), &stmt.format);
+        writer.write_header(columns)?;
+
+        select_stmt.run_with_row_callback(|row| {
+            let fields: Vec<Option<String>> = row
+                .get_values()
+                .map(|value| match value {
+                    Value::Null => None,
+                    _ => Some(value.to_string()),
+                })
+                .collect();
+
+            writer.write_record(&fields)?;
+            count += 1;
+
+            Ok(())
+        })?;
+
+        writer.finish()?;
+    }
+    tmp.persist(target)
+        .map_err(|e| LimboError::Conflict(e.to_string()))?;
+
+    Ok(count)
+}
+
 fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
-    let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
-        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
+    let data = std::fs::read_to_string(&stmt.file_path).map_err(|e| {
+        LimboError::ParseError(format!(
+            "COPY FROM: cannot read '{}': {}",
+            stmt.file_path, e
+        ))
     })?;
 
     let table_name = match &stmt.schema_name {
@@ -437,17 +509,7 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
     let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
     let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
 
-    let delimiter = stmt
-        .delimiter
-        .as_ref()
-        .and_then(|d| d.chars().next())
-        .unwrap_or('\t');
-    let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
-
-    let mut rows = parse_copy_text_format(&data, delimiter, null_string, num_columns)?;
-    if stmt.header && !rows.is_empty() {
-        rows.remove(0);
-    }
+    let rows = parse_copy_format(&data, &stmt.format, num_columns)?;
 
     let rows_inserted = rows.len();
     let mut begin = conn.prepare_sqlite("BEGIN")?;
@@ -527,4 +589,40 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(!rows.is_empty())
+}
+
+/// Return the directory in which a temp file should be created for atomic COPY TO.
+/// `Path::new("output.csv").parent()` is `Some("")`, not `None`, so we filter out
+/// the empty string and fall back to `"."` for bare filenames.
+fn copy_to_temp_parent(target: &Path) -> &Path {
+    target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_copy_to_temp_parent_bare_filename() {
+        assert_eq!(copy_to_temp_parent(Path::new("output.csv")), Path::new("."));
+    }
+
+    #[test]
+    fn test_copy_to_temp_parent_relative_dir() {
+        assert_eq!(
+            copy_to_temp_parent(Path::new("dir/output.csv")),
+            Path::new("dir")
+        );
+    }
+
+    #[test]
+    fn test_copy_to_temp_parent_absolute() {
+        assert_eq!(
+            copy_to_temp_parent(Path::new("/tmp/output.csv")),
+            Path::new("/tmp")
+        );
+    }
 }

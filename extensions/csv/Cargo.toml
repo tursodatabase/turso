@@ -15,7 +15,7 @@ static = ["turso_ext/static"]
 
 [dependencies]
 turso_ext = { workspace = true, features = ["static"] }
-csv = "1.3.1"
+csv = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

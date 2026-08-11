@@ -3,6 +3,8 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
+use std::str::FromStr;
+
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -4700,21 +4702,179 @@ pub fn is_comment_on(parse_result: &ParseResult) -> bool {
     matches!(&nodes[0].0, NodeRef::CommentStmt(_))
 }
 
-/// Extracted COPY FROM statement info for use by the connection layer.
+#[derive(Debug, Clone)]
+pub enum PgCopyStmt {
+    From(PgCopyFromStmt),
+    To(PgCopyToStmt),
+}
+
 #[derive(Debug, Clone)]
 pub struct PgCopyFromStmt {
     pub table_name: String,
     pub schema_name: Option<String>,
     pub columns: Option<Vec<String>>,
-    pub filename: String,
+    pub file_path: String,
+    pub format: PgCopyFromFormat,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgCopyToStmt {
+    pub table_name: String,
+    pub schema_name: Option<String>,
+    pub columns: Option<Vec<String>>,
+    pub file_path: String,
+    pub format: PgCopyToFormat,
+}
+
+#[derive(Debug, Clone)]
+pub enum PgCopyFromFormat {
+    Text(PgCopyTextOptions),
+    Csv(PgCopyCsvOptions),
+}
+
+#[derive(Debug, Clone)]
+pub enum PgCopyToFormat {
+    Text(PgCopyTextOptions),
+    Csv(PgCopyCsvOptions),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PgCopyTextOptions {
+    pub delimiter: Option<String>,
+    pub null_string: Option<String>,
+    pub header: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PgCopyCsvOptions {
     pub delimiter: Option<String>,
     pub header: bool,
     pub null_string: Option<String>,
+    pub quote: Option<String>,
+    pub escape: Option<String>,
 }
 
-/// Try to extract a COPY FROM file statement from pg_query parse output.
-/// Returns None if the statement is not a COPY FROM with a filename.
-pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
+#[derive(Debug)]
+enum PgCopyDirection {
+    From,
+    To,
+}
+
+#[derive(Debug)]
+enum PgCopyFormatName {
+    Text,
+    Csv,
+}
+
+impl std::str::FromStr for PgCopyFormatName {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "text" => Ok(Self::Text),
+            "csv" => Ok(Self::Csv),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RawCopyOptions {
+    direction: PgCopyDirection,
+    file_path: String,
+    table_name: String,
+    schema_name: Option<String>,
+    columns: Option<Vec<String>>,
+    format: PgCopyFormatName,
+    delimiter: Option<String>,
+    header: bool,
+    null_string: Option<String>,
+    quote: Option<String>,
+    escape: Option<String>,
+}
+
+impl RawCopyOptions {
+    fn new(
+        direction: PgCopyDirection,
+        file_path: String,
+        table_name: String,
+        schema_name: Option<String>,
+        columns: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            direction,
+            file_path,
+            table_name,
+            schema_name,
+            columns,
+            format: PgCopyFormatName::Text,
+            delimiter: None,
+            header: false,
+            null_string: None,
+            quote: None,
+            escape: None,
+        }
+    }
+
+    fn build(self) -> PgCopyStmt {
+        match self.direction {
+            PgCopyDirection::From => PgCopyStmt::From(self.build_from()),
+            PgCopyDirection::To => PgCopyStmt::To(self.build_to()),
+        }
+    }
+
+    fn build_from(self) -> PgCopyFromStmt {
+        let format = match self.format {
+            PgCopyFormatName::Text => PgCopyFromFormat::Text(PgCopyTextOptions {
+                delimiter: self.delimiter,
+                null_string: self.null_string,
+                header: self.header,
+            }),
+            PgCopyFormatName::Csv => PgCopyFromFormat::Csv(PgCopyCsvOptions {
+                delimiter: self.delimiter,
+                header: self.header,
+                null_string: self.null_string,
+                quote: self.quote,
+                escape: self.escape,
+            }),
+        };
+        PgCopyFromStmt {
+            table_name: self.table_name,
+            schema_name: self.schema_name,
+            columns: self.columns,
+            file_path: self.file_path,
+            format,
+        }
+    }
+
+    fn build_to(self) -> PgCopyToStmt {
+        let format = match self.format {
+            PgCopyFormatName::Text => PgCopyToFormat::Text(PgCopyTextOptions {
+                delimiter: self.delimiter,
+                null_string: self.null_string,
+                header: self.header,
+            }),
+            PgCopyFormatName::Csv => PgCopyToFormat::Csv(PgCopyCsvOptions {
+                delimiter: self.delimiter,
+                header: self.header,
+                null_string: self.null_string,
+                quote: self.quote,
+                escape: self.escape,
+            }),
+        };
+        PgCopyToStmt {
+            table_name: self.table_name,
+            schema_name: self.schema_name,
+            columns: self.columns,
+            file_path: self.file_path,
+            format,
+        }
+    }
+}
+
+/// Try to extract a file-based COPY FROM or COPY TO statement from pg_query parse output.
+/// Returns None if the statement is not a file COPY (STDIN/STDOUT and PROGRAM are rejected).
+pub fn try_extract_copy(parse_result: &ParseResult) -> Option<PgCopyStmt> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
@@ -4725,8 +4885,7 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         return None;
     };
 
-    // Only handle COPY FROM with a file path (not STDIN, not COPY TO)
-    if !copy.is_from || copy.filename.is_empty() || copy.is_program {
+    if copy.filename.is_empty() || copy.is_program {
         return None;
     }
 
@@ -4756,9 +4915,19 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         Some(cols)
     };
 
-    let mut delimiter = None;
-    let mut header = false;
-    let mut null_string = None;
+    let direction = if copy.is_from {
+        PgCopyDirection::From
+    } else {
+        PgCopyDirection::To
+    };
+
+    let mut opts = RawCopyOptions::new(
+        direction,
+        copy.filename.clone(),
+        table_name,
+        schema_name,
+        columns,
+    );
 
     for opt in &copy.options {
         let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
@@ -4766,29 +4935,20 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         };
         match def.defname.as_str() {
             "format" => {
-                // Only support text format for now
                 if let Some(val) = def_elem_string_val(def) {
-                    if val.to_lowercase() != "text" {
-                        return None; // unsupported format
-                    }
+                    opts.format = PgCopyFormatName::from_str(&val.to_lowercase()).ok()?;
                 }
             }
-            "delimiter" => delimiter = def_elem_string_val(def),
-            "header" => header = def_elem_bool_val(def).unwrap_or(true),
-            "null" => null_string = def_elem_string_val(def),
-            _ => {}
+            "delimiter" => opts.delimiter = def_elem_string_val(def),
+            "header" => opts.header = def_elem_bool_val(def).unwrap_or(true),
+            "null" => opts.null_string = def_elem_string_val(def),
+            "quote" => opts.quote = def_elem_string_val(def),
+            "escape" => opts.escape = def_elem_string_val(def),
+            _ => return None,
         }
     }
 
-    Some(PgCopyFromStmt {
-        table_name,
-        schema_name,
-        columns,
-        filename: copy.filename.clone(),
-        delimiter,
-        header,
-        null_string,
-    })
+    Some(opts.build())
 }
 
 /// Parse a SQL referential action string to an AST RefAct.
@@ -7300,34 +7460,56 @@ mod tests {
     #[test]
     fn test_try_extract_copy_from() {
         let parsed = crate::parse("COPY users FROM '/tmp/data.tsv'").unwrap();
-        let copy = try_extract_copy_from(&parsed).unwrap();
-        assert_eq!(copy.table_name, "users");
-        assert!(copy.schema_name.is_none());
-        assert!(copy.columns.is_none());
-        assert_eq!(copy.filename, "/tmp/data.tsv");
-        assert!(!copy.header);
-        assert!(copy.delimiter.is_none());
-        assert!(copy.null_string.is_none());
+        let copy = try_extract_copy(&parsed).unwrap();
+        let PgCopyStmt::From(stmt) = copy else {
+            panic!("expected COPY FROM")
+        };
+        assert_eq!(stmt.table_name, "users");
+        assert!(stmt.schema_name.is_none());
+        assert!(stmt.columns.is_none());
+        assert_eq!(stmt.file_path, "/tmp/data.tsv");
+        let PgCopyFromFormat::Text(opts) = stmt.format else {
+            panic!("expected text format")
+        };
+        assert!(opts.delimiter.is_none());
+        assert!(opts.null_string.is_none());
     }
 
     #[test]
     fn test_try_extract_copy_from_not_to() {
         let parsed = crate::parse("COPY users TO '/tmp/out.tsv'").unwrap();
-        assert!(try_extract_copy_from(&parsed).is_none());
+        assert!(matches!(try_extract_copy(&parsed), Some(PgCopyStmt::To(_))));
     }
 
     #[test]
     fn test_try_extract_copy_from_not_stdin() {
         let parsed = crate::parse("COPY users FROM STDIN").unwrap();
-        assert!(try_extract_copy_from(&parsed).is_none());
+        assert!(try_extract_copy(&parsed).is_none());
     }
 
     #[test]
     fn test_try_extract_copy_from_with_columns() {
         let parsed = crate::parse("COPY users (id, name) FROM '/tmp/data.tsv'").unwrap();
-        let copy = try_extract_copy_from(&parsed).unwrap();
-        let cols = copy.columns.unwrap();
+        let copy = try_extract_copy(&parsed).unwrap();
+        let PgCopyStmt::From(stmt) = copy else {
+            panic!("expected COPY FROM")
+        };
+        let cols = stmt.columns.unwrap();
         assert_eq!(cols, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn test_try_extract_copy_unsupported_option_returns_none() {
+        // FORCE_NULL is a valid PostgreSQL COPY option but not handled here.
+        // try_extract_copy must return None so the statement falls through to
+        // the normal translator path and produces a meaningful error.
+        let parsed =
+            crate::parse("COPY users FROM '/tmp/data.csv' WITH (FORMAT csv, FORCE_NULL (id))")
+                .unwrap();
+        assert!(
+            try_extract_copy(&parsed).is_none(),
+            "unsupported COPY option should return None"
+        );
     }
 
     #[test]
