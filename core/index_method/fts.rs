@@ -59,13 +59,12 @@ pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
 /// Higher values improve throughput but increase memory usage and latency.
 pub const BATCH_COMMIT_SIZE: usize = 1000;
 
-/// Default memory budget (64MB) for hot cache (metadata + term dictionaries).
-/// Hot files are frequently accessed and kept in an LRU cache.
-pub const DEFAULT_HOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Longest accepted `fts_match` / MATCH query string, in bytes.
+const FTS_MAX_QUERY_BYTES: usize = 16 * 1024;
 
-/// Default memory budget (128MB) for chunk LRU cache.
-/// Caches segment data chunks loaded on-demand from the BTree.
-pub const DEFAULT_CHUNK_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Deepest accepted parenthesis nesting in a query string. Guards Tantivy's
+/// recursive parser against stack overflow.
+const FTS_MAX_QUERY_NESTING: usize = 64;
 
 /// Fanout for synchronous tiered segment maintenance.
 ///
@@ -89,7 +88,14 @@ const FTS_MAX_SYNC_MERGE_BYTES: u64 = 32 * 1024 * 1024;
 const FTS_MAX_CACHED_CONNECTIONS: usize = 4;
 
 /// Aggregate resident file-cache budget across retained connection snapshots.
-const FTS_MAX_RETAINED_CACHE_BYTES: usize = DEFAULT_HOT_CACHE_BYTES + DEFAULT_CHUNK_CACHE_BYTES;
+///
+/// This bounds only what is *retained for reuse* after a statement finishes
+/// (read snapshots in `CachedFtsStates`, the shared writer). It is not a
+/// bound on live memory: a cursor always keeps its own complete file
+/// snapshot resident while it runs, however large the index is, because
+/// Tantivy reads through synchronous callbacks that cannot fall back to
+/// storage I/O.
+const FTS_MAX_RETAINED_CACHE_BYTES: usize = 192 * 1024 * 1024;
 
 #[cfg(feature = "test_helper")]
 crate::thread::thread_local! {
@@ -122,6 +128,10 @@ const FTS_CONTROL_FORMAT_VERSION: u32 = 1;
 /// first control record is staged and is never this value.
 const FTS_EMPTY_INDEX_INCARNATION: u64 = 0;
 static NEXT_FTS_INDEX_INCARNATION: AtomicU64 = AtomicU64::new(1);
+/// Distinguishes cursor instances within a process so a cursor can recognize
+/// its own claim on the per-index writer slot across re-entrant `open_write`
+/// calls.
+static NEXT_FTS_CURSOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 const ROWID_FIELD: &str = "rowid";
 
@@ -304,13 +314,6 @@ impl FtsControlRecord {
         };
         let mut files = HashMap::default();
         for (path, metadata) in catalog {
-            let path_text = path.to_str().ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "FTS manifest path is not valid UTF-8: {}",
-                    path.display()
-                ))
-            })?;
-            let _ = path_text;
             files.insert(
                 path.clone(),
                 FtsManifestFile {
@@ -471,110 +474,53 @@ fn fts_control_checksum(bytes: &[u8]) -> u64 {
 }
 
 /// Eviction samples per put
-const EVICTION_SAMPLES: usize = 8;
-
-/// Generic bounded LRU cache with sampling-based eviction.
-pub struct LruCache<K> {
-    capacity: usize,
-    inner: RwLock<LruCacheInner<K>>,
+/// Size-tracked map of a Tantivy directory's complete file contents.
+///
+/// Deliberately unbounded: every cataloged file must stay resident, because
+/// Tantivy reads through synchronous callbacks that cannot fall back to
+/// storage I/O. Nothing is ever evicted — the memory bound on FTS state is
+/// the retention budget in `CachedFtsStates` / `cache_writer`, which decides
+/// whether a *finished* snapshot is kept for reuse at all.
+pub struct FileCache<K> {
+    inner: RwLock<FileCacheInner<K>>,
 }
 
 #[derive(Debug)]
-struct LruCacheInner<K> {
+struct FileCacheInner<K> {
     current_size: usize,
-    clock: u64,
-    entries: HashMap<K, LruCacheEntry>,
+    entries: HashMap<K, Arc<[u8]>>,
 }
 
-#[derive(Debug)]
-struct LruCacheEntry {
-    data: Arc<[u8]>,
-    accessed: u64,
-}
-
-impl<K: std::fmt::Debug> std::fmt::Debug for LruCache<K> {
+impl<K: std::fmt::Debug> std::fmt::Debug for FileCache<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.read();
-        f.debug_struct("LruCache")
-            .field("capacity", &self.capacity)
+        f.debug_struct("FileCache")
             .field("current_size", &inner.current_size)
             .field("entries", &inner.entries.len())
             .finish()
     }
 }
 
-impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
-    /// Lookup entry, updating access timestamp. Returns Arc-cloned data.
+impl<K: Eq + std::hash::Hash + Clone> FileCache<K> {
+    /// Lookup entry. Returns Arc-cloned data.
     fn get<Q>(&self, key: &Q) -> Option<Arc<[u8]>>
     where
         K: std::borrow::Borrow<Q>,
         Q: Eq + std::hash::Hash + ?Sized,
     {
-        let mut inner = self.inner.write();
-        inner.clock += 1;
-        let ts = inner.clock;
-        if let Some(entry) = inner.entries.get_mut(key) {
-            entry.accessed = ts;
-            Some(Arc::clone(&entry.data))
-        } else {
-            None
-        }
+        self.inner.read().entries.get(key).map(Arc::clone)
     }
 
-    /// Insert entry, evicting stale entries if over capacity.
-    ///
-    /// Eviction uses sampling: examines K entries and evicts the one with
-    /// the oldest access timestamp. Repeat until under capacity.
+    /// Insert or replace an entry.
     fn put(&self, key: K, value: Vec<u8>) {
         let arc_value: Arc<[u8]> = Arc::from(value);
         let size = arc_value.len();
         let mut inner = self.inner.write();
-
-        // Check for existing entry - get old size if present
-        let old_size = inner.entries.get(&key).map(|e| e.data.len());
-
-        if let Some(old) = old_size {
-            // Update existing entry
-            inner.clock += 1;
-            let ts = inner.clock;
-            let entry = inner.entries.get_mut(&key).expect("entry must exist");
-            entry.data = arc_value;
-            entry.accessed = ts;
-            inner.current_size = inner.current_size - old + size;
-            return;
-        }
-
-        // Evict until under capacity
-        while inner.current_size + size > self.capacity && !inner.entries.is_empty() {
-            let victim = {
-                inner
-                    .entries
-                    .iter()
-                    .take(EVICTION_SAMPLES)
-                    .min_by_key(|(_, e)| e.accessed)
-                    .map(|(k, _)| k.clone())
-            };
-
-            match victim {
-                Some(k) => {
-                    if let Some(e) = inner.entries.remove(&k) {
-                        inner.current_size -= e.data.len();
-                    }
-                }
-                None => break,
-            }
-        }
-
-        inner.clock += 1;
-        let ts = inner.clock;
-        inner.entries.insert(
-            key,
-            LruCacheEntry {
-                data: arc_value,
-                accessed: ts,
-            },
-        );
-        inner.current_size += size;
+        let old_size = inner
+            .entries
+            .insert(key, arc_value)
+            .map_or(0, |old| old.len());
+        inner.current_size = inner.current_size - old_size + size;
     }
 
     /// Remove an entry from the cache.
@@ -584,8 +530,8 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
         Q: Eq + std::hash::Hash + ?Sized,
     {
         let mut inner = self.inner.write();
-        if let Some(e) = inner.entries.remove(key) {
-            inner.current_size -= e.data.len();
+        if let Some(data) = inner.entries.remove(key) {
+            inner.current_size -= data.len();
         }
     }
 
@@ -610,29 +556,13 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
 }
 
 /// Specialized methods for PathBuf caches (hot files).
-impl LruCache<PathBuf> {
-    fn with_preloaded_arcs(capacity: usize, files: HashMap<PathBuf, Arc<[u8]>>) -> Self {
+impl FileCache<PathBuf> {
+    fn with_preloaded_arcs(files: HashMap<PathBuf, Arc<[u8]>>) -> Self {
         let current_size: usize = files.values().map(|data| data.len()).sum();
-        let entries: HashMap<PathBuf, LruCacheEntry> = files
-            .into_iter()
-            .enumerate()
-            .map(|(i, (path, data))| {
-                (
-                    path,
-                    LruCacheEntry {
-                        data,
-                        accessed: i as u64,
-                    },
-                )
-            })
-            .collect();
-
         Self {
-            capacity,
-            inner: RwLock::new(LruCacheInner {
+            inner: RwLock::new(FileCacheInner {
                 current_size,
-                clock: entries.len() as u64,
-                entries,
+                entries: files,
             }),
         }
     }
@@ -642,7 +572,7 @@ impl LruCache<PathBuf> {
             .read()
             .entries
             .iter()
-            .map(|(path, entry)| (path.clone(), Arc::clone(&entry.data)))
+            .map(|(path, data)| (path.clone(), Arc::clone(data)))
             .collect()
     }
 }
@@ -706,11 +636,10 @@ struct HybridBTreeDirectory {
     /// File catalog: path -> metadata (always in memory, no content)
     catalog: Arc<RwLock<Catalog>>,
 
-    /// Complete file snapshot loaded before Tantivy is invoked.
-    ///
-    /// The capacity is deliberately unbounded: eviction would turn a synchronous Tantivy
-    /// callback into a storage read. Connection-level cache pruning bounds retained snapshots.
-    hot_cache: Arc<LruCache<PathBuf>>,
+    /// Complete file snapshot loaded before Tantivy is invoked. Unbounded by
+    /// design (see [`FileCache`]); the retention budget bounds what outlives
+    /// the cursor, not what it holds while running.
+    hot_cache: Arc<FileCache<PathBuf>>,
 
     /// Storage view at cursor checkout, kept separate from Tantivy's mutable
     /// in-memory view so unchanged rewrites can be elided.
@@ -751,10 +680,7 @@ impl HybridBTreeDirectory {
         let files = self.hot_cache.arc_snapshot();
         Self {
             catalog: Arc::new(RwLock::new(self.catalog.read().clone())),
-            hot_cache: Arc::new(LruCache::<PathBuf>::with_preloaded_arcs(
-                usize::MAX,
-                files.clone(),
-            )),
+            hot_cache: Arc::new(FileCache::<PathBuf>::with_preloaded_arcs(files.clone())),
             base_files: Arc::new(RwLock::new(files)),
             // Fresh pending state - not shared with cache
             pending_mutations: Arc::new(RwLock::new(PendingFileMutations::default())),
@@ -779,8 +705,7 @@ impl HybridBTreeDirectory {
             .collect::<HashMap<_, _>>();
         Self {
             catalog: Arc::new(RwLock::new(catalog)),
-            hot_cache: Arc::new(LruCache::<PathBuf>::with_preloaded_arcs(
-                usize::MAX,
+            hot_cache: Arc::new(FileCache::<PathBuf>::with_preloaded_arcs(
                 base_files.clone(),
             )),
             base_files: Arc::new(RwLock::new(base_files)),
@@ -934,18 +859,18 @@ impl Write for HybridWriter {
 
 impl Drop for HybridWriter {
     fn drop(&mut self) {
-        // Commit the write to the directory
-        let data = std::mem::take(&mut self.buffer);
-        if !data.is_empty() {
-            // Update catalog
-            let num_chunks = data.len().div_ceil(DEFAULT_CHUNK_SIZE);
-            let metadata = FileMetadata::new(&self.path, data.len(), num_chunks);
-            self.directory.update_catalog(self.path.clone(), metadata);
-
-            self.directory
-                .add_to_hot_cache(self.path.clone(), data.clone());
-
-            self.directory.queue_write(self.path.clone(), data);
+        // Only `terminate_ref` publishes: Tantivy's Directory contract says
+        // callers must not rely on Drop flushing, and ManagedDirectory's
+        // FooterProxy appends its CRC footer only in terminate. A file
+        // published from Drop would have no footer and read back as
+        // "Footer magic byte mismatch" — a recoverable serialization error
+        // turned into persisted state that reports itself as corruption.
+        if !self.buffer.is_empty() {
+            tracing::error!(
+                path = %self.path.display(),
+                bytes = self.buffer.len(),
+                "FTS writer dropped without terminate; discarding buffered file"
+            );
         }
     }
 }
@@ -1038,6 +963,13 @@ impl Directory for HybridBTreeDirectory {
         //
         // Skip delete for the meta lock file: Tantivy calls open_write on it for every
         // search query and it does not need BTree deletion.
+        //
+        // Because this never returns FileAlreadyExists, Tantivy's file-based
+        // single-writer lock is intentionally disabled for this directory:
+        // it cannot work anyway, since every cursor gets its own directory
+        // clone. Writer exclusion is enforced instead by the per-connection
+        // writer slot (`FtsWriterSlot`), the pager write lock in WAL mode,
+        // and the per-index MVCC write lease.
         if path != Path::new(TANTIVY_META_LOCK_FILE) {
             let _ = self.delete(path);
         }
@@ -1093,6 +1025,9 @@ impl Directory for HybridBTreeDirectory {
         Ok(())
     }
 
+    // No change notifications: every reader is built with
+    // `ReloadPolicy::Manual` and reloaded explicitly after commits, so a
+    // registered callback would never need to fire.
     fn watch(&self, _cb: WatchCallback) -> std::result::Result<WatchHandle, tantivy::TantivyError> {
         Ok(WatchHandle::empty())
     }
@@ -1277,9 +1212,11 @@ impl CachedFtsStates {
     fn insert(&mut self, state: CachedFtsState, byte_budget: usize) -> bool {
         self.entries
             .retain(|cached| !Weak::ptr_eq(&cached.connection, &state.connection));
-        if state.resident_cache_bytes() > byte_budget {
-            return false;
-        }
+        // Always keep the newest snapshot and evict older ones to make room.
+        // Rejecting an oversized snapshot outright would not save memory —
+        // the live cursor holds the whole snapshot anyway — it would only
+        // force the next statement to reload it all from storage, turning
+        // the budget cliff into a full cold load per statement.
         self.entries.push(state);
         self.prune();
         while self.entries.len() > 1 && self.resident_cache_bytes() > byte_budget {
@@ -1288,8 +1225,11 @@ impl CachedFtsStates {
         true
     }
 
-    fn clear(&mut self) {
-        self.entries.clear();
+    /// Evict oldest retained snapshots until at or under `byte_budget`.
+    fn evict_to_fit(&mut self, byte_budget: usize) {
+        while !self.entries.is_empty() && self.resident_cache_bytes() > byte_budget {
+            self.entries.remove(0);
+        }
     }
 }
 
@@ -1332,7 +1272,33 @@ pub struct FtsIndexAttachment {
     /// `Mutex` provides exclusive access without requiring `IndexWriter` to be
     /// `Sync`; SQLite transaction rules already serialize writers.
     cached_writer: Arc<Mutex<Option<CachedFtsWriter>>>,
+    /// The one cursor currently allowed to flush this index per connection.
+    /// See [`FtsWriterSlot`].
+    writer_slot: Arc<Mutex<Option<FtsWriterSlot>>>,
     runtime_stats: Arc<FtsRuntimeStats>,
+}
+
+/// The single cursor allowed to flush this FTS index for a given connection.
+///
+/// One statement can open two write cursors over the same index — a trigger
+/// whose body writes the FTS-indexed table it fired on. Each cursor builds its
+/// own Tantivy directory from the same starting snapshot, so letting both
+/// flush would store the union of two divergent file sets under one manifest
+/// and make the index unreadable on disk, permanently. The second writer is
+/// refused with a `Raise(Abort)` error instead, and the statement rolls back
+/// cleanly.
+///
+/// The slot is claimed on the cursor's first document mutation (a plan may
+/// open several write-mode cursors on one index but only one ever mutates it)
+/// and released once the cursor has staged its statement's writes
+/// (`prepare_statement_commit`), aborted, or closed — after that the cursor
+/// never flushes again, so a later statement's cursor may write. Writers on
+/// different connections are already serialized by the pager write lock (WAL)
+/// or the per-index MVCC write lease.
+#[derive(Debug)]
+struct FtsWriterSlot {
+    connection: Weak<Connection>,
+    cursor_instance: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1563,6 +1529,7 @@ impl FtsIndexAttachment {
             ngram_window,
             cached_state: Arc::new(RwLock::new(CachedFtsStates::default())),
             cached_writer: Arc::new(Mutex::new(None)),
+            writer_slot: Arc::new(Mutex::new(None)),
             runtime_stats: Arc::new(FtsRuntimeStats::default()),
         })
     }
@@ -1593,6 +1560,17 @@ fn initialize_btree_storage_table(
     database_id: usize,
     table_name: &str,
 ) -> Result<()> {
+    // Fast path: both objects already exist (every open after the index was
+    // created). Skips preparing and running two nested DDL statements per
+    // write cursor open.
+    let index_name = format!("{table_name}_key");
+    let already_exists = conn.with_schema(database_id, |schema| {
+        schema.get_btree_table(table_name).is_some()
+            && schema.get_index(table_name, &index_name).is_some()
+    });
+    if already_exists {
+        return Ok(());
+    }
     let db_prefix = conn
         .get_database_name_by_index(database_id)
         .filter(|name| name != "main")
@@ -1860,7 +1838,14 @@ pub struct FtsCursor {
     cached_parser: Option<Arc<tantivy::query::QueryParser>>,
     shared_cache: Arc<RwLock<CachedFtsStates>>,
     shared_writer: Arc<Mutex<Option<CachedFtsWriter>>>,
-    connection: Option<Arc<Connection>>,
+    /// Shared with the attachment: the one cursor allowed to flush this index
+    /// per connection. See [`FtsWriterSlot`].
+    writer_slot: Arc<Mutex<Option<FtsWriterSlot>>>,
+    /// This cursor's identity in [`FtsWriterSlot`] claims.
+    cursor_instance_id: u64,
+    /// Weak so a cursor parked on its connection does not keep the connection
+    /// alive (see `IndexMethodContext::connection`).
+    connection: Option<Weak<Connection>>,
     database_id: Option<usize>,
     fts_dir_cursor: Option<Box<dyn CursorTrait>>,
     btree_root_page: Option<i64>,
@@ -1879,6 +1864,9 @@ pub struct FtsCursor {
     /// True while `open_write` is driving the shared open state machine.
     /// Read state is never published or reused in this mode.
     opening_for_write: bool,
+    /// True once this cursor holds the per-index writer slot (and the MVCC
+    /// write lease). See [`FtsWriterSlot`].
+    holds_writer_slot: bool,
     runtime_stats: Arc<FtsRuntimeStats>,
 }
 
@@ -1912,6 +1900,8 @@ impl FtsCursor {
             cached_parser: None,
             shared_cache: Arc::clone(&attachment.cached_state),
             shared_writer: Arc::clone(&attachment.cached_writer),
+            writer_slot: Arc::clone(&attachment.writer_slot),
+            cursor_instance_id: NEXT_FTS_CURSOR_INSTANCE.fetch_add(1, Ordering::Relaxed),
             connection: None,
             database_id: None,
             fts_dir_cursor: None,
@@ -1929,7 +1919,193 @@ impl FtsCursor {
             hit_pos: 0,
             current_pattern: FTS_PATTERN_SCORE,
             opening_for_write: false,
+            holds_writer_slot: false,
             runtime_stats: Arc::clone(&attachment.runtime_stats),
+        }
+    }
+
+    /// Claim the per-index writer slot for this cursor, or refuse if another
+    /// cursor on the same connection already holds it. Under MVCC this also
+    /// acquires the per-index write lease, so a transaction only pays for the
+    /// lease once it actually mutates the index. See [`FtsWriterSlot`].
+    fn claim_writer_slot(&mut self) -> Result<()> {
+        if self.holds_writer_slot {
+            return Ok(());
+        }
+        let conn = self
+            .connection
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                LimboError::InternalError("FTS cursor claimed writer slot before open".to_string())
+            })?;
+        {
+            let mut slot = self.writer_slot.lock();
+            if let Some(claim) = slot.as_ref() {
+                let same_live_connection = claim
+                    .connection
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, &conn));
+                if same_live_connection && claim.cursor_instance != self.cursor_instance_id {
+                    // Raise(Abort) so the whole statement rolls back: the
+                    // refused write may sit mid-statement (a trigger body),
+                    // and its base rows must not commit without their index
+                    // entries.
+                    return Err(LimboError::Raise(
+                        turso_parser::ast::ResolveType::Abort,
+                        "statement already has an open writer on this FTS index; \
+                         a trigger cannot write the FTS-indexed table its firing \
+                         statement is writing"
+                            .to_string(),
+                    ));
+                }
+                // A claim from another (or dead) connection: cross-connection
+                // writers are serialized by the pager write lock or the MVCC
+                // write lease, so this claim is stale. Replace it.
+            }
+            *slot = Some(FtsWriterSlot {
+                connection: Arc::downgrade(&conn),
+                cursor_instance: self.cursor_instance_id,
+            });
+        }
+        if let Err(err) = self.acquire_mvcc_write_lease() {
+            self.release_writer_slot();
+            return Err(err);
+        }
+        self.holds_writer_slot = true;
+        Ok(())
+    }
+
+    /// Under MVCC, take the per-index write lease for this cursor's
+    /// transaction. Reentrant for the owning transaction; a no-op in WAL mode.
+    fn acquire_mvcc_write_lease(&self) -> Result<()> {
+        let conn = self
+            .connection
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| LimboError::InternalError("FTS cursor has no connection".to_string()))?;
+        let database_id = self.database_id.ok_or_else(|| {
+            LimboError::InternalError("FTS database id is not initialized".to_string())
+        })?;
+        let Some(mv_store) = conn.mv_store_for_db(database_id) else {
+            return Ok(());
+        };
+        let tx_id = conn.get_mv_tx_id_for_db(database_id).ok_or_else(|| {
+            LimboError::InternalError(
+                "FTS write opened without an active MVCC transaction".to_string(),
+            )
+        })?;
+        let root_page = self.btree_root_page.ok_or_else(|| {
+            LimboError::InternalError("FTS backing root is not initialized".to_string())
+        })?;
+        let snapshot_ts = mv_store.read_snapshot_ts(tx_id);
+        // A PASSIVE checkpoint can retire this root page under a stale
+        // compiled plan; that is a stale-schema read, not corruption.
+        let index_id = if conn.experimental_mvcc_passive_checkpoint_enabled() {
+            mv_store
+                .try_get_table_id_from_root_page_at(root_page, snapshot_ts)
+                .ok_or(LimboError::SchemaUpdated)?
+        } else {
+            mv_store.get_table_id_from_root_page_at(root_page, snapshot_ts)
+        };
+        match mv_store.acquire_index_method_write_lease(tx_id, index_id) {
+            Ok(()) => {
+                self.runtime_stats
+                    .write_lease_acquisitions
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err @ (LimboError::WriteWriteConflict | LimboError::Busy)) => {
+                self.runtime_stats
+                    .write_lease_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Body of `open_write`; split out so the wrapper can clear
+    /// `opening_for_write` on every error return.
+    fn open_write_inner(
+        &mut self,
+        context: &IndexMethodContext,
+        conn: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<IOResult<()>> {
+        if self.writer.is_some() {
+            return Ok(IOResult::Done(()));
+        }
+
+        initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
+        self.open_cursor(conn, database_id)?;
+        // The per-index write lease is taken lazily, on the first document
+        // mutation (see `claim_writer_slot`): a write cursor that never
+        // touches a document — an UPDATE matching no rows — must not lock the
+        // index for the rest of its transaction.
+        if self.restore_cached_writer(context)? {
+            return Ok(IOResult::Done(()));
+        }
+
+        // First do open_read to load existing index
+        match &self.state {
+            FtsState::Ready => {}
+            _ => {
+                let result = self.open_read(context)?;
+                if let IOResult::IO(io) = result {
+                    return Ok(IOResult::IO(io));
+                }
+            }
+        }
+        // The IndexWriter itself is built lazily on the first document
+        // mutation (`ensure_writer`), after the writer slot and MVCC lease
+        // are claimed — so a refused writer never pays for Tantivy writer
+        // construction, and a write cursor that never mutates never builds
+        // one at all.
+        Ok(IOResult::Done(()))
+    }
+
+    /// Build the Tantivy `IndexWriter` if this cursor does not have one yet.
+    /// Callers must claim the writer slot first (`claim_writer_slot`).
+    fn ensure_writer(&mut self) -> Result<()> {
+        if self.writer.is_some() {
+            return Ok(());
+        }
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("FTS index not initialized".into()))?;
+        // One worker and one merge thread: merges are driven synchronously by
+        // commit_writer_with_maintenance, so the default four merge threads
+        // would sit idle forever, at three OS threads apiece.
+        self.runtime_stats
+            .tantivy_writer_constructions
+            .fetch_add(1, Ordering::Relaxed);
+        let writer = index
+            .writer_with_options(
+                tantivy::indexer::IndexWriterOptions::builder()
+                    .num_worker_threads(1)
+                    .num_merge_threads(1)
+                    .memory_budget_per_thread(DEFAULT_MEMORY_BUDGET_BYTES)
+                    .build(),
+            )
+            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+        // Disable background merges.
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        self.writer = Some(writer);
+        Ok(())
+    }
+
+    /// Release the writer slot if this cursor holds it. Idempotent. The MVCC
+    /// write lease stays with the transaction until it commits or rolls back.
+    fn release_writer_slot(&mut self) {
+        self.holds_writer_slot = false;
+        let mut slot = self.writer_slot.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|claim| claim.cursor_instance == self.cursor_instance_id)
+        {
+            *slot = None;
         }
     }
 
@@ -2009,13 +2185,13 @@ impl FtsCursor {
         context: &IndexMethodContext,
         visible_control: Option<&FtsControlRecord>,
     ) -> Option<CachedFtsCheckout> {
-        let conn = context.connection();
+        let conn = context.connection().ok()?;
         if conn.is_in_write_tx() {
             return None;
         }
         let mut cache = self.shared_cache.write();
         cache.prune();
-        let position = cache.connection_position(conn)?;
+        let position = cache.connection_position(&conn)?;
         let cached = &cache.entries[position];
         let same_snapshot = match (context.transaction_id(), cached.transaction_id) {
             (Some(current), Some(cached)) => current == cached,
@@ -2048,29 +2224,50 @@ impl FtsCursor {
     }
 
     fn has_cached_state(&self, context: &IndexMethodContext) -> bool {
-        let conn = context.connection();
-        !conn.is_in_write_tx() && self.shared_cache.read().connection_position(conn).is_some()
+        let Ok(conn) = context.connection() else {
+            return false;
+        };
+        !conn.is_in_write_tx()
+            && self
+                .shared_cache
+                .read()
+                .connection_position(&conn)
+                .is_some()
     }
 
-    fn install_cached_checkout(&mut self, checkout: CachedFtsCheckout) {
+    /// Install a cache checkout on this cursor. Returns `true` when the cursor
+    /// is ready to serve queries, `false` when the caller must keep driving the
+    /// state machine (a write cursor still has to build its own Tantivy index).
+    fn install_cached_checkout(&mut self, checkout: CachedFtsCheckout) -> bool {
         let (directory, index, reader, query_parser, control) = checkout;
+        self.hybrid_directory = Some(directory);
+        self.control = Some(control);
+        if self.opening_for_write {
+            // A writer needs an Index whose Directory owns cursor-local pending
+            // state. The cached Index shares the cache entry's directory, so
+            // installing it would send this cursor's writes into the cache
+            // entry's pending map, where the flush never finds them. Rebuild
+            // the Index over the fresh directory clone instead.
+            tracing::debug!("FTS open_write: using cached directory snapshot, rebuilding index");
+            self.state = FtsState::CreatingIndex;
+            return false;
+        }
         self.runtime_stats
             .read_cache_hits
             .fetch_add(1, Ordering::Relaxed);
         tracing::debug!("FTS open_read: using cached state (skipping catalog load)");
-        self.hybrid_directory = Some(directory);
-        self.control = Some(control);
         self.index = Some(index);
         self.searcher = Some(reader.searcher());
         self.reader = Some(reader);
         self.cached_parser = Some(query_parser);
         self.state = FtsState::Ready;
+        true
     }
 
     /// Restore a writer retained by the previous statement when its committed
     /// metadata still matches this transaction's backing B-tree view.
     fn restore_cached_writer(&mut self, context: &IndexMethodContext) -> Result<bool> {
-        let conn = context.connection();
+        let conn = context.connection()?;
         self.runtime_stats
             .writer_cache_lookups
             .fetch_add(1, Ordering::Relaxed);
@@ -2088,7 +2285,7 @@ impl FtsCursor {
         let same_connection = cached
             .connection
             .upgrade()
-            .is_some_and(|owner| Arc::ptr_eq(&owner, conn));
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &conn));
         let metadata_matches = if conn.mv_store_for_db(database_id).is_some() {
             same_connection
                 && context.transaction_id().is_some()
@@ -2128,9 +2325,9 @@ impl FtsCursor {
             return Ok(false);
         }
 
-        let cached = cached_writer
-            .take()
-            .expect("validated cached writer must still be present");
+        let cached = cached_writer.take().ok_or_else(|| {
+            LimboError::InternalError("validated cached FTS writer disappeared".to_string())
+        })?;
         drop(cached_writer);
         self.runtime_stats
             .writer_cache_hits
@@ -2147,29 +2344,42 @@ impl FtsCursor {
         Ok(true)
     }
 
-    fn has_deferred_cached_writer(&self, context: &IndexMethodContext) -> bool {
-        let conn = context.connection();
+    /// Does this connection have a writer whose transaction committed but
+    /// whose view has not been re-checked against the on-disk control record
+    /// yet? Such a writer may only be reused after that check
+    /// (`take_writer_if_control_matches`).
+    fn writer_needs_control_check(&self, context: &IndexMethodContext) -> bool {
+        let Ok(conn) = context.connection() else {
+            return false;
+        };
         self.shared_writer.lock().as_ref().is_some_and(|cached| {
             cached.transaction_id.is_none()
                 && cached
                     .connection
                     .upgrade()
-                    .is_some_and(|owner| Arc::ptr_eq(&owner, conn))
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, &conn))
         })
     }
 
-    fn checkout_validated_cached_writer(
+    /// Reuse this connection's committed writer if the control record it was
+    /// built on is still the one visible on disk; otherwise leave (or drop)
+    /// it and report a miss.
+    fn take_writer_if_control_matches(
         &mut self,
         context: &IndexMethodContext,
         visible_control: &FtsControlRecord,
     ) -> bool {
-        let conn = context.connection();
+        let Ok(conn) = context.connection() else {
+            return false;
+        };
         let mut cached_writer = self.shared_writer.lock();
         let Some(cached) = cached_writer.as_ref() else {
             return false;
         };
         let owner = cached.connection.upgrade();
-        let same_connection = owner.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, conn));
+        let same_connection = owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &conn));
         let deferred = cached.transaction_id.is_none();
         let matches_control = cached.control.index_incarnation == visible_control.index_incarnation
             && cached.control.manifest_generation == visible_control.manifest_generation;
@@ -2193,9 +2403,12 @@ impl FtsCursor {
             return false;
         }
 
-        let cached = cached_writer
-            .take()
-            .expect("validated cached writer must still be present");
+        // The invariant (slot lock held from the check to the take) makes
+        // this infallible; treat a violation as a cache miss, not a crash.
+        let Some(cached) = cached_writer.take() else {
+            tracing::error!("validated cached FTS writer disappeared");
+            return false;
+        };
         drop(cached_writer);
         self.runtime_stats
             .writer_cache_hits
@@ -2211,8 +2424,12 @@ impl FtsCursor {
         true
     }
 
-    fn discard_deferred_cached_writer(&self, context: &IndexMethodContext) {
-        let conn = context.connection();
+    /// Drop this connection's committed-but-unchecked writer when the control
+    /// record it needed to validate against turns out not to exist.
+    fn drop_unchecked_writer(&self, context: &IndexMethodContext) {
+        let Ok(conn) = context.connection() else {
+            return;
+        };
         let mut cached_writer = self.shared_writer.lock();
         // A missing control record proves this connection's deferred writer is
         // stale. The slot is shared by every connection, so a live writer
@@ -2222,7 +2439,7 @@ impl FtsCursor {
                 .as_ref()
                 .is_some_and(|cached| match cached.connection.upgrade() {
                     None => true,
-                    Some(owner) => Arc::ptr_eq(&owner, conn) && cached.transaction_id.is_none(),
+                    Some(owner) => Arc::ptr_eq(&owner, &conn) && cached.transaction_id.is_none(),
                 });
         if !discard {
             return;
@@ -2240,7 +2457,9 @@ impl FtsCursor {
 
     /// Retain a fully flushed writer for the next statement on this connection.
     fn cache_writer(&mut self, context: &IndexMethodContext) {
-        let conn = context.connection();
+        let Ok(conn) = context.connection() else {
+            return;
+        };
         if self.pending_docs_count != 0 || !matches!(self.state, FtsState::Ready) {
             tracing::trace!(
                 pending_documents = self.pending_docs_count,
@@ -2260,15 +2479,22 @@ impl FtsCursor {
             .saturating_add(retained_read_bytes)
             > fts_max_retained_cache_bytes()
         {
+            // Keep the writer — it is the newest committed state, and the
+            // cursor held these bytes while it ran anyway — and make room by
+            // evicting retained read snapshots instead. Rejecting the writer
+            // would leave a stale one in the slot and force the next write
+            // statement into a full cold load.
             self.runtime_stats
                 .cache_admission_rejections
                 .fetch_add(1, Ordering::Relaxed);
+            let read_budget =
+                fts_max_retained_cache_bytes().saturating_sub(directory.hot_cache.size());
+            self.shared_cache.write().evict_to_fit(read_budget);
             tracing::debug!(
                 resident_bytes = directory.hot_cache.size(),
                 budget_bytes = fts_max_retained_cache_bytes(),
-                "FTS writer cache: snapshot exceeds retention budget"
+                "FTS writer cache: over retention budget; evicted read snapshots"
             );
-            return;
         }
         // Index creation and failed statements can close a cursor before all
         // directory mutations enter the normal document flush state machine.
@@ -2303,7 +2529,7 @@ impl FtsCursor {
         let snapshot_wal_pos = (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos);
 
         let previous = self.shared_writer.lock().replace(CachedFtsWriter {
-            connection: Arc::downgrade(conn),
+            connection: Arc::downgrade(&conn),
             transaction_id: context.transaction_id(),
             snapshot_wal_pos,
             control,
@@ -2715,11 +2941,11 @@ impl FtsCursor {
             committed_writer = true;
 
             // The cached reader belongs to the previous index snapshot.
-            if let Some(conn) = &self.connection {
+            if let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) {
                 let mut cache = self.shared_cache.write();
-                if cache.connection_position(conn).is_some() {
+                if cache.connection_position(&conn).is_some() {
                     tracing::debug!("FTS commit_and_flush: invalidating cached read state");
-                    cache.remove_connection(conn);
+                    cache.remove_connection(&conn);
                 }
             }
         }
@@ -2812,8 +3038,18 @@ impl FtsCursor {
             // eligible level first prevents fresh tiny segments from piling up.
             .rev()
         {
-            let segment_ids = candidate
-                .0
+            // Prefer the smallest segments of the candidate: taking the first
+            // eight of Tantivy's largest-first list picks exactly the eight
+            // most likely to blow the foreground budget, which silently
+            // stalls maintenance at that level forever.
+            let mut candidate_ids = candidate.0;
+            candidate_ids.sort_by_key(|id| {
+                segment_metas
+                    .iter()
+                    .find(|meta| meta.id() == *id)
+                    .map_or(u64::MAX, |meta| u64::from(meta.max_doc()))
+            });
+            let segment_ids = candidate_ids
                 .into_iter()
                 .take(FTS_MERGE_FACTOR)
                 .collect::<Vec<_>>();
@@ -2821,10 +3057,13 @@ impl FtsCursor {
             let mut source_bytes = 0u64;
 
             for segment_id in &segment_ids {
-                let segment_meta = segment_metas
-                    .iter()
-                    .find(|meta| meta.id() == *segment_id)
-                    .expect("merge policy returned an unknown FTS segment");
+                // The merge policy is third-party code; do not trust it to
+                // return only segments it was given.
+                let Some(segment_meta) = segment_metas.iter().find(|meta| meta.id() == *segment_id)
+                else {
+                    tracing::error!("merge policy returned an unknown FTS segment; skipping merge");
+                    return None;
+                };
                 source_docs = source_docs.saturating_add(u64::from(segment_meta.max_doc()));
                 for path in segment_meta.list_files() {
                     if let Some(size) = file_size(&path) {
@@ -2921,14 +3160,26 @@ impl FtsCursor {
             .filter(|&incarnation| incarnation != FTS_EMPTY_INDEX_INCARNATION)
             .or_else(|| {
                 self.btree_root_page.map(|root_page| {
+                    // Mix in IO-provided entropy so two processes creating
+                    // the same index in different files do not mint the same
+                    // on-disk incarnation (the counter restarts at 1 in every
+                    // process). The IO trait's generator is deterministic
+                    // under the simulator.
                     let nonce = NEXT_FTS_INDEX_INCARNATION.fetch_add(1, Ordering::Relaxed);
+                    let entropy = directory.pager.io.generate_random_number() as u64;
                     // The placeholder value marks "never written": never mint it.
-                    ((root_page as u64).rotate_left(32) ^ nonce).max(1)
+                    ((root_page as u64).rotate_left(32) ^ nonce ^ entropy).max(1)
                 })
             })
             .ok_or_else(|| {
                 LimboError::InternalError("FTS backing root is not initialized".to_string())
             })?;
+        // Deriving the next generation from this cursor's copy of the control
+        // record is safe only because writers are serialized: within a
+        // connection by the per-index writer slot (one flushing cursor at a
+        // time), across connections by the pager write lock (WAL) or the
+        // per-index MVCC write lease, which also refuses any writer whose
+        // snapshot predates the last published generation.
         let control = FtsControlRecord::from_catalog(
             self.control.as_ref(),
             index_incarnation,
@@ -2942,6 +3193,7 @@ impl FtsCursor {
 
 impl Drop for FtsCursor {
     fn drop(&mut self) {
+        self.release_writer_slot();
         let is_flushing = self.state.is_flushing();
         if self.pending_docs_count != 0 || is_flushing {
             tracing::error!(
@@ -2960,23 +3212,34 @@ impl Drop for FtsCursor {
 impl IndexMethodCursor for FtsCursor {
     /// Creates the FTS index storage (internal BTree table for Tantivy files).
     fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
-        let conn = context.connection();
+        let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
-        initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
+        initialize_btree_storage_table(&conn, database_id, &self.dir_table_name)?;
         return_if_io!(self.open_write(context));
+        // The forced flush below stages the index's first control record,
+        // which requires a committed writer even for an empty table.
+        self.claim_writer_slot()?;
+        self.ensure_writer()?;
         self.commit_and_flush_inner(true)
     }
 
     /// Destroys the FTS index, dropping all storage and clearing caches.
     fn destroy(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
-        let conn = context.connection();
+        let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
+        self.connection = Some(Arc::downgrade(&conn));
         tracing::debug!(
             "FTS destroy: dropping internal storage {}",
             self.dir_table_name
         );
+
+        // Serialize with live writers through the same per-index writer slot
+        // and MVCC write lease as DML, so DROP INDEX cannot tear the index
+        // down under a transaction that is mid-write.
+        self.open_cursor(&conn, database_id)?;
+        self.claim_writer_slot()?;
 
         // Drop all in-memory components first
         self.searcher = None;
@@ -2987,13 +3250,29 @@ impl IndexMethodCursor for FtsCursor {
         self.fts_dir_cursor = None;
         self.control = None;
 
-        // Invalidate cached read state.
+        // Invalidate only this connection's cached read state and writer. The
+        // drop is not committed yet, so other connections' caches must stay;
+        // if the drop commits, their next access misses on the schema change,
+        // and a recreated index carries a fresh incarnation so no stale
+        // snapshot can validate against it.
+        self.shared_cache.write().remove_connection(&conn);
         {
-            let mut cache = self.shared_cache.write();
-            cache.clear();
+            let mut cached_writer = self.shared_writer.lock();
+            let owned_or_dead =
+                cached_writer
+                    .as_ref()
+                    .is_some_and(|cached| match cached.connection.upgrade() {
+                        None => true,
+                        Some(owner) => Arc::ptr_eq(&owner, &conn),
+                    });
+            let stale = if owned_or_dead {
+                cached_writer.take()
+            } else {
+                None
+            };
+            drop(cached_writer);
+            drop(stale);
         }
-        let cached_writer = self.shared_writer.lock().take();
-        drop(cached_writer);
 
         // Drop the internal storage table and index
         // The backing_btree index will be dropped automatically when the table is dropped
@@ -3026,7 +3305,7 @@ impl IndexMethodCursor for FtsCursor {
     /// Opens the index for reading, loading the catalog and creating a searcher.
     /// Uses async state machine for non-blocking IO during catalog/file loading.
     fn open_read(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
-        let conn = context.connection();
+        let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
         loop {
@@ -3037,23 +3316,30 @@ impl IndexMethodCursor for FtsCursor {
                             .read_cache_lookups
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    self.connection = Some(conn.clone());
-                    // Ensure storage table exists
-                    initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
+                    self.connection = Some(Arc::downgrade(&conn));
+                    // The backing table is created by create() / open_write();
+                    // a pure read must not run DDL, or FTS queries fail on
+                    // read-only databases. If the table is genuinely missing,
+                    // open_cursor reports it.
+                    if self.opening_for_write {
+                        initialize_btree_storage_table(&conn, database_id, &self.dir_table_name)?;
+                    }
                     // Open BTree cursor (needed for btree_root_page)
-                    self.open_cursor(conn, database_id)?;
+                    self.open_cursor(&conn, database_id)?;
 
                     // A cache entry from the exact same snapshot can be used
                     // immediately. A cache from an older snapshot is retained
                     // until the small transactional control record has been
                     // read asynchronously and its identity validated.
                     if let Some(checkout) = self.checkout_cached_state(context, None) {
-                        self.install_cached_checkout(checkout);
-                        return Ok(IOResult::Done(()));
+                        if self.install_cached_checkout(checkout) {
+                            return Ok(IOResult::Done(()));
+                        }
+                        continue;
                     }
 
                     self.state = if self.has_cached_state(context)
-                        || (self.opening_for_write && self.has_deferred_cached_writer(context))
+                        || (self.opening_for_write && self.writer_needs_control_check(context))
                     {
                         FtsState::SeekingControl
                     } else {
@@ -3084,7 +3370,7 @@ impl IndexMethodCursor for FtsCursor {
                     self.state = match seek_result {
                         SeekResult::NotFound => {
                             if self.opening_for_write {
-                                self.discard_deferred_cached_writer(context);
+                                self.drop_unchecked_writer(context);
                             }
                             FtsState::Rewinding
                         }
@@ -3107,7 +3393,7 @@ impl IndexMethodCursor for FtsCursor {
                         }
                     } else {
                         if self.opening_for_write {
-                            self.discard_deferred_cached_writer(context);
+                            self.drop_unchecked_writer(context);
                         }
                         FtsState::Rewinding
                     };
@@ -3177,7 +3463,7 @@ impl IndexMethodCursor for FtsCursor {
                     if finished {
                         if chunks.is_empty() {
                             if self.opening_for_write {
-                                self.discard_deferred_cached_writer(context);
+                                self.drop_unchecked_writer(context);
                             }
                             self.runtime_stats
                                 .manifest_validation_misses
@@ -3195,7 +3481,7 @@ impl IndexMethodCursor for FtsCursor {
                             assemble_catalog_file(Path::new(FTS_CONTROL_PATH), &control_chunks)?;
                         let control = FtsControlRecord::decode(&control_bytes)?;
                         if self.opening_for_write
-                            && self.checkout_validated_cached_writer(context, &control)
+                            && self.take_writer_if_control_matches(context, &control)
                         {
                             return Ok(IOResult::Done(()));
                         }
@@ -3204,8 +3490,10 @@ impl IndexMethodCursor for FtsCursor {
                             self.runtime_stats
                                 .manifest_validation_hits
                                 .fetch_add(1, Ordering::Relaxed);
-                            self.install_cached_checkout(checkout);
-                            return Ok(IOResult::Done(()));
+                            if self.install_cached_checkout(checkout) {
+                                return Ok(IOResult::Done(()));
+                            }
+                            continue;
                         }
                         self.runtime_stats
                             .manifest_validation_misses
@@ -3262,7 +3550,21 @@ impl IndexMethodCursor for FtsCursor {
                                 .copied()
                                 .expect("catalog builder entries have chunks");
                             let total_size: usize = chunks.values().map(|(size, _)| size).sum();
-                            let num_chunks = (max_chunk + 1) as usize;
+                            // The chunk number comes straight out of a stored
+                            // record; a corrupted value must not overflow.
+                            let num_chunks =
+                                usize::try_from(max_chunk.checked_add(1).ok_or_else(|| {
+                                    LimboError::Corrupt(format!(
+                                        "FTS chunk number out of range for {}",
+                                        path.display()
+                                    ))
+                                })?)
+                                .map_err(|_| {
+                                    LimboError::Corrupt(format!(
+                                        "FTS chunk number is negative for {}",
+                                        path.display()
+                                    ))
+                                })?;
                             let metadata = FileMetadata::new(&path, total_size, num_chunks);
                             let assembled = assemble_catalog_file(&path, &chunks)?;
                             files.insert(path.clone(), assembled);
@@ -3273,10 +3575,21 @@ impl IndexMethodCursor for FtsCursor {
                             if catalog.is_empty() {
                                 Some(FtsControlRecord::new(FTS_EMPTY_INDEX_INCARNATION))
                             } else {
-                                return Err(LimboError::Corrupt(
-                                    "FTS storage predates control-record format v1; rebuild the index"
-                                        .into(),
-                                ));
+                                // An index written by a build that predates the
+                                // control record: adopt the catalog we just
+                                // loaded as the manifest, so reads and writes
+                                // keep working. The placeholder incarnation
+                                // makes the next staged control record mint a
+                                // real one and persist the manifest durably.
+                                tracing::info!(
+                                    files = catalog.len(),
+                                    "FTS storage has no control record; adopting existing catalog"
+                                );
+                                Some(FtsControlRecord::from_catalog(
+                                    None,
+                                    FTS_EMPTY_INDEX_INCARNATION,
+                                    &catalog,
+                                )?)
                             }
                         } else {
                             let control_bytes = assemble_catalog_file(
@@ -3356,16 +3669,21 @@ impl IndexMethodCursor for FtsCursor {
                     } else {
                         catalog_builder.entry(path_buf.clone()).or_default()
                     };
+                    // Move the blob into the builder — copying it just to keep
+                    // a reference for the error message below would duplicate
+                    // the whole index once per cold load.
+                    let blob_len = blob.len();
                     if let Some((existing_size, existing_blob)) =
-                        chunks.insert(chunk_no, (blob.len(), Some(blob.clone())))
+                        chunks.insert(chunk_no, (blob_len, Some(blob)))
                     {
+                        let new_blob = chunks.get(&chunk_no).and_then(|(_, blob)| blob.as_deref());
                         return Err(LimboError::Corrupt(format!(
                             "duplicate FTS chunk {}:{} (existing_size={}, new_size={}, equal={})",
                             path_buf.display(),
                             chunk_no,
                             existing_size,
-                            blob.len(),
-                            existing_blob.as_deref() == Some(blob.as_slice())
+                            blob_len,
+                            existing_blob.as_deref() == new_blob
                         )));
                     }
 
@@ -3380,13 +3698,19 @@ impl IndexMethodCursor for FtsCursor {
                     // Create Tantivy index from directory
                     self.create_index_from_directory()?;
 
-                    // Create reader and searcher
+                    // Create reader and searcher. Reload is explicit: this
+                    // directory's `watch` cannot deliver callbacks, so the
+                    // default on-commit policy would silently never fire.
                     let index = self.index.as_ref().ok_or_else(|| {
                         LimboError::InternalError("FTS index not initialized".into())
                     })?;
                     let reader = index
-                        .reader()
-                        .map_err(|e| LimboError::InternalError(e.to_string()))?;
+                        .reader_builder()
+                        .reload_policy(tantivy::ReloadPolicy::Manual)
+                        .try_into()
+                        .map_err(|e: tantivy::TantivyError| {
+                            LimboError::InternalError(e.to_string())
+                        })?;
                     self.searcher = Some(reader.searcher());
                     self.reader = Some(reader);
 
@@ -3420,7 +3744,7 @@ impl IndexMethodCursor for FtsCursor {
                             fts_max_retained_cache_bytes().saturating_sub(writer_bytes);
                         let retained = cache.insert(
                             CachedFtsState {
-                                connection: Arc::downgrade(conn),
+                                connection: Arc::downgrade(&conn),
                                 transaction_id: context.transaction_id(),
                                 snapshot_wal_pos,
                                 control,
@@ -3461,88 +3785,29 @@ impl IndexMethodCursor for FtsCursor {
     /// Opens the index for writing, creating the IndexWriter.
     /// Calls `open_read` first if not already initialized.
     fn open_write(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
-        let conn = context.connection();
+        let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
         self.opening_for_write = true;
         if self.connection.is_none() {
-            self.connection = Some(conn.clone());
+            self.connection = Some(Arc::downgrade(&conn));
         }
 
-        if self.writer.is_some() {
+        // `opening_for_write` must stay set across IO yields (the opcode
+        // re-enters), but never survive an error: a later open_read on the
+        // same cursor would then skip publishing read state forever.
+        let result = self.open_write_inner(context, &conn, database_id);
+        if !matches!(result, Ok(IOResult::IO(_))) {
             self.opening_for_write = false;
-            return Ok(IOResult::Done(()));
         }
-
-        initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
-        self.open_cursor(conn, database_id)?;
-        if let Some(mv_store) = conn.mv_store_for_db(database_id) {
-            let tx_id = conn.get_mv_tx_id_for_db(database_id).ok_or_else(|| {
-                LimboError::InternalError(
-                    "FTS write opened without an active MVCC transaction".to_string(),
-                )
-            })?;
-            let root_page = self.btree_root_page.ok_or_else(|| {
-                LimboError::InternalError("FTS backing root is not initialized".to_string())
-            })?;
-            let snapshot_ts = mv_store.read_snapshot_ts(tx_id);
-            let index_id = mv_store.get_table_id_from_root_page_at(root_page, snapshot_ts);
-            match mv_store.acquire_index_method_write_lease(tx_id, index_id) {
-                Ok(()) => {
-                    self.runtime_stats
-                        .write_lease_acquisitions
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(err @ LimboError::WriteWriteConflict) => {
-                    self.runtime_stats
-                        .write_lease_rejections
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        if self.restore_cached_writer(context)? {
-            self.opening_for_write = false;
-            return Ok(IOResult::Done(()));
-        }
-
-        // First do open_read to load existing index
-        match &self.state {
-            FtsState::Ready => {}
-            _ => {
-                let result = self.open_read(context)?;
-                if let IOResult::IO(io) = result {
-                    return Ok(IOResult::IO(io));
-                }
-            }
-        }
-        if self.writer.is_some() {
-            self.opening_for_write = false;
-            return Ok(IOResult::Done(()));
-        }
-
-        let index = self
-            .index
-            .as_ref()
-            .ok_or_else(|| LimboError::InternalError("FTS index not initialized".into()))?;
-        // Use single-threaded mode to avoid concurrent access.
-        self.runtime_stats
-            .tantivy_writer_constructions
-            .fetch_add(1, Ordering::Relaxed);
-        let writer = index
-            .writer_with_num_threads(1, DEFAULT_MEMORY_BUDGET_BYTES)
-            .map_err(|e| LimboError::InternalError(e.to_string()))?;
-        // Disable background merges.
-        writer.set_merge_policy(Box::new(NoMergePolicy));
-        self.writer = Some(writer);
-        self.opening_for_write = false;
-        Ok(IOResult::Done(()))
+        result
     }
 
     /// Inserts a document into the FTS index.
     /// Values are text columns followed by rowid. Batches commits for efficiency.
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+        self.claim_writer_slot()?;
+        self.ensure_writer()?;
         return_if_io!(self.flush_full_batch_before_mutation());
 
         let Some(ref mut writer) = self.writer else {
@@ -3573,6 +3838,14 @@ impl IndexMethodCursor for FtsCursor {
                     doc.add_text(*field, t.as_str());
                 }
                 Register::Value(Value::Null) => continue,
+                // Coerce every non-NULL value to text before tokenizing, the
+                // way FTS5's sqlite3_value_text() does. Skipping them would
+                // make the index silently miss rows a plain scan matches.
+                Register::Value(value) => {
+                    if let Some(text) = value.cast_text() {
+                        doc.add_text(*field, &text);
+                    }
+                }
                 _ => continue,
             }
         }
@@ -3588,6 +3861,8 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Deletes a document from the FTS index by rowid.
     fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+        self.claim_writer_slot()?;
+        self.ensure_writer()?;
         return_if_io!(self.flush_full_batch_before_mutation());
 
         let Some(ref mut writer) = self.writer else {
@@ -3625,9 +3900,13 @@ impl IndexMethodCursor for FtsCursor {
             let index = self.index.as_ref().ok_or_else(|| {
                 LimboError::InternalError("FTS index not initialized - call open_read first".into())
             })?;
+            // Manual reload policy: this directory's `watch` cannot deliver
+            // callbacks, so the default on-commit policy never fires.
             let reader = index
-                .reader()
-                .map_err(|e| LimboError::InternalError(e.to_string()))?;
+                .reader_builder()
+                .reload_policy(tantivy::ReloadPolicy::Manual)
+                .try_into()
+                .map_err(|e: tantivy::TantivyError| LimboError::InternalError(e.to_string()))?;
             self.searcher = Some(reader.searcher());
             self.reader = Some(reader);
         }
@@ -3635,9 +3914,9 @@ impl IndexMethodCursor for FtsCursor {
             .searcher
             .as_ref()
             .expect("FTS searcher initialized immediately above");
-        if values.is_empty() {
+        if values.len() < 2 {
             return Err(LimboError::InternalError(
-                "FTS query_start: missing pattern id".into(),
+                "FTS query_start: expected pattern id and query string".into(),
             ));
         }
 
@@ -3663,27 +3942,39 @@ impl IndexMethodCursor for FtsCursor {
             | FTS_PATTERN_MATCH_LIMIT
             | FTS_PATTERN_COMBINED_LIMIT
             | FTS_PATTERN_COMBINED_ORDERED_LIMIT => Some(if values.len() > 2 {
-                match &values[2] {
-                    Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
-                    _ => {
-                        tracing::debug!(
-                            "FTS query_start: LIMIT value is not an integer, using default 10"
-                        );
-                        10
+                // Coerce with the same rules as a plain LIMIT (MustBeInt):
+                // numeric text and integral reals become integers; anything
+                // else is a datatype mismatch, never a silent default.
+                let coerced = match &values[2] {
+                    Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => {
+                        Some(*i)
                     }
-                }
+                    Register::Value(Value::Numeric(crate::numeric::Numeric::Float(f))) => {
+                        crate::util::cast_real_to_integer(f64::from(*f)).ok()
+                    }
+                    Register::Value(Value::Text(text)) => {
+                        match crate::util::checked_cast_text_to_numeric(text.as_str(), true) {
+                            Ok(Value::Numeric(crate::numeric::Numeric::Integer(i))) => Some(i),
+                            Ok(Value::Numeric(crate::numeric::Numeric::Float(f))) => {
+                                crate::util::cast_real_to_integer(f64::from(f)).ok()
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                coerced
+                    .ok_or_else(|| LimboError::Constraint("datatype mismatch (19)".to_string()))?
             } else {
-                tracing::debug!(
-                    "FTS query_start: LIMIT pattern but no limit value provided, using default 10"
-                );
-                10
+                return Err(LimboError::InternalError(
+                    "FTS query_start: LIMIT pattern selected but no limit value captured"
+                        .to_string(),
+                ));
             }),
             _ => {
-                tracing::debug!(
-                    "FTS query_start: unknown pattern {}, using default limit 10",
-                    pattern_idx
-                );
-                Some(10)
+                return Err(LimboError::InternalError(format!(
+                    "FTS query_start: unknown pattern {pattern_idx}"
+                )));
             }
         };
 
@@ -3697,9 +3988,38 @@ impl IndexMethodCursor for FtsCursor {
         }
         let parser = self.cached_parser.as_deref().unwrap();
 
-        let query = parser
-            .parse_query(&query_str)
-            .map_err(|e| LimboError::InternalError(format!("FTS parse error: {e}")))?;
+        // Bound the query string before it reaches Tantivy's recursive
+        // parser: a few KiB of nested parentheses would otherwise burn
+        // minutes of CPU or overflow the stack (an abort no catch_unwind
+        // contains). `parse_query_lenient` uses the non-backtracking parse
+        // path, so nesting inside these bounds stays linear.
+        if query_str.len() > FTS_MAX_QUERY_BYTES {
+            return Err(LimboError::InternalError(format!(
+                "FTS query is too long ({} bytes; the limit is {FTS_MAX_QUERY_BYTES})",
+                query_str.len()
+            )));
+        }
+        let mut depth = 0usize;
+        for byte in query_str.bytes() {
+            match byte {
+                b'(' => {
+                    depth += 1;
+                    if depth > FTS_MAX_QUERY_NESTING {
+                        return Err(LimboError::InternalError(format!(
+                            "FTS query nests deeper than {FTS_MAX_QUERY_NESTING} parentheses"
+                        )));
+                    }
+                }
+                b')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let (query, parse_errors) = parser.parse_query_lenient(&query_str);
+        if let Some(error) = parse_errors.first() {
+            return Err(LimboError::InternalError(format!(
+                "FTS parse error: {error:?}"
+            )));
+        }
 
         // TopDocs keeps a heap proportional to its limit. Cap that heap at the
         // number of live documents: this preserves unlimited-query semantics,
@@ -3755,6 +4075,48 @@ impl IndexMethodCursor for FtsCursor {
             let has_result = stream.advance()?;
             self.streaming_hits = Some(stream);
             return Ok(IOResult::Done(has_result));
+        }
+
+        // A global score ordering with no effective LIMIT: TopDocs would
+        // eagerly allocate per-segment heaps sized to the whole corpus before
+        // scoring a single document. Walk the scorers and sort what actually
+        // matched instead, so memory is proportional to the matches.
+        if limit >= searcher.num_docs() as usize {
+            let weight = query
+                .weight(EnableScoring::enabled_from_searcher(searcher))
+                .map_err(|e| LimboError::InternalError(format!("FTS query weight error: {e}")))?;
+            for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+                let mut scorer = weight
+                    .scorer(segment_reader, 1.0)
+                    .map_err(|e| LimboError::InternalError(format!("FTS scorer error: {e}")))?;
+                let rowids = segment_reader
+                    .fast_fields()
+                    .i64(ROWID_FIELD)
+                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
+                let alive = segment_reader.alive_bitset();
+                loop {
+                    let doc_id = scorer.doc();
+                    if doc_id == TERMINATED {
+                        break;
+                    }
+                    let score = scorer.score();
+                    scorer.advance();
+                    if alive.is_some_and(|alive| alive.is_deleted(doc_id)) {
+                        continue;
+                    }
+                    let rowid = rowids.first(doc_id).ok_or_else(|| {
+                        LimboError::InternalError("FTS: rowid fast field missing value".into())
+                    })?;
+                    self.current_hits.push((
+                        score,
+                        DocAddress::new(segment_ord as u32, doc_id),
+                        rowid,
+                    ));
+                }
+            }
+            self.current_hits
+                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            return Ok(IOResult::Done(!self.current_hits.is_empty()));
         }
 
         let top_docs = searcher
@@ -3883,34 +4245,47 @@ impl IndexMethodCursor for FtsCursor {
         // This handles the case where commit_and_flush() returned IOResult::IO and we need
         // to continue the flush after IO completes
         if self.state.is_flushing() {
-            return self.flush_writes_internal();
-        }
-
-        if self.pending_docs_count > 0 {
+            return_if_io!(self.flush_writes_internal());
+        } else if self.pending_docs_count > 0 {
             tracing::debug!(
                 "FTS pre_commit: flushing {} pending documents",
                 self.pending_docs_count
             );
-            return self.commit_and_flush();
+            return_if_io!(self.commit_and_flush());
         }
+        // This cursor's statement-scope writes are staged; it never flushes
+        // again, so a later statement's cursor may write this index.
+        self.release_writer_slot();
         Ok(IOResult::Done(()))
     }
 
     fn abort_statement(&mut self, context: &IndexMethodContext) {
+        self.release_writer_slot();
         self.pending_docs_count = 0;
-        self.writer = None;
+        // Dropping a Tantivy writer joins its worker threads. Take the heavy
+        // pieces into locals and drop them after the shared-cache bookkeeping
+        // below, mirroring cache_writer's drop(previous) pattern, so no lock
+        // is held while the join runs.
+        let deferred_writer = self.writer.take();
+        let deferred_index = self.index.take();
+        let deferred_directory = self.hybrid_directory.take();
         self.reader = None;
         self.searcher = None;
-        self.index = None;
-        self.hybrid_directory = None;
         self.fts_dir_cursor = None;
         self.control = None;
         self.cached_parser = None;
         self.current_hits.clear();
         self.streaming_hits = None;
-        self.shared_cache
-            .write()
-            .remove_connection(context.connection());
+        // During connection teardown there is no live connection left; the
+        // shared caches are then cleaned up by `prune()` / dead-owner checks.
+        let Ok(conn) = context.connection() else {
+            self.state = FtsState::Init;
+            drop(deferred_writer);
+            drop(deferred_index);
+            drop(deferred_directory);
+            return;
+        };
+        self.shared_cache.write().remove_connection(&conn);
         // The slot is shared by every connection: a failed statement here
         // (e.g. the losing side of a lease conflict) must not evict another
         // connection's writer. Only remove what this connection's failed
@@ -3926,8 +4301,7 @@ impl IndexMethodCursor for FtsCursor {
                 None => (true, false),
                 Some(owner) => (
                     false,
-                    Arc::ptr_eq(&owner, context.connection())
-                        && cached.transaction_id == context.transaction_id(),
+                    Arc::ptr_eq(&owner, &conn) && cached.transaction_id == context.transaction_id(),
                 ),
             },
         };
@@ -3942,8 +4316,12 @@ impl IndexMethodCursor for FtsCursor {
                 .writer_cache_rollback_discards
                 .fetch_add(1, Ordering::Relaxed);
         }
-        drop(stale);
         self.state = FtsState::Init;
+        // Thread joins happen last, with no lock held.
+        drop(stale);
+        drop(deferred_writer);
+        drop(deferred_index);
+        drop(deferred_directory);
     }
 
     fn statement_committed(&mut self, context: &IndexMethodContext) {
@@ -3959,6 +4337,10 @@ impl IndexMethodCursor for FtsCursor {
             "FTS transaction outcome: committed"
         );
         self.cache_writer(context);
+        let Ok(conn) = context.connection() else {
+            self.shared_cache.write().prune();
+            return;
+        };
         if let Some(transaction_id) = context.transaction_id() {
             // The backing transaction is now committed, so its private writer
             // may be considered by a future transaction only after validating
@@ -3967,7 +4349,7 @@ impl IndexMethodCursor for FtsCursor {
                 let same_connection = cached
                     .connection
                     .upgrade()
-                    .is_some_and(|owner| Arc::ptr_eq(&owner, context.connection()));
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, &conn));
                 if same_connection && cached.transaction_id == Some(transaction_id) {
                     cached.transaction_id = None;
                     cached.snapshot_wal_pos = None;
@@ -3984,7 +4366,7 @@ impl IndexMethodCursor for FtsCursor {
             let same_connection = cached
                 .connection
                 .upgrade()
-                .is_some_and(|owner| Arc::ptr_eq(&owner, context.connection()));
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &conn));
             let matches_cursor_control = self.control.as_ref().is_some_and(|control| {
                 control.index_incarnation == cached.control.index_incarnation
                     && control.manifest_generation == cached.control.manifest_generation
@@ -4002,16 +4384,30 @@ impl IndexMethodCursor for FtsCursor {
     }
 
     fn savepoint_rolled_back(&mut self, context: &IndexMethodContext) {
+        // Correct but coarse: the hook carries no savepoint identity, so we
+        // cannot tell whether the rollback actually reverted FTS chunk rows
+        // this cursor's view depends on. Discard everything; the next FTS
+        // access reloads from the (correctly reverted) backing B-tree.
+        // Finer granularity needs a savepoint-creation sequence passed into
+        // this hook and compared against the sequence at which this cursor
+        // materialized its view.
         self.abort_statement(context);
     }
 
     fn close(&mut self, context: &IndexMethodContext) {
-        if self.pending_docs_count != 0 {
+        if self.pending_docs_count != 0 || self.state.is_flushing() {
+            // close() is the explicit "discard whatever is left" hook, so it
+            // owns this decision: log it loudly, then normalize the cursor so
+            // Drop has nothing left to enforce.
             tracing::error!(
                 pending_documents = self.pending_docs_count,
-                "closing FTS cursor with unprepared writes"
+                is_flushing = self.state.is_flushing(),
+                "closing FTS cursor with unprepared writes; discarding them"
             );
         }
+        self.release_writer_slot();
+        self.pending_docs_count = 0;
+        self.state = FtsState::Init;
         self.writer = None;
         self.reader = None;
         self.searcher = None;
@@ -4030,6 +4426,14 @@ impl IndexMethodCursor for FtsCursor {
     fn optimize(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
         let database_id = context.database().id;
         self.database_id = Some(database_id);
+        // Resume a flush this opcode started before its last IO yield.
+        // Re-entry arrives with `pending_docs_count` already zeroed (the
+        // flush zeroes it before its first yield), so the state machine is
+        // the only reliable marker; skipping this would run the merge while
+        // the old flush is mid-flight and drop the merge's output.
+        if self.state.is_flushing() {
+            return_if_io!(self.flush_writes_internal());
+        }
         // First ensure any pending documents are flushed
         if self.pending_docs_count > 0 {
             tracing::info!(
@@ -4043,6 +4447,10 @@ impl IndexMethodCursor for FtsCursor {
         if self.writer.is_none() {
             return_if_io!(self.open_write(context));
         }
+        // The merge publishes new index state, so it needs the writer slot
+        // and (under MVCC) the write lease like any document mutation.
+        self.claim_writer_slot()?;
+        self.ensure_writer()?;
 
         let index = self
             .index
@@ -4095,9 +4503,9 @@ impl IndexMethodCursor for FtsCursor {
         writer
             .commit()
             .map_err(|e| LimboError::InternalError(format!("FTS optimize commit failed: {e}")))?;
-        if let Some(conn) = &self.connection {
+        if let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) {
             let mut cache = self.shared_cache.write();
-            cache.remove_connection(conn);
+            cache.remove_connection(&conn);
         }
 
         // Reload reader to see merged segments
@@ -4173,10 +4581,32 @@ impl IndexMethodCursor for FtsCursor {
         };
 
         // Cost model:
+        // - Load cost: the dominant real cost. A query materializes the whole
+        //   index in memory, linear in index bytes, regardless of how
+        //   selective it is. Size is known exactly when a snapshot or writer
+        //   is retained (which also means the load is warm); otherwise it is
+        //   approximated from the base table and charged as a cold load.
         // - Base cost: logarithmic in vocabulary size (approximated by table size)
         // - Posting traversal: stops at LIMIT for unordered streaming patterns
         // - Scoring: omitted for MATCH-only patterns
         // - Top-k materialization: required only for global score ordering
+        let retained_bytes = {
+            let read_bytes = self.shared_cache.read().resident_cache_bytes();
+            let writer_bytes = self
+                .shared_writer
+                .lock()
+                .as_ref()
+                .map_or(0, |cached| cached.directory.hot_cache.size());
+            read_bytes.max(writer_bytes)
+        };
+        const ESTIMATED_INDEX_BYTES_PER_ROW: f64 = 64.0;
+        const PAGE_BYTES: f64 = 4096.0;
+        let load_cost = if retained_bytes > 0 {
+            // A retained snapshot makes reuse likely; charge a token amount.
+            retained_bytes as f64 / PAGE_BYTES * 0.01
+        } else {
+            (context.base_table_rows * ESTIMATED_INDEX_BYTES_PER_ROW) / PAGE_BYTES
+        };
         let base_cost = context.base_table_rows.max(1.0).ln() * 10.0;
         let traversal_cost = visited_matches as f64 * 0.05;
         let scoring_cost = scored_matches as f64 * 0.05;
@@ -4187,7 +4617,11 @@ impl IndexMethodCursor for FtsCursor {
         };
 
         Some(super::IndexMethodCostEstimate {
-            estimated_cost: base_cost + traversal_cost + scoring_cost + materialization_cost,
+            estimated_cost: load_cost
+                + base_cost
+                + traversal_cost
+                + scoring_cost
+                + materialization_cost,
             estimated_rows,
         })
     }

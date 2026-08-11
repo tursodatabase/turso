@@ -782,13 +782,15 @@ pub struct ProgramState {
     pub(crate) cursors: Vec<Option<Cursor>>,
     /// Immutable execution/storage context captured when each index-method
     /// cursor is first opened for this statement.
-    pub(crate) index_method_contexts: Vec<Option<crate::index_method::IndexMethodContext>>,
+    pub(crate) index_method_contexts:
+        Vec<Option<std::sync::Arc<crate::index_method::IndexMethodContext>>>,
     /// Index-method cursors explicitly closed by bytecode after their
-    /// statement work was prepared. Retain them until commit/rollback decides
-    /// whether prepared in-memory state may be published.
+    /// statement work was prepared (CREATE INDEX closes its backfill cursor
+    /// this way). Retain them until commit/rollback decides whether prepared
+    /// in-memory state may be published.
     pub(crate) closed_index_method_cursors: Vec<(
         Box<dyn crate::index_method::IndexMethodCursor>,
-        crate::index_method::IndexMethodContext,
+        std::sync::Arc<crate::index_method::IndexMethodContext>,
     )>,
     /// Resumption coordinates for statement-level index-method finalization.
     pub(crate) index_method_finalize_cursor: usize,
@@ -869,6 +871,13 @@ pub struct ProgramState {
     /// Keep the error here while index-method writes from earlier rows finish
     /// through the normal resumable I/O path.
     pending_fail_prepare_error: Option<LimboError>,
+    /// True once the Halt opcode has started finishing the statement. The
+    /// statement's outcome is decided at that point, so an interrupt request
+    /// arriving during Halt's resumable work (staging index-method writes,
+    /// committing the rows FAIL keeps) must not preempt it — it would replace
+    /// the promised outcome and drop staged work. The connection-level flag
+    /// stays set and clears once no root statement is active.
+    pub(crate) halt_in_progress: bool,
     /// Pending CDC info to apply after the program completes successfully.
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
@@ -970,6 +979,7 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_fail_prepare_error: None,
+            halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
         }
@@ -1119,6 +1129,7 @@ impl ProgramState {
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
+        self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
     }
@@ -1705,6 +1716,13 @@ impl Program {
     where
         I: crate::IO + ?Sized,
     {
+        // Once Halt has started finishing the statement, its outcome is
+        // decided; an interrupt (or deadline, or progress handler) must not
+        // preempt the remaining resumable finalization work. A request that
+        // arrived before Halt began still interrupts as usual.
+        if state.halt_in_progress && !state.is_interrupted() {
+            return false;
+        }
         let connection_interrupt = self.connection.is_interrupted();
         let hit_query_deadline = state
             .query_deadline
@@ -2800,7 +2818,21 @@ impl Program {
         // nested helper statements whose drop releases nested guards. Drop
         // them before the `is_nested_stmt()` check below for the same reason.
         state.close_virtual_table_cursors();
-        if err.is_some() || state.execution_state.is_running() {
+        // RAISE(IGNORE) rolls nothing back — halt() already staged the
+        // trigger's index-method writes and the kept rows keep their index
+        // entries — so it must not discard staged index-method work here.
+        // FAIL-class errors likewise keep the changes made before the error:
+        // their index-method writes were staged by the interception in
+        // `program_step` before abort() was called (and, on the autocommit
+        // path, already committed by halt()), so discarding cursor state here
+        // would deliver a rollback outcome for work that commits below.
+        let keeps_prior_changes = match err {
+            Some(LimboError::RaiseIgnore) => true,
+            Some(LimboError::Raise(ResolveType::Fail, _)) => true,
+            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
+            _ => false,
+        };
+        if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
             execute::index_method_abort_statement_all(state);
         }
 
@@ -2980,6 +3012,10 @@ impl Program {
                             if can_autocommit_now {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
+                                // Index-method writes were already staged by
+                                // the FAIL interception in `program_step`
+                                // (the resumable path) before abort() ran, so
+                                // there is nothing left to stage here.
                                 let mv_store = self.connection.mv_store();
                                 if let Err(e) = execute::vtab_commit_all(&self.connection) {
                                     capture_abort_error(
@@ -2988,28 +3024,7 @@ impl Program {
                                         "vtab_commit_all failed during FAIL abort",
                                     );
                                 }
-                                match execute::index_method_prepare_statement_all(state) {
-                                    Ok(IOResult::Done(())) => {}
-                                    Ok(IOResult::IO(io)) => {
-                                        io.abort();
-                                        capture_abort_error(
-                                            &mut abort_error,
-                                            LimboError::InternalError(
-                                                "FAIL cleanup reached asynchronous index-method \
-                                                 finalization outside the resumable Halt path"
-                                                    .to_string(),
-                                            ),
-                                            "index-method finalization yielded during FAIL abort",
-                                        );
-                                    }
-                                    Err(e) => {
-                                        capture_abort_error(
-                                            &mut abort_error,
-                                            e,
-                                            "index-method finalization failed during FAIL abort",
-                                        );
-                                    }
-                                }
+                                let mut committed = false;
                                 loop {
                                     match self.commit_txn(
                                         pager.clone(),
@@ -3017,7 +3032,10 @@ impl Program {
                                         mv_store.as_ref(),
                                         false,
                                     ) {
-                                        Ok(IOResult::Done(_)) => break,
+                                        Ok(IOResult::Done(_)) => {
+                                            committed = true;
+                                            break;
+                                        }
                                         Ok(IOResult::IO(io)) => {
                                             if let Err(e) = io.wait(pager.io.as_ref()) {
                                                 capture_abort_error(
@@ -3037,6 +3055,20 @@ impl Program {
                                             break;
                                         }
                                     }
+                                }
+                                // Deliver the committed outcome exactly once.
+                                // For a plain constraint error with FAIL
+                                // resolution, halt() already committed and
+                                // delivered it before returning the error;
+                                // only the trigger RAISE(FAIL) shape reaches
+                                // the commit through this arm.
+                                let halt_already_delivered =
+                                    matches!(err, Some(LimboError::Constraint(_)));
+                                if committed && !halt_already_delivered {
+                                    execute::index_method_transaction_committed_all(
+                                        state,
+                                        &self.connection,
+                                    );
                                 }
                             }
                         }

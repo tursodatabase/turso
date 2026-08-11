@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use rustc_hash::FxHashMap as HashMap;
 #[cfg(any(test, injected_yields))]
@@ -63,6 +63,14 @@ pub enum IndexMethodMvccSupport {
     ReadOnly,
     /// Persistent state is stored exclusively through core-provided,
     /// MVCC-aware backing storage.
+    ///
+    /// Under MVCC, at most one transaction may write a given index at a time
+    /// (a per-index write lease, taken on the first document mutation).
+    /// Contention is a retryable `Busy`; a writer whose read snapshot
+    /// predates the index's last publication gets `WriteWriteConflict` and
+    /// must restart its transaction. `BEGIN CONCURRENT` therefore does not
+    /// parallelize writes to one index of this kind — that is the write
+    /// throughput ceiling per index.
     TransactionalBackingStore,
     /// Persistent state is external and implements transaction outcome hooks.
     ExternalTransactional,
@@ -147,8 +155,13 @@ pub struct IndexMethodIdentity {
     pub method_name: String,
     pub table_name: String,
     pub index_name: String,
-    /// Runtime-stable identity for this schema incarnation. Drop/recreate and
-    /// attach/detach cannot compare equal even when names are reused.
+    /// Runtime identity derived from the database incarnation, the schema
+    /// generation, and the index's names. Attach/detach and close/reopen
+    /// cannot compare equal. Drop/recreate inside one MVCC transaction can
+    /// (MVCC DDL does not advance the schema generation); the consumers
+    /// tolerate that, because a colliding cursor is merely replaced-and-closed
+    /// and index content is validated separately by the persisted
+    /// (incarnation, generation) pair.
     pub runtime_id: u64,
     /// Schema root assigned to the logical definition. Custom index methods
     /// must keep this at zero; physical ownership belongs to backing objects.
@@ -179,7 +192,10 @@ fn index_method_runtime_id(
 /// are promoted to snapshot-aware MVCC cursors whenever MVCC is active.
 #[derive(Clone)]
 pub struct IndexMethodContext {
-    connection: Arc<Connection>,
+    /// Weak so a cursor parked on its connection (with its context) does not
+    /// make the connection reference itself — a strong edge here kept leaked
+    /// connections alive forever, holding their WAL locks.
+    connection: Weak<Connection>,
     database: IndexMethodDatabaseIdentity,
     journal_mode: JournalMode,
     transaction_mode: IndexMethodTransactionMode,
@@ -268,12 +284,12 @@ impl IndexMethodContext {
             };
 
         let source_database = connection.get_source_database(database_id);
-        let database_incarnation = Arc::as_ptr(&source_database) as usize as u64;
+        let database_incarnation = source_database.incarnation;
         let runtime_id =
             index_method_runtime_id(database_incarnation, schema_generation, definition);
 
         Ok(Self {
-            connection: Arc::clone(connection),
+            connection: Arc::downgrade(connection),
             database: IndexMethodDatabaseIdentity {
                 id: database_id,
                 name: connection
@@ -310,8 +326,13 @@ impl IndexMethodContext {
         Self::new(connection, database_id, &attachment.definition())
     }
 
-    pub fn connection(&self) -> &Arc<Connection> {
-        &self.connection
+    /// The connection this context was built for. Errors once the connection
+    /// is being torn down; outcome hooks running at that point have nothing
+    /// left to clean up and should just return.
+    pub fn connection(&self) -> Result<Arc<Connection>> {
+        self.connection.upgrade().ok_or_else(|| {
+            LimboError::InternalError("index method context outlived its connection".to_string())
+        })
     }
 
     pub fn database(&self) -> &IndexMethodDatabaseIdentity {
@@ -343,7 +364,7 @@ impl IndexMethodContext {
     }
 
     pub fn open_table_cursor(&self, table: &str) -> Result<Box<dyn CursorTrait>> {
-        open_table_cursor(&self.connection, self.database.id, table)
+        open_table_cursor(&self.connection()?, self.database.id, table)
     }
 
     pub fn open_index_cursor<I, E>(
@@ -356,7 +377,7 @@ impl IndexMethodContext {
         I: IntoIterator<Item = KeyInfo, IntoIter = E>,
         E: ExactSizeIterator<Item = KeyInfo>,
     {
-        open_index_cursor(&self.connection, self.database.id, table, index, keys)
+        open_index_cursor(&self.connection()?, self.database.id, table, index, keys)
     }
 }
 
@@ -375,9 +396,13 @@ impl crate::mvcc::yield_hooks::ProvidesYieldContext for IndexMethodContext {
         {
             selection_key = selection_key.wrapping_mul(0x100_0000_01b3) ^ u64::from(byte);
         }
+        let connection = self
+            .connection
+            .upgrade()
+            .expect("yield context requires a live connection");
         crate::mvcc::yield_hooks::YieldContext::new(
-            self.connection.yield_injector(),
-            self.connection.failure_injector(),
+            connection.yield_injector(),
+            connection.failure_injector(),
             self.yield_instance_id,
             selection_key,
         )
@@ -486,6 +511,31 @@ pub struct IndexMethodTestStats {
 }
 
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
+///
+/// # Statement and transaction lifecycle
+///
+/// A cursor that wrote anything goes through these hooks, in this order:
+///
+/// 1. `prepare_statement_commit` — stage every pending change durably (the
+///    only fallible, I/O-capable phase), at the statement's halt.
+/// 2. `statement_committed` — the statement's savepoint was released.
+/// 3. Exactly one of three ends:
+///    * `transaction_committed` — the transaction is durable;
+///    * `transaction_rolled_back` — everything the transaction staged was
+///      undone;
+///    * replacement — a later statement in the same transaction opened a
+///      newer cursor for the same attachment, so this one is closed without
+///      either transaction outcome (the newer cursor receives it).
+/// 4. `close`.
+///
+/// A failed statement gets `abort_statement` instead of steps 1–2.
+///
+/// The empty default bodies below are correct **only for a method that keeps
+/// no transaction-private in-memory state** (everything lives in core-owned
+/// backing storage, which the engine rolls back on its own). A method that
+/// mirrors state in memory must implement every outcome hook: skipping
+/// `transaction_rolled_back` silently publishes rolled-back work, and
+/// skipping `prepare_statement_commit` silently loses writes.
 pub trait IndexMethodCursor: Send {
     /// create necessary components for index method (usually, this is a bunch of btree-s)
     fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
@@ -595,7 +645,7 @@ pub trait IndexMethodCursor: Send {
 
 pub(crate) struct TransactionIndexMethodCursor {
     pub(crate) cursor: Box<dyn IndexMethodCursor>,
-    pub(crate) context: IndexMethodContext,
+    pub(crate) context: Arc<IndexMethodContext>,
 }
 
 impl TransactionIndexMethodCursor {
