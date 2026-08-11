@@ -120,7 +120,11 @@ def _build_value_strategy(v):  # noqa: C901
     raise ValueError(f"unknown value spec: {vid}")
 
 
-values = st.one_of(*[_build_value_strategy(v) for v in _SPEC["values"]])
+# Entries carrying a "disabled" field are excluded while a known server bug
+# makes them fail differentially.
+values = st.one_of(
+    *[_build_value_strategy(v) for v in _SPEC["values"] if "disabled" not in v]
+)
 
 dynamic_cols = st.integers(1, _SPEC["constants"]["max_dynamic_cols"]).flatmap(
     lambda n: st.tuples(
@@ -754,7 +758,10 @@ def test_ddl_in_transaction(prefix, table_idx, val):
 # ---------------------------------------------------------------------------
 
 # Members that only make sense on the local driver (FFI, async I/O hook).
-_LOCAL_ONLY_CONN = {"extra_io"}
+# interrupt() cannot be expressed over the stateless HTTP protocol, and the
+# query timeout APIs are not implemented in the serverless driver yet (see
+# the Python "Minor" notes in serverless/BUGS.md).
+_LOCAL_ONLY_CONN = {"extra_io", "interrupt", "get_query_timeout", "set_query_timeout"}
 _LOCAL_ONLY_CURSOR = set()
 
 

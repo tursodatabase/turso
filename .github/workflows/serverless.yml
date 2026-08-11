@@ -2,6 +2,17 @@ name: Serverless
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "serverless/**"
+      - ".github/workflows/serverless.yml"
+      - ".github/shared/setup-turso-db/**"
+  pull_request:
+    paths:
+      - "serverless/**"
+      - ".github/workflows/serverless.yml"
+      - ".github/shared/setup-turso-db/**"
 
 permissions:
   contents: read
@@ -16,8 +27,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Every job provisions its own scratch database on Turso Cloud, so the
+# suites never share state, and destroys it on the way out. Each job
+# finishes its builds before provisioning, so a build failure costs no
+# cloud resources. Fork PRs cannot read the secrets; the `if` guard skips
+# the jobs instead of failing them.
+
 jobs:
-  conformance:
+  rust:
     name: Rust conformance and differential tests
     if: >-
       github.event_name != 'pull_request' ||
@@ -40,40 +57,187 @@ jobs:
           prefix-key: "v1-serverless-rust"
           cache-on-failure: true
 
-      - name: Install Turso CLI
-        run: |
-          curl -sSfL https://get.tur.so/install.sh | bash
-          echo "$HOME/.turso" >> "$GITHUB_PATH"
+      - name: Build test binaries
+        run: cargo test --locked -p turso_serverless_conformance -p turso_serverless_differential --no-run
 
-      - name: Create scratch database
+      - name: Provision scratch database
         id: provision
-        env:
-          TURSO_API_TOKEN: ${{ secrets.TURSO_API_TOKEN }}
-          TURSO_ORG: ${{ secrets.TURSO_ORG }}
-          TURSO_GROUP: ${{ secrets.TURSO_GROUP }}
-        run: |
-          for var in TURSO_API_TOKEN TURSO_ORG TURSO_GROUP; do
-            if [ -z "${!var}" ]; then
-              echo "::error::$var is not configured"
-              exit 1
-            fi
-          done
-
-          turso org switch "$TURSO_ORG"
-          turso db create "$TURSO_DATABASE_NAME" --group "$TURSO_GROUP" --wait
-          echo "created=true" >> "$GITHUB_OUTPUT"
-
-          database_url="$(turso db show "$TURSO_DATABASE_NAME" --url)"
-          database_token="$(turso db tokens create "$TURSO_DATABASE_NAME" --expiration 1h)"
-          echo "::add-mask::$database_token"
-          echo "TURSO_DATABASE_URL=$database_url" >> "$GITHUB_ENV"
-          echo "TURSO_AUTH_TOKEN=$database_token" >> "$GITHUB_ENV"
+        uses: "./.github/shared/setup-turso-db"
+        with:
+          database-name: ${{ env.TURSO_DATABASE_NAME }}
+          api-token: ${{ secrets.TURSO_API_TOKEN }}
+          org: ${{ secrets.TURSO_ORG }}
+          group: ${{ secrets.TURSO_GROUP }}
 
       - name: Run Rust serverless conformance tests
         run: cargo test --locked -p turso_serverless_conformance
 
       - name: Run Rust serverless differential tests
         run: cargo test --locked -p turso_serverless_differential
+
+      - name: Destroy scratch database
+        if: always() && steps.provision.outputs.created == 'true'
+        env:
+          TURSO_API_TOKEN: ${{ secrets.TURSO_API_TOKEN }}
+        run: turso db destroy "$TURSO_DATABASE_NAME" --yes
+
+  javascript:
+    name: JavaScript integration and differential tests
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      TURSO_DATABASE_NAME: serverless-js-ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            serverless/javascript/package-lock.json
+            serverless/javascript/differential/package-lock.json
+            bindings/javascript/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-serverless-js"
+          cache-on-failure: true
+
+      - name: Build embedded driver (differential baseline)
+        working-directory: bindings/javascript
+        run: |
+          npm install
+          npm run build:native
+
+      - name: Build serverless driver
+        working-directory: serverless/javascript
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install differential test dependencies
+        working-directory: serverless/javascript/differential
+        run: npm ci
+
+      - name: Provision scratch database
+        id: provision
+        uses: "./.github/shared/setup-turso-db"
+        with:
+          database-name: ${{ env.TURSO_DATABASE_NAME }}
+          api-token: ${{ secrets.TURSO_API_TOKEN }}
+          org: ${{ secrets.TURSO_ORG }}
+          group: ${{ secrets.TURSO_GROUP }}
+
+      - name: Run JavaScript integration tests
+        working-directory: serverless/javascript
+        run: npm test
+
+      - name: Run JavaScript differential tests
+        working-directory: serverless/javascript/differential
+        run: npm test
+
+      - name: Destroy scratch database
+        if: always() && steps.provision.outputs.created == 'true'
+        env:
+          TURSO_API_TOKEN: ${{ secrets.TURSO_API_TOKEN }}
+        run: turso db destroy "$TURSO_DATABASE_NAME" --yes
+
+  python:
+    name: Python integration and differential tests
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      TURSO_DATABASE_NAME: serverless-py-ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-serverless-python"
+          cache-on-failure: true
+
+      - name: Install uv
+        uses: useblacksmith/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install the project
+        working-directory: serverless/python
+        run: uv sync --extra dev --extra differential
+
+      - name: Provision scratch database
+        id: provision
+        uses: "./.github/shared/setup-turso-db"
+        with:
+          database-name: ${{ env.TURSO_DATABASE_NAME }}
+          api-token: ${{ secrets.TURSO_API_TOKEN }}
+          org: ${{ secrets.TURSO_ORG }}
+          group: ${{ secrets.TURSO_GROUP }}
+
+      - name: Run Python integration tests
+        working-directory: serverless/python
+        run: uv run --no-sync pytest tests
+
+      - name: Run Python differential tests
+        working-directory: serverless/python
+        run: uv run --no-sync pytest differential
+
+      - name: Destroy scratch database
+        if: always() && steps.provision.outputs.created == 'true'
+        env:
+          TURSO_API_TOKEN: ${{ secrets.TURSO_API_TOKEN }}
+        run: turso db destroy "$TURSO_DATABASE_NAME" --yes
+
+  go:
+    name: Go driver tests
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    env:
+      TURSO_DATABASE_NAME: serverless-go-ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: serverless/go/go.mod
+
+      - name: Provision scratch database
+        id: provision
+        uses: "./.github/shared/setup-turso-db"
+        with:
+          database-name: ${{ env.TURSO_DATABASE_NAME }}
+          api-token: ${{ secrets.TURSO_API_TOKEN }}
+          org: ${{ secrets.TURSO_ORG }}
+          group: ${{ secrets.TURSO_GROUP }}
+
+      - name: Run Go driver tests
+        working-directory: serverless/go
+        run: go test -v ./...
 
       - name: Destroy scratch database
         if: always() && steps.provision.outputs.created == 'true'

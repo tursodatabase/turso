@@ -47,6 +47,10 @@ strings and blobs, 4 KB strings and blobs, emoji, CJK and RTL text, strings
 containing NUL bytes, SQL metacharacters, backslashes, whitespace-only
 strings, a BOM, negative zero, and all-zero and all-0xFF blobs.
 
+A value entry in `spec/ops.json` may carry a `disabled` field naming a known
+server bug that makes it fail differentially; every harness skips such
+entries. Delete the field to re-enable the value once the server is fixed.
+
 ## Table names
 
 Each generated test case gets a random numeric prefix and works on tables
