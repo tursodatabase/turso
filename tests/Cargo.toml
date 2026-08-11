@@ -18,6 +18,10 @@ path = "integration/mod.rs"
 name = "fuzz_tests"
 path = "fuzz/mod.rs"
 
+[[test]]
+name = "pending_byte_tests"
+path = "fuzz/pending_byte.rs"
+
 [dependencies]
 anyhow.workspace = true
 env_logger = { workspace = true }

@@ -5,6 +5,7 @@ use crate::{
         Command, CommandParser,
     },
     config::Config,
+    dot_command::tokenize_dot_command,
     helper::LimboHelper,
     input::{
         get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
@@ -786,24 +787,15 @@ impl Limbo {
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
-        let first = line.split_whitespace().next();
-        let parse = match first {
-            Some("parameter") | Some("param") => {
-                let args = shlex::split(line).unwrap_or_else(|| {
-                    line.split_whitespace()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                });
-                if args.is_empty() {
-                    return;
-                }
-                CommandParser::try_parse_from(args)
-            }
-            _ => {
-                let args = line.split_whitespace();
-                CommandParser::try_parse_from(args)
-            }
-        };
+        let (args, unterminated_quote) = tokenize_dot_command(line);
+        if let Some(quote) = unterminated_quote {
+            let _ = self.writeln_fmt(format_args!("unterminated {quote} quote"));
+            return;
+        }
+        if args.is_empty() {
+            return;
+        }
+        let parse = CommandParser::try_parse_from(args);
         match parse {
             Err(err) => {
                 // Let clap print with Styled Colors instead

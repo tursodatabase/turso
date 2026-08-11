@@ -46,3 +46,4 @@ path = "tests/oracle.rs"
 
 [build-dependencies]
 cc = "1"
+vcpkg = "0.2.15"

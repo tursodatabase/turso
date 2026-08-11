@@ -288,6 +288,14 @@ Or using `choco` on Windows:
 choco install sqlite
 ```
 
+The Rust C compatibility tests also require a static SQLite installation from
+[vcpkg](https://github.com/microsoft/vcpkg):
+
+```powershell
+$env:VCPKG_ROOT = "C:\path\to\vcpkg"
+vcpkg install sqlite3:x64-windows-static-md
+```
+
 ### Running the tests
 To run the test suite with Turso, simply run:
 

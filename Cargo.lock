@@ -7292,8 +7292,8 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "shlex",
  "syntect",
+ "tempfile",
  "termimad",
  "toml 0.8.22",
  "toml_edit 0.22.26",
@@ -7303,6 +7303,7 @@ dependencies = [
  "turso_core",
  "turso_sync_engine",
  "validator",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7616,6 +7617,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_ext",
+ "vcpkg",
 ]
 
 [[package]]
@@ -7717,6 +7719,7 @@ dependencies = [
  "turso_core",
  "turso_parser",
  "twox-hash",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7740,7 +7743,6 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "shlex",
  "syntect",
  "toml 0.8.22",
  "toml_edit 0.22.26",
@@ -7751,6 +7753,7 @@ dependencies = [
  "turso_pg",
  "turso_pg_server",
  "validator",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
