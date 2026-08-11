@@ -32,3 +32,4 @@
 + roboturso
 + nightscape
 + haze518
++ ghx5t-sol
