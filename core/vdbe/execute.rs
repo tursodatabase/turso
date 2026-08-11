@@ -3972,6 +3972,14 @@ pub fn op_transaction_inner(
             "Transaction instruction should not be used in trigger subprograms"
         );
     }
+    let is_unused_temp_database = *db == crate::TEMP_DB_ID
+        && program.connection.temp.database.read().is_none()
+        && !program.read_databases.get(*db)
+        && !program.write_databases.get(*db);
+    if is_unused_temp_database {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     if *db == crate::TEMP_DB_ID {
         program.connection.ensure_temp_database()?;
     }

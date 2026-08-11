@@ -18,6 +18,38 @@ test basic-tx-3 {
 expect {
 }
 
+test begin-immediate-does-not-initialize-temp {
+    BEGIN IMMEDIATE;
+    PRAGMA database_list;
+    ROLLBACK;
+}
+expect {
+    0|main|
+}
+
+test begin-exclusive-does-not-initialize-temp {
+    BEGIN EXCLUSIVE;
+    PRAGMA database_list;
+    ROLLBACK;
+}
+expect {
+    0|main|
+}
+
+test temp-used-after-begin-participates-in-commit-and-rollback {
+    BEGIN IMMEDIATE;
+    CREATE TEMP TABLE used_temp(v INTEGER);
+    INSERT INTO used_temp VALUES(1);
+    COMMIT;
+    BEGIN EXCLUSIVE;
+    INSERT INTO used_temp VALUES(2);
+    ROLLBACK;
+    SELECT * FROM used_temp;
+}
+expect {
+    1
+}
+
 test temp-table-in-immediate-tx {
     BEGIN IMMEDIATE;
     CREATE TEMP TABLE t1(x);

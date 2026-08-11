@@ -28,10 +28,8 @@ pub fn translate_tx_begin(
             });
         }
         TransactionType::Immediate | TransactionType::Exclusive => {
-            // SQLite emits Transaction for every open database (main, temp, each attached)
-            // on BEGIN IMMEDIATE / EXCLUSIVE. We match that exactly. For temp, this may
-            // trigger lazy initialization via `ensure_temp_database` in op_transaction:
-            // an acceptable one-time cost that keeps the opcode sequence identical to SQLite.
+            // SQLite emits Transaction for every database slot (main, temp, each attached)
+            // but skips the temp opcode at execution when temp storage is not open.
             program.emit_insn(Insn::Transaction {
                 db: crate::MAIN_DB_ID,
                 tx_mode: TransactionMode::Write,
