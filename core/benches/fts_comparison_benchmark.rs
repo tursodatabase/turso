@@ -129,7 +129,7 @@ fn run_turso_statement(
     let mut row_count = 0;
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield => db.io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step()?,
             StepResult::Done => break,
             StepResult::Row => row_count += 1,
             StepResult::Interrupt | StepResult::Busy => {

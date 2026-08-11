@@ -8,7 +8,7 @@ fn exec_sql(conn: &Arc<turso_core::Connection>, io: &dyn IO, sql: &str) -> turso
     let mut stmt = conn.prepare(sql)?;
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield => io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => io.step()?,
             StepResult::Row => {}
             StepResult::Done => return Ok(()),
             StepResult::Interrupt | StepResult::Busy => return Err(turso_core::LimboError::Busy),
@@ -26,7 +26,7 @@ fn drop_statement_at_io(
     let mut io_count = 0usize;
     loop {
         match stmt.step().unwrap() {
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 io_count += 1;
                 if io_count == target_io {
                     drop(stmt);

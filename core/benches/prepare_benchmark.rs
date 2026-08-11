@@ -41,7 +41,7 @@ fn execute(db: &Database, conn: &Arc<Connection>, sql: &str) {
     loop {
         match stmt.step().unwrap() {
             StepResult::Row => {}
-            StepResult::IO | StepResult::Yield => db.io.step().unwrap(),
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
             StepResult::Done => break,
             StepResult::Interrupt | StepResult::Busy => unreachable!(),
         }

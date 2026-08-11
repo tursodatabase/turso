@@ -1306,7 +1306,7 @@ fn test_mvcc_savepoint_is_busy_while_writer_suspended() {
 /// rejection is an error (`StatementsInProgress`), not the retryable
 /// `StepResult::Busy`, so the armed 600s busy_timeout never engages — if the
 /// rejection ever regressed into the retryable path, the step below would
-/// surface as StepResult::IO and expect_step_busy would catch it.
+/// surface as StepResult::Sleep and expect_step_busy would catch it.
 #[test]
 fn test_second_writer_busy_does_not_invoke_busy_handler() {
     let env = SameConnectionMvcc::new(":memory:second-writer-skips-busy-handler");

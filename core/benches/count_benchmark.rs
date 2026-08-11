@@ -80,7 +80,7 @@ fn drain_turso(db: &Database, stmt: &mut turso_core::Statement) {
             StepResult::Row => {
                 black_box(stmt.row());
             }
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step().unwrap();
             }
             StepResult::Done => break,

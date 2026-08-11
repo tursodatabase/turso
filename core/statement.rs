@@ -536,12 +536,16 @@ impl Statement {
 
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
-            if self.pager.io.current_time_monotonic() < busy_state.timeout() {
-                // Yield the query as the timeout has not been reached yet
+            let now = self.pager.io.current_time_monotonic();
+            if now < busy_state.timeout() {
+                // The timeout has not been reached yet: ask the caller to wait
+                // out the remaining delay before stepping again.
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                return Ok(StepResult::IO);
+                return Ok(StepResult::Sleep {
+                    duration: busy_state.get_delay(now),
+                });
             }
         }
 
@@ -613,11 +617,14 @@ impl Statement {
 
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
-                // Handler says retry, yield with IO to wait for timeout
+                // Handler says retry: ask the caller to wait out the backoff
+                // delay before stepping again.
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                res = Ok(StepResult::IO);
+                res = Ok(StepResult::Sleep {
+                    duration: busy_state.get_delay(now),
+                });
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
             }
@@ -678,7 +685,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                    self.pager.io.step()?
+                }
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
@@ -692,7 +701,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                    self.pager.io.step()?
+                }
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -712,7 +723,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                    self.pager.io.step()?
+                }
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -737,7 +750,7 @@ impl Statement {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
                 vdbe::StepResult::Row => continue,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
                         crate::types::IOCompletions(crate::io::Completion::new_yield())
                     });
@@ -770,7 +783,7 @@ impl Statement {
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
                         crate::types::IOCompletions(crate::io::Completion::new_yield())
                     });
@@ -792,7 +805,7 @@ impl Statement {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
                     pre_io_func()?;
                     self.pager.io.step()?;
                     post_io_func()?;
