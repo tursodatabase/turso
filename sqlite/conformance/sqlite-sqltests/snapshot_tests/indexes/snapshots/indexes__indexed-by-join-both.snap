@@ -18,4 +18,4 @@ info:
 ---
 QUERY PLAN
 |--SEARCH p USING INDEX idx_products_sku (sku=?)
-`--SEARCH o USING INDEX idx_orders_customer_date (customer_id=?)
+`--SEARCH o USING COVERING INDEX idx_orders_customer_date (customer_id=?)

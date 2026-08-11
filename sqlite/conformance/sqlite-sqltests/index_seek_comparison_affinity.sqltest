@@ -130,3 +130,36 @@ test in-literal-list-text-idx-numeric-source {
 expect {
 0
 }
+
+# #6715: an index seek against a REAL-affinity column applied REAL affinity
+# to the seek key, casting a large integer literal to f64 and losing the
+# precision needed to tell it apart from nearby integers. The comparison
+# affinity here should be NUMERIC, which leaves integer literals untouched.
+setup issue-6715-real-affinity-schema {
+    CREATE TABLE t(f REAL);
+    CREATE INDEX t_f ON t(f);
+    INSERT INTO t VALUES (-2701729208700874036);
+}
+
+@setup issue-6715-real-affinity-schema
+test issue-6715-real-affinity-seek-literal {
+    SELECT
+        (SELECT count(*) FROM t WHERE f = -2701729208700874000),
+        (SELECT count(*) FROM t WHERE f = -2701729208700874036),
+        (SELECT count(*) FROM t WHERE f = -2701729208700874240);
+}
+expect {
+0|0|1
+}
+
+# Same bug, reached through a computed seek-key expression rather than a
+# bare literal — confirms the fix isn't limited to the literal syntax shape.
+@setup issue-6715-real-affinity-schema
+test issue-6715-real-affinity-seek-computed-expr {
+    SELECT
+        (SELECT count(*) FROM t WHERE f = (-2701729208700874000 + 0)),
+        (SELECT count(*) FROM t WHERE f = (-2701729208700874240 + 0));
+}
+expect {
+0|1
+}

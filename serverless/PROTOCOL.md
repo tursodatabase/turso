@@ -78,6 +78,20 @@ missing or invalid token fail with HTTP status `401 Unauthorized`. The format
 and provisioning of tokens are deployment specific and outside the scope of
 this document.
 
+### 3.1 Remote encryption key
+
+Databases encrypted with a customer-managed key require the key on every
+request, carried in the `x-turso-encryption-key` header:
+
+```
+x-turso-encryption-key: <base64-encoded key>
+```
+
+A client configured with a remote encryption key MUST attach this header to
+every request it sends, on both the pipeline and the cursor endpoint. A
+client with no key configured MUST NOT send the header. Key provisioning is
+deployment specific and outside the scope of this document.
+
 ## 4. Streams
 
 ### 4.1 Opening a stream
@@ -357,9 +371,6 @@ in step order. For each step, exactly one of the following holds:
 
 A failed step does not abort the batch by itself. Later steps run or are
 skipped purely according to their conditions.
-
-The batch result also carries a `replication_index` field, which is
-reserved (section 8.4); clients MAY ignore it.
 
 #### 6.2.1 Conditions
 
@@ -642,17 +653,18 @@ entry, for example when it fails mid-stream. A response body that ends
 without a terminating `error` or `replication_index` entry MUST be treated
 by the client as a fatal error for both the batch and the stream.
 
-#### 7.2.6 `replication_index`
+#### 7.2.6 `replication_index` (terminator)
 
-The final entry of a successfully completed cursor:
+The final entry of a successfully completed cursor. Its only purpose is to
+mark the end of the stream; the entry type name is historical:
 
 ```json
 { "type": "replication_index", "replication_index": null }
 ```
 
-The `replication_index` value is reserved and may be a string, a number, or
-`null`. Clients MAY ignore this entry. Clients MUST ignore entry types they
-do not recognize, to allow future extensions.
+Clients MUST NOT interpret the `replication_index` value; they only need to
+recognize the entry as the successful terminator (section 7.2.5). Clients
+MUST ignore entry types they do not recognize, to allow future extensions.
 
 ## 8. Data types
 
@@ -726,7 +738,6 @@ A successful statement execution produces:
 | `rows_read`          | `integer`        | Number of rows read during execution.  |
 | `rows_written`       | `integer`        | Number of rows written during execution. |
 | `query_duration_ms`  | `number`         | Server-side execution time in milliseconds. |
-| `replication_index`  | `string \| null` | Reserved. Clients MAY ignore it.       |
 
 ## 9. Errors
 

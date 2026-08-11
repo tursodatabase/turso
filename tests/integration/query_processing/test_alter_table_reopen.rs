@@ -15,9 +15,9 @@ use tempfile::TempDir;
 /// the persisted schema as AUTOINCREMENT and avoid reusing deleted rowids.
 #[test]
 fn test_alter_table_drop_column_preserves_autoincrement_reopen() {
-    let path = TempDir::new()
-        .unwrap()
-        .keep()
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
         .join("alter_drop_col_autoincrement_reopen.db");
 
     {
@@ -76,10 +76,8 @@ fn test_alter_table_drop_column_preserves_autoincrement_reopen() {
 /// must succeed (no orphan autoindex) and the unique constraint must still be enforced.
 #[test]
 fn test_alter_table_add_column_preserves_unique_constraint_reopen() {
-    let path = TempDir::new()
-        .unwrap()
-        .keep()
-        .join("alter_add_col_unique_reopen.db");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_add_col_unique_reopen.db");
 
     // Session 1: create table with table-level UNIQUE, add column, close
     {
@@ -124,10 +122,8 @@ fn test_alter_table_add_column_preserves_unique_constraint_reopen() {
 /// reopen must succeed and both constraints must still be enforced.
 #[test]
 fn test_alter_table_add_column_preserves_multiple_unique_constraints_reopen() {
-    let path = TempDir::new()
-        .unwrap()
-        .keep()
-        .join("alter_add_col_multi_unique_reopen.db");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_add_col_multi_unique_reopen.db");
 
     // Session 1: create table with two table-level UNIQUEs, add column, close
     {
@@ -205,10 +201,8 @@ fn test_alter_add_generated_column_rejected_without_flag() {
 /// accepted when --experimental-generated-columns is enabled
 #[test]
 fn test_alter_add_generated_column_succeeds_with_flag() {
-    let path = TempDir::new()
-        .unwrap()
-        .keep()
-        .join("alter_add_generated_column.db");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_add_generated_column.db");
     let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
 
     {

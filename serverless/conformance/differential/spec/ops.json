@@ -246,6 +246,13 @@
     "error_recovery": { "prefix_range": [300000, 365535], "num_examples": 50 },
     "ddl_in_transaction": { "prefix_range": [100000, 165535], "num_examples": 50 },
     "ddl_prepare_in_transaction": { "prefix_range": [200000, 265535], "num_examples": 50 },
-    "protocol_properties": { "prefix_range": [400000, 465535], "num_examples": 100 }
+    "protocol_properties": { "prefix_range": [400000, 465535], "num_examples": 100 },
+    "encryption_header": {
+      "header": "x-turso-encryption-key",
+      "key_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+      "key_min_len": 1,
+      "key_max_len": 64,
+      "num_examples": 20
+    }
   }
 }

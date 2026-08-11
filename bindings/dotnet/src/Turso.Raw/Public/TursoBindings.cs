@@ -301,6 +301,8 @@ public static class TursoBindings
             Vfs = IntPtr.Zero,
             EncryptionCipher = cipherString.Pointer,
             EncryptionHexKey = hexkeyString.Pointer,
+            PageCodec = IntPtr.Zero,
+            OpenFlags = 0,
         };
 
         var status = TursoInterop.DatabaseNew(ref config, out var databasePtr, out var errorPtr);

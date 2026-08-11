@@ -13,6 +13,12 @@ use crate::sync::Arc;
 use crate::vtab::{VirtualTable, VirtualTableType};
 use turso_ext::VTabKind;
 
+/// SQLite version reported by compatibility APIs.
+pub const SQLITE_VERSION: &str = "3.50.4";
+
+/// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
+pub const SQLITE_VERSION_NUMBER: i32 = 3_050_004;
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]
@@ -281,6 +287,36 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Window(WindowFunc::NthValue)))
+        }
+        "lag" => {
+            if !(1..=3).contains(&arg_count) {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::Lag)))
+        }
+        "lead" => {
+            if !(1..=3).contains(&arg_count) {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::Lead)))
+        }
+        "ntile" => {
+            if arg_count != 1 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::Ntile)))
+        }
+        "percent_rank" => {
+            if arg_count != 0 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::PercentRank)))
+        }
+        "cume_dist" => {
+            if arg_count != 0 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::CumeDist)))
         }
         "timediff" => {
             if arg_count != 2 {

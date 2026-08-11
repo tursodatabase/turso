@@ -458,7 +458,9 @@ fn bench(criterion: &mut Criterion) {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
-                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                        turso_core::StepResult::IO
+                        | turso_core::StepResult::Yield
+                        | turso_core::StepResult::Sleep { .. } => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -618,7 +620,9 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
             loop {
                 match stmt.step().unwrap() {
                     turso_core::StepResult::Row => {}
-                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                    turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield
+                    | turso_core::StepResult::Sleep { .. } => {
                         db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
@@ -912,7 +916,9 @@ fn bench_json_patch(criterion: &mut Criterion) {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
-                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                        turso_core::StepResult::IO
+                        | turso_core::StepResult::Yield
+                        | turso_core::StepResult::Sleep { .. } => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {

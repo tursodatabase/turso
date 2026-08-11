@@ -42,7 +42,7 @@ fn drain(db: &Database, stmt: &mut Statement) {
             StepResult::Row => {
                 black_box(stmt.row());
             }
-            StepResult::IO | StepResult::Yield => db.io.step().unwrap(),
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
             StepResult::Done => break,
             StepResult::Interrupt | StepResult::Busy => unreachable!(),
         }
@@ -107,7 +107,7 @@ fn assert_opcodes(db: &Database, conn: &Arc<Connection>, sql: &str, expected: &[
                     *seen |= opcode == *expected;
                 }
             }
-            StepResult::IO | StepResult::Yield => db.io.step().unwrap(),
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
             StepResult::Done => break,
             StepResult::Interrupt | StepResult::Busy => unreachable!(),
         }

@@ -18,7 +18,7 @@ use crate::{
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
-    types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
+    types::{IOResult, ImmutableRecord, KeyInfo, RecordBuf, ValueRef},
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
@@ -359,6 +359,17 @@ impl Sorter {
 
     pub const fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
+    }
+
+    /// Moves the current record out of the sorter, seeding the next
+    /// [Sorter::next] call with `spent`'s allocation. This lets SorterData
+    /// transfer records to a register with no allocation or payload copy.
+    pub fn take_current(&mut self, spent: RecordBuf) -> Option<ImmutableRecord> {
+        let current = self.current.take();
+        if current.is_some() {
+            self.current = Some(ImmutableRecord::from_buf(spent));
+        }
+        current
     }
 
     pub fn insert(&mut self, record: &ImmutableRecord) -> Result<IOResult<()>> {
@@ -1067,7 +1078,10 @@ impl BoxedSortableRecord {
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
             };
-            cmp_with_sort(cmp, &self_val, &other_val, key_info);
+            let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
         }
         Ordering::Equal
     }
@@ -1392,6 +1406,120 @@ mod tests {
                 .expect("Failed to get the next record");
         }
         assert_eq!(idx, expected.len());
+    }
+
+    #[test]
+    fn spilled_sort_orders_secondary_key_across_chunks() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, SortOrder::Asc],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, None].unwrap(),
+            try_vec![None, None].unwrap(),
+            // Tiny buffer so the sorter spills to multiple chunk files.
+            256,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        let n = 200;
+        // Equal first key, ascending second key on insert.
+        for x in 0..n {
+            let values = try_vec![Value::from_i64(1), Value::from_i64(x)].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record))
+                .expect("Failed to insert the record");
+        }
+
+        io.block(|| sorter.sort())
+            .expect("Failed to sort the records");
+        assert!(
+            !sorter.chunks.is_empty(),
+            "test requires the sorter to have spilled to chunks"
+        );
+
+        let mut idx = 0;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                assert_eq!(
+                    vals[1],
+                    ValueRef::from_i64(idx),
+                    "secondary key out of order at position {idx}"
+                );
+            }
+            idx += 1;
+            io.block(|| sorter.next())
+                .expect("Failed to get the next record");
+        }
+        assert_eq!(idx, n);
+    }
+
+    #[test]
+    fn spilled_sort_places_nulls_last_across_chunks() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, SortOrder::Asc],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, Some(turso_parser::ast::NullsOrder::Last)].unwrap(),
+            try_vec![None, None].unwrap(),
+            256,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        let n = 200;
+        for x in 0..n {
+            let second = if x % 2 == 0 {
+                Value::Null
+            } else {
+                Value::from_i64(x)
+            };
+            let values = try_vec![Value::from_i64(1), second].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record)).unwrap();
+        }
+
+        io.block(|| sorter.sort()).unwrap();
+        assert!(
+            !sorter.chunks.is_empty(),
+            "test requires the sorter to have spilled to chunks"
+        );
+
+        let mut idx = 0;
+        let mut prev = None;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                match vals[1] {
+                    ValueRef::Null => {
+                        assert!(idx >= n / 2, "NULL emitted before all non-NULL values");
+                    }
+                    v => {
+                        assert!(idx < n / 2, "non-NULL value {v:?} emitted after NULL block");
+                        let current = match v {
+                            ValueRef::Numeric(crate::numeric::Numeric::Integer(i)) => i,
+                            other => panic!("unexpected value {other:?}"),
+                        };
+                        if let Some(prev) = prev {
+                            assert!(current > prev);
+                        }
+                        prev = Some(current);
+                    }
+                }
+            }
+            idx += 1;
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(idx, n);
     }
 
     #[test]

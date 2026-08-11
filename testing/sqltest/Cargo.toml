@@ -61,6 +61,11 @@ turso = { workspace = true, features = ["test_helper"] }
 # Turso SQL parser (for splitting multi-statement SQL)
 turso_parser = { workspace = true }
 
+# Bundled SQLite: the in-process oracle matrix cases are verified against.
+# The bundled version is pinned by Cargo.lock; upgrading it is a deliberate,
+# reviewable event because expected results follow SQLite's behavior.
+rusqlite = { workspace = true }
+
 # PostgreSQL wire-protocol client (for the pg backend, which drives a
 # spawned tursopg server over TCP)
 turso_pg_client = { workspace = true }

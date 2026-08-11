@@ -1,0 +1,46 @@
+@database :memory:
+
+# A statement's OR REPLACE conflict policy propagates into the triggers it
+# fires, but a DELETE always fires its triggers with the default (ABORT)
+# policy — SQLite codes row-delete triggers with OE_Default (delete.c). So a
+# plain INSERT inside a DELETE trigger still aborts on a UNIQUE violation even
+# when the DELETE was ultimately fired by an outer UPDATE OR REPLACE. Turso
+# used to propagate the outer REPLACE through the DELETE, silently swallowing
+# the violation.
+
+test delete-trigger-does-not-inherit-outer-or-replace {
+    CREATE TABLE t (pk INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 0);
+    CREATE TABLE t2 (pk INTEGER PRIMARY KEY, y INTEGER);
+    INSERT INTO t2 VALUES (1, 0);
+    CREATE TRIGGER t2_bd BEFORE DELETE ON t2 FOR EACH ROW BEGIN
+        INSERT INTO t2(pk, y) VALUES (1, 1), (1, 2);
+    END;
+    CREATE TRIGGER t_au AFTER UPDATE ON t FOR EACH ROW BEGIN
+        DELETE FROM t2 WHERE pk = 1;
+    END;
+    UPDATE OR REPLACE t SET x = 9;
+}
+expect error {
+}
+
+# An explicit OR clause on the trigger's own statement still wins, so the same
+# INSERT written with OR REPLACE resolves the conflict instead of aborting.
+# The DELETE that fired the trigger then removes the row, leaving t2 empty.
+@cross-check-integrity
+test delete-trigger-statement-keeps-its-own-or-clause {
+    CREATE TABLE t (pk INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 0);
+    CREATE TABLE t2 (pk INTEGER PRIMARY KEY, y INTEGER);
+    INSERT INTO t2 VALUES (1, 0);
+    CREATE TRIGGER t2_bd BEFORE DELETE ON t2 FOR EACH ROW BEGIN
+        INSERT OR REPLACE INTO t2(pk, y) VALUES (1, 1), (1, 2);
+    END;
+    CREATE TRIGGER t_au AFTER UPDATE ON t FOR EACH ROW BEGIN
+        DELETE FROM t2 WHERE pk = 1;
+    END;
+    UPDATE OR REPLACE t SET x = 9;
+    SELECT pk, y FROM t2 ORDER BY pk;
+}
+expect {
+}

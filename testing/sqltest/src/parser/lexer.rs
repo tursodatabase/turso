@@ -130,6 +130,10 @@ pub enum Token {
     #[token("@cross-check-integrity")]
     AtCrossCheckIntegrity,
 
+    /// `@var` (matrix variable decorator)
+    #[token("@var")]
+    AtVar,
+
     /// `@<identifier>` - for backend-specific expect blocks (e.g., @js, @cli, @rust)
     /// Uses priority 0 so specific @ tokens like @database take precedence
     #[regex(r"@[a-zA-Z][a-zA-Z0-9_-]*", |lex| {
@@ -145,6 +149,10 @@ pub enum Token {
     /// `test` keyword
     #[token("test")]
     Test,
+
+    /// `matrix` keyword
+    #[token("matrix")]
+    Matrix,
 
     /// `snapshot` keyword
     #[token("snapshot")]
@@ -243,9 +251,11 @@ impl fmt::Display for Token {
             Token::CustomTypes => write!(f, "custom_types"),
             Token::AtBackend => write!(f, "@backend"),
             Token::AtCrossCheckIntegrity => write!(f, "@cross-check-integrity"),
+            Token::AtVar => write!(f, "@var"),
             Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),
+            Token::Matrix => write!(f, "matrix"),
             Token::Snapshot => write!(f, "snapshot"),
             Token::SnapshotEqp => write!(f, "snapshot-eqp"),
             Token::Expect => write!(f, "expect"),
@@ -307,7 +317,7 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
 /// Suggest a fix for an invalid token
 fn suggest_fix(slice: &str) -> Option<String> {
     if slice.starts_with('@') {
-        Some("Valid directives are: @database, @setup, @skip, @skip-if, @skip-file, @skip-file-if, @requires, @requires-file, @backend, @cross-check-integrity. Did you mean one of these?".to_string())
+        Some("Valid directives are: @database, @setup, @skip, @skip-if, @skip-file, @skip-file-if, @requires, @requires-file, @backend, @cross-check-integrity, @var. Did you mean one of these?".to_string())
     } else if slice.starts_with(':') {
         Some(
             "Database specifiers are :memory:, :temp:, :default:, or :default-no-rowidalias:"

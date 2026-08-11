@@ -22,7 +22,7 @@ use crate::{
         select::emit_simple_count,
         subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
         values::emit_values,
-        window::{emit_window_results, EmitWindow},
+        window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
     vdbe::insn::Insn,
@@ -104,6 +104,7 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
+        init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
@@ -283,9 +284,9 @@ pub fn emit_query<'a>(
         group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
-        emit_ungrouped_aggregation(program, t_ctx, plan)?;
+        emit_ungrouped_aggregation(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if plan.window.is_some() {
-        emit_window_results(program, t_ctx, plan)?;
+        emit_window_flush(program, t_ctx, plan)?;
     }
 
     // Process ORDER BY results if needed
@@ -989,6 +990,7 @@ fn build_materialized_build_input_plan(
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
     };

@@ -143,6 +143,25 @@ fn new_join_type(n0: &[u8], n1: Option<&[u8]>, n2: Option<&[u8]>) -> Result<Join
     Ok(jt)
 }
 
+/// True if `e` is a bare subquery, possibly wrapped in one or more layers of
+/// single-element parentheses (e.g. `(SELECT ...)`, `((SELECT ...))`).
+fn is_bare_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::Subquery(_) => true,
+        Expr::Parenthesized(inner) => inner.len() == 1 && is_bare_subquery(&inner[0]),
+        _ => false,
+    }
+}
+
+/// Unwrap a bare subquery previously confirmed by [`is_bare_subquery`].
+fn into_bare_subquery(e: Box<Expr>) -> Select {
+    match *e {
+        Expr::Subquery(select) => select,
+        Expr::Parenthesized(mut inner) => into_bare_subquery(inner.pop().expect("single element")),
+        _ => unreachable!("into_bare_subquery called on a non-subquery expression"),
+    }
+}
+
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
 
@@ -222,7 +241,11 @@ impl<'a> Parser<'a> {
             }
             self.last_variable_id = self.last_variable_id.max(variable_id);
             let index = NonZeroU32::new(variable_id).unwrap();
-            Ok(Expr::Variable(Variable::indexed(index)))
+            // An explicit ?N is distinct from an anonymous ?: its "?N"
+            // spelling is its name (sqlite3_bind_parameter_name returns it,
+            // bind_parameter_index resolves it), derived from the index on
+            // demand rather than allocated per marker.
+            Ok(Expr::Variable(Variable::numbered(index)))
         } else {
             debug_assert!(matches!(token[0], b':' | b'@' | b'$'));
             let index = if let Some(index) = self.named_variables.get(token).copied() {
@@ -741,7 +764,7 @@ impl<'a> Parser<'a> {
         let name = String::from_utf8_lossy(raw).into_owned();
         // Advance lexer past the closing `]`
         self.lexer.offset = start + end_pos + 1;
-        Ok(Name::exact(name))
+        Ok(Name::bracketed(name))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -855,6 +878,15 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_VIEW);
         let if_not_exists = self.parse_if_not_exists()?;
         let view_name = self.parse_fullname(false)?;
+        if temporary {
+            if let Some(ref db_name) = view_name.db_name {
+                if !db_name.as_str().eq_ignore_ascii_case("TEMP") {
+                    return Err(Error::Custom(
+                        "temporary table name must be unqualified".to_owned(),
+                    ));
+                }
+            }
+        }
         let columns = self.parse_eid_list(true)?;
         eat_expect!(self, TK_AS);
         let select = self.parse_select()?;
@@ -2202,6 +2234,21 @@ impl<'a> Parser<'a> {
                                         // Simplified to a constant leaf.
                                         leaf = true;
                                         Box::new(Expr::Literal(Literal::Numeric(name.into())))
+                                    } else if exprs.len() == 1 && is_bare_subquery(&exprs[0]) {
+                                        // `x IN ((SELECT ...))` is subquery membership,
+                                        // the same as `x IN (SELECT ...)`: an empty
+                                        // subquery yields 0/1, not NULL. This matches
+                                        // SQLite. A list of two or more values, or a
+                                        // subquery embedded in a larger expression, stays
+                                        // a value list.
+                                        self.last_expr_height = 1;
+                                        Box::new(Expr::InSelect {
+                                            lhs: result,
+                                            not,
+                                            rhs: into_bare_subquery(
+                                                exprs.into_iter().next().expect("one element"),
+                                            ),
+                                        })
                                     } else {
                                         Box::new(Expr::InList {
                                             lhs: result,
@@ -3277,6 +3324,32 @@ impl<'a> Parser<'a> {
         let body = self.parse_select_body()?;
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
+        if !order_by.is_empty() || limit.is_some() {
+            if let Some(tok) = self.peek()? {
+                let op_name = match tok.token_type {
+                    TK_UNION => {
+                        eat_assert!(self, TK_UNION);
+                        match self.peek()? {
+                            Some(tok) if tok.token_type == TK_ALL => "UNION ALL",
+                            _ => "UNION",
+                        }
+                    }
+                    TK_EXCEPT => "EXCEPT",
+                    TK_INTERSECT => "INTERSECT",
+                    _ => "",
+                };
+                if !op_name.is_empty() {
+                    let clause = if order_by.is_empty() {
+                        "LIMIT"
+                    } else {
+                        "ORDER BY"
+                    };
+                    return Err(Error::Custom(format!(
+                        "{clause} clause should come after {op_name} not before"
+                    )));
+                }
+            }
+        }
         Ok(Select {
             with,
             body,
@@ -3320,9 +3393,26 @@ impl<'a> Parser<'a> {
     fn parse_check_table_constraint(&mut self) -> Result<TableConstraint> {
         eat_assert!(self, TK_CHECK);
         eat_expect!(self, TK_LP);
+        let start = self.offset();
         let expr = self.parse_expr(0)?;
+        let source = self.check_constraint_source(start);
         eat_expect!(self, TK_RP);
-        Ok(TableConstraint::Check(expr))
+        Ok(TableConstraint::Check { expr, source })
+    }
+
+    /// The text between a CHECK constraint's parens exactly as the user wrote
+    /// it, whitespace-trimmed, the way SQLite keeps it for constraint error
+    /// messages. `start` is the offset right after the opening paren; the
+    /// expression must already be parsed so the closing paren is the peeked
+    /// token.
+    fn check_constraint_source(&self, start: usize) -> Option<String> {
+        let end = self.offset();
+        let raw = self.lexer.input.get(start..end)?;
+        let text = std::str::from_utf8(raw).ok()?;
+        Some(
+            text.trim_matches(|c: char| c.is_ascii_whitespace())
+                .to_owned(),
+        )
     }
 
     fn parse_foreign_key_table_constraint(&mut self) -> Result<TableConstraint> {
@@ -3858,9 +3948,11 @@ impl<'a> Parser<'a> {
     fn parse_check_column_constraint(&mut self) -> Result<ColumnConstraint> {
         eat_assert!(self, TK_CHECK);
         eat_expect!(self, TK_LP);
+        let start = self.offset();
         let expr = self.parse_expr(0)?;
+        let source = self.check_constraint_source(start);
         eat_expect!(self, TK_RP);
-        Ok(ColumnConstraint::Check(expr))
+        Ok(ColumnConstraint::Check { expr, source })
     }
 
     fn parse_ref_act(&mut self) -> Result<RefAct> {
@@ -4643,19 +4735,12 @@ impl<'a> Parser<'a> {
         let indexed = self.parse_indexed()?;
         let where_clause = self.parse_where()?;
         let returning = self.parse_returning()?;
-        let order_by = self.parse_order_by()?;
-        let limit = self.parse_limit()?;
-        if !order_by.is_empty() && limit.is_none() {
-            return Err(Error::Custom("ORDER BY without LIMIT on DELETE".to_owned()));
-        }
         Ok(Stmt::Delete {
             with,
             tbl_name,
             indexed,
             where_clause,
             returning,
-            order_by,
-            limit,
         })
     }
 
@@ -5254,11 +5339,6 @@ impl<'a> Parser<'a> {
         let from = self.parse_from_clause_opt()?;
         let where_clause = self.parse_where()?;
         let returning = self.parse_returning()?;
-        let order_by = self.parse_order_by()?;
-        let limit = self.parse_limit()?;
-        if !order_by.is_empty() && limit.is_none() {
-            return Err(Error::Custom("ORDER BY without LIMIT on UPDATE".to_owned()));
-        }
         Ok(Stmt::Update(Update {
             with,
             or_conflict: resolve_type,
@@ -5268,8 +5348,6 @@ impl<'a> Parser<'a> {
             from,
             where_clause,
             returning,
-            order_by,
-            limit,
         }))
     }
 
@@ -5338,6 +5416,26 @@ mod tests {
         p.next_cmd().unwrap();
         let third = p.offset();
         assert_eq!(&s[second..third], "SELECT * FROM test;");
+    }
+
+    #[test]
+    fn check_constraint_comments_survive_formatting() {
+        for (sql, comment) in [
+            (
+                "CREATE TABLE t (x CHECK(x /* column comment */ > 0))",
+                "/* column comment */",
+            ),
+            (
+                "CREATE TABLE t (x, CHECK(x -- table comment\n > 0))",
+                "-- table comment",
+            ),
+        ] {
+            let command = Parser::new(sql.as_bytes()).next().unwrap().unwrap();
+            let formatted = command.to_string();
+
+            assert!(formatted.contains(comment), "formatted SQL: {formatted}");
+            Parser::new(formatted.as_bytes()).next().unwrap().unwrap();
+        }
     }
 
     #[test]
@@ -5686,7 +5784,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Literal(Literal::Blob("ab".to_owned()))),
+                                Box::new(Expr::Literal(Literal::Blob("X'ab'".to_owned()))),
                                 None,
                             )],
                             from: None,
@@ -10845,9 +10943,10 @@ mod tests {
                         constraints: vec![
                             NamedColumnConstraint {
                                 name: None,
-                                constraint: ColumnConstraint::Check(
-                                    Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                ),
+                                constraint: ColumnConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                     }),
@@ -10867,9 +10966,10 @@ mod tests {
                         constraints: vec![
                             NamedColumnConstraint {
                                 name: None,
-                                constraint: ColumnConstraint::Check(
-                                    Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                ),
+                                constraint: ColumnConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                     }),
@@ -11691,9 +11791,10 @@ mod tests {
                         constraints: vec![
                             NamedTableConstraint {
                                 name: None,
-                                constraint: TableConstraint::Check(Box::new(
-                                    Expr::Literal(Literal::Numeric("1".to_owned()))
-                                )),
+                                constraint: TableConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                         options: TableOptions::empty(),
@@ -11754,9 +11855,10 @@ mod tests {
                             },
                             NamedTableConstraint {
                                 name: None,
-                                constraint: TableConstraint::Check(Box::new(
-                                    Expr::Literal(Literal::Numeric("1".to_owned()))
-                                )),
+                                constraint: TableConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                         options: TableOptions::empty(),
@@ -12393,12 +12495,10 @@ mod tests {
                     indexed: None,
                     where_clause: None,
                     returning: vec![],
-                    order_by: vec![],
-                    limit: None,
                 })],
             ),
             (
-                b"WITH test AS (SELECT 1) DELETE FROM foo NOT INDEXED WHERE 1 RETURNING bar ORDER BY bar LIMIT 1".as_slice(),
+                b"WITH test AS (SELECT 1) DELETE FROM foo NOT INDEXED WHERE 1 RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Delete {
                     with: Some(With {
                         recursive: false,
@@ -12442,17 +12542,6 @@ mod tests {
                             None,
                         ),
                     ],
-                    order_by: vec![
-                        SortedColumn {
-                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                            order: None,
-                            nulls: None,
-                        }
-                    ],
-                    limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: None,
-                    }),
                 })],
             ),
             // parse drop index
@@ -12724,12 +12813,10 @@ mod tests {
                     from: None,
                     where_clause: None,
                     returning: vec![],
-                    order_by: vec![],
-                    limit: None,
                 }))],
             ),
             (
-                b"WITH test AS (SELECT 1) UPDATE OR REPLACE foo NOT INDEXED SET bar = 1 FROM foo_2 WHERE 1 RETURNING bar ORDER By bar LIMIT 1".as_slice(),
+                b"WITH test AS (SELECT 1) UPDATE OR REPLACE foo NOT INDEXED SET bar = 1 FROM foo_2 WHERE 1 RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Update(Update {
                     with: Some(With {
                         recursive: false,
@@ -12795,17 +12882,6 @@ mod tests {
                             None,
                         ),
                     ],
-                    order_by: vec![
-                        SortedColumn {
-                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                            order: None,
-                            nulls: None,
-                        }
-                    ],
-                    limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: None,
-                    }),
                 }))],
             ),
             // parse reindex
@@ -12883,7 +12959,7 @@ mod tests {
                     with_clause: vec![
                         (Name::exact("a".to_string()), Box::new(Expr::Literal(Literal::Numeric("1".to_string())))),
                         (Name::exact("b".to_string()), Box::new(Expr::Literal(Literal::String("'test'".to_string())))),
-                        (Name::exact("c".to_string()), Box::new(Expr::Literal(Literal::Blob("deadbeef".to_string())))),
+                        (Name::exact("c".to_string()), Box::new(Expr::Literal(Literal::Blob("x'deadbeef'".to_string())))),
                         (Name::exact("d".to_string()), Box::new(Expr::Literal(Literal::Null))),
                     ],
                 })],
@@ -12928,6 +13004,22 @@ mod tests {
         let sql = b"CREATE TABLE t(u UNION(i INT, t TEXT)) STRICT";
         let err = Parser::new(sql).next().unwrap().unwrap_err();
         assert!(err.to_string().contains("inline STRUCT/UNION"));
+    }
+
+    #[test]
+    fn test_delete_and_update_reject_limit_and_order_by() {
+        // Default SQLite builds (without SQLITE_ENABLE_UPDATE_DELETE_LIMIT)
+        // reject LIMIT and ORDER BY on DELETE and UPDATE.
+        for sql in [
+            b"DELETE FROM t LIMIT 1".as_slice(),
+            b"DELETE FROM t LIMIT 1 OFFSET 2".as_slice(),
+            b"DELETE FROM t ORDER BY x LIMIT 1".as_slice(),
+            b"UPDATE t SET x = 1 LIMIT 1".as_slice(),
+            b"UPDATE t SET x = 1 ORDER BY x LIMIT 1".as_slice(),
+        ] {
+            let result = Parser::new(sql).next().unwrap();
+            assert!(result.is_err(), "expected parse error for {sql:?}");
+        }
     }
 
     #[test]

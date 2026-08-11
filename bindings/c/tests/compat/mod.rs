@@ -213,6 +213,8 @@ mod tests {
         unsafe {
             let version = sqlite3_libversion();
             assert!(!version.is_null());
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(std::ffi::CStr::from_ptr(version), c"3.50.4");
         }
     }
 
@@ -220,7 +222,10 @@ mod tests {
     fn test_libversion_number() {
         unsafe {
             let version_num = sqlite3_libversion_number();
-            assert!(version_num >= 3042000);
+            #[cfg(feature = "sqlite3")]
+            assert!(version_num > 0);
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(version_num, 3050004);
         }
     }
 
@@ -641,6 +646,31 @@ mod tests {
             //assert!(invalid.is_null());
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_ctas_column_count_is_zero() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE dst AS SELECT 1 AS a, 'x' AS b".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_column_count(stmt), 0);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }

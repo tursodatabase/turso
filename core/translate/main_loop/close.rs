@@ -141,6 +141,7 @@ impl CloseLoop {
                                 });
                             }
                         }
+                        Scan::RecursiveCteInput => {}
                     }
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
                 }
@@ -526,17 +527,22 @@ pub(super) fn emit_autoindex(
     }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(ephemeral_cols_start_reg),
-        count: to_u16(num_regs_to_reserve),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(ephemeral_cols_start_reg),
+        count: to_u32(num_regs_to_reserve),
+        dest_reg: to_u32(record_reg),
         index_name: Some(index.name.clone()),
         affinity_str: affinity_str.map(|s| (**s).clone()),
     });
     // Skip bloom filter for non-binary collations since it uses binary hashing.
+    // Also skip it when any seek key component comes from a NULL-matching `IS`:
+    // the probe treats a NULL key as "definitely absent", which would skip rows
+    // whose key IS NULL, so such a seek never probes — and then building the
+    // filter would be wasted work on every row.
     let use_bloom_filter = index.columns.iter().take(num_seek_keys).all(|col| {
         col.collation
             .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset))
-    }) && seek_def.start.op.eq_only();
+    }) && seek_def.start.op.eq_only()
+        && (0..num_seek_keys).all(|i| !seek_def.is_null_matching_key_component(i));
     if use_bloom_filter {
         program.emit_insn(Insn::FilterAdd {
             cursor_id: index_cursor_id,
@@ -548,7 +554,7 @@ pub(super) fn emit_autoindex(
         cursor_id: index_cursor_id,
         record_reg,
         unpacked_start: Some(ephemeral_cols_start_reg),
-        unpacked_count: Some(num_regs_to_reserve as u16),
+        unpacked_count: Some(num_regs_to_reserve as u32),
         flags: IdxInsertFlags::new().use_seek(false),
     });
     program.emit_insn(Insn::Next {

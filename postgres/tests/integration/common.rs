@@ -1,9 +1,26 @@
 use rand::{rng, RngCore};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use turso_core::{Clock, Database, IO};
 use turso_pg::Connection;
+
+/// Temp directories holding test databases, deleted when the test process exits.
+///
+/// A directory cannot be owned by the `TempDatabase` that created it: some tests
+/// clone the path, drop the database to close it, and then reopen the file to
+/// check what was written. Deleting on drop would pull the file out from under
+/// them, so the directories are parked here for the life of the process instead.
+static TEMP_DIRS: Mutex<Vec<TempDir>> = Mutex::new(Vec::new());
+
+fn delete_at_process_exit(dir: TempDir) {
+    TEMP_DIRS.lock().unwrap().push(dir);
+}
+
+#[ctor::dtor]
+fn delete_temp_dirs() {
+    TEMP_DIRS.lock().unwrap().clear();
+}
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -152,8 +169,9 @@ impl TempDatabaseBuilder {
         let db_name = self
             .db_name
             .unwrap_or_else(|| format!("test-{}.db", rng().next_u32()));
-        let mut db_path = TempDir::new().unwrap().keep();
-        db_path.push(db_name);
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join(db_name);
+        delete_at_process_exit(temp_dir);
 
         if let Some(init_sql) = &self.init_sql {
             let connection = rusqlite::Connection::open(&db_path).unwrap();

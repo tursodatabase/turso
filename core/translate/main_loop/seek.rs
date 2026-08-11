@@ -1,4 +1,6 @@
 use super::*;
+use crate::translate::plan::BitSet;
+use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
@@ -122,10 +124,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         {
             match self.seek_def.iter_dir {
                 IterationDirection::Forwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Asc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::First
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::SeekGT {
                             is_index: self.is_index,
@@ -142,10 +143,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 IterationDirection::Backwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Desc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::Last
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::SeekLT {
                             is_index: self.is_index,
@@ -177,7 +177,13 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         &self.t_ctx.resolver,
                         NoConstantOptReason::RegisterReuse,
                     )?;
-                    if !expr.is_nonnull(self.tables) {
+                    // A NULL key can never satisfy `=`, so the loop is done as
+                    // soon as one shows up. `IS` matches NULL instead: keep the
+                    // NULL in the seek register and let the index comparison
+                    // find the rows whose key component is NULL.
+                    if !expr.is_nonnull(self.tables)
+                        && !self.seek_def.is_null_matching_key_component(i)
+                    {
                         self.program.emit_insn(Insn::IsNull {
                             reg,
                             target_pc: self.loop_end,
@@ -191,6 +197,15 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             }
         }
         let num_regs = self.seek_def.size(&self.seek_def.start);
+        // Which key components match NULL rather than comparing with `=`; the
+        // seek and the bloom-filter probe keep their "NULL key cannot match"
+        // shortcut for the rest.
+        let mut null_matching_mask = BitSet::default();
+        for i in 0..num_regs {
+            if self.seek_def.is_null_matching_key_component(i) {
+                null_matching_mask.set(i)?;
+            }
+        }
 
         if let Some(idx) = self.seek_index {
             encode_seek_keys_for_custom_types(
@@ -215,6 +230,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     idx.ephemeral,
                     "bloom filter can only be used with ephemeral indexes"
                 );
+                // The probe treats a NULL key as "definitely absent", which
+                // would skip rows whose key IS NULL. `emit_autoindex` never
+                // builds a filter for a NULL-matching seek, so probing one
+                // here means the build and probe decisions have diverged.
+                turso_assert!(
+                    null_matching_mask.is_empty(),
+                    "a NULL-matching seek must not probe a bloom filter"
+                );
                 self.program.emit_insn(Insn::Filter {
                     cursor_id: self.seek_cursor_id,
                     key_reg: self.start_reg,
@@ -232,6 +255,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 num_regs,
                 target_pc: self.loop_end,
                 eq_only,
+                null_matching_mask,
             }),
             SeekOp::GT => self.program.emit_insn(Insn::SeekGT {
                 is_index: self.is_index,
@@ -247,6 +271,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 num_regs,
                 target_pc: self.loop_end,
                 eq_only,
+                null_matching_mask,
             }),
             SeekOp::LT => self.program.emit_insn(Insn::SeekLT {
                 is_index: self.is_index,
@@ -268,10 +293,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             self.program.preassign_label_to_next_insn(loop_start);
             match self.seek_def.iter_dir {
                 IterationDirection::Forwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Desc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::Last
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::IdxGE {
                             cursor_id: self.seek_cursor_id,
@@ -282,10 +306,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 IterationDirection::Backwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Asc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::First
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::IdxLE {
                             cursor_id: self.seek_cursor_id,

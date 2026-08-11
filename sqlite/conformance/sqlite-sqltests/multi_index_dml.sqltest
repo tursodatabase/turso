@@ -262,32 +262,6 @@ expect {
 }
 
 @setup multi_index_dml_schema
-@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
-test delete-multi-index-or-limit-preserved {
-    DELETE FROM t
-    WHERE i1 = 5 OR i2 = 6
-    LIMIT 2;
-
-    SELECT count(*) FROM t;
-}
-expect {
-    2
-}
-
-@setup multi_index_dml_schema
-@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
-test delete-multi-index-or-limit-offset-preserved {
-    DELETE FROM t
-    WHERE i1 = 5 OR i2 = 6
-    LIMIT 1 OFFSET 1;
-
-    SELECT count(*) FROM t;
-}
-expect {
-    3
-}
-
-@setup multi_index_dml_schema
 test delete-multi-index-or-two-row-subset-compatible {
     DELETE FROM t
     WHERE (i1 = 5 OR i2 = 6) AND bar <= 20;

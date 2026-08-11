@@ -1,5 +1,4 @@
--- LIMBO_SKIP: query 20 is slow as hell in both Turso and Sqlite
-
+-- LIMBO_SKIP: this currently takes too long on both engines due to lack of subquery decorrelation
 
 select
 	s_name,

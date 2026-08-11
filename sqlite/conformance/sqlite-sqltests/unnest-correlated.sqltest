@@ -1,0 +1,1436 @@
+@database :memory:
+
+setup correlated_rows {
+    CREATE TABLE outer_rows(
+        id INTEGER PRIMARY KEY,
+        key1 INTEGER,
+        key2 INTEGER,
+        amount INTEGER,
+        text_key TEXT
+    );
+    CREATE TABLE inner_rows(key1 INTEGER, key2 INTEGER, amount INTEGER, text_key TEXT);
+    CREATE TABLE outer_key2(id INTEGER PRIMARY KEY, key2 INTEGER);
+    INSERT INTO outer_rows VALUES
+        (1, 1, 10, 5, 'A'),
+        (2, 1, 10, 15, 'a'),
+        (3, 2, 20, 7, 'B'),
+        (4, 3, 30, 9, 'C'),
+        (5, NULL, 40, 4, NULL),
+        (6, 2, NULL, NULL, 'b');
+    INSERT INTO inner_rows VALUES
+        (1, 10, 10, 'a'),
+        (1, 10, 20, 'A'),
+        (1, 99, 100, 'x'),
+        (2, 20, 6, 'b'),
+        (2, 20, NULL, 'B'),
+        (2, NULL, 7, NULL),
+        (NULL, 40, 99, NULL);
+    INSERT INTO outer_key2 VALUES (1, 10), (3, 20), (5, 40);
+}
+
+# A table function uses hidden columns to hold its arguments. Those checks
+# must stay inside the correlated subquery.
+test one-value-table-function-keeps-arguments {
+    CREATE TABLE outer_function_args(id INTEGER, first_value INTEGER);
+    INSERT INTO outer_function_args VALUES (1,3),(2,5);
+
+    SELECT o.id,
+           (SELECT sum(g.value) FROM generate_series(o.first_value, 6) g)
+    FROM outer_function_args o
+    ORDER BY o.id;
+}
+expect {
+    1|18
+    2|11
+}
+
+@setup correlated_rows
+test one-value-avg-in-select-list {
+    SELECT id, (SELECT avg(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|43.3333333333333
+    2|43.3333333333333
+    3|6.5
+    4|
+    5|
+    6|6.5
+}
+
+@setup correlated_rows
+test one-value-count-keeps-zero-for-empty-group {
+    SELECT id, (SELECT count(*) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|3
+    2|3
+    3|3
+    4|0
+    5|0
+    6|3
+}
+
+@setup correlated_rows
+test one-value-total-keeps-zero-for-empty-group {
+    SELECT id, (SELECT total(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|130.0
+    2|130.0
+    3|13.0
+    4|0.0
+    5|0.0
+    6|13.0
+}
+expect @js {
+    1|130
+    2|130
+    3|13
+    4|0
+    5|0
+    6|13
+}
+
+@setup correlated_rows
+test one-value-two-link-columns {
+    SELECT id, (SELECT min(i.amount) FROM inner_rows i
+                WHERE i.key1 = o.key1 AND i.key2 = o.key2)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|10
+    2|10
+    3|6
+    4|
+    5|
+    6|
+}
+
+@setup correlated_rows
+test one-value-outer-rowid-filter {
+    SELECT o.id,
+           (SELECT count(*)
+            FROM inner_rows i
+            WHERE i.key1 = o.key1 AND o.rowid = 1)
+    FROM outer_rows o
+    ORDER BY o.id;
+}
+expect {
+    1|3
+    2|0
+    3|0
+    4|0
+    5|0
+    6|0
+}
+
+@setup correlated_rows
+test one-value-outer-rowid-link {
+    SELECT o.id,
+           (SELECT count(*)
+            FROM inner_rows i
+            WHERE i.key1 = o.key1 AND i.amount = o.rowid)
+    FROM outer_rows o
+    ORDER BY o.id;
+}
+expect {
+    1|0
+    2|0
+    3|0
+    4|0
+    5|0
+    6|1
+}
+
+@setup correlated_rows
+test one-value-outer-rowid-in-result {
+    SELECT o.id,
+           (SELECT sum(i.amount) + o.rowid
+            FROM inner_rows i
+            WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY o.id;
+}
+expect {
+    1|131
+    2|132
+    3|16
+    4|
+    5|
+    6|19
+}
+
+@setup correlated_rows
+test one-value-outer-rowid-in-input {
+    SELECT o.id,
+           (SELECT sum(i.amount + o.rowid)
+            FROM inner_rows i
+            WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY o.id;
+}
+expect {
+    1|133
+    2|136
+    3|19
+    4|
+    5|
+    6|25
+}
+
+@setup correlated_rows
+test one-value-link-written-outer-first {
+    SELECT id, (SELECT max(i.amount) FROM inner_rows i WHERE o.key1 = i.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|100
+    2|100
+    3|7
+    4|
+    5|
+    6|7
+}
+
+@setup correlated_rows
+test one-value-inner-filter-stays-inside-grouping {
+    SELECT id, (SELECT sum(i.amount) FROM inner_rows i
+                WHERE i.key1 = o.key1 AND i.key2 = 10)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|30
+    2|30
+    3|
+    4|
+    5|
+    6|
+}
+
+@setup correlated_rows
+test one-value-aggregate-filter {
+    SELECT id, (SELECT sum(i.amount) FILTER (WHERE i.key2 = 10)
+                FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|30
+    2|30
+    3|
+    4|
+    5|
+    6|
+}
+
+@setup correlated_rows
+test one-value-group-concat {
+    SELECT id, (SELECT group_concat(i.text_key, ':')
+                FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    WHERE id IN (1, 3, 4)
+    ORDER BY id;
+}
+expect {
+    1|a:A:x
+    3|b:B
+    4|
+}
+
+@setup correlated_rows
+test one-value-distinct-aggregate {
+    SELECT id, (SELECT count(DISTINCT i.key2) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|2
+    2|2
+    3|1
+    4|0
+    5|0
+    6|1
+}
+
+@setup correlated_rows
+test two-one-value-aggregates {
+    SELECT id,
+           (SELECT min(i.amount) FROM inner_rows i WHERE i.key1 = o.key1),
+           (SELECT max(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|10|100
+    2|10|100
+    3|6|7
+    4||
+    5||
+    6|6|7
+}
+
+@setup correlated_rows
+test one-value-inside-outer-aggregate {
+    SELECT key1, sum((SELECT min(i.amount) FROM inner_rows i WHERE i.key1 = o.key1))
+    FROM outer_rows o
+    WHERE key1 IS NOT NULL
+    GROUP BY key1
+    ORDER BY key1;
+}
+expect {
+    1|20
+    2|12
+    3|
+}
+
+@setup correlated_rows
+test one-value-used-in-having {
+    SELECT key1, count(*)
+    FROM outer_rows o
+    WHERE key1 IS NOT NULL
+    GROUP BY key1
+    HAVING count(*) >= (SELECT count(*) FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY key1;
+}
+expect {
+    3|1
+}
+
+@setup correlated_rows
+test one-value-used-for-ordering {
+    SELECT id
+    FROM outer_rows o
+    ORDER BY (SELECT max(i.amount) FROM inner_rows i WHERE i.key1 = o.key1) DESC, id;
+}
+expect {
+    1
+    2
+    3
+    6
+    4
+    5
+}
+
+@setup correlated_rows
+test one-value-math-with-null-result {
+    SELECT id
+    FROM outer_rows o
+    WHERE amount < (SELECT 0.2 * avg(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup correlated_rows
+test one-value-null-key-does-not-match-null-group {
+    SELECT id, (SELECT sum(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    WHERE id = 5;
+}
+expect {
+    5|
+}
+
+@setup correlated_rows
+test one-value-correlated-to-two-outer-tables {
+    SELECT o.id, (SELECT sum(i.amount) FROM inner_rows i
+                  WHERE i.key1 = o.key1 AND i.key2 = x.key2)
+    FROM outer_rows o JOIN outer_key2 x ON x.id = o.id
+    ORDER BY o.id;
+}
+expect {
+    1|30
+    3|6
+    5|
+}
+
+# Both outer tables must be ready before the grouped table reads either link
+# value. A new inner join may not move the grouped table before them.
+test one-value-two-outer-links-in-filter {
+    CREATE TABLE filter_a(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, amount INTEGER);
+    CREATE TABLE filter_b(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, amount INTEGER);
+    CREATE TABLE filter_c(id INTEGER PRIMARY KEY, k INTEGER, amount INTEGER);
+    INSERT INTO filter_a VALUES (1,1,1,10);
+    INSERT INTO filter_b VALUES (1,1,1,100);
+    INSERT INTO filter_c VALUES (1,1,50);
+
+    SELECT a.id, c.id
+    FROM filter_a a JOIN filter_c c ON a.k = c.k
+    WHERE a.amount < (
+        SELECT sum(b.amount)
+        FROM filter_b b
+        WHERE b.k = a.k AND b.g = c.k
+    );
+}
+expect {
+    1|1
+}
+
+@setup correlated_rows
+test one-value-correlated-to-outer-table-that-may-be-null {
+    SELECT o.id, (SELECT count(*) FROM inner_rows i WHERE i.key2 = x.key2)
+    FROM outer_rows o LEFT JOIN outer_key2 x ON x.id = o.id
+    ORDER BY o.id;
+}
+expect {
+    1|2
+    2|0
+    3|2
+    4|0
+    5|1
+    6|0
+}
+
+@setup correlated_rows
+test correlated-in-basic {
+    SELECT id
+    FROM outer_rows o
+    WHERE 10 IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test correlated-in-with-two-link-columns {
+    SELECT id
+    FROM outer_rows o
+    WHERE 6 IN (SELECT i.amount FROM inner_rows i
+                WHERE i.key1 = o.key1 AND i.key2 = o.key2)
+    ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup correlated_rows
+test correlated-in-inner-filter {
+    SELECT id
+    FROM outer_rows o
+    WHERE 20 IN (SELECT i.amount FROM inner_rows i
+                 WHERE i.key1 = o.key1 AND i.text_key = 'A')
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test correlated-in-null-results-do-not-match {
+    SELECT id
+    FROM outer_rows o
+    WHERE amount IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup correlated_rows
+test correlated-in-uses-left-collation {
+    SELECT id
+    FROM outer_rows o
+    WHERE text_key COLLATE NOCASE IN (
+        SELECT i.text_key FROM inner_rows i WHERE i.key1 = o.key1
+    )
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+@setup correlated_rows
+test correlated-in-does-not-duplicate-outer-rows {
+    INSERT INTO inner_rows VALUES (1, 10, 10, 'a');
+    SELECT id
+    FROM outer_rows o
+    WHERE 10 IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test correlated-in-with-outer-aggregate {
+    SELECT count(*)
+    FROM outer_rows o
+    WHERE 10 IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1);
+}
+expect {
+    2
+}
+
+@setup correlated_rows
+test correlated-in-through-correlated-derived-table {
+    SELECT o.id
+    FROM outer_rows o
+    WHERE o.id IN (
+        SELECT amount
+        FROM (SELECT DISTINCT amount FROM inner_rows i WHERE i.key1 = o.key1)
+    )
+    ORDER BY o.id;
+}
+expect {
+    6
+}
+
+@setup correlated_rows
+test exists-through-correlated-derived-table {
+    SELECT o.id
+    FROM outer_rows o
+    WHERE EXISTS (
+        SELECT 1
+        FROM (SELECT DISTINCT amount FROM inner_rows i WHERE i.key1 = o.key1)
+    )
+    ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+# These forms stay correlated because the simple join rewrites would change
+# their result. They are included here to protect the safety checks.
+
+@setup correlated_rows
+test not-in-with-null-inner-value {
+    SELECT id
+    FROM outer_rows o
+    WHERE 11 NOT IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+    5
+}
+
+setup empty_not_in_rows {
+    CREATE TABLE not_in_outer(k INTEGER);
+    CREATE TABLE not_in_inner(k INTEGER, x INTEGER);
+    CREATE TABLE empty_values(a INTEGER);
+    INSERT INTO not_in_outer VALUES (1),(2);
+    INSERT INTO not_in_inner VALUES (1,10);
+}
+
+@setup empty_not_in_rows
+test one-value-not-in-empty-keeps-missing-group {
+    SELECT o.k
+    FROM not_in_outer o
+    WHERE (SELECT max(x) FROM not_in_inner i WHERE i.k = o.k)
+          NOT IN (SELECT a FROM empty_values)
+    ORDER BY o.k;
+}
+expect {
+    1
+    2
+}
+
+@setup empty_not_in_rows
+test one-value-not-in-empty-delete-removes-missing-group {
+    DELETE FROM not_in_outer
+    WHERE (SELECT max(x) FROM not_in_inner i WHERE i.k = not_in_outer.k)
+          NOT IN (SELECT a FROM empty_values);
+
+    SELECT count(*) FROM not_in_outer;
+}
+expect {
+    0
+}
+
+@setup correlated_rows
+test in-under-or {
+    SELECT id
+    FROM outer_rows o
+    WHERE id = 4 OR 10 IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+@setup correlated_rows
+test one-value-link-that-does-not-use-equals {
+    SELECT id, (SELECT min(i.amount) FROM inner_rows i WHERE i.key1 <= o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|10
+    2|10
+    3|6
+    4|6
+    5|
+    6|6
+}
+
+@setup correlated_rows
+test one-value-is-link-keeps-null-match {
+    SELECT id, (SELECT max(i.amount) FROM inner_rows i WHERE i.key1 IS o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|100
+    2|100
+    3|7
+    4|
+    5|99
+    6|7
+}
+
+@setup correlated_rows
+test one-value-limit-zero {
+    SELECT id, (SELECT sum(i.amount) FROM inner_rows i WHERE i.key1 = o.key1 LIMIT 0)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+    5|
+    6|
+}
+
+@setup correlated_rows
+test one-value-outer-only-filter {
+    SELECT id, (SELECT count(*) FROM inner_rows i
+                WHERE i.key1 = o.key1 AND o.amount > 10)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|0
+    2|3
+    3|0
+    4|0
+    5|0
+    6|0
+}
+
+@setup correlated_rows
+test one-value-expression-with-non-null-empty-result {
+    SELECT id, (SELECT coalesce(sum(i.amount), 0) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|130
+    2|130
+    3|13
+    4|0
+    5|0
+    6|13
+}
+
+@setup correlated_rows
+test one-value-in-outer-join-condition-stays-correlated {
+    SELECT o.id, x.id
+    FROM outer_rows o LEFT JOIN outer_key2 x
+      ON x.key2 = (SELECT min(i.key2) FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY o.id;
+}
+expect {
+    1|1
+    2|1
+    3|3
+    4|
+    5|
+    6|3
+}
+
+# EXISTS must run after FULL JOIN has made its missing-side rows.
+test exists-after-full-join {
+    CREATE TABLE full_exists_a(id INTEGER, x INTEGER);
+    CREATE TABLE full_exists_b(id INTEGER, y INTEGER);
+    CREATE TABLE full_exists_c(id INTEGER, z INTEGER);
+    CREATE TABLE full_exists_i(k INTEGER);
+    INSERT INTO full_exists_a VALUES (1,1),(2,2);
+    INSERT INTO full_exists_b VALUES (1,1),(2,2);
+    INSERT INTO full_exists_c VALUES (2,2),(3,3);
+    INSERT INTO full_exists_i VALUES (1);
+
+    SELECT a.id, b.id, c.id
+    FROM full_exists_a a
+    JOIN full_exists_b b ON a.id = b.id
+    FULL JOIN full_exists_c c ON b.id = c.id
+    WHERE EXISTS (SELECT 1 FROM full_exists_i i WHERE i.k = a.x);
+}
+expect {
+    1|1|
+}
+
+# A link to the first table must not move before a later FULL JOIN.
+test exists-linked-past-full-join {
+    CREATE TABLE past_full_a(x INTEGER);
+    CREATE TABLE past_full_b(y INTEGER);
+    CREATE TABLE past_full_c(z INTEGER);
+    CREATE TABLE past_full_i(v INTEGER);
+    INSERT INTO past_full_a VALUES (1);
+    INSERT INTO past_full_b VALUES (1);
+    INSERT INTO past_full_c VALUES (2);
+    INSERT INTO past_full_i VALUES (1);
+
+    SELECT a.x, b.y, c.z
+    FROM past_full_a a
+    JOIN past_full_b b ON a.x = b.y
+    FULL JOIN past_full_c c ON a.x = c.z
+    WHERE EXISTS (SELECT 1 FROM past_full_i i WHERE i.v = a.x);
+}
+expect {
+    1|1|
+}
+
+# NOT EXISTS must not remove a match before FULL JOIN sees it.
+test not-exists-linked-past-full-join {
+    CREATE TABLE anti_full_a(x INTEGER);
+    CREATE TABLE anti_full_b(y INTEGER);
+    CREATE TABLE anti_full_c(z INTEGER);
+    CREATE TABLE anti_full_i(v INTEGER);
+    INSERT INTO anti_full_a VALUES (1);
+    INSERT INTO anti_full_b VALUES (1);
+    INSERT INTO anti_full_c VALUES (1);
+    INSERT INTO anti_full_i VALUES (1);
+
+    SELECT a.x, b.y, c.z
+    FROM anti_full_a a
+    JOIN anti_full_b b ON a.x = b.y
+    FULL JOIN anti_full_c c ON a.x = c.z
+    WHERE NOT EXISTS (SELECT 1 FROM anti_full_i i WHERE i.v = a.x);
+}
+expect {
+}
+
+# A SELECT with no FROM has no table that can be the left side of a semi join.
+test in-under-select-with-no-from {
+    CREATE TABLE no_from_outer(k INTEGER);
+    CREATE TABLE no_from_inner(k INTEGER);
+    INSERT INTO no_from_outer VALUES (1),(2);
+    INSERT INTO no_from_inner VALUES (1),(1),(3);
+
+    SELECT o.k,
+           (SELECT 1
+            WHERE 1 IN (
+                SELECT i.k
+                FROM no_from_inner i
+                WHERE i.k = o.k
+            ))
+    FROM no_from_outer o
+    ORDER BY o.k;
+}
+expect {
+    1|1
+    2|
+}
+
+# A group that no outer row uses must not make sum fail.
+test one-value-does-not-sum-unused-group {
+    CREATE TABLE used_sum_key(id INTEGER, k INTEGER);
+    CREATE TABLE sum_values(k INTEGER, x INTEGER);
+    INSERT INTO used_sum_key VALUES (1,1);
+    INSERT INTO sum_values VALUES
+        (1,10),
+        (2,9223372036854775807),
+        (2,9223372036854775807);
+
+    SELECT o.id, (SELECT sum(i.x) FROM sum_values i WHERE i.k = o.k)
+    FROM used_sum_key o;
+}
+expect {
+    1|10
+}
+
+# A bad function input in an unused group must not fail the query.
+test one-value-does-not-read-unused-bad-json {
+    CREATE TABLE used_json_key(id INTEGER, k INTEGER);
+    CREATE TABLE json_values(k INTEGER, v TEXT);
+    INSERT INTO used_json_key VALUES (1,1);
+    INSERT INTO json_values VALUES (1,'{"a":1}'),(99,'not json');
+
+    SELECT o.id,
+           (SELECT sum(json_extract(i.v, '$.a'))
+            FROM json_values i
+            WHERE i.k = o.k)
+    FROM used_json_key o;
+}
+expect {
+    1|1
+}
+
+# A function in an inner filter must not run for an unused key.
+test one-value-does-not-filter-unused-bad-json {
+    CREATE TABLE used_filter_key(id INTEGER, k INTEGER);
+    CREATE TABLE filtered_json_values(k INTEGER, v TEXT);
+    INSERT INTO used_filter_key VALUES (1,1);
+    INSERT INTO filtered_json_values VALUES (1,'{"a":1}'),(99,'not json');
+
+    SELECT o.id,
+           (SELECT count(*)
+            FROM filtered_json_values i
+            WHERE i.k = o.k AND json_extract(i.v, '$.a') > 0)
+    FROM used_filter_key o;
+}
+expect {
+    1|1
+}
+
+# An empty outer table must not run sum over any inner key.
+test one-value-empty-outer-does-not-sum {
+    CREATE TABLE empty_sum_key(id INTEGER, k INTEGER);
+    CREATE TABLE unused_sum_values(k INTEGER, x INTEGER);
+    INSERT INTO unused_sum_values VALUES
+        (2,9223372036854775807),
+        (2,9223372036854775807);
+
+    SELECT o.id, (SELECT sum(i.x) FROM unused_sum_values i WHERE i.k = o.k)
+    FROM empty_sum_key o;
+}
+expect {
+}
+
+# LIMIT 1 can stop after the first matching row. When matches are expected to
+# be common, building an index over the whole inner table costs more.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test limit-one-keeps-correlated-in {
+    CREATE TABLE limit_outer(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER);
+    CREATE TABLE limit_inner(k INTEGER, x INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM limit_outer o
+    WHERE o.v IN (SELECT i.x FROM limit_inner i WHERE i.k = o.k)
+    LIMIT 1;
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM limit_outer o
+    WHERE o.v IN (SELECT i.x FROM limit_inner i WHERE i.k = o.k)
+    LIMIT 100;
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM limit_outer o
+    WHERE o.v IN (SELECT i.x FROM limit_inner i WHERE i.k = o.k);
+}
+expect {
+    1|0|0|SCAN limit_outer AS o
+    6|0|0|CORRELATED LIST SUBQUERY 1
+    8|6|0|SCAN limit_inner AS i
+    1|0|0|SCAN limit_outer AS o
+    6|0|0|CORRELATED LIST SUBQUERY 1
+    8|6|0|SCAN limit_inner AS i
+    1|0|0|SCAN limit_outer AS o
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_t3 (k=? AND x=?)
+}
+
+# Each EXISTS keeps its own outer row. A second one must not make both use
+# nested scans.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test two-exists-use-two-semi-joins {
+    CREATE TABLE two_exists_outer(id INTEGER PRIMARY KEY, key1 INTEGER, key2 INTEGER);
+    CREATE TABLE first_exists_inner(key1 INTEGER);
+    CREATE TABLE second_exists_inner(key2 INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM two_exists_outer o
+    WHERE EXISTS (
+              SELECT 1 FROM first_exists_inner i WHERE i.key1 = o.key1
+          )
+      AND EXISTS (
+              SELECT 1 FROM second_exists_inner j WHERE j.key2 = o.key2
+          );
+}
+expect {
+    1|0|0|SCAN two_exists_outer AS o
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_first_exists_inner_t3 (key1=?)
+    3|0|0|SEARCH j USING COVERING INDEX ephemeral_second_exists_inner_t5 (key2=?)
+}
+
+# A filter on the outer table must not turn the EXISTS semi join back into a
+# nested scan.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test outer-filter-keeps-exists-semi-join {
+    CREATE TABLE filtered_exists_outer(id INTEGER PRIMARY KEY, key1 INTEGER, body TEXT);
+    CREATE TABLE filtered_exists_inner(key1 INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM filtered_exists_outer o
+    WHERE o.body LIKE 'apple%'
+      AND EXISTS (
+              SELECT 1 FROM filtered_exists_inner i WHERE i.key1 = o.key1
+          );
+}
+expect {
+    1|0|0|SCAN filtered_exists_outer AS o
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_filtered_exists_inner_t3 (key1=?)
+}
+
+# With table counts from ANALYZE, one outer row should use the saved inner
+# index. All outer rows should group the inner table once.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test indexed-average-uses-outer-row-count {
+    CREATE TABLE one_indexed_avg_outer(id INTEGER PRIMARY KEY, k INTEGER, x REAL);
+    CREATE TABLE many_indexed_avg_outer(id INTEGER PRIMARY KEY, k INTEGER, x REAL);
+    CREATE TABLE indexed_avg_inner(k INTEGER, q REAL);
+    CREATE INDEX indexed_avg_inner_k ON indexed_avg_inner(k);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('one_indexed_avg_outer', NULL, '1'),
+        ('many_indexed_avg_outer', NULL, '20000'),
+        ('indexed_avg_inner', 'indexed_avg_inner_k', '200000 100');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM one_indexed_avg_outer o
+    WHERE o.x < (
+              SELECT avg(i.q) FROM indexed_avg_inner i WHERE i.k = o.k
+          );
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM many_indexed_avg_outer o
+    WHERE o.x < (
+              SELECT avg(i.q) FROM indexed_avg_inner i WHERE i.k = o.k
+          );
+}
+expect pattern {
+    (?s)SCAN one_indexed_avg_outer AS o.*CORRELATED SCALAR SUBQUERY.*SEARCH i USING INDEX indexed_avg_inner_k.*SCAN many_indexed_avg_outer AS o.*SEARCH scalar_subquery_.*SCAN indexed_avg_inner AS i USING INDEX indexed_avg_inner_k
+}
+
+# Two copies of the same aggregate need one grouped table.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test two-identical-averages-use-one-grouped-table {
+    CREATE TABLE two_avg_outer(id INTEGER PRIMARY KEY, x REAL, k INTEGER);
+    CREATE TABLE two_avg_inner(k INTEGER, q REAL);
+    INSERT INTO two_avg_outer VALUES (1, 0.5, 1);
+    INSERT INTO two_avg_inner VALUES (1, 1.0);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('two_avg_outer', NULL, '500'),
+        ('two_avg_inner', NULL, '500');
+    ANALYZE sqlite_schema;
+
+    SELECT count(*)
+    FROM two_avg_outer o
+    WHERE o.x < (
+              SELECT avg(i.q) FROM two_avg_inner i WHERE i.k = o.k
+          )
+      AND o.x > (
+              SELECT avg(i.q) FROM two_avg_inner i WHERE i.k = o.k
+          ) - 100;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM two_avg_outer o
+    WHERE o.x < (
+              SELECT avg(i.q) FROM two_avg_inner i WHERE i.k = o.k
+          )
+      AND o.x > (
+              SELECT avg(i.q) FROM two_avg_inner i WHERE i.k = o.k
+          ) - 100;
+}
+expect pattern {
+    ^1\n[0-9]+\|0\|0\|SCAN two_avg_outer AS o\n[0-9]+\|0\|0\|SEARCH scalar_subquery_[^\n]*\n[0-9]+\|[0-9]+\|0\|SCAN two_avg_inner AS i\n[0-9]+\|[0-9]+\|0\|USE SORTER FOR GROUP BY$
+}
+
+# A grouped table search reads its result from the index when the result is
+# used. It must not also copy every index column to unused registers after
+# each match.
+@skip-if sqlite "Turso uses a different grouped subquery plan"
+test grouped-seek-does-not-copy-unused-columns {
+    CREATE TABLE bytecode_outer(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE bytecode_inner(k INTEGER, x REAL);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('bytecode_outer', NULL, '20000'),
+        ('bytecode_inner', NULL, '200000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN
+    SELECT o.id,
+           (SELECT avg(i.x) FROM bytecode_inner i WHERE i.k = o.k)
+    FROM bytecode_outer o;
+}
+expect pattern {
+    (?m)^\d+\|SeekGE\|.*$\n^\d+\|IdxGT\|.*$\n^\d+\|Integer\|1\|.*$\n^\d+\|RowId\|.*$
+}
+
+# The IN subquery index is not used after IN becomes a semi join. Its cursor
+# number must be free for the tables and index that remain in the plan.
+@skip-if sqlite "Turso uses a different IN plan"
+test unnested-in-reuses-unused-cursor {
+    CREATE TABLE cursor_outer(id INTEGER PRIMARY KEY, k INTEGER, x INTEGER);
+    CREATE TABLE cursor_inner(k INTEGER, x INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('cursor_outer', NULL, '20000'),
+        ('cursor_inner', NULL, '200000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN
+    SELECT o.id
+    FROM cursor_outer o
+    WHERE o.x IN (
+        SELECT i.x FROM cursor_inner i WHERE i.k = o.k
+    );
+}
+expect pattern {
+    (?m)^\d+\|OpenRead\|0\|.*table=cursor_outer.*$\n^\d+\|OpenRead\|1\|.*table=cursor_inner.*$(?s).*\n\d+\|OpenAutoindex\|2\|
+}
+
+# The scalar result register is not used after the aggregate becomes a grouped
+# table. The grouped table output must be able to use that register number.
+@skip-if sqlite "Turso uses a different aggregate plan"
+test grouped-aggregate-reuses-unused-result-register {
+    CREATE TABLE register_outer(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE register_inner(k INTEGER, x REAL);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('register_outer', NULL, '20000'),
+        ('register_inner', NULL, '200000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN
+    SELECT o.id,
+           (SELECT avg(i.x) FROM register_inner i WHERE i.k = o.k)
+    FROM register_outer o;
+}
+expect pattern {
+    (?m)^\d+\|AggFinal\|.*$\n^\d+\|Copy\|\d+\|1\|.*$\n^\d+\|Copy\|\d+\|2\|.*$
+}
+
+# A grouped value can be used while two outer hash joins build their inputs.
+# Preparing this form must keep the grouped value available in both builds.
+test grouped-value-is-available-to-two-hash-builds {
+    CREATE TABLE two_hash_sales(item_key INTEGER, sold_date_key INTEGER, discount REAL);
+    CREATE TABLE two_hash_items(item_key INTEGER, maker INTEGER);
+    CREATE TABLE two_hash_dates(date_key INTEGER, sold_on TEXT);
+    INSERT INTO two_hash_items VALUES (1,977),(2,1);
+    INSERT INTO two_hash_dates VALUES (1,'2000-02-01'),(2,'1999-01-01');
+    INSERT INTO two_hash_sales VALUES
+        (1,1,10.0),(1,1,20.0),(1,1,40.0),(2,1,100.0),(1,2,1000.0);
+
+    SELECT CAST(s.discount AS INTEGER)
+    FROM two_hash_sales s, two_hash_items i, two_hash_dates d
+    WHERE i.maker = 977
+      AND i.item_key = s.item_key
+      AND d.sold_on BETWEEN '2000-01-27' AND '2000-04-26'
+      AND d.date_key = s.sold_date_key
+      AND s.discount > (
+          SELECT 1.3 * avg(s2.discount)
+          FROM two_hash_sales s2, two_hash_dates d2
+          WHERE s2.item_key = i.item_key
+            AND d2.sold_on BETWEEN '2000-01-27' AND '2000-04-26'
+            AND d2.date_key = s2.sold_date_key
+      );
+}
+expect {
+    40
+}
+
+
+# Each level has one EXISTS that can be changed to a join and one EXISTS
+# that holds the next level. Preparing this query must not try every mix of
+# changed and unchanged levels.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+@backend cli
+test deep-correlated-subqueries-prepare-once {
+    CREATE TABLE deep_prepare_rows(k INTEGER);
+    CREATE TABLE deep_prepare_guards(k INTEGER);
+
+    SELECT r0.k
+        FROM deep_prepare_rows r0
+        WHERE EXISTS (
+            SELECT 1
+            FROM deep_prepare_guards g0
+            WHERE g0.k = r0.k
+        )
+          AND EXISTS (
+            SELECT r1.k
+            FROM deep_prepare_rows r1
+            WHERE r1.k = r0.k
+              AND EXISTS (
+                SELECT 1
+                FROM deep_prepare_guards g1
+                WHERE g1.k = r1.k
+            )
+              AND EXISTS (
+                SELECT r2.k
+                FROM deep_prepare_rows r2
+                WHERE r2.k = r1.k
+                  AND EXISTS (
+                    SELECT 1
+                    FROM deep_prepare_guards g2
+                    WHERE g2.k = r2.k
+                )
+                  AND EXISTS (
+                    SELECT r3.k
+                    FROM deep_prepare_rows r3
+                    WHERE r3.k = r2.k
+                      AND EXISTS (
+                        SELECT 1
+                        FROM deep_prepare_guards g3
+                        WHERE g3.k = r3.k
+                    )
+                      AND EXISTS (
+                        SELECT r4.k
+                        FROM deep_prepare_rows r4
+                        WHERE r4.k = r3.k
+                          AND EXISTS (
+                            SELECT 1
+                            FROM deep_prepare_guards g4
+                            WHERE g4.k = r4.k
+                        )
+                          AND EXISTS (
+                            SELECT r5.k
+                            FROM deep_prepare_rows r5
+                            WHERE r5.k = r4.k
+                              AND EXISTS (
+                                SELECT 1
+                                FROM deep_prepare_guards g5
+                                WHERE g5.k = r5.k
+                            )
+                              AND EXISTS (
+                                SELECT r6.k
+                                FROM deep_prepare_rows r6
+                                WHERE r6.k = r5.k
+                                  AND EXISTS (
+                                    SELECT 1
+                                    FROM deep_prepare_guards g6
+                                    WHERE g6.k = r6.k
+                                )
+                                  AND EXISTS (
+                                    SELECT r7.k
+                                    FROM deep_prepare_rows r7
+                                    WHERE r7.k = r6.k
+                                      AND EXISTS (
+                                        SELECT 1
+                                        FROM deep_prepare_guards g7
+                                        WHERE g7.k = r7.k
+                                    )
+                                      AND EXISTS (
+                                        SELECT r8.k
+                                        FROM deep_prepare_rows r8
+                                        WHERE r8.k = r7.k
+                                          AND EXISTS (
+                                            SELECT 1
+                                            FROM deep_prepare_guards g8
+                                            WHERE g8.k = r8.k
+                                        )
+                                          AND EXISTS (
+                                            SELECT r9.k
+                                            FROM deep_prepare_rows r9
+                                            WHERE r9.k = r8.k
+                                              AND EXISTS (
+                                                SELECT 1
+                                                FROM deep_prepare_guards g9
+                                                WHERE g9.k = r9.k
+                                            )
+                                              AND EXISTS (
+                                                SELECT r10.k
+                                                FROM deep_prepare_rows r10
+                                                WHERE r10.k = r9.k
+                                                  AND EXISTS (
+                                                    SELECT 1
+                                                    FROM deep_prepare_guards g10
+                                                    WHERE g10.k = r10.k
+                                                )
+                                                  AND EXISTS (
+                                                    SELECT r11.k
+                                                    FROM deep_prepare_rows r11
+                                                    WHERE r11.k = r10.k
+                                                      AND EXISTS (
+                                                        SELECT 1
+                                                        FROM deep_prepare_guards g11
+                                                        WHERE g11.k = r11.k
+                                                    )
+                                                      AND EXISTS (
+                                                        SELECT r12.k
+                                                        FROM deep_prepare_rows r12
+                                                        WHERE r12.k = r11.k
+                                                          AND EXISTS (
+                                                            SELECT 1
+                                                            FROM deep_prepare_guards g12
+                                                            WHERE g12.k = r12.k
+                                                        )
+                                                          AND EXISTS (
+                                                            SELECT r13.k
+                                                            FROM deep_prepare_rows r13
+                                                            WHERE r13.k = r12.k
+                                                              AND EXISTS (
+                                                                SELECT 1
+                                                                FROM deep_prepare_guards g13
+                                                                WHERE g13.k = r13.k
+                                                            )
+                                                              AND EXISTS (
+                                                                SELECT r14.k
+                                                                FROM deep_prepare_rows r14
+                                                                WHERE r14.k = r13.k
+                                                                  AND EXISTS (
+                                                                    SELECT 1
+                                                                    FROM deep_prepare_guards g14
+                                                                    WHERE g14.k = r14.k
+                                                                )
+                                                                  AND EXISTS (
+                                                                    SELECT r15.k
+                                                                    FROM deep_prepare_rows r15
+                                                                    WHERE r15.k = r14.k
+                                                                      AND EXISTS (
+                                                                        SELECT 1
+                                                                        FROM deep_prepare_guards g15
+                                                                        WHERE g15.k = r15.k
+                                                                    )
+                                                                )
+                                                            )
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        );
+}
+expect {
+}
+
+setup comparison_keys {
+    CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
+    CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
+    INSERT INTO number_outer VALUES (1, 1);
+    INSERT INTO text_inner VALUES ('1', 10, 1), ('01', 20, 1);
+
+    CREATE TABLE nocase_outer(id INTEGER PRIMARY KEY, key1 TEXT COLLATE NOCASE);
+    CREATE TABLE binary_inner(key1 TEXT COLLATE BINARY, amount INTEGER);
+    CREATE TABLE nocase_inner(key1 TEXT COLLATE NOCASE, amount INTEGER);
+    INSERT INTO nocase_outer VALUES (1, 'a');
+    INSERT INTO binary_inner VALUES ('a', 10), ('A', 20);
+    INSERT INTO nocase_inner VALUES ('a', 10), ('A', 20);
+}
+
+@setup comparison_keys
+test one-value-number-and-text-stay-correlated {
+    SELECT o.id, (SELECT sum(i.amount) FROM text_inner i WHERE i.key1 = o.key1)
+    FROM number_outer o;
+}
+expect {
+    1|30
+}
+
+@setup comparison_keys
+test one-value-different-text-order-stays-correlated {
+    SELECT o.id, (SELECT sum(i.amount) FROM binary_inner i WHERE o.key1 = i.key1)
+    FROM nocase_outer o;
+}
+expect {
+    1|30
+}
+
+@setup comparison_keys
+test one-value-same-text-order-is-rewritten {
+    SELECT o.id, (SELECT sum(i.amount) FROM nocase_inner i WHERE o.key1 = i.key1)
+    FROM nocase_outer o;
+}
+expect {
+    1|30
+}
+
+# A scalar subquery result does not use the text order of its result column.
+# Replacing it with a grouped-table column must keep that rule.
+test one-value-result-has-no-text-order {
+    CREATE TABLE result_order_outer(k INTEGER, v TEXT);
+    CREATE TABLE result_order_inner(k INTEGER, v TEXT COLLATE NOCASE);
+    INSERT INTO result_order_outer VALUES (1,'a'),(2,'zz');
+    INSERT INTO result_order_inner VALUES (1,'A'),(2,'q');
+
+    SELECT o.k
+    FROM result_order_outer o
+    WHERE (o.v || '') = (
+        SELECT max(i.v)
+        FROM result_order_inner i
+        WHERE i.k = o.k
+    );
+}
+expect {
+}
+
+@setup comparison_keys
+test correlated-in-keeps-number-to-text-comparison {
+    SELECT o.id
+    FROM number_outer o
+    WHERE o.key1 IN (SELECT i.key1 FROM text_inner i WHERE i.group_id = o.id);
+}
+expect {
+    1
+}
+
+# These cases run every generated query against Turso and SQLite. The data has
+# repeated outer keys, repeated inner keys, NULL values, missing groups, and a
+# NULL outer key.
+
+@setup correlated_rows
+@var aggregate { avg(i.amount) | sum(i.amount) | min(i.amount) | max(i.amount) | count(*) | count(i.amount) | total(i.amount) | count(DISTINCT i.key2) }
+@var link { i.key1 = o.key1 | o.key1 = i.key1 | i.key1 = o.key1 AND i.key2 = o.key2 }
+@var inner_filter { | AND i.amount IS NOT NULL | AND i.amount >= 7 }
+matrix one-value-aggregate-cases {
+    SELECT o.id, (SELECT $aggregate FROM inner_rows i WHERE $link $inner_filter)
+    FROM outer_rows o ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var aggregate { avg(i.amount) | sum(i.amount) | min(i.amount) | max(i.amount) | count(*) | total(i.amount) }
+@var operator { = | <> | < | <= | > | >= }
+@var link { i.key1 = o.key1 | i.key1 = o.key1 AND i.key2 = o.key2 }
+matrix one-value-aggregate-comparisons {
+    SELECT o.id FROM outer_rows o
+    WHERE o.amount $operator (SELECT $aggregate FROM inner_rows i WHERE $link)
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var aggregate { avg(i.amount) | min(i.amount) | max(i.amount) | count(*) | count(i.amount) | total(i.amount) }
+matrix two-copies-of-one-aggregate {
+    SELECT o.id,
+           (SELECT $aggregate FROM inner_rows i WHERE i.key1 = o.key1),
+           (SELECT $aggregate FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var left { o.amount | o.key2 | 10 | NULL }
+@var link { i.key1 = o.key1 | o.key1 = i.key1 | i.key1 = o.key1 AND i.key2 = o.key2 }
+@var inner_filter { | AND i.amount IS NOT NULL | AND i.amount >= 7 }
+matrix correlated-in-cases {
+    SELECT o.id FROM outer_rows o
+    WHERE $left IN (SELECT i.amount FROM inner_rows i WHERE $link $inner_filter)
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var aggregate { avg(i.amount) | sum(i.amount) }
+@var link { i.key1 < o.key1 | i.key1 IS o.key1 | i.key1 = o.key1 OR i.key2 = o.key2 | i.key1 = o.key1 AND o.amount > 10 }
+@var tail { | LIMIT 0 | LIMIT 1 OFFSET 1 }
+matrix one-value-cases-that-stay-as-subqueries {
+    SELECT o.id, (SELECT $aggregate FROM inner_rows i WHERE $link $tail)
+    FROM outer_rows o ORDER BY o.id;
+}
+
+setup tpch_rows {
+    CREATE TABLE part(partkey INTEGER PRIMARY KEY, brand TEXT, container TEXT);
+    CREATE TABLE lineitem(
+        partkey INTEGER,
+        suppkey INTEGER,
+        quantity INTEGER,
+        extendedprice INTEGER,
+        shipdate TEXT
+    );
+    CREATE TABLE partsupp(partkey INTEGER, suppkey INTEGER, availqty INTEGER, supplycost INTEGER);
+    CREATE TABLE supplier(suppkey INTEGER PRIMARY KEY, region INTEGER);
+    INSERT INTO part VALUES (1, 'Brand#1', 'SM BOX'), (2, 'Brand#2', 'LG CAN');
+    INSERT INTO supplier VALUES (10, 1), (11, 1), (12, 2);
+    INSERT INTO partsupp VALUES (1, 10, 20, 5), (1, 11, 20, 7), (1, 12, 20, 1),
+                                (2, 10, 4, 8), (2, 11, 20, 3);
+    INSERT INTO lineitem VALUES
+        (1, 10, 1, 70, '1994-02-01'),
+        (1, 10, 2, 140, '1994-03-01'),
+        (1, 11, 20, 700, '1996-01-01'),
+        (2, 10, 5, 210, '1994-04-01'),
+        (2, 11, 7, 280, '1994-05-01');
+}
+
+@setup tpch_rows
+test tpch-q17-average {
+    SELECT sum(l.extendedprice) / 7.0
+    FROM lineitem l JOIN part p ON p.partkey = l.partkey
+    WHERE p.brand = 'Brand#1'
+      AND p.container = 'SM BOX'
+      AND l.quantity < (
+          SELECT 0.2 * avg(l2.quantity)
+          FROM lineitem l2
+          WHERE l2.partkey = p.partkey
+      );
+}
+expect {
+    10.0
+}
+expect @js {
+    10
+}
+
+@setup tpch_rows
+test tpch-q20-sum-with-two-keys {
+    SELECT ps.partkey, ps.suppkey
+    FROM partsupp ps
+    WHERE ps.availqty > (
+        SELECT 0.5 * sum(l.quantity)
+        FROM lineitem l
+        WHERE l.partkey = ps.partkey
+          AND l.suppkey = ps.suppkey
+          AND l.shipdate >= '1994-01-01'
+          AND l.shipdate < '1995-01-01'
+    )
+    ORDER BY ps.partkey, ps.suppkey;
+}
+expect {
+    1|10
+    2|10
+    2|11
+}
+
+@setup tpch_rows
+test tpch-q2-minimum-over-join {
+    SELECT ps.partkey, ps.suppkey
+    FROM partsupp ps JOIN supplier s ON s.suppkey = ps.suppkey
+    WHERE s.region = 1
+      AND ps.supplycost = (
+          SELECT min(ps2.supplycost)
+          FROM partsupp ps2 JOIN supplier s2 ON s2.suppkey = ps2.suppkey
+          WHERE ps2.partkey = ps.partkey
+            AND s2.region = 1
+      )
+    ORDER BY ps.partkey, ps.suppkey;
+}
+expect {
+    1|10
+    2|11
+}

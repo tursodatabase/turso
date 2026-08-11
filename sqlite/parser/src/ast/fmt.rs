@@ -79,12 +79,11 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
 
         match (ty, ty.as_str(), value) {
             (TK_BLOB, None, value) => {
-                self.write.write_char('X')?;
-                self.write.write_char('\'')?;
                 if let Some(str) = value {
                     self.write.write_str(str)?;
+                } else {
+                    self.write.write_str("X''")?;
                 }
-                self.write.write_char('\'')?;
                 Ok(())
             }
             (_, ty_str, value) => {
@@ -482,8 +481,6 @@ impl ToTokens for Stmt {
                 indexed,
                 where_clause,
                 returning,
-                order_by,
-                limit,
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -501,14 +498,6 @@ impl ToTokens for Stmt {
                 if !returning.is_empty() {
                     s.append(TK_RETURNING, None)?;
                     comma(returning, s, context)?;
-                }
-                if !order_by.is_empty() {
-                    s.append(TK_ORDER, None)?;
-                    s.append(TK_BY, None)?;
-                    comma(order_by, s, context)?;
-                }
-                if let Some(limit) = limit {
-                    limit.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -654,8 +643,6 @@ impl ToTokens for Stmt {
                 from,
                 where_clause,
                 returning,
-                order_by,
-                limit,
             }) => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -682,14 +669,6 @@ impl ToTokens for Stmt {
                 if !returning.is_empty() {
                     s.append(TK_RETURNING, None)?;
                     comma(returning, s, context)?;
-                }
-                if !order_by.is_empty() {
-                    s.append(TK_ORDER, None)?;
-                    s.append(TK_BY, None)?;
-                    comma(order_by, s, context)?;
-                }
-                if let Some(limit) = limit {
-                    limit.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -1825,10 +1804,23 @@ impl ToTokens for ColumnConstraint {
                 }
                 Ok(())
             }
-            Self::Check(expr) => {
+            Self::Check { expr, source } => {
                 s.append(TK_CHECK, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens(s, context)?;
+                match source {
+                    // Emit the expression exactly as the user wrote it so the
+                    // spelling survives the canonical re-render (SQLite
+                    // reports failed CHECKs with this text). Put the closing
+                    // paren on a new line when a line comment might otherwise
+                    // swallow it. Closed block comments are safe as-is.
+                    Some(src) if !src.is_empty() => {
+                        s.append(TK_ID, Some(src))?;
+                        if src.contains("--") {
+                            s.append(TK_ID, Some("\n"))?;
+                        }
+                    }
+                    _ => expr.to_tokens(s, context)?,
+                }
                 s.append(TK_RP, None)
             }
             Self::Default(expr) => {
@@ -1925,10 +1917,23 @@ impl ToTokens for TableConstraint {
                 }
                 Ok(())
             }
-            Self::Check(expr) => {
+            Self::Check { expr, source } => {
                 s.append(TK_CHECK, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens(s, context)?;
+                match source {
+                    // Emit the expression exactly as the user wrote it so the
+                    // spelling survives the canonical re-render (SQLite
+                    // reports failed CHECKs with this text). Put the closing
+                    // paren on a new line when a line comment might otherwise
+                    // swallow it. Closed block comments are safe as-is.
+                    Some(src) if !src.is_empty() => {
+                        s.append(TK_ID, Some(src))?;
+                        if src.contains("--") {
+                            s.append(TK_ID, Some("\n"))?;
+                        }
+                    }
+                    _ => expr.to_tokens(s, context)?,
+                }
                 s.append(TK_RP, None)
             }
             Self::ForeignKey {

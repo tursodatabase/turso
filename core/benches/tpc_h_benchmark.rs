@@ -106,7 +106,9 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
                             turso_core::StepResult::Row => {
                                 black_box(stmt.row());
                             }
-                            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                            turso_core::StepResult::IO
+                            | turso_core::StepResult::Yield
+                            | turso_core::StepResult::Sleep { .. } => {
                                 db.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {

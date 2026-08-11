@@ -1,0 +1,199 @@
+--
+-- CHAR
+--
+-- Per SQL standard, CHAR means character(1), that is a varlena type
+-- with a constraint restricting it to one character (not byte)
+SELECT char 'c' = char 'c' AS true;
+ true 
+------
+ t
+(1 row)
+
+--
+-- Build a table for testing
+-- (This temporarily hides the table created in test_setup.sql)
+--
+CREATE TEMP TABLE CHAR_TBL(f1 char);
+INSERT INTO CHAR_TBL (f1) VALUES ('a');
+INSERT INTO CHAR_TBL (f1) VALUES ('A');
+-- any of the following three input formats are acceptable
+INSERT INTO CHAR_TBL (f1) VALUES ('1');
+INSERT INTO CHAR_TBL (f1) VALUES (2);
+INSERT INTO CHAR_TBL (f1) VALUES ('3');
+-- zero-length char
+INSERT INTO CHAR_TBL (f1) VALUES ('');
+-- try char's of greater than 1 length
+INSERT INTO CHAR_TBL (f1) VALUES ('cd');
+ERROR:  value too long for type character(1)
+INSERT INTO CHAR_TBL (f1) VALUES ('c     ');
+SELECT * FROM CHAR_TBL;
+ f1 
+----
+ a
+ A
+ 1
+ 2
+ 3
+  
+ c
+(7 rows)
+
+SELECT c.*
+   FROM CHAR_TBL c
+   WHERE c.f1 <> 'a';
+ f1 
+----
+ A
+ 1
+ 2
+ 3
+  
+ c
+(6 rows)
+
+SELECT c.*
+   FROM CHAR_TBL c
+   WHERE c.f1 = 'a';
+ f1 
+----
+ a
+(1 row)
+
+SELECT c.*
+   FROM CHAR_TBL c
+   WHERE c.f1 < 'a';
+ f1 
+----
+ A
+ 1
+ 2
+ 3
+  
+(5 rows)
+
+SELECT c.*
+   FROM CHAR_TBL c
+   WHERE c.f1 <= 'a';
+ f1 
+----
+ a
+ A
+ 1
+ 2
+ 3
+  
+(6 rows)
+
+SELECT c.*
+   FROM CHAR_TBL c
+   WHERE c.f1 > 'a';
+ f1 
+----
+ c
+(1 row)
+
+SELECT c.*
+   FROM CHAR_TBL c
+   WHERE c.f1 >= 'a';
+ f1 
+----
+ a
+ c
+(2 rows)
+
+DROP TABLE CHAR_TBL;
+--
+-- Now test longer arrays of char
+--
+-- This char_tbl was already created and filled in test_setup.sql.
+-- Here we just try to insert bad values.
+--
+INSERT INTO CHAR_TBL (f1) VALUES ('abcde');
+ERROR:  value too long for type character(4)
+SELECT * FROM CHAR_TBL;
+  f1  
+------
+ a   
+ ab  
+ abcd
+ abcd
+(4 rows)
+
+-- Also try it with non-error-throwing API
+SELECT pg_input_is_valid('abcd  ', 'char(4)');
+ pg_input_is_valid 
+-------------------
+ t
+(1 row)
+
+SELECT pg_input_is_valid('abcde', 'char(4)');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('abcde', 'char(4)');
+               message                | detail | hint | sql_error_code 
+--------------------------------------+--------+------+----------------
+ value too long for type character(4) |        |      | 22001
+(1 row)
+
+--
+-- Also test "char", which is an ad-hoc one-byte type.  It can only
+-- really store ASCII characters, but we allow high-bit-set characters
+-- to be accessed via bytea-like escapes.
+--
+SELECT 'a'::"char";
+ char 
+------
+ a
+(1 row)
+
+SELECT '\101'::"char";
+ char 
+------
+ A
+(1 row)
+
+SELECT '\377'::"char";
+ char 
+------
+ \377
+(1 row)
+
+SELECT 'a'::"char"::text;
+ text 
+------
+ a
+(1 row)
+
+SELECT '\377'::"char"::text;
+ text 
+------
+ \377
+(1 row)
+
+SELECT '\000'::"char"::text;
+ text 
+------
+ 
+(1 row)
+
+SELECT 'a'::text::"char";
+ char 
+------
+ a
+(1 row)
+
+SELECT '\377'::text::"char";
+ char 
+------
+ \377
+(1 row)
+
+SELECT ''::text::"char";
+ char 
+------
+ 
+(1 row)
+

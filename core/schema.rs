@@ -12,9 +12,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::index::{
-    reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
-};
+use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -118,8 +116,8 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TableInternalId, TypeOperator,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
+    SortOrder, TableInternalId, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -1204,7 +1202,7 @@ impl Schema {
 
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) -> Result<()> {
-        self.check_object_name_conflict(&view.name)?;
+        self.check_object_name_conflict(&view.name, SchemaObjectType::View)?;
         let name = normalize_ident(&view.name);
         self.views.insert(name, Arc::new(view));
         Ok(())
@@ -1257,6 +1255,26 @@ impl Schema {
     pub fn remove_triggers_for_table(&mut self, table_name: &str) {
         let table_name = normalize_ident(table_name);
         self.triggers.remove(&table_name);
+    }
+
+    pub fn set_trigger_target_database_id(
+        &mut self,
+        trigger_name: &str,
+        target_database_id: usize,
+    ) -> Result<()> {
+        let trigger_name = normalize_ident(trigger_name);
+        let trigger = self
+            .triggers
+            .values_mut()
+            .flatten()
+            .find(|trigger| normalize_ident(&trigger.name) == trigger_name)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "new trigger {trigger_name} was not loaded into the schema"
+                ))
+            })?;
+        Arc::make_mut(trigger).target_database_id = Some(target_database_id);
+        Ok(())
     }
 
     /// Like [`remove_triggers_for_table`] but only removes triggers whose
@@ -1317,7 +1335,7 @@ impl Schema {
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name)?;
+        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         #[cfg(feature = "conn_raw_api")]
         self.table_names_by_root_page
@@ -1327,7 +1345,7 @@ impl Schema {
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name)?;
+        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
         Ok(())
@@ -1391,7 +1409,7 @@ impl Schema {
     }
 
     pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
-        self.check_object_name_conflict(&index.name)?;
+        self.check_object_name_conflict(&index.name, SchemaObjectType::Index)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -1742,8 +1760,10 @@ impl Schema {
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
             )?;
-            if mvcc_enabled && index.index_method.is_some() {
-                crate::bail_parse_error!("Custom index modules are not supported with MVCC");
+            if mvcc_enabled {
+                if let Some(index_method) = index.index_method.as_ref() {
+                    crate::index_method::ensure_mvcc_support(&index_method.definition(), false)?;
+                }
             }
             self.add_index(Arc::new(index))?;
         }
@@ -1782,7 +1802,7 @@ impl Schema {
                     pk_index_added = true;
 
                     if unique_set.columns.len() == 1 {
-                        let col_name = &unique_set.columns.first().unwrap().0;
+                        let col_name = &unique_set.columns.first().unwrap().name;
                         let Some((_, column)) = table.get_column(col_name) else {
                             return Err(LimboError::ParseError(format!(
                                 "Column {col_name} not found in table {}",
@@ -1801,7 +1821,7 @@ impl Schema {
                             index_entry,
                             unique_set.columns.len(),
                             unique_set.conflict_clause,
-                            &unique_set.collations,
+                            &unique_set.columns,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -1817,15 +1837,15 @@ impl Schema {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
                         Vec::try_with_capacity_ext(unique_set.columns.len())?;
-                    for (col_name, sort_order) in unique_set.columns.iter() {
-                        let Some((pos_in_table, _)) = table.get_column(col_name) else {
+                    for unique_column in unique_set.columns.iter() {
+                        let Some((pos_in_table, _)) = table.get_column(&unique_column.name) else {
                             return Err(crate::LimboError::ParseError(format!(
                                 "Column {} not found in table {}",
-                                col_name, table.name
+                                unique_column.name, table.name
                             )));
                         };
                         column_indices_and_sort_orders
-                            .push_within_capacity((pos_in_table, *sort_order))
+                            .push_within_capacity((pos_in_table, unique_column.sort_order))
                             .expect("unique columns vector was preallocated to its input length");
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
@@ -1834,7 +1854,7 @@ impl Schema {
                             index_entry,
                             column_indices_and_sort_orders,
                             unique_set.conflict_clause,
-                            &unique_set.collations,
+                            &unique_set.columns,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -2528,16 +2548,23 @@ impl Schema {
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
-    fn check_object_name_conflict(&self, name: &str) -> Result<()> {
-        if let Some(object_type) = self.get_object_type(name) {
-            let type_str = match object_type {
-                SchemaObjectType::Table => "table",
-                SchemaObjectType::View => "view",
-                SchemaObjectType::Index => "index",
+    fn check_object_name_conflict(&self, name: &str, creating: SchemaObjectType) -> Result<()> {
+        if let Some(existing) = self.get_object_type(name) {
+            // Match SQLite's message shapes: indexes and tables/views live in
+            // different namespaces, so a cross-namespace clash names the other
+            // side ("there is already a ...") instead of "already exists".
+            let msg = match (creating, existing) {
+                (SchemaObjectType::Index, SchemaObjectType::Index) => {
+                    format!("index {name} already exists")
+                }
+                (SchemaObjectType::Index, _) => format!("there is already a table named {name}"),
+                (_, SchemaObjectType::Index) => {
+                    format!("there is already an index named {name}")
+                }
+                (_, SchemaObjectType::Table) => format!("table {name} already exists"),
+                (_, SchemaObjectType::View) => format!("view {name} already exists"),
             };
-            return Err(crate::LimboError::ParseError(format!(
-                "{type_str} \"{name}\" already exists"
-            )));
+            return Err(crate::LimboError::ParseError(msg));
         }
         Ok(())
     }
@@ -2583,7 +2610,6 @@ impl TryClone for UniqueSet {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
             columns: self.columns.try_clone()?,
-            collations: self.collations.try_clone()?,
             is_primary_key: self.is_primary_key,
             conflict_clause: self.conflict_clause,
         })
@@ -2600,7 +2626,7 @@ crate::alloc::impl_try_clone_via_clone!(
 // std global allocator (Strings, `std::vec::Vec`, boxed parser AST), so
 // forwarding to `Clone` is correct today. TODO(alloc): give these real
 // fallible impls when their fields become allocator-aware.
-crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint);
+crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint, UniqueSetColumn);
 
 impl Schema {
     #[turso_macros::allocation_site(crate::alloc::SchemaAllocationSite::MakeMut)]
@@ -2679,6 +2705,17 @@ impl TryClone for FromClauseSubquery {
     }
 }
 
+impl TryClone for RecursiveCteInput {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: self.name.clone(),
+            columns: self.columns.try_clone()?,
+        })
+    }
+}
+
 impl TryClone for Table {
     type Error = TryReserveError;
 
@@ -2688,6 +2725,9 @@ impl TryClone for Table {
             Table::Virtual(table) => Table::Virtual(Arc::new(table.as_ref().try_clone()?)),
             Table::FromClauseSubquery(from_clause_subquery) => {
                 Table::FromClauseSubquery(Arc::new(from_clause_subquery.as_ref().try_clone()?))
+            }
+            Table::RecursiveCteInput(input) => {
+                Table::RecursiveCteInput(Arc::new(input.as_ref().try_clone()?))
             }
         })
     }
@@ -2815,6 +2855,9 @@ impl ColumnLayout {
             Table::FromClauseSubquery(subquery) => Ok(Self::Identity {
                 column_count: subquery.columns.len(),
             }),
+            Table::RecursiveCteInput(input) => Ok(Self::Identity {
+                column_count: input.columns.len(),
+            }),
         }
     }
 
@@ -2922,6 +2965,7 @@ pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
     FromClauseSubquery(Arc<FromClauseSubquery>),
+    RecursiveCteInput(Arc<RecursiveCteInput>),
 }
 
 impl Table {
@@ -2934,6 +2978,9 @@ impl Table {
             Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
                 "FROM clause subqueries do not have a root page".to_string(),
             )),
+            Table::RecursiveCteInput(_) => Err(crate::LimboError::InternalError(
+                "recursive CTE inputs do not have a root page".to_string(),
+            )),
         }
     }
 
@@ -2942,6 +2989,7 @@ impl Table {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
+            Self::RecursiveCteInput(input) => &input.name,
         }
     }
 
@@ -2952,6 +3000,7 @@ impl Table {
             Self::FromClauseSubquery(from_clause_subquery) => {
                 from_clause_subquery.columns.get(index)
             }
+            Self::RecursiveCteInput(input) => input.columns.get(index),
         }
     }
 
@@ -2973,6 +3022,11 @@ impl Table {
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(name))
                 }),
+            Self::RecursiveCteInput(input) => input.columns.iter().enumerate().find(|(_, col)| {
+                col.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            }),
         }
     }
 
@@ -2981,6 +3035,7 @@ impl Table {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
+            Self::RecursiveCteInput(input) => &input.columns,
         }
     }
 
@@ -2989,6 +3044,7 @@ impl Table {
             Self::BTree(table) => table.is_strict,
             Self::Virtual(_) => false,
             Self::FromClauseSubquery(_) => false,
+            Self::RecursiveCteInput(_) => false,
         }
     }
 
@@ -2997,6 +3053,7 @@ impl Table {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3014,6 +3071,7 @@ impl Table {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3035,15 +3093,20 @@ impl PartialEq for Table {
     }
 }
 
+/// UniqueSet describes a column or set of columns for which rows are unique (PRIMARY KEY, UNIQUE)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UniqueSet {
-    pub columns: Vec<(String, SortOrder)>,
-    /// Per-column collation overrides from the constraint definition,
-    /// e.g. `PRIMARY KEY(a COLLATE NOCASE)`. Parallel to `columns`; `None`
-    /// falls back to the column definition's collation.
-    pub collations: Vec<Option<CollationSeq>>,
+    pub columns: Vec<UniqueSetColumn>,
     pub is_primary_key: bool,
     pub conflict_clause: Option<ResolveType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UniqueSetColumn {
+    pub name: String,
+    pub sort_order: SortOrder,
+    pub collation: Option<CollationSeq>,
+    pub nulls_order: Option<NullsOrder>,
 }
 
 #[derive(Clone, Debug)]
@@ -3052,23 +3115,42 @@ pub struct CheckConstraint {
     pub name: Option<String>,
     /// CHECK expression
     pub expr: ast::Expr,
+    /// The expression's source text exactly as the user wrote it between the
+    /// CHECK parens (whitespace-trimmed). SQLite reports an unnamed failed
+    /// constraint with this text, not a re-rendering of the expression.
+    pub source: Option<String>,
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
     pub column: Option<String>,
 }
 
 impl CheckConstraint {
-    pub fn new(name: Option<&ast::Name>, expr: &ast::Expr, column: Option<&str>) -> Self {
+    pub fn new(
+        name: Option<&ast::Name>,
+        expr: &ast::Expr,
+        source: Option<&str>,
+        column: Option<&str>,
+    ) -> Self {
         Self {
             name: name.map(|n| n.as_str().to_string()),
             expr: expr.clone(),
+            source: source.map(|s| s.to_string()),
             column: column.map(|s| s.to_string()),
         }
     }
 
     /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
     pub fn sql(&self) -> String {
-        format!("CHECK({})", self.expr)
+        match &self.source {
+            // Keep the user's spelling when rebuilding SQL. Put the closing
+            // paren on a new line when a line comment might otherwise swallow
+            // it. Closed block comments are safe as-is.
+            Some(source) if !source.is_empty() => {
+                let newline = if source.contains("--") { "\n" } else { "" };
+                format!("CHECK({source}{newline})")
+            }
+            _ => format!("CHECK({})", self.expr),
+        }
     }
 }
 
@@ -3425,6 +3507,7 @@ impl BTreeTable {
                     new_checks.try_push(CheckConstraint {
                         name: Some(name),
                         expr: *rewritten,
+                        source: None,
                         column: Some(col_name.clone()),
                     })?;
                 }
@@ -3640,7 +3723,7 @@ impl BTreeTable {
             }
             // Skip single-column unique constraints that were already emitted inline
             if unique_set.columns.len() == 1 {
-                let col_name = &unique_set.columns[0].0;
+                let col_name = &unique_set.columns[0].name;
                 if let Some((_, col)) = self.get_column(col_name) {
                     if col.unique() {
                         continue;
@@ -3648,11 +3731,11 @@ impl BTreeTable {
                 }
             }
             sql.push_str(", UNIQUE (");
-            for (i, (col_name, _)) in unique_set.columns.iter().enumerate() {
+            for (i, unique_column) in unique_set.columns.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&quote_ident(col_name));
+                sql.push_str(&quote_ident(&unique_column.name));
             }
             sql.push(')');
         }
@@ -3912,6 +3995,13 @@ pub struct FromClauseSubquery {
     /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
     /// reference rather than an inline derived table.
     pub cte: Option<FromClauseSubqueryCteMetadata>,
+}
+
+/// The one-row table read by the recursive part of a recursive CTE.
+#[derive(Debug, Clone)]
+pub struct RecursiveCteInput {
+    pub name: String,
+    pub columns: Vec<Column>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4360,9 +4450,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     if *auto_increment {
                         has_autoincrement = true;
                     }
-                    reject_explicit_nulls(columns)?;
-
-                    let mut pk_collations = Vec::try_with_capacity_ext(columns.len())?;
+                    let mut pk_unique_set_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
                         let col_name = match expr {
@@ -4374,13 +4462,17 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 bail_parse_error!("unsupported primary key expression: {}", expr)
                             }
                         };
-                        primary_key_columns
-                            .try_push((col_name, column.order.unwrap_or(SortOrder::Asc)))?;
-                        pk_collations.try_push(collation)?;
+                        let sort_order = column.order.unwrap_or(SortOrder::Asc);
+                        pk_unique_set_columns.try_push(UniqueSetColumn {
+                            name: col_name.clone(),
+                            sort_order,
+                            collation,
+                            nulls_order: column.nulls,
+                        })?;
+                        primary_key_columns.try_push((col_name, sort_order))?;
                     }
                     unique_sets_constraints.try_push(UniqueSet {
-                        columns: primary_key_columns.try_clone()?,
-                        collations: pk_collations,
+                        columns: pk_unique_set_columns,
                         is_primary_key: true,
                         conflict_clause: *conflict_clause,
                     })?;
@@ -4389,29 +4481,27 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    reject_explicit_nulls(columns)?;
                     let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
-                    let mut unique_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
-                        match expr {
-                            Expr::Id(id) => unique_columns.try_push((
-                                id.as_str().to_string(),
-                                column.order.unwrap_or(SortOrder::Asc),
-                            ))?,
-                            Expr::Literal(Literal::String(value)) => unique_columns.try_push((
-                                value.trim_matches('\'').to_owned(),
-                                column.order.unwrap_or(SortOrder::Asc),
-                            ))?,
+                        let col_name = match expr {
+                            Expr::Id(id) => id.as_str().to_string(),
+                            Expr::Literal(Literal::String(value)) => {
+                                value.trim_matches('\'').to_owned()
+                            }
                             expr => {
                                 bail_parse_error!("unsupported unique key expression: {}", expr)
                             }
-                        }
-                        unique_collations.try_push(collation)?;
+                        };
+                        unique_columns.try_push(UniqueSetColumn {
+                            name: col_name,
+                            sort_order: column.order.unwrap_or(SortOrder::Asc),
+                            collation,
+                            nulls_order: column.nulls,
+                        })?;
                     }
                     let unique_set = UniqueSet {
                         columns: unique_columns,
-                        collations: unique_collations,
                         is_primary_key: false,
                         conflict_clause: *conflict_clause,
                     };
@@ -4485,10 +4575,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     };
                     foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
-                } else if let ast::TableConstraint::Check(expr) = &c.constraint {
+                } else if let ast::TableConstraint::Check { expr, source } = &c.constraint {
                     check_constraints.try_push(CheckConstraint::new(
                         c.name.as_ref(),
                         expr,
+                        source.as_deref(),
                         None,
                     ))?;
                 }
@@ -4554,10 +4645,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
-                        ast::ColumnConstraint::Check(expr) => {
+                        ast::ColumnConstraint::Check { expr, source } => {
                             check_constraints.try_push(CheckConstraint::new(
                                 c_def.name.as_ref(),
                                 expr,
+                                source.as_deref(),
                                 Some(&name),
                             ))?;
                         }
@@ -4591,8 +4683,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 order = *o;
                             }
                             unique_sets_columns.try_push(UniqueSet {
-                                columns: try_vec![(name.clone(), order)]?,
-                                collations: try_vec![None]?,
+                                columns: try_vec![UniqueSetColumn {
+                                    name: name.clone(),
+                                    sort_order: order,
+                                    collation: None,
+                                    nulls_order: None,
+                                }]?,
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
                             })?;
@@ -4615,8 +4711,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
                             unique_sets_columns.try_push(UniqueSet {
-                                columns: try_vec![(name.clone(), order)]?,
-                                collations: try_vec![None]?,
+                                columns: try_vec![UniqueSetColumn {
+                                    name: name.clone(),
+                                    sort_order: order,
+                                    collation: None,
+                                    nulls_order: None,
+                                }]?,
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
                             })?;
@@ -4811,7 +4911,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .columns
                         .first()
                         .unwrap()
-                        .0
+                        .name
                         .eq_ignore_ascii_case(col.name.as_ref().unwrap())
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
@@ -4847,7 +4947,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             .columns
                             .iter()
                             .zip(unique_sets[j].columns.iter())
-                            .all(|((a_name, _), (b_name, _))| a_name.eq_ignore_ascii_case(b_name))
+                            .all(|(a, b)| a.name.eq_ignore_ascii_case(&b.name))
                     {
                         // SQLite rejects duplicate constraints on the same columns when both
                         // specify ON CONFLICT with different resolve types.
@@ -5257,8 +5357,9 @@ impl Column {
 
     #[inline]
     pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
+        self.raw &= !COLL_MASK;
         if let Some(c) = c {
-            self.raw = (self.raw & !COLL_MASK) | (((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK);
+            self.raw |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
         }
     }
 
@@ -5405,9 +5506,11 @@ impl TryFrom<&ColumnDefinition> for Column {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
                 ast::ColumnConstraint::NotNull {
-                    conflict_clause, ..
+                    nullable,
+                    conflict_clause,
+                    ..
                 } => {
-                    notnull = true;
+                    notnull = !nullable;
                     notnull_conflict_clause = *conflict_clause;
                 }
                 ast::ColumnConstraint::Unique(..) => unique = true,
@@ -5578,6 +5681,7 @@ pub struct Index {
 pub struct IndexColumn {
     pub name: String,
     pub order: SortOrder,
+    pub nulls_order: Option<NullsOrder>,
     /// the position of the column in the source table.
     /// for example:
     /// CREATE TABLE t (a,b,c)
@@ -5590,12 +5694,42 @@ pub struct IndexColumn {
     pub expr: Option<Box<Expr>>,
 }
 
+macro_rules! impl_effective_nulls_order {
+    ($ty:ty) => {
+        impl $ty {
+            pub fn effective_nulls_order_when_iterated(
+                &self,
+                iter_dir: $crate::translate::plan::IterationDirection,
+            ) -> turso_parser::ast::NullsOrder {
+                match iter_dir {
+                    $crate::translate::plan::IterationDirection::Forwards => {
+                        self.effective_nulls_order()
+                    }
+                    $crate::translate::plan::IterationDirection::Backwards => {
+                        self.effective_nulls_order().reverse()
+                    }
+                }
+            }
+
+            pub fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
+                self.nulls_order
+                    .unwrap_or_else(|| turso_parser::ast::NullsOrder::default_for(self.order))
+            }
+        }
+    };
+}
+
+pub(crate) use impl_effective_nulls_order;
+
+impl_effective_nulls_order!(IndexColumn);
+
 impl IndexColumn {
     /// Returns a default column with the given name and position.
     pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
+            nulls_order: None,
             pos_in_table,
             collation: None,
             default: None,
@@ -5616,6 +5750,7 @@ impl IndexColumn {
             .map(|(i, name)| Self {
                 name: name.to_string(),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table: i,
                 collation: None,
                 default: None,
@@ -5715,7 +5850,7 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_count: usize,
         conflict_clause: Option<ResolveType>,
-        collation_overrides: &[Option<CollationSeq>],
+        constraint_columns: &[UniqueSetColumn],
     ) -> Result<Index> {
         let has_primary_key_index =
             table.get_rowid_alias_column().is_none() && !table.primary_key_columns.is_empty();
@@ -5735,11 +5870,11 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
+                    nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: collation_overrides
+                    collation: constraint_columns
                         .get(i)
-                        .copied()
-                        .flatten()
+                        .and_then(|c| c.collation)
                         .or_else(|| column.collation_opt()),
                     default: column.default.clone(),
                     expr: None,
@@ -5768,7 +5903,7 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
         conflict_clause: Option<ResolveType>,
-        collation_overrides: &[Option<CollationSeq>],
+        constraint_columns: &[UniqueSetColumn],
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
@@ -5789,11 +5924,11 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
+                    nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: collation_overrides
+                    collation: constraint_columns
                         .get(i)
-                        .copied()
-                        .flatten()
+                        .and_then(|c| c.collation)
                         .or_else(|| col.collation_opt()),
                     default: col.default.clone(),
                     expr: None,
@@ -5923,24 +6058,70 @@ impl Index {
         ok
     }
 
+    /// Bind a copy of this index's WHERE clause against the given table references.
+    ///
+    /// Returns `Ok(None)` when the index has no WHERE clause. Binding errors are
+    /// propagated, never swallowed: callers must not treat `None` as "binding failed".
+    ///
+    /// The predicate may qualify columns with the table's real name
+    /// (e.g. `CREATE INDEX i ON t(a) WHERE t.b > 0`), while the DML statement
+    /// may refer to that table only under an alias (e.g. `UPDATE t AS z ...`).
+    /// Rewrite such qualifiers to the identifier the statement uses, so the
+    /// predicate always resolves against the index's own table, like in SQLite.
     pub fn bind_where_expr(
         &self,
         table_refs: Option<&mut TableReferences>,
         resolver: &Resolver,
-    ) -> Option<ast::Expr> {
+    ) -> crate::Result<Option<ast::Expr>> {
         let Some(where_clause) = &self.where_clause else {
-            return None;
+            return Ok(None);
         };
         let mut expr = where_clause.clone();
+        let target_identifier = table_refs.as_deref().and_then(|refs| {
+            // Only a real b-tree table can be the DML target that owns this index.
+            // A CTE or subquery sharing the table's name (e.g. `WITH t AS ...
+            // UPDATE t ...`) must not be picked, so match on b-tree identity.
+            let mut matches = refs
+                .joined_tables()
+                .iter()
+                .map(|jt| (&jt.identifier, &jt.table))
+                .chain(
+                    refs.outer_query_refs()
+                        .iter()
+                        .map(|r| (&r.identifier, &r.table)),
+                )
+                .filter(|(_, table)| {
+                    table
+                        .btree()
+                        .is_some_and(|bt| normalize_ident(&bt.name) == self.table_name)
+                })
+                .map(|(identifier, _)| identifier);
+            let target = matches.next().cloned();
+            assert!(
+                matches.next().is_none(),
+                "multiple table references match the table of partial index {}",
+                self.name
+            );
+            target
+        });
+        if let Some(identifier) = target_identifier {
+            walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
+                if let Expr::Qualified(ns, _) | Expr::DoublyQualified(_, ns, _) = e {
+                    if normalize_ident(ns.as_str()) == self.table_name {
+                        *ns = Name::exact(identifier.clone());
+                    }
+                }
+                Ok(WalkControl::Continue)
+            })?;
+        }
         bind_and_rewrite_expr(
             &mut expr,
             table_refs,
             None,
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .ok()?;
-        Some(*expr)
+        )?;
+        Ok(Some(*expr))
     }
 }
 
@@ -6269,6 +6450,30 @@ mod tests {
         let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
         let actual = sqlite_schema_table()?.to_sql();
         assert_eq!(expected, actual);
+        Ok(())
+    }
+
+    #[test]
+    fn check_constraint_comments_survive_table_reconstruction() -> Result<()> {
+        for (sql, comment) in [
+            (
+                "CREATE TABLE t (x CHECK(x /* block comment */ > 0))",
+                "/* block comment */",
+            ),
+            (
+                "CREATE TABLE t (x CHECK(x > 0 -- line comment\n))",
+                "-- line comment",
+            ),
+        ] {
+            let reconstructed = BTreeTable::from_sql(sql, 0)?.to_sql();
+
+            assert!(
+                reconstructed.contains(comment),
+                "reconstructed SQL: {reconstructed}"
+            );
+            BTreeTable::from_sql(&reconstructed, 0)?;
+        }
+
         Ok(())
     }
 

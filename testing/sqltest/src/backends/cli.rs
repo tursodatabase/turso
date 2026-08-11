@@ -342,7 +342,7 @@ impl CliDatabaseInstance {
             } else {
                 format!("command exited with status {}", output.status)
             };
-            return Ok(QueryResult::error(error_msg));
+            return Ok(QueryResult::error(normalize_cli_error(&error_msg)));
         }
 
         if is_sqlite_dot_command {
@@ -415,9 +415,72 @@ impl DatabaseInstance for CliDatabaseInstance {
     }
 }
 
+/// Normalize shell-decorated error output to the message `sqlite3_errmsg`
+/// would report, matching what the rust backend surfaces: parse errors read
+/// `Parse error: <message>`, runtime errors are the bare message.
+///
+/// The sqlite3 shell prints `Parse error near line N: <message>` followed by
+/// source-context lines, and `Runtime error near line N: <message> (<code>)`.
+/// The tursodb shell prints `Runtime error: <message> (<code>)` and renders
+/// prepare-time errors through miette as `× <message>` with `│` continuation
+/// lines when the message wraps.
+fn normalize_cli_error(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        let line = line.trim_start();
+        // Older tursodb shells wrapped everything in a generic "Error: ".
+        let line = line.strip_prefix("Error: ").unwrap_or(line);
+        if let Some(message) = strip_shell_error_prefix(line, "Parse error") {
+            return format!("Parse error: {message}");
+        }
+        if let Some(message) = strip_shell_error_prefix(line, "Runtime error") {
+            return strip_result_code(message).to_string();
+        }
+        if let Some(message) = line.strip_prefix("× ") {
+            // miette wraps long messages onto `│` continuation lines.
+            let mut message = message.trim().to_string();
+            for continuation in &lines[idx + 1..] {
+                let Some(continuation) = continuation.trim_start().strip_prefix("│ ") else {
+                    break;
+                };
+                message.push(' ');
+                message.push_str(continuation.trim());
+            }
+            return message;
+        }
+    }
+    raw.trim().to_string()
+}
+
+/// Strip `<kind>: ` or `<kind> near line N: ` from the start of a shell
+/// error line, returning the message that follows.
+fn strip_shell_error_prefix<'a>(line: &'a str, kind: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(kind)?.trim_start();
+    let rest = if let Some(rest) = rest.strip_prefix("near line") {
+        rest.trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+    } else {
+        rest
+    };
+    Some(rest.strip_prefix(':')?.trim_start())
+}
+
+/// Strip a trailing ` (<code>)` result code the sqlite3 and tursodb shells
+/// append after runtime error messages.
+fn strip_result_code(message: &str) -> &str {
+    if let Some(open) = message.rfind(" (") {
+        if let Some(code) = message[open + 2..].strip_suffix(')') {
+            if !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) {
+                return &message[..open];
+            }
+        }
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CliDatabaseInstance;
+    use super::{CliDatabaseInstance, normalize_cli_error};
 
     #[test]
     fn final_supported_sqlite_dot_command_detects_last_line() {
@@ -459,6 +522,75 @@ mod tests {
                 vec!["CREATE TABLE t1 (a CHECK(abs(a) > 0));".to_string()],
                 vec!["CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT 1; END;".to_string()]
             ]
+        );
+    }
+
+    #[test]
+    fn normalize_sqlite3_runtime_error_strips_line_and_code() {
+        assert_eq!(
+            normalize_cli_error("Runtime error near line 3: UNIQUE constraint failed: u.a (19)"),
+            "UNIQUE constraint failed: u.a"
+        );
+    }
+
+    #[test]
+    fn normalize_sqlite3_runtime_error_without_code() {
+        assert_eq!(
+            normalize_cli_error(
+                "Runtime error near line 3: second argument to nth_value must be a positive integer"
+            ),
+            "second argument to nth_value must be a positive integer"
+        );
+    }
+
+    #[test]
+    fn normalize_sqlite3_parse_error_drops_context_lines() {
+        assert_eq!(
+            normalize_cli_error(
+                "Parse error near line 4: no such table: nosuch\n  CREATE TABLE...\n     ^--- error here"
+            ),
+            "Parse error: no such table: nosuch"
+        );
+    }
+
+    #[test]
+    fn normalize_tursodb_runtime_error() {
+        assert_eq!(
+            normalize_cli_error("Runtime error: CHECK constraint failed: x<5 (19)"),
+            "CHECK constraint failed: x<5"
+        );
+    }
+
+    #[test]
+    fn normalize_tursodb_miette_error_joins_wrapped_lines() {
+        assert_eq!(
+            normalize_cli_error(
+                "  × Autovacuum is not enabled. Use --experimental-autovacuum flag to enable\n  │ it."
+            ),
+            "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
+        );
+    }
+
+    #[test]
+    fn normalize_tursodb_miette_parse_error_keeps_parse_prefix() {
+        assert_eq!(
+            normalize_cli_error("  × Parse error: no such table: main.nosuch"),
+            "Parse error: no such table: main.nosuch"
+        );
+    }
+
+    #[test]
+    fn normalize_leaves_undecorated_text_alone() {
+        assert_eq!(normalize_cli_error("plain message\n"), "plain message");
+    }
+
+    #[test]
+    fn normalize_skips_leading_result_rows() {
+        assert_eq!(
+            normalize_cli_error(
+                "1|2\nRuntime error near line 9: NOT NULL constraint failed: nn.a (19)"
+            ),
+            "NOT NULL constraint failed: nn.a"
         );
     }
 }

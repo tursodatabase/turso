@@ -86,6 +86,29 @@ snapshot scalar-subquery-simple-count {
     SELECT (SELECT count(*) FROM orders) AS order_count;
 }
 
+# The grouped table is inside a correlated subquery, but it does not use the
+# outer row. Its bytecode must use Once so the table is built one time.
+setup repeated_grouped_subquery {
+    CREATE TABLE repeat_top(t INTEGER);
+    CREATE TABLE repeat_middle(sk INTEGER, tk INTEGER);
+    CREATE TABLE repeat_inner(k INTEGER, x INTEGER);
+}
+
+@setup repeated_grouped_subquery
+snapshot grouped-subquery-builds-once {
+    SELECT top.t,
+           (SELECT count(*)
+            FROM repeat_middle middle_rows
+            WHERE middle_rows.tk = top.t
+              AND middle_rows.sk IN (
+                      SELECT inner_rows.k
+                      FROM repeat_inner inner_rows
+                      GROUP BY inner_rows.k
+                      HAVING avg(inner_rows.x) > 0
+                  ))
+    FROM repeat_top top;
+}
+
 # =============================================================================
 # EXISTS SUBQUERIES
 # =============================================================================

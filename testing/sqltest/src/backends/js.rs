@@ -183,12 +183,12 @@ impl JsDatabaseInstance {
 
         // Check for errors in stderr
         if !stderr.is_empty() && (stderr.contains("Error") || stderr.contains("error")) {
-            return Ok(QueryResult::error(stderr.trim().to_string()));
+            return Ok(QueryResult::error(normalize_js_error(stderr.trim())));
         }
 
         // Check for errors in stdout (the runner outputs "Error: ...")
         if stdout.starts_with("Error:") || stdout.contains("\nError:") {
-            return Ok(QueryResult::error(stdout.trim().to_string()));
+            return Ok(QueryResult::error(normalize_js_error(stdout.trim())));
         }
 
         if !output.status.success() {
@@ -266,6 +266,22 @@ impl DatabaseInstance for JsDatabaseInstance {
     }
 }
 
+/// Normalize the JS runner's error output to the message the rust backend
+/// surfaces. The runner prints `Error: <js error>`, and the JS binding wraps
+/// the engine message in an operation context, e.g. `step failed: UNIQUE
+/// constraint failed: u.a`. Strip both layers so one error expectation works
+/// on every backend.
+fn normalize_js_error(raw: &str) -> String {
+    const BINDING_CONTEXTS: &[&str] = &["step failed: ", "prepare failed: ", "reset failed: "];
+    let message = raw.strip_prefix("Error: ").unwrap_or(raw);
+    for context in BINDING_CONTEXTS {
+        if let Some(message) = message.strip_prefix(context) {
+            return message.to_string();
+        }
+    }
+    message.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +291,26 @@ mod tests {
         let backend = JsBackend::new("node", "bindings/javascript/turso-sql-runner.mjs");
         let capabilities = backend.capabilities();
         assert!(capabilities.contains(&Capability::Trigger));
+    }
+
+    #[test]
+    fn normalize_js_error_strips_runner_and_binding_wrappers() {
+        assert_eq!(
+            normalize_js_error("Error: step failed: CHECK constraint failed: x<5"),
+            "CHECK constraint failed: x<5"
+        );
+    }
+
+    #[test]
+    fn normalize_js_error_keeps_parse_errors_intact() {
+        assert_eq!(
+            normalize_js_error("Error: prepare failed: Parse error: no such table: t"),
+            "Parse error: no such table: t"
+        );
+    }
+
+    #[test]
+    fn normalize_js_error_leaves_plain_messages_alone() {
+        assert_eq!(normalize_js_error("some other error"), "some other error");
     }
 }

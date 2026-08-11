@@ -614,6 +614,43 @@ pub fn insn_to_row(
                     ),
                 )
             }
+            Insn::ColumnRange {
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+            } => {
+                let count = defaults.len();
+                let cursor_type = &program.cursor_ref[*cursor_id].1;
+                let column_name = |column: usize| -> String {
+                    let name: Option<&String> = match cursor_type {
+                        CursorType::BTreeTable(table) => {
+                            table.columns().get(column).and_then(|v| v.name.as_ref())
+                        }
+                        CursorType::BTreeIndex(index) => index.columns.get(column).map(|c| &c.name),
+                        _ => {
+                            None
+                        }
+                    };
+                    name.map_or_else(|| format!("column {column}"), |name| name.to_string())
+                };
+                (
+                    "ColumnRange",
+                    *cursor_id as i64,
+                    *start_column as i64,
+                    *dest as i64,
+                    Value::from_i64(count as i64),
+                    0,
+                    format!(
+                        "r[{}..{}]={}.{}..{}",
+                        dest,
+                        dest + count - 1,
+                        get_table_or_index_name(*cursor_id),
+                        column_name(*start_column),
+                        column_name(*start_column + count - 1),
+                    ),
+                )
+            }
             Insn::ColumnHasField {
                 cursor_id,
                 column,
@@ -1032,6 +1069,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::ChangeCount { dest } => (
+                "ChangeCount",
+                0,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!("r[{dest}]=changes"),
+            ),
             Insn::Real { value, dest } => (
                 "Real",
                 0,
@@ -1276,6 +1322,21 @@ pub fn insn_to_row(
                 }),
                 0,
                 format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
+            ),
+            Insn::AggInverse {
+                func,
+                acc_reg,
+                delimiter: _,
+                col,
+                comparator: _,
+            } => (
+                "AggInverse",
+                0,
+                *col as i64,
+                *acc_reg as i64,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] inverse(r[{}])", *acc_reg, *col),
             ),
             Insn::AggFinal { register, func } => (
                 "AggFinal",
@@ -1931,7 +1992,9 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::ParseSchema { db, where_clause } => (
+            Insn::ParseSchema {
+                db, where_clause, ..
+            } => (
                 "ParseSchema",
                 *db as i64,
                 0,
@@ -2169,6 +2232,15 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("goto {}", target_pc_when_reentered.as_debug_int()),
+            ),
+            Insn::ResetOnce { region_end } => (
+                "ResetOnce",
+                region_end.as_debug_int() as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("clear once flags before {}", region_end.as_debug_int()),
             ),
             Insn::BeginSubrtn { dest, dest_end } => (
                 "BeginSubrtn",

@@ -233,7 +233,11 @@ mod join_fuzz_tests {
                 let mut preds = Vec::new();
                 for _ in 0..num_preds {
                     let col = join_cols[rng.random_range(0..join_cols.len())];
-                    preds.push(format!("{left_alias}.{col} = {right_alias}.{col}"));
+                    // 25% chance of `IS` instead of `=`. Both seek the index, but
+                    // `IS` also joins NULL to NULL, so it produces matches where
+                    // `=` produces the null-extended row of a LEFT JOIN.
+                    let op = if rng.random_bool(0.25) { "IS" } else { "=" };
+                    preds.push(format!("{left_alias}.{col} {op} {right_alias}.{col}"));
                 }
                 preds.sort();
                 preds.dedup();
@@ -267,7 +271,7 @@ mod join_fuzz_tests {
                 let col = cols[rng.random_range(0..cols.len())];
                 // EXISTS/NOT EXISTS only when indexes exist — without indexes,
                 // non-unnested correlated subqueries cause pathological O(n²) scans.
-                let max_kind = if add_indexes { 6 } else { 4 };
+                let max_kind = if add_indexes { 7 } else { 5 };
                 let kind = rng.random_range(0..max_kind);
                 let cond = match kind {
                     0 => {
@@ -280,9 +284,16 @@ mod join_fuzz_tests {
                     }
                     2 => format!("{alias}.{col} IS NULL"),
                     3 => format!("{alias}.{col} IS NOT NULL"),
-                    4 | 5 => {
+                    // `IS` against a literal seeks the index like `=`, but it stays
+                    // TRUE for a null-extended row, so it must not be pushed into
+                    // the loop of a LEFT JOIN's right-hand table.
+                    4 => {
+                        let val = rng.random_range(-10..=20);
+                        format!("{alias}.{col} IS {val}")
+                    }
+                    5 | 6 => {
                         // EXISTS / NOT EXISTS correlated subquery
-                        let not = if kind == 5 { "NOT " } else { "" };
+                        let not = if kind == 6 { "NOT " } else { "" };
                         let target_table = tables[rng.random_range(0..tables.len())];
                         let sub_col = ["a", "b", "c", "d"][rng.random_range(0..4)];
                         let extra = if rng.random_bool(0.3) {

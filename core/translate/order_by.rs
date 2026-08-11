@@ -14,7 +14,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, IdxInsertFlags, Insn},
+        insn::{to_u32, IdxInsertFlags, Insn},
     },
     Result,
 };
@@ -203,7 +203,12 @@ impl EmitOrderBy {
             let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
             let mut index_columns =
                 Vec::try_with_capacity_ext(order_by.len() + result_columns.len())?;
-            for (column, order, _nulls) in order_by {
+            for (column, order, nulls) in order_by {
+                if nulls.is_some() {
+                    return Err(crate::LimboError::InternalError(
+                        "heap sort cannot express an explicit NULLS ordering".to_string(),
+                    ));
+                }
                 let collation = get_collseq_from_expr_with_symbols(
                     column,
                     referenced_tables,
@@ -214,6 +219,7 @@ impl EmitOrderBy {
                 index_columns.push(IndexColumn {
                     name: pos_in_table.to_string(),
                     order: *order,
+                    nulls_order: None,
                     pos_in_table,
                     collation,
                     default: None,
@@ -225,6 +231,7 @@ impl EmitOrderBy {
             index_columns.try_push(IndexColumn {
                 name: pos_in_table.to_string(),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table,
                 collation: None,
                 default: None,
@@ -661,9 +668,9 @@ impl EmitOrderBy {
 
         if *use_heap_sort {
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(start_reg),
-                count: to_u16(orderby_sorter_column_count),
-                dest_reg: to_u16(*reg_sorter_data),
+                start_reg: to_u32(start_reg),
+                count: to_u32(orderby_sorter_column_count),
+                dest_reg: to_u32(*reg_sorter_data),
                 index_name: None,
                 affinity_str: None,
             });
@@ -698,9 +705,9 @@ pub fn sorter_insert(
     record_reg: usize,
 ) {
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(start_reg),
-        count: to_u16(column_count),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(start_reg),
+        count: to_u32(column_count),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });

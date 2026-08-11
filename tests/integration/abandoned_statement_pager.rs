@@ -347,3 +347,106 @@ fn test_abandoned_insert_does_not_poison_next_insert() {
         );
     }
 }
+
+/// Regression test for issue #8291.
+///
+/// A single big INSERT pushes the WAL past the 1000-frame auto-checkpoint
+/// threshold, so its commit runs a checkpoint that yields for I/O after the
+/// WAL commit is durable and the WAL locks are released. Resetting the
+/// statement at one of those yields used to panic: the connection's
+/// transaction state was still `Write`, so the abort path called
+/// `wal.end_write_tx()` for locks that were already released, tripping the
+/// "write lock not held" assertion in wal.rs. This sweeps every I/O boundary
+/// of the INSERT, resets the statement there, and asserts the reset does not
+/// panic and leaves the connection usable.
+#[test]
+fn test_reset_during_post_commit_auto_checkpoint() {
+    // ~1200 overflow pages at page_size 512, so one commit crosses the
+    // 1000-frame auto-checkpoint threshold.
+    const INSERT: &str = "INSERT INTO t VALUES (1, zeroblob(600000))";
+
+    fn setup(io: &Arc<MemoryYieldIO>, path: &str) -> Arc<Connection> {
+        let conn = open_conn(io.clone(), path);
+        conn.execute("PRAGMA page_size=512").unwrap();
+        conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)")
+            .unwrap();
+        conn
+    }
+
+    // Dry run: count the INSERT's I/O yields so the sweep below can visit
+    // every boundary, including the ones inside the auto-checkpoint at the
+    // end.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let total_ios = {
+        let io = Arc::new(MemoryYieldIO::new());
+        let path = temp_dir.path().join("dry-run.db");
+        let conn = setup(&io, path.to_str().unwrap());
+        let mut stmt = conn.prepare(INSERT).unwrap();
+        let mut count = 0usize;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::IO => {
+                    count += 1;
+                    io.step().unwrap();
+                }
+                StepResult::Done => break,
+                StepResult::Yield => {}
+                other => panic!("unexpected step result in dry run: {other:?}"),
+            }
+        }
+        count
+    };
+    assert!(
+        total_ios > 2,
+        "INSERT must yield for I/O several times for the sweep to mean anything"
+    );
+
+    for target_io in 1..=total_ios {
+        let io = Arc::new(MemoryYieldIO::new());
+        let path = temp_dir.path().join(format!("reset-at-{target_io}.db"));
+        let conn = setup(&io, path.to_str().unwrap());
+
+        let mut stmt = conn.prepare(INSERT).unwrap();
+        let mut io_count = 0usize;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::IO => {
+                    io_count += 1;
+                    io.step().unwrap();
+                    if io_count == target_io {
+                        break;
+                    }
+                }
+                StepResult::Done => {
+                    panic!("target_io={target_io}: INSERT finished before the target boundary")
+                }
+                StepResult::Yield => {}
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+
+        // Before the fix this panicked with "end_write_tx called while write
+        // lock not held according to connection state" when target_io landed
+        // inside the post-commit auto-checkpoint.
+        stmt.reset()
+            .unwrap_or_else(|e| panic!("target_io={target_io}: reset failed: {e}"));
+        drop(stmt);
+
+        // The reset either rolled the INSERT back (mid-write) or interrupted
+        // only the checkpoint of an already-committed INSERT, so the row
+        // count is 0 or 1 and the connection must stay fully usable.
+        let count = ids(&conn, "SELECT count(*) FROM t")[0];
+        assert!(
+            (0..=1).contains(&count),
+            "target_io={target_io}: unexpected row count {count}"
+        );
+        conn.execute("INSERT INTO t VALUES (2, zeroblob(1000))")
+            .unwrap();
+        assert_eq!(
+            integrity_check(&conn),
+            vec!["ok"],
+            "target_io={target_io}: reset during commit corrupted the database"
+        );
+    }
+}

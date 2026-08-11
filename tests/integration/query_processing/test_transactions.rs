@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tempfile::TempDir;
 use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
@@ -44,6 +45,70 @@ fn test_deferred_transaction_restart(tmp_db: TempDatabase) {
         let row = stmt.row().unwrap();
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
+}
+
+// With a busy timeout set, a statement that hits lock contention must ask the
+// caller to wait via StepResult::Sleep (never surface Busy) while the other
+// writer holds the lock, and must complete once that writer commits.
+#[turso_macros::test]
+fn test_busy_wait_returns_sleep_step_result(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+
+    conn2.set_busy_timeout(Duration::from_secs(5));
+    let mut stmt = conn2
+        .prepare("INSERT INTO test (id, value) VALUES (2, 'second')")
+        .unwrap();
+
+    // Drive the statement into the lock conflict: the busy handler asks for a
+    // retry, so step() must report Sleep instead of Busy.
+    let first_delay = loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => break duration,
+            result => panic!("expected Sleep while the write lock is held, got {result:?}"),
+        }
+    };
+    // The first retry of the default backoff schedule waits 1ms.
+    assert_eq!(first_delay, Duration::from_millis(1));
+
+    // Re-stepping while the lock is still held keeps asking the caller to wait.
+    for _ in 0..5 {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => {
+                assert!(!duration.is_zero(), "Sleep must carry a non-zero delay");
+                std::thread::sleep(duration);
+            }
+            result => panic!("expected Sleep while the write lock is held, got {result:?}"),
+        }
+    }
+
+    conn1.execute("COMMIT").unwrap();
+
+    // Once the competing writer commits, waiting out the delays lets the
+    // statement finish.
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => std::thread::sleep(duration),
+            result => panic!("expected the insert to finish after COMMIT, got {result:?}"),
+        }
+    }
+    drop(stmt);
+
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
 }
 
 // Test a scenario where a deferred transaction cannot restart due to prior reads:
@@ -2180,7 +2245,8 @@ fn test_mvcc_autoincrement_stress_multipage(tmp_db: TempDatabase) {
 /// high-water mark. No ID reuse is ever acceptable.
 #[test]
 fn test_autoincrement_watermark_survives_restart() {
-    let path = TempDir::new().unwrap().keep().join("p1_autoinc_restart");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("p1_autoinc_restart");
 
     // Phase 1: create table, insert rows, close
     {
@@ -2229,7 +2295,8 @@ fn test_autoincrement_watermark_survives_restart() {
 /// nextval must return a value past the previously committed high-water mark.
 #[test]
 fn test_user_sequence_watermark_survives_restart_mvcc() {
-    let path = TempDir::new().unwrap().keep().join("p1_user_seq_restart");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("p1_user_seq_restart");
 
     // Phase 1: create sequence, advance it, close
     {

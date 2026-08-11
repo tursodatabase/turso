@@ -1,8 +1,9 @@
 use crate::{
-    alloc::{self, TursoIteratorExt},
+    alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, RecursiveCteInput,
+        Schema, Table, Type, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -26,8 +27,7 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder,
-    SubqueryType,
+    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
 
 use turso_parser::ast::TableInternalId;
@@ -354,6 +354,13 @@ impl SubqueryOrigin {
     pub fn is_post_write_returning(self) -> bool {
         matches!(self, SubqueryOrigin::DmlReturning)
     }
+
+    pub fn is_write_statement(self) -> bool {
+        matches!(
+            self,
+            SubqueryOrigin::DmlWhere | SubqueryOrigin::DmlSet | SubqueryOrigin::DmlReturning
+        )
+    }
 }
 
 /// One ORDER BY key of a compound SELECT:
@@ -384,11 +391,42 @@ pub enum Plan {
         /// ORDER BY for compound selects, or `None` when the query has none.
         order_by: Option<Vec<CompoundOrderByKey>>,
     },
+    /// Runs the initial query once, then runs the recursive query for each queued row.
+    RecursiveCte(Box<RecursiveCtePlan>),
     Delete(Box<DeletePlan>),
     Update(Box<UpdatePlan>),
 }
 
+#[derive(Debug, Clone)]
+/// Everything needed to emit one self-referencing CTE.
+pub struct RecursiveCtePlan {
+    pub name: String,
+    pub initial_query: Box<Plan>,
+    pub recursive_query: Box<Plan>,
+    pub input_table_id: TableInternalId,
+    pub union_all: bool,
+    pub limit: Option<Box<Expr>>,
+    pub offset: Option<Box<Expr>>,
+    pub queue_order: Option<Vec<CompoundOrderByKey>>,
+    pub query_destination: QueryDestination,
+}
+
 impl Plan {
+    /// Return the estimated work for this plan's expected number of calls.
+    pub(crate) fn estimated_cost(&self) -> Option<f64> {
+        match self {
+            Plan::Select(plan) => plan.estimated_cost,
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter()
+                .map(|(plan, _)| plan.estimated_cost)
+                .chain(core::iter::once(right_most.estimated_cost))
+                .try_fold(0.0, |total, cost| cost.map(|cost| total + cost)),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
     /// Returns true if this SELECT plan contains a reference to the given table.
     /// For compound selects, checks all component selects.
     /// Returns false for Delete/Update plans.
@@ -403,6 +441,10 @@ impl Plan {
                         .iter()
                         .any(|(plan, _)| plan.table_references.contains_table(table))
             }
+            Plan::RecursiveCte(plan) => {
+                plan.initial_query.select_contains_table(table)
+                    || plan.recursive_query.select_contains_table(table)
+            }
             Plan::Delete(_) | Plan::Update(_) => false,
         }
     }
@@ -413,6 +455,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => Some(&select_plan.query_destination),
             Plan::CompoundSelect { right_most, .. } => Some(&right_most.query_destination),
+            Plan::RecursiveCte(plan) => Some(&plan.query_destination),
             Plan::Delete(_) | Plan::Update(_) => None,
         }
     }
@@ -423,6 +466,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => Some(&mut select_plan.query_destination),
             Plan::CompoundSelect { right_most, .. } => Some(&mut right_most.query_destination),
+            Plan::RecursiveCte(plan) => Some(&mut plan.query_destination),
             Plan::Delete(_) | Plan::Update(_) => None,
         }
     }
@@ -439,6 +483,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => &select_plan.result_columns,
             Plan::CompoundSelect { right_most, .. } => &right_most.result_columns,
+            Plan::RecursiveCte(plan) => plan.initial_query.select_result_columns(),
             Plan::Delete(_) | Plan::Update(_) => {
                 panic!("select_result_columns called on a non-SELECT plan")
             }
@@ -456,6 +501,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => &select_plan.table_references,
             Plan::CompoundSelect { right_most, .. } => &right_most.table_references,
+            Plan::RecursiveCte(plan) => plan.initial_query.select_table_references(),
             Plan::Delete(_) | Plan::Update(_) => {
                 panic!("select_table_references called on a non-SELECT plan")
             }
@@ -485,6 +531,10 @@ impl Plan {
                 }
                 collect_from_select(right_most, &mut ids);
             }
+            Plan::RecursiveCte(plan) => {
+                ids.extend(plan.initial_query.used_outer_query_ref_ids());
+                ids.extend(plan.recursive_query.used_outer_query_ref_ids());
+            }
             Plan::Delete(_) | Plan::Update(_) => {}
         }
         ids
@@ -501,6 +551,10 @@ impl Plan {
                 left.iter()
                     .any(|(select_plan, _)| select_plan.reads_table(database_id, table_name))
                     || right_most.reads_table(database_id, table_name)
+            }
+            Plan::RecursiveCte(plan) => {
+                plan.initial_query.reads_table(database_id, table_name)
+                    || plan.recursive_query.reads_table(database_id, table_name)
             }
             Plan::Delete(_) | Plan::Update(_) => false,
         }
@@ -554,6 +608,15 @@ pub enum QueryDestination {
         /// How to determine the rowid key for inserts.
         rowid_mode: EphemeralRowidMode,
     },
+    /// Insert rows produced by a recursive CTE into its work queue.
+    RecursiveCteQueue {
+        cursor_id: CursorID,
+        index: Arc<Index>,
+        /// Result columns that determine which queued row is read next.
+        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+        /// Index of rows already produced by a recursive `UNION`.
+        seen_rows: Option<(CursorID, Arc<Index>)>,
+    },
     /// The result of an EXISTS subquery are stored in a single register.
     ExistsSubqueryResult {
         /// The register that holds the result of the EXISTS subquery.
@@ -574,6 +637,15 @@ pub enum QueryDestination {
     },
     /// Decision made at some point after query plan construction.
     Unset,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// One result column used to order the recursive CTE work queue.
+pub struct RecursiveCteQueueKey {
+    pub result_column_index: usize,
+    /// `None` when the index sort order already puts NULLs in the requested
+    /// position.
+    pub nulls_override: Option<ast::NullsOrder>,
 }
 
 impl QueryDestination {
@@ -717,6 +789,9 @@ pub struct SelectPlan {
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
+    /// Estimated work for this query after its table reads are chosen.
+    /// Parent queries use this when they compare a subquery with a join.
+    pub(crate) estimated_cost: Option<f64>,
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
@@ -760,7 +835,7 @@ impl SelectPlan {
                     Table::FromClauseSubquery(subquery) => {
                         subquery.plan.reads_table(database_id, table_name)
                     }
-                    Table::BTree(_) | Table::Virtual(_) => false,
+                    Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => false,
                 }
         }) || self
             .non_from_clause_subqueries
@@ -821,12 +896,6 @@ pub struct DeletePlan {
     pub result_columns: Vec<ResultSetColumn>,
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Vec<WhereTerm>,
-    /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
-    /// limit clause
-    pub limit: Option<Box<Expr>>,
-    /// offset clause
-    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
@@ -896,8 +965,6 @@ pub struct UpdatePlan {
     /// SET clause assignments
     pub set_clauses: Vec<UpdateSetClause>,
     pub where_clause: Vec<WhereTerm>,
-    pub limit: Option<Box<Expr>>,
-    pub offset: Option<Box<Expr>>,
     /// Optional RETURNING clause.
     pub returning: Option<Vec<ResultSetColumn>>,
     /// Whether the WHERE clause is always false.
@@ -1311,6 +1378,54 @@ impl TableReferences {
         &mut self.joined_tables
     }
 
+    /// Whether an outer join in the FROM list can give this table's columns
+    /// NULLs ("null-extend" it).
+    ///
+    /// The right-hand table of a LEFT or FULL JOIN — the table that carries
+    /// the `join_info` — gets NULLs when a left-side row has no match. A FULL
+    /// JOIN *also* gives NULLs to every table on its left side when a
+    /// right-side row has no match, and those tables carry no `join_info` of
+    /// their own, so checking only `table.join_info` misses them. (This is
+    /// SQLite's `JT_LTORJ` bit.)
+    pub fn outer_join_may_null_extend(&self, table: TableInternalId) -> bool {
+        let Some(pos) = self
+            .joined_tables
+            .iter()
+            .position(|t| t.internal_id == table)
+        else {
+            return false;
+        };
+        if self.joined_tables[pos]
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_outer)
+        {
+            return true;
+        }
+        self.joined_tables[pos + 1..]
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
+    }
+
+    /// Like [Self::outer_join_may_null_extend], but true only when the
+    /// null extension comes from a FULL JOIN. Matters because the two join
+    /// kinds emit their null-extended rows differently: a LEFT JOIN re-checks
+    /// consumed WHERE terms when it emits the null-extended row, while a FULL
+    /// JOIN synthesizes its extra rows by jumping past the scan entirely, so a
+    /// consumed term is never checked against them.
+    pub fn full_join_may_null_extend(&self, table: TableInternalId) -> bool {
+        let Some(pos) = self
+            .joined_tables
+            .iter()
+            .position(|t| t.internal_id == table)
+        else {
+            return false;
+        };
+        self.joined_tables[pos..]
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
+    }
+
     /// Resets the expression index usages for all joined tables.
     pub fn reset_expression_index_usages(&mut self) {
         for table in self.joined_tables.iter_mut() {
@@ -1347,6 +1462,12 @@ impl TableReferences {
     /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
     pub fn outer_query_refs(&self) -> &[OuterQueryReference] {
         &self.outer_query_refs
+    }
+
+    /// Remove outer references after an optimizer rewrite has removed every
+    /// expression that uses them.
+    pub(crate) fn clear_outer_query_refs(&mut self) {
+        self.outer_query_refs.clear();
     }
 
     /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
@@ -2226,6 +2347,7 @@ impl Operation {
             Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
                 iter_dir: IterationDirection::Forwards,
             }),
+            Table::RecursiveCteInput(_) => Operation::Scan(Scan::RecursiveCteInput),
         }
     }
 
@@ -2268,12 +2390,89 @@ impl Operation {
                 // All index columns must have equality constraints.
                 let num_index_cols = idx.columns.len();
                 let num_eq_prefix = seek_def.prefix.iter().filter(|c| c.eq.is_some()).count();
-                num_eq_prefix == num_index_cols
+                if num_eq_prefix != num_index_cols {
+                    return false;
+                }
+                // Only plain `=` components guarantee one row. An `IS`
+                // component matches NULL keys, and a UNIQUE index stores every
+                // NULL key separately, so e.g. `WHERE a IS NULL` can touch
+                // many rows.
+                (0..seek_def.prefix.len()).all(|i| !seek_def.is_null_matching_key_component(i))
             }
             // Table scans, hash joins, multi-index scans, etc. are not single-row.
             _ => false,
         }
     }
+}
+
+fn query_output_columns(
+    plan: &Plan,
+    explicit_columns: Option<&[String]>,
+) -> Result<alloc::Vec<Column>> {
+    let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
+        Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .first()
+            .map(|(select, _)| (&select.result_columns[..], &select.table_references))
+            .unwrap_or((&right_most.result_columns, &right_most.table_references)),
+        Plan::RecursiveCte(recursive_cte) => (
+            recursive_cte.initial_query.select_result_columns(),
+            recursive_cte.initial_query.select_table_references(),
+        ),
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot define query output columns")
+        }
+    };
+
+    let compound_arms = match plan {
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut arms = left
+                .iter()
+                .map(|(select, _)| select)
+                .try_collect::<alloc::Vec<_>>()?;
+            arms.try_push(right_most)?;
+            Some(arms)
+        }
+        _ => None,
+    };
+
+    let mut columns = result_columns
+        .iter()
+        .enumerate()
+        .map(|(column_index, result_column)| {
+            let name = explicit_columns
+                .and_then(|names| names.get(column_index).cloned())
+                .or_else(|| result_column.name(table_references).map(String::from));
+            let column_type = compound_arms
+                .as_ref()
+                .map(|arms| compound_column_affinity(arms, column_index).to_type())
+                .unwrap_or_else(|| {
+                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                });
+            Column::new(
+                name,
+                column_type.to_string(),
+                None,
+                None,
+                column_type,
+                None,
+                ColDef::default(),
+            )
+        })
+        .try_collect::<alloc::Vec<_>>()?;
+
+    for (column_index, column) in columns.iter_mut().enumerate() {
+        let result_expr = &result_columns[column_index].expr;
+        if super::expr::expr_is_array(result_expr, Some(table_references)) {
+            column.set_array_dimensions(1);
+        }
+        column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
+    }
+    Ok(columns)
 }
 
 impl JoinedTable {
@@ -2371,80 +2570,8 @@ impl JoinedTable {
         cte_id: Option<usize>,
         materialize_hint: bool,
     ) -> Result<Self> {
+        let columns = query_output_columns(&plan, explicit_columns)?;
         // Get result columns and table references from the plan
-        let (result_columns, table_references) = match &plan {
-            Plan::Select(select_plan) => {
-                (&select_plan.result_columns, &select_plan.table_references)
-            }
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                // For compound selects, SQLite uses the leftmost select's column names.
-                // The leftmost select is left[0] if the vec is not empty, otherwise right_most.
-                if !left.is_empty() {
-                    (&left[0].0.result_columns, &left[0].0.table_references)
-                } else {
-                    (&right_most.result_columns, &right_most.table_references)
-                }
-            }
-            Plan::Delete(_) | Plan::Update(_) => {
-                unreachable!("DELETE/UPDATE plans cannot be subqueries")
-            }
-        };
-
-        // Note: column count validation (explicit_columns.len() vs result_columns.len())
-        // is intentionally NOT done here. SQLite defers this check until the CTE is
-        // actually referenced. Callers that represent actual CTE references should
-        // validate the count before calling this method.
-
-        // For a compound select, a column's affinity is combined across every arm
-        // (not just the leftmost one), so collect the arms to fold over.
-        let compound_arms: Option<Vec<&SelectPlan>> = match &plan {
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                let mut arms: Vec<&SelectPlan> = left.iter().map(|(p, _)| p).collect();
-                arms.push(right_most);
-                Some(arms)
-            }
-            _ => None,
-        };
-
-        let mut columns = result_columns
-            .iter()
-            .enumerate()
-            .map(|(i, rc)| {
-                // Use explicit column name if provided, otherwise derive from result column
-                let col_name = explicit_columns
-                    .and_then(|cols| cols.get(i).cloned())
-                    .or_else(|| rc.name(table_references).map(String::from));
-                let col_type = match &compound_arms {
-                    Some(arms) => compound_column_affinity(arms, i).to_type(),
-                    None => infer_type_from_expr(&rc.expr, Some(table_references)),
-                };
-                let type_name = col_type.to_string();
-                Column::new(
-                    col_name,
-                    type_name,
-                    None,
-                    None,
-                    col_type,
-                    None,
-                    ColDef::default(),
-                )
-            })
-            .try_collect::<alloc::Vec<_>>()?;
-
-        for (i, column) in columns.iter_mut().enumerate() {
-            if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {
-                column.set_array_dimensions(1);
-            }
-            column.set_collation(get_collseq_from_expr(
-                &result_columns[i].expr,
-                table_references,
-            )?);
-        }
-
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
         // and they may be materialized regardless of explicit keyword usage.
@@ -2467,6 +2594,38 @@ impl JoinedTable {
             identifier,
             internal_id,
             join_info,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: MAIN_DB_ID,
+            indexed: None,
+        })
+    }
+
+    pub fn new_recursive_cte_input(
+        identifier: String,
+        query: &Plan,
+        internal_id: TableInternalId,
+        explicit_columns: Option<&[String]>,
+    ) -> Result<Self> {
+        let mut columns = query_output_columns(query, explicit_columns)?;
+        // The recursive self-reference reads SQLite's queue table, whose
+        // columns have no declared type: comparisons in the recursive term
+        // see the stored value without the anchor query's affinity. Only the
+        // outer read of the CTE keeps the derived affinity.
+        for column in columns.iter_mut() {
+            column.set_base_affinity(Affinity::Blob);
+        }
+        let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
+            name: identifier.clone(),
+            columns,
+        }));
+        Ok(Self {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier,
+            internal_id,
+            join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
@@ -2644,6 +2803,13 @@ impl JoinedTable {
                     })
                     .transpose()?;
                 Ok((None, index_cursor_id))
+            }
+            Table::RecursiveCteInput(input) => {
+                let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+                    CursorKey::table(self.internal_id),
+                    CursorType::Pseudo(PseudoCursorType::new_with_columns(&input.columns)),
+                );
+                Ok((Some(cursor_id), None))
             }
         }
     }
@@ -2864,6 +3030,43 @@ impl SeekDef {
             _t: PhantomData,
         }
     }
+
+    /// Whether the key component at `pos` came from a NULL-matching equality
+    /// (`x IS <expr>`) rather than `x = <expr>`.
+    ///
+    /// A NULL key value means different things for the two: `NULL = NULL` is not
+    /// true, so an `=` seek can skip the loop entirely once its key turns out to
+    /// be NULL, while an `IS` seek must seek with the NULL key because index keys
+    /// compare NULLs as equal. Only equality prefix components can be
+    /// NULL-matching; range bounds never are.
+    ///
+    /// `x IS 5` does not count: a literal 5 is never NULL, so the component
+    /// behaves exactly like `x = 5`.
+    pub fn is_null_matching_key_component(&self, pos: usize) -> bool {
+        self.prefix.get(pos).is_some_and(|component| {
+            component
+                .eq
+                .as_ref()
+                .is_some_and(|(op, expr, _)| *op == ast::Operator::Is && !is_non_null_literal(expr))
+        })
+    }
+}
+
+/// True only for literal values that are never NULL: numbers, strings, blobs,
+/// TRUE and FALSE. Columns and parameters do not count — their runtime value
+/// can be NULL. A column does not count even when declared NOT NULL, because
+/// an outer join can still null-extend it.
+pub fn is_non_null_literal(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Literal(
+            ast::Literal::Numeric(_)
+                | ast::Literal::String(_)
+                | ast::Literal::Blob(_)
+                | ast::Literal::True
+                | ast::Literal::False
+        )
+    )
 }
 
 /// Build the affinity string for a synthesized ephemeral seek index.
@@ -2939,6 +3142,8 @@ pub enum Scan {
         /// subquery order for an extremum fast path.
         iter_dir: IterationDirection,
     },
+    /// The one-row input consumed by the recursive part of a recursive CTE.
+    RecursiveCteInput,
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
@@ -3062,9 +3267,6 @@ impl Window {
 
     /// Build a `Window` from an inline `OVER (...)` AST node
     pub fn new_unnamed(ast: &ast::Window, frame: Frame) -> Result<Self> {
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
-            crate::bail_parse_error!("Custom frame specifications are not supported yet");
-        }
         Ok(Window {
             name: None,
             partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
@@ -3103,10 +3305,13 @@ impl Window {
     /// clause matches AND the coerced frames agree — see SQLite's invariant
     /// at `window.c:1679`.
     pub fn is_equivalent(&self, ast: &ast::Window, frame: &Frame) -> bool {
+        // The effective frames must agree exactly (mode, bounds including
+        // offset expressions, EXCLUDE). Two occurrences of the same OVER
+        // clause then share one Window; a window that is NOT merged here
+        // spawns its own subquery layer, and only the layer that owns a
+        // function's rewrite pass populates `WindowFunction::rewritten` —
+        // a duplicate layer would emit against un-rewritten expressions.
         if &self.frame != frame {
-            return false;
-        }
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
             return false;
         }
 
@@ -3134,38 +3339,108 @@ impl Window {
                     && *nulls_a == col_b.nulls
             })
     }
+}
 
-    pub(crate) fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
-        if let Some(frame_clause) = frame {
-            let FrameClause {
-                mode,
-                start,
-                end,
-                exclude,
-            } = frame_clause;
-            if *mode != FrameMode::Range {
-                return false;
-            }
-            if *start != FrameBound::UnboundedPreceding {
-                return false;
-            }
-            if *end != Some(FrameBound::CurrentRow) {
-                return false;
-            }
-            if let Some(exclude) = exclude {
-                if *exclude != FrameExclude::NoOthers {
-                    return false;
-                }
-            }
+/// Convert a parsed `FRAME` clause into the planner's `Frame`.
+/// Returns `Ok(None)` when the user wrote no FRAME clause, `Ok(Some(frame))`
+/// for an accepted clause, `Err` for shapes SQLite rejects.
+/// Validation rules ported from `sqlite3WindowCreate` (`window.c:1179-1250`)
+/// and the parser-level guard at `window.c:680-684`.
+pub fn validate_frame_clause(
+    clause: &Option<FrameClause>,
+    order_by_len: usize,
+) -> Result<Option<Frame>> {
+    let Some(clause) = clause else {
+        return Ok(None);
+    };
+    let FrameClause {
+        mode,
+        start,
+        end,
+        exclude,
+    } = clause;
+
+    let start_bound = translate_frame_bound(start, /* is_start = */ true)?;
+    let end_bound = match end {
+        Some(b) => translate_frame_bound(b, /* is_start = */ false)?,
+        // No END clause means CURRENT ROW per SQL standard.
+        None => FrameBoundary::CurrentRow,
+    };
+
+    // Combinations that can never describe a real frame (start past
+    // the end, etc.). SQLite rejects the same set at
+    // `window.c:1217-1221`.
+    let illegal = matches!(
+        (&start_bound, &end_bound),
+        (FrameBoundary::UnboundedFollowing, _)
+            | (_, FrameBoundary::UnboundedPreceding)
+            | (FrameBoundary::CurrentRow, FrameBoundary::Preceding(_))
+            | (FrameBoundary::Following(_), FrameBoundary::Preceding(_))
+            | (FrameBoundary::Following(_), FrameBoundary::CurrentRow)
+    );
+    if illegal {
+        crate::bail_parse_error!("unsupported frame specification");
+    }
+
+    // RANGE with an N PRECEDING/FOLLOWING bound does arithmetic on the
+    // ORDER BY value, so it needs exactly one ORDER BY column. SQLite
+    // enforces the same rule at `window.c:680-684`.
+    if *mode == FrameMode::Range
+        && (matches!(
+            &start_bound,
+            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+        ) || matches!(
+            &end_bound,
+            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+        ))
+        && order_by_len != 1
+    {
+        crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"
+        );
+    }
+
+    Ok(Some(Frame {
+        mode: *mode,
+        start: start_bound,
+        end: end_bound,
+        exclude: exclude.clone(),
+    }))
+}
+
+/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`,
+/// cloning any offset expression out of the AST for the emit code to
+/// evaluate.
+fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoundary> {
+    // The parser enforces start/end orientation: TK_PRECEDING is only
+    // emitted as a start bound, TK_FOLLOWING only as an end bound
+    // (parser.rs: `frame_start_bound` / `frame_end_bound`). Mirrors
+    // SQLite's parser-level guarantee at window.c:1213-1215.
+    match bound {
+        FrameBound::CurrentRow => Ok(FrameBoundary::CurrentRow),
+        FrameBound::UnboundedPreceding => {
+            debug_assert!(
+                is_start,
+                "parser only emits UNBOUNDED PRECEDING as a start bound"
+            );
+            Ok(FrameBoundary::UnboundedPreceding)
         }
-        true
+        FrameBound::UnboundedFollowing => {
+            debug_assert!(
+                !is_start,
+                "parser only emits UNBOUNDED FOLLOWING as an end bound"
+            );
+            Ok(FrameBoundary::UnboundedFollowing)
+        }
+        FrameBound::Preceding(expr) => Ok(FrameBoundary::Preceding(expr.clone())),
+        FrameBound::Following(expr) => Ok(FrameBoundary::Following(expr.clone())),
     }
 }
 
-/// A named WINDOW clause definition, captured before any function
-/// references it. The frame is intentionally absent: it belongs to the
-/// resolved `Window` instance the planner spawns when a function
-/// attaches (the function's coerced frame decides).
+/// A named WINDOW clause definition, captured before any function references
+/// it. The effective frame belongs to the resolved `Window` instance the
+/// planner spawns when a function attaches. Whether the user wrote a frame is
+/// retained because SQLite forbids chaining from a framed base window.
 ///
 /// `bound` holds the already-bound `partition_by` / `order_by`. The
 /// first `resolve_window` that needs them *takes* them by moving;
@@ -3176,6 +3451,14 @@ impl Window {
 #[derive(Debug, Clone)]
 pub struct NamedWindowDef {
     pub name: String,
+    /// User-written FRAME clause preserved so a function attaching by
+    /// `Over::Name` can compute its effective frame from it.
+    pub user_frame_clause: Option<FrameClause>,
+    /// The bound PARTITION BY / ORDER BY expressions. The first function
+    /// to attach takes them (leaving `None`); any later function under a
+    /// different coerced frame copies them back from a resolved `Window`.
+    /// They live here, rather than inside the frame, so taking them
+    /// doesn't disturb `user_frame_clause`.
     pub bound: Option<NamedWindowBound>,
 }
 
@@ -3205,6 +3488,15 @@ pub struct Frame {
     pub mode: ast::FrameMode,
     pub start: FrameBoundary,
     pub end: FrameBoundary,
+    /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
+    ///
+    /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
+    /// nothing, so it returns the same rows as `None`. We keep the two
+    /// apart anyway: like SQLite, any EXCLUDE clause — even NO OTHERS —
+    /// switches the window to the slower path that recomputes each
+    /// function over the whole frame per output row. Only `None` gets the
+    /// fast streaming path.
+    pub exclude: Option<ast::FrameExclude>,
 }
 
 impl Default for Frame {
@@ -3213,6 +3505,7 @@ impl Default for Frame {
             mode: ast::FrameMode::Range,
             start: FrameBoundary::UnboundedPreceding,
             end: FrameBoundary::CurrentRow,
+            exclude: None,
         }
     }
 }
@@ -3326,6 +3619,8 @@ impl SubqueryPosition {
 /// Currently only subqueries in the WHERE clause are supported.
 pub struct NonFromClauseSubquery {
     pub internal_id: TableInternalId,
+    /// An earlier scalar subquery with the same text in the same clause.
+    pub same_query: Option<TableInternalId>,
     pub query_type: SubqueryType,
     pub state: SubqueryState,
     pub correlated: bool,
@@ -3425,6 +3720,13 @@ fn eval_at_for_plan(
             )?);
             Ok(eval_at)
         }
+        Plan::RecursiveCte(recursive_cte) => {
+            let initial_query =
+                eval_at_for_plan(&recursive_cte.initial_query, join_order, table_references)?;
+            let recursive_query =
+                eval_at_for_plan(&recursive_cte.recursive_query, join_order, table_references)?;
+            Ok(initial_query.max(recursive_query))
+        }
         Plan::Delete(_) | Plan::Update(_) => Ok(EvalAt::BeforeLoop),
     }
 }
@@ -3436,6 +3738,10 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
         Plan::CompoundSelect {
             left, right_most, ..
         } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
+        Plan::RecursiveCte(recursive_cte) => {
+            plan_is_correlated(&recursive_cte.initial_query)
+                || plan_is_correlated(&recursive_cte.recursive_query)
+        }
         Plan::Delete(_) | Plan::Update(_) => false,
     }
 }
@@ -3510,6 +3816,15 @@ fn plan_has_outer_scope_dependency_with_tables(
                 )
             }) || select_plan_has_outer_scope_dependency_with_tables(
                 right_most,
+                accessible_table_ids,
+            )
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            plan_has_outer_scope_dependency_with_tables(
+                &recursive_cte.initial_query,
+                accessible_table_ids,
+            ) || plan_has_outer_scope_dependency_with_tables(
+                &recursive_cte.recursive_query,
                 accessible_table_ids,
             )
         }

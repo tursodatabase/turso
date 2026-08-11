@@ -100,6 +100,9 @@ cargo run --release -p memory-benchmark -- --mode mvcc --workload mixed -i 100 -
 # Run a final checkpoint after the workload
 cargo run --release -p memory-benchmark -- --mode wal --workload read-heavy --checkpoint
 
+# Exercise recursive queues at a 10k-row target cardinality
+cargo run --release -p memory-benchmark -- --mode wal --workload recursive-cte -i 20 -b 10000
+
 # Guarantee automatic MVCC checkpoints during the run by lowering the
 # logical-log threshold (default is ~4 MB, more than small workloads write)
 cargo run --release -p memory-benchmark -- --mode mvcc --workload insert-heavy --mvcc-checkpoint-threshold 16384
@@ -107,7 +110,7 @@ cargo run --release -p memory-benchmark -- --mode mvcc --workload insert-heavy -
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
-  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob|update-churn \
+  --workload insert-heavy|read-heavy|mixed|scan-heavy|recursive-cte|series-blob|update-churn \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
@@ -135,6 +138,7 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `read-heavy` | 90% SELECT by id / 10% INSERT | Seeds 10k rows |
 | `mixed` | 50% SELECT / 50% INSERT | Seeds 10k rows |
 | `scan-heavy` | Full table scans with LIKE | Seeds 10k rows |
+| `recursive-cte` | Repeated linear, priority-queue, UNION-distinct, and outer-LIMIT recursive CTE queries | No schema setup; `batch-size` is the target recursive result cardinality |
 | `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
 | `update-churn` | Repeated UPDATEs to a fixed 10k-row set (key space partitioned per connection to avoid write-write conflicts) | Seeds 10k rows. Generates superseded versions — the MVCC GC accumulation case. |
 

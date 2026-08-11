@@ -2,6 +2,7 @@ pub mod checkpoint;
 pub mod insert;
 pub mod mixed;
 pub mod read;
+pub mod recursive_cte;
 pub mod scan;
 pub mod series_blob;
 pub mod update_churn;

@@ -526,6 +526,11 @@ impl WindowFunc {
                 | Self::FirstValue
                 | Self::LastValue
                 | Self::NthValue
+                | Self::Lag
+                | Self::Lead
+                | Self::Ntile
+                | Self::PercentRank
+                | Self::CumeDist
         )
     }
 
@@ -539,20 +544,28 @@ impl WindowFunc {
         use crate::translate::plan::{Frame, FrameBoundary};
         use turso_parser::ast::{Expr, FrameMode, Literal};
         match self {
+            // Lag shares row_number's streaming frame even though its lookup
+            // can point forward (negative offset): SQLite emits a row as soon
+            // as the row after it is buffered, so a forward lookup past that
+            // one row misses and yields the default — behavior we match by
+            // using the same frame rather than caching the whole partition.
             Self::RowNumber | Self::Lag => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::CurrentRow,
+                exclude: None,
             }),
             Self::Rank | Self::DenseRank => Some(Frame {
                 mode: FrameMode::Range,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::CurrentRow,
+                exclude: None,
             }),
             Self::PercentRank => Some(Frame {
                 mode: FrameMode::Groups,
                 start: FrameBoundary::CurrentRow,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::CumeDist => Some(Frame {
                 mode: FrameMode::Groups,
@@ -560,43 +573,25 @@ impl WindowFunc {
                     "1".to_string(),
                 )))),
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::Ntile => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::CurrentRow,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::Lead => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::FirstValue | Self::LastValue | Self::NthValue => None,
             Self::External(_) => unreachable!(
                 "WindowFunc::External is not constructible: ExtFunc has no Window variant"
             ),
         }
-    }
-
-    /// Returns true when the function waits for a row to be returned before
-    /// calculating that row's answer. Other functions build their answer as
-    /// input rows are read.
-    pub fn calculates_answer_when_row_is_returned(&self) -> bool {
-        matches!(
-            self,
-            Self::RowNumber
-                | Self::Ntile
-                | Self::Lag
-                | Self::Lead
-                | Self::NthValue
-                | Self::External(_)
-        )
-    }
-
-    /// Returns true when rows must remain saved after they have been returned
-    /// because a later result may need to read them again.
-    pub(crate) fn needs_rows_after_returning_them(&self) -> bool {
-        matches!(self, Self::NthValue)
     }
 }
 

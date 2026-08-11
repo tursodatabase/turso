@@ -236,6 +236,9 @@ impl OpenLoop {
                                 }
                             }
                         }
+                        (Scan::RecursiveCteInput, Table::RecursiveCteInput(_)) => {
+                            program.preassign_label_to_next_insn(loop_start);
+                        }
                         _ => unreachable!(
                             "{:?} scan cannot be used with {:?} table",
                             scan, table.table
@@ -394,17 +397,9 @@ impl OpenLoop {
                                             None,
                                         );
                                     }
-                                    MaterializedFromClauseSubqueryStorage::DirectIndex => {
-                                        let index = index.as_ref().expect(
-                                            "direct-index materialized subquery requires index",
-                                        );
-                                        emit_materialized_subquery_result_columns(
-                                            program,
-                                            from_clause_subquery,
-                                            index_cursor_id,
-                                            Some(index.as_ref()),
-                                        );
-                                    }
+                                    // Expressions read direct index columns when they need them.
+                                    // Copying all columns here would only write unused registers.
+                                    MaterializedFromClauseSubqueryStorage::DirectIndex => {}
                                 }
                             } else {
                                 // Only emit DeferredSeek for non-subquery tables
@@ -474,6 +469,7 @@ impl OpenLoop {
                                     target_pc: next_val_label,
                                     is_index: true,
                                     eq_only: false,
+                                    null_matching_mask: Default::default(),
                                 });
                                 program.preassign_label_to_next_insn(loop_start);
                                 program.emit_insn(Insn::IdxGT {

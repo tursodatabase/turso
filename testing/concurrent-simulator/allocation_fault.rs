@@ -241,6 +241,7 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             ValueBlobAllocationSite::CloneFrom => 29,
             ValueBlobAllocationSite::RecordBuild => 30,
             ValueBlobAllocationSite::RecordCopy => 31,
+            ValueBlobAllocationSite::AggAccumulate => 32,
         },
         AllocationSite::Vector(site) => match site {
             VectorAllocationSite::Parse => 15,
@@ -341,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn btree_overflow_read_site_is_fault_injectable() {
+    fn btree_allocation_sites_are_fault_injectable() {
         static INJECTOR: SimulatorAllocationFaultInjector = SimulatorAllocationFaultInjector {
             enabled: AtomicBool::new(true),
             seed: AtomicU64::new(13),
@@ -354,11 +355,23 @@ mod tests {
             fiber_idx: 8,
             execution_id: 9,
         });
-        let _site = turso_core::alloc::enter_allocation_site(BTreeAllocationSite::OverflowRead);
         let layout = Layout::from_size_align(16, 8).unwrap();
+        let sites = [
+            BTreeAllocationSite::CellPayload,
+            BTreeAllocationSite::OverflowRead,
+            BTreeAllocationSite::Balance,
+            BTreeAllocationSite::BlobRecordHeader,
+            BTreeAllocationSite::IntegrityCheck,
+            BTreeAllocationSite::OverflowCell,
+            BTreeAllocationSite::RecordPayload,
+            BTreeAllocationSite::SavedCursorRecord,
+        ];
 
-        assert!(INJECTOR.allocate(layout).is_err());
-        assert_eq!(INJECTOR.injected_faults(), 1);
+        for (index, site) in sites.into_iter().enumerate() {
+            let _site = turso_core::alloc::enter_allocation_site(site);
+            assert!(INJECTOR.allocate(layout).is_err(), "site {site:?}");
+            assert_eq!(INJECTOR.injected_faults(), index as u64 + 1);
+        }
     }
 
     #[test]

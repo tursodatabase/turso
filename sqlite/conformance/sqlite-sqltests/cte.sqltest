@@ -1463,3 +1463,46 @@ expect {
     1
     2
 }
+
+# An unqualified column in a correlated subquery resolves against a CTE joined
+# in the outer FROM clause, same as a plain table.
+test cte-unqualified-correlated-ref-in-exists {
+    WITH c(x) AS (SELECT 1)
+    SELECT * FROM c WHERE EXISTS (SELECT 1 WHERE x > 0);
+}
+expect {
+    1
+}
+
+# A sibling CTE's columns are not visible in another CTE's body unless the
+# body's FROM clause adds the table.
+test cte-sibling-columns-not-visible-without-from {
+    WITH a(y) AS (SELECT 1), b AS (SELECT y) SELECT * FROM b;
+}
+expect error {
+    no such column: y
+}
+
+test cte-sibling-columns-not-visible-in-subquery-without-from {
+    WITH a(y) AS (SELECT 1), b AS (SELECT (SELECT y)) SELECT * FROM b;
+}
+expect error {
+    no such column: y
+}
+
+# A CTE is not a table-valued function; calling it with arguments is an error.
+test cte-referenced-with-call-arguments-rejected {
+    WITH cte1(x) AS (VALUES(1)) SELECT * FROM cte1(7);
+}
+expect error {
+    'cte1' is not a function
+}
+
+# Neither is a regular table.
+test table-referenced-with-call-arguments-rejected {
+    CREATE TABLE not_a_function(a);
+    SELECT * FROM not_a_function(5);
+}
+expect error {
+    'not_a_function' is not a function
+}

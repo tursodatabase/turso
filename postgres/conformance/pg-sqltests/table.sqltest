@@ -94,3 +94,76 @@ expect {
     eng|bob
     ops|carol
 }
+
+# ---------------------------------------------------------------------------
+# CREATE TABLE AS / SELECT INTO
+# ---------------------------------------------------------------------------
+
+@setup users
+test table-create-table-as {
+    CREATE TABLE adults AS SELECT id, name FROM users WHERE age >= 30;
+    SELECT id, name FROM adults ORDER BY id;
+}
+expect {
+    1|alice
+    3|carol
+}
+
+test table-create-table-as-snapshot-not-view {
+    CREATE TABLE src (id int);
+    INSERT INTO src VALUES (1), (2);
+    CREATE TABLE snap AS SELECT * FROM src;
+    INSERT INTO src VALUES (3);
+    SELECT count(*) FROM snap;
+}
+expect {
+    2
+}
+
+test table-create-table-as-with-no-data {
+    CREATE TABLE src (id int, name text);
+    INSERT INTO src VALUES (1, 'alice'), (2, 'bob');
+    CREATE TABLE dst AS SELECT * FROM src WITH NO DATA;
+    SELECT count(*) FROM dst;
+    INSERT INTO dst VALUES (7, 'new');
+    SELECT id, name FROM dst;
+}
+expect {
+    0
+    7|new
+}
+
+test table-create-table-as-compound {
+    CREATE TABLE dst AS SELECT 1 AS x UNION SELECT 2;
+    SELECT x FROM dst ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+test table-create-table-as-if-not-exists {
+    CREATE TABLE src (id int);
+    INSERT INTO src VALUES (1);
+    CREATE TABLE dst AS SELECT * FROM src;
+    CREATE TABLE IF NOT EXISTS dst AS SELECT * FROM src;
+    SELECT count(*) FROM dst;
+}
+expect {
+    1
+}
+
+test table-select-into {
+    CREATE TABLE src (id int, name text);
+    INSERT INTO src VALUES (1, 'alice'), (2, 'bob');
+    SELECT id, name INTO dst FROM src WHERE id = 2;
+    SELECT name FROM dst;
+}
+expect {
+    bob
+}
+
+test table-select-into-nested-rejected {
+    SELECT * FROM (SELECT 1 INTO dst) sub;
+}
+expect error {}

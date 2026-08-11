@@ -82,7 +82,9 @@ fn has_index_search_on_table(eqp_rows: &[Vec<rusqlite::types::Value>], table_nam
     for row in eqp_rows {
         assert!(row.len() >= 4);
         if let rusqlite::types::Value::Text(detail) = &row[3] {
-            if detail.contains(&format!("SEARCH {table_name} USING INDEX")) {
+            if detail.contains(&format!("SEARCH {table_name} USING INDEX"))
+                || detail.contains(&format!("SEARCH {table_name} USING COVERING INDEX"))
+            {
                 return true;
             }
         }
@@ -222,7 +224,9 @@ fn test_chain_join_fuzz() {
                     let Value::Text(detail) = &row[3] else {
                         panic!("Expected TEXT value for detail in EXPLAIN QUERY PLAN");
                     };
-                    detail.contains("SEARCH") && detail.contains("USING INDEX")
+                    detail.contains("SEARCH")
+                        && (detail.contains("USING INDEX")
+                            || detail.contains("USING COVERING INDEX"))
                 })
                 .count();
             assert_eq!(

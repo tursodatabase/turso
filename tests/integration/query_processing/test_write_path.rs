@@ -1153,9 +1153,10 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
 #[test]
 fn test_unique_complex_key() {
     let _ = env_logger::try_init();
-    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.db");
     {
-        let connection = rusqlite::Connection::open(db_path.path()).unwrap();
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
         connection
             .execute("CREATE TABLE t(a, b, c, UNIQUE (b, a));", ())
             .unwrap();
@@ -1164,7 +1165,7 @@ fn test_unique_complex_key() {
             .unwrap();
     }
 
-    let tmp_db = TempDatabase::builder().with_db_path(db_path.path()).build();
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
     let conn = tmp_db.connect_limbo();
 
     let rows: Vec<(String, String, String)> = conn.exec_rows("SELECT * FROM t");
@@ -1378,8 +1379,8 @@ pub fn test_savepoint_rollback_uses_current_wal_snapshot(
 #[test]
 pub fn test_reopen_database_wal_restart() {
     let _ = env_logger::try_init();
-    let db_path = tempfile::NamedTempFile::new().unwrap();
-    let (_file, db_path) = db_path.keep().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.db");
     tracing::info!("path: {:?}", db_path);
     {
         let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
@@ -1422,8 +1423,8 @@ pub fn test_reopen_database_wal_restart() {
 /// Here, we simulate BusySnapshot condition when during IO in between of begin_read_tx and begin_write_tx, another connection commited some change
 pub fn test_busy_snapshot_immediate() {
     let _ = env_logger::try_init();
-    let db_path = tempfile::NamedTempFile::new().unwrap();
-    let (_file, db_path) = db_path.keep().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.db");
     tracing::info!("path: {:?}", db_path);
     let tmp_db = TempDatabase::builder()
         .with_db_path(&db_path)
@@ -1475,8 +1476,8 @@ pub fn test_busy_snapshot_immediate() {
 /// Here, we simulate BusySnapshot condition when transaction upgraded in the middle, but since its started another connection commited changes
 pub fn test_busy_snapshot_txn_upgrade() {
     let _ = env_logger::try_init();
-    let db_path = tempfile::NamedTempFile::new().unwrap();
-    let (_file, db_path) = db_path.keep().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.db");
     tracing::info!("path: {:?}", db_path);
     let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
     let conn1 = tmp_db.connect_limbo();
@@ -1512,8 +1513,8 @@ pub fn test_busy_snapshot_txn_upgrade() {
 /// The tricky part is that auto-checkpoint happens in between which can result in reuse of a page if checkpoint epoch do not properly incremented during auto-checkpoint
 pub fn test_auto_checkpoint_restart() {
     let _ = env_logger::try_init();
-    let db_path = tempfile::NamedTempFile::new().unwrap();
-    let (_file, db_path) = db_path.keep().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.db");
     tracing::info!("path: {:?}", db_path);
     let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
     let conn1 = tmp_db.connect_limbo();
@@ -1560,8 +1561,8 @@ pub fn test_wal_truncate_checkpoint() {
             break;
         }
         let _ = env_logger::try_init();
-        let db_path = tempfile::NamedTempFile::new().unwrap();
-        let (_file, db_path) = db_path.keep().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
         tracing::info!("path: {:?}", db_path);
         let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
         let conn1 = tmp_db.connect_limbo();
@@ -1612,8 +1613,8 @@ pub fn test_empty_wal_truncate_checkpoint() {
             break;
         }
         let _ = env_logger::try_init();
-        let db_path = tempfile::NamedTempFile::new().unwrap();
-        let (_file, db_path) = db_path.keep().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
         tracing::info!("path: {:?}", db_path);
         let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
         let conn1 = tmp_db.connect_limbo();
@@ -1656,8 +1657,8 @@ pub fn test_empty_wal_truncate_checkpoint() {
 #[test]
 pub fn test_mvcc_reader_stale_snapshot_after_schema_updated_returns_ok() {
     let _ = env_logger::try_init();
-    let db_path = tempfile::NamedTempFile::new().unwrap();
-    let (_file, db_path) = db_path.keep().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.db");
     tracing::info!("path: {:?}", db_path);
     let tmp_db = TempDatabase::builder()
         .with_db_path(&db_path)
@@ -1703,8 +1704,8 @@ pub fn test_mvcc_reader_stale_snapshot_after_schema_updated_returns_ok() {
 #[test]
 pub fn test_mvcc_writer_stale_snapshot_after_schema_updated() {
     let _ = env_logger::try_init();
-    let db_path = tempfile::NamedTempFile::new().unwrap();
-    let (_file, db_path) = db_path.keep().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.db");
     tracing::info!("path: {:?}", db_path);
     let tmp_db = TempDatabase::builder()
         .with_db_path(&db_path)
@@ -1866,8 +1867,8 @@ fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> a
 #[test]
 pub fn test_mvcc_update_set_self_does_not_delete_rows() {
     let _ = env_logger::try_init();
-    let db_path = tempfile::NamedTempFile::new().unwrap();
-    let (_file, db_path) = db_path.keep().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.db");
     let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
     let conn = tmp_db.connect_limbo();
 

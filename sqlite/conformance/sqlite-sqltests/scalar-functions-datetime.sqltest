@@ -2454,3 +2454,107 @@ test strftime-format-bool-false {
 expect {
     0
 }
+
+# The 'unixepoch' modifier must reject seconds values whose julian-day
+# milliseconds fall outside [0, 9999-12-31 23:59:59.999]. The 'localtime' and
+# 'utc' modifiers run before the final range check and subtract the epoch
+# constant from the julian day, so an unvalidated value overflowed there.
+
+test unixepoch-out-of-range-localtime {
+    SELECT datetime(-9e18, 'unixepoch', 'localtime');
+}
+expect {
+}
+
+test unixepoch-out-of-range-utc {
+    SELECT datetime(-9e18, 'unixepoch', 'utc');
+}
+expect {
+}
+
+test unixepoch-out-of-range-integer-utc {
+    SELECT datetime(-9223372036854775, 'unixepoch', 'utc');
+}
+expect {
+}
+
+test unixepoch-min-integer-utc {
+    SELECT datetime(-9223372036854775808, 'unixepoch', 'utc');
+}
+expect {
+}
+
+test unixepoch-out-of-range-positive-utc {
+    SELECT datetime(9e18, 'unixepoch', 'utc');
+}
+expect {
+}
+
+test unixepoch-out-of-range-text-utc {
+    SELECT datetime('-9e18', 'unixepoch', 'utc');
+}
+expect {
+}
+
+test unixepoch-out-of-range-strftime-utc {
+    SELECT strftime('%Y', -9e18, 'unixepoch', 'utc');
+}
+expect {
+}
+
+test unixepoch-out-of-range-julianday-utc {
+    SELECT julianday(-9e18, 'unixepoch', 'utc');
+}
+expect {
+}
+
+test unixepoch-min-integer-time-localtime {
+    SELECT time(-9223372036854775808, 'unixepoch', 'localtime');
+}
+expect {
+}
+
+test unixepoch-out-of-range-no-tz-modifier {
+    SELECT datetime(-9e18, 'unixepoch');
+}
+expect {
+}
+
+# Reached from a table column too, so constant folding is not what saves this.
+test unixepoch-out-of-range-from-column {
+    WITH unixepoch_range(x) AS (VALUES (-9223372036854776), (-9e18), (9e18))
+    SELECT datetime(x, 'unixepoch', 'utc') IS NULL FROM unixepoch_range;
+}
+expect {
+    1
+    1
+    1
+}
+
+# The accepted range is unchanged at its edges: these are the last and first
+# representable seconds values, one step outside is NULL.
+test unixepoch-upper-boundary {
+    SELECT datetime(253402300799, 'unixepoch');
+}
+expect {
+    9999-12-31 23:59:59
+}
+
+test unixepoch-just-past-upper-boundary {
+    SELECT datetime(253402300800, 'unixepoch');
+}
+expect {
+}
+
+test unixepoch-lower-boundary {
+    SELECT datetime(-210866760000, 'unixepoch');
+}
+expect {
+    -4713-11-24 12:00:00
+}
+
+test unixepoch-just-past-lower-boundary {
+    SELECT datetime(-210866760001, 'unixepoch');
+}
+expect {
+}

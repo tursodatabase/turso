@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -259,35 +260,22 @@ def test_table_patterns():
     shell.quit()
 
 
-def test_update_with_limit():
+def test_update_delete_reject_limit():
+    # Default SQLite builds (without SQLITE_ENABLE_UPDATE_DELETE_LIMIT) reject
+    # LIMIT and ORDER BY on UPDATE and DELETE, and so does Turso.
     turso = TestTursoShell(
         "CREATE TABLE t (a,b,c); insert into t values (1,2,3), (4,5,6), (7,8,9), (1,2,3),(4,5,6), (7,8,9);"
     )
-    turso.run_test("update-limit", "UPDATE t SET a = 10 LIMIT 1;", "")
-    turso.run_test("update-limit-result", "SELECT COUNT(*) from t WHERE a = 10;", "1")
-    turso.run_test("update-limit-zero", "UPDATE t SET a = 100 LIMIT 0;", "")
-    turso.run_test("update-limit-zero-result", "SELECT COUNT(*) from t WHERE a = 100;", "0")
-    turso.run_test("update-limit-all", "UPDATE t SET a = 100 LIMIT -1;", "")
-    # negative limit is treated as no limit in sqlite due to check for --val = 0
-    turso.run_test("update-limit-result", "SELECT COUNT(*) from t WHERE a = 100;", "6")
-    turso.run_test("udpate-limit-where", "UPDATE t SET a = 333 WHERE b = 5 LIMIT 1;", "")
-    turso.run_test("update-limit-where-result", "SELECT COUNT(*) from t WHERE a = 333;", "1")
-    turso.quit()
-
-
-def test_update_with_limit_and_offset():
-    turso = TestTursoShell(
-        "CREATE TABLE t (a,b,c); insert into t values (1,2,3), (4,5,6), (7,8,9), (1,2,3),(4,5,6), (7,8,9);"
-    )
-    turso.run_test("update-limit-offset", "UPDATE t SET a = 10 LIMIT 1 OFFSET 3;", "")
-    turso.run_test("update-limit-offset-result", "SELECT COUNT(*) from t WHERE a = 10;", "1")
-    turso.run_test("update-limit-result", "SELECT a from t LIMIT 4;", "1\n4\n7\n10")
-    turso.run_test("update-limit-offset-zero", "UPDATE t SET a = 100 LIMIT 0 OFFSET 0;", "")
-    turso.run_test("update-limit-zero-result", "SELECT COUNT(*) from t WHERE a = 100;", "0")
-    turso.run_test("update-limit-all", "UPDATE t SET a = 100 LIMIT -1 OFFSET 1;", "")
-    turso.run_test("update-limit-result", "SELECT COUNT(*) from t WHERE a = 100;", "5")
-    turso.run_test("udpate-limit-where", "UPDATE t SET a = 333 WHERE b = 5 LIMIT 1 OFFSET 2;", "")
-    turso.run_test("update-limit-where-result", "SELECT COUNT(*) from t WHERE a = 333;", "0")
+    for name, sql in [
+        ("update-limit", "UPDATE t SET a = 10 LIMIT 1;"),
+        ("update-limit-offset", "UPDATE t SET a = 10 LIMIT 1 OFFSET 3;"),
+        ("update-order-by-limit", "UPDATE t SET a = 10 ORDER BY a LIMIT 1;"),
+        ("delete-limit", "DELETE FROM t LIMIT 1;"),
+        ("delete-limit-offset", "DELETE FROM t LIMIT 1 OFFSET 3;"),
+        ("delete-order-by-limit", "DELETE FROM t ORDER BY a LIMIT 1;"),
+    ]:
+        turso.run_test_fn(sql, lambda res: "syntax error" in res, name)
+    turso.run_test("update-delete-limit-no-rows-changed", "SELECT COUNT(*) from t;", "6")
     turso.quit()
 
 
@@ -478,6 +466,43 @@ def test_read_command():
     shell.quit()
 
 
+def test_blob_bytes_are_printed_raw_in_list_mode():
+    # Regression test for https://github.com/tursodatabase/turso/issues/4247.
+    # sqlite3 writes blob bytes to stdout unchanged in list mode, even when
+    # they are not valid UTF-8. tursodb used to replace every invalid byte
+    # with U+FFFD (EF BF BD), which mangled blob output.
+    #
+    # The TursoShell pipe harness decodes output as UTF-8, so it cannot check
+    # raw bytes. Run the shell directly and capture stdout as bytes instead.
+    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+
+    console.test("Running test: blob-with-invalid-utf8-prints-raw-bytes")
+    result = subprocess.run(
+        [exec_name, ":memory:", "SELECT X'900A6280';"],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"\x90\x0a\x62\x80\x0a", (
+        f"blob bytes must be written raw, not replaced with U+FFFD; got {result.stdout.hex()}"
+    )
+
+    # Mix printable ASCII with invalid UTF-8 bytes, taken from the
+    # trigger-inserted row in the issue's repro script. Blobs with ASCII
+    # control bytes are left out on purpose: sqlite3 escapes those as ^X in
+    # list mode, which is a separate behavior.
+    console.test("Running test: mixed-ascii-and-invalid-utf8-blob-prints-raw-bytes")
+    result = subprocess.run(
+        [exec_name, ":memory:", "SELECT X'B66552C3', X'64AC767B';"],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"\xb6\x65\x52\xc3|\x64\xac\x76\x7b\x0a", (
+        f"blob bytes must be written raw, not replaced with U+FFFD; got {result.stdout.hex()}"
+    )
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_read_command()
@@ -497,14 +522,14 @@ def main():
     test_import_csv_skip()
     test_import_csv_create_table_from_header()
     test_table_patterns()
-    test_update_with_limit()
-    test_update_with_limit_and_offset()
+    test_update_delete_reject_limit()
     test_uri_readonly()
     test_copy_db_file()
     test_copy_memory_db_to_file()
     test_parse_error()
     test_tables_with_attached_db()
     test_dbtotxt()
+    test_blob_bytes_are_printed_raw_in_list_mode()
     console.info("All tests have passed")
 
 

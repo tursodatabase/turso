@@ -349,10 +349,7 @@ pub fn translate_condition_expr(
         // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE in conditions
         // Delegate to translate_expr which handles these correctly with IsTrue instruction
         ast::Expr::Binary(_, ast::Operator::Is | ast::Operator::IsNot, e2)
-            if matches!(
-                e2.as_ref(),
-                ast::Expr::Literal(ast::Literal::True) | ast::Expr::Literal(ast::Literal::False)
-            ) =>
+            if truth_test_rhs(e2).is_some() =>
         {
             let reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;

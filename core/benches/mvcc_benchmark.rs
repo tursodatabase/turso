@@ -357,7 +357,7 @@ impl HugeMultiWriteHarness {
 fn run_to_completion(db: &Arc<Database>, stmt: &mut Statement) {
     loop {
         match stmt.step().unwrap() {
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step().unwrap();
             }
             // Drain the RETURNING rows.

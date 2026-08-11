@@ -180,6 +180,12 @@ pub enum StepResult {
     /// still drive the event loop (`io.step()`) between steps so progress that depends on
     /// other threads' I/O is not starved.
     Yield,
+    /// The statement asks the caller to wait for `duration` before stepping again,
+    /// e.g. because a busy handler decided to retry after a delay. Callers that don't
+    /// track time may treat this exactly like `IO`: drive the event loop and step again.
+    Sleep {
+        duration: std::time::Duration,
+    },
 }
 
 #[derive(Debug)]
@@ -1081,9 +1087,6 @@ impl ProgramState {
         if is_already_committing {
             return true;
         }
-        if self.auto_txn_cleanup != TxnCleanup::RollbackTxn {
-            return false;
-        }
         let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
         turso_assert!(
             active_writers <= 1,
@@ -1098,16 +1101,45 @@ impl ProgramState {
         if connection.mv_store().is_some() {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
-            return connection.n_active_root_statements.load(Ordering::SeqCst) == 1
+            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && connection.n_active_root_statements.load(Ordering::SeqCst) == 1
                 && (self.is_active_write || active_writers == 0);
         }
-        if self.is_active_write {
-            // Pager/WAL writers can finish while sibling readers remain active.
-            // The readers keep their cursors and release them when they finish.
+        if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
+            // Pager/WAL writers can finish while sibling readers remain
+            // active, like SQLite commits when the halting statement is the
+            // only writer (the nVdbeWrite check in sqlite3VdbeHalt). The
+            // readers keep their cursors and release them when they finish.
             return true;
         }
-        // Pager/WAL readers do not wait for sibling readers.
-        active_writers == 0
+        // Non-main pagers keep their transaction state on the pager itself,
+        // like SQLite keeps it on the Btree handle (Btree.inTrans), and the
+        // transaction is shared by every statement on the connection.
+        let attached_txn_open = || {
+            connection.with_all_attached_pagers_with_index(|pagers| {
+                pagers
+                    .iter()
+                    .any(|(_, pager)| pager.holds_read_lock() || pager.holds_write_lock())
+            })
+        };
+        if connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+            // Readers can finish while sibling readers remain active, but a
+            // shared attached transaction may only be finished by the last
+            // active statement, like SQLite's btreeEndTransaction keeps the
+            // transaction open while db->nVdbeRead > 1.
+            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && active_writers == 0
+                && !attached_txn_open();
+        }
+        // This is the last active statement: finish its own transaction, or
+        // an attached transaction a deferring sibling left behind — SQLite's
+        // vdbeCommit visits every database on halt, so leftovers are closed
+        // even by a statement that never started a transaction itself.
+        if active_writers != 0 {
+            return false;
+        }
+        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || (connection.get_auto_commit() && attached_txn_open())
     }
 
     #[inline]
@@ -1832,6 +1864,7 @@ impl Program {
                                 "Abort also failed during checkpoint error handling: {abort_err}"
                             );
                         }
+                        pager.cleanup_after_checkpoint_failure();
                         return Err(checkpoint_err);
                     }
                     let err = err.into();
@@ -2076,6 +2109,16 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
     ) -> Result<IOResult<()>> {
+        if !rollback {
+            turso_assert!(
+                !matches!(
+                    program_state.sequence_inner_tx_pending.as_ref(),
+                    Some(pending) if pending.saved_outer.is_some()
+                ),
+                "cannot commit while a sequence inner tx has a saved outer user tx"
+            );
+        }
+
         // Apply view deltas with I/O handling
         match self.apply_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2157,9 +2200,18 @@ impl Program {
             tx_state,
         );
         if matches!(program_state.commit_state, CommitState::Committing) {
-            let TransactionState::Write { .. } = tx_state else {
-                unreachable!("invalid state for write commit step")
-            };
+            // Normally a resumed commit still has an open write transaction.
+            // The exception is the post-commit auto-checkpoint: commit_tx has
+            // already committed the WAL, released the locks and cleared the
+            // transaction state, and only the checkpoint is still in flight,
+            // so the state is None.
+            turso_assert!(
+                matches!(
+                    tx_state,
+                    TransactionState::Write { .. } | TransactionState::None
+                ),
+                "invalid state for write commit step: {tx_state:?}"
+            );
             self.step_end_write_txn(&pager, &connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
@@ -2719,6 +2771,13 @@ impl Program {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.
+                    if let Err(err) = self.rollback_pending_sequence_outer_tx(state) {
+                        capture_abort_error(
+                            &mut abort_error,
+                            err,
+                            "Failed to rollback saved outer transaction after sequence conflict",
+                        );
+                    }
                     self.rollback_current_txn(pager);
                     self.connection.set_changes(0);
                 }
@@ -2877,6 +2936,45 @@ impl Program {
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
         self.connection.rollback_current_txn_state(pager, true);
+        self.connection.set_cdc_transaction_id(-1);
+    }
+
+    /// MVCC sequence operations run in a separate inner tx, which temporarily
+    /// replaces the connection's `mv_tx` slot. If a transaction-level conflict
+    /// happens while that swap is active, the user transaction lives only in
+    /// `saved_outer`, not in `connection.mv_tx`. Roll it back here and clear
+    /// `saved_outer` so later statement cleanup cannot restore a transaction
+    /// that has already been aborted.
+    fn rollback_pending_sequence_outer_tx(&self, state: &mut ProgramState) -> Result<()> {
+        let Some(pending) = state.sequence_inner_tx_pending.as_mut() else {
+            return Ok(());
+        };
+        let db = pending.db;
+        let (outer_tx_id, _) = pending.saved_outer.take().ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence conflict rollback had pending inner transaction without saved outer \
+                 transaction"
+                    .to_string(),
+            )
+        })?;
+        let mv_store = self.connection.mv_store_for_db(db).ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence inner transaction has no MV store during conflict rollback".to_string(),
+            )
+        })?;
+        let pager = self.connection.get_pager_from_database_index(&db)?;
+        if !mv_store.is_tx_rollbackable(outer_tx_id) {
+            return Err(LimboError::InternalError(format!(
+                "saved sequence outer transaction {outer_tx_id} is not rollbackable during \
+                 conflict rollback"
+            )));
+        }
+        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
+        // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
+        // generic rollback then has no current tx to inspect, so it will not flip
+        // autocommit for us.
+        self.connection.auto_commit.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {
@@ -3032,6 +3130,12 @@ pub trait ValueIteratorExt {
     /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on parse error,
     /// or `None` if there are fewer than `n+1` elements.
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>>;
+
+    /// Skips `skip` elements, then decodes one value into each register of `dests` in order.
+    /// Returns the number of registers filled, which is less than `dests.len()` when the record
+    /// has fewer elements; registers past the returned count are left untouched.
+    fn decode_into_registers_after(&mut self, skip: usize, dests: &mut [Register])
+        -> Result<usize>;
 }
 
 impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
@@ -3217,18 +3321,11 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
+                    mark_unlikely();
+                    return Some(Err(LimboError::Corrupt(
+                        "TEXT value contains invalid UTF-8".into(),
+                    )));
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
@@ -3253,6 +3350,23 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
 
         Some(Ok(()))
     }
+
+    #[inline]
+    fn decode_into_registers_after(
+        &mut self,
+        skip: usize,
+        dests: &mut [Register],
+    ) -> Result<usize> {
+        for (i, dest) in dests.iter_mut().enumerate() {
+            let n = if i == 0 { skip } else { 0 };
+            match self.nth_into_register(n, dest) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Err(e),
+                None => return Ok(i),
+            }
+        }
+        Ok(dests.len())
+    }
 }
 
 #[cfg(test)]
@@ -3271,6 +3385,26 @@ mod tests {
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn nth_into_register_rejects_invalid_utf8_text() {
+        let payload = [2, 15, 0xff];
+        let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
+        let mut destination = Register::Value(Value::Null);
+
+        let result = iterator
+            .nth_into_register(0, &mut destination)
+            .expect("record contains one value");
+
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::Corrupt(ref message))
+                    if message == "TEXT value contains invalid UTF-8"
+            ),
+            "unexpected result: {result:?}"
+        );
     }
 
     #[test]

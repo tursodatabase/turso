@@ -57,7 +57,7 @@ ON CONFLICT (name) DO UPDATE
 
 ### Conflict Target
 
-The conflict target identifies which `UNIQUE` or `PRIMARY KEY` constraint the clause applies to. It is a parenthesized list of column names that must exactly match the columns of an existing unique constraint on the table.
+The conflict target identifies which `UNIQUE` or `PRIMARY KEY` constraint the clause applies to. It is a parenthesized list of column names that must exactly match the columns of an existing unique constraint on the table. The list may not use `NULLS FIRST` or `NULLS LAST` (same as SQLite), even when the matched index declares them.
 
 For partial unique indexes (indexes with a `WHERE` clause), the conflict target must also include a `WHERE` clause that matches the index's condition.
 

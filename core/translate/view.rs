@@ -255,6 +255,7 @@ pub fn translate_create_materialized_view(
         where_clause: Some(format!(
             "name = '{escaped_view_name}' OR name = '{escaped_dbsp_table_name}' OR name = '{escaped_dbsp_index_name}'"
         )),
+        trigger_target_database_id: None,
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
@@ -282,6 +283,7 @@ fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -
 fn validate_create_view(
     resolver: &Resolver,
     database_id: usize,
+    view_name: &ast::Name,
     normalized_view_name: &str,
 ) -> Result<()> {
     // Check if view already exists. A broken view (unparseable sqlite_schema
@@ -293,7 +295,8 @@ fn validate_create_view(
             || s.broken_views.contains(normalized_view_name)
     }) {
         return Err(crate::LimboError::ParseError(format!(
-            "View {normalized_view_name} already exists"
+            "view {} already exists",
+            crate::util::identifier_token_for_error(view_name)
         )));
     }
     if RESERVED_TABLE_PREFIXES
@@ -310,10 +313,17 @@ pub fn translate_create_view(
     resolver: &Resolver,
     select_stmt: &ast::Select,
     columns: &[ast::IndexedColumn],
+    temporary: bool,
     if_not_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(view_name)?;
+    // TEMP views always live in the temp schema. The parser rejects
+    // CREATE TEMP VIEW with a database name other than "temp".
+    let database_id = if temporary {
+        crate::TEMP_DB_ID
+    } else {
+        resolver.resolve_database_id(view_name)?
+    };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
@@ -328,7 +338,12 @@ pub fn translate_create_view(
         return Ok(());
     }
 
-    validate_create_view(resolver, database_id, &normalized_view_name)?;
+    validate_create_view(
+        resolver,
+        database_id,
+        &view_name.name,
+        &normalized_view_name,
+    )?;
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
@@ -344,14 +359,17 @@ pub fn translate_create_view(
         {
             return Ok(());
         }
-        let type_str = match object_type {
-            SchemaObjectType::Table => "table",
-            SchemaObjectType::View => "view",
-            SchemaObjectType::Index => "index",
-        };
-        return Err(crate::LimboError::ParseError(format!(
-            "{type_str} {normalized_view_name} already exists"
-        )));
+        // SQLite echoes the new view's name token as written, except when the
+        // name clashes with an index, which gets its own message shape.
+        let token = crate::util::identifier_token_for_error(&view_name.name);
+        return Err(crate::LimboError::ParseError(match object_type {
+            SchemaObjectType::Table => format!("table {token} already exists"),
+            SchemaObjectType::View => format!("view {token} already exists"),
+            SchemaObjectType::Index => format!(
+                "there is already an index named {}",
+                view_name.name.as_str()
+            ),
+        }));
     }
 
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
@@ -386,6 +404,7 @@ pub fn translate_create_view(
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
+        trigger_target_database_id: None,
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
@@ -421,7 +440,9 @@ pub fn translate_drop_view(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(view_name)?;
+    // Unqualified names search the temp schema first, then main, then
+    // attached databases, so DROP VIEW finds temp views like SQLite does.
+    let database_id = resolver.resolve_existing_table_database_id_qualified(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());

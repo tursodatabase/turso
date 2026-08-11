@@ -1,0 +1,196 @@
+# 2022-11-23
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# This file implements regression tests for SQLite library.
+#
+# This file implements tests to verify that the enhancement
+# request documented by ticket 99378177930f87bd is working.
+#
+# The enhancement is that if an aggregate query with a GROUP BY clause
+# uses subexpressions in the arguments to aggregate functions that are
+# also columns of an index, then the values are pulled from the index
+# rather than being recomputed.  This has the potential to make some
+# indexed queries works as if the index were covering.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+do_execsql_test tkt-99378-100 {
+  CREATE TABLE t1(a INT, b TEXT, c INT, d INT);
+  INSERT INTO t1(a,b,c,d) VALUES
+    (1, '{"x":1}', 12,  3),
+    (1, '{"x":2}',  4,  5),
+    (1, '{"x":1}',  6, 11),
+    (2, '{"x":1}', 22,  3),
+    (2, '{"x":2}',  4,  5),
+    (3, '{"x":1}',  6,  7);
+  CREATE INDEX t1x ON t1(d, a, b->>'x', c);
+} {}
+do_execsql_test tkt-99378-110 {
+  SELECT a,
+         SUM(1)                              AS t1,
+         SUM(CASE WHEN b->>'x'=1 THEN 1 END) AS t2,
+         SUM(c)                              AS t3,
+         SUM(CASE WHEN b->>'x'=1 THEN c END) AS t4
+    FROM t1
+   WHERE d BETWEEN 0 and 10
+   GROUP BY a;
+} {
+  1  2  1 16 12
+  2  2  1 26 22
+  3  1  1  6  6
+}
+
+# The proof that the index on the expression is being used is in the
+# fact that the byte code contains no "Function" opcodes.  In other words,
+# the ->> operator (which is implemented by a function) is never invoked.
+# Instead, the b->>'x' value is pulled out of the index.
+#
+do_execsql_test tkt-99378-120 {
+  EXPLAIN
+  SELECT a,
+         SUM(1)                              AS t1,
+         SUM(CASE WHEN b->>'x'=1 THEN 1 END) AS t2,
+         SUM(c)                              AS t3,
+         SUM(CASE WHEN b->>'x'=1 THEN c END) AS t4
+    FROM t1
+   WHERE d BETWEEN 0 and 10
+   GROUP BY a;
+} {~/Function/}
+
+
+do_execsql_test tkt-99378-130 {
+  SELECT a,
+         SUM(1)                              AS t1,
+         SUM(CASE WHEN b->>'x'=1 THEN 1 END) AS t2,
+         SUM(c)                              AS t3,
+         SUM(CASE WHEN b->>'x'=1 THEN c END) AS t4
+    FROM t1
+   WHERE d BETWEEN 0 and 10
+   GROUP BY +a;
+} {
+  1  2  1 16 12
+  2  2  1 26 22
+  3  1  1  6  6
+}
+do_execsql_test tkt-99378-140 {
+  EXPLAIN
+  SELECT a,
+         SUM(1)                              AS t1,
+         SUM(CASE WHEN b->>'x'=1 THEN 1 END) AS t2,
+         SUM(c)                              AS t3,
+         SUM(CASE WHEN b->>'x'=1 THEN c END) AS t4
+    FROM t1
+   WHERE d BETWEEN 0 and 10
+   GROUP BY +a;
+} {~/Function/}
+
+do_execsql_test tkt-99378-200 {
+  DROP INDEX t1x;
+  CREATE INDEX t1x ON t1(a, d, b->>'x', c);
+}
+do_execsql_test tkt-99378-210 {
+  SELECT a,
+         SUM(1)                              AS t1,
+         SUM(CASE WHEN b->>'x'=1 THEN 1 END) AS t2,
+         SUM(c)                              AS t3,
+         SUM(CASE WHEN b->>'x'=1 THEN c END) AS t4
+    FROM t1
+   WHERE d BETWEEN 0 and 10
+   GROUP BY a;
+} {
+  1  2  1 16 12
+  2  2  1 26 22
+  3  1  1  6  6
+}
+do_execsql_test tkt-99378-220 {
+  EXPLAIN
+  SELECT a,
+         SUM(1)                              AS t1,
+         SUM(CASE WHEN b->>'x'=1 THEN 1 END) AS t2,
+         SUM(c)                              AS t3,
+         SUM(CASE WHEN b->>'x'=1 THEN c END) AS t4
+    FROM t1
+   WHERE d BETWEEN 0 and 10
+   GROUP BY a;
+} {~/Function/}
+do_execsql_test tkt-99378-230 {
+  SELECT a,
+         SUM(1)                              AS t1,
+         SUM(CASE WHEN b->>'x'=1 THEN 1 END) AS t2,
+         SUM(c)                              AS t3,
+         SUM(CASE WHEN b->>'x'=1 THEN c END) AS t4
+    FROM t1
+   WHERE d BETWEEN 0 and 10
+   GROUP BY a;
+} {
+  1  2  1 16 12
+  2  2  1 26 22
+  3  1  1  6  6
+}
+do_execsql_test tkt-99378-240 {
+  EXPLAIN
+  SELECT a,
+         SUM(1)                              AS t1,
+         SUM(CASE WHEN b->>'x'=1 THEN 1 END) AS t2,
+         SUM(c)                              AS t3,
+         SUM(CASE WHEN b->>'x'=1 THEN c END) AS t4
+    FROM t1
+   WHERE d BETWEEN 0 and 10
+   GROUP BY a;
+} {~/Function/}
+
+# 2022-12-20 dbsqlfuzz a644e70d7683a7ca59c71861a153c1dccf8850b9
+#
+do_execsql_test tkt-99378-300 {
+  DROP TABLE IF EXISTS t1;
+  CREATE TABLE t1(a INT);
+  CREATE INDEX i1 ON t1(a,a=a);
+  INSERT INTO t1 VALUES(1),(2),(3),(4);
+  SELECT * FROM t1 NATURAL JOIN t1 
+   WHERE a==1
+      OR (
+           (SELECT avg(
+                (SELECT sum((SELECT 1 FROM t1 NATURAL RIGHT JOIN t1 WHERE a=a)))) AS xyz
+           )
+           AND a==2
+         );
+} {1 2}
+do_execsql_test tkt-99378-310 {
+  DROP INDEX i1;
+  SELECT * FROM t1 NATURAL JOIN t1 
+   WHERE a==1
+      OR (
+           (SELECT avg(
+                (SELECT sum((SELECT 1 FROM t1 NATURAL RIGHT JOIN t1 WHERE a=a)))) AS xyz
+           )
+           AND a==2
+         );
+} {1 2}
+
+# 2023-03-04 https://sqlite.org/forum/forumpost/a68313d054
+#
+# See also indexexpr1-2200 added on 2023-03-18.
+#
+do_execsql_test tkt-99378-400 {
+  DROP TABLE t1;
+  CREATE TABLE t0(w);
+  INSERT INTO t0(w) VALUES(1);
+  CREATE TABLE t1(x);
+  INSERT INTO t1(x) VALUES(1);
+  CREATE INDEX t1x ON t1(x > 0);
+  CREATE VIEW t2(y) AS SELECT avg(w) FROM t0 GROUP BY w>1;
+  CREATE VIEW t3(z) AS SELECT count(*) FROM t2 WHERE y BETWEEN 0 and 0;
+  SELECT count(*) FROM t1 NOT INDEXED WHERE (SELECT z FROM t3);
+  SELECT count(*) FROM t1 INDEXED BY t1x WHERE (SELECT z FROM t3);
+} {0 0}
+
+finish_test

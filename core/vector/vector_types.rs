@@ -63,8 +63,24 @@ impl<'a> Vector<'a> {
                     ));
                 }
                 let trailing_bits = blob[n_blob_size - 1] as usize;
-                let dims = n_blob_size * 8 - trailing_bits;
+                // `trailing_bits` is a raw blob byte, so it can name more padding
+                // than the blob holds. Unchecked, `dims` wraps and `from_slice`
+                // slices with a bogus length.
+                let dims = (n_blob_size * 8)
+                    .checked_sub(trailing_bits)
+                    .ok_or_else(|| {
+                        LimboError::ConversionError(format!(
+                            "float1bit vector trailing bits {trailing_bits} exceed blob capacity"
+                        ))
+                    })?;
                 let data_size = dims.div_ceil(8);
+                // The trailing-bits byte is counted in `n_blob_size`, so valid data
+                // is always strictly shorter than the blob.
+                if data_size >= n_blob_size {
+                    return Err(LimboError::ConversionError(format!(
+                        "float1bit vector needs {data_size} data bytes but blob holds {n_blob_size}"
+                    )));
+                }
                 Ok((VectorType::Float1Bit, data_size, dims))
             }
             4 => {
@@ -77,7 +93,16 @@ impl<'a> Vector<'a> {
                     ));
                 }
                 let trailing_bytes = blob[n_blob_size - 1] as usize;
-                let dims = (n_blob_size - 2) - 8 - trailing_bytes;
+                // 8 bytes of alpha/shift plus the padding and trailing markers, so
+                // `n_blob_size` must be >= 10 before subtracting `trailing_bytes`.
+                let dims = n_blob_size
+                    .checked_sub(10)
+                    .and_then(|dims| dims.checked_sub(trailing_bytes))
+                    .ok_or_else(|| {
+                        LimboError::ConversionError(format!(
+                            "float8 vector blob of {n_blob_size} bytes is too short for {trailing_bytes} trailing bytes"
+                        ))
+                    })?;
                 // data_size = ALIGN(dims, 4) + 8
                 let data_size = n_blob_size - 2;
                 Ok((VectorType::Float8, data_size, dims))
@@ -312,6 +337,19 @@ impl<'a> Vector<'a> {
                     dims_bytes[2],
                     dims_bytes[3],
                 ]) as usize;
+                // Layout is [values: n * f32][idx: n * u32][dims: u32]. Every
+                // `idx` entry comes from the blob and is used to index a dense
+                // `dims` buffer, so check it here rather than in each consumer.
+                let entries = (original_len - 4) / 8;
+                for entry in data[entries * 4..entries * 8].chunks_exact(4) {
+                    let index =
+                        u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
+                    if index >= dims {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "f32 sparse vector index {index} out of range for {dims} dims"
+                        )));
+                    }
+                }
                 let owned = owned.map(|mut x| {
                     x.truncate(original_len - 4);
                     x
@@ -809,6 +847,102 @@ pub(crate) mod tests {
         assert!(
             (operations::distance_cos::vector_distance_cos(&a, &b).unwrap() - 2.0).abs() <= 1e-6
         );
+    }
+
+    /// Malformed float1bit/float8 blobs encode a dimension count that would underflow
+    /// the size arithmetic in `Vector::vector_type`. They must be rejected with an
+    /// error instead of panicking (debug) or wrapping into a huge `dims` that
+    /// out-of-bounds slices the blob in `from_slice` (release).
+    #[test]
+    fn malformed_1bit_and_f8_blobs_are_rejected() {
+        // float1bit, trailing_bits = 0xFF but the blob only holds 16 bits
+        assert!(Vector::from_slice(&[0x00, 0xFF, 0x03]).is_err());
+        // float1bit, trailing_bits equals the whole blob capacity -> zero dims
+        assert!(Vector::from_slice(&[0x00, 0x10, 0x03]).is_err());
+        // float8, blob far shorter than the mandatory alpha/shift header
+        assert!(Vector::from_slice(&[0x00, 0x00, 0x04]).is_err());
+        assert!(Vector::from_slice(&[0x00, 0x00, 0x00, 0x0A, 0x04]).is_err());
+    }
+
+    /// No single-byte perturbation of the trailing marker may panic for any blob
+    /// length: `vector_type` and `from_slice` must always fall back to an error.
+    #[test]
+    fn arbitrary_1bit_and_f8_trailing_bytes_never_panic() {
+        for type_byte in [0x03u8, 0x04u8] {
+            for len in 1..=24usize {
+                for trailing in 0..=255u8 {
+                    let mut blob = crate::alloc::vec![0u8; len];
+                    if let Some(last) = blob.last_mut() {
+                        *last = trailing;
+                    }
+                    blob.push(type_byte);
+                    // Must not panic; either parses or reports a clean error.
+                    let _ = Vector::from_slice(&blob);
+                }
+            }
+        }
+    }
+
+    /// Valid float1bit/float8 blobs keep round-tripping through the size arithmetic.
+    #[test]
+    fn valid_1bit_and_f8_blobs_still_parse() {
+        for dims in 1..=40usize {
+            for vector_type in [VectorType::Float1Bit, VectorType::Float8] {
+                let text = format!(
+                    "[{}]",
+                    (0..dims)
+                        .map(|i| ((i % 3) as f32 - 1.0).to_string())
+                        .collect::<std::vec::Vec<_>>()
+                        .join(",")
+                );
+                let vector = operations::text::vector_from_text(vector_type, &text).unwrap();
+                let blob = operations::serialize::vector_serialize(vector)
+                    .unwrap()
+                    .to_blob()
+                    .unwrap()
+                    .to_vec();
+                let parsed = Vector::from_slice(&blob)
+                    .unwrap_or_else(|e| panic!("{vector_type:?} with {dims} dims: {e}"));
+                assert_eq!(parsed.vector_type, vector_type);
+                assert_eq!(parsed.dims, dims);
+            }
+        }
+    }
+
+    /// Every sparse consumer (vector_to_text, vector_convert) uses `idx` to index a
+    /// dense buffer of `dims` elements, and both fields come straight from the blob.
+    /// Out-of-range indices must be rejected while the blob is parsed, not when a
+    /// particular consumer happens to trip over them.
+    #[test]
+    fn sparse_vector_index_out_of_range_is_rejected() {
+        // values = [1.0], idx = [0xFFFFFFFF], dims = 1
+        let err = Vector::from_slice(&[
+            0x00, 0x00, 0x80, 0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .expect_err("out of range sparse index must be rejected");
+        assert!(matches!(err, LimboError::InvalidArgument(_)), "{err}");
+
+        // values = [1.0], idx = [1], dims = 1 -- one past the end is still out of range
+        assert!(Vector::from_slice(&[
+            0x00, 0x00, 0x80, 0x3F, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .is_err());
+    }
+
+    /// A well-formed sparse blob keeps parsing and densifying correctly.
+    #[test]
+    fn valid_sparse_vector_still_parses() {
+        // values = [1.0], idx = [0], dims = 3. Parsed from an owned blob so the
+        // pointer is f32-aligned, the way blobs reaching the SQL layer are.
+        let vector = Vector::from_slice_owned(&[
+            0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .expect("well-formed sparse vector must parse");
+        assert_eq!(vector.vector_type, VectorType::Float32Sparse);
+        assert_eq!(vector.dims, 3);
+        assert_eq!(operations::text::vector_to_text(&vector), "[1,0,0]");
+        let dense = operations::convert::vector_convert(vector, VectorType::Float32Dense).unwrap();
+        assert_eq!(dense.as_f32_slice(), [1.0, 0.0, 0.0]);
     }
 
     #[test]

@@ -14,6 +14,8 @@
 !bindings/dotnet/src/Turso.Data.Sqlite/
 !bindings/dotnet/src/Turso.Data.Sqlite/**
 # Python
+*.egg-info/
+.hypothesis/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
@@ -86,6 +88,7 @@ custom-types-fuzzer-output/
 CLAUDE.md
 bindings/python/dev.py
 bindings/python/implementation-test/
+bindings/javascript/wasi-sdk-*
 dhat-heap.json
 
 # Aristo runtime, cache, and per-user state: never commit these.

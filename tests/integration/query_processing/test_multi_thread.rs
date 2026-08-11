@@ -73,7 +73,7 @@ fn test_create_multiple_connections(tmp_db: TempDatabase) -> anyhow::Result<()> 
                             StepResult::Row => {
                                 panic!("unexpected row result");
                             }
-                            StepResult::IO | StepResult::Yield => {
+                            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                                 stmt._io().step().unwrap();
                             }
                             StepResult::Done => {

@@ -167,6 +167,11 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct PrepareOptions {
+    pub unqualified_database_search_path: Option<Vec<String>>,
+}
+
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
 /// VACUUM-only [`Connection::reparse_schema_with_cookie_keeping_sequences`].
 /// `Start` is the fresh state (cookie not yet read / schema build not yet
@@ -396,6 +401,9 @@ pub struct Connection {
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
+    /// PRAGMA count_changes: when ON, each INSERT, UPDATE and DELETE returns
+    /// one row with the number of rows it changed.
+    pub(super) count_changes: AtomicBool,
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
     /// in DML statements fall back to string literals instead of raising an error.
     pub(super) dqs_dml: AtomicBool,
@@ -622,7 +630,7 @@ impl Connection {
                 None,
                 self.db.dialect(),
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             return Ok(TempDatabase {
                 db,
@@ -653,7 +661,7 @@ impl Connection {
                 None,
                 self.db.dialect(),
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             Ok(TempDatabase {
                 db,
@@ -673,7 +681,7 @@ impl Connection {
                 None,
                 self.db.dialect(),
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             Ok(TempDatabase { db, pager })
         }
@@ -690,7 +698,7 @@ impl Connection {
             None,
             self.db.dialect(),
         )?;
-        let pager = Arc::new(db._init(None)?);
+        let pager = Arc::new(db._init(None, None)?);
         pager.set_initial_page_size(self.get_page_size())?;
         Ok(TempDatabase {
             db,
@@ -895,6 +903,7 @@ impl Connection {
         cmd: Cmd,
         input: &str,
         origin: StatementOrigin,
+        prepare_options: &PrepareOptions,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
 
@@ -912,6 +921,7 @@ impl Connection {
             mode,
             input,
             origin,
+            prepare_options,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -942,6 +952,7 @@ impl Connection {
                     mode,
                     input,
                     origin,
+                    prepare_options,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -1005,7 +1016,8 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
+            let prepare_options = PrepareOptions::default();
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1034,15 +1046,44 @@ impl Connection {
         stmt: ast::Stmt,
         input: &str,
     ) -> Result<Statement> {
-        self.prepare_stmt_with_input_and_origin(stmt, input, StatementOrigin::Root)
+        self.prepare_translated_cmd(ast::Cmd::Stmt(stmt), input)
     }
 
-    #[turso_macros::trace_stack]
-    fn prepare_stmt_with_input_and_origin(
+    pub fn prepare_translated_stmt_with_options(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
         input: &str,
+        prepare_options: &PrepareOptions,
+    ) -> Result<Statement> {
+        self.prepare_translated_cmd_with_options(ast::Cmd::Stmt(stmt), input, prepare_options)
+    }
+
+    /// Prepare an already-translated command while keeping the original SQL
+    /// text.
+    pub fn prepare_translated_cmd(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
+        input: &str,
+    ) -> Result<Statement> {
+        self.prepare_translated_cmd_with_options(cmd, input, &PrepareOptions::default())
+    }
+
+    pub fn prepare_translated_cmd_with_options(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
+        input: &str,
+        prepare_options: &PrepareOptions,
+    ) -> Result<Statement> {
+        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options)
+    }
+
+    #[turso_macros::trace_stack]
+    fn prepare_cmd_with_input_and_origin(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
+        input: &str,
         origin: StatementOrigin,
+        prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1052,7 +1093,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(Cmd::Stmt(stmt), input, origin)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1640,11 +1681,13 @@ impl Connection {
         tracing::trace!("Preparing and executing batch: {}", sql);
 
         let mut remaining = sql;
+        let prepare_options = PrepareOptions::default();
         while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+            let (program, pager, mode) =
+                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
             Statement::new(program, pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
@@ -1678,7 +1721,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+        let prepare_options = PrepareOptions::default();
+        let (program, pager, mode) =
+            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -1697,11 +1742,13 @@ impl Connection {
         }
         let sql = sql.as_ref();
         let mut remaining = sql;
+        let prepare_options = PrepareOptions::default();
         while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+            let (program, pager, mode) =
+                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
@@ -1723,7 +1770,9 @@ impl Connection {
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+        let prepare_options = PrepareOptions::default();
+        let (program, pager, mode) =
+            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
@@ -2645,8 +2694,8 @@ impl Connection {
             return Ok(());
         };
 
-        self.page_size.store(size.get_raw(), Ordering::SeqCst);
         self.pager.load().set_initial_page_size(size)?;
+        self.page_size.store(size.get_raw(), Ordering::SeqCst);
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the
@@ -3358,6 +3407,12 @@ impl Connection {
                             "reserved name {alias} is already in use"
                         )));
                     }
+                    if self.pager.load().has_external_page_codec() {
+                        return Err(LimboError::InvalidArgument(
+                            "ATTACH is unsupported for connections using an external page codec"
+                                .to_string(),
+                        ));
+                    }
 
                     let db_opts = DatabaseOpts::new()
                         .with_views(self.db.experimental_views_enabled())
@@ -3408,9 +3463,11 @@ impl Connection {
                     }));
                 }
                 AttachDatabaseState::Init(init) => {
-                    let mut pager = Arc::new(crate::return_if_io!(init
-                        .db
-                        ._init_nonblock(&mut init.init_st, init.encryption_key.as_ref(),)));
+                    let mut pager = Arc::new(crate::return_if_io!(init.db._init_nonblock(
+                        &mut init.init_st,
+                        init.encryption_key.as_ref(),
+                        None,
+                    )));
 
                     if !init.attached_is_fresh {
                         self.reject_initialized_attach_mismatches(&init.alias, &init.db, &pager)?;
@@ -3781,6 +3838,14 @@ impl Connection {
 
     pub fn set_dml_require_where(&self, value: bool) {
         self.dml_require_where.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_count_changes(&self) -> bool {
+        self.count_changes.load(Ordering::SeqCst)
+    }
+
+    pub fn set_count_changes(&self, value: bool) {
+        self.count_changes.store(value, Ordering::SeqCst);
     }
 
     pub fn get_dqs_dml(&self) -> bool {
@@ -4493,6 +4558,14 @@ impl Connection {
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
+        if let Some(codec) = pager.page_codec_external() {
+            let required_reserved_bytes = codec.required_reserved_bytes();
+            if reserved_bytes != required_reserved_bytes {
+                return Err(LimboError::InvalidArgument(format!(
+                    "page codec requires exactly {required_reserved_bytes} reserved bytes"
+                )));
+            }
+        }
         pager.set_reserved_space_bytes(reserved_bytes);
         Ok(())
     }
@@ -4516,6 +4589,12 @@ impl Connection {
         if pager.is_encryption_ctx_set() {
             return Err(LimboError::InvalidArgument(
                 "cannot reset encryption attributes if already set in the session".to_string(),
+            ));
+        }
+        if pager.has_external_page_codec() {
+            return Err(LimboError::InvalidArgument(
+                "cannot configure built-in encryption while an external page codec is installed"
+                    .to_string(),
             ));
         }
         if self.db.get_mv_store().is_some() {
@@ -5249,7 +5328,7 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "Invalid argument supplied: cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
+            "cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
         );
     }
 

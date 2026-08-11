@@ -162,3 +162,31 @@ expect {
 
 
 }
+
+# `i64::MIN % -1` overflows, and rustc emits that check even in release, so
+# these aborted the process instead of raising an error. -1 divides every
+# integer, so the GCD is 1; the LCM would be 2^63 and does not fit.
+
+test gcd_min_by_minus_one {
+    SELECT gcd(-9223372036854775808, -1);
+    SELECT gcd(-1, -9223372036854775808);
+}
+expect {
+    1
+    1
+}
+
+# +1 takes the reduction path instead and must agree.
+test gcd_min_by_one {
+    SELECT gcd(-9223372036854775808, 1);
+}
+expect {
+    1
+}
+
+test lcm_min_by_minus_one {
+    SELECT lcm(-9223372036854775808, -1);
+}
+expect error {
+    integer overflow
+}

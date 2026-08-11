@@ -1,6 +1,7 @@
 use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
+use std::ops::Range;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -261,7 +262,9 @@ pub struct ProgramBuilder {
     /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
+    free_register_ranges: Vec<Range<usize>>,
     next_free_cursor_id: usize,
+    free_cursor_ids: Vec<usize>,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
     /// Current parsing nesting level
@@ -600,6 +603,8 @@ impl ProgramBuilder {
             .expect("variable index must be non-zero");
         if let Some(name) = variable.name.as_deref() {
             self.parameters.push_named_at(name, index);
+        } else if variable.numbered {
+            self.parameters.push_numbered(index);
         } else {
             self.parameters.push_index(index);
         }
@@ -660,7 +665,9 @@ impl ProgramBuilder {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
+            free_register_ranges: Vec::new(),
             next_free_cursor_id: 0,
+            free_cursor_ids: Vec::new(),
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
@@ -753,6 +760,30 @@ impl ProgramBuilder {
     /// Check whether a name refers to a CTE currently being planned.
     pub fn is_cte_being_defined(&self, name: &str) -> bool {
         self.ctes_being_defined.iter().any(|n| n == name)
+    }
+
+    /// Hide CTEs being defined whose names an inner WITH clause redefines:
+    /// the inner definitions shadow the outer names for that lexical scope,
+    /// so references to them are not circular. Returns the hidden names for
+    /// [Self::unmask_shadowed_ctes_being_defined].
+    pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
+        let mut masked = Vec::new();
+        self.ctes_being_defined.retain(|name| {
+            if shadowing_names.contains(name) {
+                masked.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        masked
+    }
+
+    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
+    /// their shadowing scope ends. Membership is all that matters for the
+    /// circular-reference check, so restore order is irrelevant.
+    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
+        self.ctes_being_defined.extend(masked);
     }
 
     /// Temporarily take the CTE-being-defined stack (e.g. during view
@@ -942,16 +973,66 @@ impl ProgramBuilder {
         self.constant_spans.truncate(idx);
     }
 
-    pub const fn alloc_register(&mut self) -> usize {
-        let reg = self.next_free_register;
-        self.next_free_register += 1;
-        reg
+    pub fn alloc_register(&mut self) -> usize {
+        self.alloc_registers(1)
     }
 
-    pub const fn alloc_registers(&mut self, amount: usize) -> usize {
+    pub fn alloc_registers(&mut self, amount: usize) -> usize {
+        if amount == 0 {
+            return self.next_free_register;
+        }
+        if let Some(index) = self
+            .free_register_ranges
+            .iter()
+            .position(|range| range.len() >= amount)
+        {
+            let reg = self.free_register_ranges[index].start;
+            self.free_register_ranges[index].start += amount;
+            if self.free_register_ranges[index].is_empty() {
+                self.free_register_ranges.remove(index);
+            }
+            return reg;
+        }
         let reg = self.next_free_register;
         self.next_free_register += amount;
         reg
+    }
+
+    /// Allow later code to use registers that a removed plan had reserved.
+    pub(crate) fn release_registers(&mut self, start: usize, amount: usize) {
+        if amount == 0 {
+            return;
+        }
+        let end = start.checked_add(amount).expect("register range overflow");
+        turso_assert!(start > 0 && end <= self.next_free_register);
+        self.free_register_ranges.push(start..end);
+        self.free_register_ranges
+            .sort_unstable_by_key(|range| range.start);
+
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(self.free_register_ranges.len());
+        for range in self.free_register_ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                turso_assert!(last.end <= range.start, "register range released twice");
+                if last.end == range.start {
+                    last.end = range.end;
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        self.free_register_ranges = merged;
+
+        while self
+            .free_register_ranges
+            .last()
+            .is_some_and(|range| range.end == self.next_free_register)
+        {
+            let range = self
+                .free_register_ranges
+                .pop()
+                .expect("last register range was present");
+            self.next_free_register = range.start;
+        }
     }
 
     /// Returns the next register that will be allocated by alloc_register/alloc_registers.
@@ -1028,11 +1109,40 @@ impl ProgramBuilder {
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
+        if let Some(cursor) = self.free_cursor_ids.pop() {
+            self.cursor_ref[cursor] = (key, cursor_type);
+            return cursor;
+        }
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
         turso_assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
+    }
+
+    /// Allow later code to use a cursor that a removed plan had reserved.
+    pub(crate) fn release_cursor_id(&mut self, cursor_id: usize) {
+        turso_assert!(cursor_id < self.next_free_cursor_id);
+        turso_assert!(!self.free_cursor_ids.contains(&cursor_id));
+
+        if cursor_id + 1 == self.next_free_cursor_id {
+            self.cursor_ref.pop();
+            self.next_free_cursor_id -= 1;
+            while let Some(index) = self
+                .free_cursor_ids
+                .iter()
+                .position(|id| *id + 1 == self.next_free_cursor_id)
+            {
+                self.free_cursor_ids.remove(index);
+                self.cursor_ref.pop();
+                self.next_free_cursor_id -= 1;
+            }
+            return;
+        }
+
+        self.free_cursor_ids.push(cursor_id);
+        self.free_cursor_ids
+            .sort_unstable_by(|left, right| right.cmp(left));
     }
 
     pub fn add_pragma_result_column(&mut self, col_name: String) {
@@ -1057,7 +1167,91 @@ impl ProgramBuilder {
         if matches!(insn, Insn::Function { .. }) {
             self.emitted_function_call = true;
         }
+        if let Insn::Column {
+            cursor_id,
+            column,
+            dest,
+            default,
+        } = insn
+        {
+            self.emit_column_maybe_fused(cursor_id, column, dest, default);
+            return;
+        }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
+    /// or `ColumnRange` on the same cursor when both the column index and the destination register
+    /// are exactly consecutive and no label is set to target the current opcode.
+    fn emit_column_maybe_fused(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+        default: Option<Value>,
+    ) {
+        if self.column_run_fusable(cursor_id) && !self.label_targets_next_insn() {
+            if let Some((prev_insn, _)) = self.insns.last_mut() {
+                match prev_insn {
+                    Insn::Column {
+                        cursor_id: prev_cursor,
+                        column: prev_column,
+                        dest: prev_dest,
+                        default: prev_default,
+                    } if *prev_cursor == cursor_id
+                        && column == *prev_column + 1
+                        && dest == *prev_dest + 1 =>
+                    {
+                        let defaults = vec![prev_default.take(), default];
+                        *prev_insn = Insn::ColumnRange {
+                            cursor_id,
+                            start_column: *prev_column,
+                            dest: *prev_dest,
+                            defaults,
+                        };
+                        return;
+                    }
+                    Insn::ColumnRange {
+                        cursor_id: prev_cursor,
+                        start_column,
+                        dest: prev_dest,
+                        defaults,
+                    } if *prev_cursor == cursor_id
+                        && column == *start_column + defaults.len()
+                        && dest == *prev_dest + defaults.len() =>
+                    {
+                        defaults.push(default);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.insns.push((
+            Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                default,
+            },
+            self.insns.len(),
+        ));
+    }
+
+    fn column_run_fusable(&self, cursor_id: CursorID) -> bool {
+        self.cursor_ref
+            .get(cursor_id)
+            .map(|(_, cursor_type)| cursor_type.accepts_column_range_fusing())
+            .unwrap_or(false)
+    }
+
+    fn label_targets_next_insn(&self) -> bool {
+        let Some(last) = self.insns.len().checked_sub(1) else {
+            return false;
+        };
+        let last = last as u32;
+        self.label_to_resolved_offset.contains(&Some(last))
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -1439,6 +1633,9 @@ impl ProgramBuilder {
                     ..
                 } => {
                     resolve(target_pc_when_reentered, "Once")?;
+                }
+                Insn::ResetOnce { region_end, .. } => {
+                    resolve(region_end, "ResetOnce")?;
                 }
                 Insn::Prev { pc_if_prev, .. } => {
                     resolve(pc_if_prev, "Prev")?;
@@ -2045,5 +2242,21 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+}
+
+pub(crate) trait CursorTypeExt {
+    fn accepts_column_range_fusing(&self) -> bool;
+}
+
+impl CursorTypeExt for CursorType {
+    fn accepts_column_range_fusing(&self) -> bool {
+        matches!(
+            self,
+            CursorType::BTreeTable(_)
+                | CursorType::BTreeIndex(_)
+                | CursorType::Pseudo(_)
+                | CursorType::Sorter
+        )
     }
 }

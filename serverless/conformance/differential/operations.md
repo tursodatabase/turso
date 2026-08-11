@@ -67,3 +67,24 @@ OpResult {
 ```
 
 Type tags: `"null"`, `"integer"`, `"real"`, `"text"`, `"blob"`.
+
+## Required properties
+
+Beyond the differential tests, `spec/ops.json` lists properties every
+harness must implement under `tests`. Most compare the two drivers against
+a live Turso Cloud database; the exceptions are noted below. A harness for
+a new serverless driver is not complete until it covers every entry.
+
+### `encryption_header`
+
+For any remote encryption key `K` drawn from the spec's `key_alphabet`
+(length `key_min_len` to `key_max_len`, plus optional base64 `=` padding),
+a driver configured with `K` attaches `x-turso-encryption-key: K` to every
+HTTP request it sends — pipeline and cursor endpoints alike — and a driver
+configured without a key never sends the header (see `PROTOCOL.md` section
+3.1).
+
+This property runs against a local stub HTTP server that records request
+headers and speaks just enough of the protocol for the driver to complete a
+statement. It needs no Turso Cloud database and must run unconditionally,
+never skipping on missing environment configuration.

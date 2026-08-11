@@ -40,4 +40,9 @@ name = "sqlite3.h"
 name = "compat"
 path = "tests/compat/mod.rs"
 
+[[test]]
+name = "oracle"
+path = "tests/oracle.rs"
+
 [build-dependencies]
+cc = "1"

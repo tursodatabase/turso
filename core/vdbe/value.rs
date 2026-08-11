@@ -851,9 +851,12 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
+        let f: f64 =
+            crate::numeric::round_half_away_from_zero_tie(f, precision).unwrap_or_else(|| {
+                crate::numeric::str_to_f64(format!("{f:.precision$}"))
+                    .expect("formatted float should always parse successfully")
+                    .into()
+            });
 
         Value::from_f64(f)
     }
@@ -1366,14 +1369,40 @@ impl Value {
         result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    /// Concatenate another value onto this Text value, converting both to strings.
-    /// Used by GROUP_CONCAT/STRING_AGG to properly handle all value types.
+    /// Fallibly concatenate another value onto this Text value, converting it to a string.
     /// Panics if self is not a Text value.
-    pub fn exec_group_concat(&mut self, other: &Value) {
+    pub fn exec_group_concat(
+        &mut self,
+        other: &Value,
+    ) -> std::result::Result<(), crate::alloc::TryReserveError> {
         let Value::Text(text) = self else {
-            panic!("concat_to_text must be called only on Value::Text");
+            panic!("group_concat accumulator must be a Text value");
         };
-        text.value.to_mut().push_str(&other.to_string());
+        let acc = match &mut text.value {
+            std::borrow::Cow::Owned(s) => s,
+            borrowed => {
+                let mut s = String::new();
+                s.try_reserve(borrowed.len())?;
+                s.push_str(borrowed);
+                *borrowed = std::borrow::Cow::Owned(s);
+                let std::borrow::Cow::Owned(s) = borrowed else {
+                    unreachable!("accumulator was just converted to Owned");
+                };
+                s
+            }
+        };
+        match other {
+            Value::Text(text) => {
+                acc.try_reserve(text.as_str().len())?;
+                acc.push_str(text.as_str());
+            }
+            other => {
+                let rendered = other.to_string();
+                acc.try_reserve(rendered.len())?;
+                acc.push_str(&rendered);
+            }
+        }
+        Ok(())
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
@@ -1414,20 +1443,28 @@ impl Value {
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
         let result: String = values
-            .filter_map(|x| match x {
-                Value::Numeric(Numeric::Integer(i)) => {
-                    // Convert integer to Unicode codepoint.
-                    // For invalid codepoints (negative, surrogates, or > U+10FFFF),
-                    // output U+FFFD (replacement character) to match SQLite behavior.
-                    if *i >= 0 {
-                        Some(char::from_u32(*i as u32).unwrap_or('\u{FFFD}'))
-                    } else {
-                        Some('\u{FFFD}')
+            .map(|x| {
+                // char() coerces every argument to an integer codepoint, the
+                // same way sqlite3_value_int64 / CAST(... AS INTEGER) does:
+                // text and blobs by their numeric prefix (0 if none), floats by
+                // truncation, NULL as 0. Turso previously accepted only integer
+                // arguments and dropped the rest.
+                let codepoint = match x {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+                    Value::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
+                    Value::Blob(b) => {
+                        crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
                     }
+                    Value::Null => 0,
+                };
+                // Invalid codepoints (negative, surrogates, or > U+10FFFF)
+                // become U+FFFD, matching SQLite.
+                if codepoint >= 0 {
+                    char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
+                } else {
+                    '\u{FFFD}'
                 }
-                // NULL arguments produce NUL characters to match SQLite behavior.
-                Value::Null => Some('\0'),
-                _ => None,
             })
             .collect();
         Value::build_text(result)
@@ -2732,13 +2769,15 @@ mod tests {
             ),
             Value::build_text("\0")
         );
+        // Non-numeric text coerces to integer 0, so char('a') is a NUL byte,
+        // the same as SQLite (it feeds every argument through integer coercion).
         assert_eq!(
             Value::exec_char(
                 [Register::Value(Value::build_text("a"))]
                     .iter()
                     .map(|reg| reg.get_value())
             ),
-            Value::build_text("")
+            Value::build_text("\0")
         );
     }
 

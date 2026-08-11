@@ -1063,6 +1063,27 @@ impl Default for CteMaterializationWeights {
 // SELECT Configuration
 // =============================================================================
 
+/// Window-frame syntax the generator may emit.
+///
+/// Keep this aligned with the frame modes accepted by the planner so the
+/// differential fuzzer does not spend its budget on intentionally rejected
+/// statements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowFramePolicy {
+    /// Generate built-in window functions without an explicit frame.
+    #[default]
+    CoercedOnly,
+    /// Generate aggregate window functions over any valid `ROWS` frame.
+    Rows,
+    /// Also generate all `GROUPS` frames and offset-free `RANGE` frames.
+    GroupsAndOffsetFreeRange,
+    /// Also generate numeric-offset `RANGE` frames.
+    RangeOffsets,
+    /// Also generate every explicit frame-exclusion variant while retaining
+    /// unexcluded frames for xInverse coverage.
+    Exclude,
+}
+
 /// Configuration for SELECT statement generation.
 #[derive(Debug, Clone)]
 pub struct SelectConfig {
@@ -1175,6 +1196,17 @@ pub struct SelectConfig {
     /// Weights for compound operator selection.
     pub compound_operator_weights: CompoundOperatorWeights,
 
+    /// Probability that each expression-list result column is generated
+    /// as a window function (`func(...) OVER (...)`) rather than a
+    /// generic expression. 0.0 disables window-function generation in
+    /// the SELECT list. Window functions live outside the recursive
+    /// expression dispatch, so this gate keeps them out of WHERE /
+    /// HAVING / function args / subqueries.
+    pub window_function_probability: f64,
+
+    /// Highest window-frame feature set the generator may use.
+    pub window_frame_policy: WindowFramePolicy,
+
     // Stubs (not yet implemented, probability 0.0)
     /// Probability of generating a derived table (subquery in FROM).
     pub derived_table_probability: f64,
@@ -1220,6 +1252,11 @@ impl Default for SelectConfig {
             compound_operator_weights: CompoundOperatorWeights::default(),
             // Stubs
             derived_table_probability: 0.0,
+            // Off by default — the differential fuzzer's window_fuzzer
+            // mode and any explicit window-function test should set
+            // this themselves.
+            window_function_probability: 0.0,
+            window_frame_policy: WindowFramePolicy::CoercedOnly,
         }
     }
 }

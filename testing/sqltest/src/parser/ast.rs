@@ -124,6 +124,8 @@ pub struct TestFile {
     pub tests: Vec<TestCase>,
     /// Snapshot test cases (for EXPLAIN output)
     pub snapshots: Vec<SnapshotCase>,
+    /// Matrix test cases (cross-product expansions with blessed results)
+    pub matrices: Vec<MatrixCase>,
     /// Global skip directives that apply to all tests in the file
     pub global_skip: Vec<Skip>,
     /// Global capability requirements that apply to all tests in the file
@@ -169,6 +171,112 @@ pub struct SnapshotCase {
     pub eqp_only: bool,
     /// Common modifiers (setups, skip, backend, requires)
     pub modifiers: CaseModifiers,
+}
+
+/// A matrix variable: a substitution name plus the values it expands over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatrixVar {
+    /// Name referenced in the SQL template as `$name`
+    pub name: String,
+    /// Values the variable iterates over (may include the empty string)
+    pub values: Vec<String>,
+}
+
+/// A matrix test case: one SQL template expanded over the cross-product of
+/// its `@var` decorators. Each expansion becomes an individual case named
+/// `<matrix>[<slug>]...[<slug>]` and is verified differentially at run
+/// time: Turso and the bundled SQLite oracle must produce the same rows,
+/// or both must reject the statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatrixCase {
+    /// Base name for the expansions
+    pub name: String,
+    /// Span of the matrix name in the source
+    pub name_span: Range<usize>,
+    /// SQL template with `$name` substitution points
+    pub sql_template: String,
+    /// Variables, in declaration order (also the order of name suffixes)
+    pub vars: Vec<MatrixVar>,
+    /// Common modifiers (setups, skip, backend, requires)
+    pub modifiers: CaseModifiers,
+}
+
+/// One expansion of a matrix case: a concrete name and SQL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatrixExpansion {
+    /// Generated case name, e.g. `frame-sum[rows][1-preceding][current-row]`
+    pub name: String,
+    /// SQL with all variables substituted
+    pub sql: String,
+}
+
+impl MatrixCase {
+    /// Expand the cross-product of all variables into concrete cases.
+    /// Substitution replaces longer variable names first so `$start` is
+    /// never clobbered by a variable named `$s`.
+    pub fn expand(&self) -> Vec<MatrixExpansion> {
+        let mut order: Vec<usize> = (0..self.vars.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.vars[i].name.len()));
+
+        let mut expansions = Vec::new();
+        let mut indices = vec![0usize; self.vars.len()];
+        loop {
+            let mut sql = self.sql_template.clone();
+            for &vi in &order {
+                let var = &self.vars[vi];
+                sql = sql.replace(&format!("${}", var.name), &var.values[indices[vi]]);
+            }
+            let mut name = self.name.clone();
+            for (vi, var) in self.vars.iter().enumerate() {
+                name.push('[');
+                name.push_str(&slug(&var.values[indices[vi]]));
+                name.push(']');
+            }
+            expansions.push(MatrixExpansion { name, sql });
+
+            // Advance the odometer.
+            let mut pos = self.vars.len();
+            loop {
+                if pos == 0 {
+                    return expansions;
+                }
+                pos -= 1;
+                indices[pos] += 1;
+                if indices[pos] < self.vars[pos].values.len() {
+                    break;
+                }
+                indices[pos] = 0;
+            }
+        }
+    }
+
+    /// Total number of expansions this matrix produces.
+    pub fn expansion_count(&self) -> usize {
+        self.vars.iter().map(|v| v.values.len().max(1)).product()
+    }
+}
+
+/// Turn a variable value into a stable, readable name fragment.
+fn slug(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_dash = true;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "none".to_string()
+    } else {
+        out
+    }
 }
 
 /// A single test case

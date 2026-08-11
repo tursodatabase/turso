@@ -7,72 +7,1011 @@ set testdir [file dirname $argv0]
 # summaries or exit.
 set ALL_TESTS 1
 
-source $testdir/select1.test
-source $testdir/select2.test
-# FIXME: source $testdir/select3.test
-# FIXME: source $testdir/select4.test
-source $testdir/select5.test
-# FIXME: source $testdir/select6.test
-# FIXME: source $testdir/select7.test
-source $testdir/select8.test
-# FIXME: source $testdir/select9.test
-# FIXME: source $testdir/selectA.test
-# FIXME: source $testdir/selectB.test
-source $testdir/selectC.test
-# FIXME: source $testdir/selectD.test
-# FIXME: source $testdir/selectE.test
-source $testdir/selectF.test
-# FIXME: source $testdir/selectG.test
-# FIXME: source $testdir/selectH.test
-
-# FIXME: source $testdir/insert.test
-# FIXME: source $testdir/insert2.test
-# FIXME: source $testdir/insert3.test
-# FIXME: source $testdir/insert4.test
-# FIXME: source $testdir/insert5.test
-
-# FIXME: source $testdir/join.test
-# FIXME: source $testdir/join2.test
-# FIXME: source $testdir/join3.test
-# FIXME: source $testdir/join4.test
-# FIXME: source $testdir/join5.test
-source $testdir/join6.test
-# FIXME: source $testdir/join7.test
-# FIXME: source $testdir/join8.test
-# FIXME: source $testdir/join9.test
-# FIXME: source $testdir/joinA.test
-# FIXME: source $testdir/joinB.test
-# FIXME: source $testdir/joinC.test
-# FIXME: source $testdir/joinD.test
-# FIXME: source $testdir/joinE.test
-# FIXME: source $testdir/joinF.test
-# FIXME: source $testdir/joinH.test
-
-# FIXME: source $testdir/alter.test
-# FIXME: source $testdir/alter2.test
-# FIXME: source $testdir/alter3.test
-# FIXME: source $testdir/alter4.test
-
-# FIXME: source $testdir/func.test
-source $testdir/func2.test
-# FIXME: source $testdir/func3.test
-# FIXME: source $testdir/func4.test
-# FIXME: source $testdir/func5.test
-# FIXME: source $testdir/func6.test
-source $testdir/func7.test
-source $testdir/func8.test
-source $testdir/func9.test
-
-# Print aggregate summary and exit non-zero if any test failed.
-puts ""
-puts "=========================================="
-if {$TC(errors) == 0} {
-  puts "All $TC(count) tests passed!"
-  puts "=========================================="
-  exit 0
-} else {
-  puts "$TC(errors) errors out of $TC(count) tests"
-  puts "Failed tests: $TC(fail_list)"
-  puts "=========================================="
-  exit 1
+# Every test file below runs on every invocation. Each file has a status:
+#
+#   pass - blessed: every test in the file must pass. Any failure (or a
+#          crash while sourcing the file) fails the run.
+#   fail - known-bad: the file runs and its failures are reported, but they
+#          do not fail the run. If such a file becomes fully green the run
+#          fails with a request to move it to "pass", so the known-bad list
+#          only ever shrinks.
+#   skip - not run at all. Reserved for files that hang or that die on a
+#          missing test-harness command; the reason is noted next to each.
+#
+# To bless a file: fix the remaining failures, then change its status here
+# from "fail" to "pass".
+set test_files {
+  8_3_names            fail
+  affinity2            pass
+  affinity3            pass
+  aggerror             fail
+  aggnested            fail
+  aggorderby           fail
+  alias                fail
+  alter                skip {dies mid-file on a TCL error}
+  alter2               skip {dies mid-file on a TCL error}
+  alter3               fail
+  alter4               fail
+  altercol             fail
+  altercorrupt         fail
+  alterdropcol         skip {hangs at alterdropcol-9.2.1}
+  alterdropcol2        fail
+  alterlegacy          fail
+  alterqf              fail
+  altertab             fail
+  altertab2            fail
+  altertab3          skip {aborts the harness on an engine panic at core/translate/expr/translator.rs:2286}
+  altertrig            fail
+  analyze              fail
+  analyze3             fail
+  analyze4             fail
+  analyze5             fail
+  analyze6             fail
+  analyze7             fail
+  analyze8             fail
+  analyze9             fail
+  analyzeC             fail
+  analyzeD             fail
+  analyzeE             fail
+  analyzeF             fail
+  analyzeG             fail
+  analyzer1            fail
+  atof1                fail
+  atomic               fail
+  atomic2              fail
+  attach               fail
+  attach2              fail
+  attach3              fail
+  attach4              fail
+  autoanalyze1         fail
+  autoinc              fail
+  autoindex1           fail
+  autoindex2           fail
+  autoindex3           fail
+  autoindex4           pass
+  autoindex5           fail
+  autovacuum           fail
+  autovacuum2          fail
+  avfs                 fail
+  avtrans              fail
+  backcompat           fail
+  backup               fail
+  backup2              fail
+  backup4              fail
+  backup5              fail
+  badutf               fail
+  badutf2              fail
+  between              fail
+  bigfile              fail
+  bigfile2             pass
+  bigmmap              fail
+  bigrow               pass
+  bigsort              skip {builds a multi-GB database and WAL; far too slow to run}
+  bind                 fail
+  bind2                fail
+  bindxfer             fail
+  bitvec               fail
+  blob                 fail
+  bloom1               fail
+  boundary1            fail
+  boundary2            fail
+  boundary3            fail
+  boundary4            fail
+  btree01            skip {aborts the harness on an engine panic}
+  btree02              fail
+  busy                 fail
+  busy2                fail
+  cache                fail
+  cacheflush           fail
+  cachespill           fail
+  capi2                fail
+  capi3                fail
+  capi3b               fail
+  capi3c               fail
+  capi3d               fail
+  capi3e               fail
+  carray01             fail
+  cast                 fail
+  changes              fail
+  changes2             fail
+  check                fail
+  chunksize            fail
+  cksumvfs             fail
+  close                fail
+  closure01            fail
+  coalesce             pass
+  collate1             fail
+  collate2             fail
+  collate3             fail
+  collate4             fail
+  collate5             fail
+  collate6             fail
+  collate7             fail
+  collate8             fail
+  collate9             fail
+  collateA             pass
+  collateB             pass
+  colmeta              fail
+  colname              fail
+  columncount          fail
+  conflict             fail
+  conflict2            fail
+  conflict3            fail
+  contrib01            pass
+  corrupt              fail
+  corrupt2             fail
+  corrupt3             fail
+  corrupt4             fail
+  corrupt5             fail
+  corrupt6             fail
+  corrupt7             fail
+  corrupt8             fail
+  corrupt9             fail
+  corruptA             fail
+  corruptB             fail
+  corruptC             fail
+  corruptD             fail
+  corruptE             fail
+  corruptF             fail
+  corruptG             fail
+  corruptH             fail
+  corruptI             fail
+  corruptJ             fail
+  corruptK             fail
+  corruptL             fail
+  corruptM             fail
+  corruptN             fail
+  cost                 fail
+  count                fail
+  countofview          fail
+  coveridxscan         fail
+  createtab            fail
+  cse                  pass
+  csv01                fail
+  ctime                fail
+  cursorhint           fail
+  cursorhint2          fail
+  dataversion1         fail
+  date                 fail
+  date2                fail
+  date3                pass
+  date4                fail
+  date5                fail
+  dbfuzz001            fail
+  dbpage               fail
+  dbstatus             fail
+  dbstatus2            fail
+  delete               fail
+  delete2              fail
+  delete3              skip {hangs at delete3-1.1}
+  delete4            skip {aborts the harness on an engine panic at core/storage/wal.rs:4363}
+  delete_db            fail
+  descidx1             fail
+  descidx2             fail
+  descidx3             fail
+  diskfull             fail
+  distinct             fail
+  distinct2            fail
+  distinctagg          fail
+  e_blobbytes          pass
+  e_blobclose          fail
+  e_blobopen           fail
+  e_blobwrite          fail
+  e_changes            fail
+  e_createtable        fail
+  e_delete             fail
+  e_droptrigger        fail
+  e_dropview           fail
+  e_expr               fail
+  e_fkey               fail
+  e_insert             fail
+  e_reindex            fail
+  e_resolve            fail
+  e_select             fail
+  e_select2            fail
+  e_totalchanges       fail
+  e_update             fail
+  e_uri                fail
+  e_vacuum             fail
+  e_wal                fail
+  e_walauto            fail
+  e_walckpt            fail
+  e_walhook            fail
+  emptytable           fail
+  enc                  fail
+  enc2                 fail
+  enc3                 fail
+  enc4                 fail
+  eqp                  fail
+  eqp2                 fail
+  errmsg               fail
+  errofst1             fail
+  eval                 fail
+  exclusive            fail
+  exclusive2           fail
+  exec                 pass
+  exists               fail
+  expr                 fail
+  expr2                pass
+  extension01          fail
+  external_reader      fail
+  fallocate            fail
+  filectrl             fail
+  filefmt              fail
+  filter1              fail
+  filter2              pass
+  fkey1                skip {aborts the harness on an engine panic at sqlite/parser/src/ast.rs:1215}
+  fkey2                fail
+  fkey3                fail
+  fkey4                fail
+  fkey5                fail
+  fkey6                fail
+  fkey7                fail
+  fkey8                fail
+  fordelete            fail
+  format4              fail
+  full                 fail
+  func                 skip {needs "sqlite3_connection_pointer"}
+  func2                pass
+  func3                fail
+  func4                skip {needs "load_static_extension" (totype)}
+  func5                skip {needs "sqlite3_create_function"}
+  func6                fail
+  func7                pass
+  func8                pass
+  func9                pass
+  fuzz                 fail
+  fuzz-oss1            fail
+  fuzz2                fail
+  fuzz3                fail
+  fuzz4                fail
+  fuzzer1              fail
+  fuzzer2              fail
+  gencol1              fail
+  having               fail
+  hexlit               fail
+  hidden               fail
+  hook                 fail
+  hook2                fail
+  icu                  fail
+  ieee754              fail
+  imposter1            fail
+  in                   fail
+  in2                  fail
+  in3                  fail
+  in4                  fail
+  in5                  fail
+  in6                  fail
+  in7                  fail
+  incrcorrupt          fail
+  incrvacuum           fail
+  incrvacuum2          fail
+  incrvacuum3          fail
+  index                fail
+  index2               pass
+  index3               fail
+  index4               fail
+  index5               fail
+  index6               fail
+  index7               fail
+  index8               fail
+  index9               fail
+  indexA               fail
+  indexedby            fail
+  indexexpr1           fail
+  indexexpr2           fail
+  indexexpr3           fail
+  init                 fail
+  insert               fail
+  insert2              pass
+  insert3              fail
+  insert4              fail
+  insert5              pass
+  instr                pass
+  intarray             fail
+  interrupt            fail
+  interrupt2           fail
+  intpkey              fail
+  intreal              fail
+  io                   fail
+  istrue               fail
+  join                 fail
+  join2                skip {needs "do_vmstep_test"}
+  join3                skip {dies mid-file on a TCL error}
+  join4                fail
+  join5                fail
+  join6                pass
+  join7                fail
+  join8                skip {needs "load_static_extension" (series)}
+  join9                fail
+  joinA                fail
+  joinB                fail
+  joinC                fail
+  joinD                fail
+  joinE                pass
+  joinF                fail
+  joinH                fail
+  journal1             fail
+  journal2             fail
+  journal3             fail
+  jrnlmode             fail
+  jrnlmode2            fail
+  jrnlmode3            fail
+  json101              fail
+  json102              fail
+  json103              fail
+  json104              fail
+  json105              fail
+  json106              fail
+  json107              fail
+  json108              fail
+  json501              fail
+  json502              fail
+  jsonb01              pass
+  keyword1             pass
+  lastinsert           fail
+  laststmtchanges      fail
+  like                 fail
+  like2                pass
+  like3                fail
+  limit                pass
+  limit2               fail
+  literal              fail
+  literal2             pass
+  lock                 fail
+  lock2                fail
+  lock3                fail
+  lock4                fail
+  lock5                fail
+  lock6                fail
+  lock7                fail
+  lookaside            fail
+  main                 fail
+  manydb               pass
+  memjournal           fail
+  memjournal2          fail
+  memleak              fail
+  memsubsys1           fail
+  memsubsys2           fail
+  merge1               fail
+  minmax               fail
+  minmax2              fail
+  minmax3              fail
+  minmax4              fail
+  misc1                fail
+  misc2                fail
+  misc3                pass
+  misc4                fail
+  misc5                fail
+  misc6                fail
+  misc7                fail
+  misc8                fail
+  misuse               fail
+  mjournal             fail
+  mmap1                fail
+  mmap3                fail
+  mmap4                fail
+  mmapcorrupt          fail
+  mmapwarm             fail
+  mutex1               fail
+  mutex2               fail
+  nan                  fail
+  nockpt               fail
+  nolock               fail
+  normalize            fail
+  notify1              fail
+  notify2              fail
+  notify3              fail
+  notnull              fail
+  notnull2             fail
+  null                 fail
+  nulls1               fail
+  numcast              fail
+  numindex1            pass
+  offset1              pass
+  openv2               fail
+  orderby1             fail
+  orderby2             fail
+  orderby3             pass
+  orderby4             pass
+  orderby5             fail
+  orderby6             pass
+  orderby7             fail
+  orderby8             pass
+  orderby9             pass
+  orderbyA             fail
+  orderbyB             fail
+  ovfl                 pass
+  pager1               fail
+  pager2               fail
+  pager3               fail
+  pager4               fail
+  pageropt             fail
+  pagesize           skip {aborts the harness on an engine panic at core/storage/wal.rs:4363}
+  parser1              fail
+  pcache               fail
+  pcache2              fail
+  pendingrace          fail
+  percentile         skip {aborts the harness on an engine panic at core/percentile.rs:13}
+  pragma               fail
+  pragma2              fail
+  pragma3              fail
+  pragma4              fail
+  pragma5              fail
+  pragma6              fail
+  prefixes             fail
+  printf               fail
+  printf2              fail
+  progress             fail
+  ptrchng              fail
+  pushdown             fail
+  queryonly            fail
+  quick                fail
+  quickcheck           pass
+  quote                fail
+  randexpr1            pass
+  rdonly               fail
+  readonly             fail
+  recover              fail
+  regexp1              fail
+  regexp2              fail
+  reindex              fail
+  resetdb              fail
+  resolver01           fail
+  returning1           fail
+  rollback             fail
+  rollback2          skip {aborts the harness on an engine panic at core/storage/btree.rs:8315}
+  round1               pass
+  rowallock            fail
+  rowhash              fail
+  rowid                skip {hangs at rowid-13.1}
+  rowvalue             fail
+  rowvalue2            pass
+  rowvalue3            fail
+  rowvalue4            fail
+  rowvalue5            fail
+  rowvalue6            pass
+  rowvalue7            pass
+  rowvalue8            fail
+  rowvalue9          skip {aborts the harness on an engine panic at core/vdbe/builder.rs:1580}
+  rowvalueA            pass
+  rowvaluevtab         fail
+  savepoint            fail
+  savepoint2           fail
+  savepoint4           fail
+  savepoint5           pass
+  savepoint6           fail
+  savepoint7           fail
+  scanstatus           fail
+  scanstatus2          fail
+  schema               fail
+  schema2              fail
+  schema3              fail
+  schema4              fail
+  schema5              fail
+  schema6              fail
+  securedel            fail
+  securedel2           fail
+  seekscan1            pass
+  select1              pass
+  select2              pass
+  select3              fail
+  select4              fail
+  select5              pass
+  select6              fail
+  select7              fail
+  select8              pass
+  select9              skip {needs "db collate" (custom TCL collations)}
+  selectA              fail
+  selectB              fail
+  selectC              pass
+  selectD              fail
+  selectE              pass
+  selectF              pass
+  selectG              skip {hangs on an INSERT with a 100,000-entry VALUES clause}
+  selectH              fail
+  shmlock              fail
+  shortread1           fail
+  shrink               fail
+  sidedelete         skip {aborts the harness on an engine panic}
+  skipscan1            fail
+  skipscan2            fail
+  skipscan3            fail
+  skipscan5            fail
+  skipscan6            fail
+  snapshot             fail
+  snapshot2            fail
+  snapshot3            fail
+  snapshot4            fail
+  snapshot_up          fail
+  softheap1            fail
+  sort                 fail
+  sort2                fail
+  sort3                fail
+  sort4                fail
+  sort5                fail
+  sorterref            pass
+  sqldiff1             fail
+  sqllimits1           fail
+  sqllog               fail
+  starschema1          fail
+  stat                 fail
+  stmt                 fail
+  stmtrand             fail
+  stmtvtab1            fail
+  strict1              fail
+  strict2              fail
+  subjournal           fail
+  subquery             fail
+  subquery2            pass
+  subselect            fail
+  substr               fail
+  subtype1             fail
+  swarmvtab            fail
+  swarmvtab2           fail
+  swarmvtab3           fail
+  symlink              fail
+  sync                 fail
+  sync2                fail
+  tabfunc01            fail
+  table                fail
+  tableapi             fail
+  tableopts            fail
+  tclsqlite            fail
+  tempdb               fail
+  tempdb2              fail
+  temptable            fail
+  temptable2           fail
+  temptable3           fail
+  temptrigger          fail
+  timediff1            fail
+  tkt-02a8e81d44       pass
+  tkt-18458b1a         fail
+  tkt-26ff0c2d1e       fail
+  tkt-2a5629202f       fail
+  tkt-2d1a5c67d        fail
+  tkt-2ea2425d34       fail
+  tkt-31338dca7e       pass
+  tkt-313723c356       fail
+  tkt-385a5b56b9       fail
+  tkt-38cb5df375       fail
+  tkt-3998683a16       pass
+  tkt-3a77c9714e       pass
+  tkt-3fe897352e       fail
+  tkt-4a03edc4c8       pass
+  tkt-4c86b126f2       pass
+  tkt-4dd95f6943       pass
+  tkt-4ef7e3cfca       fail
+  tkt-54844eea3f       pass
+  tkt-5d863f876e       fail
+  tkt-5e10420e8d       fail
+  tkt-5ee23731f        fail
+  tkt-6bfb98dfc0       pass
+  tkt-752e1646fc       pass
+  tkt-78e04e52ea       fail
+  tkt-7a31705a7e6      fail
+  tkt-7bbfb7d442       pass
+  tkt-80ba201079       fail
+  tkt-80e031a00f       fail
+  tkt-8454a207b9       fail
+  tkt-868145d012       pass
+  tkt-8c63ff0ec        pass
+  tkt-91e2e8ba6f       pass
+  tkt-99378177930f87bd fail
+  tkt-9a8b09f8e6       pass
+  tkt-9d68c883         fail
+  tkt-9f2eb3abac       fail
+  tkt-a7b7803e         fail
+  tkt-a7debbe0         fail
+  tkt-a8a0d2996a       pass
+  tkt-b1d3a2e531       fail
+  tkt-b351d95f9        fail
+  tkt-b72787b1         fail
+  tkt-b75a9ca6b0       fail
+  tkt-ba7cbfaedc       pass
+  tkt-bd484a090c       fail
+  tkt-bdc6bbbb38       fail
+  tkt-c48d99d690       pass
+  tkt-c694113d5        pass
+  tkt-cbd054fa6b       fail
+  tkt-d11f09d36e       pass
+  tkt-d635236375       pass
+  tkt-d82e3f3721       fail
+  tkt-f3e5abed55       fail
+  tkt-f67b41381a       fail
+  tkt-f777251dc7a      skip {hangs at tkt-f7772-1.2}
+  tkt-f7b4edec         fail
+  tkt-f973c7ac31       pass
+  tkt-fa7bf5ec         pass
+  tkt-fc62af4523       fail
+  tkt-fc7bd6358f       pass
+  tkt1435              pass
+  tkt1443              pass
+  tkt1444              pass
+  tkt1449              pass
+  tkt1473              fail
+  tkt1501              pass
+  tkt1512              fail
+  tkt1514              fail
+  tkt1536              pass
+  tkt1537              fail
+  tkt1567              fail
+  tkt1644              fail
+  tkt1667              fail
+  tkt1873              pass
+  tkt2141              pass
+  tkt2192              pass
+  tkt2213              fail
+  tkt2251              pass
+  tkt2285              pass
+  tkt2332              fail
+  tkt2339              pass
+  tkt2391              pass
+  tkt2409              fail
+  tkt2450              pass
+  tkt2565              fail
+  tkt2640              fail
+  tkt2643              pass
+  tkt2686              fail
+  tkt2767              pass
+  tkt2817              pass
+  tkt2820              fail
+  tkt2822              fail
+  tkt2832              pass
+  tkt2854              fail
+  tkt2920              fail
+  tkt2927              pass
+  tkt2942              pass
+  tkt3080              skip {hangs at tkt3080.1}
+  tkt3093              fail
+  tkt3121              fail
+  tkt3201              pass
+  tkt3292              pass
+  tkt3298              fail
+  tkt3334              pass
+  tkt3346              fail
+  tkt3357              pass
+  tkt3419              pass
+  tkt3424              pass
+  tkt3442              fail
+  tkt3461              fail
+  tkt3493              pass
+  tkt3508              fail
+  tkt3522              pass
+  tkt3527              pass
+  tkt3541              pass
+  tkt3554              pass
+  tkt3581              pass
+  tkt35xx              fail
+  tkt3630              pass
+  tkt3718              skip {hangs at tkt3718-1.2}
+  tkt3731              pass
+  tkt3757              fail
+  tkt3761              fail
+  tkt3762              fail
+  tkt3773              pass
+  tkt3791              pass
+  tkt3793              fail
+  tkt3810              fail
+  tkt3824              fail
+  tkt3832              pass
+  tkt3838              fail
+  tkt3841              pass
+  tkt3871              fail
+  tkt3879              pass
+  tkt3911              fail
+  tkt3918              fail
+  tkt3922              fail
+  tkt3929              pass
+  tkt3935              fail
+  tkt3992              pass
+  tkt3997              fail
+  tkt4018              fail
+  tokenize             fail
+  tpch01               fail
+  trace                fail
+  trace2               fail
+  trace3               fail
+  trans                fail
+  trans2               fail
+  trans3               fail
+  transitive1          fail
+  trigger1             fail
+  trigger2             fail
+  trigger3             fail
+  trigger4             fail
+  trigger5             pass
+  trigger6             pass
+  trigger7             fail
+  trigger8             pass
+  trigger9             fail
+  triggerA             fail
+  triggerB             fail
+  triggerC             fail
+  triggerD             fail
+  triggerE             fail
+  triggerF             fail
+  triggerG             fail
+  triggerupfrom        fail
+  trustschema1         fail
+  types                fail
+  types2               pass
+  types3               fail
+  unhex                fail
+  unionall             fail
+  unionall2            pass
+  unionvtab            fail
+  unique               fail
+  unique2              fail
+  unixexcl             fail
+  unordered            fail
+  update               fail
+  update2              fail
+  upfrom1              fail
+  upfrom2              fail
+  upfrom3              fail
+  upfrom4              fail
+  upsert1              fail
+  upsert2              fail
+  upsert3              fail
+  upsert4              fail
+  upsert5              fail
+  uri                  fail
+  uri2                 fail
+  utf16align           fail
+  vacuum               fail
+  vacuum-into          fail
+  vacuum3              fail
+  vacuum4              fail
+  vacuum5              fail
+  vacuum6              fail
+  vacuummem            fail
+  values               fail
+  varint               pass
+  veryquick            fail
+  view                 fail
+  view2                pass
+  view3                skip {hangs at view3-1.1}
+  wal                  fail
+  wal2                 fail
+  wal3                 fail
+  wal4                 fail
+  wal5                 fail
+  wal6                 fail
+  wal7                 fail
+  wal8                 pass
+  wal9                 fail
+  walbak               fail
+  walbig               pass
+  walblock             fail
+  walcksum             fail
+  walhook              fail
+  walmode              fail
+  walnoshm             fail
+  waloverwrite         fail
+  walpersist           fail
+  walprotocol          fail
+  walprotocol2         fail
+  walro                fail
+  walro2               fail
+  walseh1              fail
+  walsetlk             fail
+  walsetlk2            fail
+  walsetlk3            fail
+  walsetlk_recover     fail
+  walsetlk_snapshot    fail
+  walshared            fail
+  walslow              fail
+  walvfs               fail
+  where                fail
+  where2               fail
+  where3               fail
+  where4               fail
+  where5               pass
+  where6               fail
+  where7               fail
+  where8               fail
+  where9               fail
+  whereA               fail
+  whereB               pass
+  whereC               pass
+  whereD               fail
+  whereE               pass
+  whereF               fail
+  whereG               fail
+  whereH               fail
+  whereI               fail
+  whereJ               fail
+  whereK               fail
+  whereL               fail
+  whereM               fail
+  whereN               fail
+  wherelimit           fail
+  wherelimit2          fail
+  wherelimit3          fail
+  widetab1             fail
+  win32heap            fail
+  win32lock            fail
+  win32longpath        fail
+  win32nolock          fail
+  window1              fail
+  window2              pass
+  window3              skip {hangs at window3-1.17.13.4}
+  window4              fail
+  window5              fail
+  window6              fail
+  window7              pass
+  window8              pass
+  window9              fail
+  windowA              pass
+  windowB              fail
+  windowC              fail
+  windowD              pass
+  windowE              fail
+  windowerr            pass
+  windowpushd          fail
+  with1                fail
+  with2                fail
+  with3                fail
+  with4                fail
+  with5                fail
+  with6                fail
+  withM                fail
+  without_rowid1       fail
+  without_rowid2       fail
+  without_rowid3       fail
+  without_rowid4       fail
+  without_rowid5       fail
+  without_rowid6       fail
+  without_rowid7       fail
+  zeroblob             fail
+  zerodamage           fail
 }
+
+# Aggregate counters; tester.tcl only initializes these if they don't exist.
+set TC(errors) 0
+set TC(count) 0
+set TC(fail_list) [list]
+
+# Runner variables use a __runner_ prefix so a sourced test file can't
+# accidentally clobber them with its own globals.
+set __runner_results [list]
+set __runner_blessed_failed [list]
+set __runner_xpassed [list]
+
+# The list above mixes 2-field (pass/fail) and 3-field (skip + reason)
+# entries, so walk it manually instead of with foreach.
+set __runner_i 0
+while {$__runner_i < [llength $test_files]} {
+  set __runner_name [lindex $test_files $__runner_i]
+  set __runner_status [lindex $test_files [expr {$__runner_i + 1}]]
+  incr __runner_i 2
+  set __runner_reason ""
+  if {$__runner_status eq "skip"} {
+    set __runner_reason [lindex $test_files $__runner_i]
+    incr __runner_i
+  }
+
+  if {$__runner_status eq "skip"} {
+    lappend __runner_results [list $__runner_name SKIP 0 0 $__runner_reason]
+    continue
+  }
+
+  set testprefix ""
+
+  # Run each test file in its own tclsh process. A file that hard-crashes the
+  # engine - a segfault, an abort, a stack overflow, or the OOM killer - takes
+  # down only its own process, so the run keeps going and the report names the
+  # file that died and the signal that killed it, instead of the whole suite
+  # aborting silently with no summary. A plain Tcl error in the file surfaces
+  # the same way, as a non-zero exit.
+  #
+  # Each file is self-contained (it sources tester.tcl and calls finish_test),
+  # so running it standalone prints its own "All N tests passed!" or "N errors
+  # out of M tests" line, which we parse below for this file's counts.
+  set __runner_crashed 0
+  set __runner_out ""
+  set __runner_rc [catch {
+    exec [info nameofexecutable] $testdir/$__runner_name.test 2>@1
+  } __runner_out __runner_opts]
+  puts $__runner_out
+  if {$__runner_rc
+      && [lindex [dict get $__runner_opts -errorcode] 0] eq "CHILDKILLED"} {
+    set __runner_crashed 1
+    set __runner_signal [lindex [dict get $__runner_opts -errorcode] 2]
+    puts "CRASH in $__runner_name.test: killed by signal $__runner_signal"
+  }
+
+  # Derive this file's counts from the summary line its finish_test printed. A
+  # file that crashed before finishing leaves both at 0, and the crash flag
+  # above still marks it.
+  set __runner_ntest 0
+  set __runner_nerr 0
+  if {[regexp {All (\d+) tests passed!} $__runner_out -> __runner_m]} {
+    set __runner_ntest $__runner_m
+  } elseif {[regexp {(\d+) errors out of (\d+) tests} \
+                 $__runner_out -> __runner_e __runner_t]} {
+    set __runner_nerr $__runner_e
+    set __runner_ntest $__runner_t
+  }
+  incr TC(count) $__runner_ntest
+  incr TC(errors) $__runner_nerr
+
+  if {$__runner_status eq "pass"} {
+    if {$__runner_crashed || $__runner_nerr > 0} {
+      lappend __runner_blessed_failed $__runner_name
+      set __runner_verdict [expr {$__runner_crashed ? "CRASH" : "FAIL"}]
+    } else {
+      set __runner_verdict "OK"
+    }
+  } else {
+    if {$__runner_crashed} {
+      set __runner_verdict "XCRASH"
+    } elseif {$__runner_nerr > 0} {
+      set __runner_verdict "XFAIL"
+    } elseif {$__runner_ntest == 0} {
+      # The file ran no tests (e.g. it self-disables on this platform), so
+      # a clean exit says nothing about the engine; don't count it as a
+      # fully-passing file that needs blessing.
+      set __runner_verdict "EMPTY"
+    } else {
+      lappend __runner_xpassed $__runner_name
+      set __runner_verdict "XPASS"
+    }
+  }
+  lappend __runner_results \
+      [list $__runner_name $__runner_verdict $__runner_ntest $__runner_nerr ""]
+}
+
+set __runner_namew [string length "File"]
+foreach __runner_row $__runner_results {
+  set __runner_len [string length "[lindex $__runner_row 0].test"]
+  if {$__runner_len > $__runner_namew} {
+    set __runner_namew $__runner_len
+  }
+}
+set __runner_tablew [expr {$__runner_namew + 25}]
+
+puts ""
+puts [string repeat = $__runner_tablew]
+puts [format "%-${__runner_namew}s %-7s %7s %7s" File Result Tests Failed]
+puts [string repeat - $__runner_tablew]
+foreach __runner_row $__runner_results {
+  lassign $__runner_row __runner_name __runner_verdict \
+      __runner_ntest __runner_nerr __runner_reason
+  set __runner_note ""
+  if {$__runner_reason ne ""} {
+    set __runner_note "  ($__runner_reason)"
+  }
+  puts [format "%-${__runner_namew}s %-7s %7d %7d%s" $__runner_name.test \
+      $__runner_verdict $__runner_ntest $__runner_nerr $__runner_note]
+}
+puts [string repeat - $__runner_tablew]
+set __runner_pct 0.0
+if {$TC(count) > 0} {
+  set __runner_pct \
+      [expr {100.0 * ($TC(count) - $TC(errors)) / $TC(count)}]
+}
+puts [format "Total: %d/%d tests passed (%.1f%%)" \
+    [expr {$TC(count) - $TC(errors)}] $TC(count) $__runner_pct]
+
+set __runner_exit 0
+if {[llength $__runner_blessed_failed] > 0} {
+  puts ""
+  puts "Blessed test files regressed: $__runner_blessed_failed"
+  set __runner_exit 1
+}
+if {[llength $__runner_xpassed] > 0} {
+  puts ""
+  puts "Known-bad test files now fully pass: $__runner_xpassed"
+  puts "Bless them by changing their status from \"fail\" to \"pass\" in all.test."
+  set __runner_exit 1
+}
+puts ""
+if {$__runner_exit == 0} {
+  puts "OK"
+} else {
+  puts "FAILED"
+}
+puts [string repeat = $__runner_tablew]
+exit $__runner_exit
