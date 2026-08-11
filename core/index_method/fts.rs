@@ -2232,7 +2232,12 @@ impl FtsCursor {
         // Using prefix=false for full n-gram (not just prefix)
         let (min_gram, max_gram) = self.ngram_window;
         if let Ok(ngram) = NgramTokenizer::new(min_gram, max_gram, false) {
-            tokenizers.register("ngram", ngram);
+            // Lowercase the n-grams so matching is case-insensitive, like the
+            // other tokenizers.
+            let analyzer = TextAnalyzer::builder(ngram)
+                .filter(tantivy::tokenizer::LowerCaser)
+                .build();
+            tokenizers.register("ngram", analyzer);
         }
     }
 
