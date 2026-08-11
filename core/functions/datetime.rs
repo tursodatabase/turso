@@ -542,6 +542,15 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             }
             if p.raw_s {
                 let r = p.s * 1000.0 + 210866760000000.0;
+                // Range check before the cast, as SQLite's date.c does. `as i64`
+                // saturates, so an out-of-range value would park i64::MIN in
+                // `i_jd`, which 'localtime'/'utc' then subtract the epoch from.
+                // The check in exec_datetime_general runs too late. Rejects NaN.
+                if !(r >= 0.0 && r < (MAX_JD + 1) as f64) {
+                    return Err(InvalidModifier(format!(
+                        "Unixepoch value out of range: {z}"
+                    )));
+                }
                 p.i_jd = (r + 0.5) as i64;
                 p.valid_jd = true;
                 p.raw_s = false;
@@ -1103,62 +1112,86 @@ where
     d1.compute_ymd_hms();
     d2.compute_ymd_hms();
 
+    // Month arithmetic is not symmetric: adding a month clamps a day-of-month
+    // overflow forward, so subtracting a month is not the inverse of adding
+    // one. To keep datetime(B, timediff(A, B)) == datetime(A), the Y/M shift
+    // must be applied to the second argument (d2) in the same direction that
+    // the resulting modifier will be applied, exactly as SQLite does.
     let sign: char;
+    let mut y: i32;
+    let mut m: i32;
+    let diff_ms: i64;
     if d1.i_jd >= d2.i_jd {
         sign = '+';
+        y = d1.y - d2.y;
+        if y != 0 {
+            d2.y = d1.y;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        m = d1.m - d2.m;
+        if m < 0 {
+            y -= 1;
+            m += 12;
+        }
+        if m != 0 {
+            d2.m = d1.m;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        // If shifting d2 forward by Y years and M months overshot d1, back
+        // off one month at a time.
+        while d1.i_jd < d2.i_jd {
+            m -= 1;
+            if m < 0 {
+                m = 11;
+                y -= 1;
+            }
+            d2.m -= 1;
+            if d2.m < 1 {
+                d2.m = 12;
+                d2.y -= 1;
+            }
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        diff_ms = d1.i_jd - d2.i_jd;
     } else {
         sign = '-';
-        std::mem::swap(&mut d1, &mut d2);
-    }
-
-    let mut y = d1.y - d2.y;
-    let mut m = d1.m - d2.m;
-
-    if m < 0 {
-        y -= 1;
-        m += 12;
-    }
-
-    let mut temp = d2;
-    temp.y += y;
-    temp.m += m;
-
-    // Normalize months
-    while temp.m > 12 {
-        temp.m -= 12;
-        temp.y += 1;
-    }
-    while temp.m < 1 {
-        temp.m += 12;
-        temp.y -= 1;
-    }
-
-    temp.valid_jd = false;
-    temp.compute_jd();
-
-    // Adjust if the Y/M shift overshot d1
-    while temp.i_jd > d1.i_jd {
-        m -= 1;
+        y = d2.y - d1.y;
+        if y != 0 {
+            d2.y = d1.y;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        m = d2.m - d1.m;
         if m < 0 {
-            m = 11;
             y -= 1;
+            m += 12;
         }
-        temp = d2;
-        temp.y += y;
-        temp.m += m;
-        while temp.m > 12 {
-            temp.m -= 12;
-            temp.y += 1;
+        if m != 0 {
+            d2.m = d1.m;
+            d2.valid_jd = false;
+            d2.compute_jd();
         }
-        while temp.m < 1 {
-            temp.m += 12;
-            temp.y -= 1;
+        // If shifting d2 backward by Y years and M months overshot d1, move
+        // forward one month at a time.
+        while d1.i_jd > d2.i_jd {
+            m -= 1;
+            if m < 0 {
+                m = 11;
+                y -= 1;
+            }
+            d2.m += 1;
+            if d2.m > 12 {
+                d2.m = 1;
+                d2.y += 1;
+            }
+            d2.valid_jd = false;
+            d2.compute_jd();
         }
-        temp.valid_jd = false;
-        temp.compute_jd();
+        diff_ms = d2.i_jd - d1.i_jd;
     }
-
-    let diff_ms = d1.i_jd - temp.i_jd;
     let days = diff_ms / 86400000;
     let rem_ms = diff_ms % 86400000;
     let hours = rem_ms / 3600000;

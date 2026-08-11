@@ -12,13 +12,13 @@ use std::rc::Rc;
 use crate::alloc::vec;
 use crate::alloc::*;
 use crate::io::TempFile;
-use crate::types::{IOCompletions, ValueIterator};
+use crate::types::{cmp_in_column, cmp_with_sort, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
-    types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
+    types::{IOResult, ImmutableRecord, KeyInfo, RecordBuf, ValueRef},
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
@@ -27,6 +27,109 @@ use crate::{io_yield_one, return_if_io, CompletionError};
 /// Takes two value references and returns an Ordering.
 /// Used when a custom type defines a `<` operator for correct sort behavior.
 pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Result<Ordering> + Send + Sync>;
+
+/// Bit position of the 3-bit class rank in a normalized key.
+const NORM_CLASS_SHIFT: u32 = 61;
+
+/// Order-preserving 64-bit prefix of the first sort-key column.
+///
+/// Layout: 3-bit class rank | 61-bit payload. Class ranks follow the SQL type
+/// ordering (NULL < numeric < text < blob), with NULL remapped above blob when
+/// the effective NULLS placement requires it. The whole key is bit-inverted for
+/// DESC so a plain `u64` comparison applies the sort direction.
+///
+/// Invariant: `norm < other_norm` implies the full key comparison orders this
+/// record first, so the sort comparator only falls back to the full (collation
+/// and comparator aware) comparison when two normalized keys are equal. The
+/// returned `decisive` flag is true when equal normalized keys additionally
+/// prove the full keys are equal, letting the comparator skip the fallback.
+fn normalized_first_key(
+    values: &[ValueRef<'_>],
+    key_info: &[KeyInfo],
+    comparators: &[Option<SortComparator>],
+) -> (u64, bool) {
+    use crate::numeric::Numeric;
+    let (Some(value), Some(key)) = (values.first(), key_info.first()) else {
+        return (0, false);
+    };
+    if comparators.first().is_some_and(|c| c.is_some()) {
+        // Custom ordering: the normalized key cannot mirror it.
+        return (0, false);
+    }
+    let (norm, mut decisive) = match value {
+        ValueRef::Null => {
+            // Rank NULL above blobs when it must sort after non-NULL values in
+            // the pre-inversion key space. With `nulls_order` unset the natural
+            // rank is correct for ASC, and the DESC bit inversion below moves
+            // NULL last, matching the reversed comparison.
+            let rank_high = match (key.nulls_order, key.sort_order) {
+                (None, _) => false,
+                (Some(turso_parser::ast::NullsOrder::First), SortOrder::Asc) => false,
+                (Some(turso_parser::ast::NullsOrder::First), SortOrder::Desc) => true,
+                (Some(turso_parser::ast::NullsOrder::Last), SortOrder::Asc) => true,
+                (Some(turso_parser::ast::NullsOrder::Last), SortOrder::Desc) => false,
+            };
+            (
+                if rank_high {
+                    4u64 << NORM_CLASS_SHIFT
+                } else {
+                    0
+                },
+                true,
+            )
+        }
+        ValueRef::Numeric(n) => {
+            // Map both integers and floats through the monotone f64 encoding so
+            // cross-type comparisons stay ordered (rounding to nearest is
+            // monotone). Equal-after-truncation pairs fall back to the exact
+            // comparison; `decisive` only covers integers whose f64 form is
+            // exact and injective after dropping the low 3 mantissa bits.
+            let (f, exact) = match n {
+                Numeric::Integer(i) => (*i as f64, i.unsigned_abs() < (1u64 << 49)),
+                Numeric::Float(f) => (f64::from(*f), false),
+            };
+            let f = if f == 0.0 { 0.0 } else { f }; // collapse -0.0 with +0.0
+            let bits = f.to_bits();
+            let monotone = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits | (1u64 << 63)
+            };
+            ((1u64 << NORM_CLASS_SHIFT) | (monotone >> 3), exact)
+        }
+        ValueRef::Text(t) => {
+            if !matches!(key.collation, CollationSeq::Unset | CollationSeq::Binary) {
+                // Non-binary collation: constant key, always full comparison.
+                (2u64 << NORM_CLASS_SHIFT, false)
+            } else {
+                let bytes = t.value.as_bytes();
+                (normalized_prefix(2, bytes), bytes.len() <= 7)
+            }
+        }
+        ValueRef::Blob(b) => (normalized_prefix(3, b), b.len() <= 7),
+    };
+    decisive &= values.len() == 1 && key_info.len() == 1;
+    (
+        if key.sort_order == SortOrder::Desc {
+            !norm
+        } else {
+            norm
+        },
+        decisive,
+    )
+}
+
+/// Packs the first 7 bytes (big-endian) and a length capped at 8 into the
+/// 61-bit payload. With equal prefixes the capped length orders a string
+/// against its zero-padded extension correctly, and ties beyond the prefix
+/// (both lengths >= 8) fall back to the full comparison.
+fn normalized_prefix(class: u64, bytes: &[u8]) -> u64 {
+    let mut prefix = [0u8; 8];
+    let n = bytes.len().min(7);
+    prefix[..n].copy_from_slice(&bytes[..n]);
+    let p56 = u64::from_be_bytes(prefix) >> 8;
+    (class << NORM_CLASS_SHIFT) | (p56 << 5) | (bytes.len().min(8) as u64)
+}
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -258,6 +361,17 @@ impl Sorter {
         self.current.as_ref()
     }
 
+    /// Moves the current record out of the sorter, seeding the next
+    /// [Sorter::next] call with `spent`'s allocation. This lets SorterData
+    /// transfer records to a register with no allocation or payload copy.
+    pub fn take_current(&mut self, spent: RecordBuf) -> Option<ImmutableRecord> {
+        let current = self.current.take();
+        if current.is_some() {
+            self.current = Some(ImmutableRecord::from_buf(spent));
+        }
+        current
+    }
+
     pub fn insert(&mut self, record: &ImmutableRecord) -> Result<IOResult<()>> {
         let payload_size = record.get_payload().len();
         loop {
@@ -364,7 +478,7 @@ impl Sorter {
             if !completion.succeeded() {
                 // IO not complete - put it back and yield
                 self.pending_completion = Some((completion.clone(), chunk_idx));
-                return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                return Ok(IOResult::IO(IOCompletions(completion)));
             }
             // IO completed - push result to heap and retry
             if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
@@ -760,6 +874,10 @@ struct ArenaSortableRecord {
     index_key_info: NonNull<[KeyInfo]>,
     /// Shared comparators owned by Sorter. Same safety model as index_key_info.
     comparators: NonNull<[Option<SortComparator>]>,
+    /// Order-preserving prefix of the first key column; see [normalized_first_key].
+    norm_key: u64,
+    /// True when equal `norm_key`s prove the full keys are equal.
+    norm_decisive: bool,
 }
 
 impl ArenaSortableRecord {
@@ -787,11 +905,16 @@ impl ArenaSortableRecord {
             key_values.push(value);
         }
 
+        let key_values = key_values.into_bump_slice();
+        let (norm_key, norm_decisive) =
+            normalized_first_key(key_values, index_key_info, comparators);
         Ok(Self {
             payload: NonNull::from(payload),
-            key_values: NonNull::from(key_values.into_bump_slice()),
+            key_values: NonNull::from(key_values),
             index_key_info: NonNull::from(index_key_info),
             comparators: NonNull::from(comparators),
+            norm_key,
+            norm_decisive,
         })
     }
 
@@ -816,9 +939,9 @@ impl ArenaSortableRecord {
     }
 }
 
-impl Ord for ArenaSortableRecord {
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
+impl ArenaSortableRecord {
+    /// Full key comparison; only reached when the normalized keys tie.
+    fn full_cmp(&self, other: &Self) -> Ordering {
         let self_values = self.key_values();
         let other_values = other.key_values();
         // SAFETY: index_key_info and comparators point to Sorter-owned data that outlives all records.
@@ -832,36 +955,29 @@ impl Ord for ArenaSortableRecord {
             .enumerate()
         {
             let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                comparator(&self_val, &other_val).expect("Memory allocation failed here")
+                let base =
+                    comparator(&self_val, &other_val).expect("Memory allocation failed here");
+                cmp_with_sort(base, &self_val, &other_val, key_info)
             } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
+                cmp_in_column(&self_val, &other_val, key_info)
             };
             if cmp != Ordering::Equal {
-                let involves_null =
-                    matches!(self_val, ValueRef::Null) || matches!(other_val, ValueRef::Null);
-                if involves_null {
-                    if let Some(nulls_order) = key_info.nulls_order {
-                        // ValueRef ordering: NULL < non-NULL.
-                        // NULLS FIRST: keep that natural order regardless of ASC/DESC.
-                        // NULLS LAST: reverse it regardless of ASC/DESC.
-                        return match nulls_order {
-                            turso_parser::ast::NullsOrder::First => cmp,
-                            turso_parser::ast::NullsOrder::Last => cmp.reverse(),
-                        };
-                    }
-                }
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+                return cmp;
             }
         }
+
         Ordering::Equal
+    }
+}
+
+impl Ord for ArenaSortableRecord {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.norm_key.cmp(&other.norm_key) {
+            Ordering::Equal if self.norm_decisive && other.norm_decisive => Ordering::Equal,
+            Ordering::Equal => self.full_cmp(other),
+            ord => ord,
+        }
     }
 }
 
@@ -887,6 +1003,10 @@ struct BoxedSortableRecord {
     index_key_info: Rc<Vec<KeyInfo>>,
     comparators: Rc<Vec<Option<SortComparator>>>,
     deserialization_error: Option<LimboError>,
+    /// Order-preserving prefix of the first key column; see [normalized_first_key].
+    norm_key: u64,
+    /// True when equal `norm_key`s prove the full keys are equal.
+    norm_decisive: bool,
 }
 
 impl BoxedSortableRecord {
@@ -924,23 +1044,23 @@ impl BoxedSortableRecord {
             }
         }
 
+        let (norm_key, norm_decisive) =
+            normalized_first_key(&key_values, &index_key_info, &comparators);
         Ok(Self {
             record,
             key_values,
             index_key_info,
             comparators,
             deserialization_error,
+            norm_key,
+            norm_decisive,
         })
     }
 }
 
-impl Ord for BoxedSortableRecord {
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.deserialization_error.is_some() || other.deserialization_error.is_some() {
-            return Ordering::Equal;
-        }
-
+impl BoxedSortableRecord {
+    /// Full key comparison; only reached when the normalized keys tie.
+    fn full_cmp(&self, other: &Self) -> Ordering {
         for (i, ((&self_val, &other_val), key_info)) in self
             .key_values
             .iter()
@@ -958,24 +1078,26 @@ impl Ord for BoxedSortableRecord {
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
             };
+            let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
             if cmp != Ordering::Equal {
-                let involves_null =
-                    matches!(self_val, ValueRef::Null) || matches!(other_val, ValueRef::Null);
-                if involves_null {
-                    if let Some(nulls_order) = key_info.nulls_order {
-                        return match nulls_order {
-                            turso_parser::ast::NullsOrder::First => cmp,
-                            turso_parser::ast::NullsOrder::Last => cmp.reverse(),
-                        };
-                    }
-                }
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+                return cmp;
             }
         }
         Ordering::Equal
+    }
+}
+
+impl Ord for BoxedSortableRecord {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.deserialization_error.is_some() || other.deserialization_error.is_some() {
+            return Ordering::Equal;
+        }
+        match self.norm_key.cmp(&other.norm_key) {
+            Ordering::Equal if self.norm_decisive && other.norm_decisive => Ordering::Equal,
+            Ordering::Equal => self.full_cmp(other),
+            ord => ord,
+        }
     }
 }
 
@@ -1027,6 +1149,118 @@ mod tests {
                     .expect("Failed to parse SEED environment variable as u64")
             },
         ) as u64
+    }
+
+    #[test]
+    fn fuzz_normalized_key_invariant() {
+        use crate::types::AsValueRef;
+        use turso_parser::ast::NullsOrder;
+        let seed = get_seed();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+        // Values chosen to stress every branch: type boundaries, f64 exactness
+        // limits, shared prefixes, embedded NULs, lengths straddling 7 bytes.
+        let gen_value = |rng: &mut ChaCha8Rng| -> Value {
+            match rng.next_u64() % 10 {
+                0 => Value::Null,
+                1 => Value::from_i64(rng.next_u64() as i64),
+                2 => Value::from_i64((rng.next_u64() % 100) as i64 - 50),
+                3 => {
+                    // Integers around the 2^49..2^53 exactness boundaries.
+                    let base = 1i64 << (48 + rng.next_u64() % 8);
+                    Value::from_i64(base + (rng.next_u64() % 5) as i64 - 2)
+                }
+                4 => {
+                    let numerator = rng.next_u64() as f64;
+                    let denominator = (rng.next_u64() as f64).abs().max(1.0);
+                    Value::from_f64(numerator / denominator)
+                }
+                5 => Value::from_f64(if rng.next_u64() % 2 == 0 { 0.0 } else { -0.0 }),
+                6..=8 => {
+                    let alphabet = [b'a', b'b', b'\0'];
+                    let len = (rng.next_u64() % 10) as usize;
+                    let s: String = (0..len)
+                        .map(|_| alphabet[(rng.next_u64() % 3) as usize] as char)
+                        .collect();
+                    Value::build_text(s)
+                }
+                _ => {
+                    let len = (rng.next_u64() % 10) as usize;
+                    let mut blob = try_vec![0u8; len].unwrap();
+                    rng.fill_bytes(&mut blob);
+                    Value::Blob(blob)
+                }
+            }
+        };
+
+        let gen_key = |rng: &mut ChaCha8Rng| KeyInfo {
+            sort_order: if rng.next_u64() % 2 == 0 {
+                SortOrder::Asc
+            } else {
+                SortOrder::Desc
+            },
+            collation: CollationSeq::Binary,
+            nulls_order: match rng.next_u64() % 3 {
+                0 => None,
+                1 => Some(NullsOrder::First),
+                _ => Some(NullsOrder::Last),
+            },
+        };
+
+        for _ in 0..200_000 {
+            // Half the iterations use a two-column key so the multi-column path
+            // is covered: the normalized key still encodes only the first
+            // column, and `decisive` must never be set (else equal first
+            // columns would wrongly short-circuit past the second column).
+            let ncols = 1 + (rng.next_u64() % 2) as usize;
+            // Fixed-size arrays sliced to `ncols`: the crate's `Vec` alias is
+            // allocator-parameterized under the nightly cfg and has no
+            // `FromIterator`, so `collect()` into it would not compile.
+            let va = [gen_value(&mut rng), gen_value(&mut rng)];
+            let vb = [gen_value(&mut rng), gen_value(&mut rng)];
+            let keys = [gen_key(&mut rng), gen_key(&mut rng)];
+            let comparators: [Option<SortComparator>; 2] = [None, None];
+            let ra = [va[0].as_value_ref(), va[1].as_value_ref()];
+            let rb = [vb[0].as_value_ref(), vb[1].as_value_ref()];
+
+            let (norm_a, dec_a) =
+                normalized_first_key(&ra[..ncols], &keys[..ncols], &comparators[..ncols]);
+            let (norm_b, dec_b) =
+                normalized_first_key(&rb[..ncols], &keys[..ncols], &comparators[..ncols]);
+            // The normalized key only ever reflects the first column.
+            let a = &ra[0];
+            let b = &rb[0];
+            let key = &keys[0];
+            let reference = cmp_in_column(a, b, key);
+
+            if ncols > 1 {
+                assert!(
+                    !dec_a && !dec_b,
+                    "multi-column keys must never be decisive: {va:?} vs {vb:?} keys {keys:?}"
+                );
+            }
+            match norm_a.cmp(&norm_b) {
+                Ordering::Equal => {
+                    if dec_a && dec_b {
+                        assert_eq!(
+                            reference,
+                            Ordering::Equal,
+                            "decisive equal norms must mean equal keys: {va:?} vs {vb:?} keys {keys:?}"
+                        );
+                    }
+                }
+                ord => {
+                    // A strict normalized order must match the first-column
+                    // reference exactly: it may never contradict the reference,
+                    // and it may never separate keys the reference deems equal
+                    // (that would split GROUP BY groups or skip a later column).
+                    assert_eq!(
+                        ord, reference,
+                        "strict norm order must match reference: {va:?} vs {vb:?} keys {keys:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1127,5 +1361,208 @@ mod tests {
             values.push(value);
         }
         values
+    }
+
+    fn assert_secondary_key_sort(
+        second_order: SortOrder,
+        second_nulls: Option<turso_parser::ast::NullsOrder>,
+        seconds: &[Value],
+        expected: &[ValueRef],
+    ) {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, second_order],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, second_nulls].unwrap(),
+            try_vec![None, None].unwrap(),
+            1 << 20,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        for second in seconds {
+            let values = try_vec![Value::from_i64(1), second.clone()].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record))
+                .expect("Failed to insert the record");
+        }
+
+        io.block(|| sorter.sort())
+            .expect("Failed to sort the records");
+        assert!(sorter.chunks.is_empty());
+
+        let mut idx = 0;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                assert_eq!(vals[1], expected[idx]);
+            }
+            idx += 1;
+            io.block(|| sorter.next())
+                .expect("Failed to get the next record");
+        }
+        assert_eq!(idx, expected.len());
+    }
+
+    #[test]
+    fn spilled_sort_orders_secondary_key_across_chunks() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, SortOrder::Asc],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, None].unwrap(),
+            try_vec![None, None].unwrap(),
+            // Tiny buffer so the sorter spills to multiple chunk files.
+            256,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        let n = 200;
+        // Equal first key, ascending second key on insert.
+        for x in 0..n {
+            let values = try_vec![Value::from_i64(1), Value::from_i64(x)].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record))
+                .expect("Failed to insert the record");
+        }
+
+        io.block(|| sorter.sort())
+            .expect("Failed to sort the records");
+        assert!(
+            !sorter.chunks.is_empty(),
+            "test requires the sorter to have spilled to chunks"
+        );
+
+        let mut idx = 0;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                assert_eq!(
+                    vals[1],
+                    ValueRef::from_i64(idx),
+                    "secondary key out of order at position {idx}"
+                );
+            }
+            idx += 1;
+            io.block(|| sorter.next())
+                .expect("Failed to get the next record");
+        }
+        assert_eq!(idx, n);
+    }
+
+    #[test]
+    fn spilled_sort_places_nulls_last_across_chunks() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, SortOrder::Asc],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, Some(turso_parser::ast::NullsOrder::Last)].unwrap(),
+            try_vec![None, None].unwrap(),
+            256,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        let n = 200;
+        for x in 0..n {
+            let second = if x % 2 == 0 {
+                Value::Null
+            } else {
+                Value::from_i64(x)
+            };
+            let values = try_vec![Value::from_i64(1), second].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record)).unwrap();
+        }
+
+        io.block(|| sorter.sort()).unwrap();
+        assert!(
+            !sorter.chunks.is_empty(),
+            "test requires the sorter to have spilled to chunks"
+        );
+
+        let mut idx = 0;
+        let mut prev = None;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                match vals[1] {
+                    ValueRef::Null => {
+                        assert!(idx >= n / 2, "NULL emitted before all non-NULL values");
+                    }
+                    v => {
+                        assert!(idx < n / 2, "non-NULL value {v:?} emitted after NULL block");
+                        let current = match v {
+                            ValueRef::Numeric(crate::numeric::Numeric::Integer(i)) => i,
+                            other => panic!("unexpected value {other:?}"),
+                        };
+                        if let Some(prev) = prev {
+                            assert!(current > prev);
+                        }
+                        prev = Some(current);
+                    }
+                }
+            }
+            idx += 1;
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(idx, n);
+    }
+
+    #[test]
+    fn in_memory_sort_applies_desc_on_secondary_key() {
+        let seconds = try_vec![
+            Value::from_i64(10),
+            Value::from_i64(40),
+            Value::from_i64(20),
+            Value::from_i64(30)
+        ]
+        .unwrap();
+        assert_secondary_key_sort(
+            SortOrder::Desc,
+            None,
+            &seconds,
+            &[
+                ValueRef::from_i64(40),
+                ValueRef::from_i64(30),
+                ValueRef::from_i64(20),
+                ValueRef::from_i64(10),
+            ],
+        );
+    }
+
+    #[test]
+    fn in_memory_sort_places_nulls_last_on_desc_secondary_key() {
+        let seconds = try_vec![
+            Value::Null,
+            Value::from_i64(10),
+            Value::Null,
+            Value::from_i64(20)
+        ]
+        .unwrap();
+        assert_secondary_key_sort(
+            SortOrder::Desc,
+            Some(turso_parser::ast::NullsOrder::Last),
+            &seconds,
+            &[
+                ValueRef::from_i64(20),
+                ValueRef::from_i64(10),
+                ValueRef::Null,
+                ValueRef::Null,
+            ],
+        );
     }
 }

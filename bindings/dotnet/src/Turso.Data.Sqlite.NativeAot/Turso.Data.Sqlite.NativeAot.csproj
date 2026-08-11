@@ -4,11 +4,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
-    <PackageId>Turso.Data.Sqlite.NativeAot.$(NativeAotRid)</PackageId>
+    <PackageId>Turso.Data.NativeAot.$(NativeAotRid)</PackageId>
     <Title>Turso NativeAOT static library ($(NativeAotRid))</Title>
-    <Description>RID-specific static native library assets for NativeAOT publishing with Turso.Data.Sqlite.</Description>
+    <Description>RID-specific static native library assets for NativeAOT publishing with Turso .NET providers.</Description>
     <Authors>Turso authors</Authors>
-    <PackageTags>turso;sqlite;database;nativeaot;static;$(NativeAotRid)</PackageTags>
+    <PackageTags>turso;database;nativeaot;static;$(NativeAotRid)</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
     <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
@@ -42,7 +42,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="buildTransitive\Turso.Data.Sqlite.NativeAot.targets"
+    <None Include="buildTransitive\Turso.Data.NativeAot.targets"
           Pack="true"
           PackagePath="buildTransitive\$(PackageId).targets" />
     <None Include="$(_NativeAotLibraryPath)"
@@ -67,7 +67,7 @@
     </ItemGroup>
 
     <Error Condition="'$(NativeAotRid)' == ''"
-           Text="NativeAotRid is required when packing Turso.Data.Sqlite.NativeAot." />
+           Text="NativeAotRid is required when packing Turso.Data.NativeAot." />
     <Error Condition="'$(NativeAotTarget)' == ''"
            Text="Unsupported NativeAotRid '$(NativeAotRid)'." />
     <Error Condition="'$(_NativeAotLibraryPath)' == '' or !Exists('$(_NativeAotLibraryPath)')"

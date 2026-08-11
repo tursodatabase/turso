@@ -190,3 +190,52 @@ expect @js {
     -2
 }
 
+
+# `dims` was derived by subtracting a raw, caller-controlled blob byte from a
+# length computed from the blob, so a hostile trailing-bits or trailing-bytes
+# value wrapped and produced an out-of-range slice.
+
+test vector-1bit-trailing-bits-overflow {
+    SELECT vector_extract(x'00FF03');
+}
+expect error {
+    float1bit vector trailing bits 255 exceed blob capacity
+}
+
+test vector-f8-blob-too-short {
+    SELECT vector_extract(x'000004');
+}
+expect error {
+    float8 vector blob of 2 bytes is too short for 0 trailing bytes
+}
+
+test vector-f8-trailing-bytes-overflow {
+    SELECT vector_extract(x'0000000A04');
+}
+expect error {
+    float8 vector blob of 4 bytes is too short for 10 trailing bytes
+}
+
+# Sparse `idx` entries come from the blob and are used to index a dense
+# `dims`-element buffer, so they must be checked against `dims` when parsed.
+
+test vector-sparse-index-out-of-range {
+    SELECT vector_extract(x'0000803FFFFFFFFF0100000009');
+}
+expect error {
+    f32 sparse vector index 4294967295 out of range for 1 dims
+}
+
+test vector-sparse-index-out-of-range-convert {
+    SELECT vector32(x'0000803FFFFFFFFF0100000009');
+}
+expect error {
+    f32 sparse vector index 4294967295 out of range for 1 dims
+}
+
+test vector-sparse-valid-still-parses {
+    SELECT vector_extract(x'0000803F000000000300000009');
+}
+expect {
+    [1,0,0]
+}

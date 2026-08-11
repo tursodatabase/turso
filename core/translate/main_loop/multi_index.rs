@@ -282,6 +282,7 @@ fn emit_in_seek_multi_index_branch(
             target_pc: next_value_label,
             is_index: true,
             eq_only: false,
+            null_matching_mask: Default::default(),
         });
         program.preassign_label_to_next_insn(branch_loop_start);
         program.emit_insn(Insn::IdxGT {

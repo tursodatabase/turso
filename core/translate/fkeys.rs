@@ -370,7 +370,7 @@ where
 ///
 /// Used when an FK parent-side probe needs the matching child rowid, for
 /// example to ignore the row currently being updated in a self-referential FK.
-fn index_scan_match_any<F>(
+pub(super) fn index_scan_match_any<F>(
     program: &mut ProgramBuilder,
     icur: usize,
     probe_start: usize,
@@ -389,6 +389,7 @@ where
         num_regs,
         target_pc: done,
         eq_only: true,
+        null_matching_mask: Default::default(),
     });
 
     let loop_top = program.allocate_label();
@@ -429,7 +430,7 @@ where
     Ok(())
 }
 
-fn emit_skip_if_any_null(
+pub(super) fn emit_skip_if_any_null(
     program: &mut ProgramBuilder,
     reg_start: usize,
     nregs: usize,
@@ -1785,8 +1786,6 @@ fn generate_cascade_delete_stmt(
         indexed: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
         returning: vec![],
-        order_by: vec![],
-        limit: None,
     }
 }
 
@@ -1815,8 +1814,6 @@ fn generate_set_null_stmt(
         from: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
         returning: vec![],
-        order_by: vec![],
-        limit: None,
     })
 }
 
@@ -1853,8 +1850,6 @@ fn generate_set_default_stmt(
         from: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
         returning: vec![],
-        order_by: vec![],
-        limit: None,
     })
 }
 
@@ -1896,8 +1891,6 @@ fn generate_cascade_update_stmt(
         from: None,
         where_clause: Some(Box::new(where_clause)),
         returning: vec![],
-        order_by: vec![],
-        limit: None,
     })
 }
 

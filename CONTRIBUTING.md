@@ -288,6 +288,14 @@ Or using `choco` on Windows:
 choco install sqlite
 ```
 
+The Rust C compatibility tests also require a static SQLite installation from
+[vcpkg](https://github.com/microsoft/vcpkg):
+
+```powershell
+$env:VCPKG_ROOT = "C:\path\to\vcpkg"
+vcpkg install sqlite3:x64-windows-static-md
+```
+
 ### Running the tests
 To run the test suite with Turso, simply run:
 
@@ -305,7 +313,7 @@ When working on a new feature, please consider adding a test case for it.
 
 ## SQL Test Runner
 
-The `test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
+The `sqltest` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
 Tests should be added to `sqlite/conformance/sqlite-sqltests/` using the `.sqltest` format.
 
 To run tests:
@@ -314,7 +322,7 @@ To run tests:
 make -C sqlite/conformance run
 ```
 
-For full documentation on the DSL syntax and CLI usage, see the [test-runner docs](testing/sqltests/docs/).
+For full documentation on the DSL syntax and CLI usage, see the [sqltest docs](testing/sqltest/docs/).
 
 ## TPC-H
 

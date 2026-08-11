@@ -410,16 +410,10 @@ mod tests {
     ) -> crate::Result<Arc<Database>> {
         let file = io.open_file(path, OpenFlags::Create, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Database::open_with_flags_with_allocator(
+        Database::open(
             io.clone(),
             path,
-            db_file,
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-            None,
-            crate::alloc::DynAllocator::default(),
-            dialect,
+            crate::OpenOptions::new(dialect).storage(db_file),
         )
     }
 

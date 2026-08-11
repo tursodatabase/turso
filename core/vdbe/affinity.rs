@@ -537,8 +537,17 @@ fn create_result_from_significand(
         }
     }
 
-    // For pure integers without exponent, try to return as integer
-    if !has_decimal && !has_exponent && exponent == 0 && significand <= i64::MAX as u64 {
+    // For pure integers without exponent, try to return as integer.
+    // The digits were accumulated as an unsigned magnitude, so the limit is
+    // sign-dependent: a negative number may reach |i64::MIN| == i64::MAX + 1.
+    // This mirrors sqlite3Atoi64, which compares against "9223372036854775807"
+    // for positives and "9223372036854775808" for negatives.
+    let magnitude_limit = if sign < 0 {
+        i64::MAX as u64 + 1
+    } else {
+        i64::MAX as u64
+    };
+    if !has_decimal && !has_exponent && exponent == 0 && significand <= magnitude_limit {
         let signed_val = (significand as i64).wrapping_mul(sign);
         return (parse_result, ParsedNumber::Integer(signed_val));
     }
@@ -749,5 +758,40 @@ mod tests {
             "try_for_float precision mismatch: got {}, expected {expected}",
             parsed.as_float().unwrap(),
         );
+    }
+
+    #[test]
+    fn test_try_for_float_i64_min_is_integer() {
+        // |i64::MIN| is one past i64::MAX, so the integer range check has to be
+        // sign-dependent the way sqlite3Atoi64 is.
+        let (res, parsed) = try_for_float(b"-9223372036854775808");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        let (res, parsed) = try_for_float(b"  -9223372036854775808  ");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        let (res, parsed) = try_for_float(b"-009223372036854775808");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        // One past the negative limit, and the positive twin, stay floats.
+        let (_, parsed) = try_for_float(b"-9223372036854775809");
+        assert_eq!(parsed.as_integer(), None);
+        let (_, parsed) = try_for_float(b"9223372036854775808");
+        assert_eq!(parsed.as_integer(), None);
+
+        // The limits that already worked must keep working.
+        let (_, parsed) = try_for_float(b"-9223372036854775807");
+        assert_eq!(parsed.as_integer(), Some(-i64::MAX));
+        let (_, parsed) = try_for_float(b"9223372036854775807");
+        assert_eq!(parsed.as_integer(), Some(i64::MAX));
+
+        // The magnitude is only integral when it is a bare integer.
+        let (_, parsed) = try_for_float(b"-9223372036854775808.0");
+        assert_eq!(parsed.as_integer(), None);
+        let (_, parsed) = try_for_float(b"-9.223372036854775808e18");
+        assert_eq!(parsed.as_integer(), None);
     }
 }

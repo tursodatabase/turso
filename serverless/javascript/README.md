@@ -90,11 +90,11 @@ They apply to that call only and are merged over the connection-level
 `requestHeaders`, so a query can override a header the connection sets:
 
 ```javascript
-await conn.execute("SELECT * FROM users", [], {
+await conn.all("SELECT * FROM users", {
   requestHeaders: { "X-Turso-Request-Identity": "abc123" },
 });
 
-// Also accepted by run()/get()/all()/iterate() and prepared statements:
+// Also accepted by run()/get()/iterate() and prepared statements:
 await conn.run("INSERT INTO users (email) VALUES (?)", "user@example.com", {
   requestHeaders: { "X-Turso-Request-Identity": "abc124" },
 });

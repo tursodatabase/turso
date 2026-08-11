@@ -584,8 +584,8 @@ pub fn insn_to_row(
                         name
                     }
                     CursorType::BTreeIndex(index) => {
-                        let name = &index.columns.get(*column).expect("column index out of bounds").name;
-                        Some(name)
+                        let name = index.columns.get(*column).map(|c| &c.name);
+                        name
                     }
                     CursorType::MaterializedView(table, _) => {
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
@@ -594,7 +594,10 @@ pub fn insn_to_row(
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::IndexMethod(..) => None,
-                    CursorType::VirtualTable(v) => v.columns.get(*column).expect("column index out of bounds").name.as_ref(),
+                    CursorType::VirtualTable(v) => {
+                        let name = v.columns.get(*column).and_then(|c| c.name.as_ref());
+                        name
+                    }
                 };
                 (
                     "Column",
@@ -608,6 +611,43 @@ pub fn insn_to_row(
                         dest,
                         get_table_or_index_name(*cursor_id),
                         &column_name.map_or_else(|| format!("column {}", *column), |name| name.to_string())
+                    ),
+                )
+            }
+            Insn::ColumnRange {
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+            } => {
+                let count = defaults.len();
+                let cursor_type = &program.cursor_ref[*cursor_id].1;
+                let column_name = |column: usize| -> String {
+                    let name: Option<&String> = match cursor_type {
+                        CursorType::BTreeTable(table) => {
+                            table.columns().get(column).and_then(|v| v.name.as_ref())
+                        }
+                        CursorType::BTreeIndex(index) => index.columns.get(column).map(|c| &c.name),
+                        _ => {
+                            None
+                        }
+                    };
+                    name.map_or_else(|| format!("column {column}"), |name| name.to_string())
+                };
+                (
+                    "ColumnRange",
+                    *cursor_id as i64,
+                    *start_column as i64,
+                    *dest as i64,
+                    Value::from_i64(count as i64),
+                    0,
+                    format!(
+                        "r[{}..{}]={}.{}..{}",
+                        dest,
+                        dest + count - 1,
+                        get_table_or_index_name(*cursor_id),
+                        column_name(*start_column),
+                        column_name(*start_column + count - 1),
                     ),
                 )
             }
@@ -1029,6 +1069,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::ChangeCount { dest } => (
+                "ChangeCount",
+                0,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!("r[{dest}]=changes"),
+            ),
             Insn::Real { value, dest } => (
                 "Real",
                 0,
@@ -1261,14 +1310,33 @@ pub fn insn_to_row(
                 delimiter: _,
                 col,
                 comparator: _,
+                collation,
             } => (
                 "AggStep",
                 0,
                 *col as i64,
                 *acc_reg as i64,
-                Value::build_text(func.as_str()),
+                Value::build_text(match collation {
+                    Some(collation) => format!("{}({collation})", func.as_str()),
+                    None => func.as_str().to_string(),
+                }),
                 0,
                 format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
+            ),
+            Insn::AggInverse {
+                func,
+                acc_reg,
+                delimiter: _,
+                col,
+                comparator: _,
+            } => (
+                "AggInverse",
+                0,
+                *col as i64,
+                *acc_reg as i64,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] inverse(r[{}])", *acc_reg, *col),
             ),
             Insn::AggFinal { register, func } => (
                 "AggFinal",
@@ -1279,7 +1347,11 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}]", *register),
             ),
-            Insn::AggValue { acc_reg, dest_reg, func } => (
+            Insn::AggValue {
+                acc_reg,
+                dest_reg,
+                func,
+            } => (
                 "AggValue",
                 0,
                 *acc_reg as i64,
@@ -1920,7 +1992,9 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::ParseSchema { db, where_clause } => (
+            Insn::ParseSchema {
+                db, where_clause, ..
+            } => (
                 "ParseSchema",
                 *db as i64,
                 0,
@@ -2159,6 +2233,15 @@ pub fn insn_to_row(
                 0,
                 format!("goto {}", target_pc_when_reentered.as_debug_int()),
             ),
+            Insn::ResetOnce { region_end } => (
+                "ResetOnce",
+                region_end.as_debug_int() as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("clear once flags before {}", region_end.as_debug_int()),
+            ),
             Insn::BeginSubrtn { dest, dest_end } => (
                 "BeginSubrtn",
                 *dest as i64,
@@ -2338,15 +2421,6 @@ pub fn insn_to_row(
                 0,
                 format!("r[{dest}]=journal_mode(db[{db}]{})",
                     new_mode.as_ref().map_or(String::new(), |m| format!(",'{m}'"))),
-            ),
-            Insn::CollSeq { reg, collation } => (
-                "CollSeq",
-                reg.unwrap_or(0) as i64,
-                0,
-                0,
-                Value::build_text(collation.to_string()),
-                0,
-                format!("collation={collation}"),
             ),
             Insn::IfNeg { reg, target_pc } => (
                 "IfNeg",

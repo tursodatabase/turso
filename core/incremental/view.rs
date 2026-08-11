@@ -1327,7 +1327,9 @@ impl IncrementalView {
                                 return Err(LimboError::Busy);
                             }
 
-                            crate::vdbe::StepResult::IO | crate::vdbe::StepResult::Yield => {
+                            crate::vdbe::StepResult::IO
+                            | crate::vdbe::StepResult::Yield
+                            | crate::vdbe::StepResult::Sleep { .. } => {
                                 // Statement needs I/O - save state and return
                                 self.populate_state = PopulateState::ProcessingOneTable {
                                     queries,
@@ -1338,9 +1340,7 @@ impl IncrementalView {
                                 };
                                 // TODO: Get the actual I/O completion from the statement
                                 let completion = crate::io::Completion::new_yield();
-                                return Ok(IOResult::IO(crate::types::IOCompletions::Single(
-                                    completion,
-                                )));
+                                return Ok(IOResult::IO(crate::types::IOCompletions(completion)));
                             }
                         }
                     }

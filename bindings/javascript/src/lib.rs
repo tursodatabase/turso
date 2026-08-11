@@ -40,6 +40,7 @@ type StatementHandle = Arc<RefCell<Option<turso_core::Statement>>>;
 const STEP_ROW: u32 = 1;
 const STEP_DONE: u32 = 2;
 const STEP_IO: u32 = 3;
+const STEP_SLEEP: u32 = 4;
 
 /// The presentation mode for rows.
 #[derive(Debug, Clone)]
@@ -198,15 +199,23 @@ pub struct TableColumn {
     pub database: Option<()>,
 }
 
-fn step_sync(stmt: &StatementHandle) -> napi::Result<u32> {
+/// Step one statement. Returns the step constant plus the requested sleep in
+/// milliseconds, which is nonzero only for `STEP_SLEEP`.
+fn step_sync(stmt: &StatementHandle) -> napi::Result<(u32, u32)> {
     let mut guard = stmt.borrow_mut();
     let core_stmt = guard
         .as_mut()
         .ok_or_else(|| create_generic_error("statement has been finalized"))?;
     match core_stmt.step() {
-        Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
-        Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => Ok(STEP_IO),
-        Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
+        Ok(turso_core::StepResult::Row) => Ok((STEP_ROW, 0)),
+        Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => Ok((STEP_IO, 0)),
+        Ok(turso_core::StepResult::Sleep { duration }) => {
+            // Round sub-millisecond delays up to 1ms: a 0ms setTimeout would
+            // make the JS step loop spin without letting the backoff expire.
+            let sleep_ms = duration.as_millis().clamp(1, u32::MAX as u128) as u32;
+            Ok((STEP_SLEEP, sleep_ms))
+        }
+        Ok(turso_core::StepResult::Done) => Ok((STEP_DONE, 0)),
         Ok(turso_core::StepResult::Interrupt) => {
             Err(create_generic_error("statement was interrupted"))
         }
@@ -650,11 +659,13 @@ pub struct BatchExecutor {
 
 #[napi]
 impl BatchExecutor {
+    /// Step the current statement. Returns `[step, sleepMs]`; `sleepMs` is the
+    /// delay to wait before stepping again and is nonzero only for `STEP_SLEEP`.
     #[napi]
-    pub fn step_sync(&mut self) -> Result<u32> {
+    pub fn step_sync(&mut self) -> Result<(u32, u32)> {
         loop {
             if self.stmt.is_none() && self.position >= self.sql.len() {
-                return Ok(STEP_DONE);
+                return Ok((STEP_DONE, 0));
             }
             if self.stmt.is_none() {
                 let conn = self.conn.as_ref().unwrap();
@@ -669,13 +680,13 @@ impl BatchExecutor {
                             .set_query_timeout_override(self.query_timeout_override);
                         self.stmt = Some(stmt);
                     }
-                    Ok(None) => return Ok(STEP_DONE),
+                    Ok(None) => return Ok((STEP_DONE, 0)),
                     Err(err) => return Err(to_generic_error("failed to consume stmt", err)),
                 }
             }
             let stmt = self.stmt.as_ref().unwrap();
             match step_sync(stmt) {
-                Ok(STEP_DONE) => {
+                Ok((STEP_DONE, _)) => {
                     let _ = self.stmt.take();
                     continue;
                 }
@@ -827,10 +838,12 @@ impl Statement {
         Ok(())
     }
 
-    /// Step the statement and return result code (executed on the main thread):
-    /// 1 = Row available, 2 = Done, 3 = I/O needed
+    /// Step the statement (executed on the main thread). Returns `[step, sleepMs]`
+    /// where `step` is 1 = Row available, 2 = Done, 3 = I/O needed, 4 = Sleep
+    /// requested, and `sleepMs` is the delay to wait before stepping again
+    /// (nonzero only for `STEP_SLEEP`).
     #[napi]
-    pub fn step_sync(&self) -> Result<u32> {
+    pub fn step_sync(&self) -> Result<(u32, u32)> {
         step_sync(self.statement_handle()?)
     }
 
@@ -863,10 +876,9 @@ impl Statement {
                 to_js_value(env, value, safe_integers)?
             }
             PresentationMode::Expanded => {
-                let mut row = Object::new(env)?;
+                let row = Object::new(env)?;
                 let raw_row = row.raw();
                 let raw_env = env.raw();
-                let mut positional_properties = Vec::with_capacity(row_data.len());
                 for idx in 0..row_data.len() {
                     let value = row_data.get_value(idx);
                     let column_name = &self.column_names[idx];
@@ -879,16 +891,7 @@ impl Statement {
                             js_value.raw(),
                         )
                     })?;
-                    positional_properties.push(
-                        Property::new()
-                            .with_utf8_name(&idx.to_string())?
-                            .with_value(&js_value)
-                            .with_property_attributes(
-                                PropertyAttributes::Writable | PropertyAttributes::Configurable,
-                            ),
-                    );
                 }
-                row.define_properties(&positional_properties)?;
                 row.to_unknown()
             }
         };

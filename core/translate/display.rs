@@ -61,7 +61,7 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
                         format!("SCAN {table_name}")
                     }
                 }
-                Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                Scan::VirtualTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCteInput => {
                     format!("SCAN {table_name}")
                 }
             }
@@ -222,11 +222,18 @@ impl Display for Plan {
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
-                    for (expr, dir, nulls) in order_by {
+                    for (expr, dir, nulls, _) in order_by {
                         fmt_order_by_item(f, expr, *dir, *nulls)?;
                     }
                 }
                 Ok(())
+            }
+            Self::RecursiveCte(plan) => {
+                writeln!(f, "RECURSIVE CTE {}", plan.name)?;
+                writeln!(f, "INITIAL QUERY:")?;
+                plan.initial_query.fmt(f)?;
+                writeln!(f, "RECURSIVE QUERY:")?;
+                plan.recursive_query.fmt(f)
             }
             Self::Delete(delete_plan) => delete_plan.fmt(f),
             Self::Update(update_plan) => update_plan.fmt(f),
@@ -280,7 +287,9 @@ impl Display for SelectPlan {
                                 writeln!(f, "{indent}SCAN {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             writeln!(f, "{indent}SCAN {table_name}")?;
                         }
                     }
@@ -302,9 +311,14 @@ impl Display for SelectPlan {
                             seek_def,
                         } => {
                             let constraints = seek_constraint_annotation(index, seek_def);
+                            let covering = if reference.utilizes_covering_index() {
+                                "COVERING "
+                            } else {
+                                ""
+                            };
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                                "{indent}SEARCH {} USING {covering}INDEX {}{constraints}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }
@@ -316,9 +330,14 @@ impl Display for SelectPlan {
                             } else {
                                 String::new()
                             };
+                            let covering = if reference.utilizes_covering_index() {
+                                "COVERING "
+                            } else {
+                                ""
+                            };
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
+                                "{indent}SEARCH {} USING {covering}INDEX {}{constraint}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }
@@ -403,7 +422,9 @@ impl Display for DeletePlan {
                                 writeln!(f, "{indent}DELETE FROM {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             writeln!(f, "{indent}DELETE FROM {table_name}")?;
                         }
                     }
@@ -529,7 +550,9 @@ impl fmt::Display for UpdatePlan {
                                 writeln!(f, "{indent}{action} {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             if i == 0 {
                                 writeln!(f, "{indent}UPDATE {table_name}")?;
                             } else {
@@ -588,9 +611,6 @@ impl fmt::Display for UpdatePlan {
                     unreachable!("Update plan should not have multi-index scans");
                 }
             }
-        }
-        if let Some(limit) = self.limit.as_ref() {
-            writeln!(f, "LIMIT: {limit}")?;
         }
         if let Some(ret) = &self.returning {
             writeln!(f, "RETURNING:")?;
@@ -671,7 +691,7 @@ impl ToTokens for Plan {
                     s.comma(
                         order_by
                             .iter()
-                            .map(|(col_idx, order, nulls)| ast::SortedColumn {
+                            .map(|(col_idx, order, nulls, _)| ast::SortedColumn {
                                 expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                                     (col_idx + 1).to_string(),
                                 ))),
@@ -691,6 +711,15 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_OFFSET, None)?;
                     s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
                 }
+            }
+            Self::RecursiveCte(plan) => {
+                plan.initial_query.to_tokens(s, context)?;
+                if plan.union_all {
+                    ast::CompoundOperator::UnionAll.to_tokens(s, context)?;
+                } else {
+                    ast::CompoundOperator::Union.to_tokens(s, context)?;
+                }
+                plan.recursive_query.to_tokens(s, context)?;
             }
             Self::Delete(delete) => delete.to_tokens(s, context)?,
             Self::Update(update) => update.to_tokens(s, context)?,
@@ -713,7 +742,7 @@ impl ToTokens for JoinedTable {
         _context: &C,
     ) -> Result<(), S::Error> {
         match &self.table {
-            Table::BTree(..) | Table::Virtual(..) => {
+            Table::BTree(..) | Table::Virtual(..) | Table::RecursiveCteInput(..) => {
                 let name = self.table.get_name();
                 s.append(TokenType::TK_ID, Some(name))?;
                 if self.identifier != name {
@@ -918,32 +947,6 @@ impl ToTokens for DeletePlan {
             }
         }
 
-        if !self.order_by.is_empty() {
-            s.append(TokenType::TK_ORDER, None)?;
-            s.append(TokenType::TK_BY, None)?;
-
-            s.comma(
-                self.order_by
-                    .iter()
-                    .map(|(expr, order, nulls)| ast::SortedColumn {
-                        expr: expr.clone(),
-                        order: Some(*order),
-                        nulls: *nulls,
-                    }),
-                context,
-            )?;
-        }
-
-        if let Some(limit) = &self.limit {
-            s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
-        }
-
-        if let Some(offset) = &self.offset {
-            s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
-        }
-
         Ok(())
     }
 }
@@ -996,15 +999,6 @@ impl ToTokens for UpdatePlan {
                 s.append(TokenType::TK_AND, None)?;
                 expr.to_tokens(s, context)?;
             }
-        }
-
-        if let Some(limit) = &self.limit {
-            s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
-        }
-        if let Some(offset) = &self.offset {
-            s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
         }
 
         Ok(())

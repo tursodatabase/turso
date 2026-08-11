@@ -19,4 +19,4 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-`--SEARCH o USING INDEX idx_orders_customer (customer_id=?)
+`--SEARCH o USING COVERING INDEX idx_orders_customer (customer_id=?)

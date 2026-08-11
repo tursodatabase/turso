@@ -12,7 +12,7 @@ use crate::stats::AnalyzeStats;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
-    BranchReadMode, ChosenInSeekCandidate, ResidualConstraintMode,
+    BranchReadMode, ChosenInSeekCandidate,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
@@ -21,7 +21,7 @@ use crate::translate::optimizer::constraints::{
 };
 use crate::translate::optimizer::cost::{
     estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
-    AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
+    where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::optimizer::AvailableIndexes;
@@ -184,8 +184,11 @@ fn get_table_local_constraints_for_branch(
         {
             continue;
         }
-        constraint.constraining_expr =
-            Some(constraint.get_constraining_expr(&synthetic_where_terms, Some(table_references)));
+        constraint.constraining_expr = Some(constraint.get_constraining_expr(
+            &synthetic_where_terms,
+            Some(table_references),
+            None,
+        ));
     }
     Ok((synthetic_where_terms, table_constraints))
 }
@@ -382,7 +385,7 @@ fn choose_multi_index_branch_access(
                 index: chosen.index.clone(),
                 access: MultiIdxBranchAccess::Seek {
                     constraints: table_constraints.constraints.clone(),
-                    constraint_refs: chosen.constraint_refs.clone(),
+                    constraint_refs: chosen.constraint_refs.to_vec(),
                 },
                 cost: branch_cost,
                 estimated_rows: estimate_rows_per_seek(
@@ -665,6 +668,19 @@ fn evaluate_multi_index_branches(
     let mut branch_params = Vec::with_capacity(branches.len());
 
     for branch in branches {
+        let where_cost = branch
+            .union_prepost_filters
+            .as_ref()
+            .map(|filters| {
+                let pre_steps: usize = filters.pre_filter_exprs.iter().map(where_expr_steps).sum();
+                let post_steps: usize =
+                    filters.post_filter_exprs.iter().map(where_expr_steps).sum();
+                Cost(
+                    (pre_steps as f64 + branch.estimated_rows * post_steps as f64)
+                        * params.cpu_cost_per_where_step,
+                )
+            })
+            .unwrap_or(Cost(0.0));
         let post_filter_exprs = branch
             .union_prepost_filters
             .as_ref()
@@ -702,7 +718,7 @@ fn evaluate_multi_index_branches(
             residuals: branch.union_prepost_filters,
         };
 
-        branch_costs.push(branch.cost);
+        branch_costs.push(branch.cost + where_cost);
         branch_rows.push(params_for_branch.estimated_rows);
         branch_params.push(params_for_branch);
     }
@@ -750,7 +766,6 @@ fn evaluate_multi_index_branches(
         Some(AccessMethod {
             cost: multi_index_cost,
             estimated_rows_per_outer_row: estimated_rows,
-            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
             consumed_where_terms,
             params: AccessMethodParams::MultiIndexScan {
                 branches: branch_params,
@@ -761,6 +776,25 @@ fn evaluate_multi_index_branches(
     } else {
         None
     }
+}
+
+/// Whether a multi-index scan on `table` may be driven by `term`.
+///
+/// The scan *is* the term's evaluation: rows failing it are never visited, and
+/// the term is marked consumed so nothing checks it again. For a table that an
+/// outer join can null-extend (the right-hand table of a LEFT/FULL JOIN, or
+/// any table on the left side of a FULL JOIN) that only holds for the join's
+/// own ON clause, which defines what counts as a match. Any other term must
+/// also reject the null-extended row the join emits when nothing matched, and
+/// that row is produced by jumping straight past the scan — so consuming such
+/// a term silently drops it.
+fn multi_index_can_consume_term(
+    table: &JoinedTable,
+    term: &WhereTerm,
+    table_references: &TableReferences,
+) -> bool {
+    !table_references.outer_join_may_null_extend(table.internal_id)
+        || term.from_outer_join == Some(table.internal_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -798,6 +832,9 @@ fn analyze_and_terms_for_multi_index(
 
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed || matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _)) {
+            continue;
+        }
+        if !multi_index_can_consume_term(table_reference, term, table_references) {
             continue;
         }
 
@@ -943,6 +980,9 @@ pub fn consider_multi_index_union(
 ) -> Result<Option<AccessMethod>> {
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
+            continue;
+        }
+        if !multi_index_can_consume_term(rhs_table, term, table_references) {
             continue;
         }
 
@@ -1206,7 +1246,7 @@ mod tests {
         MAIN_DB_ID,
     };
     use std::{collections::VecDeque, sync::Arc};
-    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
     struct TestColumn {
         name: String,
@@ -1362,14 +1402,7 @@ mod tests {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "id".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
+                columns: IndexColumn::new_many(vec!["id"]),
                 unique: false,
                 ephemeral: false,
                 root_page: 2,
@@ -1513,14 +1546,7 @@ mod tests {
                 name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "a".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
+                columns: crate::alloc::vec![IndexColumn::new("a", 1)],
                 unique: false,
                 ephemeral: false,
                 root_page: 2,
@@ -1628,24 +1654,7 @@ mod tests {
                 name: "idx_item_id_kind".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![
-                    IndexColumn {
-                        name: "id".to_string(),
-                        order: SortOrder::Asc,
-                        pos_in_table: 0,
-                        collation: None,
-                        default: None,
-                        expr: None,
-                    },
-                    IndexColumn {
-                        name: "kind".to_string(),
-                        order: SortOrder::Asc,
-                        pos_in_table: 1,
-                        collation: None,
-                        default: None,
-                        expr: None,
-                    },
-                ],
+                columns: IndexColumn::new_many(vec!["id", "kind"]),
                 unique: false,
                 ephemeral: false,
                 root_page: 2,
@@ -1826,14 +1835,7 @@ mod tests {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "id".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
+                columns: IndexColumn::new_many(vec!["id"]),
                 unique: false,
                 ephemeral: false,
                 root_page: 2,

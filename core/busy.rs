@@ -43,7 +43,7 @@ impl std::fmt::Debug for BusyHandler {
 ///
 /// This implements a yield-based busy handling mechanism that integrates with
 /// the async event loop. Instead of blocking with `thread::sleep`, the statement
-/// yields back to the caller with `StepResult::IO` and a timeout. When `step()`
+/// yields back to the caller with `StepResult::Sleep { duration }`. When `step()`
 /// is called again after the timeout has passed, it retries the operation.
 ///
 /// Uses increasing delays. After 12 iterations, continues with 100ms delays until max duration is reached.

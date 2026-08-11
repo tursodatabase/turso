@@ -1,14 +1,14 @@
 # Turso SQL conformance test Makefile
 #
-# The .sqltest corpora live here; the test-runner crate lives in
-# testing/sqltests. All test-runner invocations run with this directory as
+# The .sqltest corpora live here; the sqltest runner crate lives in
+# testing/sqltest. All sqltest invocations run with this directory as
 # the working directory so that relative @database paths in the corpora
 # (e.g. database/integrity_*.db) resolve against sqlite/conformance/database.
 
 # Paths
 ROOT_DIR := $(shell cd ../.. && pwd)
 SQLITE := $(ROOT_DIR)/.sqlite3/sqlite3
-RUNNER_DIR := $(ROOT_DIR)/testing/sqltests
+RUNNER_DIR := $(ROOT_DIR)/testing/sqltest
 
 # Use release mode in CI, debug mode locally
 ifdef CI
@@ -20,7 +20,7 @@ else
 endif
 
 TURSODB := $(ROOT_DIR)/target/$(TARGET_DIR)/tursodb
-TEST_RUNNER := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin test-runner $(CARGO_PROFILE)
+TEST_RUNNER := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CARGO_PROFILE)
 
 # Test corpora (relative to this directory)
 SQLITE_TESTS := sqlite-sqltests

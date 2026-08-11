@@ -4,7 +4,8 @@ use crate::SqlGen;
 use crate::ast::{
     BinOp, CompoundOperator, CompoundSelectArm, CteDefinition, CteMaterialization, Expr,
     FromClause, GroupByClause, JoinClause, JoinConstraint, JoinType, Literal, NullsOrder,
-    OrderByItem, OrderDirection, SelectColumn, SelectStmt, WithClause,
+    OrderByItem, OrderDirection, SelectColumn, SelectStmt, WindowFrame, WindowFrameBoundary,
+    WindowFrameExclude, WindowFrameMode, WithClause,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -13,7 +14,7 @@ use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;
-use crate::policy::SelectConfig;
+use crate::policy::{SelectConfig, WindowFramePolicy};
 use crate::schema::{ColumnDef, DataType, Table};
 use crate::trace::Origin;
 use sql_gen_macros::trace_gen;
@@ -256,11 +257,12 @@ fn generate_select_impl_inner<C: Capabilities>(
     // --- DISTINCT ---
     let distinct = match mode {
         SelectMode::Full => ctx.gen_bool_with_prob(select_config.distinct_probability),
-        // Scalar: only when not grouped
-        SelectMode::Scalar => {
-            group_by.is_none()
-                && ctx.gen_bool_with_prob(select_config.subquery_distinct_probability)
-        }
+        // Scalar subqueries carry LIMIT 1, and DISTINCT makes that pick
+        // undecidable: when duplicates collapse, which duplicate's ORDER BY
+        // key survives is the engine's choice, so SQLite and Turso can return
+        // different rows and both are allowed. No tiebreaker can help because
+        // a unique column cannot be added through the deduplication.
+        SelectMode::Scalar => false,
     };
 
     let from = {
@@ -287,20 +289,24 @@ fn generate_select_impl_inner<C: Capabilities>(
     // --- Compound SELECT decision ---
     // Only at top level (not inside subqueries) since Turso doesn't support
     // compound SELECTs in subquery positions yet.
+    let compound_column_types = compound_column_types(&columns, ctx);
     let is_compound = mode == SelectMode::Full
         && ctx.subquery_depth() == 0
         && joins.is_empty()
         && group_by.is_none()
+        && compound_column_types.as_ref().is_some_and(|column_types| {
+            generator.schema().tables.iter().any(|table| {
+                column_types
+                    .iter()
+                    .all(|data_type| table.columns_of_type(*data_type).next().is_some())
+            })
+        })
         && ctx.gen_bool_with_prob(select_config.compound_probability);
 
     if is_compound {
-        let num_result_cols = if columns.is_empty() {
-            // SELECT * — count columns from primary table
-            ctx.tables_in_scope()[0].table.columns.len()
-        } else {
-            columns.len()
-        };
-        let compounds = generate_compound_arms(generator, ctx, num_result_cols)?;
+        let column_types = compound_column_types.as_ref().unwrap();
+        let num_result_cols = column_types.len();
+        let compounds = generate_compound_arms(generator, ctx, column_types)?;
 
         // ORDER BY for compounds uses positional indices (1..N)
         let mut order_by = if ctx.gen_bool_with_prob(select_config.compound_order_by_probability) {
@@ -358,6 +364,47 @@ fn generate_select_impl_inner<C: Capabilities>(
             } else {
                 generate_order_by(generator, ctx)?
             };
+        }
+
+        // A scalar subquery's LIMIT 1 must pick the same row in both engines,
+        // and an ORDER BY key with duplicate values leaves the pick to scan
+        // order. Grouped: order by every GROUP BY expression — groups are
+        // distinct combinations of them, so that is a total order. Ungrouped:
+        // append the table's primary key as a final tiebreaker.
+        if mode == SelectMode::Scalar {
+            if let Some(gb) = &group_by {
+                let covered: Vec<String> = order_by.iter().map(|i| i.expr.to_string()).collect();
+                for expr in &gb.exprs {
+                    if !covered.contains(&expr.to_string()) {
+                        let direction =
+                            select_order_direction(ctx, &select_config.order_direction_weights);
+                        order_by.push(OrderByItem {
+                            expr: expr.clone(),
+                            direction,
+                            nulls: None,
+                        });
+                    }
+                }
+            } else {
+                let scoped = &ctx.tables_in_scope()[0];
+                let qualifier = scoped.qualifier.clone();
+                let pk = scoped
+                    .table
+                    .columns
+                    .iter()
+                    .find(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "rowid".to_string());
+                let direction = select_order_direction(ctx, &select_config.order_direction_weights);
+                order_by.push(OrderByItem {
+                    expr: Expr::ColumnRef(crate::ast::ColumnRef {
+                        table: Some(qualifier),
+                        column: pk,
+                    }),
+                    direction,
+                    nulls: None,
+                });
+            }
         }
 
         Ok(SelectStmt {
@@ -642,17 +689,25 @@ fn generate_select_columns<C: Capabilities>(
             let num_cols = ctx.gen_range_inclusive((*range.start()).max(1), *range.end());
             let mut columns = Vec::with_capacity(num_cols);
             let restrict = select_config.restrict_mixed_aggregates;
+            let window_prob = select_config.window_function_probability.clamp(0.0, 1.0);
 
             for i in 0..num_cols {
-                let expr = generate_expr(generator, ctx, 0)?;
-                // When restricting mixed aggregates and there is no GROUP BY,
-                // an expression that mixes aggregate calls with bare column
-                // refs (e.g. `COUNT(a) + b`) is invalid SQL.  Replace it with
-                // a plain column reference.
-                let expr = if restrict && expr.contains_aggregate() && expr.contains_column_ref() {
-                    pick_scoped_column_ref(ctx)?
+                // Window functions are only valid as a result-column expression
+                // (or in ORDER BY of the same SELECT). We don't recurse: the
+                // window function call itself is the projection.
+                let expr = if window_prob > 0.0 && ctx.gen_bool_with_prob(window_prob) {
+                    generate_window_function(ctx, select_config.window_frame_policy)?
                 } else {
-                    expr
+                    let e = generate_expr(generator, ctx, 0)?;
+                    // When restricting mixed aggregates and there is no GROUP BY,
+                    // an expression that mixes aggregate calls with bare column
+                    // refs (e.g. `COUNT(a) + b`) is invalid SQL. Replace it with
+                    // a plain column reference.
+                    if restrict && e.contains_aggregate() && e.contains_column_ref() {
+                        pick_scoped_column_ref(ctx)?
+                    } else {
+                        e
+                    }
                 };
                 columns.push(SelectColumn {
                     expr,
@@ -665,6 +720,268 @@ fn generate_select_columns<C: Capabilities>(
             }
             Ok(columns)
         }
+    }
+}
+
+/// The set of built-in window functions Turso supports. Mirrors
+/// SQLite's built-in list at `window.c:610-625`.
+const BUILTIN_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
+    ("row_number", WindowFnArity::ZeroArg),
+    ("rank", WindowFnArity::ZeroArg),
+    ("dense_rank", WindowFnArity::ZeroArg),
+    ("percent_rank", WindowFnArity::ZeroArg),
+    ("cume_dist", WindowFnArity::ZeroArg),
+    ("ntile", WindowFnArity::Ntile),
+    ("lag", WindowFnArity::LagLead),
+    ("lead", WindowFnArity::LagLead),
+    ("first_value", WindowFnArity::OneArg),
+    ("last_value", WindowFnArity::OneArg),
+    ("nth_value", WindowFnArity::NthValue),
+];
+
+const AGGREGATE_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
+    ("sum", WindowFnArity::OneArg),
+    ("total", WindowFnArity::OneArg),
+    ("count", WindowFnArity::OneArg),
+    ("avg", WindowFnArity::OneArg),
+    ("min", WindowFnArity::OneArg),
+    ("max", WindowFnArity::OneArg),
+    ("group_concat", WindowFnArity::Concat),
+    ("string_agg", WindowFnArity::Concat),
+    ("json_group_array", WindowFnArity::OneArg),
+];
+
+#[derive(Clone, Copy)]
+enum WindowFnArity {
+    ZeroArg,
+    OneArg,
+    Ntile,
+    NthValue,
+    LagLead,
+    Concat,
+}
+
+/// Generate a `func(...) OVER (...)` projection within the configured
+/// window-frame feature set.
+fn generate_window_function(
+    ctx: &mut Context,
+    frame_policy: WindowFramePolicy,
+) -> Result<Expr, GenError> {
+    let with_explicit_frame =
+        !matches!(frame_policy, WindowFramePolicy::CoercedOnly) && ctx.gen_bool();
+    let functions = if with_explicit_frame {
+        AGGREGATE_WINDOW_FUNCS
+    } else {
+        BUILTIN_WINDOW_FUNCS
+    };
+    let (name, arity) = *ctx
+        .choose(functions)
+        .expect("window function sets are non-empty");
+    let frame = with_explicit_frame.then(|| generate_window_frame(ctx, frame_policy));
+
+    // Pick a typed column for value args (lag/lead/first_value/etc).
+    // We restrict to columns the current scope sees; window functions
+    // are projection-only so the scope is the SELECT's FROM clause.
+    let arg_col = pick_scoped_column_ref(ctx)?;
+
+    let args: Vec<Expr> = match arity {
+        WindowFnArity::ZeroArg => Vec::new(),
+        WindowFnArity::OneArg => vec![arg_col],
+        WindowFnArity::Ntile => {
+            // ntile(N) — N must be a positive integer literal.
+            let n = ctx.gen_range_inclusive(1, 6) as i64;
+            vec![Expr::literal(ctx, Literal::Integer(n))]
+        }
+        WindowFnArity::NthValue => {
+            // nth_value(expr, N) — N must be a positive integer.
+            let n = ctx.gen_range_inclusive(1, 4) as i64;
+            vec![arg_col, Expr::literal(ctx, Literal::Integer(n))]
+        }
+        WindowFnArity::LagLead => {
+            // lag/lead take 1-3 args: expr[, offset[, default]].
+            let nargs = ctx.gen_range_inclusive(1, 3);
+            let mut a = vec![arg_col];
+            if nargs >= 2 {
+                // Negative offsets are legal and look in the opposite
+                // direction; for lag they exercise the streaming-frame
+                // miss behavior (forward lookups past the one buffered
+                // row return the default).
+                let offset = ctx.gen_range_inclusive(0, 8) as i64 - 4;
+                a.push(Expr::literal(ctx, Literal::Integer(offset)));
+            }
+            if nargs >= 3 {
+                let default = ctx.gen_range_inclusive(0, 200) as i64 - 100;
+                a.push(Expr::literal(ctx, Literal::Integer(default)));
+            }
+            a
+        }
+        WindowFnArity::Concat => vec![arg_col, pick_scoped_column_ref(ctx)?],
+    };
+
+    // Build the OVER clause: 0-2 PARTITION BY exprs, 0-2 ORDER BY
+    // exprs with the same direction. Columns picked from the SELECT
+    // scope so they're always valid.
+    let n_part = ctx.gen_range_inclusive(0, 2);
+    let range_has_offset = frame.is_some_and(|frame| {
+        matches!(frame.mode, WindowFrameMode::Range)
+            && matches!(
+                (frame.start, frame.end),
+                (
+                    WindowFrameBoundary::Preceding(_) | WindowFrameBoundary::Following(_),
+                    _
+                ) | (
+                    _,
+                    WindowFrameBoundary::Preceding(_) | WindowFrameBoundary::Following(_)
+                )
+            )
+    });
+    let n_ord = if range_has_offset {
+        1
+    } else {
+        ctx.gen_range_inclusive(0, 2)
+    };
+    let partition_by: Vec<Expr> = (0..n_part)
+        .map(|_| pick_scoped_column_ref(ctx))
+        .collect::<Result<_, _>>()?;
+    let dir = if ctx.gen_bool() {
+        OrderDirection::Asc
+    } else {
+        OrderDirection::Desc
+    };
+    let order_by: Vec<(Expr, OrderDirection)> = (0..n_ord)
+        .map(|_| pick_scoped_column_ref(ctx).map(|e| (e, dir)))
+        .collect::<Result<_, _>>()?;
+
+    // Some functions return floats whose default formatting differs
+    // between SQLite and Turso (e.g. percent_rank = 1/3). Wrap them in
+    // `printf('%.4f', ...)` so the textual comparison agrees while
+    // still exercising the same semantics.
+    let win = Expr::window_function(ctx, name.to_string(), args, partition_by, order_by, frame);
+    if matches!(name, "percent_rank" | "cume_dist") {
+        let fmt_str = Expr::literal(ctx, Literal::Text("%.4f".to_string()));
+        Ok(Expr::function_call(
+            ctx,
+            "printf".to_string(),
+            vec![fmt_str, win],
+        ))
+    } else {
+        Ok(win)
+    }
+}
+
+/// Generate an explicit frame within the configured feature set.
+fn generate_window_frame(ctx: &mut Context, frame_policy: WindowFramePolicy) -> WindowFrame {
+    match frame_policy {
+        WindowFramePolicy::CoercedOnly => {
+            unreachable!("coerced-only policy does not generate explicit frames")
+        }
+        WindowFramePolicy::Rows => generate_offset_frame(ctx, WindowFrameMode::Rows),
+        WindowFramePolicy::GroupsAndOffsetFreeRange => match ctx.gen_range(3) {
+            0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+            1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+            2 => generate_offset_free_range_frame(ctx),
+            _ => unreachable!("range is limited to three frame modes"),
+        },
+        WindowFramePolicy::RangeOffsets => match ctx.gen_range(3) {
+            0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+            1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+            2 => generate_offset_frame(ctx, WindowFrameMode::Range),
+            _ => unreachable!("range is limited to three frame modes"),
+        },
+        WindowFramePolicy::Exclude => {
+            let mut frame = match ctx.gen_range(3) {
+                0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+                1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+                2 => generate_offset_frame(ctx, WindowFrameMode::Range),
+                _ => unreachable!("range is limited to three frame modes"),
+            };
+            // Retain unexcluded frames so the latest policy continues to
+            // exercise xInverse in addition to the full-scan EXCLUDE path.
+            frame.exclude = if ctx.gen_bool() {
+                None
+            } else {
+                Some(match ctx.gen_range(4) {
+                    0 => WindowFrameExclude::NoOthers,
+                    1 => WindowFrameExclude::CurrentRow,
+                    2 => WindowFrameExclude::Group,
+                    3 => WindowFrameExclude::Ties,
+                    _ => unreachable!("range is limited to four exclusion variants"),
+                })
+            };
+            frame
+        }
+    }
+}
+
+/// Generate one of the structurally valid boundary combinations for a
+/// frame mode that supports integer offsets.
+/// The two offsets are deliberately independent so same-kind pairs also
+/// exercise frames that are empty for every row.
+fn generate_offset_frame(ctx: &mut Context, mode: WindowFrameMode) -> WindowFrame {
+    let start_offset = ctx.gen_range_inclusive(0, 4) as u64;
+    let end_offset = ctx.gen_range_inclusive(0, 4) as u64;
+    use WindowFrameBoundary as Boundary;
+    let (start, end) = match ctx.gen_range(13) {
+        0 => (
+            Boundary::UnboundedPreceding,
+            Boundary::Preceding(end_offset),
+        ),
+        1 => (Boundary::UnboundedPreceding, Boundary::CurrentRow),
+        2 => (
+            Boundary::UnboundedPreceding,
+            Boundary::Following(end_offset),
+        ),
+        3 => (Boundary::UnboundedPreceding, Boundary::UnboundedFollowing),
+        4 => (
+            Boundary::Preceding(start_offset),
+            Boundary::Preceding(end_offset),
+        ),
+        5 => (Boundary::Preceding(start_offset), Boundary::CurrentRow),
+        6 => (
+            Boundary::Preceding(start_offset),
+            Boundary::Following(end_offset),
+        ),
+        7 => (
+            Boundary::Preceding(start_offset),
+            Boundary::UnboundedFollowing,
+        ),
+        8 => (Boundary::CurrentRow, Boundary::CurrentRow),
+        9 => (Boundary::CurrentRow, Boundary::Following(end_offset)),
+        10 => (Boundary::CurrentRow, Boundary::UnboundedFollowing),
+        11 => (
+            Boundary::Following(start_offset),
+            Boundary::Following(end_offset),
+        ),
+        12 => (
+            Boundary::Following(start_offset),
+            Boundary::UnboundedFollowing,
+        ),
+        _ => unreachable!("range is limited to 13 offset frame shapes"),
+    };
+    WindowFrame {
+        mode,
+        start,
+        end,
+        exclude: None,
+    }
+}
+
+/// Generate one of the four structurally valid RANGE frames without a
+/// numeric PRECEDING/FOLLOWING offset.
+fn generate_offset_free_range_frame(ctx: &mut Context) -> WindowFrame {
+    use WindowFrameBoundary as Boundary;
+    let (start, end) = match ctx.gen_range(4) {
+        0 => (Boundary::UnboundedPreceding, Boundary::CurrentRow),
+        1 => (Boundary::UnboundedPreceding, Boundary::UnboundedFollowing),
+        2 => (Boundary::CurrentRow, Boundary::CurrentRow),
+        3 => (Boundary::CurrentRow, Boundary::UnboundedFollowing),
+        _ => unreachable!("range is limited to four offset-free RANGE shapes"),
+    };
+    WindowFrame {
+        mode: WindowFrameMode::Range,
+        start,
+        end,
+        exclude: None,
     }
 }
 
@@ -735,7 +1052,13 @@ fn generate_order_by<C: Capabilities>(
                 // Avoid bare literals — SQLite interprets integer literals in
                 // ORDER BY as column-ordinal positions (e.g. ORDER BY 2).
                 // Also catch unary wrappers like -478008 or +3.
-                if looks_like_literal(&e) {
+                //
+                // Also avoid any term without a column reference: it computes
+                // the same value for every row, so all keys tie and the order
+                // is whatever scan order the engine used. With a LIMIT that
+                // makes the surviving rows engine-specific, and both answers
+                // are allowed.
+                if looks_like_literal(&e) || !e.contains_column_ref() {
                     pick_scoped_column_ref(ctx)?
                 } else {
                     e
@@ -1005,14 +1328,57 @@ pub(crate) fn generate_join_on_condition<C: Capabilities>(
     Ok(Expr::binary_op(ctx, col_expr, op, lit_expr))
 }
 
+/// Return the declared type of each result column when every result is a table
+/// column. Expressions have no dependable declared type for compound queries.
+fn compound_column_types(columns: &[SelectColumn], ctx: &Context) -> Option<Vec<DataType>> {
+    if columns.is_empty() {
+        return Some(
+            ctx.tables_in_scope()[0]
+                .table
+                .columns
+                .iter()
+                .map(|column| column.data_type)
+                .collect(),
+        );
+    }
+
+    columns
+        .iter()
+        .map(|column| {
+            let Expr::ColumnRef(column_ref) = &column.expr else {
+                return None;
+            };
+            ctx.tables_in_scope()
+                .iter()
+                .filter(|table| {
+                    column_ref.table.as_ref().is_none_or(|qualifier| {
+                        qualifier == &table.qualifier || qualifier == &table.table.name
+                    })
+                })
+                .find_map(|table| {
+                    table
+                        .table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == column_ref.column)
+                        .map(|column| column.data_type)
+                })
+        })
+        .collect()
+}
+
 /// Generate compound arms for a compound SELECT.
 ///
-/// Each arm picks a table, generates columns matching `num_cols`, and optionally
-/// generates a WHERE clause. The compound operator is chosen by weighted random.
+/// Each arm picks a table, generates columns matching `column_types`, and
+/// optionally generates a WHERE clause. SQLite is free to choose the declared
+/// type of a compound result column from any SELECT arm. If the arms use
+/// different types, SQLite may turn an integer into a real while Turso leaves it
+/// unchanged, and both results are allowed. Using the same type in every arm
+/// gives the fuzzer one result to compare.
 fn generate_compound_arms<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    num_cols: usize,
+    column_types: &[DataType],
 ) -> Result<Vec<CompoundSelectArm>, GenError> {
     let select_config = &generator.policy().select_config;
     let weights = &select_config.compound_operator_weights;
@@ -1046,18 +1412,43 @@ fn generate_compound_arms<C: Capabilities>(
 
         let arm = ctx.scope(origin, |ctx| {
             // Pick a table for this arm
+            let tables: Vec<_> = generator
+                .schema()
+                .tables
+                .iter()
+                .filter(|table| {
+                    column_types
+                        .iter()
+                        .all(|data_type| table.columns_of_type(*data_type).next().is_some())
+                })
+                .cloned()
+                .collect();
             let table = ctx
-                .choose(&generator.schema().tables)
-                .ok_or_else(|| GenError::schema_empty("tables"))?;
-            let table = table.clone();
+                .choose(&tables)
+                .ok_or_else(|| {
+                    GenError::exhausted("compound_select", "no table has matching columns")
+                })?
+                .clone();
             let table_name = table.qualified_name();
 
             // Generate columns in a temporary table scope for this arm's table
             let (columns, where_clause) = ctx.with_table_scope(vec![(table, None)], |ctx| {
-                // Generate columns matching the required count
-                let mut cols = Vec::with_capacity(num_cols);
-                for _ in 0..num_cols {
-                    let expr = pick_scoped_column_ref(ctx)?;
+                let matching_columns: Vec<Vec<String>> = {
+                    let table = &ctx.tables_in_scope()[0].table;
+                    column_types
+                        .iter()
+                        .map(|data_type| {
+                            table
+                                .columns_of_type(*data_type)
+                                .map(|column| column.name.clone())
+                                .collect()
+                        })
+                        .collect()
+                };
+                let mut cols = Vec::with_capacity(column_types.len());
+                for column_names in matching_columns {
+                    let column_name = ctx.choose(&column_names).unwrap().clone();
+                    let expr = Expr::column_ref(ctx, None, column_name);
                     cols.push(SelectColumn { expr, alias: None });
                 }
 
@@ -1436,6 +1827,374 @@ mod tests {
         let sql = stmt.unwrap().to_string();
         assert!(sql.starts_with("SELECT"));
         assert!(sql.contains("FROM users"));
+    }
+
+    #[test]
+    fn test_rows_window_frame_policy_generates_aggregate_frames() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::Rows,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut generated_rows_frame = false;
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            if sql.contains(" ROWS BETWEEN ") {
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+                generated_rows_frame = true;
+                break;
+            }
+        }
+        assert!(
+            generated_rows_frame,
+            "ROWS policy should generate an explicit frame"
+        );
+    }
+
+    #[test]
+    fn test_groups_and_range_window_frame_policy_generates_supported_modes() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::GroupsAndOffsetFreeRange,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_rows = false;
+        let mut saw_groups = false;
+        let mut saw_range = false;
+
+        for seed in 0..500 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            let has_explicit_frame = [
+                (" ROWS BETWEEN ", &mut saw_rows),
+                (" GROUPS BETWEEN ", &mut saw_groups),
+                (" RANGE BETWEEN ", &mut saw_range),
+            ]
+            .into_iter()
+            .fold(false, |found, (needle, seen)| {
+                if sql.contains(needle) {
+                    *seen = true;
+                    true
+                } else {
+                    found
+                }
+            });
+            if has_explicit_frame {
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+            }
+            if saw_rows && saw_groups && saw_range {
+                break;
+            }
+        }
+
+        assert!(saw_rows, "phase-2 policy should retain ROWS generation");
+        assert!(saw_groups, "phase-2 policy should generate GROUPS frames");
+        assert!(
+            saw_range,
+            "phase-2 policy should generate offset-free RANGE frames"
+        );
+    }
+
+    #[test]
+    fn test_range_offset_policy_generates_ordered_numeric_range_frames() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::RangeOffsets,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for seed in 0..500 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            let is_offset_range = sql.contains(" RANGE BETWEEN ")
+                && (sql.contains(" PRECEDING") || sql.contains(" FOLLOWING"));
+            if is_offset_range {
+                assert!(
+                    sql.contains("ORDER BY "),
+                    "RANGE offsets require exactly one ORDER BY expression: {sql}"
+                );
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+                return;
+            }
+        }
+        panic!("RANGE-offset policy should generate a numeric RANGE boundary");
+    }
+
+    #[test]
+    fn test_exclude_policy_generates_all_variants() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::Exclude,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_no_others = false;
+        let mut saw_current_row = false;
+        let mut saw_group = false;
+        let mut saw_ties = false;
+        let mut saw_offset_range = false;
+        let mut saw_unexcluded_removable_prefix = false;
+
+        for seed in 0..2000 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+
+            saw_no_others |= sql.contains(" EXCLUDE NO OTHERS");
+            saw_current_row |= sql.contains(" EXCLUDE CURRENT ROW");
+            saw_group |= sql.contains(" EXCLUDE GROUP");
+            saw_ties |= sql.contains(" EXCLUDE TIES");
+
+            let is_offset_range = sql.contains(" RANGE BETWEEN ")
+                && (sql.contains(" PRECEDING") || sql.contains(" FOLLOWING"));
+            if is_offset_range && sql.contains(" EXCLUDE ") {
+                assert!(
+                    sql.contains("ORDER BY "),
+                    "RANGE offsets require exactly one ORDER BY expression: {sql}"
+                );
+                saw_offset_range = true;
+            }
+            saw_unexcluded_removable_prefix |= sql.contains(" BETWEEN ")
+                && !sql.contains("BETWEEN UNBOUNDED PRECEDING")
+                && !sql.contains(" EXCLUDE ")
+                && [
+                    "min(",
+                    "max(",
+                    "group_concat(",
+                    "string_agg(",
+                    "json_group_array(",
+                ]
+                .iter()
+                .any(|name| sql.contains(name));
+
+            if saw_no_others
+                && saw_current_row
+                && saw_group
+                && saw_ties
+                && saw_offset_range
+                && saw_unexcluded_removable_prefix
+            {
+                return;
+            }
+        }
+
+        panic!(
+            "EXCLUDE policy coverage incomplete: no_others={saw_no_others}, \
+             current_row={saw_current_row}, group={saw_group}, ties={saw_ties}, \
+             offset_range={saw_offset_range}, \
+             unexcluded_removable_prefix={saw_unexcluded_removable_prefix}"
+        );
+    }
+
+    #[test]
+    fn scalar_subqueries_pick_a_deterministic_row() {
+        // LIMIT 1 must select the same row in both engines, so a scalar
+        // subquery may not use DISTINCT, and its ORDER BY must fully decide
+        // the winner: the primary key as a tiebreaker, or (when grouped)
+        // every GROUP BY expression.
+        let generator = test_generator();
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope(
+                [(generator.schema().tables[0].clone(), None)],
+                |ctx| -> Result<(), GenError> {
+                    let stmt = generate_simple_select(&generator, ctx)?;
+                    assert!(!stmt.distinct, "seed {seed}: scalar subquery uses DISTINCT");
+                    if let Some(gb) = &stmt.group_by {
+                        let ordered: Vec<String> =
+                            stmt.order_by.iter().map(|i| i.expr.to_string()).collect();
+                        for e in &gb.exprs {
+                            assert!(
+                                ordered.contains(&e.to_string()),
+                                "seed {seed}: GROUP BY expr {e} missing from ORDER BY"
+                            );
+                        }
+                    } else {
+                        let last = stmt.order_by.last().expect("scalar must have ORDER BY");
+                        assert!(
+                            matches!(&last.expr, Expr::ColumnRef(c) if c.column == "id"
+                                || c.column == "rowid"),
+                            "seed {seed}: last ORDER BY term is not the tiebreaker: {}",
+                            last.expr
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn order_by_terms_always_reference_a_column() {
+        // A term that computes the same value for every row (e.g.
+        // REPLACE('a','b','c')) makes every key tie, so with a LIMIT the
+        // surviving rows depend on engine scan order.
+        let generator = test_generator();
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope(
+                [(generator.schema().tables[0].clone(), None)],
+                |ctx| -> Result<(), GenError> {
+                    let items = generate_order_by(&generator, ctx)?;
+                    for item in items {
+                        assert!(
+                            item.expr.contains_column_ref(),
+                            "seed {seed} produced constant ORDER BY term: {}",
+                            item.expr
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_compound_arms_use_matching_column_types() {
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "mixed",
+                vec![
+                    ColumnDef::new("integer_value", DataType::Integer),
+                    ColumnDef::new("real_value", DataType::Real),
+                ],
+            ))
+            .table(Table::new(
+                "integers",
+                vec![ColumnDef::new("integer_value", DataType::Integer)],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, Policy::default());
+        let mut ctx = Context::new_with_seed(42);
+
+        let arms =
+            generate_compound_arms(&generator, &mut ctx, &[DataType::Integer, DataType::Real])
+                .unwrap();
+
+        for arm in arms {
+            assert_eq!(arm.from.unwrap().table, "mixed");
+            assert_eq!(arm.columns[0].expr.to_string(), "integer_value");
+            assert_eq!(arm.columns[1].expr.to_string(), "real_value");
+        }
     }
 
     #[test]

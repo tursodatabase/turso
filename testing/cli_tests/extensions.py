@@ -516,11 +516,12 @@ def _test_kv(exec_name, ext_path):
         lambda res: res == "100",
         "can update all rows",
     )
-    if exec_name is None:
-        # Test only on Limbo, since SQLite supports the DELETE ... LIMIT syntax only when compiled
-        # with the SQLITE_ENABLE_UPDATE_DELETE_LIMIT option: https://www.sqlite.org/lang_delete.html
-        turso.run_test_fn("delete from t limit 96;", null, "can delete 96 rows")
-        turso.run_test_fn("select count(*) from t;", lambda res: "4" == res, "four rows remain")
+    turso.run_test_fn(
+        "delete from t where key not in ('key0', 'key1', 'key2', 'key33');",
+        null,
+        "can delete 96 rows",
+    )
+    turso.run_test_fn("select count(*) from t;", lambda res: "4" == res, "four rows remain")
     turso.run_test_fn("update t set key = '100' where 1;", null, "where clause evaluates properly")
     turso.run_test_fn(
         "select * from t where key = '100';",
@@ -916,7 +917,11 @@ def test_csv():
         "Empty CSV table without header should not have columns other than 'c0'",
     )
 
-    turso.run_debug("create virtual table t2 using csv(data='', header=true);")
+    turso.run_test_fn(
+        "create virtual table t2 using csv(data='', header=true);",
+        null,
+        "Create empty CSV table with header",
+    )
     turso.run_test_fn(
         'SELECT "(NULL)" FROM t2;',
         lambda res: res == "",

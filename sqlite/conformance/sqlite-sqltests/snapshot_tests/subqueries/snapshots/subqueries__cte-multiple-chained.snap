@@ -29,7 +29,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN customer_orders AS co
-|  `--SCAN orders USING INDEX idx_orders_customer
-`--SEARCH ac USING INDEX ephemeral_subquery_t2 (id=?)
-   `--SCAN customers
+|--SCAN active_customers AS ac
+|  `--SCAN customers
+`--SEARCH co USING INDEX ephemeral_subquery_t4 (customer_id=? AND order_count>?)
+   `--SCAN orders USING INDEX idx_orders_customer

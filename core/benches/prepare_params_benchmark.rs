@@ -31,7 +31,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn run_to_completion(stmt: &mut turso_core::Statement, db: &Arc<Database>) {
     loop {
         match stmt.step().unwrap() {
-            StepResult::IO | StepResult::Yield => db.io.step().unwrap(),
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
             StepResult::Done => break,
             StepResult::Row => {}
             StepResult::Interrupt | StepResult::Busy => panic!("unexpected step result"),

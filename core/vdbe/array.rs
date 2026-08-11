@@ -608,6 +608,7 @@ pub(crate) fn compare_arrays(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
         }
     }
     // Count remaining elements in the longer array
+    //TODO don't start another iterator, because it will deserialize the whole record again.
     let len_a = count_a + ValueIterator::new(a)?.skip(count_a).count();
     let len_b = count_b + ValueIterator::new(b)?.skip(count_b).count();
     Ok(len_a.cmp(&len_b))

@@ -5,6 +5,7 @@ use crate::{
         Command, CommandParser,
     },
     config::Config,
+    dot_command::tokenize_dot_command,
     helper::LimboHelper,
     input::{
         get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
@@ -786,24 +787,15 @@ impl Limbo {
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
-        let first = line.split_whitespace().next();
-        let parse = match first {
-            Some("parameter") | Some("param") => {
-                let args = shlex::split(line).unwrap_or_else(|| {
-                    line.split_whitespace()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                });
-                if args.is_empty() {
-                    return;
-                }
-                CommandParser::try_parse_from(args)
-            }
-            _ => {
-                let args = line.split_whitespace();
-                CommandParser::try_parse_from(args)
-            }
-        };
+        let (args, unterminated_quote) = tokenize_dot_command(line);
+        if let Some(quote) = unterminated_quote {
+            let _ = self.writeln_fmt(format_args!("unterminated {quote} quote"));
+            return;
+        }
+        if args.is_empty() {
+            return;
+        }
+        let parse = CommandParser::try_parse_from(args);
         match parse {
             Err(err) => {
                 // Let clap print with Styled Colors instead
@@ -1209,10 +1201,19 @@ impl Limbo {
                         if i > 0 {
                             let _ = self.write(b"|");
                         }
-                        if matches!(value, Value::Null) {
-                            let _ = self.write(null_value.as_bytes());
-                        } else {
-                            write!(self, "{value}").map_err(|e| io_error(e, "write"))?;
+                        match value {
+                            Value::Null => {
+                                let _ = self.write(null_value.as_bytes());
+                            }
+                            // Write blob bytes raw, like sqlite3 does in list
+                            // mode. Going through Display would replace bytes
+                            // that are not valid UTF-8 with U+FFFD.
+                            Value::Blob(bytes) => {
+                                self.write(bytes).map_err(|e| io_error(e, "write"))?;
+                            }
+                            _ => {
+                                write!(self, "{value}").map_err(|e| io_error(e, "write"))?;
+                            }
                         }
                     }
                     let _ = self.writeln("");
@@ -1269,7 +1270,6 @@ impl Limbo {
             match stepper.next_row() {
                 Ok(Some(row)) => {
                     let mut table_row = Row::new();
-                    table_row.max_height(1);
                     for (idx, value) in row.get_values().enumerate() {
                         let (content, alignment) = match value {
                             Value::Null => (null_value.clone(), CellAlignment::Left),
@@ -1359,7 +1359,16 @@ impl Limbo {
                 let _ = self.writeln("database is busy");
             }
             _ => {
-                let _ = self.writeln_fmt(format_args!("Error: {err}"));
+                // Mirror the sqlite3 shell: the bare sqlite3_errmsg text plus
+                // the result code, e.g.
+                // "Runtime error: UNIQUE constraint failed: t.a (19)".
+                // The shell omits the code for plain SQLITE_ERROR (1).
+                let code = err.sqlite_result_code();
+                if code == 1 {
+                    let _ = self.writeln_fmt(format_args!("Runtime error: {err}"));
+                } else {
+                    let _ = self.writeln_fmt(format_args!("Runtime error: {err} ({code})"));
+                }
             }
         }
     }

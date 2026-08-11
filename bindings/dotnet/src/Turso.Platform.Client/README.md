@@ -2,7 +2,7 @@
 
 .NET client for the [Turso Platform API](https://docs.turso.tech/api-reference/introduction) (`https://api.turso.tech`): manage databases, groups, auth tokens, organizations, members and invites.
 
-Unlike the `Turso` and `Turso.Data.Sqlite` packages, this is a pure managed HTTP client — it has no native component.
+Unlike the `Turso` and `Turso.Data.Sqlite.Provider` packages, this is a pure managed HTTP client — it has no native component.
 
 ## Getting started
 

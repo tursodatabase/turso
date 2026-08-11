@@ -27,7 +27,7 @@ jobs:
       - name: Setup node
         uses: useblacksmith/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
@@ -50,13 +50,16 @@ jobs:
       - name: Install test dependencies
         working-directory: testing/conformance/javascript
         run: npm install
-      - name: Run conformance tests
+      - name: Run conformance tests against Turso
         working-directory: testing/conformance/javascript
         run: npm run test:turso
+      - name: Run conformance tests against better-sqlite3
+        working-directory: testing/conformance/javascript
+        run: npm run test:better-sqlite3
 
   sqlite-tcl:
     name: SQLite TCL conformance tests
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4

@@ -135,3 +135,16 @@ expect error {
     Parse error: ANALYZE on tables without rowid is not supported
 }
 
+# This test will fail if a ColumnRange opcode incorrectly collapses Column opcodes where the nth consecutive Column
+# opcode is the target of a jump (if the collapsing code doesn't first check for pending labels).
+# ANALYZE relies on such jumps.
+test analyze-column-run-is-a-jump-table-2col {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE INDEX idx_ab ON t (a, b);
+    INSERT INTO t (id, a, b) VALUES (1, 1, 1), (2, 1, 2), (3, 1, 2), (4, 1, 2);
+    ANALYZE;
+    SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_ab';
+}
+expect {
+    4 4 2
+}

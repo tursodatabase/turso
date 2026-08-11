@@ -3,6 +3,8 @@
 
 #[path = "../../cli/config/mod.rs"]
 mod config;
+#[path = "../../cli/dot_command.rs"]
+mod dot_command;
 #[path = "../../cli/helper.rs"]
 mod helper;
 mod read_state_machine;
@@ -602,11 +604,14 @@ fn handle_meta_command(
     timing: &mut bool,
     w: &mut dyn Write,
 ) -> bool {
-    let trimmed = line.trim();
-    let (cmd, arg) = match trimmed.find(char::is_whitespace) {
-        Some(pos) => (&trimmed[..pos], trimmed[pos..].trim()),
-        None => (trimmed, ""),
-    };
+    let (tokens, unterminated_quote) = dot_command::tokenize_dot_command(line);
+    if let Some(quote) = unterminated_quote {
+        let _ = writeln!(w, "unterminated {quote} quote");
+        return false;
+    }
+    let cmd = tokens.first().map(String::as_str).unwrap_or_default();
+    let arg = tokens.get(1..).unwrap_or_default().join(" ");
+    let arg = arg.as_str();
     match cmd {
         "\\q" => return true,
         "\\?" => cmd_help(w),
@@ -1006,9 +1011,9 @@ fn main() -> anyhow::Result<()> {
         .expect("Error setting Ctrl-C handler");
     }
 
+    auto_attach_pg_schemas(&conn, &db_file);
     // Server mode: start PG wire protocol server and exit
     if let Some(ref address) = opts.server {
-        auto_attach_pg_schemas(&conn, &db_file);
         let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
         return server.run();
     }

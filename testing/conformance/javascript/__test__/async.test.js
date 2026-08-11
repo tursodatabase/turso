@@ -316,13 +316,13 @@ test.serial("Database.batch() [mixed value types]", async (t) => {
   t.is(bigRow.i, "9007199254740993");
 });
 
-test.serial("Database.batch() [rollback via transaction()]", async (t) => {
+test.serial("Database.batch() [rollback via transactionAsync()]", async (t) => {
   const db = t.context.db;
 
   // batch() itself is not transactional; transaction() provides
   // all-or-nothing semantics around the failing batch.
-  const txn = db.transaction(async () => {
-    return await db.batch([
+  const txn = db.transactionAsync(async (tx) => {
+    return await tx.batch([
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Mallory", "mallory@example.net"] },
       // Duplicate primary key with the row inserted in beforeEach.
       { sql: "INSERT INTO users(id, name, email) VALUES (1, 'dup', 'dup@example.net')" },
@@ -418,12 +418,12 @@ test.serial("Database.batch() [non-insert batch does not expose lastInsertRowid]
 });
 
 
-test.serial("Database.transaction().deferred() [batch]", async (t) => {
+test.serial("Database.transactionAsync().deferred() [batch]", async (t) => {
   const db = t.context.db;
 
-  const insertMany = db.transaction(async () => {
-    t.is(db.inTransaction, true);
-    return await db.batch([
+  const insertMany = db.transactionAsync(async (tx) => {
+    t.is(db.inTransaction, process.env.PROVIDER !== "serverless");
+    return await tx.batch([
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Joey", "joey@example.org"] },
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Sally", "sally@example.org"] },
       { sql: "INSERT INTO users(name, email) VALUES (:name, :email)", args: { name: "Junior", email: "junior@example.org" } },
@@ -512,12 +512,18 @@ test.serial("Database.inTransaction property", async (t) => {
   t.false(db.inTransaction, "autocommit after a one-shot query");
 
   // 3. The transaction() helper reports in-transaction inside its callback and
-  //    autocommit once it completes.
+  //    autocommit once it completes. The serverless driver runs the
+  //    transaction on its own dedicated session, so the connection itself
+  //    stays in autocommit.
   let insideTxn;
-  const txn = db.transaction(async () => { insideTxn = db.inTransaction; });
+  const txn = db.transactionAsync(async (tx) => { insideTxn = db.inTransaction; });
   await txn();
-  t.true(insideTxn, "in a transaction inside the transaction() callback");
-  t.false(db.inTransaction, "autocommit after transaction() completes");
+  if (process.env.PROVIDER === "serverless") {
+    t.false(insideTxn, "serverless transactionAsync() runs on a dedicated session");
+  } else {
+    t.true(insideTxn, "in a transaction inside the transactionAsync() callback");
+  }
+  t.false(db.inTransaction, "autocommit after transactionAsync() completes");
 
   // 4. inTransaction must reflect the real transaction state, so it also tracks
   //    transactions opened with raw BEGIN/COMMIT/ROLLBACK.
@@ -569,15 +575,20 @@ test.serial("Database.inTransaction after failed batch() with raw BEGIN", async 
   t.is(rows[0].n, 0, "ROLLBACK undid the batch's successful INSERT");
 });
 
-test.serial("Database.transaction()", async (t) => {
+test.serial("Database.transactionAsync()", async (t) => {
   const db = t.context.db;
 
-  const insert = await db.prepare(
-    "INSERT INTO users(name, email) VALUES (:name, :email)"
-  );
-
-  const insertMany = db.transaction(async (users) => {
-    t.is(db.inTransaction, true);
+  const insertMany = db.transactionAsync(async (tx, users) => {
+    // the serverless driver runs the transaction on a dedicated session,
+    // so the connection itself stays in autocommit inside the callback
+    t.is(db.inTransaction, process.env.PROVIDER !== "serverless");
+    // statements of the transaction must be prepared from its handle:
+    // database-level statements never join the transaction — on the native
+    // driver they wait on the connection lock, on the serverless driver
+    // they run in autocommit on the connection's own stream
+    const insert = await tx.prepare(
+      "INSERT INTO users(name, email) VALUES (:name, :email)"
+    );
     for (const user of users) await insert.run(user);
   });
 
@@ -595,14 +606,40 @@ test.serial("Database.transaction()", async (t) => {
   t.is((await stmt.get(5)).name, "Junior");
 });
 
-test.serial("Database.transaction().immediate()", async (t) => {
+// The deprecated transaction() keeps the pre-transactionAsync contract: the
+// callback receives the call's own arguments and statements issued on the
+// database (or prepared from it) join the transaction.
+test.serial("Database.transaction() [deprecated]", async (t) => {
   const db = t.context.db;
+
   const insert = await db.prepare(
     "INSERT INTO users(name, email) VALUES (:name, :email)"
   );
-  const insertMany = db.transaction((users) => {
+
+  const insertMany = db.transaction(async (users) => {
     t.is(db.inTransaction, true);
-    for (const user of users) insert.run(user);
+    for (const user of users) await insert.run(user);
+  });
+
+  await insertMany([
+    { name: "Joey", email: "joey@example.org" },
+    { name: "Sally", email: "sally@example.org" },
+  ]);
+  t.is(db.inTransaction, false);
+
+  const stmt = await db.prepare("SELECT * FROM users WHERE id = ?");
+  t.is((await stmt.get(3)).name, "Joey");
+  t.is((await stmt.get(4)).name, "Sally");
+});
+
+test.serial("Database.transactionAsync().immediate()", async (t) => {
+  const db = t.context.db;
+  const insertMany = db.transactionAsync(async (tx, users) => {
+    t.is(db.inTransaction, process.env.PROVIDER !== "serverless");
+    const insert = await tx.prepare(
+      "INSERT INTO users(name, email) VALUES (:name, :email)"
+    );
+    for (const user of users) await insert.run(user);
   });
   t.is(db.inTransaction, false);
   await insertMany.immediate([
@@ -799,7 +836,7 @@ test.serial("Statement.get() [raw]", async (t) => {
   t.deepEqual(await stmt.raw().get(1), [1, "Alice", "alice@example.org"]);
 });
 
-test.serial("Database.all() preserves positional values for duplicate column names", async (t) => {
+test.serial("Database.all() collapses duplicate column names", async (t) => {
   const db = t.context.db;
 
   await db.exec("DROP TABLE IF EXISTS role; DROP TABLE IF EXISTS org_unit");
@@ -810,9 +847,12 @@ test.serial("Database.all() preserves positional values for duplicate column nam
 
   t.deepEqual(Object.keys(row), ["path"]);
   t.is(row.path, "/");
-  t.is(row[0], "/Employee");
-  t.is(row[1], "/");
+  t.is(row[0], undefined);
+  t.is(row[1], undefined);
   t.deepEqual(row, { path: "/" });
+
+  const stmt = await db.prepare("SELECT role.path, org_unit.path FROM role JOIN org_unit");
+  t.deepEqual(await stmt.raw().get(), ["/Employee", "/"]);
 });
 
 test.serial("Statement.get() values", async (t) => {
@@ -1256,7 +1296,7 @@ test.serial("Concurrent writes over same connection", async (t) => {
   t.is(rows[0][0], 22);
 });
 
-test.serial("Statement.iterate() with nested execute() on same connection does not deadlock", async (t) => {
+test.serial("Statement.iterate() with a nested query on same connection does not deadlock", async (t) => {
   if (process.env.PROVIDER !== "serverless") {
     t.pass("Skipping serverless-only deadlock reproduction");
     return;
@@ -1272,12 +1312,12 @@ test.serial("Statement.iterate() with nested execute() on same connection does n
   const run = (async () => {
     for await (const row of stmt.iterate()) {
       const id = row.id ?? row[0];
-      await db.execute("SELECT ? as echoed_id", [id]);
+      await db.all("SELECT ? as echoed_id", [id]);
     }
   })();
 
   await t.notThrowsAsync(async () => {
-    await withTimeout(run, 2000, "nested iterate/execute");
+    await withTimeout(run, 2000, "nested iterate/query");
   });
 });
 
@@ -1433,7 +1473,7 @@ test.serial("defaultQueryTimeout interrupts long-running query", async (t) => {
   });
 
   const error = await t.throwsAsync(async () => {
-    await db.execute(
+    await db.all(
       "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r;"
     );
   });
@@ -1456,9 +1496,9 @@ test.serial("defaultQueryTimeout allows short-running query", async (t) => {
     defaultQueryTimeout: 5000,
   });
 
-  const result = await db.execute("SELECT 1 AS value");
-  t.is(result.rows.length, 1);
-  t.is(result.rows[0].value, 1);
+  const rows = await db.all("SELECT 1 AS value");
+  t.is(rows.length, 1);
+  t.is(rows[0].value, 1);
 
   await db.close();
 });
@@ -1475,9 +1515,8 @@ test.serial("Per-query queryTimeout interrupts long-running query", async (t) =>
   });
 
   const error = await t.throwsAsync(async () => {
-    await db.execute(
+    await db.all(
       "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r;",
-      [],
       { queryTimeout: 100 }
     );
   });

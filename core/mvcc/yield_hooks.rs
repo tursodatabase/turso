@@ -64,9 +64,7 @@ pub(crate) fn maybe_inject_transition_yield<T, P: YieldPointMarker>(
         .is_some_and(|injector| injector.should_yield(instance_id, selection_key, point.point()));
     if should_yield {
         tracing::debug!(?point, "injecting MVCC yield");
-        return Some(TransitionResult::Io(IOCompletions::Single(
-            Completion::new_yield(),
-        )));
+        return Some(TransitionResult::Io(IOCompletions(Completion::new_yield())));
     }
     None
 }
@@ -81,7 +79,7 @@ pub(crate) fn maybe_inject_io_yield<T, P: YieldPointMarker>(
         .is_some_and(|injector| injector.should_yield(instance_id, selection_key, point.point()));
     if should_yield {
         tracing::debug!(?point, "injecting MVCC yield");
-        return Some(IOResult::IO(IOCompletions::Single(Completion::new_yield())));
+        return Some(IOResult::IO(IOCompletions(Completion::new_yield())));
     }
     None
 }

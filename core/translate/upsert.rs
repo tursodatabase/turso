@@ -20,7 +20,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
-use crate::vdbe::insn::{to_u16, CmpInsFlags};
+use crate::vdbe::insn::{to_u32, CmpInsFlags};
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -427,9 +427,12 @@ pub fn resolve_upsert_target(
     upsert: &Upsert,
 ) -> crate::Result<ResolvedUpsertTarget> {
     // Omitted target, catch-all
-    if upsert.index.is_none() {
+    let Some(target) = upsert.index.as_ref() else {
         return Ok(ResolvedUpsertTarget::CatchAll);
-    }
+    };
+    // SQLite rejects explicit NULLS FIRST/LAST in conflict targets
+    // (sqlite3UpsertAnalyzeTarget -> sqlite3HasExplicitNulls).
+    crate::translate::index::reject_explicit_nulls(&target.targets)?;
 
     // Targeted: must match PK, only if PK is a rowid alias
     if upsert_matches_rowid_alias(upsert, table) {
@@ -1094,9 +1097,9 @@ pub fn emit_upsert(
 
             let rec = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(ins),
-                count: to_u16(k + 1),
-                dest_reg: to_u16(rec),
+                start_reg: to_u32(ins),
+                count: to_u32(k + 1),
+                dest_reg: to_u32(rec),
                 index_name: Some((*idx_name).clone()),
                 affinity_str: None,
             });
@@ -1242,7 +1245,7 @@ pub fn emit_upsert(
                 cursor_id: pending.idx_cid,
                 record_reg: pending.record_reg,
                 unpacked_start: Some(pending.ins_start),
-                unpacked_count: Some((k + 1) as u16),
+                unpacked_count: Some((k + 1) as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
 

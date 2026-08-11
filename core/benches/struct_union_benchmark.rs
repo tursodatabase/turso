@@ -49,7 +49,7 @@ fn execute(db: &Database, conn: &Arc<turso_core::Connection>, sql: &str) {
     loop {
         match stmt.step().unwrap() {
             StepResult::Row => {}
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step().unwrap();
             }
             StepResult::Done => break,
@@ -64,7 +64,7 @@ fn run_to_completion(db: &Database, stmt: &mut turso_core::Statement) {
             StepResult::Row => {
                 black_box(stmt.row());
             }
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step().unwrap();
             }
             StepResult::Done => break,

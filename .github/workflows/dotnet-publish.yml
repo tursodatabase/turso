@@ -349,14 +349,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package=$(find src/Turso.Data.Sqlite/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.*.nupkg' | head -n 1)
-          if [ -z "$package" ]; then
-            echo "No Turso.Data.Sqlite NuGet package found"
+          native_package=$(find src/Turso.Raw/bin/Release -maxdepth 1 -name 'Turso.Data.Native.*.nupkg' | head -n 1)
+          common_package=$(find src/Turso.Data/bin/Release -maxdepth 1 -name 'Turso.Data.Common.*.nupkg' | head -n 1)
+          provider_package=$(find src/Turso.Data.Sqlite/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.Provider.*.nupkg' | head -n 1)
+          if [ -z "$native_package" ]; then
+            echo "No Turso.Data.Native NuGet package found"
             exit 1
           fi
-          unzip -Z1 "$package" > package-files.txt
-          required_files=(
-            "buildTransitive/Turso.Data.Sqlite.targets"
+          if [ -z "$common_package" ]; then
+            echo "No Turso.Data.Common NuGet package found"
+            exit 1
+          fi
+          if [ -z "$provider_package" ]; then
+            echo "No Turso.Data.Sqlite.Provider NuGet package found"
+            exit 1
+          fi
+
+          unzip -Z1 "$native_package" > native-package-files.txt
+          native_required_files=(
+            "buildTransitive/Turso.Data.Native.targets"
+            "runtimes/win-x64/native/turso_sdk_kit.dll"
+            "runtimes/win-arm64/native/turso_sdk_kit.dll"
+            "runtimes/linux-x64/native/libturso_sdk_kit.so"
+            "runtimes/linux-arm64/native/libturso_sdk_kit.so"
             "runtimes/android-arm64/native/libturso_sdk_kit.so"
             "runtimes/android-arm/native/libturso_sdk_kit.so"
             "runtimes/android-x64/native/libturso_sdk_kit.so"
@@ -365,22 +380,54 @@ jobs:
             "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/libturso_sdk_kit"
             "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/libturso_sdk_kit"
           )
-          for required_file in "${required_files[@]}"; do
-            if ! grep -Fxq "$required_file" package-files.txt; then
-              echo "Missing $required_file in $package"
+          for required_file in "${native_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" native-package-files.txt; then
+              echo "Missing $required_file in $native_package"
+              exit 1
+            fi
+          done
+
+          unzip -Z1 "$common_package" > common-package-files.txt
+          common_required_files=(
+            "lib/net8.0/Turso.Data.dll"
+            "lib/net8.0/Turso.Raw.dll"
+            "lib/net8.0/Turso.Raw.xml"
+            "buildTransitive/Turso.Data.Common.targets"
+          )
+          for required_file in "${common_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" common-package-files.txt; then
+              echo "Missing $required_file in $common_package"
+              exit 1
+            fi
+          done
+
+          unzip -Z1 "$provider_package" > provider-package-files.txt
+          provider_required_files=(
+            "lib/net8.0/Turso.Data.Sqlite.dll"
+            "README.md"
+          )
+          for required_file in "${provider_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" provider-package-files.txt; then
+              echo "Missing $required_file in $provider_package"
               exit 1
             fi
           done
 
           max_package_bytes=250000000
-          package_size=$(stat -c%s "$package")
-          if [ "$package_size" -gt "$max_package_bytes" ]; then
-            echo "$package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+          for package in "$native_package" "$common_package" "$provider_package"; do
+            package_size=$(stat -c%s "$package")
+            if [ "$package_size" -gt "$max_package_bytes" ]; then
+              echo "$package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+              exit 1
+            fi
+          done
+
+          if grep -Eq '^runtimes/' provider-package-files.txt; then
+            echo "Dynamic native assets must stay in Turso.Data.Native, not $provider_package"
             exit 1
           fi
-
-          if grep -Eq '^buildTransitive/native/(win|linux|osx)-' package-files.txt; then
-            echo "Static NativeAOT assets must stay in RID-specific companion packages, not $package"
+          if grep -Eq '(^|/)(Turso.Raw|Turso.Data)\.(dll|xml)$' provider-package-files.txt; then
+            echo "Shared assemblies must stay in Turso.Data.Common and Turso.Data.Native, not $provider_package"
             exit 1
           fi
 
@@ -395,9 +442,9 @@ jobs:
           for static_package_spec in "${static_packages[@]}"; do
             rid="${static_package_spec%%:*}"
             library="${static_package_spec#*:}"
-            static_package=$(find src/Turso.Data.Sqlite.NativeAot/bin/Release -maxdepth 1 -name "Turso.Data.Sqlite.NativeAot.${rid}.*.nupkg" | head -n 1)
+            static_package=$(find src/Turso.Data.Sqlite.NativeAot/bin/Release -maxdepth 1 -name "Turso.Data.NativeAot.${rid}.*.nupkg" | head -n 1)
             if [ -z "$static_package" ]; then
-              echo "No Turso.Data.Sqlite.NativeAot.${rid} NuGet package found"
+              echo "No Turso.Data.NativeAot.${rid} NuGet package found"
               exit 1
             fi
 
@@ -409,7 +456,7 @@ jobs:
 
             unzip -Z1 "$static_package" > "package-files-${rid}.txt"
             required_static_files=(
-              "buildTransitive/Turso.Data.Sqlite.NativeAot.${rid}.targets"
+              "buildTransitive/Turso.Data.NativeAot.${rid}.targets"
               "buildTransitive/native/${rid}/${library}"
             )
             for required_static_file in "${required_static_files[@]}"; do
@@ -432,8 +479,10 @@ jobs:
           rm -rf artifacts/nuget-packages
           mkdir -p artifacts/nuget-packages
           files=(
-            src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
-            src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
+            src/Turso.Raw/bin/Release/Turso.Data.Native.*.nupkg
+            src/Turso.Data/bin/Release/Turso.Data.Common.*.nupkg
+            src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.Provider.*.nupkg
+            src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.NativeAot.*.nupkg
             src/Turso.Platform.Client/bin/Release/Turso.Platform.Client.*.nupkg
             src/Turso.Serverless.Client/bin/Release/Turso.Serverless.Client.*.nupkg
           )
@@ -528,8 +577,10 @@ jobs:
             </packageSources>
             <packageSourceMapping>
               <packageSource key="local">
-                <package pattern="Turso.Data.Sqlite" />
-                <package pattern="Turso.Data.Sqlite.NativeAot.*" />
+                <package pattern="Turso.Data.Sqlite.Provider" />
+                <package pattern="Turso.Data.Common" />
+                <package pattern="Turso.Data.Native" />
+                <package pattern="Turso.Data.NativeAot.*" />
               </packageSource>
               <packageSource key="nuget.org">
                 <package pattern="*" />

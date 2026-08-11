@@ -207,3 +207,8 @@ snapshot union-subquery-aggregation {
     GROUP BY department
     ORDER BY total_people DESC;
 }
+
+# UNION + ORDER BY on literals (EXPLAIN regression #6411)
+snapshot union-order-by-literals {
+    SELECT 1 UNION SELECT 2 ORDER BY 1;
+}

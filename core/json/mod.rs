@@ -23,11 +23,6 @@ use jsonb::{
 use std::borrow::Cow;
 use std::str::FromStr;
 
-// Object/array headers with inline payload size <= 7 are ambiguous with 8-byte scalar blobs:
-// 1-byte header + 7-byte payload == 8 bytes (e.g. INT/FLOAT scalar bytes like `0x7C 12 34 56 78 9A BC DE`
-// It is not JSONB, but it is being recognized as JSONB.
-const JSONB_AMBIGUOUS_PAYLOAD_MAX: usize = 7;
-
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
     Strict,
@@ -85,6 +80,25 @@ pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<
     Ok(json.data())
 }
 
+/// Return the encoded length of the raw JSONB element beginning at `cursor`.
+///
+/// Aggregate JSON payloads keep an unfinalized one-byte array/object header
+/// followed by complete JSONB elements. Window xInverse uses this boundary to
+/// remove the oldest array value or object key/value pair without reparsing
+/// textual JSON.
+pub(crate) fn raw_jsonb_element_len(data: &[u8], cursor: usize) -> crate::Result<usize> {
+    let (header, header_len) = JsonbHeader::from_slice(cursor, data)?;
+    let element_len = header_len
+        .checked_add(header.payload_size())
+        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+    let end = cursor
+        .checked_add(element_len)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+    debug_assert_eq!(end - cursor, element_len);
+    Ok(element_len)
+}
+
 pub fn json_from_raw_bytes_agg(data: &[u8], raw: bool) -> crate::Result<Value> {
     let mut json = Jsonb::from_raw_data(data)?;
     let el_type = json.element_type()?;
@@ -128,14 +142,13 @@ fn is_jsonb_blob(slice: &[u8]) -> Result<bool, TryReserveError> {
         return Ok(false);
     }
 
+    // A one-byte header cannot identify JSONB: any blob's first byte parses as a
+    // plausible header, and the length check above still admits arbitrary data --
+    // an 8-byte blob starting `0x7C` reads as "OBJECT, 7-byte payload". So the
+    // whole document must validate, because later readers trust its interior
+    // offsets and decode its text payloads as `&str`.
     let jsonb = Jsonb::from_raw_data(slice)?;
-    Ok(
-        if header.is_scalar() || payload_size <= JSONB_AMBIGUOUS_PAYLOAD_MAX {
-            jsonb.is_valid()
-        } else {
-            jsonb.element_type().is_ok()
-        },
-    )
+    Ok(jsonb.is_valid())
 }
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
@@ -178,13 +191,11 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         if total_expected != slice.len() {
                             parse_as_json_text(slice, strict)?
                         } else {
+                            // Validate the whole document, not just the outer
+                            // header: later readers trust interior offsets and
+                            // the UTF-8 well-formedness of text payloads.
                             let jsonb = Jsonb::from_raw_data(slice)?;
-                            let is_valid_json = if payload_size <= 7 {
-                                jsonb.is_valid()
-                            } else {
-                                jsonb.element_type().is_ok()
-                            };
-                            if is_valid_json {
+                            if jsonb.is_valid() {
                                 jsonb
                             } else {
                                 parse_as_json_text(slice, strict)?
@@ -1903,8 +1914,20 @@ mod tests {
 
     #[test]
     fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
+        // `|` is 0x7C: OBJECT with a 7-byte inline payload, so this is exactly at
+        // the length where a scalar blob and a JSONB object are indistinguishable
+        // by header alone.
         let overlapping_scalar = b"|1234567";
-        assert_eq!(overlapping_scalar.len(), JSONB_AMBIGUOUS_PAYLOAD_MAX + 1);
+        assert_eq!(overlapping_scalar.len(), 8);
         assert!(!is_jsonb_blob(overlapping_scalar).expect(crate::alloc::ALLOC_ERR_MSG));
+    }
+
+    /// Object with a payload larger than a scalar blob, so header inspection
+    /// alone accepts it, but the TEXT5 key holds bytes that are not UTF-8.
+    /// Reading such a key used to reach `str::from_utf8_unchecked`.
+    #[test]
+    fn test_is_jsonb_blob_rejects_invalid_utf8_key() {
+        let invalid_utf8_key = b"\x9C\x79aaaaaa\xF0\x00";
+        assert!(!is_jsonb_blob(invalid_utf8_key).expect(crate::alloc::ALLOC_ERR_MSG));
     }
 }

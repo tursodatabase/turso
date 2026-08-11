@@ -1211,7 +1211,7 @@ impl HashTable {
                 // I/O pending, caller will re-enter after completion and retry the insert.
                 if !c.finished() {
                     return Ok(HashInsertResult::IO {
-                        io: IOCompletions::Single(c),
+                        io: IOCompletions(c),
                         pending,
                     });
                 }
@@ -1319,7 +1319,7 @@ impl HashTable {
             let entry_size = HashEntry::size_from_values(key_values, &[]);
             if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics.as_deref_mut())? {
                 if !c.succeeded() {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(IOResult::IO(IOCompletions(c)));
                 }
             }
 
@@ -2734,7 +2734,7 @@ impl HashTable {
         if probe_state.mem_used > probe_state.mem_budget {
             if let Some(c) = self.spill_largest_probe_partition(None)? {
                 if !c.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(IOResult::IO(IOCompletions(c)));
                 }
             }
         }

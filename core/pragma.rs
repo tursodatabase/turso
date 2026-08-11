@@ -46,6 +46,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
                 | PragmaFlags::NoColumns1,
             &["cache_size"],
         ),
+        CountChanges => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["count_changes"],
+        ),
         DataSyncRetry => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["data_sync_retry"],
@@ -416,7 +420,7 @@ impl PragmaVirtualTableCursor {
         Ok(value)
     }
 
-    pub(crate) fn filter(&mut self, args: Vec<Value>) -> crate::Result<bool> {
+    pub(crate) fn filter(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<bool> {
         if args.len() > self.max_arg_count {
             return Err(LimboError::ParseError(format!(
                 "Too many arguments for pragma {}: expected at most {}, got {}",

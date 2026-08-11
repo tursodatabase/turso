@@ -3,9 +3,9 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use turso_core::alloc::{
-    AllocError, AllocationSite, ApiAllocator, Global, Layout, MvStoreAllocationSite,
-    MvccCheckpointAllocationSite, SchemaAllocationSite, SetAllocatorError, TursoAllocBackend,
-    ValueBlobAllocationSite, VectorAllocationSite,
+    AllocError, AllocationSite, ApiAllocator, BTreeAllocationSite, Global, Layout,
+    MvStoreAllocationSite, MvccCheckpointAllocationSite, SchemaAllocationSite, SetAllocatorError,
+    TursoAllocBackend, ValueBlobAllocationSite, VectorAllocationSite,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +201,16 @@ fn allocation_hash(
 fn allocation_site_id(site: AllocationSite) -> u64 {
     match site {
         AllocationSite::NoFaultInjection => 0,
+        AllocationSite::BTree(site) => match site {
+            BTreeAllocationSite::CellPayload => 29,
+            BTreeAllocationSite::OverflowRead => 30,
+            BTreeAllocationSite::Balance => 31,
+            BTreeAllocationSite::BlobRecordHeader => 32,
+            BTreeAllocationSite::IntegrityCheck => 33,
+            BTreeAllocationSite::OverflowCell => 34,
+            BTreeAllocationSite::RecordPayload => 35,
+            BTreeAllocationSite::SavedCursorRecord => 36,
+        },
         AllocationSite::MvStore(site) => match site {
             MvStoreAllocationSite::RootpageMappingInsert => 1,
             MvStoreAllocationSite::TxInsert => 2,
@@ -228,6 +238,10 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             ValueBlobAllocationSite::JsonbCopy => 26,
             ValueBlobAllocationSite::Hash128 => 27,
             ValueBlobAllocationSite::JsonbConstruction => 28,
+            ValueBlobAllocationSite::CloneFrom => 29,
+            ValueBlobAllocationSite::RecordBuild => 30,
+            ValueBlobAllocationSite::RecordCopy => 31,
+            ValueBlobAllocationSite::AggAccumulate => 32,
         },
         AllocationSite::Vector(site) => match site {
             VectorAllocationSite::Parse => 15,
@@ -306,6 +320,57 @@ mod tests {
         let ids = sites.map(|site| allocation_site_id(AllocationSite::ValueBlob(site)));
         for (index, id) in ids.iter().enumerate() {
             assert!(!ids[index + 1..].contains(id), "duplicate site id {id}");
+        }
+    }
+
+    #[test]
+    fn btree_allocation_sites_have_distinct_ids() {
+        let sites = [
+            BTreeAllocationSite::CellPayload,
+            BTreeAllocationSite::OverflowRead,
+            BTreeAllocationSite::Balance,
+            BTreeAllocationSite::BlobRecordHeader,
+            BTreeAllocationSite::IntegrityCheck,
+            BTreeAllocationSite::OverflowCell,
+            BTreeAllocationSite::RecordPayload,
+            BTreeAllocationSite::SavedCursorRecord,
+        ];
+        let ids = sites.map(|site| allocation_site_id(AllocationSite::BTree(site)));
+        for (index, id) in ids.iter().enumerate() {
+            assert!(!ids[index + 1..].contains(id), "duplicate site id {id}");
+        }
+    }
+
+    #[test]
+    fn btree_allocation_sites_are_fault_injectable() {
+        static INJECTOR: SimulatorAllocationFaultInjector = SimulatorAllocationFaultInjector {
+            enabled: AtomicBool::new(true),
+            seed: AtomicU64::new(13),
+            threshold: AtomicU64::new(u64::MAX),
+            injected_faults: AtomicU64::new(0),
+        };
+
+        let _context = INJECTOR.enter_context(AllocationFaultContext {
+            step: 7,
+            fiber_idx: 8,
+            execution_id: 9,
+        });
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        let sites = [
+            BTreeAllocationSite::CellPayload,
+            BTreeAllocationSite::OverflowRead,
+            BTreeAllocationSite::Balance,
+            BTreeAllocationSite::BlobRecordHeader,
+            BTreeAllocationSite::IntegrityCheck,
+            BTreeAllocationSite::OverflowCell,
+            BTreeAllocationSite::RecordPayload,
+            BTreeAllocationSite::SavedCursorRecord,
+        ];
+
+        for (index, site) in sites.into_iter().enumerate() {
+            let _site = turso_core::alloc::enter_allocation_site(site);
+            assert!(INJECTOR.allocate(layout).is_err(), "site {site:?}");
+            assert_eq!(INJECTOR.injected_faults(), index as u64 + 1);
         }
     }
 

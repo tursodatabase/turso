@@ -1,0 +1,170 @@
+# Scalar function behavior through the PostgreSQL frontend.
+#
+# Coverage here asserts behavior that real PostgreSQL also exhibits, so the
+# corpus is valid for differential runs against a stock server.
+# Server-specific outputs (version(), current_database(), pg_backend_pid())
+# are covered in postgres/tests/integration instead.
+
+@database :memory:
+
+test quote-ident-plain-lowercase {
+    SELECT quote_ident('abc');
+}
+expect {
+    abc
+}
+
+test quote-ident-underscore-and-digits {
+    SELECT quote_ident('a_1');
+}
+expect {
+    a_1
+}
+
+test quote-ident-mixed-case {
+    SELECT quote_ident('Abc');
+}
+expect {
+    "Abc"
+}
+
+test quote-ident-embedded-space {
+    SELECT quote_ident('a b');
+}
+expect {
+    "a b"
+}
+
+test quote-ident-embedded-quote-doubled {
+    SELECT quote_ident('a"b');
+}
+expect {
+    "a""b"
+}
+
+test quote-ident-reserved-keyword {
+    SELECT quote_ident('select');
+}
+expect {
+    "select"
+}
+
+test quote-ident-unreserved-keyword-unquoted {
+    SELECT quote_ident('commit');
+}
+expect {
+    commit
+}
+
+test quote-ident-col-name-keyword {
+    SELECT quote_ident('between');
+}
+expect {
+    "between"
+}
+
+test quote-ident-type-func-name-keyword {
+    SELECT quote_ident('binary');
+}
+expect {
+    "binary"
+}
+
+test quote-ident-empty-string {
+    SELECT quote_ident('');
+}
+expect {
+    ""
+}
+
+test quote-ident-leading-digit {
+    SELECT quote_ident('1a');
+}
+expect {
+    "1a"
+}
+
+test quote-ident-null-is-null {
+    SELECT quote_ident(NULL);
+}
+expect {
+}
+
+test quote-literal-plain {
+    SELECT quote_literal('abc');
+}
+expect {
+    'abc'
+}
+
+test quote-literal-embedded-quote {
+    SELECT quote_literal('O''Reilly');
+}
+expect {
+    'O''Reilly'
+}
+
+test quote-literal-integer {
+    SELECT quote_literal(42);
+}
+expect {
+    '42'
+}
+
+test quote-literal-null-is-null {
+    SELECT quote_literal(NULL);
+}
+expect {
+}
+
+# The sqltest lexer collapses \\ to \, so the expected E'a\\b' is written
+# with doubled backslashes here.
+test quote-literal-backslash-uses-escape-string {
+    SELECT quote_literal('a\b');
+}
+expect {
+    E'a\\\\b'
+}
+
+test current-schema-default {
+    SELECT current_schema();
+}
+expect {
+    public
+}
+
+test current-schema-bare-keyword {
+    SELECT current_schema;
+}
+expect {
+    public
+}
+
+test current-schema-in-from-position {
+    SELECT * FROM current_schema();
+}
+expect {
+    public
+}
+
+test obj-description-unknown-oid-is-null {
+    SELECT obj_description(0, 'pg_class');
+}
+expect {
+}
+
+test col-description-unknown-oid-is-null {
+    SELECT col_description(0, 1);
+}
+expect {
+}
+
+test version-wrong-arity-errors {
+    SELECT version(1);
+}
+expect error {}
+
+test quote-ident-wrong-arity-errors {
+    SELECT quote_ident();
+}
+expect error {}

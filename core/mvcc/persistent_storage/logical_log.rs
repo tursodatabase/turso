@@ -254,10 +254,13 @@ use crate::File;
 
 mod serializer;
 use serializer::EncryptedPayload;
-pub(crate) use serializer::LogSerializer;
 #[cfg(feature = "conn_raw_api")]
 use serializer::{
     extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
+};
+pub(crate) use serializer::{
+    log_write, LogBufferWrite, LogChunkStream, LogSerializer, ProtoKey, ProtoSint64, ProtoVarint,
+    PROTO_WIRE_LENGTH_DELIMITED, PROTO_WIRE_VARINT,
 };
 
 /// Logical log size in bytes at which a committing transaction will trigger a checkpoint.
@@ -572,10 +575,12 @@ fn derive_initial_crc(salt: u64) -> u32 {
     crc32c::crc32c(&salt.to_le_bytes())
 }
 
+#[cfg_attr(feature = "aristo-instr", derive(aristo::instrument::Inspect))]
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
     io: Arc<dyn crate::IO>,
     pub offset: u64,
+    #[cfg_attr(feature = "aristo-instr", inspect(ret = Option<u8>, with = |h| h.as_ref().map(|x| x.version), name = "header_version"))]
     header: Option<LogHeader>,
     /// Running CRC state for chained checksums. Seeded from the header salt;
     /// updated after each committed frame. The next frame's CRC is computed as
@@ -584,12 +589,24 @@ pub struct LogicalLog {
     /// Pending CRC from a deferred-offset write. Applied by
     /// `advance_offset_after_success` so that an abandoned write
     /// doesn't corrupt the chain.
+    #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
     max_appended_commit_ts: u64,
+}
+
+#[cfg(feature = "aristo-instr")]
+impl LogicalLog {
+    /// Harness accessor: the logical-log write cursor and running CRC as one
+    /// owned snapshot, read by the durability-ordering (DOI) differential tests.
+    /// Both underlying fields are already `pub`; this pairs them under the exact
+    /// symbol the routed conformance tests expect.
+    pub fn read_logicallog_offset_crc(&self) -> (u64, u32) {
+        (self.offset, self.running_crc)
+    }
 }
 
 impl LogicalLog {
@@ -668,14 +685,22 @@ impl LogicalLog {
         let payload_size = tx.buf.len() - LOG_RECORD_PREFIX_SIZE;
         let payload_size_u64 = payload_size as u64;
 
+        // Every commit from a portable-enabled writer gets an extension block,
+        // including one whose portable object map is empty. A transaction that
+        // touches only internal objects (`turso_sync_*`, `turso_cdc*`,
+        // `sqlite_*`, indexes) would otherwise be written as a plain frame with
+        // recovery ops, which is byte-identical to pre-portable LML2 history: a
+        // reader planning a logical sync range cannot tell "no user-visible
+        // changes here" from "user data this reader cannot replay", so it must
+        // refuse the range. Emitting the block makes the empty change set
+        // explicit; readers that decode it produce no ops for the frame.
         #[cfg(feature = "conn_raw_api")]
-        let has_portable_changes = tx.portable_changes_required || !tx.portable_changes.is_empty();
-        #[cfg(not(feature = "conn_raw_api"))]
-        let has_portable_changes = false;
-        #[cfg(feature = "conn_raw_api")]
-        let portable_changes_enabled = tx.portable_changes_enabled || has_portable_changes;
+        let portable_changes_enabled = tx.portable_changes_enabled
+            || tx.portable_changes_required
+            || !tx.portable_changes.is_empty();
         #[cfg(not(feature = "conn_raw_api"))]
         let portable_changes_enabled = false;
+        let has_portable_changes = portable_changes_enabled;
 
         // 1. Ensure we have a log header object (created lazily on first write).
         // Non-portable logs remain LML2 so a deployment that does not enable
@@ -918,6 +943,7 @@ impl LogicalLog {
         self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
+    #[aristo::intent("the in-memory log offset advances only after the corresponding frame pwrite has completed durably", id = "aristos:logical_log_inmemory_offset_advances_after_durable_write", verify = "full")]
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
         self.offset = self
             .offset
@@ -927,6 +953,15 @@ impl LogicalLog {
             .pending_running_crc
             .take()
             .expect("advance_offset_after_success called without pending deferred write");
+    }
+
+    /// Discard the pending running CRC staged by a deferred write whose
+    /// two-phase commit aborted before the offset advanced.
+    ///
+    /// This must be called on the abort path so no later write chains its
+    /// running CRC from a value staged for a write that never confirmed.
+    pub fn discard_pending_write(&mut self) {
+        self.pending_running_crc = None;
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
@@ -950,6 +985,7 @@ impl LogicalLog {
         ))
     }
 
+    #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
     fn write_header(&mut self, mut header: LogHeader) -> Result<Completion> {
         let header_bytes = header.encode();
         header.hdr_crc32c = u32::from_le_bytes([
@@ -981,6 +1017,7 @@ impl LogicalLog {
         self.write_header(header)
     }
 
+    #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
@@ -3765,7 +3802,9 @@ mod tests {
         let file = io.open_file(file_name, OpenFlags::Create, false).unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord::new(commit_ts);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(commit_ts, crate::alloc::DynAllocator::default())
+                .unwrap();
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
@@ -4616,7 +4655,9 @@ mod tests {
         let op_size = 6 + payload_len_len + payload_len;
         let frame_size = TX_HEADER_SIZE + op_size + TX_TRAILER_SIZE;
 
-        let mut tx1 = crate::mvcc::database::LogRecord::new(10);
+        let mut tx1 =
+            crate::mvcc::database::LogRecord::new(10, crate::alloc::DynAllocator::default())
+                .unwrap();
         tx1.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
             begin: crate::mvcc::database::PackedTs::pack(Some(
@@ -4630,7 +4671,9 @@ mod tests {
         let c = log.log_tx(tx1).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut tx2 = crate::mvcc::database::LogRecord::new(20);
+        let mut tx2 =
+            crate::mvcc::database::LogRecord::new(20, crate::alloc::DynAllocator::default())
+                .unwrap();
         tx2.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 2,
             begin: crate::mvcc::database::PackedTs::pack(Some(
@@ -4940,7 +4983,9 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord::new(123);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(123, crate::alloc::DynAllocator::default())
+                .unwrap();
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
@@ -5418,7 +5463,9 @@ mod tests {
             .open_file("bitflip.db-log", crate::OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
-        let mut tx = crate::mvcc::database::LogRecord::new(300);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(300, crate::alloc::DynAllocator::default())
+                .unwrap();
         tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
             begin: crate::mvcc::database::PackedTs::pack(Some(
@@ -5490,7 +5537,11 @@ mod tests {
 
         let mut expected = Vec::new();
         for tx_i in 0..128u64 {
-            let mut tx = crate::mvcc::database::LogRecord::new(1_000 + tx_i);
+            let mut tx = crate::mvcc::database::LogRecord::new(
+                1_000 + tx_i,
+                crate::alloc::DynAllocator::default(),
+            )
+            .unwrap();
             let op_count = (rng.next_u64() % 4) as usize;
             for _ in 0..op_count {
                 let rowid = (rng.next_u64() % 64) as i64 + 1;
@@ -5548,7 +5599,11 @@ mod tests {
         // correctly when a single frame spans chunk boundaries.
         let large_commit_ts = 1_000 + 128u64;
         let large_text: String = "x".repeat(200);
-        let mut large_tx = crate::mvcc::database::LogRecord::new(large_commit_ts);
+        let mut large_tx = crate::mvcc::database::LogRecord::new(
+            large_commit_ts,
+            crate::alloc::DynAllocator::default(),
+        )
+        .unwrap();
         for rowid in 1..=30i64 {
             let row = generate_simple_string_row((-3).into(), rowid, &large_text);
             expected.push(ExpectedTableOp::Upsert {
@@ -5701,7 +5756,9 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord::new(55);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(55, crate::alloc::DynAllocator::default())
+                .unwrap();
         let mut row = generate_simple_string_row((-2).into(), 1, "foo");
         row.id.table_id = (-2).into();
         let version = crate::mvcc::database::RowVersion {
@@ -5764,7 +5821,9 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord::new(10);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(10, crate::alloc::DynAllocator::default())
+                .unwrap();
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
@@ -7115,7 +7174,7 @@ mod tests {
             None,
         );
         portable_tx.portable_changes_enabled = true;
-        portable_tx.portable_changes = vec![0x1a, 0x00];
+        portable_tx.portable_changes = crate::alloc::vec![0x1a, 0x00];
 
         let c = log
             .upgrade_header_for_log_tx(&portable_tx)
@@ -7169,7 +7228,7 @@ mod tests {
         let c = log.log_tx(empty_sync_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let encoded_empty_logical_op = vec![0x1a, 0x00];
+        let encoded_empty_logical_op = crate::alloc::vec![0x1a, 0x00];
         let mut sync_tx = crate::mvcc::database::LogRecord::for_test(
             20,
             &[make_test_row_version((-2).into(), 2, "visible", 20)],
@@ -7182,13 +7241,19 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(&io).unwrap();
         assert_eq!(reader.header().unwrap().version, LOG_VERSION);
+        // A portable-enabled writer marks an empty change set explicitly: the
+        // frame carries an extension record whose payload has the frame cursor
+        // and commit timestamp but no object map, so readers decode it into no
+        // logical ops instead of having to guess whether a plain frame predates
+        // portable changes.
         let first = io
             .block(|| reader.next_portable_change_frame())
             .unwrap()
             .unwrap();
         assert_eq!(first.commit_ts, 10);
-        assert_eq!(first.extension_record_count, 0);
-        assert!(first.payload.is_empty());
+        assert_eq!(first.extension_record_count, 1);
+        assert!(!first.payload.is_empty());
+        assert_eq!(first.end_offset, reader.last_valid_offset() as u64);
 
         let second = io
             .block(|| reader.next_portable_change_frame())
@@ -7219,7 +7284,7 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let portable_metadata = vec![0x1a, 0x00];
+        let portable_metadata = crate::alloc::vec![0x1a, 0x00];
         let mut tx = crate::mvcc::database::LogRecord::for_test(
             20,
             &[make_test_row_version((-2).into(), 2, "visible", 20)],

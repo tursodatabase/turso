@@ -873,3 +873,16 @@ test upsert-do-update-set-expr-uses-column-collation {
 expect {
     1|A|1
 }
+
+# https://github.com/tursodatabase/turso/issues/7944
+# SQLite rejects NULLS FIRST/LAST in UPSERT conflict targets
+# (sqlite3UpsertAnalyzeTarget -> sqlite3HasExplicitNulls).
+@cross-check-integrity
+test upsert-conflict-target-nulls-first-rejected {
+    CREATE TABLE t_upnulls(a UNIQUE);
+    INSERT INTO t_upnulls VALUES (1)
+    ON CONFLICT (a NULLS FIRST) DO NOTHING;
+}
+expect error {
+    NULLS
+}

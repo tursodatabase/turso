@@ -19,7 +19,7 @@ function timeoutMs(ms: number): Promise<void> {
 }
 
 function normalizeUrl(url: string): string {
-    return url.replace(/^libsql:\/\//, 'https://');
+    return url.replace(/^(libsql|turso):\/\//, 'https://');
 }
 
 async function process(opts: RunOpts, io: ProtocolIo, request: any) {

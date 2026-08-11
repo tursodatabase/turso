@@ -2,26 +2,26 @@
 
 ADO.NET bindings for Turso local and remote databases.
 
-The `Turso.Data.Sqlite` package includes both a SQLite-compatible `Turso.Data.Sqlite` facade and Turso-specific `System.Data.Common` types such as `TursoConnection`, `TursoCommand`, `TursoDataReader`, `TursoParameter`, `TursoTransaction`, and `TursoFactory`.
+The `Turso.Data.Sqlite.Provider` package includes a SQLite-compatible `Turso.Data.Sqlite` facade. It depends on the implementation packages `Turso.Data.Common` and `Turso.Data.Native`, which provide the shared managed ADO.NET types and native runtime.
 
 ## Install
 
 ```bash
-dotnet add package Turso.Data.Sqlite
+dotnet add package Turso.Data.Sqlite.Provider
 ```
 
-Application code only needs to reference `Turso.Data.Sqlite`.
+Application code only needs to install `Turso.Data.Sqlite.Provider` and reference the `Turso.Data.Sqlite` namespace.
 
-The package targets `net8.0`, `net9.0`, and `net10.0`. It includes native runtime assets for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices.
+The package targets `net8.0`, `net9.0`, and `net10.0`. Its `Turso.Data.Native` dependency supplies native runtime assets for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices.
 
 ## NativeAOT static linking
 
-NativeAOT apps can opt into statically linking the Turso native library so publish output does not include a sidecar `turso_sdk_kit` DLL, `.so`, or `.dylib`. Reference the RID-specific static package alongside `Turso.Data.Sqlite`:
+NativeAOT apps can opt into statically linking the Turso native library so publish output does not include a sidecar `turso_sdk_kit` DLL, `.so`, or `.dylib`. Reference the neutral RID-specific static package alongside `Turso.Data.Sqlite.Provider`:
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Turso.Data.Sqlite" Version="0.7.0-pre.18" />
-  <PackageReference Include="Turso.Data.Sqlite.NativeAot.win-x64" Version="0.7.0-pre.18" PrivateAssets="all" />
+  <PackageReference Include="Turso.Data.Sqlite.Provider" Version="0.8.0-pre.2" />
+  <PackageReference Include="Turso.Data.NativeAot.win-x64" Version="0.8.0-pre.2" PrivateAssets="all" />
 </ItemGroup>
 ```
 
@@ -136,7 +136,7 @@ connection.Open();
 
 ## Migrating from Microsoft.Data.Sqlite
 
-For common embedded SQLite usage, `Turso.Data.Sqlite` exposes a SQLite-compatible facade over the Turso engine:
+For common embedded SQLite usage, the `Turso.Data.Sqlite.Provider` package exposes a SQLite-compatible `Turso.Data.Sqlite` facade over the Turso engine:
 
 ```diff
 - using Microsoft.Data.Sqlite;
@@ -177,7 +177,7 @@ Supported common connection string keywords include:
 
 ## Entity Framework Core
 
-`Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local and embedded Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through `Turso.Data.Sqlite`.
+`Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local and embedded Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through the `Turso.Data.Sqlite` facade.
 
 ```bash
 dotnet add package Turso.EntityFrameworkCore.Sqlite

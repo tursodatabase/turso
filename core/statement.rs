@@ -10,7 +10,7 @@ use std::{
 use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
-use crate::alloc::TursoIteratorExt;
+use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -536,12 +536,16 @@ impl Statement {
 
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
-            if self.pager.io.current_time_monotonic() < busy_state.timeout() {
-                // Yield the query as the timeout has not been reached yet
+            let now = self.pager.io.current_time_monotonic();
+            if now < busy_state.timeout() {
+                // The timeout has not been reached yet: ask the caller to wait
+                // out the remaining delay before stepping again.
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                return Ok(StepResult::IO);
+                return Ok(StepResult::Sleep {
+                    duration: busy_state.get_delay(now),
+                });
             }
         }
 
@@ -613,11 +617,14 @@ impl Statement {
 
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
-                // Handler says retry, yield with IO to wait for timeout
+                // Handler says retry: ask the caller to wait out the backoff
+                // delay before stepping again.
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                res = Ok(StepResult::IO);
+                res = Ok(StepResult::Sleep {
+                    duration: busy_state.get_delay(now),
+                });
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
             }
@@ -678,7 +685,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                    self.pager.io.step()?
+                }
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
@@ -692,7 +701,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                    self.pager.io.step()?
+                }
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -712,7 +723,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                    self.pager.io.step()?
+                }
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -737,9 +750,9 @@ impl Statement {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
                 vdbe::StepResult::Row => continue,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
-                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                        crate::types::IOCompletions(crate::io::Completion::new_yield())
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
@@ -770,9 +783,9 @@ impl Statement {
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
-                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                        crate::types::IOCompletions(crate::io::Completion::new_yield())
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
@@ -792,7 +805,7 @@ impl Statement {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
                     pre_io_func()?;
                     self.pager.io.step()?;
                     post_io_func()?;
@@ -878,6 +891,7 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = conn.schema.read().clone();
+            let prepare_options = PrepareOptions::default();
             translate::translate(
                 &schema,
                 stmt,
@@ -887,6 +901,7 @@ impl Statement {
                 mode,
                 &self.program.sql,
                 self.origin,
+                &prepare_options,
             )?
         };
 
@@ -1263,6 +1278,51 @@ impl Statement {
         Ok(())
     }
 
+    /// Returns the SQL text with every parameter marker replaced by the
+    /// literal of its currently bound value (NULL when unbound), following
+    /// SQLite's sqlite3_expanded_sql rendering. The text is re-tokenized
+    /// with the lexer — whose token stream partitions the input, emitting
+    /// whitespace and comments as TK_NONE tokens carrying their bytes — so
+    /// string literals, quoted identifiers and comments are never mistaken
+    /// for markers. Each TK_VARIABLE token resolves to its bind index from
+    /// its own text: `?N` carries the number, named markers are looked up
+    /// in the parameter table (the same marker can occur several times),
+    /// and a bare `?` takes one more than the largest number assigned so
+    /// far, which is SQLite's numbering rule.
+    pub fn expanded_sql(&self) -> String {
+        let sql = self.get_sql();
+        let params = &self.program.parameters;
+        let mut out = String::with_capacity(sql.len());
+        let mut max_index = 0usize;
+        for token in turso_parser::lexer::Lexer::new(sql.as_bytes()) {
+            let Ok(token) = token else {
+                // The statement already parsed once, so re-lexing its text
+                // cannot fail; return the unexpanded SQL if it somehow does.
+                return sql.to_string();
+            };
+            if token.token_type == turso_parser::token::TokenType::TK_VARIABLE {
+                let text = String::from_utf8_lossy(token.value);
+                let index = if let Some(digits) = text.strip_prefix('?') {
+                    if digits.is_empty() {
+                        max_index + 1
+                    } else {
+                        digits.parse().unwrap_or(0)
+                    }
+                } else {
+                    params.index(text.as_ref()).map_or(0, |i| i.get())
+                };
+                max_index = max_index.max(index);
+                let value = NonZero::new(index)
+                    .map(|i| self.state.get_parameter(i))
+                    .unwrap_or(Value::Null);
+                append_expanded_literal(&mut out, &value);
+            } else {
+                out.push_str(&String::from_utf8_lossy(token.value));
+            }
+        }
+        out
+    }
+
     pub fn clear_bindings(&mut self) {
         self.state.clear_bindings();
     }
@@ -1504,6 +1564,40 @@ impl Statement {
     }
 }
 
+/// Appends `value` to `out` as a SQL literal, the way SQLite renders bound
+/// parameters into expanded SQL: NULL, decimal integers, floats, single-quoted
+/// text with embedded quotes doubled, and x'..' hex blobs.
+///
+/// This deliberately does not reuse Value::exec_quote: SQLite's quote() and
+/// its expanded-SQL rendering differ (quote() emits X'..' uppercase blobs and
+/// truncates text at an embedded NUL; expanded SQL emits x'..' lowercase).
+fn append_expanded_literal(out: &mut String, value: &Value) {
+    use std::fmt::Write;
+    match value {
+        Value::Null => out.push_str("NULL"),
+        Value::Text(t) => {
+            out.push('\'');
+            for ch in t.as_str().chars() {
+                if ch == '\'' {
+                    out.push('\'');
+                }
+                out.push(ch);
+            }
+            out.push('\'');
+        }
+        Value::Blob(b) => {
+            out.push_str("x'");
+            for byte in b.iter() {
+                let _ = write!(out, "{byte:02x}");
+            }
+            out.push('\'');
+        }
+        other => {
+            let _ = write!(out, "{other}");
+        }
+    }
+}
+
 impl Drop for Statement {
     fn drop(&mut self) {
         // Keep helper statements nested while drop-time reset/abort cleanup runs.
@@ -1535,6 +1629,55 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect()
+    }
+
+    #[test]
+    fn test_expanded_sql() {
+        let conn = open_test_connection().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT ?1, :nm, ':nm' /* ? */, -- ?\n?")
+            .unwrap();
+
+        // Unbound parameters render as NULL; markers inside string
+        // literals and comments are untouched.
+        assert_eq!(
+            stmt.expanded_sql(),
+            "SELECT NULL, NULL, ':nm' /* ? */, -- ?\nNULL"
+        );
+
+        stmt.bind_at(1.try_into().unwrap(), Value::from_i64(42))
+            .unwrap();
+        let nm = stmt.parameter_index(":nm").unwrap();
+        stmt.bind_at(nm, Value::build_text("it's")).unwrap();
+        stmt.bind_at(3.try_into().unwrap(), Value::from_slice(&[1, 2]).unwrap())
+            .unwrap();
+        assert_eq!(
+            stmt.expanded_sql(),
+            "SELECT 42, 'it''s', ':nm' /* ? */, -- ?\nx'0102'"
+        );
+
+        // Bindings survive reset; clear_bindings reverts them to NULL.
+        stmt.reset().unwrap();
+        assert_eq!(
+            stmt.expanded_sql(),
+            "SELECT 42, 'it''s', ':nm' /* ? */, -- ?\nx'0102'"
+        );
+        stmt.clear_bindings();
+        assert_eq!(
+            stmt.expanded_sql(),
+            "SELECT NULL, NULL, ':nm' /* ? */, -- ?\nNULL"
+        );
+
+        // A marker can occur several times and renders its value at every
+        // occurrence; a bare ? after ?2 takes index 3.
+        let mut stmt = conn.prepare("SELECT ?2, :a, ?2, ?").unwrap();
+        stmt.bind_at(2.try_into().unwrap(), Value::from_i64(7))
+            .unwrap();
+        stmt.bind_at(3.try_into().unwrap(), Value::build_text("x"))
+            .unwrap();
+        stmt.bind_at(4.try_into().unwrap(), Value::from_i64(9))
+            .unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT 7, 'x', 7, 9");
     }
 
     #[test]

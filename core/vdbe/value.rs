@@ -1,11 +1,10 @@
-use crate::turso_assert;
 use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
-    LimboError, Result, Value, ValueRef,
+    LimboError, Result, Value,
 };
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
@@ -17,11 +16,14 @@ mod cmath {
     pub fn log(x: f64) -> f64 {
         x.ln()
     }
+    // Use log10/log2 directly rather than log(x, base): the latter computes
+    // ln(x)/ln(base), which can be 1 ulp off from the dedicated functions
+    // SQLite calls, and e.g. mod() amplifies that into visible divergence.
     pub fn log10(x: f64) -> f64 {
-        x.log(10.)
+        x.log10()
     }
     pub fn log2(x: f64) -> f64 {
-        x.log(2.)
+        x.log2()
     }
     pub fn pow(x: f64, y: f64) -> f64 {
         x.powf(y)
@@ -137,28 +139,6 @@ impl ComparisonOp {
             ComparisonOp::Le => order.is_le(),
             ComparisonOp::Gt => order.is_gt(),
             ComparisonOp::Ge => order.is_ge(),
-        }
-    }
-
-    pub(super) fn compare_nulls<V1: AsValueRef, V2: AsValueRef>(
-        &self,
-        lhs: V1,
-        rhs: V2,
-        null_eq: bool,
-    ) -> bool {
-        let (lhs, rhs) = (lhs.as_value_ref(), rhs.as_value_ref());
-        turso_assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
-
-        match self {
-            ComparisonOp::Eq => {
-                let both_null = lhs == rhs;
-                null_eq && both_null
-            }
-            ComparisonOp::Ne => {
-                let at_least_one_null = lhs != rhs;
-                null_eq && at_least_one_null
-            }
-            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => false,
         }
     }
 }
@@ -344,7 +324,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        let mut blob = crate::alloc::vec![0; length as usize];
+        let mut blob = crate::alloc::try_vec![0; length as usize]?;
         fill_bytes(&mut blob);
         Ok(Value::Blob(blob))
     }
@@ -871,9 +851,12 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
+        let f: f64 =
+            crate::numeric::round_half_away_from_zero_tie(f, precision).unwrap_or_else(|| {
+                crate::numeric::str_to_f64(format!("{f:.precision$}"))
+                    .expect("formatted float should always parse successfully")
+                    .into()
+            });
 
         Value::from_f64(f)
     }
@@ -936,7 +919,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        Ok(Value::Blob(crate::alloc::vec![0; length as usize]))
+        Ok(Value::Blob(crate::alloc::try_vec![0; length as usize]?))
     }
 
     // exec_if returns whether you should jump
@@ -1134,36 +1117,36 @@ impl Value {
         }
     }
 
+    /// Mirrors SQLite's logFunc: log(X) calls log10 directly, and log(B,X)
+    /// always computes log(X)/log(B). Special-casing base 2 or 10 to call
+    /// their dedicated logarithm functions looks more accurate but shifts
+    /// the result by 1 ulp relative to SQLite's ratio.
+    #[allow(unused_unsafe)]
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
         let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
-        let base = match base.map(|value| Numeric::from_value_strict(value).map(|v| v.to_f64())) {
-            Some(Some(f)) => f,
-            Some(None) => return Value::Null,
-            None => 10.0,
-        };
-
-        if f <= 0.0 || base <= 0.0 || base == 1.0 {
+        if f <= 0.0 {
             return Value::Null;
         }
 
-        if base == 2.0 {
-            return Value::from_f64(libm::log2(f));
-        } else if base == 10.0 {
-            return Value::from_f64(libm::log10(f));
+        let base = match base.map(|value| Numeric::from_value_strict(value).map(|v| v.to_f64())) {
+            Some(Some(base)) => base,
+            Some(None) => return Value::Null,
+            None => return Value::from_f64(unsafe { cmath::log10(f) }),
         };
 
-        let log_x = libm::log(f);
-        let log_base = libm::log(base);
+        if base <= 0.0 {
+            return Value::Null;
+        }
 
+        let log_base = unsafe { cmath::log(base) };
         if log_base <= 0.0 {
             return Value::Null;
         }
 
-        let result = log_x / log_base;
-        Value::from_f64(result)
+        Value::from_f64(unsafe { cmath::log(f) } / log_base)
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
@@ -1386,14 +1369,40 @@ impl Value {
         result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    /// Concatenate another value onto this Text value, converting both to strings.
-    /// Used by GROUP_CONCAT/STRING_AGG to properly handle all value types.
+    /// Fallibly concatenate another value onto this Text value, converting it to a string.
     /// Panics if self is not a Text value.
-    pub fn exec_group_concat(&mut self, other: &Value) {
+    pub fn exec_group_concat(
+        &mut self,
+        other: &Value,
+    ) -> std::result::Result<(), crate::alloc::TryReserveError> {
         let Value::Text(text) = self else {
-            panic!("concat_to_text must be called only on Value::Text");
+            panic!("group_concat accumulator must be a Text value");
         };
-        text.value.to_mut().push_str(&other.to_string());
+        let acc = match &mut text.value {
+            std::borrow::Cow::Owned(s) => s,
+            borrowed => {
+                let mut s = String::new();
+                s.try_reserve(borrowed.len())?;
+                s.push_str(borrowed);
+                *borrowed = std::borrow::Cow::Owned(s);
+                let std::borrow::Cow::Owned(s) = borrowed else {
+                    unreachable!("accumulator was just converted to Owned");
+                };
+                s
+            }
+        };
+        match other {
+            Value::Text(text) => {
+                acc.try_reserve(text.as_str().len())?;
+                acc.push_str(text.as_str());
+            }
+            other => {
+                let rendered = other.to_string();
+                acc.try_reserve(rendered.len())?;
+                acc.push_str(&rendered);
+            }
+        }
+        Ok(())
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
@@ -1434,20 +1443,28 @@ impl Value {
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
         let result: String = values
-            .filter_map(|x| match x {
-                Value::Numeric(Numeric::Integer(i)) => {
-                    // Convert integer to Unicode codepoint.
-                    // For invalid codepoints (negative, surrogates, or > U+10FFFF),
-                    // output U+FFFD (replacement character) to match SQLite behavior.
-                    if *i >= 0 {
-                        Some(char::from_u32(*i as u32).unwrap_or('\u{FFFD}'))
-                    } else {
-                        Some('\u{FFFD}')
+            .map(|x| {
+                // char() coerces every argument to an integer codepoint, the
+                // same way sqlite3_value_int64 / CAST(... AS INTEGER) does:
+                // text and blobs by their numeric prefix (0 if none), floats by
+                // truncation, NULL as 0. Turso previously accepted only integer
+                // arguments and dropped the rest.
+                let codepoint = match x {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+                    Value::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
+                    Value::Blob(b) => {
+                        crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
                     }
+                    Value::Null => 0,
+                };
+                // Invalid codepoints (negative, surrogates, or > U+10FFFF)
+                // become U+FFFD, matching SQLite.
+                if codepoint >= 0 {
+                    char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
+                } else {
+                    '\u{FFFD}'
                 }
-                // NULL arguments produce NUL characters to match SQLite behavior.
-                Value::Null => Some('\0'),
-                _ => None,
             })
             .collect();
         Value::build_text(result)
@@ -2752,13 +2769,15 @@ mod tests {
             ),
             Value::build_text("\0")
         );
+        // Non-numeric text coerces to integer 0, so char('a') is a NUL byte,
+        // the same as SQLite (it feeds every argument through integer coercion).
         assert_eq!(
             Value::exec_char(
                 [Register::Value(Value::build_text("a"))]
                     .iter()
                     .map(|reg| reg.get_value())
             ),
-            Value::build_text("")
+            Value::build_text("\0")
         );
     }
 

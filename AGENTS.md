@@ -36,6 +36,7 @@ Default: add coverage to the narrowest existing test harness that can express th
 - `sqlite/conformance/sqlite-sqltests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
 - `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. Do not modify these for Turso behavior changes; use them as fixed compatibility coverage, and only touch them for intentional upstream sync or harness maintenance.
+- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend, run via `make -C postgres/conformance run` (spawns a tursopg server per test and drives it over the wire protocol). Only assert behavior real PostgreSQL also exhibits, so the corpus stays valid for differential runs.
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
 - `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
@@ -120,6 +121,22 @@ complete example.
 4. **Assert invariants.** Don't silently fail. Don't hedge with if-statements
 5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
 6. **Validate your hypotheses.**: If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
+
+## Always use plain language instead of complex jargon
+
+OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Examples:
+
+```diff
+-    /// Number of generated statements outside the engines' shared executable domain.
++    /// Number of statements skipped because EXPLAIN failed in at least one engine.
+
+...
+
+-    fn empty_schema_only_selects_bootstrap_safe_statements() {
++    fn empty_schema_never_chooses_a_statement_that_needs_a_table() {
+```
+
+No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is.
 
 ## CI Note
 

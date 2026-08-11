@@ -1,0 +1,44 @@
+@database :memory:
+
+# Comparing a TEXT column against a scalar subquery over an INTEGER column
+# uses numeric comparison affinity, so the integer keeps its type and sorts
+# before every text value (SQLite's sqlite3CompareAffinity). When the TEXT
+# column had a UNIQUE index, Turso's index seek ignored the subquery's column
+# affinity, fell back to the TEXT side's affinity, converted the integer to
+# text, and compared '4x' < '602393' as strings — returning rows SQLite does
+# not.
+
+@cross-check-integrity
+test text-index-less-than-integer-subquery-matches-nothing {
+    CREATE TABLE a(t TEXT UNIQUE);
+    INSERT INTO a VALUES ('4x');
+    CREATE TABLE b(i INTEGER);
+    INSERT INTO b VALUES (602393);
+    SELECT 1 FROM a WHERE t < (SELECT i FROM b);
+}
+expect {
+}
+
+@cross-check-integrity
+test text-index-greater-than-integer-subquery-matches-all {
+    CREATE TABLE a(t TEXT UNIQUE);
+    INSERT INTO a VALUES ('4x');
+    CREATE TABLE b(i INTEGER);
+    INSERT INTO b VALUES (602393);
+    SELECT 1 FROM a WHERE t > (SELECT i FROM b);
+}
+expect {
+    1
+}
+
+# A bare integer literal has no affinity of its own, so the TEXT side wins and
+# the comparison happens as text: '4x' < '602393'. This must keep working.
+@cross-check-integrity
+test text-index-less-than-integer-literal-compares-as-text {
+    CREATE TABLE a(t TEXT UNIQUE);
+    INSERT INTO a VALUES ('4x');
+    SELECT 1 FROM a WHERE t < 602393;
+}
+expect {
+    1
+}

@@ -284,16 +284,79 @@ expect {
     row_number|w|0
 }
 
-@skip-if sqlite "sqlite implements these window functions; we don't yet, so they must not be advertised in pragma_function_list"
-test pragma-function-list-omits-unimplemented-window-functions {
-    SELECT COUNT(*) FROM pragma_function_list
-    WHERE name IN (
-        'rank','dense_rank','percent_rank','cume_dist','ntile',
-        'lag','lead','first_value','last_value','nth_value'
-    );
+test pragma-function-list-window-rank {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'rank';
 }
 expect {
-    0
+    rank|w|0
+}
+
+test pragma-function-list-window-dense-rank {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'dense_rank';
+}
+expect {
+    dense_rank|w|0
+}
+
+test pragma-function-list-window-first-value {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'first_value';
+}
+expect {
+    first_value|w|1
+}
+
+test pragma-function-list-window-last-value {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'last_value';
+}
+expect {
+    last_value|w|1
+}
+
+test pragma-function-list-window-nth-value {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'nth_value';
+}
+expect {
+    nth_value|w|2
+}
+
+# lag and lead each appear three times (one row per accepted arity).
+test pragma-function-list-window-lag {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'lag' ORDER BY narg;
+}
+expect {
+    lag|w|1
+    lag|w|2
+    lag|w|3
+}
+
+test pragma-function-list-window-lead {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'lead' ORDER BY narg;
+}
+expect {
+    lead|w|1
+    lead|w|2
+    lead|w|3
+}
+
+test pragma-function-list-window-ntile {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'ntile';
+}
+expect {
+    ntile|w|1
+}
+
+test pragma-function-list-window-percent-rank {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'percent_rank';
+}
+expect {
+    percent_rank|w|0
+}
+
+test pragma-function-list-window-cume-dist {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'cume_dist';
+}
+expect {
+    cume_dist|w|0
 }
 
 @skip-if sqlite "sqlite will default to 'delete'"

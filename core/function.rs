@@ -518,7 +518,80 @@ impl WindowFunc {
     /// drifts ahead of the resolver and users get "no such function" when
     /// they try to call them.
     pub fn is_implemented(&self) -> bool {
-        matches!(self, Self::RowNumber)
+        matches!(
+            self,
+            Self::RowNumber
+                | Self::Rank
+                | Self::DenseRank
+                | Self::FirstValue
+                | Self::LastValue
+                | Self::NthValue
+                | Self::Lag
+                | Self::Lead
+                | Self::Ntile
+                | Self::PercentRank
+                | Self::CumeDist
+        )
+    }
+
+    /// The hardcoded frame this built-in evaluates over, overriding any
+    /// user-written FRAME clause.
+    /// - `Some(frame)` = even if the user provides an explicit frame, it's ignored in favor of this hardcoded frame.
+    /// - `None` = the function honors the user's frame, falling back to Frame::default() when user hasn't specified one.
+    ///
+    /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
+    pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
+        use crate::translate::plan::{Frame, FrameBoundary};
+        use turso_parser::ast::{Expr, FrameMode, Literal};
+        match self {
+            // Lag shares row_number's streaming frame even though its lookup
+            // can point forward (negative offset): SQLite emits a row as soon
+            // as the row after it is buffered, so a forward lookup past that
+            // one row misses and yields the default — behavior we match by
+            // using the same frame rather than caching the whole partition.
+            Self::RowNumber | Self::Lag => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::CurrentRow,
+                exclude: None,
+            }),
+            Self::Rank | Self::DenseRank => Some(Frame {
+                mode: FrameMode::Range,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::CurrentRow,
+                exclude: None,
+            }),
+            Self::PercentRank => Some(Frame {
+                mode: FrameMode::Groups,
+                start: FrameBoundary::CurrentRow,
+                end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
+            }),
+            Self::CumeDist => Some(Frame {
+                mode: FrameMode::Groups,
+                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                    "1".to_string(),
+                )))),
+                end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
+            }),
+            Self::Ntile => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::CurrentRow,
+                end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
+            }),
+            Self::Lead => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
+            }),
+            Self::FirstValue | Self::LastValue | Self::NthValue => None,
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
     }
 }
 

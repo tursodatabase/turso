@@ -1187,14 +1187,16 @@ impl PgDatabaseTable {
     fn new() -> Self {
         Self
     }
+}
 
-    fn db_name_from_path(path: &str) -> String {
-        std::path::Path::new(path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(path)
-            .to_string()
-    }
+/// Shared by the pg_database virtual table and current_database() so both
+/// report the same database name.
+pub(crate) fn db_name_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
 }
 
 impl InternalVirtualTable for PgDatabaseTable {
@@ -1289,7 +1291,7 @@ impl InternalVirtualTableCursor for PgDatabaseCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
-        let db_name = PgDatabaseTable::db_name_from_path(self.conn.db_file_path());
+        let db_name = db_name_from_path(self.conn.db_file_path());
         self.rows = vec![vec![
             Value::from_i64(16384),           // oid
             Value::build_text(db_name),       // datname
@@ -2458,8 +2460,7 @@ impl PgConstraintCursor {
             // PK / UNIQUE constraints from unique_sets
             for us in &btree.unique_sets {
                 let contype = if us.is_primary_key { "p" } else { "u" };
-                let col_names: Vec<&str> =
-                    us.columns.iter().map(|(name, _)| name.as_str()).collect();
+                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if us.is_primary_key {
                     format!("{table_name}_pkey")
                 } else {
@@ -3521,8 +3522,7 @@ pub fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String
         // PK / UNIQUE from unique_sets
         for us in &btree.unique_sets {
             if constraint_oid == target_oid {
-                let col_names: Vec<&str> =
-                    us.columns.iter().map(|(name, _)| name.as_str()).collect();
+                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let kw = if us.is_primary_key {
                     "PRIMARY KEY"
                 } else {

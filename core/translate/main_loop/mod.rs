@@ -36,19 +36,18 @@ use crate::{
     },
     turso_assert, turso_assert_eq,
     types::SeekOp,
-    util::expr_tables_subset_of,
     vdbe::{
         affinity::{self, Affinity},
         builder::{
             CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
             ProgramBuilder,
         },
-        insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
+        insn::{to_u32, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
 };
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, ops::Range, sync::Arc};
 use turso_macros::turso_assert_some;
 
 mod body;

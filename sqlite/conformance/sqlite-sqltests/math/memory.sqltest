@@ -3029,3 +3029,57 @@ test is-nonnull-divide-by-zero {
 expect {
 }
 
+
+# Full-precision compatibility with SQLite's logFunc: log10/log2/one-arg log
+# must call the dedicated C functions (computing ln(x)/ln(base) instead is
+# 1 ulp off), and two-arg log(B,X) must compute ln(X)/ln(B) with no
+# special-casing of bases 2 and 10 (the dedicated functions are 1 ulp off
+# from the ratio SQLite computes). The results are compared against exact
+# literals so the 0/1 output is identical across backends regardless of
+# float formatting.
+
+test log10-full-precision {
+    SELECT log10(2.0) = 0.3010299956639812
+}
+expect {
+    1
+}
+
+test log2-full-precision {
+    SELECT log2(3.0) = 1.584962500721156
+}
+expect {
+    1
+}
+
+test log-one-arg-full-precision {
+    SELECT log(5.0) = 0.6989700043360189
+}
+expect {
+    1
+}
+
+test log-two-arg-is-ln-ratio {
+    SELECT log(2.0, 3.0) = ln(3.0) / ln(2.0)
+}
+expect {
+    1
+}
+
+test log-two-arg-no-base2-special-case {
+    SELECT log(2.0, 3.0) = 1.5849625007211563
+}
+expect {
+    1
+}
+
+# Regression for a fuzzer-found divergence: mod() with a huge dividend
+# (cosh of ~26.9) amplifies a 1-ulp error in the log10 modulus by the
+# quotient (~8e11) into a visible difference.
+test mod-huge-dividend-log10-modulus {
+    SELECT mod(cosh(-2.0 - (0.5) * (-2.0 / 2.0 + (0.5) - degrees(1.0))), log10(2.0))
+         = mod(cosh(-2.0 - (0.5) * (-2.0 / 2.0 + (0.5) - degrees(1.0))), 0.3010299956639812)
+}
+expect {
+    1
+}

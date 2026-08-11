@@ -345,7 +345,16 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             });
         }
 
-        if !config.use_materialized_keys {
+        // Pre-filtering build rows with WHERE terms is a pure optimization: the
+        // same terms are still evaluated in the probe loop. It is safe for INNER
+        // and LEFT OUTER joins because the build side is never null-extended, so
+        // a build row rejected here can never appear in the output. For FULL
+        // OUTER joins it is wrong: a build row removed from the hash table makes
+        // the probe rows that matched it look unmatched, so they would be
+        // emitted as spurious null-extended rows.
+        let push_where_filters_to_build = !config.use_materialized_keys
+            && planner.hash_join_op.join_type != HashJoinType::FullOuter;
+        if push_where_filters_to_build {
             let build_only_mask: TableMask = [planner.hash_join_op.build_table_idx]
                 .into_iter()
                 .try_collect()?;
@@ -753,16 +762,16 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
 
         let match_reg = self.program.alloc_register();
         self.program.emit_insn(Insn::HashProbe {
-            hash_table_id: to_u16(hash_table_id),
-            key_start_reg: to_u16(probe_key_start_reg),
-            num_keys: to_u16(num_keys),
-            dest_reg: to_u16(match_reg),
+            hash_table_id: to_u32(hash_table_id),
+            key_start_reg: to_u32(probe_key_start_reg),
+            num_keys: to_u32(num_keys),
+            dest_reg: to_u32(match_reg),
             target_pc: hash_probe_miss_label,
-            payload_dest_reg: payload_dest_reg.map(to_u16),
-            num_payload: to_u16(num_payload),
+            payload_dest_reg: payload_dest_reg.map(to_u32),
+            num_payload: to_u32(num_payload),
             // Main probe loop always carries the probe rowid so spilled build
             // partitions are deferred to grace processing instead of loaded here.
-            probe_rowid_reg: probe_rowid_reg.map(to_u16),
+            probe_rowid_reg: probe_rowid_reg.map(to_u32),
         });
 
         let match_found_label = self.program.allocate_label();
@@ -1079,6 +1088,10 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                     self.hash_ctx
                         .inner_loop_gosub_reg
                         .zip(self.hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(
+                        self.hash_ctx.payload_start_reg,
+                        self.hash_ctx.payload_columns.len(),
+                    ),
                 )?;
             }
         }
@@ -1172,6 +1185,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
         hash_ctx
             .inner_loop_gosub_reg
             .zip(hash_ctx.labels.inner_loop_gosub),
+        payload_regs(payload_dest_reg, num_payload),
     )?;
 
     program.preassign_label_to_next_insn(label_next_unmatched);
@@ -1187,6 +1201,15 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     });
     program.preassign_label_to_next_insn(done_unmatched);
     Ok(())
+}
+
+/// The registers holding this hash join's payload, which the unmatched-row paths
+/// refill for every row they emit. Empty when the join carries no payload.
+fn payload_regs(start_reg: Option<usize>, num_payload: usize) -> Range<usize> {
+    match start_reg {
+        Some(start) => start..start + num_payload,
+        None => 0..0,
+    }
 }
 
 /// Grace Hash Join processing loop after the probe cursor is exhausted.
@@ -1229,7 +1252,7 @@ impl GraceHashLoop {
 
         // HashGraceInit: finalize probe spill + grace_begin
         program.emit_insn(Insn::HashGraceInit {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_done,
         });
 
@@ -1242,7 +1265,7 @@ impl GraceHashLoop {
         // grace_partition_top: load build partition + first probe chunk
         program.preassign_label_to_next_insn(grace_partition_top);
         program.emit_insn(Insn::HashGraceLoadPartition {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_cleanup,
         });
 
@@ -1261,10 +1284,10 @@ impl GraceHashLoop {
         }
 
         program.emit_insn(Insn::HashGraceNextProbe {
-            hash_table_id: to_u16(hash_table_reg),
-            key_start_reg: to_u16(hash_ctx.key_start_reg),
-            num_keys: to_u16(hash_ctx.num_keys),
-            probe_rowid_dest: to_u16(probe_rowid_reg),
+            hash_table_id: to_u32(hash_table_reg),
+            key_start_reg: to_u32(hash_ctx.key_start_reg),
+            num_keys: to_u32(hash_ctx.num_keys),
+            probe_rowid_dest: to_u32(probe_rowid_reg),
             target_pc: grace_advance,
         });
 
@@ -1286,13 +1309,13 @@ impl GraceHashLoop {
 
         // HashProbe the loaded build partition with the probe keys
         program.emit_insn(Insn::HashProbe {
-            hash_table_id: to_u16(hash_table_reg),
-            key_start_reg: to_u16(hash_ctx.key_start_reg),
-            num_keys: to_u16(hash_ctx.num_keys),
-            dest_reg: to_u16(match_reg),
+            hash_table_id: to_u32(hash_table_reg),
+            key_start_reg: to_u32(hash_ctx.key_start_reg),
+            num_keys: to_u32(hash_ctx.num_keys),
+            dest_reg: to_u32(match_reg),
             target_pc: grace_outer_check,
-            payload_dest_reg: payload_dest_reg.map(to_u16),
-            num_payload: to_u16(num_payload),
+            payload_dest_reg: payload_dest_reg.map(to_u32),
+            num_payload: to_u32(num_payload),
             probe_rowid_reg: None, // grace-only: HashGraceLoadPartition already loaded this partition
         });
 
@@ -1364,6 +1387,7 @@ impl GraceHashLoop {
                     hash_ctx
                         .inner_loop_gosub_reg
                         .zip(hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(payload_dest_reg, num_payload),
                 )?;
             }
 
@@ -1421,6 +1445,7 @@ impl GraceHashLoop {
                     hash_ctx
                         .inner_loop_gosub_reg
                         .zip(hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(payload_dest_reg, num_payload),
                 )?;
 
                 program.preassign_label_to_next_insn(grace_next_unmatched);
@@ -1440,7 +1465,7 @@ impl GraceHashLoop {
 
         // Evict current partition, advance to next
         program.emit_insn(Insn::HashGraceAdvancePartition {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_cleanup,
         });
         program.emit_insn(Insn::Goto {

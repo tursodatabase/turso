@@ -22,8 +22,8 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
-            ForeignKeyActions,
+            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
+            open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -48,7 +48,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
-        insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
@@ -267,7 +267,10 @@ pub fn translate_insert(
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
+        None => crate::bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        ),
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
@@ -295,7 +298,10 @@ pub fn translate_insert(
     }
 
     let Some(btree_table) = table.btree() else {
-        crate::bail_parse_error!("no such table: {}", table_name);
+        crate::bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        );
     };
 
     let BoundInsertResult {
@@ -1395,9 +1401,9 @@ fn emit_commit_phase(
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(idx_start_reg),
-            count: to_u16(num_cols + 1),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(idx_start_reg),
+            count: to_u32(num_cols + 1),
+            dest_reg: to_u32(record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
@@ -1405,7 +1411,7 @@ fn emit_commit_phase(
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(idx_start_reg),
-            unpacked_count: Some((num_cols + 1) as u16),
+            unpacked_count: Some((num_cols + 1) as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -2279,9 +2285,9 @@ fn init_source_emission<'a>(
                     };
 
                     program.emit_insn(Insn::MakeRecord {
-                        start_reg: to_u16(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
-                        count: to_u16(num_result_cols),
-                        dest_reg: to_u16(record_reg),
+                        start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+                        count: to_u32(num_result_cols),
+                        dest_reg: to_u32(record_reg),
                         index_name: None,
                         affinity_str: Some(affinity_str),
                     });
@@ -3037,9 +3043,9 @@ fn emit_index_uniqueness_check(
         if preflight.on_replace {
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(idx_start_reg),
-                count: to_u16(num_cols + 1),
-                dest_reg: to_u16(record_reg),
+                start_reg: to_u32(idx_start_reg),
+                count: to_u32(num_cols + 1),
+                dest_reg: to_u32(record_reg),
                 index_name: Some(index.name.clone()),
                 affinity_str: None,
             });
@@ -3047,7 +3053,7 @@ fn emit_index_uniqueness_check(
                 cursor_id: idx_cursor_id,
                 record_reg,
                 unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u16),
+                unpacked_count: Some((num_cols + 1) as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
         }
@@ -3189,9 +3195,9 @@ fn emit_unique_index_check(
             // IdxDelete repositions the cursor, so we must NOT use USE_SEEK.
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(idx_start_reg),
-                count: to_u16(num_cols + 1),
-                dest_reg: to_u16(record_reg),
+                start_reg: to_u32(idx_start_reg),
+                count: to_u32(num_cols + 1),
+                dest_reg: to_u32(record_reg),
                 index_name: Some(index.name.clone()),
                 affinity_str: None,
             });
@@ -3199,7 +3205,7 @@ fn emit_unique_index_check(
                 cursor_id: idx_cursor_id,
                 record_reg,
                 unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u16),
+                unpacked_count: Some((num_cols + 1) as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
         }
@@ -3442,9 +3448,9 @@ fn ensure_sequence_initialized(
         .collect();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(record_start_reg),
-        count: to_u16(2),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(record_start_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -3488,7 +3494,7 @@ pub(crate) fn halt_desc_and_on_error(
     }
     match effective {
         ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {raw_desc} (19)"),
+            format!("UNIQUE constraint failed: {raw_desc}"),
             Some(effective),
         ),
         _ => (raw_desc.to_string(), None),
@@ -3732,9 +3738,9 @@ fn emit_update_sqlite_sequence(
         .map(|col| col.affinity().aff_mask())
         .collect::<String>();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(record_start_reg),
-        count: to_u16(2),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(record_start_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -3827,8 +3833,8 @@ fn emit_replace_delete_conflicting_row(
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index
-                .bind_where_expr(Some(table_references), resolver)
-                .expect("where clause to exist");
+                .bind_where_expr(Some(table_references), resolver)?
+                .expect("index.where_clause was checked to be Some above");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
             translate_expr_no_constant_opt(
@@ -4219,8 +4225,19 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
         }
+        // Nothing to do if the parent counter is 0
+        let skip_fk = program.allocate_label();
+        program.emit_insn(Insn::FkIfZero {
+            deferred: pref.fk.deferred,
+            target_pc: skip_fk,
+        });
+
         let (new_pk_start, n_cols) =
             build_parent_key_image_for_insert(program, parent_table, &pref, insertion)?;
+
+        // Nothing to do if the key contains NULLs, because a NULL parent key
+        // never matches any child row (SQL NULL semantics)
+        emit_skip_if_any_null(program, new_pk_start, n_cols, skip_fk);
 
         let child_tbl = &pref.child_table;
         let child_cols = &pref.fk.child_columns;
@@ -4255,24 +4272,13 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 });
             }
 
-            let found = program.allocate_label();
-            program.emit_insn(Insn::Found {
-                cursor_id: icur,
-                target_pc: found,
-                record_reg: probe_start,
-                num_regs: n_cols,
-            });
-
-            // Not found, nothing to decrement
-            program.emit_insn(Insn::Close { cursor_id: icur });
-            let skip = program.allocate_label();
-            program.emit_insn(Insn::Goto { target_pc: skip });
-
-            // Found: guarded counter decrement
-            program.preassign_label_to_next_insn(found);
-            program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, skip, pref.fk.deferred);
-            program.preassign_label_to_next_insn(skip);
+            // Decrement once per matching child row
+            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
+                let next = p.allocate_label();
+                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                p.preassign_label_to_next_insn(next);
+                Ok(())
+            })?;
         } else {
             // fallback scan :(
             let ccur = open_read_table(program, child_tbl, database_id);
@@ -4325,6 +4331,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             program.preassign_label_to_next_insn(done);
             program.emit_insn(Insn::Close { cursor_id: ccur });
         }
+        program.preassign_label_to_next_insn(skip_fk);
     }
     Ok(())
 }

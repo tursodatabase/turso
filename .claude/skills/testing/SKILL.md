@@ -28,7 +28,7 @@ make test-single TEST=select.test
 make -C sqlite/conformance run-cli
 
 # OR
-cargo run -p test-runner -- run <test-file or directory>
+cargo run -p sqltest -- run <test-file or directory>
 
 # Rust unit/integration tests (full workspace)
 cargo test

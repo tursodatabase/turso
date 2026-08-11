@@ -7,6 +7,8 @@ use crate::sync::RwLock;
 use crate::turso_assert;
 use std::fmt::Debug;
 
+#[cfg(test)]
+mod discard_pending_tests;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
@@ -97,9 +99,12 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn set_checkpoint_threshold(&self, threshold: i64);
     fn checkpoint_threshold(&self) -> i64;
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()>;
-    fn discard_pending_log_write(&self) -> Result<()> {
-        Ok(())
-    }
+    #[aristo::intent(
+        "the pending running-CRC slot is cleared by the storage abort path after an abandoned deferred-offset write",
+        id = "logical_log_pending_crc_cleared_on_abort",
+        verify = "full"
+    )]
+    fn discard_pending_log_write(&self) -> Result<()>;
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32);
 
     /// Set the in-memory log header from a previously-read on-disk header.
@@ -114,6 +119,8 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Called after the checkpoint has fully completed: rows are flushed, WAL is
     /// truncated, and the logical log is reset.
+    ///
+    /// Runs while checkpoint locks are still held.
     fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
         Ok(())
     }
@@ -210,6 +217,7 @@ impl DurableStorage for Storage {
         self.logical_log.write().update_header()
     }
 
+    #[aristo::intent("after a truncate, once no write is in flight, the in-memory shadow_offset equals the on-disk durable_offset (the tracked end-of-log matches what's been fsync'd)", id = "aristos:logical_log_shadow_offset_matches_durable", verify = "full")]
     fn truncate(
         &self,
         checkpointed_through_ts: u64,
@@ -264,6 +272,11 @@ impl DurableStorage for Storage {
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
         self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
+        Ok(())
+    }
+
+    fn discard_pending_log_write(&self) -> Result<()> {
+        self.logical_log.write().discard_pending_write();
         Ok(())
     }
 

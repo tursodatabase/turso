@@ -17,6 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
@@ -41,7 +42,7 @@ pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
 use crate::{
-    alloc::DynAllocator,
+    alloc::{DynAllocator, TryClone},
     error::LimboError,
     function::FuncCtx,
     mvcc::{database::CommitStateMachine, MvccClock},
@@ -73,7 +74,7 @@ use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, ImmutableRecord, Value},
+    types::{AggContext, Cursor, ImmutableRecord, RecordBuf, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 use crate::{
@@ -179,6 +180,12 @@ pub enum StepResult {
     /// still drive the event loop (`io.step()`) between steps so progress that depends on
     /// other threads' I/O is not starved.
     Yield,
+    /// The statement asks the caller to wait for `duration` before stepping again,
+    /// e.g. because a busy handler decided to retry after a delay. Callers that don't
+    /// track time may treat this exactly like `IO`: drive the event loop and step again.
+    Sleep {
+        duration: std::time::Duration,
+    },
 }
 
 #[derive(Debug)]
@@ -261,7 +268,76 @@ pub enum Register {
     Record(ImmutableRecord),
 }
 
+impl TryClone for Register {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
+            Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
+            Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
+                record.get_payload(),
+                RecordBuf::alloc(),
+            )?)),
+        }
+    }
+
+    /// Fallibly copies `source` into this register, reusing the destination's
+    /// Value or record allocation when the variants match; see
+    /// [Value::try_clone_from].
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone_from(&mut self, source: &Self) -> Result<(), Self::Error> {
+        match (self, source) {
+            (Register::Value(dst), Register::Value(src)) => dst.try_clone_from(src)?,
+            (Register::Record(dst), Register::Record(src)) => {
+                let buf = dst.as_blob_mut();
+                buf.clear();
+                buf.try_extend(src.get_payload().iter().copied())?;
+            }
+            (dst, Register::Value(src)) => {
+                let mut value = Value::Null;
+                value.try_clone_from(src)?;
+                *dst = Register::Value(value);
+            }
+            (dst, Register::Record(src)) => {
+                *dst = Register::Record(ImmutableRecord::copy_payload(
+                    src.get_payload(),
+                    RecordBuf::alloc(),
+                )?);
+            }
+            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+        }
+        Ok(())
+    }
+}
+
 impl Register {
+    /// Takes the register's spent record buffer for reuse, leaving NULL.
+    /// Callers about to overwrite the register use this to recycle its
+    /// allocation instead of dropping it.
+    #[inline]
+    pub fn take_buf(&mut self) -> RecordBuf {
+        match std::mem::replace(self, Register::Value(Value::Null)) {
+            Register::Record(record) => record.retire(),
+            _ => RecordBuf::alloc(),
+        }
+    }
+
+    /// Fallibly sets the register to a copy of `val`, reusing the register's
+    /// existing allocation when possible; see [Value::try_clone_from].
+    #[inline]
+    pub fn try_clone_value_from(&mut self, val: &Value) -> crate::Result<()> {
+        match self {
+            Register::Value(v) => v.try_clone_from(val)?,
+            _ => {
+                let mut value = Value::Null;
+                value.try_clone_from(val)?;
+                *self = Register::Value(value);
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     pub const fn is_null(&self) -> bool {
         matches!(self, Register::Value(Value::Null))
@@ -749,8 +825,6 @@ pub struct ProgramState {
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
-    /// Current collation sequence set by OP_CollSeq instruction
-    current_collation: Option<CollationSeq>,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -846,7 +920,6 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
-            current_collation: None,
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
@@ -956,7 +1029,6 @@ impl ProgramState {
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
-        self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -967,7 +1039,6 @@ impl ProgramState {
         self.commit_state.cleanup_mvcc_checkpoint_state();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
-        self.current_collation = None;
         self.commit_state = CommitState::Ready;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
@@ -1016,9 +1087,6 @@ impl ProgramState {
         if is_already_committing {
             return true;
         }
-        if self.auto_txn_cleanup != TxnCleanup::RollbackTxn {
-            return false;
-        }
         let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
         turso_assert!(
             active_writers <= 1,
@@ -1033,16 +1101,45 @@ impl ProgramState {
         if connection.mv_store().is_some() {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
-            return connection.n_active_root_statements.load(Ordering::SeqCst) == 1
+            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && connection.n_active_root_statements.load(Ordering::SeqCst) == 1
                 && (self.is_active_write || active_writers == 0);
         }
-        if self.is_active_write {
-            // Pager/WAL writers can finish while sibling readers remain active.
-            // The readers keep their cursors and release them when they finish.
+        if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
+            // Pager/WAL writers can finish while sibling readers remain
+            // active, like SQLite commits when the halting statement is the
+            // only writer (the nVdbeWrite check in sqlite3VdbeHalt). The
+            // readers keep their cursors and release them when they finish.
             return true;
         }
-        // Pager/WAL readers do not wait for sibling readers.
-        active_writers == 0
+        // Non-main pagers keep their transaction state on the pager itself,
+        // like SQLite keeps it on the Btree handle (Btree.inTrans), and the
+        // transaction is shared by every statement on the connection.
+        let attached_txn_open = || {
+            connection.with_all_attached_pagers_with_index(|pagers| {
+                pagers
+                    .iter()
+                    .any(|(_, pager)| pager.holds_read_lock() || pager.holds_write_lock())
+            })
+        };
+        if connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+            // Readers can finish while sibling readers remain active, but a
+            // shared attached transaction may only be finished by the last
+            // active statement, like SQLite's btreeEndTransaction keeps the
+            // transaction open while db->nVdbeRead > 1.
+            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && active_writers == 0
+                && !attached_txn_open();
+        }
+        // This is the last active statement: finish its own transaction, or
+        // an attached transaction a deferring sibling left behind — SQLite's
+        // vdbeCommit visits every database on halt, so leftovers are closed
+        // even by a statement that never started a transaction itself.
+        if active_writers != 0 {
+            return false;
+        }
+        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || (connection.get_auto_commit() && attached_txn_open())
     }
 
     #[inline]
@@ -1740,20 +1837,14 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        loop {
-            if self.connection.is_closed() {
-                // Connection is closed for whatever reason, rollback the transaction.
-                let state = self.connection.get_tx_state();
-                if let TransactionState::Write { .. } = state {
-                    pager.rollback_tx(&self.connection);
-                }
-                return Err(LimboError::InternalError("Connection closed".to_string()));
-            }
-            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
-                self.abort(pager, None, state)?;
-                return Ok(StepResult::Interrupt);
-            }
-
+        // Invalidate the previous result row once per step call: rows are only
+        // handed out between step calls, and ResultRow returns immediately
+        // after setting a fresh one.
+        let _ = state.result_row.take();
+        // The outer loop runs once per step call and is re-entered only when an
+        // instruction completed its IO inline; the inner loop dispatches
+        // instructions without re-inspecting the completion slot every time.
+        'io_check: loop {
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
                     io.set_waker(waker);
@@ -1773,6 +1864,7 @@ impl Program {
                                 "Abort also failed during checkpoint error handling: {abort_err}"
                             );
                         }
+                        pager.cleanup_after_checkpoint_failure();
                         return Err(checkpoint_err);
                     }
                     let err = err.into();
@@ -1783,110 +1875,124 @@ impl Program {
                 }
                 state.io_completions = None;
             }
-            // invalidate row
-            let _ = state.result_row.take();
-            let (insn, _) = &self.insns[state.pc as usize];
-            let insn_function = insn.to_function();
-            if enable_tracing {
-                trace_insn(self, state.pc as InsnReference, insn);
-                crate::stack::trace_remaining("program_step:opcode");
-            }
-            if self.connection.get_vdbe_trace() {
-                // Diff registers from PREVIOUS opcode
-                // The last opcode (Halt) won't have its diff printed, but Halt
-                // doesn't write to any registers
-                if let Some(ref old) = state.pre_op_registers {
-                    for (i, (old_reg, new_reg)) in
-                        old.iter().zip(state.registers.iter()).enumerate()
-                    {
-                        if old_reg != new_reg {
-                            match new_reg {
-                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
-                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
-                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
+            loop {
+                if self.connection.is_closed() {
+                    // Connection is closed for whatever reason, rollback the transaction.
+                    let state = self.connection.get_tx_state();
+                    if let TransactionState::Write { .. } = state {
+                        pager.rollback_tx(&self.connection);
+                    }
+                    return Err(LimboError::InternalError("Connection closed".to_string()));
+                }
+                if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+                    self.abort(pager, None, state)?;
+                    return Ok(StepResult::Interrupt);
+                }
+                let (insn, _) = &self.insns[state.pc as usize];
+                let insn_function = insn.to_function();
+                if enable_tracing {
+                    trace_insn(self, state.pc as InsnReference, insn);
+                    crate::stack::trace_remaining("program_step:opcode");
+                }
+                if self.connection.get_vdbe_trace() {
+                    // Diff registers from PREVIOUS opcode
+                    // The last opcode (Halt) won't have its diff printed, but Halt
+                    // doesn't write to any registers
+                    if let Some(ref old) = state.pre_op_registers {
+                        for (i, (old_reg, new_reg)) in
+                            old.iter().zip(state.registers.iter()).enumerate()
+                        {
+                            if old_reg != new_reg {
+                                match new_reg {
+                                    Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                    Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                    Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                                }
                             }
                         }
+                        state.pre_op_registers = None;
                     }
-                    state.pre_op_registers = None;
-                }
 
-                // Print CURRENT opcode
-                if matches!(insn, Insn::Init { .. }) {
-                    eprintln!("VDBE Trace:");
+                    // Print CURRENT opcode
+                    if matches!(insn, Insn::Init { .. }) {
+                        eprintln!("VDBE Trace:");
+                    }
+                    eprintln!(
+                        "{}",
+                        explain::insn_to_str(
+                            self,
+                            state.pc as InsnReference,
+                            insn,
+                            String::new(),
+                            self.comments
+                                .iter()
+                                .find(|(offset, _)| *offset == state.pc as InsnReference)
+                                .map(|(_, comment)| comment)
+                                .copied()
+                        )
+                    );
+                    // Snapshot for next iteration
+                    state.pre_op_registers = Some(state.registers.clone());
                 }
-                eprintln!(
-                    "{}",
-                    explain::insn_to_str(
-                        self,
-                        state.pc as InsnReference,
-                        insn,
-                        String::new(),
-                        self.comments
-                            .iter()
-                            .find(|(offset, _)| *offset == state.pc as InsnReference)
-                            .map(|(_, comment)| comment)
-                            .copied()
-                    )
-                );
-                // Snapshot for next iteration
-                state.pre_op_registers = Some(state.registers.clone());
-            }
-            // Always increment VM steps for every loop iteration
-            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+                // Always increment VM steps for every loop iteration
+                state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-            match insn_function(self, state, insn, pager) {
-                Ok(InsnFunctionStepResult::Step) => {
-                    // Instruction completed, moving to next
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                }
-                Ok(InsnFunctionStepResult::Done) => {
-                    // Instruction completed execution
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    state.auto_txn_cleanup = TxnCleanup::None;
-                    return Ok(StepResult::Done);
-                }
-                Ok(InsnFunctionStepResult::IO(io)) => {
-                    // Instruction not complete - waiting for I/O, will resume at same PC
-                    io.set_waker(waker);
-                    let is_yield = io.is_explicit_yield();
-                    if is_yield {
-                        // Yield: return control to the cooperative scheduler so
-                        // other connections can make progress (e.g. release a
-                        // contended lock). Don't store in io_completions —
-                        // yields aren't pending I/O, so the instruction will
-                        // simply re-execute on the next step.
-                        return Ok(StepResult::Yield);
+                match insn_function(self, state, insn, pager) {
+                    Ok(InsnFunctionStepResult::Step) => {
+                        // Instruction completed, moving to next
+                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     }
-                    let finished = io.finished();
-                    state.io_completions = Some(io);
-                    if !finished {
-                        return Ok(StepResult::IO);
+                    Ok(InsnFunctionStepResult::Done) => {
+                        // Instruction completed execution
+                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                        state.auto_txn_cleanup = TxnCleanup::None;
+                        return Ok(StepResult::Done);
                     }
-                    // just continue the outer loop if IO is finished so db will continue execution immediately
-                }
-                Ok(InsnFunctionStepResult::Row) => {
-                    // Instruction completed (ResultRow already incremented PC)
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    return Ok(StepResult::Row);
-                }
-                Err(LimboError::Busy) => {
-                    // Instruction blocked - will retry at same PC
-                    return Ok(StepResult::Busy);
-                }
-                Err(LimboError::BusySnapshot)
-                    if self.connection.transaction_state.get() == TransactionState::None =>
-                {
-                    // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
-                    // because the snapshot will continue to be stale no matter how many times we retry.
-                    // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
-                    // back, so auto-retrying can be useful.
-                    return Ok(StepResult::Busy);
-                }
-                Err(err) => {
-                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
-                        tracing::error!("Abort failed during error handling: {abort_err}");
+                    Ok(InsnFunctionStepResult::IO(io)) => {
+                        // Instruction not complete - waiting for I/O, will resume at same PC
+                        io.set_waker(waker);
+                        let is_yield = io.is_explicit_yield();
+                        if is_yield {
+                            // Yield: return control to the cooperative scheduler so
+                            // other connections can make progress (e.g. release a
+                            // contended lock). Don't store in io_completions —
+                            // yields aren't pending I/O, so the instruction will
+                            // simply re-execute on the next step.
+                            return Ok(StepResult::Yield);
+                        }
+                        let finished = io.finished();
+                        state.io_completions = Some(io);
+                        if !finished {
+                            return Ok(StepResult::IO);
+                        }
+                        // IO already finished: loop back to the completion check so
+                        // errors are observed, then continue execution immediately.
+                        continue 'io_check;
                     }
-                    return Err(err);
+                    Ok(InsnFunctionStepResult::Row) => {
+                        // Instruction completed (ResultRow already incremented PC)
+                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                        return Ok(StepResult::Row);
+                    }
+                    Err(LimboError::Busy) => {
+                        // Instruction blocked - will retry at same PC
+                        return Ok(StepResult::Busy);
+                    }
+                    Err(LimboError::BusySnapshot)
+                        if self.connection.transaction_state.get() == TransactionState::None =>
+                    {
+                        // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
+                        // because the snapshot will continue to be stale no matter how many times we retry.
+                        // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
+                        // back, so auto-retrying can be useful.
+                        return Ok(StepResult::Busy);
+                    }
+                    Err(err) => {
+                        if let Err(abort_err) = self.abort(pager, Some(&err), state) {
+                            tracing::error!("Abort failed during error handling: {abort_err}");
+                        }
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -2003,6 +2109,16 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
     ) -> Result<IOResult<()>> {
+        if !rollback {
+            turso_assert!(
+                !matches!(
+                    program_state.sequence_inner_tx_pending.as_ref(),
+                    Some(pending) if pending.saved_outer.is_some()
+                ),
+                "cannot commit while a sequence inner tx has a saved outer user tx"
+            );
+        }
+
         // Apply view deltas with I/O handling
         match self.apply_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2084,9 +2200,18 @@ impl Program {
             tx_state,
         );
         if matches!(program_state.commit_state, CommitState::Committing) {
-            let TransactionState::Write { .. } = tx_state else {
-                unreachable!("invalid state for write commit step")
-            };
+            // Normally a resumed commit still has an open write transaction.
+            // The exception is the post-commit auto-checkpoint: commit_tx has
+            // already committed the WAL, released the locks and cleared the
+            // transaction state, and only the checkpoint is still in flight,
+            // so the state is None.
+            turso_assert!(
+                matches!(
+                    tx_state,
+                    TransactionState::Write { .. } | TransactionState::None
+                ),
+                "invalid state for write commit step: {tx_state:?}"
+            );
             self.step_end_write_txn(&pager, &connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
@@ -2646,6 +2771,13 @@ impl Program {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.
+                    if let Err(err) = self.rollback_pending_sequence_outer_tx(state) {
+                        capture_abort_error(
+                            &mut abort_error,
+                            err,
+                            "Failed to rollback saved outer transaction after sequence conflict",
+                        );
+                    }
                     self.rollback_current_txn(pager);
                     self.connection.set_changes(0);
                 }
@@ -2804,6 +2936,45 @@ impl Program {
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
         self.connection.rollback_current_txn_state(pager, true);
+        self.connection.set_cdc_transaction_id(-1);
+    }
+
+    /// MVCC sequence operations run in a separate inner tx, which temporarily
+    /// replaces the connection's `mv_tx` slot. If a transaction-level conflict
+    /// happens while that swap is active, the user transaction lives only in
+    /// `saved_outer`, not in `connection.mv_tx`. Roll it back here and clear
+    /// `saved_outer` so later statement cleanup cannot restore a transaction
+    /// that has already been aborted.
+    fn rollback_pending_sequence_outer_tx(&self, state: &mut ProgramState) -> Result<()> {
+        let Some(pending) = state.sequence_inner_tx_pending.as_mut() else {
+            return Ok(());
+        };
+        let db = pending.db;
+        let (outer_tx_id, _) = pending.saved_outer.take().ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence conflict rollback had pending inner transaction without saved outer \
+                 transaction"
+                    .to_string(),
+            )
+        })?;
+        let mv_store = self.connection.mv_store_for_db(db).ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence inner transaction has no MV store during conflict rollback".to_string(),
+            )
+        })?;
+        let pager = self.connection.get_pager_from_database_index(&db)?;
+        if !mv_store.is_tx_rollbackable(outer_tx_id) {
+            return Err(LimboError::InternalError(format!(
+                "saved sequence outer transaction {outer_tx_id} is not rollbackable during \
+                 conflict rollback"
+            )));
+        }
+        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
+        // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
+        // generic rollback then has no current tx to inspect, so it will not flip
+        // autocommit for us.
+        self.connection.auto_commit.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {
@@ -2817,15 +2988,6 @@ impl Deref for Program {
     fn deref(&self) -> &PreparedProgram {
         &self.prepared
     }
-}
-
-pub(crate) fn make_record(
-    registers: &[Register],
-    start_reg: &usize,
-    count: &usize,
-) -> Result<ImmutableRecord> {
-    let regs = &registers[*start_reg..*start_reg + *count];
-    ImmutableRecord::from_registers(regs, regs.len())
 }
 
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
@@ -2968,6 +3130,12 @@ pub trait ValueIteratorExt {
     /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on parse error,
     /// or `None` if there are fewer than `n+1` elements.
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>>;
+
+    /// Skips `skip` elements, then decodes one value into each register of `dests` in order.
+    /// Returns the number of registers filled, which is less than `dests.len()` when the record
+    /// has fewer elements; registers past the returned count are left untouched.
+    fn decode_into_registers_after(&mut self, skip: usize, dests: &mut [Register])
+        -> Result<usize>;
 }
 
 impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
@@ -3153,18 +3321,11 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
+                    mark_unlikely();
+                    return Some(Err(LimboError::Corrupt(
+                        "TEXT value contains invalid UTF-8".into(),
+                    )));
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
@@ -3189,6 +3350,23 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
 
         Some(Ok(()))
     }
+
+    #[inline]
+    fn decode_into_registers_after(
+        &mut self,
+        skip: usize,
+        dests: &mut [Register],
+    ) -> Result<usize> {
+        for (i, dest) in dests.iter_mut().enumerate() {
+            let n = if i == 0 { skip } else { 0 };
+            match self.nth_into_register(n, dest) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Err(e),
+                None => return Ok(i),
+            }
+        }
+        Ok(dests.len())
+    }
 }
 
 #[cfg(test)]
@@ -3207,6 +3385,26 @@ mod tests {
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn nth_into_register_rejects_invalid_utf8_text() {
+        let payload = [2, 15, 0xff];
+        let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
+        let mut destination = Register::Value(Value::Null);
+
+        let result = iterator
+            .nth_into_register(0, &mut destination)
+            .expect("record contains one value");
+
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::Corrupt(ref message))
+                    if message == "TEXT value contains invalid UTF-8"
+            ),
+            "unexpected result: {result:?}"
+        );
     }
 
     #[test]
@@ -3236,6 +3434,104 @@ mod tests {
             OpInsertSubState::Seek
         ));
         assert!(matches!(state.seek_state, OpSeekState::MoveLast));
+    }
+
+    #[test]
+    fn register_try_clone_copies_each_variant() {
+        let record_values = [Value::from_i64(1), Value::build_text("record payload")];
+        let aggregate_values = crate::alloc::vec![Value::build_text("aggregate payload")];
+        let registers = [
+            Register::Value(Value::build_text("value")),
+            Register::Aggregate(AggContext::Builtin(aggregate_values)),
+            Register::Record(
+                ImmutableRecord::from_values(&record_values, record_values.len()).unwrap(),
+            ),
+        ];
+
+        for source in registers {
+            assert_eq!(source.try_clone().unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn register_try_clone_from_reuses_matching_allocations() {
+        use crate::types::Text;
+
+        let src = Register::Value(Value::Text(Text::new(String::from("short"))));
+        let mut dst = Register::Value(Value::Text(Text::new(String::from(
+            "a destination string with plenty of capacity",
+        ))));
+        let ptr = match &dst {
+            Register::Value(Value::Text(t)) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Register::Value(Value::Text(t)) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src_values = [Value::from_i64(1), Value::build_text("record payload")];
+        let src =
+            Register::Record(ImmutableRecord::from_values(&src_values, src_values.len()).unwrap());
+        let large_values = [Value::build_text(
+            "a much longer record payload that dwarfs the source record",
+        )];
+        let mut dst = Register::Record(
+            ImmutableRecord::from_values(&large_values, large_values.len()).unwrap(),
+        );
+        let ptr = match &dst {
+            Register::Record(record) => record.get_payload().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Register::Record(record) => assert_eq!(record.get_payload().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
+            Value::build_text("agg state"),
+            Value::from_i64(2),
+        ]));
+        let mut dst = Register::Value(Value::Null);
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn register_take_buf_recycles_record_allocations() {
+        let values = [Value::build_text("some record payload")];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let capacity = record.as_blob().capacity();
+        let ptr = record.get_payload().as_ptr();
+
+        let mut register = Register::Record(record);
+        let rebuilt = ImmutableRecord::build(&values, register.take_buf()).unwrap();
+        assert!(register.is_null());
+        assert_eq!(rebuilt.as_blob().capacity(), capacity);
+        assert_eq!(rebuilt.get_payload().as_ptr(), ptr);
+    }
+
+    #[test]
+    fn register_try_clone_value_from_reuses_value_slot() {
+        let value = Value::build_text(String::from("payload"));
+        let mut register = Register::Value(Value::build_text(String::from(
+            "existing buffer with plenty of capacity to reuse",
+        )));
+        let ptr = match &register {
+            Register::Value(Value::Text(text)) => text.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+
+        register.try_clone_value_from(&value).unwrap();
+        assert_eq!(register, Register::Value(value));
+        match &register {
+            Register::Value(Value::Text(text)) => assert_eq!(text.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
     }
 }
 

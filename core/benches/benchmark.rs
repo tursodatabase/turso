@@ -467,7 +467,9 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
                             turso_core::StepResult::Row => {
                                 black_box(stmt.row());
                             }
-                            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                            turso_core::StepResult::IO
+                            | turso_core::StepResult::Yield
+                            | turso_core::StepResult::Sleep { .. } => {
                                 db.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {
@@ -530,7 +532,9 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
                     turso_core::StepResult::Row => {
                         black_box(stmt.row());
                     }
-                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                    turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield
+                    | turso_core::StepResult::Sleep { .. } => {
                         db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
@@ -584,7 +588,9 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
                     turso_core::StepResult::Row => {
                         black_box(stmt.row());
                     }
-                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                    turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield
+                    | turso_core::StepResult::Sleep { .. } => {
                         db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
@@ -649,7 +655,9 @@ fn bench_execute_group_by(criterion: &mut Criterion) {
                     turso_core::StepResult::Row => {
                         black_box(stmt.row());
                     }
-                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                    turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield
+                    | turso_core::StepResult::Sleep { .. } => {
                         db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
@@ -716,7 +724,9 @@ fn bench_insert_rows(criterion: &mut Criterion) {
 
         loop {
             match stmt.step().unwrap() {
-                turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                turso_core::StepResult::IO
+                | turso_core::StepResult::Yield
+                | turso_core::StepResult::Sleep { .. } => {
                     db.io.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
@@ -743,7 +753,9 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
-                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                        turso_core::StepResult::IO
+                        | turso_core::StepResult::Yield
+                        | turso_core::StepResult::Sleep { .. } => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -788,7 +800,9 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             .unwrap();
         loop {
             match stmt.step().unwrap() {
-                turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                turso_core::StepResult::IO
+                | turso_core::StepResult::Yield
+                | turso_core::StepResult::Sleep { .. } => {
                     mvcc_db.io.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
@@ -815,7 +829,9 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
-                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                        turso_core::StepResult::IO
+                        | turso_core::StepResult::Yield
+                        | turso_core::StepResult::Sleep { .. } => {
                             mvcc_db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -953,7 +969,7 @@ fn bench_limbo(
                 StepResult::Done => {
                     conn.current_statement = None;
                 }
-                StepResult::IO | StepResult::Yield => {
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
                 StepResult::Busy => {
@@ -1191,7 +1207,9 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
 
         loop {
             match stmt.step().unwrap() {
-                turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                turso_core::StepResult::IO
+                | turso_core::StepResult::Yield
+                | turso_core::StepResult::Sleep { .. } => {
                     db.io.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
@@ -1215,7 +1233,9 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
-                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                        turso_core::StepResult::IO
+                        | turso_core::StepResult::Yield
+                        | turso_core::StepResult::Sleep { .. } => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {

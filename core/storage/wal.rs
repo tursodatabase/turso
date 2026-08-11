@@ -7,7 +7,6 @@ use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
 use branches::mark_unlikely;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use strum::EnumString;
@@ -28,7 +27,10 @@ use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::DatabaseStorage;
+use crate::storage::page_transform::{
+    page_codec_completion_error, PageCodecContext, PageLocation, PageTransform,
+};
 #[cfg(host_shared_wal)]
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
 #[cfg(host_shared_wal)]
@@ -36,14 +38,15 @@ use crate::storage::shared_wal_coordination::{
     MappedSharedWalCoordination, SharedOwnerRecord, SharedReaderSlot, SharedWalCoordinationHeader,
 };
 use crate::storage::sqlite3_ondisk::{
-    begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
-    write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+    begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame_header,
+    recompute_wal_frame_checksum, write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE,
+    WAL_HEADER_SIZE,
 };
 use crate::types::{IOCompletions, IOResult};
 use crate::util::IOExt as _;
 use crate::{
     bail_corrupt_error, io_yield_one, Buffer, Completion, CompletionError, IOContext, LimboError,
-    Result,
+    Result, SyncMode,
 };
 
 /// this contains the frame to rollback to and its associated checksum.
@@ -677,11 +680,14 @@ pub trait Wal: Debug + Send + Sync {
         scratch_buf: Option<Arc<Buffer>>,
     ) -> Result<Completion>;
 
-    /// Read a raw frame (header included) from the WAL.
+    /// Read a raw WAL frame with its on-disk header and page body decoded by
+    /// the configured encryption context or external page codec.
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion>;
 
-    /// Write a raw frame (header included) from the WAL.
-    /// Note, that turso-db will use page_no and size_after fields from the header, but will overwrite checksum with proper value
+    /// Write an in-memory page as a WAL frame.
+    ///
+    /// TursoDB uses `page_no` and `size_after` from the supplied header, applies
+    /// any configured page transform to the body, and overwrites the checksum.
     fn write_frame_raw(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -728,8 +734,16 @@ pub trait Wal: Debug + Send + Sync {
     fn finish_append_frames_commit(&self) -> Result<()>;
 
     fn should_checkpoint(&self) -> bool;
-    fn checkpoint(&self, pager: &Pager, mode: CheckpointMode)
-        -> Result<IOResult<CheckpointResult>>;
+    /// Checkpoint the WAL into the database file.
+    /// `sync_mode` controls the WAL durability barrier: unless it is
+    /// [SyncMode::Off], the WAL is fsynced before any frame is backfilled so
+    /// that a crash mid-backfill can always be healed by WAL recovery.
+    fn checkpoint(
+        &self,
+        pager: &Pager,
+        mode: CheckpointMode,
+        sync_mode: SyncMode,
+    ) -> Result<IOResult<CheckpointResult>>;
     fn install_durable_backfill_proof(
         &self,
         max_frame: u64,
@@ -815,8 +829,11 @@ pub trait Wal: Debug + Send + Sync {
     /// method consumes that raw checkpoint-lock ownership: on success the guard
     /// is held by the checkpoint state machine, and on early failure it is
     /// released before returning.
-    fn vacuum_checkpoint_with_held_lock(&self, pager: &Pager)
-        -> Result<IOResult<CheckpointResult>>;
+    fn vacuum_checkpoint_with_held_lock(
+        &self,
+        pager: &Pager,
+        sync_mode: SyncMode,
+    ) -> Result<IOResult<CheckpointResult>>;
 
     /// Release the exclusive VACUUM lock acquired by `begin_vacuum_blocking_tx`.
     /// VACUUM calls this once done, after which new
@@ -2389,6 +2406,12 @@ impl WalCoordination for ShmWalCoordination {
 #[derive(Debug, Clone)]
 pub enum CheckpointState {
     Start,
+    /// Fsync the WAL before backfilling any frame into the database file.
+    /// Under `synchronous=NORMAL` commits do not fsync the WAL, so without
+    /// this durability barrier a crash mid-backfill could persist some
+    /// backfilled DB pages while recovery drops the unsynced WAL tail,
+    /// leaving a torn database that matches no committed prefix.
+    SyncWal,
     Processing,
     /// Determine the checkpoint result: update nBackfills, restart log if needed.
     DetermineResult,
@@ -3048,6 +3071,66 @@ enum TryBeginReadResult {
 }
 
 impl WalFile {
+    fn prepare_transformed_frame(
+        buffer_pool: &Arc<BufferPool>,
+        wal_header: &WalHeader,
+        previous_checksums: (u32, u32),
+        page_number: u32,
+        db_size: u32,
+        page: &[u8],
+        page_transform: &PageTransform,
+    ) -> Result<((u32, u32), Arc<Buffer>)> {
+        turso_assert!(
+            page_number > 0,
+            "WAL page number must be one-based",
+            { "page_number": page_number }
+        );
+        let page_size = wal_header.page_size as usize;
+        turso_assert!(
+            PageSize::new(wal_header.page_size).is_some(),
+            "WAL header must contain a valid page size",
+            { "page_size": wal_header.page_size }
+        );
+        turso_assert!(
+            page.len() == page_size,
+            "WAL input page size must match the WAL header",
+            { "input_len": page.len(), "page_size": page_size }
+        );
+
+        let frame = prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size);
+        turso_assert!(
+            frame.len() == WAL_FRAME_HEADER_SIZE + page_size,
+            "WAL frame buffer size must match its header and page body",
+            {
+                "frame_len": frame.len(),
+                "expected_len": WAL_FRAME_HEADER_SIZE + page_size
+            }
+        );
+        let frame_body = &mut frame.as_mut_slice()[WAL_FRAME_HEADER_SIZE..];
+        turso_assert!(
+            frame_body.len() == page.len(),
+            "WAL frame body size must match the input page",
+            { "frame_body_len": frame_body.len(), "input_len": page.len() }
+        );
+
+        match page_transform {
+            PageTransform::Codec(codec) => codec.encode_page(
+                PageCodecContext::new(page_number, PageLocation::Wal),
+                page,
+                frame_body,
+            )?,
+            PageTransform::Checksum(checksum) => {
+                frame_body.copy_from_slice(page);
+                checksum.add_checksum_to_page(frame_body, page_number as usize)?;
+            }
+            PageTransform::None => frame_body.copy_from_slice(page),
+        }
+
+        let checksum =
+            recompute_wal_frame_checksum(frame.as_mut_slice(), wal_header, previous_checksums);
+        Ok((checksum, frame))
+    }
+
     /// Load the authoritative WAL snapshot through the coordination backend.
     fn load_coordination_snapshot(&self) -> WalSnapshot {
         self.coordination.load_snapshot()
@@ -3574,7 +3657,7 @@ impl Wal for WalFile {
         }
 
         let epoch = self.coordination.checkpoint_epoch();
-        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
+        let page_transform = self.io_ctx.read().page_transform().clone();
         let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
 
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -3629,25 +3712,28 @@ impl Wal for WalFile {
                     "read_frames_batch buffer size must match WAL page size",
                     { "buffer_len": body_slice.len(), "page_size": page_size }
                 );
-                body_slice.copy_from_slice(page_body);
-
-                match &enc_or_csum {
-                    EncryptionOrChecksum::Encryption(ctx) => {
-                        match ctx.decrypt_page(body_slice, expected_page_id) {
-                            Ok(decrypted) => body_slice.copy_from_slice(&decrypted),
+                match &page_transform {
+                    PageTransform::Codec(ctx) => {
+                        let codec_context =
+                            PageCodecContext::from_page_idx(expected_page_id, PageLocation::Wal)
+                                .expect("WAL page numbers fit in u32");
+                        match ctx.decode_page(codec_context, page_body, body_slice) {
+                            Ok(()) => {}
                             Err(e) => {
                                 mark_unlikely();
                                 tracing::error!(
-                                    "Failed to decrypt WAL batch frame for page_idx={expected_page_id}: {e}"
+                                    "Failed to decode WAL batch frame for page_idx={expected_page_id}: {e}"
                                 );
                                 clear_slots_on_err(&slots);
-                                return Some(CompletionError::DecryptionError {
-                                    page_idx: expected_page_id,
-                                });
+                                return Some(page_codec_completion_error(
+                                    ctx.as_ref(),
+                                    expected_page_id,
+                                ));
                             }
                         }
                     }
-                    EncryptionOrChecksum::Checksum(ctx) => {
+                    PageTransform::Checksum(ctx) => {
+                        body_slice.copy_from_slice(page_body);
                         if let Err(e) = ctx.verify_checksum(body_slice, expected_page_id) {
                             mark_unlikely();
                             tracing::error!(
@@ -3657,7 +3743,7 @@ impl Wal for WalFile {
                             return Some(e);
                         }
                     }
-                    EncryptionOrChecksum::None => {}
+                    PageTransform::None => body_slice.copy_from_slice(page_body),
                 }
             }
 
@@ -3680,15 +3766,19 @@ impl Wal for WalFile {
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
         tracing::debug!("read_frame_raw({})", frame_id);
         let offset = self.frame_offset(frame_id);
+        let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
+        if frame.len() != expected_frame_len {
+            return Err(LimboError::InvalidArgument(format!(
+                "unexpected WAL frame buffer size: got={}, expected={expected_frame_len}",
+                frame.len()
+            )));
+        }
 
         // HACK: *mut u8 can't be Sent between threads safely, cast it to usize then
         // for the time of writing this comment - this is *safe* as all callers immediately call synchronous method wait_for_completion and hold necessary references
         let (frame_ptr, frame_len) = (frame.as_mut_ptr() as usize, frame.len());
 
-        let encryption_ctx = {
-            let io_ctx = self.io_ctx.read();
-            io_ctx.encryption_context().cloned()
-        };
+        let page_transform = self.io_ctx.read().page_transform().clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return None; // IO error already captured in completion
@@ -3704,32 +3794,39 @@ impl Wal for WalFile {
                     actual: bytes_read as usize,
                 });
             }
-            let buf_ptr = buf.as_ptr();
             let frame_ptr = frame_ptr as *mut u8;
             let frame_ref: &mut [u8] =
                 unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
 
-            // Copy the just-read WAL frame into the destination buffer
-            unsafe {
-                std::ptr::copy_nonoverlapping(buf_ptr, frame_ptr, frame_len);
-            }
+            frame_ref[..WAL_FRAME_HEADER_SIZE]
+                .copy_from_slice(&buf.as_slice()[..WAL_FRAME_HEADER_SIZE]);
+            let (header, raw_page) = sqlite3_ondisk::parse_wal_frame_header(buf.as_slice());
 
-            // Now parse the header from the freshly-copied data
-            let (header, raw_page) = sqlite3_ondisk::parse_wal_frame_header(frame_ref);
-
-            if let Some(ctx) = encryption_ctx.clone() {
-                match ctx.decrypt_page(raw_page, header.page_number as usize) {
-                    Ok(decrypted_data) => {
-                        turso_assert!(
-                            (frame_len - WAL_FRAME_HEADER_SIZE) == decrypted_data.len(),
-                            "frame_len minus header_size does not equal expected decrypted data length",
-                            { "frame_len_minus_header": frame_len - WAL_FRAME_HEADER_SIZE, "decrypted_data_len": decrypted_data.len() }
-                        );
-                        frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decrypted_data);
+            match &page_transform {
+                PageTransform::Codec(ctx) => {
+                    let codec_context =
+                        PageCodecContext::new(header.page_number, PageLocation::Wal);
+                    let output = &mut frame_ref[WAL_FRAME_HEADER_SIZE..];
+                    turso_assert!(
+                        output.len() == raw_page.len(),
+                        "decoded WAL page buffer size must match encoded page size",
+                        { "output_len": output.len(), "input_len": raw_page.len() }
+                    );
+                    match ctx.decode_page(codec_context, raw_page, output) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to decode page data for frame_id={frame_id}: {e}"
+                            );
+                            return Some(page_codec_completion_error(
+                                ctx.as_ref(),
+                                header.page_number as usize,
+                            ));
+                        }
                     }
-                    Err(_) => {
-                        tracing::debug!("Failed to decrypt page data for frame_id={frame_id}");
-                    }
+                }
+                PageTransform::Checksum(_) | PageTransform::None => {
+                    frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(raw_page);
                 }
             }
             None
@@ -3828,16 +3925,19 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         let header = self.coordination.wal_header();
         let file = self.coordination.wal_file()?;
-        let checksums = *self.last_checksum.read();
-        let (checksums, frame_bytes) = prepare_wal_frame(
-            &self.buffer_pool,
+        let previous_checksums = *self.last_checksum.read();
+        let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
+        let db_size = u32::try_from(db_size).map_err(|_| LimboError::IntegerOverflow)?;
+        let page_transform = self.io_ctx.read().page_transform().clone();
+        let (checksums, frame_bytes) = Self::prepare_transformed_frame(
+            &buffer_pool,
             &header,
-            checksums,
-            header.page_size,
-            page_id as u32,
-            db_size as u32,
+            previous_checksums,
+            page_number,
+            db_size,
             page,
-        );
+            &page_transform,
+        )?;
         let c = Completion::new_write(|_| {});
         let c = file.pwrite(offset, frame_bytes, c)?;
         self.io.wait_for_completion(c)?;
@@ -3859,8 +3959,9 @@ impl Wal for WalFile {
         &self,
         pager: &Pager,
         mode: CheckpointMode,
+        sync_mode: SyncMode,
     ) -> Result<IOResult<CheckpointResult>> {
-        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire)
+        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire, sync_mode)
             .inspect_err(|e| {
                 tracing::debug!("WAL checkpoint failed: {e}");
                 let _ = self.checkpoint_guard.write().take();
@@ -3871,6 +3972,7 @@ impl Wal for WalFile {
     fn vacuum_checkpoint_with_held_lock(
         &self,
         pager: &Pager,
+        sync_mode: SyncMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(
             pager,
@@ -3878,6 +3980,7 @@ impl Wal for WalFile {
                 upper_bound_inclusive: None,
             },
             CheckpointLockSource::HeldByCaller,
+            sync_mode,
         )
         .inspect_err(|e| {
             tracing::debug!("WAL checkpoint failed: {e}");
@@ -4320,24 +4423,11 @@ impl Wal for WalFile {
 
         let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
         let mut metadata = Vec::with_capacity(pages.len());
+        let page_transform = self.io_ctx.read().page_transform().clone();
 
         for (idx, page) in pages.iter().enumerate() {
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
-
-            let data: Cow<[u8]> = {
-                let io_ctx = self.io_ctx.read();
-                match io_ctx.encryption_or_checksum() {
-                    EncryptionOrChecksum::Encryption(ctx) => {
-                        Cow::Owned(ctx.encrypt_page(plain, page_id)?)
-                    }
-                    EncryptionOrChecksum::Checksum(ctx) => {
-                        ctx.add_checksum_to_page(plain, page_id)?;
-                        Cow::Borrowed(plain)
-                    }
-                    EncryptionOrChecksum::None => Cow::Borrowed(plain),
-                }
-            };
 
             // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
             // however it might not be present in this batch so we cannot assert its presence
@@ -4346,15 +4436,16 @@ impl Wal for WalFile {
             } else {
                 0
             };
-            let (checksum, frame_buf) = prepare_wal_frame(
+            let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
+            let (checksum, frame_buf) = Self::prepare_transformed_frame(
                 &self.buffer_pool,
                 &header,
                 rolling_checksum,
-                header.page_size,
-                page_id as u32,
+                page_number,
                 frame_db_size,
-                &data,
-            );
+                plain,
+                &page_transform,
+            )?;
             bufs.push(frame_buf);
             metadata.push((page.clone(), next_frame_id, checksum));
             rolling_checksum = checksum;
@@ -4431,6 +4522,7 @@ impl Wal for WalFile {
         let mut iovecs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
         let mut page_frame_and_checksum: Vec<(PageRef, u64, (u32, u32))> =
             Vec::with_capacity(pages.len());
+        let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
         let mut rolling_checksum: (u32, u32) = *self.last_checksum.read();
@@ -4442,30 +4534,17 @@ impl Wal for WalFile {
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
 
-            let data_to_write: std::borrow::Cow<[u8]> = {
-                let io_ctx = self.io_ctx.read();
-                match &io_ctx.encryption_or_checksum() {
-                    EncryptionOrChecksum::Encryption(ctx) => {
-                        Cow::Owned(ctx.encrypt_page(plain, page_id)?)
-                    }
-                    EncryptionOrChecksum::Checksum(ctx) => {
-                        ctx.add_checksum_to_page(plain, page_id)?;
-                        Cow::Borrowed(plain)
-                    }
-                    EncryptionOrChecksum::None => Cow::Borrowed(plain),
-                }
-            };
-
             let frame_db_size = 0; // this method is not used for the commit path
-            let (new_checksum, frame_bytes) = prepare_wal_frame(
+            let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
+            let (new_checksum, frame_bytes) = Self::prepare_transformed_frame(
                 &self.buffer_pool,
                 &header,
                 rolling_checksum,
-                shared_page_size,
-                page_id as u32,
+                page_number,
                 frame_db_size,
-                &data_to_write,
-            );
+                plain,
+                &page_transform,
+            )?;
             iovecs.push(frame_bytes);
 
             // (page, assigned_frame_id, cumulative_checksum_at_this_frame)
@@ -4697,11 +4776,13 @@ impl WalFile {
         Ok(())
     }
 
+    #[aristo::intent("Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames", id = "aristos:wal_checkpoint_backfill_crash_atomic", verify = "full", parent = "wal_protocol_correctness")]
     fn checkpoint_inner(
         &self,
         pager: &Pager,
         mode: CheckpointMode,
         lock_source: CheckpointLockSource,
+        sync_mode: SyncMode,
     ) -> Result<IOResult<CheckpointResult>> {
         loop {
             let state = self.ongoing_checkpoint.read().state.clone();
@@ -4776,13 +4857,26 @@ impl WalFile {
                         .iter_latest_frames(oc_min_frame, oc_max_frame);
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+                    // Every frame we are about to backfill must be durable in
+                    // the WAL before it may be copied into the database file:
+                    // commits under synchronous=NORMAL do not fsync the WAL,
+                    // so the checkpoint owes that fsync itself. The barrier is
+                    // issued after the frame range is fixed (under the
+                    // checkpoint locks), so it covers exactly the frames that
+                    // will be backfilled. Skipped only under synchronous=OFF,
+                    // which forgoes crash durability entirely.
+                    let needs_wal_sync = !to_checkpoint.is_empty() && sync_mode != SyncMode::Off;
                     {
                         let mut oc = self.ongoing_checkpoint.write();
                         oc.pages_to_checkpoint = to_checkpoint;
                         oc.current_page = 0;
                         oc.inflight_writes.clear();
                         oc.inflight_reads.clear();
-                        oc.state = CheckpointState::Processing;
+                        oc.state = if needs_wal_sync {
+                            CheckpointState::SyncWal
+                        } else {
+                            CheckpointState::Processing
+                        };
                         oc.time = self.io.current_time_monotonic();
                     }
                     tracing::trace!(
@@ -4790,6 +4884,17 @@ impl WalFile {
                         oc_min_frame,
                         oc_max_frame,
                     );
+                }
+                // Durability barrier: fsync the WAL so every frame selected
+                // for backfill is on stable storage before any of them is
+                // copied into the database file. Without it, a crash during
+                // the backfill could persist some DB pages while recovery
+                // drops the unsynced WAL tail — a torn database that matches
+                // no committed prefix.
+                CheckpointState::SyncWal => {
+                    let c = self.sync(pager.get_sync_type())?;
+                    self.ongoing_checkpoint.write().state = CheckpointState::Processing;
+                    io_yield_one!(c);
                 }
                 // For locality, reading is ordered by frame ID, and writing ordered by page ID.
                 // the more consecutive page ID's that we submit together, the fewer overall
@@ -5830,14 +5935,17 @@ pub mod test {
         storage::{
             buffer_pool::BufferPool,
             database::{DatabaseFile, DatabaseStorage},
+            encryption::{CipherMode, EncryptionContext, EncryptionKey},
+            page_transform::{PageCodec, PageCodecContext, PageCodecId},
             pager::{allocate_new_page, PageRef},
-            sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
+            sqlite3_ondisk::{self, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
         },
         types::IOResult,
         util::IOExt,
         Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, Connection,
-        Database, File, LimboError, MemoryIO, OpenFlags, PlatformIO, SyncMode, WalFileShared, IO,
+        Database, File, IOContext, LimboError, MemoryIO, OpenFlags, PlatformIO, Result, SyncMode,
+        WalFileShared, IO,
     };
     use std::num::NonZeroUsize;
     #[cfg(unix)]
@@ -5857,11 +5965,12 @@ pub mod test {
         }
     }
 
+    /// The returned `TempDir` deletes the database directory when it drops, so
+    /// callers must hold it for as long as they use the database.
     #[allow(clippy::arc_with_non_send_sync)]
-    pub(crate) fn get_database() -> (Arc<Database>, std::path::PathBuf) {
-        let mut path = tempfile::tempdir().unwrap().keep();
-        let dbpath = path.clone();
-        path.push("test.db");
+    pub(crate) fn get_database() -> (Arc<Database>, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test.db");
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
             connection
@@ -5879,7 +5988,7 @@ pub mod test {
         )
         .unwrap();
         // db + tmp directory
-        (db, dbpath)
+        (db, temp_dir)
     }
 
     struct DeferredReadFile {
@@ -6010,9 +6119,7 @@ pub mod test {
     #[test]
     fn test_wal_truncate_checkpoint() {
         let (db, path) = get_database();
-        let mut walpath = path.clone().into_os_string().into_string().unwrap();
-        walpath.push_str("/test.db-wal");
-        let walpath = std::path::PathBuf::from(walpath);
+        let walpath = path.path().join("test.db-wal");
 
         let conn = db.connect().unwrap();
         conn.execute("create table test (id integer primary key, value text)")
@@ -6046,7 +6153,6 @@ pub mod test {
             bytes_after, 0,
             "WAL file should be truncated to 0 bytes, but is {bytes_after} bytes",
         );
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -6056,9 +6162,7 @@ pub mod test {
     )]
     fn test_shutdown_checkpoint_truncates_after_restart() {
         let (db, path) = get_database();
-        let mut walpath = path.clone().into_os_string().into_string().unwrap();
-        walpath.push_str("/test.db-wal");
-        let walpath = std::path::PathBuf::from(walpath);
+        let walpath = path.path().join("test.db-wal");
 
         let conn = db.connect().unwrap();
         conn.execute("create table test (id integer primary key, value text)")
@@ -6082,7 +6186,6 @@ pub mod test {
             bytes_after, 0,
             "Shutdown checkpoint should truncate WAL after RESTART, but WAL is {bytes_after} bytes",
         );
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     fn bulk_inserts(conn: &Arc<Connection>, n_txns: usize, rows_per_txn: usize) {
@@ -6123,7 +6226,7 @@ pub mod test {
     ) -> CheckpointResult {
         let wal = pager.wal.as_ref().expect("wal should be present");
         loop {
-            match wal.checkpoint(pager, mode) {
+            match wal.checkpoint(pager, mode, SyncMode::Full) {
                 Ok(IOResult::IO(io)) => io.wait(db.io.as_ref()).unwrap(),
                 Ok(IOResult::Done(result)) => return result,
                 Err(err) => panic!("checkpoint should succeed: {err:?}"),
@@ -6308,6 +6411,81 @@ pub mod test {
         page
     }
 
+    #[derive(Debug)]
+    enum TestPageCodec {
+        Xor(u8),
+        ErrorEncode,
+        ErrorDecode,
+    }
+
+    impl PageCodec for TestPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            let mut id = *b"wal-test-codec--";
+            id[15] = match self {
+                Self::Xor(mask) => *mask,
+                Self::ErrorEncode => 1,
+                Self::ErrorDecode => 2,
+            };
+            PageCodecId::new(id)
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            0
+        }
+
+        fn encode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            match self {
+                Self::Xor(mask) => {
+                    for (input, output) in input.iter().zip(output) {
+                        *output = input ^ mask;
+                    }
+                    Ok(())
+                }
+                Self::ErrorEncode => Err(LimboError::InternalError("codec encode failed".into())),
+                Self::ErrorDecode => {
+                    output.copy_from_slice(input);
+                    Ok(())
+                }
+            }
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            match self {
+                Self::Xor(_) => self.encode_page(context, input, output),
+                Self::ErrorEncode => {
+                    output.copy_from_slice(input);
+                    Ok(())
+                }
+                Self::ErrorDecode => Err(LimboError::InternalError("codec decode failed".into())),
+            }
+        }
+    }
+
+    fn set_test_page_codec(wal: &WalFile, codec: Arc<dyn PageCodec>) {
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_page_codec(codec);
+        wal.set_io_context(io_ctx);
+    }
+
+    fn set_test_encryption(wal: &WalFile, page_size: usize) {
+        let key = EncryptionKey::from_hex_string("000102030405060708090a0b0c0d0e0f").unwrap();
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_encryption(
+            EncryptionContext::new(CipherMode::Aes128Gcm, &key, page_size).unwrap(),
+        );
+        wal.set_io_context(io_ctx);
+    }
+
     fn append_test_pages(
         io: &Arc<dyn IO>,
         wal: &WalFile,
@@ -6402,6 +6580,207 @@ pub mod test {
             assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
             assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
         }
+    }
+
+    #[test]
+    fn page_codec_round_trips_wal_batch_reads() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let source_pages = vec![
+            page_with_pattern(32, 0x10, &buffer_pool),
+            page_with_pattern(33, 0x20, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(32)),
+            Arc::new(crate::Page::new(33)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+        }
+    }
+
+    #[test]
+    fn page_codec_missing_wal_frame_reports_short_read() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let target_page = Arc::new(crate::Page::new(43));
+
+        let completion = wal.read_frame(1, target_page, buffer_pool).unwrap();
+        let error = wait_for_completion_error(&io, completion);
+
+        assert!(matches!(
+            error,
+            CompletionError::ShortReadWalFrame {
+                expected: 512,
+                actual: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn page_codec_round_trips_vectored_wal_spill_frames() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let source_page = page_with_pattern(32, 0x10, &buffer_pool);
+        let expected = source_page.get_contents().as_ptr().to_vec();
+
+        let completion = wal
+            .append_frames_vectored(vec![source_page], PageSize::new(page_size).unwrap())
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+
+        let target_page = Arc::new(crate::Page::new(32));
+        let completion = wal
+            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+        assert_eq!(target_page.get_contents().as_ptr(), expected.as_slice());
+    }
+
+    #[test]
+    fn page_codec_round_trips_raw_wal_frames() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let expected = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
+
+        wal.write_frame_raw(buffer_pool, 1, 44, 0, &expected, FileSyncType::Fsync)
+            .unwrap();
+
+        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
+        let completion = wal.read_frame_raw(1, &mut frame).unwrap();
+        io.wait_for_completion(completion).unwrap();
+        assert_eq!(&frame[WAL_FRAME_HEADER_SIZE..], expected.as_slice());
+    }
+
+    #[test]
+    fn page_codec_raw_wal_read_rejects_wrong_buffer_size() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let page = vec![0; page_size as usize];
+        wal.write_frame_raw(buffer_pool, 1, 44, 0, &page, FileSyncType::Fsync)
+            .unwrap();
+
+        let expected_frame_len = WAL_FRAME_HEADER_SIZE + page_size as usize;
+        for frame_len in [expected_frame_len - 1, expected_frame_len + 1] {
+            let mut frame = vec![0; frame_len];
+            match wal.read_frame_raw(1, &mut frame) {
+                Err(LimboError::InvalidArgument(message)) => assert_eq!(
+                    message,
+                    format!(
+                        "unexpected WAL frame buffer size: got={frame_len}, expected={expected_frame_len}"
+                    )
+                ),
+                Err(error) => panic!("expected invalid argument, got {error:?}"),
+                Ok(_) => panic!("expected frame size {frame_len} to be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn page_codec_encode_error_does_not_publish_wal_frames() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::ErrorEncode));
+        let source_page = page_with_pattern(43, 0x43, &buffer_pool);
+
+        assert!(wal
+            .prepare_frames(
+                &[source_page],
+                PageSize::new(page_size).unwrap(),
+                Some(1),
+                None,
+            )
+            .is_err());
+        assert_eq!(wal.get_max_frame(), 0);
+        assert_eq!(wal.find_frame(43, None).unwrap(), None);
+    }
+
+    #[test]
+    fn encryption_round_trips_raw_wal_frames() {
+        let page_size = 4096;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_encryption(&wal, page_size as usize);
+        let mut expected = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
+        expected[page_size as usize - 64..].fill(0);
+
+        wal.write_frame_raw(buffer_pool, 1, 44, 0, &expected, FileSyncType::Fsync)
+            .unwrap();
+
+        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
+        let completion = wal.read_frame_raw(1, &mut frame).unwrap();
+        io.wait_for_completion(completion).unwrap();
+        assert_eq!(&frame[WAL_FRAME_HEADER_SIZE..], expected.as_slice());
+    }
+
+    #[cfg(feature = "checksum")]
+    #[test]
+    fn checksum_is_applied_to_raw_wal_frames() {
+        let page_size = 4096;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let mut source = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
+        source[page_size as usize - 8..].fill(0);
+
+        wal.write_frame_raw(buffer_pool.clone(), 1, 44, 0, &source, FileSyncType::Fsync)
+            .unwrap();
+
+        let target = Arc::new(crate::Page::new(44));
+        let completion = wal.read_frame(1, target.clone(), buffer_pool).unwrap();
+        io.wait_for_completion(completion).unwrap();
+        assert_eq!(
+            &target.get_contents().as_ptr()[..page_size as usize - 8],
+            &source[..page_size as usize - 8]
+        );
+    }
+
+    #[test]
+    fn page_codec_raw_wal_read_propagates_decode_error() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::ErrorDecode));
+        let source_pages = vec![page_with_pattern(43, 0x43, &buffer_pool)];
+        append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
+        let c = wal.read_frame_raw(1, &mut frame).unwrap();
+        let err = wait_for_completion_error(&io, c);
+
+        assert!(matches!(
+            err,
+            CompletionError::PageCodecError { page_idx: 43 }
+        ));
+    }
+
+    #[test]
+    fn page_codec_wal_batch_read_reports_codec_error() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::ErrorDecode));
+        let source_pages = vec![page_with_pattern(43, 0x43, &buffer_pool)];
+        append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_page = Arc::new(crate::Page::new(43));
+        let c = wal
+            .read_frames_batch(1, &[target_page], buffer_pool, None)
+            .unwrap();
+        let err = wait_for_completion_error(&io, c);
+
+        assert!(matches!(
+            err,
+            CompletionError::PageCodecError { page_idx: 43 }
+        ));
     }
 
     #[test]
@@ -7979,7 +8358,7 @@ pub mod test {
     #[test]
     fn test_restart_checkpoint_clears_backfill_proof_and_later_replaces_it() {
         let (db, path) = get_database();
-        let wal_path = path.join("test.db-wal");
+        let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
         let conn = db.connect().unwrap();
         conn.wal_auto_actions_disable();
@@ -8067,7 +8446,7 @@ pub mod test {
     #[test]
     fn test_truncate_checkpoint_clears_backfill_proof_and_later_replaces_it() {
         let (db, path) = get_database();
-        let wal_path = path.join("test.db-wal");
+        let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
         let conn = db.connect().unwrap();
         conn.wal_auto_actions_disable();
@@ -9108,11 +9487,7 @@ pub mod test {
     fn restart_checkpoint_reset_wal_state_handling() {
         let (db, path) = get_database();
 
-        let walpath = {
-            let mut p = path.clone().into_os_string().into_string().unwrap();
-            p.push_str("/test.db-wal");
-            std::path::PathBuf::from(p)
-        };
+        let walpath = path.path().join("test.db-wal");
 
         let conn = db.connect().unwrap();
         conn.execute("create table test(id integer primary key, value text)")
@@ -9200,8 +9575,6 @@ pub mod test {
             .unwrap();
         let new_max = wal_shared.read().metadata.max_frame.load(Ordering::SeqCst);
         assert_eq!(new_max, 1, "first append after RESTART starts at frame 1");
-
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -9289,7 +9662,7 @@ pub mod test {
 
     #[test]
     fn test_wal_restart_blocks_readers() {
-        let (db, _) = get_database();
+        let (db, _temp_dir) = get_database();
         let conn1 = db.connect().unwrap();
         let conn2 = db.connect().unwrap();
 
@@ -9308,7 +9681,7 @@ pub mod test {
         let p = conn1.pager.load();
         let w = p.wal.as_ref().unwrap();
         loop {
-            match w.checkpoint(&p, CheckpointMode::Restart) {
+            match w.checkpoint(&p, CheckpointMode::Restart, SyncMode::Full) {
                 Ok(IOResult::IO(io)) => {
                     io.wait(db.io.as_ref()).unwrap();
                 }
@@ -9336,7 +9709,7 @@ pub mod test {
         let p = conn1.pager.load();
         let w = p.wal.as_ref().unwrap();
         loop {
-            match w.checkpoint(&p, CheckpointMode::Restart) {
+            match w.checkpoint(&p, CheckpointMode::Restart, SyncMode::Full) {
                 Ok(IOResult::IO(io)) => {
                     io.wait(db.io.as_ref()).unwrap();
                 }
@@ -9505,7 +9878,7 @@ pub mod test {
         let result = {
             let pager = conn1.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.checkpoint(&pager, CheckpointMode::Restart)
+            wal.checkpoint(&pager, CheckpointMode::Restart, SyncMode::Full)
         };
 
         assert!(
@@ -9633,11 +10006,7 @@ pub mod test {
         let (db, path) = get_database();
         let conn = db.connect().unwrap();
 
-        let walpath = {
-            let mut p = path.clone().into_os_string().into_string().unwrap();
-            p.push_str("/test.db-wal");
-            std::path::PathBuf::from(p)
-        };
+        let walpath = path.path().join("test.db-wal");
 
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -9684,7 +10053,6 @@ pub mod test {
         assert_eq!(hdr.file_format, 3007000);
         assert_eq!(hdr.page_size, 4096, "invalid page size");
         assert_eq!(hdr.checkpoint_seq, 1, "invalid checkpoint_seq");
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -9692,11 +10060,7 @@ pub mod test {
         let (db, path) = get_database();
         let conn = db.connect().unwrap();
 
-        let walpath = {
-            let mut p = path.clone().into_os_string().into_string().unwrap();
-            p.push_str("/test.db-wal");
-            std::path::PathBuf::from(p)
-        };
+        let walpath = path.path().join("test.db-wal");
 
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -9761,7 +10125,6 @@ pub mod test {
             count, 1001,
             "we should have 1001 rows in the table all together"
         );
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     fn read_wal_header(path: &std::path::Path) -> sqlite3_ondisk::WalHeader {
@@ -9863,7 +10226,7 @@ pub mod test {
         {
             let pager = conn1.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            let result = wal.checkpoint(&pager, CheckpointMode::Restart);
+            let result = wal.checkpoint(&pager, CheckpointMode::Restart, SyncMode::Full);
 
             assert!(
                 matches!(result, Err(LimboError::Busy)),
@@ -9971,7 +10334,7 @@ pub mod test {
             let pager = writer.pager.load();
             let wal = pager.wal.as_ref().unwrap();
             loop {
-                match wal.checkpoint(&pager, CheckpointMode::Full) {
+                match wal.checkpoint(&pager, CheckpointMode::Full, SyncMode::Full) {
                     Ok(IOResult::IO(io)) => {
                         // Drive any pending IO (should quickly become Busy or Done)
                         io.wait(db.io.as_ref()).unwrap();

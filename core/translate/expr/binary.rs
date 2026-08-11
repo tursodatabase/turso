@@ -14,9 +14,7 @@ pub(super) fn binary_expr_shared(
     let lhs_arity = expr_vector_size(e1)?;
     let rhs_arity = expr_vector_size(e2)?;
     if lhs_arity != rhs_arity {
-        crate::bail_parse_error!(
-            "all arguments to binary operator {op} must return the same number of values. Got: ({lhs_arity}) {op} ({rhs_arity})"
-        );
+        crate::bail_parse_error!("row value misused");
     }
 
     if lhs_arity == 1 {

@@ -16,7 +16,6 @@ use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
     SeekResult, Value,
 };
-use crate::vdbe::make_record;
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
@@ -730,7 +729,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let locked = allocator.lock();
         if !locked {
             // Yield, some other cursor is generating new rowid
-            return Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())));
+            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
         }
 
         self.creating_new_rowid = true;
@@ -1321,12 +1320,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // Just need to pick the smaller one
                     (false, false)
                 }
-                CursorPosition::Loaded { in_btree, .. } => {
-                    // Advance whichever cursor we just consumed
-                    if *in_btree {
-                        (false, true) // Last row was from btree, advance btree
+                CursorPosition::Loaded {
+                    row_id, in_btree, ..
+                } => {
+                    // Sorted-merge: if the other peek still holds the same key
+                    // (GC made fallthrough valid under a live MVCC peek), advance
+                    // both so we do not emit K twice.
+                    let other_same_key = if *in_btree {
+                        self.dual_peek.mvcc_peek.get_row_key() == Some(&row_id.row_id)
                     } else {
-                        (true, false) // Last row was from MVCC, advance MVCC
+                        self.dual_peek.btree_peek.get_row_key() == Some(&row_id.row_id)
+                    };
+                    if *in_btree {
+                        (other_same_key, true)
+                    } else {
+                        (true, other_same_key)
                     }
                 }
                 CursorPosition::End => {
@@ -1403,12 +1411,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // First call after last() - peek values should already be populated
                     (false, false)
                 }
-                CursorPosition::Loaded { in_btree, .. } => {
-                    // Advance whichever cursor we just consumed
-                    if *in_btree {
-                        (false, true) // Last row was from btree, advance btree
+                CursorPosition::Loaded {
+                    row_id, in_btree, ..
+                } => {
+                    // Sorted-merge: if the other peek still holds the same key
+                    // (GC made fallthrough valid under a live MVCC peek), advance
+                    // both so we do not emit K twice.
+                    let other_same_key = if *in_btree {
+                        self.dual_peek.mvcc_peek.get_row_key() == Some(&row_id.row_id)
                     } else {
-                        (true, false) // Last row was from MVCC, advance MVCC
+                        self.dual_peek.btree_peek.get_row_key() == Some(&row_id.row_id)
+                    };
+                    if *in_btree {
+                        (other_same_key, true)
+                    } else {
+                        (true, other_same_key)
                     }
                 }
                 CursorPosition::BeforeFirst => {
@@ -1486,7 +1503,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         registers: &[Register],
         op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
-        let record = make_record(registers, &0, &registers.len())?;
+        let record = ImmutableRecord::from_registers(registers, registers.len())?;
         self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
     }
 

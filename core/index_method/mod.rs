@@ -48,6 +48,19 @@ pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethodMvccSupport {
+    /// The method cannot be opened while MVCC is active.
+    Unsupported,
+    /// The method may query MVCC snapshots but has no transactional write path.
+    ReadOnly,
+    /// Persistent state is stored exclusively through core-provided,
+    /// MVCC-aware backing storage.
+    TransactionalBackingStore,
+    /// Persistent state is external and implements transaction outcome hooks.
+    ExternalTransactional,
+}
+
 #[derive(Debug)]
 pub struct IndexMethodDefinition<'a> {
     /// index method name
@@ -65,6 +78,30 @@ pub struct IndexMethodDefinition<'a> {
     /// a live data structure that writes could invalidate.
     /// When `false`, the emitter will collect rowids into a RowSet/ephemeral table before writing.
     pub results_materialized: bool,
+    /// Declares how this method participates in MVCC transactions.
+    pub mvcc_support: IndexMethodMvccSupport,
+}
+
+pub(crate) fn ensure_mvcc_support(
+    definition: &IndexMethodDefinition<'_>,
+    write: bool,
+) -> Result<()> {
+    match (definition.mvcc_support, write) {
+        (IndexMethodMvccSupport::Unsupported, _) => Err(LimboError::ParseError(format!(
+            "index method '{}' does not support MVCC",
+            definition.method_name
+        ))),
+        (IndexMethodMvccSupport::ReadOnly, true) => Err(LimboError::ParseError(format!(
+            "index method '{}' is read-only in MVCC",
+            definition.method_name
+        ))),
+        (
+            IndexMethodMvccSupport::ReadOnly
+            | IndexMethodMvccSupport::TransactionalBackingStore
+            | IndexMethodMvccSupport::ExternalTransactional,
+            _,
+        ) => Ok(()),
+    }
 }
 
 /// Cost estimate returned by custom index methods for optimizer integration.
@@ -76,6 +113,34 @@ pub struct IndexMethodCostEstimate {
     pub estimated_cost: f64,
     /// Estimated number of rows returned by the query
     pub estimated_rows: u64,
+}
+
+/// Planning-time inputs available to an index method's cost model.
+///
+/// `arguments` are the query expressions captured from the selected pattern,
+/// ordered by parameter number. They may be literals or runtime expressions;
+/// implementations must treat unknown values conservatively.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMethodCostContext<'a> {
+    pub pattern_idx: usize,
+    pub base_table_rows: f64,
+    pub arguments: &'a [ast::Expr],
+}
+
+/// Internal index state exposed only to test-helper builds.
+#[cfg(feature = "test_helper")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexMethodTestStats {
+    /// Number of physical files visible in the index method's storage.
+    pub storage_file_count: usize,
+    /// Number of searchable engine segments, when the method is segmented.
+    pub segment_count: Option<usize>,
+    /// Number of connection-local read snapshots retained by the method.
+    pub cached_connection_count: Option<usize>,
+    /// Resident bytes held by retained read-snapshot file caches.
+    pub cached_bytes: Option<usize>,
+    /// Whether the method retained a committed writer for statement reuse.
+    pub cached_writer: Option<bool>,
 }
 
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
@@ -163,11 +228,16 @@ pub trait IndexMethodCursor {
     /// between custom index methods and traditional BTree indexes.
     fn estimate_cost(
         &self,
-        pattern_idx: usize,
-        base_table_rows: f64,
+        context: &IndexMethodCostContext<'_>,
     ) -> Option<IndexMethodCostEstimate> {
-        let _ = (pattern_idx, base_table_rows);
+        let _ = context;
         None
+    }
+
+    /// Return internal storage statistics for invariant tests.
+    #[cfg(feature = "test_helper")]
+    fn test_stats(&self) -> Result<Option<IndexMethodTestStats>> {
+        Ok(None)
     }
 }
 
@@ -238,4 +308,35 @@ pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
         parsed.push(select);
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_mvcc_support, IndexMethodDefinition, IndexMethodMvccSupport};
+
+    fn definition(support: IndexMethodMvccSupport) -> IndexMethodDefinition<'static> {
+        IndexMethodDefinition {
+            method_name: "test_method",
+            index_name: "test_index",
+            patterns: &[],
+            backing_btree: false,
+            results_materialized: true,
+            mvcc_support: support,
+        }
+    }
+
+    #[test]
+    fn mvcc_support_declaration_rejects_unsupported_access() {
+        let error = ensure_mvcc_support(&definition(IndexMethodMvccSupport::Unsupported), false)
+            .unwrap_err();
+        assert!(matches!(error, crate::LimboError::ParseError(_)));
+
+        ensure_mvcc_support(&definition(IndexMethodMvccSupport::ReadOnly), false).unwrap();
+        assert!(ensure_mvcc_support(&definition(IndexMethodMvccSupport::ReadOnly), true).is_err());
+        ensure_mvcc_support(
+            &definition(IndexMethodMvccSupport::TransactionalBackingStore),
+            true,
+        )
+        .unwrap();
+    }
 }

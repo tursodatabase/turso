@@ -138,7 +138,7 @@ jobs:
         run: uv sync --all-extras --dev --all-packages
 
       - name: Ruff lint
-        run: uvx ruff check
+        run: uvx ruff@0.5.4 check
 
   linux:
     timeout-minutes: 30

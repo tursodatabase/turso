@@ -76,6 +76,25 @@ ongoing work to pass the full SQLite TCL test suite.
 * 🚧 SQLite query language [[status](#sqlite-query-language)] is partially supported
 * 🚧 SQLite C API [[status](#sqlite-c-api)] is partially supported
 
+### Limitations
+
+**Text values must be valid UTF-8.** SQLite text is a plain byte string: it
+never validates encoding, so a text value can hold any bytes. Turso represents
+text as a Rust string, which must be valid UTF-8. When a conversion produces
+text from bytes that are not valid UTF-8, Turso substitutes the U+FFFD
+replacement character where SQLite keeps the original bytes:
+
+```sql
+SELECT HEX(CAST(X'96' AS TEXT));
+-- SQLite: 96
+-- Turso:  EFBFBD
+```
+
+This affects every operation that turns a blob into text: `CAST`, string
+functions such as `UPPER` and `REPLACE`, and concatenation with `||`. Reading
+an existing database that already contains invalid UTF-8 in a text column is
+affected the same way. Storing and reading blobs is not affected; bytes only
+change when they are converted to text.
 
 ## SQLite query language
 
@@ -129,7 +148,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | UPDATE                    | ✅ Yes     |                                                                                   |
 | VACUUM                    | 🚧 Partial | VACUUM INTO supported; plain in-place VACUUM is experimental                       |
 | WITH clause               | 🚧 Partial | WITH RECURSIVE not yet supported.  |
-| WINDOW functions             | 🚧 Partial | Only `row_number()` and aggregate `… OVER (…)` work. Missing: `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`. Custom frame specs (`ROWS`/`RANGE`/`GROUPS BETWEEN`, `EXCLUDE`) not yet supported. `agg(…) FILTER (…) OVER (…)` **panics**. |
+| WINDOW functions             | 🚧 Partial | Aggregate functions, `row_number`, `rank`, `dense_rank`, `first_value`, `last_value`, and `nth_value` work with the default frame. Missing: `percent_rank`, `cume_dist`, `ntile`, `lag`, and `lead`. Custom frame specs (`ROWS`/`RANGE`/`GROUPS BETWEEN`, `EXCLUDE`) are not yet supported. |
 | GENERATED                 | 🚧 Partial      | virtual columns only (no ALTER, partial affinity support). Requires `--experimental-generated-columns`. |
 | WITHOUT ROWID             | 🚧 Partial | Requires `--experimental-without-rowid`. Effectively **insert-only**: CREATE / INSERT / SELECT work (incl. composite PK), but UPDATE, DELETE, UPSERT, `INSERT OR REPLACE`, secondary UNIQUE constraints, secondary `CREATE INDEX`, `FOREIGN KEY`, CDC, and materialized views are all rejected. AUTOINCREMENT and missing PK rejection are parity with SQLite. |
 | CREATE TRIGGER ... INSTEAD OF | ❌ No  | Triggers on views are not supported. Currently errors with misleading "no such table" message. |
@@ -875,7 +894,7 @@ Modifiers:
 | Concat         | ✅ Yes    |         |
 | Copy           | ✅ Yes    |         |
 | Count          | ✅ Yes    |         |
-| CreateBTree    | 🚧 Partial| no temp databases |
+| CreateBTree    | ✅ Yes    |         |
 | DecrJumpZero   | ✅ Yes    |         |
 | Delete         | ✅ Yes    |         |
 | Destroy        | ✅ Yes    |         |
@@ -950,13 +969,13 @@ Modifiers:
 | OpenRead       | ✅ Yes    |         |
 | OpenWrite      | ✅ Yes     |         |
 | Or             | ✅ Yes    |         |
-| Pagecount      | 🚧 Partial| no temp databases |
+| Pagecount      | ✅ Yes    |         |
 | Param          | ❌ No     |         |
 | ParseSchema    | ✅ Yes    |         |
 | Permutation    | ❌ No     |         |
 | Prev           | ✅ Yes     |         |
 | Program        | ✅ Yes     |         |
-| ReadCookie     | 🚧 Partial| no temp databases, only user_version supported |
+| ReadCookie     | 🚧 Partial| IncrementalVacuum cookie not supported |
 | Real           | ✅ Yes    |         |
 | RealAffinity   | ✅ Yes    |         |
 | Remainder      | ✅ Yes    |         |

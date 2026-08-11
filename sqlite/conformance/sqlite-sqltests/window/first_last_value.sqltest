@@ -1,0 +1,456 @@
+@database :memory:
+
+setup fv_lv_base {
+    CREATE TABLE fv_lv(id INTEGER PRIMARY KEY, g TEXT, v INTEGER);
+    INSERT INTO fv_lv VALUES
+        (1, 'a', 10),
+        (2, 'a', 20),
+        (3, 'a', 30),
+        (4, 'b', 5),
+        (5, 'b', 15),
+        (6, 'b', 15);
+}
+
+# first_value reads the first row of the frame; under the default
+# RANGE UNBOUNDED PRECEDING TO CURRENT ROW frame that's the first row of
+# the partition. last_value reads the last row of the frame; under the
+# same frame that's the last row of the current peer group.
+@setup fv_lv_base
+test first-value-last-value-partition-order {
+    SELECT id, g, v,
+           first_value(v) OVER (PARTITION BY g ORDER BY v),
+           last_value(v) OVER (PARTITION BY g ORDER BY v)
+    FROM fv_lv ORDER BY id;
+}
+expect {
+    1|a|10|10|10
+    2|a|20|10|20
+    3|a|30|10|30
+    4|b|5|5|5
+    5|b|15|5|15
+    6|b|15|5|15
+}
+
+setup fv_lv_peers {
+    CREATE TABLE fv_p(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO fv_p VALUES (1, 1), (2, 2), (3, 2), (4, 3), (5, 3), (6, 3);
+}
+
+# Rows in the same peer group share last_value: they all see the same
+# "end of frame" because the frame ends at the last peer of the current
+# row under RANGE.
+@setup fv_lv_peers
+test first-last-value-shared-within-peer-group {
+    SELECT id, v,
+           first_value(v) OVER (ORDER BY v),
+           last_value(v) OVER (ORDER BY v)
+    FROM fv_p ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|2|1|2
+    3|2|1|2
+    4|3|1|3
+    5|3|1|3
+    6|3|1|3
+}
+
+setup fv_nulls {
+    CREATE TABLE fv_n(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO fv_n VALUES (1, NULL), (2, 5), (3, 10);
+}
+
+# A NULL first value is preserved (the capture flag distinguishes
+# "no row stepped yet" from "the captured value was NULL").
+@setup fv_nulls
+test first-value-null-is-preserved {
+    SELECT id, v, first_value(v) OVER (ORDER BY v) FROM fv_n ORDER BY id;
+}
+expect {
+    1||
+    2|5|
+    3|10|
+}
+
+setup fv_lv_empty {
+    CREATE TABLE fv_e(v INTEGER);
+}
+
+@setup fv_lv_empty
+test first-value-last-value-empty-input {
+    SELECT first_value(v) OVER (ORDER BY v), last_value(v) OVER (ORDER BY v) FROM fv_e;
+}
+expect {
+}
+
+setup fv_lv_text {
+    CREATE TABLE fv_t(v TEXT);
+    INSERT INTO fv_t VALUES ('apple'), ('banana'), ('cherry');
+}
+
+@setup fv_lv_text
+test first-last-value-text-args {
+    SELECT v, first_value(v) OVER (ORDER BY v), last_value(v) OVER (ORDER BY v) FROM fv_t ORDER BY v;
+}
+expect {
+    apple|apple|apple
+    banana|apple|banana
+    cherry|apple|cherry
+}
+
+@setup fv_lv_base
+test first-value-expression-argument {
+    SELECT id, v, first_value(v * 10) OVER (ORDER BY v) FROM fv_lv ORDER BY id;
+}
+expect {
+    1|10|50
+    2|20|50
+    3|30|50
+    4|5|50
+    5|15|50
+    6|15|50
+}
+
+@setup fv_lv_base
+test first-value-different-from-last-value-column {
+    SELECT id, g, v,
+           first_value(g) OVER (ORDER BY v),
+           last_value(v) OVER (ORDER BY v)
+    FROM fv_lv ORDER BY id;
+}
+expect {
+    1|a|10|b|10
+    2|a|20|b|20
+    3|a|30|b|30
+    4|b|5|b|5
+    5|b|15|b|15
+    6|b|15|b|15
+}
+
+@setup fv_lv_base
+test first-last-value-alongside-rank-and-row-number {
+    SELECT id, g, v,
+           rank() OVER (PARTITION BY g ORDER BY v),
+           first_value(v) OVER (PARTITION BY g ORDER BY v),
+           last_value(v) OVER (PARTITION BY g ORDER BY v),
+           row_number() OVER (PARTITION BY g ORDER BY v)
+    FROM fv_lv ORDER BY id;
+}
+expect {
+    1|a|10|1|10|10|1
+    2|a|20|2|10|20|2
+    3|a|30|3|10|30|3
+    4|b|5|1|5|5|1
+    5|b|15|2|5|15|2
+    6|b|15|2|5|15|3
+}
+
+setup fv_lv_no_order {
+    CREATE TABLE fv_no(g TEXT, v INTEGER);
+    INSERT INTO fv_no VALUES ('a', 1), ('a', 2), ('a', 3), ('b', 10), ('b', 20);
+}
+
+# With no ORDER BY, the frame covers the entire partition; first and
+# last_value both read across the whole partition.
+@setup fv_lv_no_order
+test first-last-value-no-order-by {
+    SELECT g, v,
+           first_value(v) OVER (PARTITION BY g),
+           last_value(v) OVER (PARTITION BY g)
+    FROM fv_no;
+}
+expect {
+    a|1|1|3
+    a|2|1|3
+    a|3|1|3
+    b|10|10|20
+    b|20|10|20
+}
+
+@setup fv_lv_base
+test first-last-value-named-window-shared {
+    SELECT id, first_value(v) OVER w, last_value(v) OVER w
+    FROM fv_lv WINDOW w AS (ORDER BY v) ORDER BY id;
+}
+expect {
+    1|5|10
+    2|5|20
+    3|5|30
+    4|5|5
+    5|5|15
+    6|5|15
+}
+
+# ---------------------------------------------------------------------------
+# Adversarial value-fidelity cases: the captured value must round-trip every
+# storage class untouched.
+# ---------------------------------------------------------------------------
+
+setup fvlv_types {
+    CREATE TABLE ty (x, y);
+    INSERT INTO ty VALUES (1,NULL), (2,'b'), (3,X'ff00'), (4,7.5), (5,42);
+}
+
+# first_value latches the partition-leading NULL for every row; last_value's
+# type tracks the current peer group's row.
+@setup fvlv_types
+test first-last-value-typeof-preservation {
+    SELECT typeof(first_value(y) OVER (ORDER BY x)),
+           typeof(last_value(y) OVER (ORDER BY x)) FROM ty;
+}
+expect {
+    null|null
+    null|text
+    null|blob
+    null|real
+    null|integer
+}
+
+# DESC flips which end each function reads; hex() keeps the blob printable.
+@setup fvlv_types
+test first-last-value-desc-hex-roundtrip {
+    SELECT hex(first_value(y) OVER (ORDER BY x DESC)),
+           hex(last_value(y) OVER (ORDER BY x DESC)) FROM ty;
+}
+expect {
+    3432|3432
+    3432|372E35
+    3432|FF00
+    3432|62
+    3432|
+}
+
+setup fvlv_empties {
+    CREATE TABLE es (x, y);
+    INSERT INTO es VALUES (1,''), (2,NULL), (3,X'');
+}
+
+# Empty string, NULL, and empty blob are three different captured values;
+# none may collapse into another.
+@setup fvlv_empties
+test first-last-value-empty-string-vs-null-vs-empty-blob {
+    SELECT typeof(first_value(y) OVER (ORDER BY x)),
+           length(first_value(y) OVER (ORDER BY x)),
+           typeof(last_value(y) OVER (ORDER BY x)) FROM es;
+}
+expect {
+    text|0|text
+    text|0|null
+    text|0|blob
+}
+
+setup fvlv_null_keys {
+    CREATE TABLE nk (x, y);
+    INSERT INTO nk VALUES (NULL,'n1'), (1,'a'), (NULL,'n2'), (2,'b');
+}
+
+# NULL ordering keys are peers of each other; NULLS LAST moves the group to
+# the end, so last_value inside it reads the group's final row for both.
+@setup fvlv_null_keys
+test first-last-value-null-keys-nulls-last {
+    SELECT y, first_value(y) OVER (ORDER BY x NULLS LAST),
+           last_value(y) OVER (ORDER BY x NULLS LAST) FROM nk;
+}
+expect {
+    a|a|a
+    b|a|b
+    n1|a|n2
+    n2|a|n2
+}
+
+setup fvlv_column_collation {
+    CREATE TABLE nc (x TEXT COLLATE NOCASE, y);
+    INSERT INTO nc VALUES ('a',1), ('A',2), ('b',3);
+}
+
+# The window ORDER BY inherits the column's declared NOCASE collation, so
+# 'a' and 'A' are peers (the second key keeps output deterministic).
+@setup fvlv_column_collation
+test first-last-value-column-declared-collation {
+    SELECT y, first_value(y) OVER (ORDER BY x, y),
+           last_value(y) OVER (ORDER BY x, y) FROM nc;
+}
+expect {
+    1|1|1
+    2|1|2
+    3|1|3
+}
+
+# ---------------------------------------------------------------------------
+# Argument-shape cases.
+# ---------------------------------------------------------------------------
+
+setup fvlv_comp {
+    CREATE TABLE co (x);
+    INSERT INTO co VALUES (3), (1), (1), (2);
+}
+
+@setup fvlv_comp
+test first-last-value-case-expression-argument {
+    SELECT first_value(CASE WHEN x > 1 THEN x*10 ELSE -x END) OVER (ORDER BY x DESC),
+           last_value(CASE WHEN x > 1 THEN x*10 ELSE -x END) OVER (ORDER BY x) FROM co;
+}
+expect {
+    30|30
+    30|20
+    30|-1
+    30|-1
+}
+
+# The argument can be the partition/order key itself.
+@setup fvlv_comp
+test first-last-value-arg-is-key {
+    SELECT first_value(x) OVER (PARTITION BY x ORDER BY x),
+           last_value(x) OVER (PARTITION BY x) FROM co;
+}
+expect {
+    1|1
+    1|1
+    2|2
+    3|3
+}
+
+# Window over aggregates: the functions see one row per group, and their
+# argument is the group's aggregate.
+setup fvlv_groupby {
+    CREATE TABLE ga (k, x);
+    INSERT INTO ga VALUES ('a',1), ('a',2), ('b',30), ('c',5);
+}
+
+@setup fvlv_groupby
+test first-last-value-over-group-by-aggregates {
+    SELECT k, first_value(sum(x)) OVER (ORDER BY k),
+           last_value(sum(x)) OVER (ORDER BY k),
+           last_value(count(*)) OVER (ORDER BY sum(x) DESC)
+    FROM ga GROUP BY k;
+}
+expect {
+    a|3|3|2
+    b|3|30|1
+    c|3|5|1
+}
+
+# ---------------------------------------------------------------------------
+# Larger query shapes.
+# ---------------------------------------------------------------------------
+
+setup fvlv_two_windows {
+    CREATE TABLE tw (p, x);
+    INSERT INTO tw VALUES (1,10), (1,20), (2,30), (2,40);
+}
+
+# The same function pair over opposite orderings of the same partition: four
+# window layers in one SELECT.
+@setup fvlv_two_windows
+test first-last-value-opposite-direction-windows {
+    SELECT p, x,
+           first_value(x) OVER (PARTITION BY p ORDER BY x),
+           first_value(x) OVER (PARTITION BY p ORDER BY x DESC),
+           last_value(x) OVER (PARTITION BY p ORDER BY x),
+           last_value(x) OVER (PARTITION BY p ORDER BY x DESC)
+    FROM tw;
+}
+expect {
+    1|10|10|20|10|10
+    1|20|10|20|20|20
+    2|30|30|40|30|30
+    2|40|30|40|40|40
+}
+
+# first/last_value over another window query's output.
+@setup fvlv_comp
+test first-last-value-over-row-number {
+    SELECT first_value(rn) OVER (ORDER BY rn DESC),
+           last_value(rn) OVER (ORDER BY rn DESC)
+    FROM (SELECT row_number() OVER (ORDER BY x) rn FROM co);
+}
+expect {
+    4|4
+    4|3
+    4|2
+    4|1
+}
+
+@setup fvlv_comp
+test first-last-value-union-all-branches {
+    SELECT first_value(x) OVER (ORDER BY x) FROM co
+    UNION ALL
+    SELECT last_value(x) OVER (ORDER BY x) FROM co;
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    1
+    2
+    3
+}
+
+@setup fvlv_comp
+test first-last-value-insert-into-select {
+    CREATE TABLE dst (a, b, c);
+    INSERT INTO dst SELECT x, first_value(x) OVER (ORDER BY x DESC),
+                           last_value(x) OVER (ORDER BY x DESC) FROM co;
+    SELECT * FROM dst ORDER BY a, c;
+}
+expect {
+    1|3|1
+    1|3|1
+    2|3|2
+    3|3|3
+}
+
+test first-last-value-generate-series-source {
+    SELECT first_value(value) OVER (ORDER BY value % 3, value),
+           last_value(value) OVER (ORDER BY value % 3, value)
+    FROM generate_series(1, 7);
+}
+expect {
+    3|3
+    3|6
+    3|1
+    3|4
+    3|7
+    3|2
+    3|5
+}
+
+# Volume with fat values: 50 rows of ~500-byte strings; the length checksums
+# pin every captured value without a huge expect block.
+test first-last-value-fat-values-checksum {
+    SELECT sum(length(fv)), sum(length(lv))
+    FROM (SELECT first_value(y) OVER (ORDER BY x) fv,
+                 last_value(y) OVER (ORDER BY x) lv
+          FROM (SELECT value x, printf('%.*c', 500, 'q') || value y
+                FROM generate_series(1, 50)));
+}
+expect {
+    25050|25091
+}
+
+# ---------------------------------------------------------------------------
+# Contexts where first_value / last_value must be rejected.
+# ---------------------------------------------------------------------------
+
+@setup fvlv_comp
+test first-value-rejected-inside-aggregate {
+    SELECT sum(first_value(x) OVER (ORDER BY x)) FROM co;
+}
+expect error {
+}
+
+@setup fvlv_comp
+test first-value-rejected-nested-window {
+    SELECT first_value(row_number() OVER (ORDER BY x)) OVER (ORDER BY x) FROM co;
+}
+expect error {
+}
+
+@setup fvlv_comp
+test last-value-rejected-in-having {
+    SELECT count(*) FROM co GROUP BY x HAVING last_value(x) OVER (ORDER BY x) > 0;
+}
+expect error {
+}

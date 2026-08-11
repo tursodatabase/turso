@@ -43,6 +43,8 @@ internal struct TursoDatabaseConfig
     public IntPtr Vfs;
     public IntPtr EncryptionCipher;
     public IntPtr EncryptionHexKey;
+    public IntPtr PageCodec;
+    public uint OpenFlags;
 }
 
 internal static class TursoInterop

@@ -16,7 +16,6 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
-    use tempfile::TempDir;
     use turso_core::{ColumnTypeInfo, ColumnTypeKind, Statement};
 
     /// Helper: open a fresh DB with custom types + STRICT support enabled.
@@ -25,9 +24,11 @@ mod tests {
     /// same opt — every test that exercises the rich type-info path uses
     /// this constructor.
     fn fresh_db_with_custom_types(name: &str) -> TempDatabase {
-        let path = TempDir::new().unwrap().keep().join(name);
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
-        TempDatabase::new_with_existent_with_opts(&path, opts)
+        TempDatabase::builder()
+            .with_db_name(name)
+            .with_opts(opts)
+            .build()
     }
 
     /// Unwrap `Result<Option<ColumnTypeInfo>>` down to `ColumnTypeInfo`,
@@ -461,5 +462,31 @@ mod tests {
         let via_reverse: Vec<(String,)> = conn.exec_rows("SELECT reverse('hello')");
         assert_eq!(via_string_reverse, vec![("olleh".to_string(),)]);
         assert_eq!(via_reverse, vec![("olleh".to_string(),)]);
+    }
+
+    /// `CREATE TABLE ... AS SELECT` returns no rows, so the prepared
+    /// statement must report zero result columns (sqlite3_column_count is 0
+    /// for CTAS). The source SELECT feeds the insert coroutine internally
+    /// and must not leak its columns into statement metadata.
+    #[test]
+    fn ctas_statement_reports_zero_columns() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE src(a INTEGER, b TEXT)").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'x'), (2, 'y')")
+            .unwrap();
+
+        let mut stmt = conn
+            .prepare("CREATE TABLE dst AS SELECT a, b FROM src")
+            .unwrap();
+        assert_eq!(
+            stmt.num_columns(),
+            0,
+            "CTAS must report zero result columns"
+        );
+
+        stmt.run_ignore_rows().unwrap();
+        let copied: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM dst ORDER BY a");
+        assert_eq!(copied, vec![(1, "x".to_string()), (2, "y".to_string())]);
     }
 }

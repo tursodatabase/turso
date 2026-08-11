@@ -26,3 +26,86 @@ expect {
     4
     6
 }
+
+test simple-count-index-correctness {
+    CREATE TABLE indexed_count(
+        id INTEGER PRIMARY KEY,
+        value TEXT,
+        payload_1 TEXT,
+        payload_2 TEXT
+    );
+    CREATE INDEX indexed_count_value_idx ON indexed_count(value);
+    CREATE INDEX indexed_count_partial_idx
+        ON indexed_count(value)
+        WHERE value IS NOT NULL;
+
+    -- A full index contains NULL keys and stops containing deleted rows.
+    INSERT INTO indexed_count VALUES
+        (1, 'one', 'a', 'b'),
+        (2, NULL, 'c', 'd'),
+        (3, 'three', 'e', 'f'),
+        (4, 'four', 'g', 'h');
+    DELETE FROM indexed_count WHERE id = 3;
+
+    SELECT count(*) FROM indexed_count;
+    SELECT count(*) FROM indexed_count INDEXED BY indexed_count_value_idx;
+    -- An unusable partial index must not omit the NULL row.
+    SELECT count(*) FROM indexed_count INDEXED BY indexed_count_partial_idx;
+}
+expect {
+    3
+    3
+    3
+}
+
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test simple-count-expression-index-correctness {
+    CREATE TABLE expression_indexed_count(value, payload_1, payload_2);
+    CREATE INDEX expression_indexed_count_idx
+        ON expression_indexed_count(length(value));
+    INSERT INTO expression_indexed_count VALUES
+        ('one', 'a', 'b'),
+        (NULL, 'c', 'd'),
+        ('three', 'e', 'f');
+    DELETE FROM expression_indexed_count WHERE value = 'three';
+
+    SELECT count(*) FROM expression_indexed_count;
+    SELECT count(*) FROM expression_indexed_count
+        INDEXED BY expression_indexed_count_idx;
+}
+expect {
+    2
+    2
+}
+
+test simple-count-empty-index {
+    CREATE TABLE empty_indexed_count(value, payload_1, payload_2);
+    CREATE INDEX empty_indexed_count_idx ON empty_indexed_count(value);
+    SELECT count(*) FROM empty_indexed_count;
+}
+expect {
+    0
+}
+
+test column-free-and-autoindex-correctness {
+    CREATE TABLE automatic_index_count(
+        email TEXT UNIQUE,
+        payload_1 TEXT,
+        payload_2 TEXT
+    );
+    INSERT INTO automatic_index_count VALUES
+        ('one@example.com', 'a', 'b'),
+        (NULL, 'c', 'd'),
+        ('three@example.com', 'e', 'f'),
+        (NULL, 'g', 'h');
+    DELETE FROM automatic_index_count WHERE email = 'three@example.com';
+
+    SELECT count(*) FROM automatic_index_count;
+    SELECT 1 FROM automatic_index_count;
+}
+expect {
+    3
+    1
+    1
+    1
+}

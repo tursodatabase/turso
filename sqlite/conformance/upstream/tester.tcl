@@ -62,8 +62,39 @@ proc reset_db {} {
 }
 
 # Execute SQL and return results
+# Tcl 9 removed the tcl_precision magic variable; its default float
+# formatting (shortest exact representation) matches the old
+# tcl_precision=0 behavior. Define a plain global so upstream tests that
+# save/set/restore tcl_precision keep working.
+if {![info exists ::tcl_precision]} {
+  set ::tcl_precision 0
+}
+
+# Upstream tester.tcl no-op hooks: breakpoint is a debugger anchor and
+# do_not_use_codec only matters for codec-enabled builds.
+proc breakpoint {} {}
+proc do_not_use_codec {} {}
+
+# Name of the current test permutation, as in upstream tester.tcl. We only
+# run the default configuration, so this is "" unless a permutation script
+# sets G(perm:name).
+proc permutation {} {
+  set perm ""
+  catch {set perm $::G(perm:name)}
+  set perm
+}
+
+# Modern SQLite builds default to schema file format 4; upstream tests
+# read this to decide format-dependent expectations.
+if {![info exists ::SQLITE_DEFAULT_FILE_FORMAT]} {
+  set ::SQLITE_DEFAULT_FILE_FORMAT 4
+}
+
 proc execsql {sql {db db}} {
-  return [$db eval $sql]
+  # Evaluate in the caller's scope so that TCL variables referenced inside
+  # the SQL (e.g. {SELECT round($x1)}) bind to the caller's values instead
+  # of silently binding NULL.
+  return [uplevel [list $db eval $sql]]
 }
 
 # Execute SQL and return first value only (similar to db one)
@@ -110,11 +141,26 @@ proc normalize_result {result} {
 
 # Execute SQL and catch errors
 proc catchsql {sql {db db}} {
-  if {[catch {execsql $sql $db} result]} {
+  # Do not route through execsql: its uplevel would land in this frame, one
+  # level short of the caller whose variables the SQL may reference.
+  if {[catch {uplevel [list $db eval $sql]} result]} {
     return [list 1 [normalize_errmsg $result]]
   } else {
     return [list 0 $result]
   }
+}
+
+# Compare two doubles, tolerating formatting noise. The tolerance is
+# relative, not absolute: TCL 8.6 and 9 print the same double differently
+# (15 significant digits vs shortest round-trip), so two renderings of one
+# value can differ in their last digits at any magnitude.
+proc floats_equal {a b} {
+  # NaN passes [string is double] but throws in expr arithmetic; treat any
+  # non-computable comparison as unequal instead of aborting the test file.
+  if {[catch {expr {abs($a - $b) <= 1e-12 * (abs($a) + abs($b) + 1.0)}} eq]} {
+    return 0
+  }
+  return $eq
 }
 
 # Main test execution function
@@ -161,7 +207,7 @@ proc do_test {name cmd expected} {
           if {$r ne $e} {
             if {[string is double -strict $r] && [string is double -strict $e]} {
               # True mathematical comparison for floating point noise
-              if {[expr {abs($r - $e) > 1e-12}]} {
+              if {![floats_equal $r $e]} {
                 set ok 0; break
               }
             } else {
@@ -177,7 +223,7 @@ proc do_test {name cmd expected} {
       if {$r ne $e} {
         if {[string is double -strict $r] && [string is double -strict $e]} {
           # True mathematical comparison for floating point noise
-          set ok [expr {abs($r - $e) < 1e-12}]
+          set ok [floats_equal $r $e]
         } else {
           set ok 0
         }
@@ -265,6 +311,7 @@ proc ifcapable {expr code {else_keyword ""} {elsecode ""}} {
       "upsert" { set has_capability 1 }
       "gencol" { set has_capability 1 }
       "generated_always" { set has_capability 1 }
+      "update_delete_limit" { set has_capability 0 }
       default { set has_capability 1 }
     }
 
@@ -279,10 +326,14 @@ proc ifcapable {expr code {else_keyword ""} {elsecode ""}} {
     }
   }
 
+  # Propagate return codes (like `return` inside the block) to the caller, so
+  # tests that early-exit with `ifcapable !foo { finish_test; return }` work.
   if {$capable} {
-    uplevel 1 $code
+    set c [catch {uplevel 1 $code} r]
+    return -code $c $r
   } elseif {$else_keyword eq "else" && $elsecode ne ""} {
-    uplevel 1 $elsecode
+    set c [catch {uplevel 1 $elsecode} r]
+    return -code $c $r
   }
 }
 
@@ -306,6 +357,10 @@ set SQLITE_MAX_ATTACHED 10
 set SQLITE_MAX_VARIABLE_NUMBER 999
 set SQLITE_MAX_COLUMN 2000
 set SQLITE_MAX_SQL_LENGTH 1000000
+# Turso does not enforce SQLite's default 1e9 string-length limit, so
+# report the practical 32-bit cap; tests guarded on a smaller limit
+# (e.g. printf.test's 2e9-width allocation probe) skip themselves.
+set SQLITE_MAX_LENGTH 2147483647
 set SQLITE_MAX_EXPR_DEPTH 1000
 set SQLITE_MAX_LIKE_PATTERN_LENGTH 50000
 set SQLITE_MAX_TRIGGER_DEPTH 1000

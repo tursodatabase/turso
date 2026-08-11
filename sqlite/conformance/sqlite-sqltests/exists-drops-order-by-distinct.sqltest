@@ -1,0 +1,62 @@
+@database :memory:
+
+# EXISTS only checks whether a row comes out, so SQLite drops ORDER BY and
+# DISTINCT from the subquery (select.c, "dropping superfluous ORDER BY").
+# Dropped ORDER BY terms are still name-resolved but never evaluated, so a
+# term that would fail at runtime must not fail the query. Turso previously
+# kept both: an overflowing ORDER BY term errored the whole statement, and
+# DISTINCT+OFFSET counted distinct rows where SQLite counts plain rows.
+
+@cross-check-integrity
+test exists-order-by-term-is-not-evaluated {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (1), (2);
+    SELECT EXISTS (SELECT x FROM t ORDER BY ABS(-9223372036854775807 - 1));
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test exists-order-by-term-not-evaluated-with-limit {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (1), (2);
+    SELECT EXISTS (SELECT x FROM t ORDER BY ABS(-9223372036854775807 - 1) LIMIT 2);
+}
+expect {
+    1
+}
+
+# Name resolution still runs on the dropped ORDER BY.
+@cross-check-integrity
+test exists-order-by-still-resolves-names {
+    CREATE TABLE t(x);
+    SELECT EXISTS (SELECT x FROM t ORDER BY nosuchcol);
+}
+expect error {
+    no such column: nosuchcol
+}
+
+# With DISTINCT dropped, OFFSET counts plain rows: 3 rows, OFFSET 2 leaves one.
+# Counting the 2 distinct values instead would leave none.
+@cross-check-integrity
+test exists-distinct-offset-counts-plain-rows {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (1), (2);
+    SELECT EXISTS (SELECT DISTINCT x FROM t ORDER BY x LIMIT 5 OFFSET 2);
+}
+expect {
+    1
+}
+
+# IN subqueries are not EXISTS: their ORDER BY is still evaluated, so the
+# overflowing term fails the statement in both engines.
+@cross-check-integrity
+test in-subquery-order-by-is-still-evaluated {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    SELECT 1 IN (SELECT x FROM t ORDER BY ABS(-9223372036854775807 - 1));
+}
+expect error {
+    integer overflow
+}

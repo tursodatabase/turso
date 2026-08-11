@@ -232,6 +232,90 @@ snapshot simple-count-star {
     SELECT count(*) FROM t1;
 }
 
+setup indexed_count_table {
+    CREATE TABLE indexed_count(
+        id INTEGER PRIMARY KEY,
+        narrow_col TEXT,
+        wide_col_1 TEXT,
+        wide_col_2 TEXT,
+        wide_col_3 TEXT
+    );
+    CREATE INDEX indexed_count_wide_idx
+        ON indexed_count(narrow_col, wide_col_1, wide_col_2);
+    CREATE INDEX indexed_count_narrow_idx
+        ON indexed_count(narrow_col);
+    CREATE INDEX indexed_count_partial_idx
+        ON indexed_count(wide_col_3)
+        WHERE wide_col_3 IS NOT NULL;
+}
+
+@setup indexed_count_table
+snapshot simple-count-narrowest-index {
+    SELECT count(*) FROM indexed_count;
+}
+
+@setup indexed_count_table
+snapshot simple-count-indexed-by {
+    SELECT count(*) FROM indexed_count INDEXED BY indexed_count_wide_idx;
+}
+
+@setup indexed_count_table
+snapshot simple-count-not-indexed {
+    SELECT count(*) FROM indexed_count NOT INDEXED;
+}
+
+# Complete indexes can provide row-producing scans even when no columns are referenced.
+@setup indexed_count_table
+snapshot column-free-scan-covering-index {
+    SELECT 1 FROM indexed_count;
+}
+
+setup automatic_index_count_table {
+    CREATE TABLE automatic_index_count(
+        email TEXT UNIQUE,
+        payload_1 TEXT,
+        payload_2 TEXT
+    );
+}
+
+@setup automatic_index_count_table
+snapshot simple-count-autoindex {
+    SELECT count(*) FROM automatic_index_count;
+}
+
+setup expression_indexed_count_table {
+    CREATE TABLE expression_indexed_count(
+        id INTEGER PRIMARY KEY,
+        value TEXT,
+        payload_1 TEXT,
+        payload_2 TEXT
+    );
+    CREATE INDEX expression_indexed_count_idx
+        ON expression_indexed_count(length(value));
+}
+
+@setup expression_indexed_count_table
+snapshot simple-count-expression-index {
+    SELECT count(*) FROM expression_indexed_count;
+}
+
+setup partial_only_count_table {
+    CREATE TABLE partial_only_count(
+        id INTEGER PRIMARY KEY,
+        value TEXT,
+        payload_1 TEXT,
+        payload_2 TEXT
+    );
+    CREATE INDEX partial_only_count_idx
+        ON partial_only_count(value)
+        WHERE value IS NOT NULL;
+}
+
+@setup partial_only_count_table
+snapshot simple-count-excludes-partial-index {
+    SELECT count(*) FROM partial_only_count;
+}
+
 setup partial_index_count_table {
     CREATE TABLE t2(
         id INTEGER PRIMARY KEY,

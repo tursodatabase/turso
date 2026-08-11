@@ -1,4 +1,7 @@
-use crate::alloc::{TryClone, TryReserveError, TursoAllocExt, TursoTryWithCapacityExt};
+use crate::alloc::{
+    TryClone, TryReserveError, TursoAllocExt, TursoFromIterator, TursoTryWithCapacityExt,
+    TursoVecExt,
+};
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
@@ -7,7 +10,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
     fmt::Write,
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
 };
 
 use super::path::{JsonPath, PathElement};
@@ -436,7 +439,10 @@ impl PathOperation for DeleteOperation {
                 json.read_header(array_value_idx)?;
             let delta = 0 - (array_value_size + array_value_header_size) as isize;
 
-            let end_pos = array_value_idx + array_value_size + array_value_header_size;
+            let end_pos = json.element_end(
+                array_value_idx,
+                &[array_value_size, array_value_header_size],
+            )?;
             json.data.drain(array_value_idx..end_pos);
 
             let h_delta = if matches!(
@@ -460,7 +466,10 @@ impl PathOperation for DeleteOperation {
             let (JsonbHeader(_, key_size), key_header_size) = json.read_header(key_idx)?;
             let delta = 0 - (value_header_size + value_size + key_size + key_header_size) as isize;
 
-            let end_pos = key_idx + value_header_size + value_size + key_size + key_header_size;
+            let end_pos = json.element_end(
+                key_idx,
+                &[value_header_size, value_size, key_size, key_header_size],
+            )?;
             json.data.drain(key_idx..end_pos);
 
             json.update_parent_references(stack, delta + target.delta)?;
@@ -670,9 +679,8 @@ impl PathOperation for SearchOperation {
             target.field_value_index
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
-        self.value
-            .data
-            .extend_from_slice(&json.data[idx..idx + header_size + size]);
+        let end = json.element_end(idx, &[header_size, size])?;
+        self.value.data.extend_from_slice(&json.data[idx..end]);
 
         Ok(())
     }
@@ -886,13 +894,6 @@ impl JsonbHeader {
         }
     }
 
-    pub fn is_scalar(&self) -> bool {
-        !matches!(
-            self.element_type(),
-            ElementType::ARRAY | ElementType::OBJECT
-        )
-    }
-
     fn get_size_bytes(slice: &[u8], start: usize, count: usize) -> Result<&[u8]> {
         match slice.get(start..start + count) {
             Some(bytes) => Ok(bytes),
@@ -965,10 +966,32 @@ impl Jsonb {
         Ok((header, offset))
     }
 
+    /// Offset one past the element at `cursor`, rejecting a declared size that
+    /// runs past the buffer.
+    ///
+    /// Checked here rather than relying on validation having run: the size
+    /// fields are caller-controlled, and the `header_size == 15` marker reads an
+    /// 8-byte size, so the addition can overflow too.
+    fn element_end(&self, cursor: usize, sizes: &[usize]) -> Result<usize> {
+        let mut end = cursor;
+        for size in sizes {
+            end = end
+                .checked_add(*size)
+                .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        }
+        if end > self.data.len() {
+            return Err(LimboError::ParseError("malformed JSON".to_string()));
+        }
+        Ok(end)
+    }
+
     pub fn element_type(&self) -> Result<ElementType> {
         match self.read_header(0) {
             Ok((header, offset)) => {
-                if self.data.get(offset..offset + header.1).is_some() {
+                let end = offset
+                    .checked_add(header.1)
+                    .filter(|end| *end <= self.data.len());
+                if end.is_some() {
                     Ok(header.0)
                 } else {
                     bail_parse_error!("malformed JSON")
@@ -994,7 +1017,11 @@ impl Jsonb {
         let (header, header_offset) = self.read_header(start)?;
         let payload_start = start + header_offset;
         let payload_size = header.payload_size();
-        let payload_end = payload_start + payload_size;
+        // The 8-byte size marker lets a header declare a payload close to
+        // usize::MAX, so this must be checked before it is compared below.
+        let Some(payload_end) = payload_start.checked_add(payload_size) else {
+            bail_parse_error!("Payload size overflow");
+        };
 
         if payload_end != end {
             bail_parse_error!("Size mismatch");
@@ -1032,7 +1059,12 @@ impl Jsonb {
                         bail_parse_error!("Array element out of bounds");
                     }
                     let (elem_header, elem_header_size) = self.read_header(pos)?;
-                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    let Some(elem_end) = pos
+                        .checked_add(elem_header_size)
+                        .and_then(|end| end.checked_add(elem_header.payload_size()))
+                    else {
+                        bail_parse_error!("Element size overflow");
+                    };
                     if elem_end > payload_end {
                         bail_parse_error!("Array element exceeds bounds");
                     }
@@ -1053,7 +1085,12 @@ impl Jsonb {
                         bail_parse_error!("Object key must be text");
                     }
 
-                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    let Some(elem_end) = pos
+                        .checked_add(elem_header_size)
+                        .and_then(|end| end.checked_add(elem_header.payload_size()))
+                    else {
+                        bail_parse_error!("Element size overflow");
+                    };
                     if elem_end > payload_end {
                         bail_parse_error!("Object element exceeds bounds");
                     }
@@ -1095,6 +1132,13 @@ impl Jsonb {
         depth: usize,
         delimiter: &JsonIndentation,
     ) -> Result<usize> {
+        // Serialization recurses once per nesting level, so without this the
+        // stack depth is bounded only by the size of the document, and a
+        // deeply nested blob aborts the process instead of raising an error.
+        if depth > MAX_JSON_DEPTH {
+            bail_parse_error!("Too deep");
+        }
+
         let (header, skip_header) = self.read_header(cursor)?;
 
         let cursor = cursor + skip_header;
@@ -1600,7 +1644,7 @@ impl Jsonb {
                 return Err(PError::Message {
                     msg: "Unexpected character".to_string(),
                     location: Some(pos),
-                })
+                });
             }
         }
 
@@ -2296,7 +2340,7 @@ impl Jsonb {
         if payload_size <= 11 && !size_might_change {
             let header_byte = (element_type as u8) | ((payload_size as u8) << 4);
             if cursor == self.len() {
-                self.data.push(header_byte);
+                self.data.try_push(header_byte)?;
             } else {
                 self.data[cursor] = header_byte;
             }
@@ -2308,7 +2352,7 @@ impl Jsonb {
         let header_len = header_bytes.len();
 
         if cursor == self.len() {
-            self.data.extend_from_slice(header_bytes);
+            self.data.try_extend(header_bytes.iter().copied())?;
             return Ok(header_len);
         }
 
@@ -2323,6 +2367,7 @@ impl Jsonb {
 
         match new_len.cmp(&old_len) {
             std::cmp::Ordering::Greater => {
+                self.data.try_reserve(new_len - old_len)?;
                 self.data.splice(
                     cursor + old_len..cursor + old_len,
                     std::iter::repeat_n(0, new_len - old_len),
@@ -2673,9 +2718,7 @@ impl Jsonb {
                         }
 
                         let key_start = pos + key_header_len;
-                        let json_key = unsafe {
-                            from_utf8_unchecked(&self.data[key_start..key_start + key_len])
-                        };
+                        let json_key = read_text_payload(&self.data, key_start, key_len)?;
 
                         if compare((json_key, key_type), (path_key, *is_raw)) {
                             if mode.allows_replace() {
@@ -2850,12 +2893,8 @@ impl Jsonb {
                         bail_parse_error!("Key should be string")
                     }
 
-                    let obj_key = unsafe {
-                        from_utf8_unchecked(
-                            &self.data[current_pos + key_header_size
-                                ..current_pos + key_header_size + key_size],
-                        )
-                    };
+                    let obj_key =
+                        read_text_payload(&self.data, current_pos + key_header_size, key_size)?;
 
                     if compare((obj_key, key_type), (path_key, *is_raw)) {
                         break;
@@ -3077,9 +3116,7 @@ impl Jsonb {
                 }
 
                 let key_start = patch_key_cursor + key_header_size;
-                let key_text = unsafe {
-                    from_utf8_unchecked(&patch.data[key_start..key_start + key_header.1])
-                };
+                let key_text = read_text_payload(&patch.data, key_start, key_header.1)?;
 
                 // Read the value
                 let value_cursor = key_start + key_header.1;
@@ -3349,6 +3386,23 @@ impl std::str::FromStr for Jsonb {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Self::from_str(s)
     }
+}
+
+/// Reads the `len`-byte text payload that starts at `start`.
+///
+/// JSONB documents are validated on entry, but text payloads are read from
+/// buffers that user-supplied blobs flow into, so neither the range nor the
+/// UTF-8 well-formedness of the payload may be assumed here: an unchecked
+/// decode would hand invalid UTF-8 to `&str` consumers such as
+/// [`unescape_string`], which is undefined behaviour.
+fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
+    let Some(end) = start.checked_add(len) else {
+        bail_parse_error!("malformed JSON: text payload size overflow");
+    };
+    let Some(bytes) = data.get(start..end) else {
+        bail_parse_error!("malformed JSON: text payload extends beyond data");
+    };
+    from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
 }
 
 #[inline]
@@ -4642,5 +4696,57 @@ mod path_operations_tests {
         // Should return an error instead of panicking with overflow
         let result = jsonb.array_len();
         assert!(result.is_err());
+    }
+
+    /// A child element whose declared size runs past the buffer must not reach
+    /// the slice in `SearchOperation` or the `drain` in `DeleteOperation`.
+    ///
+    /// Blob-sourced documents are validated on the way in, so no SQL input
+    /// reaches these ranges today. The checks exist because the sizes are
+    /// caller-controlled and a range derived from them must not depend on a
+    /// validation pass having run somewhere else: that coupling is what made
+    /// the sibling `from_utf8_unchecked` defect undefined behaviour rather than
+    /// a clean error.
+    #[test]
+    fn malformed_element_size_is_rejected_before_slicing() {
+        // ARRAY (type 11, inline payload size 8) whose single child is a TEXT5
+        // with a 1-byte size marker declaring 200 bytes, in a 9-byte buffer.
+        let bytes = [0x8Bu8, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let path = create_path(vec![
+            PathElement::Root(),
+            PathElement::ArrayLocator(Some(0)),
+        ]);
+
+        let mut jsonb = Jsonb {
+            data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        let mut search = SearchOperation::new(bytes.len()).unwrap();
+        assert!(
+            jsonb.operate_on_path(&path, &mut search).is_err(),
+            "oversized child size must not be sliced out of bounds"
+        );
+
+        let mut jsonb = Jsonb {
+            data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        let mut delete = DeleteOperation::new();
+        assert!(
+            jsonb.operate_on_path(&path, &mut delete).is_err(),
+            "oversized child size must not be drained out of bounds"
+        );
+    }
+
+    #[test]
+    fn element_end_rejects_overflow_and_out_of_range() {
+        let jsonb = Jsonb {
+            data: crate::alloc::vec![0x0C, 0x00],
+        };
+
+        // Sum overflows usize (the 8-byte size marker can declare this).
+        assert!(jsonb.element_end(1, &[usize::MAX, 2]).is_err());
+        // Sum is representable but past the 2-byte buffer.
+        assert!(jsonb.element_end(0, &[3]).is_err());
+        // Exactly the end of the buffer is in range.
+        assert!(jsonb.element_end(0, &[2]).is_ok());
     }
 }

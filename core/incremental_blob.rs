@@ -52,7 +52,7 @@ fn pump_step(stmt: &mut Statement, pager: &Pager) -> Result<StepOutcome> {
         match stmt.step()? {
             StepResult::Row => return Ok(StepOutcome::Row),
             StepResult::Done => return Ok(StepOutcome::Done),
-            StepResult::IO | StepResult::Yield => pager.io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => pager.io.step()?,
             StepResult::Interrupt | StepResult::Busy => return Err(LimboError::Busy),
         }
     }
@@ -238,7 +238,7 @@ fn check_column_writable(
         || table.unique_sets.iter().any(|set| {
             set.columns
                 .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case(col_name))
+                .any(|c| c.name.eq_ignore_ascii_case(col_name))
         });
     if indexed {
         return Err(LimboError::InternalError(

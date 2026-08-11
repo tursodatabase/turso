@@ -237,7 +237,7 @@ public class TursoTests
 
         command.Invoking(x => x.ExecuteScalar())
             .Should().Throw<InvalidOperationException>()
-            .WithMessage("Missing value for parameter ?1.");
+            .WithMessage("Missing value for parameter at position 1.");
     }
 
     [Test]
