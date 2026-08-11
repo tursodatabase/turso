@@ -4716,19 +4716,12 @@ impl<'a> Parser<'a> {
         let indexed = self.parse_indexed()?;
         let where_clause = self.parse_where()?;
         let returning = self.parse_returning()?;
-        let order_by = self.parse_order_by()?;
-        let limit = self.parse_limit()?;
-        if !order_by.is_empty() && limit.is_none() {
-            return Err(Error::Custom("ORDER BY without LIMIT on DELETE".to_owned()));
-        }
         Ok(Stmt::Delete {
             with,
             tbl_name,
             indexed,
             where_clause,
             returning,
-            order_by,
-            limit,
         })
     }
 
@@ -5327,11 +5320,6 @@ impl<'a> Parser<'a> {
         let from = self.parse_from_clause_opt()?;
         let where_clause = self.parse_where()?;
         let returning = self.parse_returning()?;
-        let order_by = self.parse_order_by()?;
-        let limit = self.parse_limit()?;
-        if !order_by.is_empty() && limit.is_none() {
-            return Err(Error::Custom("ORDER BY without LIMIT on UPDATE".to_owned()));
-        }
         Ok(Stmt::Update(Update {
             with,
             or_conflict: resolve_type,
@@ -5341,8 +5329,6 @@ impl<'a> Parser<'a> {
             from,
             where_clause,
             returning,
-            order_by,
-            limit,
         }))
     }
 
@@ -12466,12 +12452,10 @@ mod tests {
                     indexed: None,
                     where_clause: None,
                     returning: vec![],
-                    order_by: vec![],
-                    limit: None,
                 })],
             ),
             (
-                b"WITH test AS (SELECT 1) DELETE FROM foo NOT INDEXED WHERE 1 RETURNING bar ORDER BY bar LIMIT 1".as_slice(),
+                b"WITH test AS (SELECT 1) DELETE FROM foo NOT INDEXED WHERE 1 RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Delete {
                     with: Some(With {
                         recursive: false,
@@ -12515,17 +12499,6 @@ mod tests {
                             None,
                         ),
                     ],
-                    order_by: vec![
-                        SortedColumn {
-                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                            order: None,
-                            nulls: None,
-                        }
-                    ],
-                    limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: None,
-                    }),
                 })],
             ),
             // parse drop index
@@ -12797,12 +12770,10 @@ mod tests {
                     from: None,
                     where_clause: None,
                     returning: vec![],
-                    order_by: vec![],
-                    limit: None,
                 }))],
             ),
             (
-                b"WITH test AS (SELECT 1) UPDATE OR REPLACE foo NOT INDEXED SET bar = 1 FROM foo_2 WHERE 1 RETURNING bar ORDER By bar LIMIT 1".as_slice(),
+                b"WITH test AS (SELECT 1) UPDATE OR REPLACE foo NOT INDEXED SET bar = 1 FROM foo_2 WHERE 1 RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Update(Update {
                     with: Some(With {
                         recursive: false,
@@ -12868,17 +12839,6 @@ mod tests {
                             None,
                         ),
                     ],
-                    order_by: vec![
-                        SortedColumn {
-                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                            order: None,
-                            nulls: None,
-                        }
-                    ],
-                    limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: None,
-                    }),
                 }))],
             ),
             // parse reindex
@@ -13001,6 +12961,22 @@ mod tests {
         let sql = b"CREATE TABLE t(u UNION(i INT, t TEXT)) STRICT";
         let err = Parser::new(sql).next().unwrap().unwrap_err();
         assert!(err.to_string().contains("inline STRUCT/UNION"));
+    }
+
+    #[test]
+    fn test_delete_and_update_reject_limit_and_order_by() {
+        // Default SQLite builds (without SQLITE_ENABLE_UPDATE_DELETE_LIMIT)
+        // reject LIMIT and ORDER BY on DELETE and UPDATE.
+        for sql in [
+            b"DELETE FROM t LIMIT 1".as_slice(),
+            b"DELETE FROM t LIMIT 1 OFFSET 2".as_slice(),
+            b"DELETE FROM t ORDER BY x LIMIT 1".as_slice(),
+            b"UPDATE t SET x = 1 LIMIT 1".as_slice(),
+            b"UPDATE t SET x = 1 ORDER BY x LIMIT 1".as_slice(),
+        ] {
+            let result = Parser::new(sql).next().unwrap();
+            assert!(result.is_err(), "expected parse error for {sql:?}");
+        }
     }
 
     #[test]

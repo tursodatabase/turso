@@ -315,15 +315,10 @@ pub fn translate_inner(
         ast::Stmt::Delete {
             tbl_name,
             where_clause,
-            limit,
             returning,
             indexed,
-            order_by,
             with,
         } => {
-            if !order_by.is_empty() {
-                bail_parse_error!("ORDER BY clause is not supported in DELETE");
-            }
             if where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
                     "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
@@ -333,7 +328,6 @@ pub fn translate_inner(
                 &tbl_name,
                 resolver,
                 where_clause,
-                limit,
                 returning,
                 indexed,
                 with,

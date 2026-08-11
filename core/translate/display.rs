@@ -612,9 +612,6 @@ impl fmt::Display for UpdatePlan {
                 }
             }
         }
-        if let Some(limit) = self.limit.as_ref() {
-            writeln!(f, "LIMIT: {limit}")?;
-        }
         if let Some(ret) = &self.returning {
             writeln!(f, "RETURNING:")?;
             for col in ret {
@@ -950,32 +947,6 @@ impl ToTokens for DeletePlan {
             }
         }
 
-        if !self.order_by.is_empty() {
-            s.append(TokenType::TK_ORDER, None)?;
-            s.append(TokenType::TK_BY, None)?;
-
-            s.comma(
-                self.order_by
-                    .iter()
-                    .map(|(expr, order, nulls)| ast::SortedColumn {
-                        expr: expr.clone(),
-                        order: Some(*order),
-                        nulls: *nulls,
-                    }),
-                context,
-            )?;
-        }
-
-        if let Some(limit) = &self.limit {
-            s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
-        }
-
-        if let Some(offset) = &self.offset {
-            s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
-        }
-
         Ok(())
     }
 }
@@ -1028,15 +999,6 @@ impl ToTokens for UpdatePlan {
                 s.append(TokenType::TK_AND, None)?;
                 expr.to_tokens(s, context)?;
             }
-        }
-
-        if let Some(limit) = &self.limit {
-            s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
-        }
-        if let Some(offset) = &self.offset {
-            s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
         }
 
         Ok(())

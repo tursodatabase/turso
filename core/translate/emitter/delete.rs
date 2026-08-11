@@ -8,8 +8,7 @@ use crate::{
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_program_for_select,
-            get_triggers_including_temp, has_triggers_including_temp, init_limit, OperationMode,
-            TriggerTime,
+            get_triggers_including_temp, has_triggers_including_temp, OperationMode, TriggerTime,
         },
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
@@ -74,8 +73,6 @@ pub fn emit_program_for_delete(
     } else {
         None
     };
-
-    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -482,19 +479,6 @@ fn emit_delete_insns<'a>(
         false
     };
 
-    // Apply OFFSET: skip the first N matching rows before deleting
-    if let Some(offset) = t_ctx.reg_offset {
-        let loop_labels = *t_ctx
-            .labels_main_loop
-            .first()
-            .expect("loop labels to exist");
-        program.emit_insn(Insn::IfPos {
-            reg: offset,
-            target_pc: loop_labels.next,
-            decrement_by: 1,
-        });
-    }
-
     let cols_len = unsafe { &*table_reference }.columns().len();
     let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
         // Get rowid for RETURNING
@@ -593,13 +577,6 @@ fn emit_delete_insns<'a>(
             raise_error_if_no_matching_entry: index.where_clause.is_none(),
         });
     }
-    if let Some(limit_ctx) = t_ctx.limit_ctx {
-        program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
-        })
-    }
-
     Ok(())
 }
 

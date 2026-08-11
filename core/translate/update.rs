@@ -6,7 +6,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
-use crate::translate::planner::{parse_limit, ROWID_STRS};
+use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -202,7 +202,6 @@ fn prepare_and_optimize_update_plan(
 
 fn validate_update(
     schema: &Schema,
-    body: &ast::Update,
     table_name: &str,
     is_internal_schema_change: bool,
     conn: &Arc<Connection>,
@@ -214,9 +213,6 @@ fn validate_update(
         && !crate::schema::allow_user_dml(table_name)
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
-    }
-    if !body.order_by.is_empty() {
-        bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
     // Check if this is a materialized view
     if schema.is_materialized_view(table_name) {
@@ -265,7 +261,6 @@ fn prepare_update_plan(
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
         schema,
-        &body,
         target_name.as_str(),
         is_internal_schema_change,
         connection,
@@ -421,10 +416,6 @@ fn prepare_update_plan(
         resolver,
     )?;
 
-    let (limit, offset) = body
-        .limit
-        .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
-
     let indexes_to_update = collect_indexes_to_update(
         &table,
         table_name,
@@ -447,8 +438,6 @@ fn prepare_update_plan(
         set_clauses,
         where_clause,
         returning: (!result_columns.is_empty()).then_some(result_columns),
-        limit,
-        offset,
         contains_constant_false_condition: false,
         indexes_to_update,
         write_set_plan: None,

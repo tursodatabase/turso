@@ -21,7 +21,7 @@ use crate::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
             emit_index_column_value_old_image, emit_make_record, emit_program_for_select,
-            init_limit, OperationMode, Resolver, UpdateRowSource,
+            OperationMode, Resolver, UpdateRowSource,
         },
         expr::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
@@ -212,8 +212,6 @@ pub fn emit_program_for_update(
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
-
-    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -1223,13 +1221,6 @@ fn emit_update_insns<'a>(
         })
     }
 
-    if let Some(offset) = t_ctx.reg_offset {
-        program.emit_insn(Insn::IfPos {
-            reg: offset,
-            target_pc: loop_labels.next,
-            decrement_by: 1,
-        });
-    }
     let col_len = target_table.table.columns().len();
 
     // we scan a column at a time, loading either the column's values, or the new value
@@ -2640,12 +2631,6 @@ fn emit_update_insns<'a>(
         _ => crate::bail_parse_error!("cannot UPDATE a subquery table"),
     }
 
-    if let Some(limit_ctx) = t_ctx.limit_ctx {
-        program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
-        })
-    }
     if let Some(label) = check_rowid_not_exists_label {
         program.preassign_label_to_next_insn(label);
     }

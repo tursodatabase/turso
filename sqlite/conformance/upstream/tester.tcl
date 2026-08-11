@@ -297,6 +297,7 @@ proc ifcapable {expr code {else_keyword ""} {elsecode ""}} {
       "upsert" { set has_capability 1 }
       "gencol" { set has_capability 1 }
       "generated_always" { set has_capability 1 }
+      "update_delete_limit" { set has_capability 0 }
       default { set has_capability 1 }
     }
 
@@ -311,10 +312,14 @@ proc ifcapable {expr code {else_keyword ""} {elsecode ""}} {
     }
   }
 
+  # Propagate return codes (like `return` inside the block) to the caller, so
+  # tests that early-exit with `ifcapable !foo { finish_test; return }` work.
   if {$capable} {
-    uplevel 1 $code
+    set c [catch {uplevel 1 $code} r]
+    return -code $c $r
   } elseif {$else_keyword eq "else" && $elsecode ne ""} {
-    uplevel 1 $elsecode
+    set c [catch {uplevel 1 $elsecode} r]
+    return -code $c $r
   }
 }
 
