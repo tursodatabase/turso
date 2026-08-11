@@ -45,14 +45,6 @@ impl Value {
         matches!(self, Self::Null)
     }
 
-    /// Returns `true` if the value is [`Integer`].
-    ///
-    /// [`Integer`]: Value::Integer
-    #[must_use]
-    pub fn is_integer(&self) -> bool {
-        matches!(self, Self::Integer(..))
-    }
-
     /// Returns `true` if the value is [`Real`].
     ///
     /// [`Real`]: Value::Real
@@ -62,6 +54,14 @@ impl Value {
     }
 
     pub fn as_real(&self) -> Option<&f64> {
+        if let Self::Real(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn into_real(self) -> Option<f64> {
         if let Self::Real(v) = self {
             Some(v)
         } else {
@@ -85,7 +85,31 @@ impl Value {
         }
     }
 
+    pub fn into_text(self) -> Option<String> {
+        if let Self::Text(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` if the value is [`Integer`].
+    ///
+    /// [`Integer`]: Value::Integer
+    #[must_use]
+    pub fn is_integer(&self) -> bool {
+        matches!(self, Self::Integer(..))
+    }
+
     pub fn as_integer(&self) -> Option<&i64> {
+        if let Self::Integer(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn into_integer(self) -> Option<i64> {
         if let Self::Integer(v) = self {
             Some(v)
         } else {
@@ -102,6 +126,14 @@ impl Value {
     }
 
     pub fn as_blob(&self) -> Option<&Vec<u8>> {
+        if let Self::Blob(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn into_blob(self) -> Option<Vec<u8>> {
         if let Self::Blob(v) = self {
             Some(v)
         } else {
