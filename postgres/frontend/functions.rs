@@ -235,13 +235,16 @@ fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Value {
 }
 
 fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
-    if args.iter().any(|arg| matches!(arg, Value::Null)) {
-        return Ok(Value::Null);
-    }
-
-    // TursoPG already stores adbin and conbin as rendered SQL rather than pg_node_tree, so the relation OID and pretty flag do not affect the output
     match args.first() {
-        Some(Value::Text(expression)) => Ok(Value::Text(expression.clone())),
+        Some(Value::Text(expression)) => {
+            if args[1..].iter().any(|arg| matches!(arg, Value::Null)) {
+                return Ok(Value::Null);
+            }
+
+            // TursoPG stores adbin and conbin as rendered SQL, so the relation OID and pretty flag do not change the output.
+            Ok(Value::Text(expression.clone()))
+        }
+        Some(Value::Null) => Ok(Value::Null),
         Some(_) | None => Err(LimboError::ConversionError(
             "Expected text value".to_string(),
         )),

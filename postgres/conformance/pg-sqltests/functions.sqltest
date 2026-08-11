@@ -197,3 +197,16 @@ test pg-get-expr-non-text-expression-errors {
     SELECT pg_get_expr(42, 1::oid) FROM pg_attrdef;
 }
 expect error {}
+
+test pg-get-expr-null-oid-does-not-hide-invalid-expression {
+    SELECT pg_get_expr(42, NULL::oid);
+}
+expect error {}
+
+test pg-get-expr-check-constraint {
+    CREATE TABLE checked (val int CHECK (val > 0));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c';
+}
+expect {
+    val > 0
+}
