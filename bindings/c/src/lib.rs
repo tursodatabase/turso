@@ -22,6 +22,32 @@ static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
 #[allow(non_upper_case_globals)]
 pub static mut sqlite3_search_count: ffi::c_int = 0;
 
+/// Test-only export of core's SQLite varint encoder for the TCL harness's
+/// btree_varint_test command (upstream test3.c). `buf` must have room for
+/// 9 bytes. Returns the number of bytes written. Not part of the sqlite3
+/// API.
+#[no_mangle]
+pub unsafe extern "C" fn turso_test_put_varint(buf: *mut u8, value: u64) -> ffi::c_int {
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf, 9) };
+    turso_core::storage::sqlite3_ondisk::write_varint(buf, value) as ffi::c_int
+}
+
+/// Test-only export of core's SQLite varint decoder, the counterpart of
+/// [`turso_test_put_varint`]. `buf` must hold at least 9 readable bytes.
+/// Returns the number of bytes consumed and stores the decoded value in
+/// `*out`, or returns 0 if the bytes are not a valid varint.
+#[no_mangle]
+pub unsafe extern "C" fn turso_test_get_varint(buf: *const u8, out: *mut u64) -> ffi::c_int {
+    let buf = unsafe { std::slice::from_raw_parts(buf, 9) };
+    match turso_core::storage::sqlite3_ondisk::read_varint(buf) {
+        Ok((value, n)) => {
+            unsafe { *out = value };
+            n as ffi::c_int
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Enable all experimental features for databases opened after this call.
 #[no_mangle]
 pub extern "C" fn turso_enable_experimental() {
@@ -1045,7 +1071,13 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     let db = &mut *stmt.db;
-    let mut db_inner = db.inner.lock().unwrap();
+    // Do not hold the handle lock across the step. A user-defined function
+    // invoked mid-step may re-enter the C API on the same handle (SQLite
+    // allows e.g. a nested prepare/step from inside a scalar callback), and
+    // re-locking the non-reentrant mutex on the same thread deadlocks.
+    // Nothing here needs the lock while stepping: core's Connection is
+    // internally synchronized, and the statement itself was never protected
+    // by the handle lock to begin with.
     let res = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
     let rc = match res {
         Ok(Some(_)) => {
@@ -1058,7 +1090,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         }
         Err(LimboError::Busy) => SQLITE_BUSY,
         Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
-        Err(err) => set_db_err(&mut db_inner, err),
+        Err(err) => {
+            let mut db_inner = db.inner.lock().unwrap();
+            set_db_err(&mut db_inner, err)
+        }
     };
     let current = stmt.stmt.metrics().search_count;
     let delta = current - stmt.prev_search_count;
@@ -1255,17 +1290,27 @@ unsafe fn execute_query_with_callback(
                 // Safety: checked earlier
                 let callback = callback.unwrap();
 
-                let mut values: Vec<CString> = Vec::with_capacity(n_cols as usize);
+                let mut values: Vec<Option<CString>> = Vec::with_capacity(n_cols as usize);
                 let mut value_ptrs: Vec<*mut ffi::c_char> = Vec::with_capacity(n_cols as usize);
                 let mut col_ptrs: Vec<*mut ffi::c_char> = Vec::with_capacity(n_cols as usize);
 
                 for i in 0..n_cols {
                     let val = stmt_ref.stmt.row().unwrap().get_value(i as usize);
-                    values.push(CString::new(val.to_string().as_bytes()).unwrap());
+                    // SQL NULL is passed to the callback as a NULL pointer,
+                    // as in SQLite, not as an empty string.
+                    if matches!(val, Value::Null) {
+                        values.push(None);
+                    } else {
+                        values.push(Some(CString::new(val.to_string().as_bytes()).unwrap()));
+                    }
                 }
 
                 for value in &values {
-                    value_ptrs.push(value.as_ptr() as *mut ffi::c_char);
+                    value_ptrs.push(
+                        value
+                            .as_ref()
+                            .map_or(std::ptr::null_mut(), |v| v.as_ptr() as *mut ffi::c_char),
+                    );
                 }
                 for name in &column_names {
                     col_ptrs.push(name.as_ptr() as *mut ffi::c_char);

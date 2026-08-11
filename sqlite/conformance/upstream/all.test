@@ -193,7 +193,7 @@ set test_files {
   distinct             fail
   distinct2            fail
   distinctagg          fail
-  e_blobbytes          fail
+  e_blobbytes          pass
   e_blobclose          fail
   e_blobopen           fail
   e_blobwrite          fail
@@ -229,7 +229,7 @@ set test_files {
   eval                 fail
   exclusive            fail
   exclusive2           fail
-  exec                 fail
+  exec                 pass
   exists               fail
   expr                 fail
   expr2                pass
@@ -767,7 +767,7 @@ set test_files {
   vacuum6              fail
   vacuummem            fail
   values               fail
-  varint               fail
+  varint               pass
   veryquick            fail
   view                 fail
   view2                pass

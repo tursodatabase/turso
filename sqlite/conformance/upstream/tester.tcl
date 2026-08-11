@@ -75,6 +75,15 @@ if {![info exists ::tcl_precision]} {
 proc breakpoint {} {}
 proc do_not_use_codec {} {}
 
+# Name of the current test permutation, as in upstream tester.tcl. We only
+# run the default configuration, so this is "" unless a permutation script
+# sets G(perm:name).
+proc permutation {} {
+  set perm ""
+  catch {set perm $::G(perm:name)}
+  set perm
+}
+
 # Modern SQLite builds default to schema file format 4; upstream tests
 # read this to decide format-dependent expectations.
 if {![info exists ::SQLITE_DEFAULT_FILE_FORMAT]} {
@@ -146,7 +155,12 @@ proc catchsql {sql {db db}} {
 # (15 significant digits vs shortest round-trip), so two renderings of one
 # value can differ in their last digits at any magnitude.
 proc floats_equal {a b} {
-  expr {abs($a - $b) <= 1e-12 * (abs($a) + abs($b) + 1.0)}
+  # NaN passes [string is double] but throws in expr arithmetic; treat any
+  # non-computable comparison as unequal instead of aborting the test file.
+  if {[catch {expr {abs($a - $b) <= 1e-12 * (abs($a) + abs($b) + 1.0)}} eq]} {
+    return 0
+  }
+  return $eq
 }
 
 # Main test execution function
@@ -343,6 +357,10 @@ set SQLITE_MAX_ATTACHED 10
 set SQLITE_MAX_VARIABLE_NUMBER 999
 set SQLITE_MAX_COLUMN 2000
 set SQLITE_MAX_SQL_LENGTH 1000000
+# Turso does not enforce SQLite's default 1e9 string-length limit, so
+# report the practical 32-bit cap; tests guarded on a smaller limit
+# (e.g. printf.test's 2e9-width allocation probe) skip themselves.
+set SQLITE_MAX_LENGTH 2147483647
 set SQLITE_MAX_EXPR_DEPTH 1000
 set SQLITE_MAX_LIKE_PATTERN_LENGTH 50000
 set SQLITE_MAX_TRIGGER_DEPTH 1000

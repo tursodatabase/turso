@@ -127,6 +127,204 @@ assert_eq "attached database is queryable" 42 [db eval {SELECT x FROM aux.t5}]
 assert_eq "DETACH is accepted" "" [db eval {DETACH aux}]
 
 # ---------------------------------------------------------------------------
+# Probe 6: TCL variable binding in [db one] and [db exists].
+# Both prepare their statement directly (bypassing the eval path), so they
+# must bind TCL variables themselves; without that, $var silently binds NULL
+# and the query returns an empty result.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE tv(x);}
+db eval {INSERT INTO tv VALUES (7), (8);}
+
+set want 7
+assert_eq "db one binds \$var from the caller scope" 7 \
+    [db one {SELECT x FROM tv WHERE x = $want}]
+assert_eq "db exists binds \$var from the caller scope" 1 \
+    [db exists {SELECT 1 FROM tv WHERE x = $want}]
+assert_eq "db exists is false for a non-matching \$var" 0 \
+    [db exists {SELECT 1 FROM tv WHERE x = $want + 100}]
+
+# ---------------------------------------------------------------------------
+# Probe 7: [db transaction].
+# The script runs inside a transaction: committed on success, rolled back
+# when the script raises an error. Nested transactions use a savepoint, so
+# an inner failure undoes only the inner work.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE tt(x);}
+
+db transaction {
+    db eval {INSERT INTO tt VALUES (1);}
+}
+assert_eq "transaction commits on success" 1 [db one {SELECT count(*) FROM tt}]
+
+set txerr [catch {
+    db transaction {
+        db eval {INSERT INTO tt VALUES (2);}
+        error "boom"
+    }
+} txmsg]
+assert_eq "transaction propagates the script error" 1 $txerr
+assert_eq "transaction error message survives" "boom" $txmsg
+assert_eq "transaction rolls back on error" 1 [db one {SELECT count(*) FROM tt}]
+
+db transaction immediate {
+    db eval {INSERT INTO tt VALUES (3);}
+}
+assert_eq "transaction accepts a type argument" 2 [db one {SELECT count(*) FROM tt}]
+
+db transaction {
+    db eval {INSERT INTO tt VALUES (4);}
+    catch {
+        db transaction {
+            db eval {INSERT INTO tt VALUES (5);}
+            error "inner boom"
+        }
+    }
+}
+assert_eq "inner transaction rolls back to its savepoint only" \
+    {1 3 4} [db eval {SELECT x FROM tt ORDER BY x}]
+
+# ---------------------------------------------------------------------------
+# Probe 8: the [sqlite3_exec] test-harness command.
+# Returns {rc results} where results is column names followed by row values
+# (first row supplies the names), or {rc errmsg} on failure. %HH escapes in
+# the SQL decode to raw bytes, as in upstream test1.c.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE te(a, b); INSERT INTO te VALUES (1, 2), (3, 4);}
+
+assert_eq "sqlite3_exec returns rc 0 plus names and rows" \
+    {0 {a b 1 2 3 4}} [sqlite3_exec db {SELECT * FROM te ORDER BY a}]
+assert_eq "sqlite3_exec renders NULL as the string NULL" \
+    {0 {x NULL}} [sqlite3_exec db {SELECT NULL AS x}]
+assert_eq "sqlite3_exec decodes %HH escapes" \
+    {0 {x 41}} [sqlite3_exec db {SELECT hex('%41') AS x}]
+assert_eq "sqlite3_exec reports SQL errors via rc" \
+    1 [lindex [sqlite3_exec db {SELECT * FROM no_such_table}] 0]
+set execerr [catch {sqlite3_exec nosuchdb {SELECT 1}} execmsg]
+assert_eq "sqlite3_exec errors on an unknown handle" 1 $execerr
+
+# ---------------------------------------------------------------------------
+# Probe 9: [sqlite3_connection_pointer].
+# Returns a value that identifies the database to C-API-level harness
+# commands (here, the handle name itself), and errors on a non-database.
+# ---------------------------------------------------------------------------
+
+set DB [sqlite3_connection_pointer db]
+assert_eq "sqlite3_connection_pointer result works as a DB argument" \
+    {0 {one 1}} [sqlite3_exec $DB {SELECT 1 AS one}]
+set ptrerr [catch {sqlite3_connection_pointer nosuchdb} ptrmsg]
+assert_eq "sqlite3_connection_pointer errors on an unknown handle" 1 $ptrerr
+
+# ---------------------------------------------------------------------------
+# Probe 10: the [sqlite3_mprintf_*] / [sqlite3_snprintf_*] commands.
+# Each formats through the real sqlite3_mprintf/sqlite3_snprintf C API, so
+# these expectations (taken from upstream printf.test) exercise the engine's
+# printf implementation.
+# ---------------------------------------------------------------------------
+
+assert_eq "mprintf_int formats three ints" \
+    {This is a test 1,2,3} \
+    [sqlite3_mprintf_int {This is a test %d,%d,%d} 1 2 3]
+assert_eq "mprintf_int honors width and zero-pad flags" \
+    {abc: (000012) (00000d) (000016) :xyz} \
+    [sqlite3_mprintf_int {abc: (%06d) (%06x) (%06o) :xyz} 12 13 14]
+assert_eq "mprintf_int64 formats past 32 bits" \
+    {2147483647 2147483648 4294967296} \
+    [sqlite3_mprintf_int64 {%lld %lld %lld} 2147483647 2147483648 4294967296]
+assert_eq "mprintf_long truncates each argument to 32 bits" \
+    {2147483647 2147483648 4294967295} \
+    [sqlite3_mprintf_long {%lu %lu %lu} 0x7fffffff 0x80000000 0xffffffff]
+assert_eq "mprintf_str formats two ints and a string" \
+    {1 2 A String: (This is the string)} \
+    [sqlite3_mprintf_str {%d %d A String: (%s)} 1 2 {This is the string}]
+assert_eq "mprintf_str passes NULL when the string is omitted" \
+    {1 2 A NULL pointer in %q: '(NULL)'} \
+    [sqlite3_mprintf_str {%d %d A NULL pointer in %%q: '%q'} 1 2]
+assert_eq "mprintf_stronly quotes via %q" \
+    {Hi Y''all} [sqlite3_mprintf_stronly %q {Hi Y'all}]
+assert_eq "mprintf_double formats two ints and a double" \
+    {1 2 3.5} [sqlite3_mprintf_double {%d %d %g} 1 2 3.5]
+assert_eq "mprintf_scaled formats the product of its doubles" \
+    {A double: 1e+308} [sqlite3_mprintf_scaled {A double: %g} 1.0e307 10.0]
+assert_eq "mprintf_hexdouble decodes an IEEE-754 bit pattern" \
+    {10.00000000000000000000} [sqlite3_mprintf_hexdouble %.20f 4024000000000000]
+assert_eq "mprintf_z_test joins arguments via %z" \
+    {,one,two,three} [sqlite3_mprintf_z_test , one two three]
+assert_eq "snprintf_int truncates to SIZE-1 characters" \
+    {1234} [sqlite3_snprintf_int 5 {12345} 0]
+assert_eq "snprintf_int leaves the buffer alone when SIZE is 0" \
+    {abcdefghijklmnopqrstuvwxyz} [sqlite3_snprintf_int 0 {} 0]
+assert_eq "snprintf_str truncates to SIZE-1 characters" \
+    {x10 1} [sqlite3_snprintf_str 6 {x%d %d %s} 10 10 {This is the string}]
+
+# ---------------------------------------------------------------------------
+# Probe 11: [btree_varint_test].
+# Round-trips values through core's varint encoder/decoder; returns "" on
+# success. The ranges cover 1-byte, mid-size, and 9-byte encodings.
+# ---------------------------------------------------------------------------
+
+assert_eq "btree_varint_test round-trips small values" "" \
+    [btree_varint_test 0 1 5000 1]
+assert_eq "btree_varint_test round-trips large steps" "" \
+    [btree_varint_test 100 1000000 5000 50000000]
+assert_eq "btree_varint_test round-trips 9-byte encodings" "" \
+    [btree_varint_test 0x10000000 0x10000000 5000 50000000]
+
+# ---------------------------------------------------------------------------
+# Probe 12: the [sqlite3_blob_*] commands over the incremental blob C API.
+# blob_open sets VARNAME to a handle on success and raises the symbolic
+# result code on failure; read/write/bytes/close operate on the handle.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE tb(x BLOB); INSERT INTO tb(rowid, x) VALUES (1, zeroblob(10));}
+
+sqlite3_blob_open db main tb x 1 1 B
+assert_eq "blob_bytes reports the blob size" 10 [sqlite3_blob_bytes $B]
+assert_eq "blob_write stores bytes" "" [sqlite3_blob_write $B 0 hello 5]
+assert_eq "blob_read returns written bytes" "hello" [sqlite3_blob_read $B 0 5]
+assert_eq "blob_read honors the offset" "ello" [sqlite3_blob_read $B 1 4]
+assert_eq "blob_close succeeds" "" [sqlite3_blob_close $B]
+assert_eq "blob_write persisted through the SQL layer" \
+    68656C6C6F0000000000 [db one {SELECT hex(x) FROM tb WHERE rowid = 1}]
+
+set boerr [catch {sqlite3_blob_open db main tb x 99 0 B2} bomsg]
+assert_eq "blob_open raises the symbolic code on a missing row" 1 $boerr
+assert_ne "blob_open error is a symbolic result code" "" $bomsg
+set brerr [catch {sqlite3_blob_read $B 0 5} brmsg]
+assert_eq "blob commands reject a closed handle" 1 $brerr
+
+# ---------------------------------------------------------------------------
+# Probe 13: re-entering the database from inside a [db func] callback.
+# SQLite allows a scalar function to run its own statements on the calling
+# connection; this used to deadlock because sqlite3_step held the handle
+# lock across the whole step.
+# ---------------------------------------------------------------------------
+
+db func nested_probe {} { db one {SELECT 40 + 2} }
+assert_eq "db func callback can run a nested statement" 42 \
+    [db one {SELECT nested_probe()}]
+
+# ---------------------------------------------------------------------------
+# Probe 14: [sqlite3BitvecBuiltinTest].
+# Returns 0 when the tested bitmap matches the reference, and the index of
+# the first mismatch otherwise (opcode 5 writes only the reference, which
+# is how bitvec.test verifies deliberate errors are detected).
+# ---------------------------------------------------------------------------
+
+assert_eq "bitvec test detects a deliberate mismatch at bit 1" 1 \
+    [sqlite3BitvecBuiltinTest 400 {5 1 1 1 0}]
+assert_eq "bitvec test reports the first mismatched index" 234 \
+    [sqlite3BitvecBuiltinTest 400 {5 1 234 1 0}]
+assert_eq "bitvec test passes a linear fill" 0 \
+    [sqlite3BitvecBuiltinTest 4000 {1 4000 1 1 0}]
+assert_eq "bitvec test passes fill then clear" 0 \
+    [sqlite3BitvecBuiltinTest 4000 {1 4000 1 1 2 4000 1 1 0}]
+assert_eq "bitvec test passes random set and clear" 0 \
+    [sqlite3BitvecBuiltinTest 4000 {3 1000 4 1000 0}]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
