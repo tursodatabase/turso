@@ -1140,6 +1140,156 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
     assert!(!rows.is_empty());
 }
 
+/// A one-character typo in a WITH clause key must be an error, not a
+/// silently different index (issue #8169).
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_with_clause_rejects_typo_key(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    let result =
+        conn.execute("CREATE INDEX fts_docs ON docs USING fts (body) WITH (tokenzier = 'ngram')");
+    assert!(
+        result.is_err(),
+        "typo key 'tokenzier' was accepted; the index silently uses the default tokenizer"
+    );
+}
+
+/// An unrecognised extra key next to a valid one must also be an error.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_with_clause_rejects_unknown_key(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    let result = conn.execute(
+        "CREATE INDEX fts_docs ON docs USING fts (body) WITH (tokenizer = 'ngram', completely_bogus_key = 42)",
+    );
+    assert!(
+        result.is_err(),
+        "unknown key 'completely_bogus_key' was accepted and ignored"
+    );
+}
+
+/// The same key spelled in two casings must be rejected as a duplicate,
+/// not have one spelling silently win.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_with_clause_rejects_duplicate_key_across_casings(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    let result = conn.execute(
+        "CREATE INDEX fts_docs ON docs USING fts (body) WITH (tokenizer = 'ngram', TOKENIZER = 'raw')",
+    );
+    assert!(
+        result.is_err(),
+        "'tokenizer' and 'TOKENIZER' name the same key and must be a duplicate error"
+    );
+}
+
+/// Keys are case-insensitive like other SQL keywords in DDL: a mis-cased
+/// key must configure the index, not be silently ignored (issue #8169).
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_with_clause_treats_keys_case_insensitively(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_docs ON docs USING fts (body) WITH (TOKENIZER = 'ngram')")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'alpha')")
+        .unwrap();
+
+    // Only ngram can match the 2-character prefix 'al'; the default
+    // tokenizer indexes whole words and returns nothing.
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'al')");
+    assert_eq!(
+        rows.len(),
+        1,
+        "TOKENIZER = 'ngram' was accepted but ignored: the index got the default tokenizer"
+    );
+}
+
+/// min_gram/max_gram in the WITH clause must actually change the ngram
+/// window instead of being ignored (issue #8169). With the default window
+/// of (2, 3) a 1-character query term can never match; min_gram = 1 makes
+/// it match.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_with_clause_configures_ngram_window(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE narrow(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute(
+        "CREATE INDEX fts_narrow ON narrow USING fts (body) WITH (tokenizer = 'ngram', min_gram = 1, max_gram = 3)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO narrow VALUES (1, 'alpha')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM narrow WHERE fts_match(body, 'a')");
+    assert_eq!(
+        rows.len(),
+        1,
+        "min_gram = 1 was ignored: a 1-character term did not match"
+    );
+
+    // The default window of (2, 3) cannot index 1-character grams, so the
+    // same query on a default ngram index finds nothing.
+    conn.execute("CREATE TABLE wide(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_wide ON wide USING fts (body) WITH (tokenizer = 'ngram')")
+        .unwrap();
+    conn.execute("INSERT INTO wide VALUES (1, 'alpha')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM wide WHERE fts_match(body, 'a')");
+    assert_eq!(
+        rows.len(),
+        0,
+        "default ngram window unexpectedly matched a 1-character term"
+    );
+}
+
+/// Bad ngram window values must fail at CREATE INDEX time with a clear
+/// error rather than falling back to the default window.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_with_clause_rejects_bad_ngram_window(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+
+    // min_gram must be a positive integer
+    for clause in [
+        "WITH (tokenizer = 'ngram', min_gram = 0)",
+        "WITH (tokenizer = 'ngram', min_gram = 'one')",
+        // min_gram above max_gram (explicit or the default of 3)
+        "WITH (tokenizer = 'ngram', min_gram = 4)",
+        "WITH (tokenizer = 'ngram', min_gram = 3, max_gram = 2)",
+        // the window only makes sense for the ngram tokenizer
+        "WITH (tokenizer = 'raw', min_gram = 1)",
+        "WITH (max_gram = 4)",
+    ] {
+        let result = conn.execute(format!(
+            "CREATE INDEX fts_docs ON docs USING fts (body) {clause}"
+        ));
+        assert!(result.is_err(), "bad ngram window `{clause}` was accepted");
+    }
+}
+
 /// Test fts_highlight function for text highlighting
 /// Signature: fts_highlight(text1, text2, ..., before_tag, after_tag, query)
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]

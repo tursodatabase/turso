@@ -1609,6 +1609,9 @@ pub struct FtsIndexAttachment {
     /// Created from WITH clause parameters,
     /// e.g. `WITH (tokenizer='default',weights='col1=1.0,col2=2.0')`.
     field_weights: HashMap<String, f32>,
+    /// (min_gram, max_gram) for the ngram tokenizer, from the WITH clause
+    /// `min_gram`/`max_gram` keys. [DEFAULT_NGRAM_WINDOW] unless configured.
+    ngram_window: (usize, usize),
     /// In-memory cached Tantivy read state.
     cached_state: Arc<RwLock<CachedFtsStates>>,
     /// Tantivy writer retained across sequential statements.
@@ -1627,12 +1630,47 @@ pub const SUPPORTED_TOKENIZERS: &[&str] = &[
     "ngram",      // N-gram tokenizer (2-3 chars by default)
 ];
 
+/// Supported keys in the WITH clause of an FTS index
+pub const SUPPORTED_WITH_KEYS: &[&str] = &["tokenizer", "weights", "min_gram", "max_gram"];
+
+/// Ngram window used when `min_gram`/`max_gram` are not given.
+pub const DEFAULT_NGRAM_WINDOW: (usize, usize) = (2, 3);
+
 impl FtsIndexAttachment {
+    #[aristo::intent(
+        "Every WITH clause key this constructor accepts is also consumed by it: \
+         a key outside the supported list is an error, and lookups go through \
+         one case-folded map so a mis-cased key cannot slip past. Adding a key \
+         to the supported list without reading it from that map recreates the \
+         accepted-but-ignored failure this guards against — the DDL succeeds \
+         but the index silently gets different semantics than it asked for.",
+        verify = "neural",
+        id = "fts_with_keys_all_validated_and_consumed"
+    )]
     pub fn new(cfg: IndexMethodConfiguration) -> Result<Self> {
+        // Validate WITH clause keys the same way bad values are validated:
+        // a typo like `tokenzier` must be an error, not a silently different
+        // index. Keys are matched case-insensitively.
+        let mut parameters: HashMap<String, &Value> = HashMap::default();
+        for (key, value) in &cfg.parameters {
+            let normalized = key.to_ascii_lowercase();
+            if !SUPPORTED_WITH_KEYS.contains(&normalized.as_str()) {
+                return Err(LimboError::ParseError(format!(
+                    "unsupported FTS WITH parameter '{}'. Supported parameters: {}",
+                    key,
+                    SUPPORTED_WITH_KEYS.join(", ")
+                )));
+            }
+            if parameters.insert(normalized, value).is_some() {
+                return Err(LimboError::ParseError(format!(
+                    "duplicate FTS WITH parameter '{key}'"
+                )));
+            }
+        }
+
         // Parse tokenizer from WITH clause parameters, default to "default"
         // The parser may include surrounding quotes in the value, so we strip them
-        let tokenizer_name = cfg
-            .parameters
+        let tokenizer_name = parameters
             .get("tokenizer")
             .and_then(|v| match v {
                 Value::Text(t) => {
@@ -1654,8 +1692,40 @@ impl FtsIndexAttachment {
             )));
         }
 
+        // Parse the ngram window: WITH (tokenizer = 'ngram', min_gram = 1, max_gram = 3)
+        let parse_gram = |key: &str| -> Result<Option<usize>> {
+            let Some(value) = parameters.get(key) else {
+                return Ok(None);
+            };
+            match value {
+                Value::Numeric(crate::numeric::Numeric::Integer(v)) if *v >= 1 => {
+                    Ok(Some(usize::try_from(*v).expect("checked to be positive")))
+                }
+                _ => Err(LimboError::ParseError(format!(
+                    "FTS WITH parameter '{key}' must be a positive integer"
+                ))),
+            }
+        };
+        let min_gram = parse_gram("min_gram")?;
+        let max_gram = parse_gram("max_gram")?;
+        if (min_gram.is_some() || max_gram.is_some()) && tokenizer_name != "ngram" {
+            return Err(LimboError::ParseError(format!(
+                "FTS WITH parameters 'min_gram' and 'max_gram' require tokenizer = 'ngram', got tokenizer = '{tokenizer_name}'"
+            )));
+        }
+        let ngram_window = (
+            min_gram.unwrap_or(DEFAULT_NGRAM_WINDOW.0),
+            max_gram.unwrap_or(DEFAULT_NGRAM_WINDOW.1),
+        );
+        if ngram_window.0 > ngram_window.1 {
+            return Err(LimboError::ParseError(format!(
+                "FTS ngram window is invalid: min_gram ({}) is greater than max_gram ({})",
+                ngram_window.0, ngram_window.1
+            )));
+        }
+
         // Parse field weights from WITH clause: weights='body=2.0,title=1.0'
-        let field_weights = if let Some(weights_value) = cfg.parameters.get("weights") {
+        let field_weights = if let Some(weights_value) = parameters.get("weights") {
             let weights_str = match weights_value {
                 Value::Text(t) => {
                     let s = t.to_string();
@@ -1757,6 +1827,7 @@ impl FtsIndexAttachment {
             text_fields,
             patterns,
             field_weights,
+            ngram_window,
             cached_state: Arc::new(RwLock::new(CachedFtsStates::default())),
             cached_writer: Arc::new(Mutex::new(None)),
         })
@@ -1778,15 +1849,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     }
 
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
-        Ok(Box::new(FtsCursor::new(
-            &self.cfg,
-            self.schema.clone(),
-            self.rowid_field,
-            self.text_fields.clone(),
-            self.field_weights.clone(),
-            self.cached_state.clone(),
-            self.cached_writer.clone(),
-        )))
+        Ok(Box::new(FtsCursor::new(self)))
     }
 }
 
@@ -2038,6 +2101,8 @@ pub struct FtsCursor {
     default_fields: Vec<Field>,
     /// Pre-computed (Field, boost) pairs for QueryParser (avoids re-iterating per query)
     field_boosts: Vec<(Field, f32)>,
+    /// (min_gram, max_gram) window for the ngram tokenizer
+    ngram_window: (usize, usize),
     /// Query parser shared with other read cursors on the same snapshot.
     cached_parser: Option<Arc<tantivy::query::QueryParser>>,
     shared_cache: Arc<RwLock<CachedFtsStates>>,
@@ -2063,36 +2128,35 @@ pub struct FtsCursor {
 }
 
 impl FtsCursor {
-    /// Creates a new FTS cursor with the given configuration.
-    fn new(
-        cfg: &IndexMethodConfiguration,
-        schema: Schema,
-        rowid_field: Field,
-        text_fields: Vec<(IndexColumn, Field)>,
-        field_weights: HashMap<String, f32>,
-        shared_cache: Arc<RwLock<CachedFtsStates>>,
-        shared_writer: Arc<Mutex<Option<CachedFtsWriter>>>,
-    ) -> Self {
+    /// Creates a new FTS cursor from the attachment's configuration.
+    fn new(attachment: &FtsIndexAttachment) -> Self {
         let dir_table_name = format!(
             "{}fts_dir_{}",
             crate::schema::TURSO_INTERNAL_PREFIX,
-            cfg.index_name
+            attachment.cfg.index_name
         );
+        let text_fields = attachment.text_fields.clone();
         let default_fields: Vec<Field> = text_fields.iter().map(|(_, f)| *f).collect();
         let field_boosts: Vec<(Field, f32)> = text_fields
             .iter()
-            .filter_map(|(col, field)| field_weights.get(&col.name).map(|&boost| (*field, boost)))
+            .filter_map(|(col, field)| {
+                attachment
+                    .field_weights
+                    .get(&col.name)
+                    .map(|&boost| (*field, boost))
+            })
             .collect();
         Self {
-            schema,
-            rowid_field,
+            schema: attachment.schema.clone(),
+            rowid_field: attachment.rowid_field,
             text_fields,
             dir_table_name,
             default_fields,
             field_boosts,
+            ngram_window: attachment.ngram_window,
             cached_parser: None,
-            shared_cache,
-            shared_writer,
+            shared_cache: attachment.cached_state.clone(),
+            shared_writer: attachment.cached_writer.clone(),
             connection: None,
             database_id: None,
             fts_dir_cursor: None,
@@ -2162,9 +2226,12 @@ impl FtsCursor {
         // Register "whitespace" tokenizer - split on whitespace only
         tokenizers.register("whitespace", WhitespaceTokenizer::default());
 
-        // Register "ngram" tokenizer - 2-3 character n-grams for substring matching
+        // Register "ngram" tokenizer for substring matching. The window comes
+        // from the WITH clause `min_gram`/`max_gram` keys and was validated at
+        // CREATE INDEX time, so construction cannot fail here.
         // Using prefix=false for full n-gram (not just prefix)
-        if let Ok(ngram) = NgramTokenizer::new(2, 3, false) {
+        let (min_gram, max_gram) = self.ngram_window;
+        if let Ok(ngram) = NgramTokenizer::new(min_gram, max_gram, false) {
             tokenizers.register("ngram", ngram);
         }
     }
