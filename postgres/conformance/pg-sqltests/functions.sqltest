@@ -169,8 +169,7 @@ test quote-ident-wrong-arity-errors {
 }
 expect error {}
 
-test pg-get-expr-  {
-    DROP TABLE IF EXISTS demo;
+test pg-get-expr-default-two-args {
     CREATE TABLE demo (id int DEFAULT 7, label text);
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef;
 }
@@ -178,8 +177,23 @@ expect {
     7
 }
 
-test pg-get-expr-null-expressions-is-null {
-    SELECT pg_get_expr(NULL, 1);
+test pg-get-expr-default-three-args {
+    CREATE TABLE demo (id int DEFAULT 7, label text);
+    SELECT pg_get_expr(adbin, adrelid, true) FROM pg_attrdef;
+}
+expect {
+    7
+}
+
+test pg-get-expr-null-oid-is-null {
+    CREATE TABLE demo (id int DEFAULT 7, label text);
+    SELECT pg_get_expr(adbin, NULL, true) FROM pg_attrdef;
 }
 expect {
 }
+
+test pg-get-expr-non-text-expression-errors {
+    CREATE TABLE demo (id int DEFAULT 7, label text);
+    SELECT pg_get_expr(42, 1::oid) FROM pg_attrdef;
+}
+expect error {}

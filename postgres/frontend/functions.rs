@@ -71,7 +71,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             ))),
         },
         "quote_literal" => Ok(exec_quote_literal(args.first().unwrap_or(&Value::Null))),
-        "pg_get_expr" => Ok(exec_pg_get_expr(args)),
+        "pg_get_expr" => exec_pg_get_expr(args),
         // Catalog introspection stubs: accepted for compatibility, no output.
         // obj_description/col_description are NULL because COMMENT ON is not persisted.
         "pg_get_statisticsobjdef_columns"
@@ -234,11 +234,18 @@ fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Value {
     Value::from_i64(if valid { 1 } else { 0 })
 }
 
-fn exec_pg_get_expr(args: &[Value]) -> Value {
+fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
     if args.iter().any(|arg| matches!(arg, Value::Null)) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
-    args.first().cloned().unwrap_or(Value::Null)
+
+    // TursoPG already stores adbin and conbin as rendered SQL rather than pg_node_tree, so the relation OID and pretty flag do not affect the output
+    match args.first() {
+        Some(Value::Text(expression)) => Ok(Value::Text(expression.clone())),
+        Some(_) | None => Err(LimboError::ConversionError(
+            "Expected text value".to_string(),
+        )),
+    }
 }
 
 fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
