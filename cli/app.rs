@@ -1367,7 +1367,16 @@ impl Limbo {
                 let _ = self.writeln("database is busy");
             }
             _ => {
-                let _ = self.writeln_fmt(format_args!("Error: {err}"));
+                // Mirror the sqlite3 shell: the bare sqlite3_errmsg text plus
+                // the result code, e.g.
+                // "Runtime error: UNIQUE constraint failed: t.a (19)".
+                // The shell omits the code for plain SQLITE_ERROR (1).
+                let code = err.sqlite_result_code();
+                if code == 1 {
+                    let _ = self.writeln_fmt(format_args!("Runtime error: {err}"));
+                } else {
+                    let _ = self.writeln_fmt(format_args!("Runtime error: {err} ({code})"));
+                }
             }
         }
     }

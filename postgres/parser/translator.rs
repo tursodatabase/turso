@@ -311,7 +311,10 @@ impl PostgreSQLTranslator {
                                 let expr = self.translate_expr(raw_expr)?;
                                 table_constraints.push(ast::NamedTableConstraint {
                                     name: None,
-                                    constraint: ast::TableConstraint::Check(Box::new(expr)),
+                                    constraint: ast::TableConstraint::Check {
+                                        expr: Box::new(expr),
+                                        source: None,
+                                    },
                                 });
                             }
                         }
@@ -417,9 +420,10 @@ impl PostgreSQLTranslator {
                             } else {
                                 Some(ast::Name::from_string(constraint.conname.clone()))
                             },
-                            constraint: ast::ColumnConstraint::Check(Box::new(
-                                self.translate_expr(raw_expr)?,
-                            )),
+                            constraint: ast::ColumnConstraint::Check {
+                                expr: Box::new(self.translate_expr(raw_expr)?),
+                                source: None,
+                            },
                         });
                     }
                 }

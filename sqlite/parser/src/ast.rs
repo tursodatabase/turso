@@ -1217,6 +1217,14 @@ impl Name {
             quote: None,
         }
     }
+    /// Create a name parsed from a bracket-quoted identifier (`[name]`),
+    /// remembering the bracket quoting so the name renders back as written.
+    pub const fn bracketed(s: String) -> Self {
+        Self {
+            value: s,
+            quote: Some('['),
+        }
+    }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
     pub fn from_string(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
@@ -1242,7 +1250,7 @@ impl Name {
         } else if bytes[0] == b'[' {
             assert!(s.len() >= 2);
             assert!(bytes[bytes.len() - 1] == b']');
-            Name::exact(s[1..s.len() - 1].to_string())
+            Name::bracketed(s[1..s.len() - 1].to_string())
         } else {
             Name::exact(s.to_string())
         }
@@ -1262,6 +1270,14 @@ impl Name {
     pub fn as_ident(&self) -> String {
         // let's keep original quotes if they were set
         // (parser.rs tests validates that behaviour)
+        if self.quote == Some('[') {
+            // A `]` cannot be escaped inside a bracket-quoted identifier, so
+            // fall back to double quotes when the name contains one.
+            if !self.value.contains(']') {
+                return format!("[{}]", self.value);
+            }
+            return format!("\"{}\"", self.value.replace('"', "\"\""));
+        }
         if let Some(quote) = self.quote {
             let single = quote.to_string();
             let double = single.clone() + &single;
@@ -1496,7 +1512,17 @@ pub enum ColumnConstraint {
     /// `UNIQUE`
     Unique(Option<ResolveType>),
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the constraint did not come from this
+        /// parser — the PostgreSQL frontend's translator builds these nodes
+        /// from its own AST — or after an ALTER TABLE rewrite changed the
+        /// expression out from under the captured text.
+        source: Option<String>,
+    },
     /// `DEFAULT`
     Default(Box<Expr>),
     /// `COLLATE`
@@ -1563,7 +1589,17 @@ pub enum TableConstraint {
         conflict_clause: Option<ResolveType>,
     },
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the constraint did not come from this
+        /// parser — the PostgreSQL frontend's translator builds these nodes
+        /// from its own AST — or after an ALTER TABLE rewrite changed the
+        /// expression out from under the captured text.
+        source: Option<String>,
+    },
     /// `FOREIGN KEY`
     ForeignKey {
         /// columns

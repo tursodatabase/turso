@@ -3423,16 +3423,16 @@ pub fn halt(
     let constraint_error = match err_code {
         0 => None,
         SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
-            "UNIQUE constraint failed: {description} (19)"
+            "UNIQUE constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
-            "CHECK constraint failed: {description} (19)"
+            "CHECK constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
-            "NOT NULL constraint failed: {description} (19)"
+            "NOT NULL constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
-            "UNIQUE constraint failed: {description} (19)"
+            "UNIQUE constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_FOREIGNKEY => {
             Some(LimboError::ForeignKeyConstraint(description.to_string()))
@@ -3440,8 +3440,9 @@ pub fn halt(
         SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
         SQLITE_FULL => Some(LimboError::DatabaseFull(description.to_string())),
         // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
-        // Use InternalError so abort() doesn't apply ON CONFLICT resolution to it.
-        SQLITE_ERROR => Some(LimboError::InternalError(description.to_string())),
+        // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
+        // ON CONFLICT resolution to it.
+        SQLITE_ERROR => Some(LimboError::SqlError(description.to_string())),
         _ => Some(LimboError::Constraint(format!(
             "undocumented halt error code {description}"
         ))),
@@ -10683,26 +10684,34 @@ pub fn op_function(
                                 // (e.g. t1.a > 0 → t2.a > 0)
                                 if this_table == rename_from {
                                     for c in &mut constraints {
-                                        if let ast::TableConstraint::Check(ref mut expr) =
-                                            c.constraint
+                                        if let ast::TableConstraint::Check {
+                                            ref mut expr,
+                                            ref mut source,
+                                        } = c.constraint
                                         {
                                             rewrite_check_expr_table_refs(
                                                 expr,
                                                 &rename_from,
                                                 &rename_to,
                                             );
+                                            // The captured source text no longer
+                                            // matches the rewritten expression.
+                                            *source = None;
                                         }
                                     }
                                     for col in &mut columns {
                                         for cc in &mut col.constraints {
-                                            if let ast::ColumnConstraint::Check(ref mut expr) =
-                                                cc.constraint
+                                            if let ast::ColumnConstraint::Check {
+                                                ref mut expr,
+                                                ref mut source,
+                                            } = cc.constraint
                                             {
                                                 rewrite_check_expr_table_refs(
                                                     expr,
                                                     &rename_from,
                                                     &rename_to,
                                                 );
+                                                *source = None;
                                             }
                                         }
                                     }
@@ -11033,12 +11042,16 @@ pub fn op_function(
                                                     column_def.col_name.as_str(),
                                                 );
                                             }
-                                            ast::TableConstraint::Check(ref mut expr) => {
+                                            ast::TableConstraint::Check {
+                                                ref mut expr,
+                                                ref mut source,
+                                            } => {
                                                 rename_identifiers(
                                                     expr,
                                                     &rename_from,
                                                     column_def.col_name.as_str(),
                                                 );
+                                                *source = None;
                                             }
                                         }
                                     }
@@ -15879,6 +15892,9 @@ pub fn op_rename_table(
                         &normalized_from,
                         &normalized_to,
                     );
+                    // The captured source text no longer matches the
+                    // rewritten expression.
+                    check.source = None;
                 }
 
                 normalized_to.clone_into(&mut btree.name);
@@ -16375,6 +16391,9 @@ pub fn op_alter_column(
         let old_col_normalized = normalize_ident(&old_column_name);
         for check in &mut btree.check_constraints {
             rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
+            // The captured source text no longer matches the rewritten
+            // expression.
+            check.source = None;
             if let Some(ref mut col) = check.column {
                 if col.eq_ignore_ascii_case(&old_column_name) {
                     col.clone_from(&new_name);

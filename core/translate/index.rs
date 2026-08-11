@@ -104,13 +104,14 @@ pub fn translate_create_index(
     };
 
     let original_idx_name = idx_name;
+    let original_tbl_name = tbl_name;
     let database_id = if original_idx_name.db_name.is_some() {
         resolver.resolve_database_id(&original_idx_name)?
     } else {
-        resolver.resolve_existing_table_database_id(tbl_name.as_str())?
+        resolver.resolve_existing_table_database_id(original_tbl_name.as_str())?
     };
     let idx_name = normalize_ident(original_idx_name.name.as_str());
-    let tbl_name = normalize_ident(tbl_name.as_str());
+    let tbl_name = normalize_ident(original_tbl_name.as_str());
 
     validate(
         &tbl_name,
@@ -134,14 +135,24 @@ pub fn translate_create_index(
         if if_not_exists {
             return Ok(());
         }
-        crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
+        crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
-        crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
+        if resolver.with_schema(database_id, |s| {
+            s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
+        }) {
+            crate::bail_parse_error!("views may not be indexed");
+        }
+        // The index's target table always lives in the index's own database,
+        // so SQLite qualifies the missing table with that database name.
+        let db_name = resolver
+            .get_database_name_by_index(database_id)
+            .unwrap_or_else(|| "main".to_string());
+        crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
     let Some(tbl) = table.btree() else {
-        crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
+        crate::bail_parse_error!("virtual tables may not be indexed");
     };
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");

@@ -738,7 +738,7 @@ fn validate(
             let col_i = &columns[i];
             for constraint in &col_i.constraints {
                 match &constraint.constraint {
-                    ast::ColumnConstraint::Check(expr) => {
+                    ast::ColumnConstraint::Check { expr, .. } => {
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Generated { .. }
@@ -775,7 +775,7 @@ fn validate(
             }
         }
         for constraint in constraints {
-            if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
+            if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
                 validate_check_expr(expr, table_name, &column_names, resolver)?;
             }
         }
@@ -860,13 +860,13 @@ fn validate(
             let col_refs: Vec<&ast::ColumnDefinition> = columns.iter().collect();
             for col in columns {
                 for constraint in &col.constraints {
-                    if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                    if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
                         validate_check_types_in_expr(expr, &col_refs, resolver)?;
                     }
                 }
             }
             for constraint in constraints {
-                if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
+                if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
                     validate_check_types_in_expr(expr, &col_refs, resolver)?;
                 }
             }
@@ -1186,12 +1186,22 @@ pub fn translate_create_table(
                 return Ok(());
             }
             _ => {
-                let type_str = match object_type {
-                    SchemaObjectType::Table => "table",
-                    SchemaObjectType::View => "view",
-                    SchemaObjectType::Index => "index",
-                };
-                bail_parse_error!("{} {} already exists", type_str, normalized_tbl_name);
+                // SQLite echoes the new table's name token as written
+                // (`table "t" already exists`), except when the name clashes
+                // with an index, which gets its own message shape.
+                let token = crate::util::identifier_token_for_error(&tbl_name.name);
+                match object_type {
+                    SchemaObjectType::Table => {
+                        bail_parse_error!("table {} already exists", token)
+                    }
+                    SchemaObjectType::View => {
+                        bail_parse_error!("view {} already exists", token)
+                    }
+                    SchemaObjectType::Index => bail_parse_error!(
+                        "there is already an index named {}",
+                        tbl_name.name.as_str()
+                    ),
+                }
             }
         }
     }
@@ -1703,7 +1713,10 @@ pub fn translate_create_virtual_table(
         if *if_not_exists {
             return Ok(());
         }
-        bail_parse_error!("Table {} already exists", tbl_name);
+        bail_parse_error!(
+            "table {} already exists",
+            crate::util::identifier_token_for_error(&tbl_name.name)
+        );
     }
 
     let opts = ProgramBuilderOpts::new(2, 40, 2);
@@ -1819,7 +1832,10 @@ pub fn translate_drop_table(
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!("No such table: {name}");
+        bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        );
     };
     validate_drop_table(resolver, database_id, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys

@@ -236,7 +236,7 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
     assert_eq!(
         err,
         format!(
-            "Invalid argument supplied: cannot attach database 'aux': page size mismatch (main={:?}, attached={:?})",
+            "cannot attach database 'aux': page size mismatch (main={:?}, attached={:?})",
             turso_core::storage::sqlite3_ondisk::PageSize::new(8192).unwrap(),
             turso_core::storage::sqlite3_ondisk::PageSize::new(4096).unwrap(),
         )
@@ -262,7 +262,7 @@ fn test_attach_rejects_fresh_read_only_database(_tmp_db: TempDatabase) -> anyhow
         .to_string();
     assert_eq!(
         err,
-        "Invalid argument supplied: cannot attach database 'aux': fresh read-only databases cannot be initialized during attach"
+        "cannot attach database 'aux': fresh read-only databases cannot be initialized during attach"
     );
 
     Ok(())
@@ -358,7 +358,7 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
         .to_string();
     assert_eq!(
         err,
-        "Invalid argument supplied: cannot attach database 'aux': fresh MVCC attach does not support inheriting custom durable storage"
+        "cannot attach database 'aux': fresh MVCC attach does not support inheriting custom durable storage"
     );
 
     Ok(())

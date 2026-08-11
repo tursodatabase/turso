@@ -1804,10 +1804,23 @@ impl ToTokens for ColumnConstraint {
                 }
                 Ok(())
             }
-            Self::Check(expr) => {
+            Self::Check { expr, source } => {
                 s.append(TK_CHECK, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens(s, context)?;
+                match source {
+                    // Emit the expression exactly as the user wrote it so the
+                    // spelling survives the canonical re-render (SQLite
+                    // reports failed CHECKs with this text). Put the closing
+                    // paren on a new line when a line comment might otherwise
+                    // swallow it. Closed block comments are safe as-is.
+                    Some(src) if !src.is_empty() => {
+                        s.append(TK_ID, Some(src))?;
+                        if src.contains("--") {
+                            s.append(TK_ID, Some("\n"))?;
+                        }
+                    }
+                    _ => expr.to_tokens(s, context)?,
+                }
                 s.append(TK_RP, None)
             }
             Self::Default(expr) => {
@@ -1904,10 +1917,23 @@ impl ToTokens for TableConstraint {
                 }
                 Ok(())
             }
-            Self::Check(expr) => {
+            Self::Check { expr, source } => {
                 s.append(TK_CHECK, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens(s, context)?;
+                match source {
+                    // Emit the expression exactly as the user wrote it so the
+                    // spelling survives the canonical re-render (SQLite
+                    // reports failed CHECKs with this text). Put the closing
+                    // paren on a new line when a line comment might otherwise
+                    // swallow it. Closed block comments are safe as-is.
+                    Some(src) if !src.is_empty() => {
+                        s.append(TK_ID, Some(src))?;
+                        if src.contains("--") {
+                            s.append(TK_ID, Some("\n"))?;
+                        }
+                    }
+                    _ => expr.to_tokens(s, context)?,
+                }
                 s.append(TK_RP, None)
             }
             Self::ForeignKey {

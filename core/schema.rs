@@ -1246,7 +1246,7 @@ impl Schema {
 
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) -> Result<()> {
-        self.check_object_name_conflict(&view.name)?;
+        self.check_object_name_conflict(&view.name, SchemaObjectType::View)?;
         let name = normalize_ident(&view.name);
         self.views.insert(name, Arc::new(view));
         Ok(())
@@ -1379,7 +1379,7 @@ impl Schema {
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name)?;
+        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         #[cfg(feature = "conn_raw_api")]
         self.table_names_by_root_page
@@ -1389,7 +1389,7 @@ impl Schema {
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name)?;
+        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
         Ok(())
@@ -1453,7 +1453,7 @@ impl Schema {
     }
 
     pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
-        self.check_object_name_conflict(&index.name)?;
+        self.check_object_name_conflict(&index.name, SchemaObjectType::Index)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -2592,16 +2592,23 @@ impl Schema {
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
-    fn check_object_name_conflict(&self, name: &str) -> Result<()> {
-        if let Some(object_type) = self.get_object_type(name) {
-            let type_str = match object_type {
-                SchemaObjectType::Table => "table",
-                SchemaObjectType::View => "view",
-                SchemaObjectType::Index => "index",
+    fn check_object_name_conflict(&self, name: &str, creating: SchemaObjectType) -> Result<()> {
+        if let Some(existing) = self.get_object_type(name) {
+            // Match SQLite's message shapes: indexes and tables/views live in
+            // different namespaces, so a cross-namespace clash names the other
+            // side ("there is already a ...") instead of "already exists".
+            let msg = match (creating, existing) {
+                (SchemaObjectType::Index, SchemaObjectType::Index) => {
+                    format!("index {name} already exists")
+                }
+                (SchemaObjectType::Index, _) => format!("there is already a table named {name}"),
+                (_, SchemaObjectType::Index) => {
+                    format!("there is already an index named {name}")
+                }
+                (_, SchemaObjectType::Table) => format!("table {name} already exists"),
+                (_, SchemaObjectType::View) => format!("view {name} already exists"),
             };
-            return Err(crate::LimboError::ParseError(format!(
-                "{type_str} \"{name}\" already exists"
-            )));
+            return Err(crate::LimboError::ParseError(msg));
         }
         Ok(())
     }
@@ -3153,23 +3160,42 @@ pub struct CheckConstraint {
     pub name: Option<String>,
     /// CHECK expression
     pub expr: ast::Expr,
+    /// The expression's source text exactly as the user wrote it between the
+    /// CHECK parens (whitespace-trimmed). SQLite reports an unnamed failed
+    /// constraint with this text, not a re-rendering of the expression.
+    pub source: Option<String>,
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
     pub column: Option<String>,
 }
 
 impl CheckConstraint {
-    pub fn new(name: Option<&ast::Name>, expr: &ast::Expr, column: Option<&str>) -> Self {
+    pub fn new(
+        name: Option<&ast::Name>,
+        expr: &ast::Expr,
+        source: Option<&str>,
+        column: Option<&str>,
+    ) -> Self {
         Self {
             name: name.map(|n| n.as_str().to_string()),
             expr: expr.clone(),
+            source: source.map(|s| s.to_string()),
             column: column.map(|s| s.to_string()),
         }
     }
 
     /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
     pub fn sql(&self) -> String {
-        format!("CHECK({})", self.expr)
+        match &self.source {
+            // Keep the user's spelling when rebuilding SQL. Put the closing
+            // paren on a new line when a line comment might otherwise swallow
+            // it. Closed block comments are safe as-is.
+            Some(source) if !source.is_empty() => {
+                let newline = if source.contains("--") { "\n" } else { "" };
+                format!("CHECK({source}{newline})")
+            }
+            _ => format!("CHECK({})", self.expr),
+        }
     }
 }
 
@@ -3526,6 +3552,7 @@ impl BTreeTable {
                     new_checks.try_push(CheckConstraint {
                         name: Some(name),
                         expr: *rewritten,
+                        source: None,
                         column: Some(col_name.clone()),
                     })?;
                 }
@@ -4593,10 +4620,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     };
                     foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
-                } else if let ast::TableConstraint::Check(expr) = &c.constraint {
+                } else if let ast::TableConstraint::Check { expr, source } = &c.constraint {
                     check_constraints.try_push(CheckConstraint::new(
                         c.name.as_ref(),
                         expr,
+                        source.as_deref(),
                         None,
                     ))?;
                 }
@@ -4662,10 +4690,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
-                        ast::ColumnConstraint::Check(expr) => {
+                        ast::ColumnConstraint::Check { expr, source } => {
                             check_constraints.try_push(CheckConstraint::new(
                                 c_def.name.as_ref(),
                                 expr,
+                                source.as_deref(),
                                 Some(&name),
                             ))?;
                         }
@@ -6466,6 +6495,30 @@ mod tests {
         let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
         let actual = sqlite_schema_table()?.to_sql();
         assert_eq!(expected, actual);
+        Ok(())
+    }
+
+    #[test]
+    fn check_constraint_comments_survive_table_reconstruction() -> Result<()> {
+        for (sql, comment) in [
+            (
+                "CREATE TABLE t (x CHECK(x /* block comment */ > 0))",
+                "/* block comment */",
+            ),
+            (
+                "CREATE TABLE t (x CHECK(x > 0 -- line comment\n))",
+                "-- line comment",
+            ),
+        ] {
+            let reconstructed = BTreeTable::from_sql(sql, 0)?.to_sql();
+
+            assert!(
+                reconstructed.contains(comment),
+                "reconstructed SQL: {reconstructed}"
+            );
+            BTreeTable::from_sql(&reconstructed, 0)?;
+        }
+
         Ok(())
     }
 

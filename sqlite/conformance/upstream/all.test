@@ -354,7 +354,7 @@ set test_files {
   like                 fail
   like2                pass
   like3                fail
-  limit                fail
+  limit                pass
   limit2               fail
   literal              fail
   literal2             pass
@@ -578,7 +578,7 @@ set test_files {
   tkt-3998683a16       pass
   tkt-3a77c9714e       pass
   tkt-3fe897352e       fail
-  tkt-4a03edc4c8       fail
+  tkt-4a03edc4c8       pass
   tkt-4c86b126f2       pass
   tkt-4dd95f6943       pass
   tkt-4ef7e3cfca       fail
@@ -638,7 +638,7 @@ set test_files {
   tkt1567              fail
   tkt1644              fail
   tkt1667              fail
-  tkt1873              fail
+  tkt1873              pass
   tkt2141              pass
   tkt2192              pass
   tkt2213              fail

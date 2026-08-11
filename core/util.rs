@@ -130,6 +130,59 @@ pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")
 }
 
+/// Format an identifier for error messages the way SQLite's `%T` does: the
+/// token exactly as the user wrote it, keeping the original quote characters.
+/// `CREATE TABLE "t"` reports an existing table as `table "t" already exists`.
+pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
+    if name.quoted() {
+        name.as_ident()
+    } else {
+        name.as_str().to_owned()
+    }
+}
+
+/// Format a CHECK constraint's captured source text for an error message the
+/// way SQLite does. SQLite dequotes the text: when it starts with a quote
+/// character, only the first quoted token survives, so `"x" < +5` is
+/// reported as just `x`.
+pub fn check_source_for_error(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let close = match bytes.first() {
+        Some(&c @ (b'"' | b'\'' | b'`')) => c,
+        Some(b'[') => b']',
+        _ => return source.to_string(),
+    };
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == close {
+            // A doubled quote is an escaped quote, not the end.
+            if close != b']' && bytes.get(i + 1) == Some(&close) {
+                i += 2;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+    }
+    let inner = &source[1..i.min(source.len())];
+    if close == b']' {
+        inner.to_string()
+    } else {
+        let quote = (close as char).to_string();
+        inner.replace(&format!("{quote}{quote}"), &quote)
+    }
+}
+
+/// Format a table reference for error messages the way SQLite does: the name
+/// as the user wrote it with quotes stripped, keeping any database prefix.
+/// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.
+pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
+    match &name.db_name {
+        Some(db) => format!("{}.{}", db.as_str(), name.name.as_str()),
+        None => name.name.as_str().to_owned(),
+    }
+}
+
 /// Quote a SQL identifier with double quotes when necessary.
 /// Always safe to call — returns the bare name when no quoting is needed.
 pub fn quote_identifier(name: &str) -> String {
@@ -3482,8 +3535,11 @@ pub fn rewrite_column_references_if_needed(
             ast::ColumnConstraint::ForeignKey { clause, .. } => {
                 rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
             }
-            ast::ColumnConstraint::Check(expr) => {
+            ast::ColumnConstraint::Check { expr, source } => {
                 rename_identifiers(expr, from, to);
+                // The captured source text no longer matches the rewritten
+                // expression.
+                *source = None;
             }
             ast::ColumnConstraint::Generated { expr, .. } => {
                 rename_identifiers(expr, from, to);
