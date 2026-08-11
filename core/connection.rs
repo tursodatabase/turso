@@ -526,6 +526,10 @@ pub struct Connection {
     /// eventual transaction outcome is delivered exactly once per attachment.
     pub(crate) index_method_tx_cursors:
         Mutex<Vec<crate::index_method::TransactionIndexMethodCursor>>,
+    /// True while `index_method_tx_cursors` may be non-empty. Lets every
+    /// commit/rollback skip the mutex and sort when no index method was ever
+    /// touched — the overwhelmingly common case.
+    pub(crate) has_index_method_tx_cursors: crate::sync::atomic::AtomicBool,
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
@@ -551,6 +555,11 @@ crate::assert::assert_send_sync!(Connection);
 impl Drop for Connection {
     fn drop(&mut self) {
         if !self.is_closed() {
+            // A handle dropped mid-transaction rolls that transaction back
+            // below, so parked index-method cursors must receive the same
+            // rollback outcome they would get from an explicit close().
+            self.index_methods_transaction_rolled_back();
+
             // Roll back any active MVCC transactions so that MvStore entries
             // don't leak and block future checkpoints.  The tx may have
             // already been committed/aborted externally (e.g. by tests that
@@ -4988,11 +4997,20 @@ impl Connection {
         self.named_savepoints.write().clear();
     }
 
+    /// Park a statement's index-method cursor on the connection until the
+    /// transaction's outcome is known. A cursor replaced by a later
+    /// statement's cursor for the same attachment is closed immediately and
+    /// receives neither `transaction_committed` nor `transaction_rolled_back`
+    /// — that replacement is the third legitimate end of a cursor's life
+    /// (see the `IndexMethodCursor` trait docs). Only the newest cursor per
+    /// attachment gets the final outcome.
     pub(crate) fn register_index_method_transaction_cursor(
         &self,
         mut entry: crate::index_method::TransactionIndexMethodCursor,
     ) {
         entry.cursor.statement_committed(&entry.context);
+        self.has_index_method_tx_cursors
+            .store(true, Ordering::Release);
         let mut entries = self.index_method_tx_cursors.lock();
         let previous = if let Some(position) = entries
             .iter()
@@ -5013,6 +5031,14 @@ impl Connection {
     fn take_index_method_transaction_cursors(
         &self,
     ) -> Vec<crate::index_method::TransactionIndexMethodCursor> {
+        // Fast path for the overwhelmingly common no-index-method case:
+        // skip the mutex and the sort below entirely.
+        if !self
+            .has_index_method_tx_cursors
+            .swap(false, Ordering::AcqRel)
+        {
+            return Vec::new();
+        }
         let mut entries = std::mem::take(&mut *self.index_method_tx_cursors.lock());
         entries.sort_by(|left, right| {
             (
@@ -5058,6 +5084,9 @@ impl Connection {
     }
 
     pub(crate) fn index_methods_savepoint_rolled_back(&self) {
+        if !self.has_index_method_tx_cursors.load(Ordering::Acquire) {
+            return;
+        }
         let mut entries = self.index_method_tx_cursors.lock();
         tracing::trace!(
             attachments = entries.len(),

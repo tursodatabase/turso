@@ -2423,6 +2423,9 @@ impl IndexInfo {
     ) -> Result<Self, TryReserveError> {
         // A backing_btree stores the index method's complete opaque key. Unlike
         // an ordinary secondary index, it must not append the base-table rowid.
+        // MVCC's commit-time conflict validation handles these
+        // `has_rowid == false` records by treating the whole key as the
+        // uniqueness prefix (see `check_index_for_conflicts`).
         let has_rowid = index.has_rowid && !index.is_backing_btree_index();
         let key_info = index
             .columns
@@ -3374,6 +3377,11 @@ impl Cursor {
             Self::Pseudo(_) => {}
             // Permanently null; the flag is a no-op.
             Self::NullRow => {}
+            // The FTS side of an outer join: columns are decoded from the
+            // base-table cursor (which receives its own NullRow), never from
+            // the index-method cursor, so there is no column state to null
+            // out here.
+            Self::IndexMethod(_) => {}
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");

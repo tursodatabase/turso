@@ -622,6 +622,16 @@ fn translate_integrity_check_impl(
         program.preassign_label_to_next_insn(table_empty_label);
 
         for bound_index in &bound_indexes {
+            // An index method's backing B-tree stores its data in the index
+            // alone; the owning table has zero rows by construction, so the
+            // entry-count comparison below would report every healthy FTS
+            // database as corrupt. Its pages are still visited above.
+            if bound_index.index.is_backing_btree_index() {
+                program.emit_insn(Insn::Close {
+                    cursor_id: bound_index.cursor_id,
+                });
+                continue;
+            }
             if bound_index.where_expr.is_none() {
                 let actual_count_reg = program.alloc_register();
                 program.emit_insn(Insn::Count {

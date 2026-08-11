@@ -406,7 +406,7 @@ fn key_info() -> KeyInfo {
 impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
         // we need to properly track subprograms and propagate result to the root program to make this execution async
-        let connection = context.connection();
+        let connection = context.connection()?;
         let database_id = context.database().id;
 
         let columns = &self.configuration.columns;
@@ -451,7 +451,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn destroy(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
-        let connection = context.connection();
+        let connection = context.connection()?;
         let database_id = context.database().id;
         let db_prefix = connection
             .get_database_name_by_index(database_id)

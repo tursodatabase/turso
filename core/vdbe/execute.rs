@@ -758,7 +758,9 @@ pub fn op_null_row(
         turso_assert!(
             matches!(
                 cursor_type,
-                CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+                CursorType::BTreeTable(_)
+                    | CursorType::BTreeIndex(_)
+                    | CursorType::IndexMethod(_)
             ),
             "NullRow on unopened non-btree cursor",
             { "cursor_id": cursor_id }
@@ -1192,17 +1194,19 @@ fn ensure_index_method_context(
     cursor_id: usize,
     database_id: usize,
     attachment: &dyn crate::index_method::IndexMethodAttachment,
-) -> Result<crate::index_method::IndexMethodContext> {
+) -> Result<Arc<crate::index_method::IndexMethodContext>> {
+    // Arc, not a deep clone: an opcode that yields on IO re-enters and calls
+    // this again — a cold FTS open does that hundreds of times per megabyte,
+    // and cloning the context's four heap strings each time adds up.
     if let Some(context) = state.index_method_contexts[cursor_id].as_ref() {
-        return Ok(context.clone());
+        return Ok(Arc::clone(context));
     }
-    let definition = attachment.definition();
-    let context = crate::index_method::IndexMethodContext::new(
+    let context = Arc::new(crate::index_method::IndexMethodContext::new(
         &program.connection,
         database_id,
-        &definition,
-    )?;
-    state.index_method_contexts[cursor_id] = Some(context.clone());
+        &attachment.definition(),
+    )?);
+    state.index_method_contexts[cursor_id] = Some(Arc::clone(&context));
     Ok(context)
 }
 
@@ -3430,6 +3434,7 @@ pub fn halt(
     description: &str,
     on_error: Option<ResolveType>,
 ) -> Result<InsnFunctionStepResult> {
+    state.halt_in_progress = true;
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     // halt() runs while the statement is still stepping, so it is always
@@ -3460,6 +3465,13 @@ pub fn halt(
     if let Some(resolve_type) = on_error {
         // RAISE(IGNORE) signals the parent to skip the current row
         if resolve_type == ResolveType::Ignore {
+            // RAISE(IGNORE) is not an error: the frame unwinds, but everything
+            // the trigger wrote before the RAISE is kept. Stage index-method
+            // writes now, exactly like the normal trigger-subprogram halt
+            // below, so the kept base rows keep their index entries too.
+            if program.is_trigger_subprogram() {
+                return_if_io!(index_method_prepare_statement_all(state));
+            }
             return Err(LimboError::RaiseIgnore);
         }
         if err_code > 0 {
@@ -3638,10 +3650,16 @@ pub fn halt(
             }
             result
         } else {
-            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             // Another root statement may own the implicit autocommit
             // transaction. This statement can finish, but must not commit or
-            // roll back connection-level state it did not start.
+            // roll back connection-level state it did not start. Its
+            // index-method writes must still be staged before the statement
+            // savepoint is released, and its cursors handed to the connection
+            // so the sibling that eventually commits (or rolls back) the
+            // shared transaction delivers their outcome.
+            return_if_io!(index_method_prepare_statement_all(state));
+            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+            index_method_register_transaction_all(state, &program.connection)?;
             //
             // FIXME: when this statement is a writer in MVCC mode, deferring
             // its commit to the last sibling statement means the writer's
@@ -3796,6 +3814,12 @@ pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
             continue;
         };
         let Some(context) = state.index_method_contexts[cursor_id].as_ref() else {
+            // Every opcode that installs an index-method cursor builds its
+            // context first, so this cursor cannot have pending work.
+            debug_assert!(
+                false,
+                "index-method cursor {cursor_id} installed without a context"
+            );
             continue;
         };
         cursor.abort_statement(context);
@@ -3832,6 +3856,12 @@ pub(crate) fn index_method_transaction_committed_all(
             continue;
         };
         let Some(context) = state.index_method_contexts[cursor_id].as_ref() else {
+            // Every opcode that installs an index-method cursor builds its
+            // context first, so this cursor cannot have pending work.
+            debug_assert!(
+                false,
+                "index-method cursor {cursor_id} installed without a context"
+            );
             continue;
         };
         cursor.transaction_committed(context);
@@ -4928,12 +4958,13 @@ pub fn op_auto_commit(
         { "tx_op": tx_op }
     );
 
-    // For explicit COMMIT, flush pending writes before the actual commit
-    // so they are part of the same transaction. Sequence flush no longer
-    // belongs here — see the long-form comment in `op_halt` above.
-    if matches!(tx_op, TxOp::Commit) {
-        return_if_io!(index_method_prepare_statement_all(state));
-    }
+    // Index-method staging is a per-statement Halt responsibility (each
+    // statement stages its writes at its own halt and hands its cursors to
+    // the connection), so the COMMIT program has nothing to stage here. A
+    // yield point at this spot would also be unsafe: `conn.auto_commit` was
+    // already flipped above, and re-entering this opcode from the top after
+    // an IO yield would then fail `valid_transition` with a torn-down
+    // transaction.
 
     let res = match program
         .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
@@ -13202,23 +13233,25 @@ pub fn op_index_method_create(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
-        if program.connection.mv_store_for_db(*db).is_some() {
-            crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
-        }
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
-        let context =
-            ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
-        let cursor = state.cursors[*cursor_id]
-            .as_mut()
-            .expect("cursor should exist");
-        let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.create(&context));
+    let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] else {
+        unreachable!("IndexMethodCreate emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
+    // Build the context before installing the cursor: a context error must
+    // not leave a cursor in the slot with no context, a state the statement
+    // outcome helpers cannot deliver hooks to.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
+    }
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.create(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13234,23 +13267,23 @@ pub fn op_index_method_destroy(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
-        if program.connection.mv_store_for_db(*db).is_some() {
-            crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
-        }
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
-        let context =
-            ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
-        let cursor = state.cursors[*cursor_id]
-            .as_mut()
-            .expect("cursor should exist");
-        let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.destroy(&context));
+    let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) else {
+        unreachable!("IndexMethodDestroy emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
+    // Context before cursor install; see op_index_method_create.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
+    }
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.destroy(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13266,23 +13299,23 @@ pub fn op_index_method_optimize(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
-        if program.connection.mv_store_for_db(*db).is_some() {
-            crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
-        }
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
-        let context =
-            ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
-        let cursor = state.cursors[*cursor_id]
-            .as_mut()
-            .expect("cursor should exist");
-        let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.optimize(&context));
+    let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) else {
+        unreachable!("IndexMethodOptimize emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
+    // Context before cursor install; see op_index_method_create.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
+    }
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.optimize(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

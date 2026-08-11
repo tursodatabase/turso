@@ -1844,8 +1844,13 @@ impl Limbo {
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
-                // Skip sqlite_sequence and internal types metadata table
-                if name == "sqlite_sequence" || name == turso_core::schema::TURSO_TYPES_TABLE_NAME {
+                // Skip sqlite_sequence and every internal object. Index-method
+                // backing tables (e.g. FTS's __turso_internal_fts_dir_*) are
+                // rejected on replay because their names are reserved, and the
+                // trailing CREATE INDEX ... USING ... rebuilds them anyway.
+                if name == "sqlite_sequence"
+                    || name.starts_with(turso_core::schema::TURSO_INTERNAL_PREFIX)
+                {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
@@ -1991,6 +1996,7 @@ impl Limbo {
             SELECT name, sql FROM sqlite_schema
             WHERE sql NOT NULL
               AND name NOT LIKE 'sqlite_%'
+              AND name NOT LIKE '\_\_turso\_internal\_%' ESCAPE '\'
               AND type IN ('index','trigger','view')
             ORDER BY CASE type WHEN 'view' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 END, rowid
         "#;

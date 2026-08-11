@@ -155,9 +155,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
     for MvccLazyCursor<Clock, A>
 {
     fn yield_context(&self) -> YieldContext {
+        let connection = self
+            .connection
+            .upgrade()
+            .expect("yield context requires a live connection");
         YieldContext::new(
-            self.connection.yield_injector(),
-            self.connection.failure_injector(),
+            connection.yield_injector(),
+            connection.failure_injector(),
             self.yield_instance_id,
             cursor_yield_key(self.tx_id, self.table_id),
         )
@@ -491,8 +495,10 @@ impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
 
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator = TursoAllocator> {
     pub db: Arc<MvStore<Clock, A>>,
+    /// Weak so a cursor retained past its statement (an index-method cursor
+    /// parked on its connection) cannot keep the connection alive.
     #[cfg(any(test, injected_yields))]
-    connection: Arc<Connection>,
+    connection: crate::sync::Weak<Connection>,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     current_pos: CursorPosition<A>,
@@ -575,7 +581,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
             #[cfg(any(test, injected_yields))]
-            connection: connection.clone(),
+            connection: Arc::downgrade(connection),
             tx_id,
             table_iterator: None,
             index_iterator: None,

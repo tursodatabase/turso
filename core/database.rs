@@ -549,6 +549,10 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     dialect: Arc<dyn Dialect>,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
+    /// Process-unique id minted at construction. Unlike the `Arc`'s heap
+    /// address, this can never repeat within a process, so detach/reattach
+    /// and close/reopen produce distinguishable values.
+    pub(crate) incarnation: u64,
 
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
@@ -688,6 +692,18 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            incarnation: {
+                // Deliberately std, not crate::sync: this static outlives a
+                // shuttle test execution, and a shuttle-tracked atomic that
+                // survives into the next execution corrupts shuttle's vector
+                // clocks (task ids restart, the stale clock is longer than
+                // the new task table, and clock bookkeeping underflows).
+                // A plain std atomic is fine here: the counter only mints
+                // process-unique ids and needs no ordering guarantees.
+                static NEXT_DATABASE_INCARNATION: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
 
@@ -2397,6 +2413,7 @@ impl Database {
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
+            has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),

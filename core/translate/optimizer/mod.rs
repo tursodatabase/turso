@@ -696,7 +696,7 @@ fn optimize_recursive_cte_query_with_cache(
 /// Transform MATCH expressions to fts_match() function calls.
 fn transform_match_to_fts_match(
     where_clause: &mut [WhereTerm],
-    schema: &Schema,
+    resolver: &Resolver,
     table_references: &TableReferences,
 ) -> Result<()> {
     use super::ast::{FunctionTail, LikeOperator, Name, TableInternalId};
@@ -711,7 +711,9 @@ fn transform_match_to_fts_match(
         }
     }
 
-    // Helper to check if a table has an FTS index by its internal ID
+    // Helper to check if a table has an FTS index by its internal ID.
+    // Resolve against the schema of the table's own database, so MATCH also
+    // plans against FTS indexes in ATTACHed databases.
     let table_has_fts_index = |table_id: TableInternalId| -> bool {
         table_references
             .joined_tables()
@@ -719,7 +721,10 @@ fn transform_match_to_fts_match(
             .find(|t| t.internal_id == table_id)
             .and_then(|t| {
                 if let Table::BTree(btree) = &t.table {
-                    Some(schema.has_fts_index(&btree.name))
+                    Some(
+                        resolver
+                            .with_schema(t.database_id, |schema| schema.has_fts_index(&btree.name)),
+                    )
                 } else {
                     None
                 }
@@ -975,7 +980,7 @@ fn find_select_plan_form(
     // A rewrite can move MATCH terms out of a subquery, so do this after the
     // query form has been chosen.
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
+    transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
     // EXISTS only needs one row. Add LIMIT 1 to subqueries left after the
     // rewrite. The rewrite must see the limit written by the user, if any.
@@ -1145,7 +1150,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
+    transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -1194,7 +1199,7 @@ fn optimize_update_plan(
         plan.from_tables.outer_query_refs().to_vec(),
     );
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause, schema, &target_tables)?;
+    transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?

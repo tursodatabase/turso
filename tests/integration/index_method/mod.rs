@@ -2098,6 +2098,116 @@ fn test_fts_mvcc_lifecycle(tmp_db: TempDatabase) {
     );
 }
 
+/// A connection handle dropped mid-transaction with a parked FTS cursor used
+/// to keep itself alive forever: the cursor's context held a strong
+/// `Arc<Connection>`, so the connection referenced itself, its `Drop` never
+/// ran, and its WAL write lock was never released — every later writer got
+/// Busy until the process died.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn fts_dropped_connection_mid_transaction_releases_locks(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'hello')")
+        .unwrap();
+
+    // Drop the handle with no COMMIT / ROLLBACK / close().
+    let weak = std::sync::Arc::downgrade(&conn);
+    drop(conn);
+    assert_eq!(
+        weak.strong_count(),
+        0,
+        "dropping the handle must actually drop the connection"
+    );
+
+    // A fresh connection must be able to write; the dropped transaction's
+    // row must be gone.
+    let fresh = tmp_db.connect_limbo();
+    fresh
+        .execute("INSERT INTO docs VALUES (2, 'world')")
+        .unwrap();
+    assert!(
+        limbo_exec_rows(&fresh, "SELECT id FROM docs WHERE fts_match(body, 'hello')").is_empty()
+    );
+    assert_eq!(
+        limbo_exec_rows(&fresh, "SELECT id FROM docs WHERE fts_match(body, 'world')"),
+        vec![vec![rusqlite::types::Value::Integer(2)]]
+    );
+}
+
+/// One statement driving two FTS write cursors over the same index — here a
+/// trigger inserting into the table it fired on — used to let both cursors
+/// flush divergent Tantivy directories over one backing store, killing the
+/// index on disk permanently (every later read returned Corrupt). The second
+/// writer must be refused, the statement must roll back atomically, and the
+/// index must stay fully usable.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn fts_second_write_cursor_in_one_statement_fails_cleanly(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a TEXT)").unwrap();
+    conn.execute("CREATE INDEX ft ON t USING fts(a)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.a <> 'stop' BEGIN \
+         INSERT INTO t VALUES('stop'); END",
+    )
+    .unwrap();
+
+    // The trigger's INSERT opens a second write cursor on the same FTS index
+    // while the firing statement's writer is still open. It must fail...
+    assert!(conn.execute("INSERT INTO t VALUES ('go')").is_err());
+    // ...and the whole statement must roll back, keeping table and index in
+    // sync (previously the base row committed and the index died on disk).
+    assert!(limbo_exec_rows(&conn, "SELECT rowid FROM t").is_empty());
+
+    // The index must stay healthy and writable afterwards.
+    conn.execute("DROP TRIGGER tr").unwrap();
+    conn.execute("INSERT INTO t VALUES ('after')").unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT a FROM t WHERE fts_match(a, 'after')"),
+        vec![vec![rusqlite::types::Value::Text("after".to_string())]]
+    );
+}
+
+/// Regression test: a write cursor that hits the shared read cache must not
+/// adopt the cached Tantivy `Index`, whose directory belongs to the cache
+/// entry — its writes would land in the cache entry's pending map and never
+/// reach the backing B-tree. On a TEMP (or ATTACHed) database the
+/// `is_in_write_tx()` guard is false, so a read followed by a write used to
+/// lose every later FTS write silently.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn fts_temp_db_write_after_cached_read_reaches_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TEMP TABLE t(a TEXT)").unwrap();
+    conn.execute("CREATE INDEX temp.ft ON t USING fts(a)")
+        .unwrap();
+    // Warm the read cache for the TEMP database before any write.
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT rowid FROM t WHERE fts_match(a, 'alpha')"),
+        Vec::<Vec<rusqlite::types::Value>>::new()
+    );
+
+    conn.execute("INSERT INTO t VALUES ('alpha')").unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT rowid FROM t WHERE fts_match(a, 'alpha')"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+
+    conn.execute("DELETE FROM t WHERE rowid = 1").unwrap();
+    // The deleted row must not come back as a phantom from a stale index.
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT rowid FROM t WHERE fts_match(a, 'alpha')"),
+        Vec::<Vec<rusqlite::types::Value>>::new()
+    );
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test(mvcc)]
 fn fts_trigger_writes_survive_repeated_subprogram_runs(tmp_db: TempDatabase) {
@@ -2127,6 +2237,77 @@ fn fts_trigger_writes_survive_repeated_subprogram_runs(tmp_db: TempDatabase) {
             vec![rusqlite::types::Value::Integer(1)],
             vec![rusqlite::types::Value::Integer(2)],
         ]
+    );
+}
+
+/// RAISE(IGNORE) is not an error: everything the trigger wrote before the
+/// RAISE is kept. The trigger's FTS writes used to be discarded while its base
+/// rows survived, leaving the table and index permanently out of sync in both
+/// directions (missing entry after an INSERT, phantom entry after a DELETE).
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn fts_raise_ignore_keeps_trigger_writes_in_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("CREATE TABLE src(v INTEGER)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr BEFORE INSERT ON src BEGIN \
+         INSERT INTO docs VALUES(NEW.v, 'ignoredrow'); \
+         SELECT RAISE(IGNORE); END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO src VALUES (1)").unwrap();
+
+    // The trigger's row is kept, and so must its index entry be.
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM docs ORDER BY id"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'ignoredrow')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+}
+
+/// The DELETE direction of the RAISE(IGNORE) divergence: a row deleted by the
+/// trigger must not come back as a phantom from a stale index entry.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn fts_raise_ignore_keeps_trigger_deletes_in_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'orphanword')")
+        .unwrap();
+    conn.execute("CREATE TABLE src(v INTEGER)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr BEFORE INSERT ON src BEGIN \
+         DELETE FROM docs WHERE id = 1; \
+         SELECT RAISE(IGNORE); END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO src VALUES (1)").unwrap();
+
+    assert!(limbo_exec_rows(&conn, "SELECT id FROM docs").is_empty());
+    assert!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'orphanword')"
+        )
+        .is_empty(),
+        "the deleted row must not survive as a phantom index entry"
     );
 }
 
@@ -2295,13 +2476,12 @@ fn test_fts_mvcc_same_index_writer_conflicts_before_tantivy_work() {
         .unwrap();
     let stats_before_conflict = fts_attachment_test_stats(&tmp_db, &first, "docs", "docs_fts");
 
+    // Contention with the live lease holder is Busy — retryable, without
+    // rolling back the loser's transaction or its unrelated work.
     let conflict = second
         .execute("INSERT INTO docs VALUES (2, 'writer two')")
         .unwrap_err();
-    assert!(matches!(
-        conflict,
-        turso_core::LimboError::WriteWriteConflict
-    ));
+    assert!(matches!(conflict, turso_core::LimboError::Busy));
     let stats_after_conflict = fts_attachment_test_stats(&tmp_db, &first, "docs", "docs_fts");
     assert_eq!(
         stats_after_conflict.tantivy_writer_constructions,
@@ -2316,6 +2496,16 @@ fn test_fts_mvcc_same_index_writer_conflicts_before_tantivy_work() {
     );
 
     first.execute("COMMIT").unwrap();
+
+    // The loser's snapshot now predates the winner's publication, so retrying
+    // inside the same transaction is a write-write conflict: committing its
+    // rebuild of the index would overwrite the winner's. The transaction is
+    // rolled back.
+    let stale = second
+        .execute("INSERT INTO docs VALUES (2, 'writer two')")
+        .unwrap_err();
+    assert!(matches!(stale, turso_core::LimboError::WriteWriteConflict));
+
     second.execute("BEGIN CONCURRENT").unwrap();
     second
         .execute("INSERT INTO docs VALUES (2, 'writer two retry')")
@@ -2339,6 +2529,65 @@ fn test_fts_mvcc_same_index_writer_conflicts_before_tantivy_work() {
             vec![rusqlite::types::Value::Integer(2)],
         ]
     );
+}
+
+/// Two overlapping BEGIN CONCURRENT writers used to both publish: the lease
+/// was freed when the first writer committed, so the second — still on its
+/// pre-commit snapshot — rewrote the Tantivy directory from a superseded base.
+/// The backing store ended up holding the union of two divergent directories,
+/// making the index unreadable and the base table unwritable, permanently.
+/// With chunk rows checkpointed into the B-tree (threshold 0), MVCC row
+/// validation cannot catch this, so the lease itself must: a writer whose
+/// snapshot predates the last publication is refused.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn test_fts_mvcc_stale_snapshot_writer_is_refused_after_checkpoint() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let first = tmp_db.connect_limbo();
+    let second = tmp_db.connect_limbo();
+
+    first
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    first
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    first
+        .execute("CREATE INDEX ft ON t USING fts (body)")
+        .unwrap();
+
+    first.execute("BEGIN CONCURRENT").unwrap();
+    second.execute("BEGIN CONCURRENT").unwrap();
+    first.execute("INSERT INTO t VALUES (1, 'alpha')").unwrap();
+    first.execute("COMMIT").unwrap();
+
+    // `second` began before `first` published, so its rebuild of the index
+    // would start from a superseded base. It must be refused — previously it
+    // silently succeeded and corrupted the index on disk.
+    let stale = second
+        .execute("INSERT INTO t VALUES (2, 'beta')")
+        .unwrap_err();
+    assert!(matches!(stale, turso_core::LimboError::WriteWriteConflict));
+
+    // A fresh transaction sees the publication and works; the index must be
+    // readable and the base table writable.
+    second.execute("BEGIN CONCURRENT").unwrap();
+    second.execute("INSERT INTO t VALUES (2, 'beta')").unwrap();
+    second.execute("COMMIT").unwrap();
+
+    let third = tmp_db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(&third, "SELECT id FROM t WHERE fts_match(body, 'alpha')"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(&third, "SELECT id FROM t WHERE fts_match(body, 'beta')"),
+        vec![vec![rusqlite::types::Value::Integer(2)]]
+    );
+    third.execute("INSERT INTO t VALUES (3, 'gamma')").unwrap();
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -2425,14 +2674,26 @@ fn test_fts_mvcc_opposite_index_order_rejects_without_deadlock() {
         .execute("INSERT INTO b VALUES (2, 'survives')")
         .unwrap();
 
+    // Opposite-order lease acquisition cannot deadlock: contention is an
+    // immediate Busy, and neither transaction is destroyed.
     let conflict = first
         .execute("INSERT INTO b VALUES (1, 'rolled back')")
         .unwrap_err();
-    assert!(matches!(
-        conflict,
-        turso_core::LimboError::WriteWriteConflict
-    ));
+    assert!(matches!(conflict, turso_core::LimboError::Busy));
+    let conflict = second
+        .execute("INSERT INTO a VALUES (2, 'survives')")
+        .unwrap_err();
+    assert!(matches!(conflict, turso_core::LimboError::Busy));
 
+    // Both sides back off (a write statement abandoned on Busy leaves its
+    // transaction commit-poisoned); a fresh transaction then takes the freed
+    // leases. Neither original transaction published, so nothing is stale.
+    first.execute("ROLLBACK").unwrap();
+    second.execute("ROLLBACK").unwrap();
+    second.execute("BEGIN CONCURRENT").unwrap();
+    second
+        .execute("INSERT INTO b VALUES (2, 'survives')")
+        .unwrap();
     second
         .execute("INSERT INTO a VALUES (2, 'survives')")
         .unwrap();
@@ -2488,15 +2749,18 @@ fn test_fts_mvcc_savepoint_rollback_keeps_transaction_lease() {
     first.execute("ROLLBACK TO pending_write").unwrap();
 
     second.execute("BEGIN CONCURRENT").unwrap();
+    // The savepoint rollback must not release the transaction's lease, so a
+    // concurrent writer still sees it held (Busy, retryable).
     let conflict = second
         .execute("INSERT INTO docs VALUES (2, 'blocked writer')")
         .unwrap_err();
-    assert!(matches!(
-        conflict,
-        turso_core::LimboError::WriteWriteConflict
-    ));
+    assert!(matches!(conflict, turso_core::LimboError::Busy));
 
+    // `first` never published, so a retry from a fresh transaction succeeds
+    // (the Busy write statement was abandoned, which poisons the commit of
+    // `second`'s original transaction).
     first.execute("ROLLBACK").unwrap();
+    second.execute("ROLLBACK").unwrap();
     second.execute("BEGIN CONCURRENT").unwrap();
     second
         .execute("INSERT INTO docs VALUES (2, 'successful retry')")
@@ -3800,13 +4064,13 @@ fn fts_mvcc_loser_rollback_keeps_winner_cached_writer() {
         "the winner's statement must retain its transaction-tagged writer"
     );
 
+    // Contention with a live lease holder is Busy: retryable, and it does
+    // not destroy the loser's transaction.
     let conflict = loser
         .execute("INSERT INTO docs VALUES (2, 'loser writer')")
         .unwrap_err();
-    assert!(matches!(
-        conflict,
-        turso_core::LimboError::WriteWriteConflict
-    ));
+    assert!(matches!(conflict, turso_core::LimboError::Busy));
+    loser.execute("ROLLBACK").unwrap();
 
     let after_conflict = fts_attachment_test_stats(&tmp_db, &winner, "docs", "docs_fts");
     assert_eq!(
@@ -3834,8 +4098,8 @@ fn fts_mvcc_loser_rollback_keeps_winner_cached_writer() {
     );
     winner.execute("COMMIT").unwrap();
 
-    // The conflict rolled back the loser's whole transaction; a retry from a
-    // fresh transaction succeeds.
+    // A retry from a fresh transaction, whose snapshot includes the winner's
+    // publication, succeeds.
     loser.execute("BEGIN CONCURRENT").unwrap();
     loser
         .execute("INSERT INTO docs VALUES (2, 'loser retry writer')")
@@ -4089,8 +4353,11 @@ fn fts_mvcc_reuses_snapshot_within_one_read_transaction() {
         after_second.full_snapshot_loads, after_first.full_snapshot_loads,
         "the second read in one MVCC transaction must not rescan the directory"
     );
+    // The stats probe itself opens a read cursor and scores one cache hit, so
+    // require two: the probe's and the SELECT under test's. A plain `>` would
+    // pass even with the SELECT deleted.
     assert!(
-        after_second.read_cache_hits > after_first.read_cache_hits,
+        after_second.read_cache_hits.unwrap() >= after_first.read_cache_hits.unwrap() + 2,
         "the second read must use the transaction-bound snapshot cache"
     );
 }
@@ -4227,6 +4494,14 @@ fn fts_manifest_generation_invalidates_stale_snapshot_once() {
     assert!(
         after_write.full_snapshot_loads > before_write.full_snapshot_loads,
         "the first reader of a new generation must load its directory snapshot"
+    );
+    // Pins that the SELECT — not the stats probe — performed the reload: the
+    // probe after a successful reload scores a cache hit, while a probe that
+    // had to do the reload itself would not. Without this, deleting the
+    // SELECT above still satisfies the two counter assertions.
+    assert!(
+        after_write.read_cache_hits > before_write.read_cache_hits,
+        "the stats probe after the reload must hit the refreshed cache"
     );
 
     assert_eq!(
@@ -4384,6 +4659,67 @@ fn fts_read_cache_is_connection_local_and_bounded() {
 
 /// Unordered MATCH cursors stream from Tantivy. UPDATE and DELETE must first
 /// collect their rowids so index maintenance cannot perturb the active scorer.
+/// Regression test: under MVCC, an autocommit write that runs while a sibling
+/// root statement is still open cannot commit at its own halt — it joins the
+/// shared implicit transaction. That halt exit used to release the statement
+/// savepoint without staging the FTS documents or handing the cursor to the
+/// connection, so the base row committed while its index entry was silently
+/// dropped (and the cursor's Drop tripped a debug assert).
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_deferred_autocommit_write_keeps_index_entries() {
+    let tmp_db = TempDatabase::builder()
+        .with_mvcc(true)
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'alpha')")
+        .unwrap();
+
+    // Statement A: step to the first row and hold it open.
+    let mut reader = conn.prepare("SELECT id FROM docs").unwrap();
+    loop {
+        match reader.step().unwrap() {
+            turso_core::StepResult::Row => break,
+            turso_core::StepResult::IO => reader.get_pager().io.step().unwrap(),
+            other => panic!("expected a row from the held-open reader, got {other:?}"),
+        }
+    }
+
+    // Statement B on the same connection: its halt defers the commit to the
+    // shared implicit transaction that statement A still holds open.
+    conn.execute("INSERT INTO docs VALUES (2, 'bravo')")
+        .unwrap();
+
+    // Finish statement A so the shared transaction commits.
+    loop {
+        match reader.step().unwrap() {
+            turso_core::StepResult::Row => {}
+            turso_core::StepResult::IO => reader.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Done => break,
+            other => panic!("expected the reader to finish, got {other:?}"),
+        }
+    }
+    drop(reader);
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM docs ORDER BY id"),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+        ]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'bravo')"),
+        vec![vec![rusqlite::types::Value::Integer(2)]],
+        "the deferred autocommit write must keep its FTS index entry"
+    );
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
 fn fts_streaming_dml_collects_stable_rowids() {
