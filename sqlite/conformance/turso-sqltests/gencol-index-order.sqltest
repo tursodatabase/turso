@@ -10,7 +10,7 @@ test eqp-order-by-virtual-column-uses-index {
     EXPLAIN QUERY PLAN SELECT v FROM t ORDER BY v LIMIT 10;
 }
 expect {
-    1|0|0|SCAN t USING INDEX tv
+    1|0|0|SCAN t USING COVERING INDEX tv
 }
 
 test eqp-order-by-desc-virtual-column-uses-index {
@@ -19,7 +19,7 @@ test eqp-order-by-desc-virtual-column-uses-index {
     EXPLAIN QUERY PLAN SELECT v FROM t ORDER BY v DESC;
 }
 expect {
-    1|0|0|SCAN t USING INDEX tv
+    1|0|0|SCAN t USING COVERING INDEX tv
 }
 
 test eqp-order-by-virtual-column-uses-desc-index {
@@ -28,7 +28,7 @@ test eqp-order-by-virtual-column-uses-desc-index {
     EXPLAIN QUERY PLAN SELECT v FROM t ORDER BY v DESC;
 }
 expect {
-    1|0|0|SCAN t USING INDEX tvd
+    1|0|0|SCAN t USING COVERING INDEX tvd
 }
 
 test eqp-group-by-virtual-column-uses-index {
@@ -37,7 +37,7 @@ test eqp-group-by-virtual-column-uses-index {
     EXPLAIN QUERY PLAN SELECT v, count(*) FROM t GROUP BY v;
 }
 expect {
-    1|0|0|SCAN t USING INDEX tv
+    1|0|0|SCAN t USING COVERING INDEX tv
 }
 
 test eqp-max-virtual-column-uses-index {
@@ -46,7 +46,7 @@ test eqp-max-virtual-column-uses-index {
     EXPLAIN QUERY PLAN SELECT max(v) FROM t;
 }
 expect {
-    1|0|0|SCAN t USING INDEX tv
+    1|0|0|SCAN t USING COVERING INDEX tv
 }
 
 test eqp-eq-prefix-order-by-virtual-column-uses-index {
@@ -55,7 +55,7 @@ test eqp-eq-prefix-order-by-virtual-column-uses-index {
     EXPLAIN QUERY PLAN SELECT v FROM t WHERE a = 1 ORDER BY v;
 }
 expect {
-    1|0|0|SEARCH t USING INDEX tav (a=?)
+    1|0|0|SEARCH t USING COVERING INDEX tav (a=?)
 }
 
 test eqp-order-by-virtual-column-and-unindexed-column-still-sorts {

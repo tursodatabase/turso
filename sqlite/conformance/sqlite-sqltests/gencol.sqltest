@@ -2540,7 +2540,7 @@ test gencol_index_on_virtual_is_covering_query_plan {
 }
 expect {
     1|0|0|SCAN t1 USING COVERING INDEX idx_v
-    1|0|0|SEARCH t1 USING INDEX idx_v (v>?)
+    1|0|0|SEARCH t1 USING COVERING INDEX idx_v (v>?)
 }
 
 @skip-if sqlite "sqlite doesn't use covering indexes with virtual columns"
@@ -2550,7 +2550,7 @@ test gencol_composite_index_with_virtual_is_covering_query_plan {
     EXPLAIN QUERY PLAN SELECT v, a FROM t1 WHERE v > 5;
 }
 expect {
-    1|0|0|SEARCH t1 USING INDEX idx_va (v>?)
+    1|0|0|SEARCH t1 USING COVERING INDEX idx_va (v>?)
 }
 
 @cross-check-integrity
