@@ -536,12 +536,16 @@ impl Statement {
 
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
-            if self.pager.io.current_time_monotonic() < busy_state.timeout() {
-                // Yield the query as the timeout has not been reached yet
+            let now = self.pager.io.current_time_monotonic();
+            if now < busy_state.timeout() {
+                // The timeout has not been reached yet: ask the caller to wait
+                // out the remaining delay before stepping again.
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                return Ok(StepResult::IO);
+                return Ok(StepResult::Sleep {
+                    duration: busy_state.get_delay(now),
+                });
             }
         }
 
@@ -613,11 +617,14 @@ impl Statement {
 
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
-                // Handler says retry, yield with IO to wait for timeout
+                // Handler says retry: ask the caller to wait out the backoff
+                // delay before stepping again.
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                res = Ok(StepResult::IO);
+                res = Ok(StepResult::Sleep {
+                    duration: busy_state.get_delay(now),
+                });
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
             }
