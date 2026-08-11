@@ -1,4 +1,4 @@
--- SQLITE_SKIP: this query takes more than 30 seconds
+-- LIMBO_SKIP: this currently takes too long on both engines due to lack of subquery decorrelation
 
 select
 	s_name,
