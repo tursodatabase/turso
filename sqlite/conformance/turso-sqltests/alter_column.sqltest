@@ -717,3 +717,855 @@ expect {
     a2|a2c2|c2
     ok
 }
+
+# Altering a column while keeping its name must not trip the duplicate
+# column name check against the column being altered.
+test alter-column-same-name-change-type {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ALTER COLUMN x TO x TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x, typeof(x) FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (x TEXT)
+    1|text
+    2|text
+    ok
+}
+
+test alter-column-same-name-add-default {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT 'none';
+    INSERT INTO t (a) VALUES (1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT a, b FROM t;
+}
+expect {
+    CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'none')
+    1|none
+}
+
+# Colliding with a different existing column must still be an error.
+test fail-alter-column-collides-with-other-column {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    ALTER TABLE t ALTER COLUMN a TO b TEXT;
+}
+expect error {
+}
+
+# Adding NOT NULL must check existing rows and fail if any are NULL,
+# even when the type does not change and no row rewrite runs.
+test fail-alter-column-add-notnull-with-existing-nulls {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL;
+}
+expect error {
+}
+
+# Same, through the row-rewrite path (affinity also changes).
+test fail-alter-column-add-notnull-with-existing-nulls-rewrite {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t ALTER COLUMN b TO b INTEGER NOT NULL;
+}
+expect error {
+}
+
+test alter-column-add-notnull-without-nulls {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (a INTEGER, b TEXT NOT NULL)
+    ok
+}
+
+# The added NOT NULL is enforced on later writes.
+test fail-insert-null-after-alter-column-add-notnull {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL;
+    INSERT INTO t (a) VALUES (2);
+}
+expect error {
+}
+
+test alter-column-drop-notnull {
+    CREATE TABLE t (a INTEGER, b TEXT NOT NULL);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT;
+    INSERT INTO t (a) VALUES (2);
+    SELECT a, b IS NULL FROM t ORDER BY a;
+}
+expect {
+    1|0
+    2|1
+}
+
+# Adding a CHECK must validate existing rows, like the rewrite path does.
+test fail-alter-column-add-check-violated-by-existing-rows {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (-5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER CHECK (x > 0);
+}
+expect error {
+}
+
+test alter-column-add-check-existing-rows-pass {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER CHECK (x > 0);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (x INTEGER CHECK (x > 0))
+}
+
+# A CHECK added via ALTER COLUMN must be enforced on later writes.
+test fail-insert-check-violation-after-alter-column-add-check {
+    CREATE TABLE t (x INTEGER);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER CHECK (x > 0);
+    INSERT INTO t VALUES (-1);
+}
+expect error {
+}
+
+test fail-update-check-violation-after-alter-column-add-check {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER CHECK (x > 0);
+    UPDATE t SET x = -1;
+}
+expect error {
+}
+
+# Omitting the CHECK in the new definition drops it.
+test alter-column-drop-check {
+    CREATE TABLE t (x INTEGER CHECK (x > 0));
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    INSERT INTO t VALUES (-1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x FROM t;
+}
+expect {
+    CREATE TABLE t (x INTEGER)
+    -1
+}
+
+# A table-level CHECK does not belong to the column definition and must
+# survive an ALTER COLUMN on the column it references.
+test fail-alter-column-keeps-table-level-check {
+    CREATE TABLE t (x INTEGER, CHECK (x > 0));
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER DEFAULT 7;
+    INSERT INTO t VALUES (-1);
+}
+expect error {
+}
+
+# STRICT: a type change must fail when existing values cannot be stored
+# under the new type.
+test fail-alter-column-strict-nonconforming-data {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, 'abc');
+    ALTER TABLE t ALTER COLUMN v TO v INT;
+}
+expect error {
+}
+
+# STRICT: values that convert cleanly are converted, like an insert would.
+test alter-column-strict-convertible-data {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, '123');
+    ALTER TABLE t ALTER COLUMN v TO v INT;
+    SELECT v, typeof(v) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    123|integer
+    ok
+}
+
+# STRICT: the new type must be a valid STRICT type name.
+test fail-alter-column-strict-invalid-type-name {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    ALTER TABLE t ALTER COLUMN v TO v VARCHAR;
+}
+expect error {
+}
+
+# STRICT: the new type is enforced on later writes.
+test fail-insert-after-alter-column-strict-type-change {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    ALTER TABLE t ALTER COLUMN v TO v INT;
+    INSERT INTO t VALUES (1, 'abc');
+}
+expect error {
+}
+
+# The old column name matches case-insensitively; same-name means same
+# column regardless of case, not a collision.
+test alter-column-case-insensitive-old-name {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ALTER COLUMN X TO x TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x, typeof(x) FROM t;
+}
+expect {
+    CREATE TABLE t (x TEXT)
+    1|text
+}
+
+# A case-only rename changes the stored name, like SQLite.
+test rename-column-case-only {
+    CREATE TABLE t (x INT);
+    ALTER TABLE t RENAME COLUMN x TO X;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (X INT)
+}
+
+# Renaming a column to itself is a no-op, like SQLite.
+test rename-column-to-self-noop {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t RENAME COLUMN x TO x;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x FROM t;
+}
+expect {
+    CREATE TABLE t (x INT)
+    1
+}
+
+# Quoted identifiers: keywords and names with spaces work as old and
+# new column names.
+test alter-column-quoted-identifiers {
+    CREATE TABLE t ("select" INT, "a b" TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN "select" TO "order" TEXT;
+    ALTER TABLE t ALTER COLUMN "a b" TO "a b" INTEGER DEFAULT 3;
+    INSERT INTO t ("order") VALUES ('2');
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT "order", "a b" FROM t ORDER BY rowid;
+}
+expect {
+    CREATE TABLE t ("order" TEXT, "a b" INTEGER DEFAULT 3)
+    1|x
+    2|3
+}
+
+test alter-column-replace-default {
+    CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'old');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT 'new';
+    INSERT INTO t (a) VALUES (1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT b FROM t;
+}
+expect {
+    CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'new')
+    new
+}
+
+test alter-column-drop-default {
+    CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT;
+    INSERT INTO t (a) VALUES (1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT a, b IS NULL FROM t;
+}
+expect {
+    CREATE TABLE t (a INTEGER, b TEXT)
+    1|1
+}
+
+# Inserting the default applies the column's affinity, like CREATE TABLE.
+test alter-column-default-applies-column-affinity {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    ALTER TABLE t ALTER COLUMN b TO b INTEGER DEFAULT '42';
+    INSERT INTO t (a) VALUES (1);
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    42|integer
+}
+
+# Non-constant defaults are allowed: existing rows already have values,
+# so nothing is applied retroactively (unlike ADD COLUMN, which
+# restricts these to empty tables).
+test alter-column-current-timestamp-default {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT CURRENT_TIMESTAMP;
+    INSERT INTO t (a) VALUES (2);
+    SELECT a, b IS NULL FROM t WHERE a = 1;
+    SELECT a, length(b) >= 19, b LIKE '20%' FROM t WHERE a = 2;
+}
+expect {
+    1|1
+    2|1|1
+}
+
+# Double-quoted strings resolve as string literals in the new default.
+test alter-column-double-quoted-default {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT "foo";
+    INSERT INTO t (a) VALUES (1);
+    SELECT b FROM t;
+}
+expect {
+    foo
+}
+
+# Converting an indexed column must keep the index in sync: index seeks
+# must find the converted values and integrity_check must pass.
+test alter-column-conversion-rebuilds-index {
+    CREATE TABLE t (x TEXT);
+    CREATE INDEX i ON t (x);
+    INSERT INTO t VALUES ('123'), ('456'), ('abc');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT x, typeof(x) FROM t WHERE x = 123;
+    SELECT x, typeof(x) FROM t WHERE x = 'abc';
+    PRAGMA integrity_check;
+}
+expect {
+    123|integer
+    abc|text
+    ok
+}
+
+test alter-column-conversion-rebuilds-unique-index {
+    CREATE TABLE t (x TEXT UNIQUE);
+    INSERT INTO t VALUES ('7'), ('8');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT x, typeof(x) FROM t WHERE x = 7;
+    PRAGMA integrity_check;
+}
+expect {
+    7|integer
+    ok
+}
+
+test alter-column-real-to-integer-affinity {
+    CREATE TABLE t (x REAL);
+    INSERT INTO t VALUES (3.0), (3.5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT x, typeof(x) FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    3|integer
+    3.5|real
+    ok
+}
+
+test alter-column-conversion-preserves-nulls {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES ('1'), (NULL);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT x IS NULL, typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    0|integer
+    1|null
+}
+
+test alter-column-rename-and-convert-rebuilds-index {
+    CREATE TABLE t (x TEXT);
+    CREATE INDEX i ON t (x);
+    INSERT INTO t VALUES ('5');
+    ALTER TABLE t ALTER COLUMN x TO y INTEGER;
+    SELECT y, typeof(y) FROM t WHERE y = 5;
+    PRAGMA integrity_check;
+}
+expect {
+    5|integer
+    ok
+}
+
+test alter-column-conversion-rebuilds-expression-index {
+    CREATE TABLE t (x TEXT);
+    CREATE INDEX i ON t (x + 1);
+    INSERT INTO t VALUES ('10');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT x FROM t WHERE x + 1 = 11;
+    PRAGMA integrity_check;
+}
+expect {
+    10
+    ok
+}
+
+# Values that become equal after the conversion must fail the UNIQUE
+# index rebuild and roll the whole ALTER back.
+test fail-alter-column-conversion-unique-collision {
+    CREATE TABLE t (x BLOB UNIQUE);
+    INSERT INTO t VALUES ('1'), (1);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+}
+expect error {
+}
+
+test alter-column-conversion-unique-collision-rolls-back {
+    CREATE TABLE t (x BLOB UNIQUE);
+    INSERT INTO t VALUES ('1'), (1);
+    SELECT typeof(x) FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    text
+    integer
+    ok
+}
+
+# Non-convertible values keep their stored type; convertible ones
+# convert, matching SQLite affinity rules on insert.
+test alter-column-text-to-integer-mixed-values {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES ('123'), ('abc'), ('45.0'), ('');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT quote(x), typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    123|integer
+    'abc'|text
+    45|integer
+    ''|text
+}
+
+# BLOB values are never converted by an affinity change.
+test alter-column-conversion-never-touches-blobs {
+    CREATE TABLE t (x);
+    INSERT INTO t VALUES (x'deadbeef'), (42), ('7');
+    ALTER TABLE t ALTER COLUMN x TO x TEXT;
+    SELECT quote(x), typeof(x) FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    X'DEADBEEF'|blob
+    '42'|text
+    '7'|text
+    ok
+}
+
+# A type change within the same affinity keeps stored values untouched.
+test alter-column-varchar-to-text-same-affinity {
+    CREATE TABLE t (x VARCHAR);
+    INSERT INTO t VALUES ('a'), (1);
+    ALTER TABLE t ALTER COLUMN x TO x TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT quote(x), typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    CREATE TABLE t (x TEXT)
+    'a'|text
+    '1'|text
+}
+
+# Conversion must survive values large enough to spill to overflow pages.
+test alter-column-conversion-with-overflow-pages {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES (replace(hex(zeroblob(5000)), '00', 'ab'));
+    INSERT INTO t VALUES ('77');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT length(x), typeof(x) FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    10000|text
+    2|integer
+    ok
+}
+
+# Changing the column collation rebuilds the index in the new order so
+# seeks respect the new collation.
+test alter-column-add-collate-nocase-with-index {
+    CREATE TABLE t (name TEXT);
+    CREATE INDEX i ON t (name);
+    INSERT INTO t VALUES ('Apple'), ('apple'), ('BANANA'), ('banana'), ('cherry');
+    ALTER TABLE t ALTER COLUMN name TO name TEXT COLLATE NOCASE;
+    SELECT count(*) FROM t WHERE name = 'APPLE';
+    SELECT name FROM t WHERE name = 'BaNaNa' ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    BANANA
+    banana
+    ok
+}
+
+# Omitting COLLATE drops it back to BINARY.
+test alter-column-drop-collation {
+    CREATE TABLE t (name TEXT COLLATE NOCASE);
+    CREATE INDEX i ON t (name);
+    INSERT INTO t VALUES ('Apple');
+    ALTER TABLE t ALTER COLUMN name TO name TEXT;
+    SELECT count(*) FROM t WHERE name = 'APPLE';
+    SELECT count(*) FROM t WHERE name = 'Apple';
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# An index with its own explicit collation does not follow the column.
+test alter-column-collation-keeps-explicit-index-collation {
+    CREATE TABLE t (name TEXT);
+    CREATE INDEX i ON t (name COLLATE NOCASE);
+    INSERT INTO t VALUES ('Apple'), ('apple');
+    ALTER TABLE t ALTER COLUMN name TO name TEXT COLLATE NOCASE;
+    SELECT count(*) FROM t WHERE name = 'APPLE';
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    ok
+}
+
+test alter-column-notnull-with-default {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL DEFAULT 'd';
+    INSERT INTO t (a) VALUES (2);
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|d
+}
+
+# A generated expression referencing an unknown column fails cleanly.
+test fail-alter-column-generated-expr-unknown-column {
+    CREATE TABLE t (a INT, b INT);
+    ALTER TABLE t ALTER COLUMN b TO c AS (nosuch + 1);
+}
+expect error {
+}
+
+test fail-alter-column-generated-expr-self-reference {
+    CREATE TABLE t (a INT, b INT);
+    ALTER TABLE t ALTER COLUMN b TO c AS (c + 1);
+}
+expect error {
+}
+
+test alter-column-virtual-to-virtual-new-expression {
+    CREATE TABLE t (a INT, b AS (a * 2));
+    INSERT INTO t (a) VALUES (5);
+    ALTER TABLE t ALTER COLUMN b TO b2 AS (a * 3);
+    SELECT a, b2 FROM t;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    5|15
+    CREATE TABLE t (a INT, b2 AS (a * 3))
+}
+
+# Changing the type of a composite PRIMARY KEY member keeps the PK
+# working: values are converted and the PK index is rebuilt.
+test alter-column-composite-pk-member-type-change {
+    CREATE TABLE t (a TEXT, b TEXT, c TEXT, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('x', '1', 'v1'), ('x', '2', 'v2');
+    ALTER TABLE t ALTER COLUMN b TO b INTEGER;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT c FROM t WHERE a = 'x' AND b = 1;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (a TEXT, b INTEGER, c TEXT, PRIMARY KEY (a, b))
+    v1
+    ok
+}
+
+# Changing an INTEGER PRIMARY KEY column to TEXT: rowids are preserved,
+# the column keeps the old rowid values as text, and new inserts leave
+# it NULL because it is no longer the rowid alias.
+test alter-column-rowid-alias-to-text {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    ALTER TABLE t ALTER COLUMN id TO id TEXT;
+    INSERT INTO t (v) VALUES ('c');
+    SELECT rowid, quote(id), v FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    1|'1'|a
+    2|'2'|b
+    3|NULL|c
+    ok
+}
+
+# A UNIQUE index created separately stays consistent after conversion.
+test alter-column-separate-unique-index-conversion {
+    CREATE TABLE t (x TEXT);
+    CREATE UNIQUE INDEX u ON t (x);
+    INSERT INTO t VALUES ('7'), ('8');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT x, typeof(x) FROM t WHERE x = 7;
+    INSERT INTO t VALUES (7);
+    PRAGMA integrity_check;
+}
+expect error {
+}
+
+# Renaming a column through ALTER COLUMN must update triggers and views
+# like RENAME COLUMN does.
+test alter-column-rename-updates-trigger-and-view {
+    CREATE TABLE src (a INT, b TEXT);
+    CREATE VIEW v AS SELECT b FROM src;
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN UPDATE src SET b = new.b WHERE a = new.a; END;
+    ALTER TABLE src ALTER COLUMN b TO name TEXT;
+    INSERT INTO src VALUES (1, 'x');
+    SELECT * FROM v;
+    SELECT sql LIKE '%new.name%' FROM sqlite_schema WHERE name = 'tr';
+}
+expect {
+    x
+    1
+}
+
+# A foreign key added via ALTER COLUMN is enforced right away.
+test fail-alter-column-add-fk-enforced {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER, pid INTEGER);
+    INSERT INTO parent VALUES (1);
+    ALTER TABLE child ALTER COLUMN pid TO pid INTEGER REFERENCES parent(id);
+    INSERT INTO child VALUES (1, 1);
+    INSERT INTO child VALUES (2, 99);
+}
+expect error {
+}
+
+# Omitting the REFERENCES clause drops the foreign key.
+test alter-column-drop-fk-stops-enforcement {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER, pid INTEGER REFERENCES parent(id));
+    ALTER TABLE child ALTER COLUMN pid TO pid INTEGER;
+    INSERT INTO child VALUES (1, 99);
+    SELECT count(*) FROM child;
+}
+expect {
+    1
+}
+
+# A table-level foreign key does not belong to the column definition and
+# must survive the alter.
+test fail-alter-column-keeps-table-level-fk {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent(id));
+    ALTER TABLE child ALTER COLUMN pid TO pid INTEGER DEFAULT 7;
+    INSERT INTO child VALUES (1, 99);
+}
+expect error {
+}
+
+# WITHOUT ROWID: the PRIMARY KEY is the table itself; altering a PK
+# column would strip or reorder it. Must be rejected.
+test fail-alter-column-without-rowid-pk-member {
+    CREATE TABLE w (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+    ALTER TABLE w ALTER COLUMN k TO k INTEGER;
+}
+expect error {
+}
+
+# WITHOUT ROWID: the row rewrite machinery is rowid-based, so a type
+# change that must rewrite rows is rejected instead of leaving the
+# schema claiming a type the rows do not have.
+test fail-alter-column-without-rowid-type-change {
+    CREATE TABLE w (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+    INSERT INTO w VALUES ('a', '1');
+    ALTER TABLE w ALTER COLUMN v TO v INTEGER;
+}
+expect error {
+}
+
+# WITHOUT ROWID: metadata-only changes still work.
+test alter-column-without-rowid-default-change {
+    CREATE TABLE w (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+    ALTER TABLE w ALTER COLUMN v TO v TEXT DEFAULT 'd';
+    INSERT INTO w (k) VALUES ('a');
+    SELECT k, v FROM w;
+}
+expect {
+    a|d
+}
+
+# WITHOUT ROWID: the NOT NULL validation scan works.
+test fail-alter-column-without-rowid-notnull-with-nulls {
+    CREATE TABLE w (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+    INSERT INTO w (k) VALUES ('a');
+    ALTER TABLE w ALTER COLUMN v TO v TEXT NOT NULL;
+}
+expect error {
+}
+
+# ROLLBACK restores both the schema and the pre-ALTER row data.
+test alter-column-rollback-restores-schema-and-data {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1);
+    BEGIN;
+    ALTER TABLE t ALTER COLUMN x TO x TEXT;
+    ROLLBACK;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x, typeof(x) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (x INT)
+    1|integer
+    ok
+}
+
+test fail-alter-column-sqlite-schema-protected {
+    ALTER TABLE sqlite_schema ALTER COLUMN name TO name2 TEXT;
+}
+expect error {
+}
+
+# Empty table: pure metadata change, no rewrite needed.
+test alter-column-empty-table {
+    CREATE TABLE t (x TEXT);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER DEFAULT 5;
+    INSERT INTO t VALUES ('9');
+    INSERT INTO t (rowid) VALUES (5);
+    SELECT x, typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    9|integer
+    5|integer
+}
+
+# A partial index whose WHERE references the converted column is
+# rebuilt so membership reflects the converted values.
+test alter-column-conversion-rebuilds-partial-index {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE INDEX pi ON t (y) WHERE x > 5;
+    INSERT INTO t VALUES ('10', 'a'), ('2', 'b');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT y FROM t WHERE x > 5;
+    PRAGMA integrity_check;
+}
+expect {
+    a
+    ok
+}
+
+# STRICT ANY -> TEXT must fail when a stored value (a BLOB) cannot be
+# stored under TEXT; STRICT never coerces BLOBs.
+test fail-alter-column-strict-any-to-text-with-blob {
+    CREATE TABLE s (id INTEGER PRIMARY KEY, v ANY) STRICT;
+    INSERT INTO s VALUES (1, 'abc'), (2, x'ff');
+    ALTER TABLE s ALTER COLUMN v TO v TEXT;
+}
+expect error {
+}
+
+test alter-column-strict-text-to-any {
+    CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO s VALUES (1, 'abc');
+    ALTER TABLE s ALTER COLUMN v TO v ANY;
+    INSERT INTO s VALUES (2, 42);
+    SELECT quote(v), typeof(v) FROM s ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    'abc'|text
+    42|integer
+    ok
+}
+
+test alter-column-conversion-mvcc {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES ('123'), ('abc');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT quote(x), typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    mvcc
+    123|integer
+    'abc'|text
+}
+
+# The index refill machinery is not MVCC-safe, so converting an indexed
+# column errors in MVCC mode instead of corrupting the index.
+test fail-alter-column-mvcc-indexed-conversion {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (x TEXT);
+    CREATE INDEX i ON t (x);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+}
+expect error {
+}
+
+test fail-alter-column-add-notnull-with-nulls-mvcc {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL;
+}
+expect error {
+}
+
+# Changing to a custom type must not leave stored values the type's own
+# rules reject. Custom-type encoding does not run on existing rows, so
+# the change requires an empty table.
+test fail-alter-column-to-custom-type-nonempty {
+    CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO b VALUES (1, 'abcdef');
+    ALTER TABLE b ALTER COLUMN v TO v VARCHAR(3);
+}
+expect error {
+}
+
+test alter-column-to-custom-type-empty-table {
+    CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    ALTER TABLE b ALTER COLUMN v TO v VARCHAR(3);
+    INSERT INTO b VALUES (1, 'abc');
+    SELECT v FROM b;
+}
+expect {
+    abc
+}
+
+# The custom type's rules apply to writes after the change.
+test fail-insert-too-long-after-alter-to-varchar {
+    CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    ALTER TABLE b ALTER COLUMN v TO v VARCHAR(3);
+    INSERT INTO b VALUES (1, 'toolong');
+}
+expect error {
+}
+
+# Domain types require STRICT tables, same as ADD COLUMN: on a
+# non-STRICT table the domain's constraints would silently not apply.
+test fail-alter-column-domain-type-on-non-strict-table {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE n (x INTEGER);
+    ALTER TABLE n ALTER COLUMN x TO x posint;
+}
+expect error {
+}
+
+test alter-column-domain-type-on-strict-table {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER) STRICT;
+    ALTER TABLE n ALTER COLUMN x TO x posint;
+    INSERT INTO n VALUES (1, -5);
+}
+expect error {
+}

@@ -102,7 +102,7 @@ change when they are converted to text.
 
 | Statement                 | Status  | Comment                                                                           |
 |---------------------------|---------|-----------------------------------------------------------------------------------|
-| ALTER TABLE               | ✅ Yes     |                                                                                   |
+| ALTER TABLE               | ✅ Yes     | Includes the `ALTER COLUMN` Turso extension for changing a column's definition     |
 | ANALYZE                   | ✅ Yes     |                                                                                   |
 | ATTACH DATABASE           | ✅ Yes     |                                                                                   |
 | BEGIN TRANSACTION         | ✅ Yes     |                                                                                   |
@@ -149,7 +149,7 @@ change when they are converted to text.
 | VACUUM                    | 🚧 Partial | VACUUM INTO supported; plain in-place VACUUM is experimental                       |
 | WITH clause               | 🚧 Partial | WITH RECURSIVE not yet supported.  |
 | WINDOW functions             | 🚧 Partial | Aggregate functions, `row_number`, `rank`, `dense_rank`, `first_value`, `last_value`, and `nth_value` work with the default frame. Missing: `percent_rank`, `cume_dist`, `ntile`, `lag`, and `lead`. Custom frame specs (`ROWS`/`RANGE`/`GROUPS BETWEEN`, `EXCLUDE`) are not yet supported. |
-| GENERATED                 | 🚧 Partial      | virtual columns only (no ALTER, partial affinity support). Requires `--experimental-generated-columns`. |
+| GENERATED                 | 🚧 Partial      | virtual columns only (ADD COLUMN cannot add them; ALTER COLUMN can convert a column to virtual generated; partial affinity support). Requires `--experimental-generated-columns`. |
 | WITHOUT ROWID             | 🚧 Partial | Requires `--experimental-without-rowid`. Effectively **insert-only**: CREATE / INSERT / SELECT work (incl. composite PK), but UPDATE, DELETE, UPSERT, `INSERT OR REPLACE`, secondary UNIQUE constraints, secondary `CREATE INDEX`, `FOREIGN KEY`, CDC, and materialized views are all rejected. AUTOINCREMENT and missing PK rejection are parity with SQLite. |
 | CREATE TRIGGER ... INSTEAD OF | ❌ No  | Triggers on views are not supported. Currently errors with misleading "no such table" message. |
 | CREATE VIEW IF NOT EXISTS | 🚧 Partial | Not idempotent — second create on an existing view errors instead of no-op. |

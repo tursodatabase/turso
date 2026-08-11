@@ -1,6 +1,6 @@
 ---
 title: ALTER TABLE
-description: Modify the structure of an existing table by renaming, adding, or dropping columns
+description: Modify the structure of an existing table by renaming, adding, dropping, or altering columns
 sidebarTitle: ALTER TABLE
 ---
 
@@ -15,11 +15,12 @@ ALTER TABLE [schema-name.]table-name RENAME TO new-table-name;
 ALTER TABLE [schema-name.]table-name RENAME COLUMN old-column-name TO new-column-name;
 ALTER TABLE [schema-name.]table-name ADD COLUMN column-def;
 ALTER TABLE [schema-name.]table-name DROP COLUMN column-name;
+ALTER TABLE [schema-name.]table-name ALTER COLUMN column-name TO column-def;
 ```
 
 ## Description
 
-`ALTER TABLE` modifies the structure of an existing table without requiring you to recreate the table and copy its data. Turso supports four forms of ALTER TABLE: renaming the table, renaming a column, adding a new column, and dropping an existing column.
+`ALTER TABLE` modifies the structure of an existing table without requiring you to recreate the table and copy its data. Turso supports five forms of ALTER TABLE: renaming the table, renaming a column, adding a new column, dropping an existing column, and altering a column's definition.
 
 ### Parameters
 
@@ -226,6 +227,77 @@ PRAGMA table_info(example);
 -- 1   | name   | TEXT    | 1       | NULL       | 0
 -- 2   | active | INTEGER | 0       | 1          | 0
 ```
+
+## ALTER COLUMN
+
+Replace a column's definition: its name, type, and constraints, in a single statement.
+
+<Info>
+`ALTER COLUMN` is a Turso extension. SQLite has no way to change an existing column's type, default, or constraints; its documentation recommends recreating the table and copying the data. In Turso this is one statement.
+</Info>
+
+```sql
+ALTER TABLE table-name ALTER COLUMN column-name TO column-def;
+```
+
+The `column-def` after `TO` is a complete column definition, like one you would write in CREATE TABLE. It replaces the old definition entirely: anything you omit is dropped, anything you add is applied. The column name may stay the same or change; changing it renames the column and updates indexes, triggers, views, and foreign key references like RENAME COLUMN does.
+
+```sql
+CREATE TABLE t (x INT);
+
+-- Change the type
+ALTER TABLE t ALTER COLUMN x TO x TEXT;
+
+-- Change type and name, add a default
+ALTER TABLE t ALTER COLUMN x TO label TEXT DEFAULT 'none';
+
+-- Drop the default by omitting it
+ALTER TABLE t ALTER COLUMN label TO label TEXT;
+```
+
+### Data Conversion
+
+When the new type has a different affinity, existing rows are rewritten as if each value were inserted into a column of the new type:
+
+- Values that convert cleanly are converted: TEXT `'123'` becomes INTEGER `123`.
+- Values that cannot be converted keep their stored type: TEXT `'abc'` stays text in an INTEGER column, matching SQLite affinity rules.
+- BLOB values are never converted.
+- NULLs are unchanged.
+
+Indexes that contain the column are rebuilt so lookups see the converted values. If converting makes two values equal in a UNIQUE index, the statement fails and rolls back.
+
+On STRICT tables, every existing value must be storable under the new type, and the statement fails if one is not:
+
+```sql
+CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+INSERT INTO s VALUES (1, 'abc');
+ALTER TABLE s ALTER COLUMN v TO v INT;
+-- Error: cannot store TEXT value in INT column s.v
+```
+
+### Constraints
+
+Adding a constraint validates existing rows first:
+
+| Constraint | Behavior |
+|-----------|----------|
+| `NOT NULL` | Fails if any existing row is NULL |
+| `CHECK (expr)` | Fails if any existing row violates the expression |
+| `DEFAULT expr` | Applies to later inserts; existing rows keep their values |
+| `COLLATE name` | Comparisons use the new collation; indexes on the column are rebuilt in the new order |
+| `REFERENCES parent(col)` | Adds a foreign key; enforced on later writes |
+| `GENERATED ALWAYS AS (expr)` | Converts the column to a virtual generated column |
+
+Omitting a constraint the column previously had drops it. Table-level constraints (composite PRIMARY KEY, table-level CHECK and FOREIGN KEY) are not part of the column definition and survive the statement.
+
+### Restrictions
+
+- `PRIMARY KEY` and `UNIQUE` cannot be added with ALTER COLUMN.
+- `GENERATED ... STORED` columns cannot be created this way (VIRTUAL works).
+- At least one non-generated column must remain in the table.
+- On STRICT tables the new type must be a valid STRICT type name.
+- On WITHOUT ROWID tables, PRIMARY KEY columns cannot be altered, and type or collation changes are not supported.
+- In MVCC mode, type or collation changes on indexed columns are not supported.
 
 ## Examples
 
