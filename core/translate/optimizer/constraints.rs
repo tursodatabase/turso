@@ -9,8 +9,8 @@ use crate::{
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
-            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            TableReferences, WhereTerm,
+            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Plan,
+            SubqueryState, TableReferences, WhereTerm,
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -919,7 +919,6 @@ pub fn constraints_from_where_clause(
                     .expect("subquery not found");
                 // Only use as constraint if NOT correlated
                 if !subquery.correlated {
-                    let estimated_values = params.in_subquery_rows;
                     let table_stats = schema
                         .analyze_stats
                         .table_stats(table_reference.table.get_name());
@@ -927,6 +926,22 @@ pub fn constraints_from_where_clause(
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
                         as f64;
+                    // Use the inner plan's row count instead of always using 25.
+                    // FIXME: The plan does not estimate distinct result values.
+                    // Until it does, cap this estimate at the square root of the
+                    // table row count.
+                    let planned_rows = match &subquery.state {
+                        SubqueryState::Unevaluated {
+                            plan: Some(inner_plan),
+                        } => match inner_plan.as_ref() {
+                            Plan::Select(plan) => plan.estimated_output_rows,
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let estimated_values = planned_rows
+                        .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
+                        .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
                     let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
                     // SQLite's `comparisonAffinity` for IN-subquery combines the
                     // LHS column affinity with each result column via
