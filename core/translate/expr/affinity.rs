@@ -51,18 +51,26 @@ pub(crate) struct ExprAffinityInfo {
 }
 
 impl ExprAffinityInfo {
-    const fn with_affinity(affinity: Affinity) -> Self {
+    pub(crate) const fn with_affinity(affinity: Affinity) -> Self {
         Self {
             affinity,
             has_affinity: true,
         }
     }
 
-    const fn no_affinity() -> Self {
+    pub(crate) const fn no_affinity() -> Self {
         Self {
             affinity: Affinity::Blob,
             has_affinity: false,
         }
+    }
+
+    pub(crate) const fn affinity(&self) -> Affinity {
+        self.affinity
+    }
+
+    pub(crate) const fn has_affinity(&self) -> bool {
+        self.has_affinity
     }
 }
 
@@ -83,6 +91,9 @@ pub(crate) fn get_expr_affinity_info(
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
+                        if !col.has_declared_affinity() {
+                            return ExprAffinityInfo::no_affinity();
+                        }
                         if let Some(btree) = table_ref.btree() {
                             return ExprAffinityInfo::with_affinity(
                                 col.affinity_with_strict(btree.is_strict),
