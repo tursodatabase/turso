@@ -352,7 +352,7 @@ fn rewrite_terminal_expr(
                     } else {
                         // Window function referencing a different window. Push the
                         // whole expression to the subquery; it will be rewritten later.
-                        rewrite_expr_as_subquery_column(expr, ctx, false);
+                        push_new_subquery_column(expr, ctx, false);
                     }
                 }
                 Expr::RowId { .. } | Expr::Column { .. } => {
