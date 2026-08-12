@@ -703,6 +703,7 @@ fn emit_add_virtual_column_validation(
     program.emit_insn(Insn::Next {
         cursor_id,
         pc_if_next: loop_start,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(skip_label);

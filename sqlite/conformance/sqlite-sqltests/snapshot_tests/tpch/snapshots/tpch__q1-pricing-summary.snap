@@ -50,7 +50,7 @@ addr  opcode                  p1  p2  p3  p4                                    
   11            ColumnRange    2   4  29  4                                       0  r[29..32]=lineitem.L_QUANTITY..L_TAX
   12            MakeRecord    27   6  26                                          0  r[26]=mkrec(r[27..32])
   13            SorterInsert   0  26   0  0                                       0  key=r[26]
-  14          Next             2   8   0                                          0
+  14          Next             2   8   0                                          1
   15          OpenPseudo       1  26   6                                          0  6 columns in r[26]
   16          SorterSort       0  49   0                                          0
   17            SorterData     0  26   1                                          0  r[26]=data

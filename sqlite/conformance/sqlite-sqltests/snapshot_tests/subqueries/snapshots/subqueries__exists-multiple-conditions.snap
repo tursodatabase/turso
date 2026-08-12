@@ -56,7 +56,7 @@ addr  opcode              p1  p2  p3  p4              p5  comment
   25    Column             0   3   4                   0  r[4]=products.price
   26    RealAffinity       4   0   0                   0
   27    ResultRow          2   3   0                   0  output=r[2..4]
-  28  Next                 0   3   0                   0
+  28  Next                 0   3   0                   1
   29  Halt                 0   0   0                   0
   30  Transaction          0   1  11                   0  iDb=0 tx_mode=Read
   31  String8              0  12   0  2024-01-01       0  r[12]='2024-01-01'

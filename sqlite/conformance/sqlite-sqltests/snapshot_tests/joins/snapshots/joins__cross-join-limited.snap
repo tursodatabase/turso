@@ -34,8 +34,8 @@ addr  opcode            p1  p2  p3  p4              p5  comment
    8      Column         1   1   2                   0  r[2]=products.name
    9      ResultRow      1   2   0                   0  output=r[1..2]
   10      DecrJumpZero   3  13   0                   0  if (--r[3]==0) goto 13
-  11    Next             1   7   0                   0
-  12  Next               0   6   0                   0
+  11    Next             1   7   0                   1
+  12  Next               0   6   0                   1
   13  Halt               0   0   0                   0
   14  Transaction        0   1  10                   0  iDb=0 tx_mode=Read
   15  Goto               0   1   0                   0

@@ -632,6 +632,7 @@ pub(crate) fn emit_backing_table_compaction(
     program.emit_insn(Insn::Next {
         cursor_id,
         pc_if_next: loop_top_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(skip_label);
 }
@@ -706,6 +707,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.emit_insn(Insn::Next {
         cursor_id: sseq_cursor,
         pc_if_next: loop_top_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(insert_label);
 
@@ -984,6 +986,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(end_loop_label);
 

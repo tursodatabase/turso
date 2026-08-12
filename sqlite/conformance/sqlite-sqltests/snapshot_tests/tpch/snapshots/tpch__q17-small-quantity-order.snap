@@ -49,7 +49,7 @@ addr  opcode                  p1  p2  p3  p4                                    
   11            Column         3   4  11                                          0  r[11]=lineitem.L_QUANTITY
   12            MakeRecord    10   2   9                                          0  r[9]=mkrec(r[10..11])
   13            SorterInsert   1   9   0  0                                       0  key=r[9]
-  14          Next             3  10   0                                          0
+  14          Next             3  10   0                                          1
   15          OpenPseudo       2   9   2                                          0  2 columns in r[9]
   16          SorterSort       1  31   0                                          0
   17            SorterData     1   9   2                                          0  r[9]=data
@@ -118,7 +118,7 @@ addr  opcode                  p1  p2  p3  p4                                    
   80        AggStep            0  37  22  sum                                     0  accum=r[22] step(r[37])
   81      Next                 5  77   0                                          0
   82    Next                   0  61   0                                          0
-  83  Next                     6  55   0                                          0
+  83  Next                     6  55   0                                          1
   84  AggFinal                 0  22   0  sum                                     0  accum=r[22]
   85  Copy                    22  38   0                                          0  r[38]=r[22]
   86  Divide                  38  39  21                                          0  r[21]=r[38]/r[39]

@@ -35,7 +35,7 @@ addr  opcode              p1  p2  p3  p4                     p5  comment
    8        Column         1   4  12                          0  r[12]=sales.region
    9        MakeRecord     8   5   7                          0  r[7]=mkrec(r[8..12])
   10        SorterInsert   0   7   0  0                       0  key=r[7]
-  11      Next             1   5   0                          0
+  11      Next             1   5   0                          1
   12      OpenPseudo       2   7   5                          0  5 columns in r[7]
   13      SorterSort       0  18   0                          0
   14        SorterData     0   7   2                          0  r[7]=data

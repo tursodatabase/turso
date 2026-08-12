@@ -38,7 +38,7 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   12    RowId           1   2   0                      0  r[2]=products.rowid
   13    MakeRecord      2   1   6                      0  r[6]=mkrec(r[2..2]); for ephemeral_scratch
   14    Insert          0   6   2  ephemeral_scratch   6  intkey=r[2] data=r[6]
-  15  Next              1   4   0                      0
+  15  Next              1   4   0                      1
   16  OpenWrite         1   2   0                      0  root=2; iDb=0
   17  Rewind            0  31   0                      0  Rewind table ephemeral(ephemeral_scratch)
   18    RowId           0   7   0                      0  r[7]=ephemeral(ephemeral_scratch).rowid
@@ -53,7 +53,7 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   27    NotExists       1  30   7                      0
   28    Delete          1   0   0  products            0
   29    Insert          1  15   7  products           11  intkey=r[7] data=r[15]
-  30  Next              0  18   0                      0
+  30  Next              0  18   0                      1
   31  Halt              0   0   0                      0
   32  Transaction       0   2  10                      0  iDb=0 tx_mode=Write
   33  Integer           1  14   0                      0  r[14]=1

@@ -160,6 +160,7 @@ pub fn translate_create_materialized_view(
     program.emit_insn(Insn::Next {
         cursor_id: view_cursor_id,
         pc_if_next: clear_loop_label,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(clear_done_label);
@@ -606,6 +607,7 @@ pub fn translate_drop_view(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(end_loop_label);
@@ -721,6 +723,7 @@ pub fn translate_drop_view(
         program.emit_insn(Insn::Next {
             cursor_id: sqlite_schema_cursor_id,
             pc_if_next: dbsp_loop_start_label,
+            fullscan: false,
         });
 
         program.preassign_label_to_next_insn(dbsp_end_loop_label);

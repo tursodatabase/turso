@@ -526,6 +526,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         planner.program.emit_insn(Insn::Next {
             cursor_id: build_iter_cursor_id,
             pc_if_next: build_loop_start,
+            fullscan: false,
         });
 
         planner.program.preassign_label_to_next_insn(build_loop_end);

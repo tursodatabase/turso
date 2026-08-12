@@ -49,7 +49,7 @@ addr  opcode                      p1  p2  p3  p4              p5  comment
   15                RealAffinity  16   0   0                   0
   16                MakeRecord    15   2  14                   0  r[14]=mkrec(r[15..16])
   17                SorterInsert   2  14   0  0                0  key=r[14]
-  18              Next             4  14   0                   0
+  18              Next             4  14   0                   1
   19              OpenPseudo       3  14   2                   0  2 columns in r[14]
   20              SorterSort       2  35   0                   0
   21                SorterData     2  14   3                   0  r[14]=data
@@ -102,7 +102,7 @@ addr  opcode                      p1  p2  p3  p4              p5  comment
   68    ColumnRange                0   3   3  2                0  r[3..4]=employees.department..salary
   69    RealAffinity               4   0   0                   0
   70    ResultRow                  2   3   0                   0  output=r[2..4]
-  71  Next                         0   3   0                   0
+  71  Next                         0   3   0                   1
   72  Halt                         0   0   0                   0
   73  Transaction                  0   1  11                   0  iDb=0 tx_mode=Read
   74  Goto                         0   1   0                   0

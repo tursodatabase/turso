@@ -42,7 +42,7 @@ addr  opcode             p1  p2  p3  p4              p5  comment
    8    RowId             1   2   0                   0  r[2]=categories.rowid
    9    MakeRecord        2   1   4                   0  r[4]=mkrec(r[2..2]); for ephemeral_index_where_sub_t2
   10    IdxInsert         0   4   0                   8  key=r[4]
-  11  Next                1   6   0                   0
+  11  Next                1   6   0                   1
   12  OpenRead            2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
   13  OpenRead            3   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   14  NullRow             0   0   0                   0  Set cursor 0 to a (pseudo) NULL row

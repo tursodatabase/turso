@@ -27,7 +27,7 @@ addr  opcode       p1  p2  p3  p4           p5  comment
    5    AggStep     0   5   3  min(Binary)   0  accum=r[3] step(r[5])
    6    Column      0   0   6                0  r[6]=idx_sales_amount.amount
    7    AggStep     0   6   4  max(Binary)   0  accum=r[4] step(r[6])
-   8  Next          0   4   0                0
+   8  Next          0   4   0                1
    9  AggFinal      0   3   0  min           0  accum=r[3]
   10  AggFinal      0   4   0  max           0  accum=r[4]
   11  Copy          3   1   0                0  r[1]=r[3]

@@ -423,6 +423,7 @@ where
     program.emit_insn(Insn::Next {
         cursor_id: icur,
         pc_if_next: loop_top,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(done);
@@ -531,6 +532,7 @@ where
     program.emit_insn(Insn::Next {
         cursor_id: ccur,
         pc_if_next: loop_top,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(done);
@@ -2442,6 +2444,7 @@ pub fn emit_fk_drop_table_check(
     program.emit_insn(Insn::Next {
         cursor_id: parent_cur,
         pc_if_next: collect_loop,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(collect_done);
@@ -2588,6 +2591,7 @@ pub fn emit_fk_drop_table_check(
         program.emit_insn(Insn::Next {
             cursor_id: child_cur,
             pc_if_next: child_loop,
+            fullscan: false,
         });
 
         program.preassign_label_to_next_insn(child_done);

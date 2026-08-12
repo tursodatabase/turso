@@ -33,7 +33,7 @@ addr  opcode          p1  p2  p3  p4          p5  comment
    9    Column         1   2   2               0  r[2]=purchases.amount
   10    RealAffinity   2   0   0               0
   11    ResultRow      1   2   0               0  output=r[1..2]
-  12  Next             1   5   0               0
+  12  Next             1   5   0               1
   13  Halt             0   0   0               0
   14  Transaction      0   1   4               0  iDb=0 tx_mode=Read
   15  Integer          2   3   0               0  r[3]=2

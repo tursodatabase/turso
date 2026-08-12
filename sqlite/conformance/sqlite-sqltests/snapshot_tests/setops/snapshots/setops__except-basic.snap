@@ -29,12 +29,12 @@ addr  opcode         p1  p2  p3  p4      p5  comment
    4    Column        1   0   1           0  r[1]=idx_current_dept.department
    5    MakeRecord    1   1   2           0  r[2]=mkrec(r[1..1]); for compound_dedupe
    6    IdxInsert     0   2   0           8  key=r[2]
-   7  Next            1   4   0           0
+   7  Next            1   4   0           1
    8  OpenRead        2   6   0  k(2,B)   0  index=idx_former_dept, root=6, iDb=0
    9  Rewind          2  13   0           0  Rewind index idx_former_dept
   10    Column        2   0   3           0  r[3]=idx_former_dept.department
   11    IdxDelete     0   3   1           0
-  12  Next            2  10   0           0
+  12  Next            2  10   0           1
   13  Rewind          0  16   0           0  Rewind  ephemeral(compound_dedupe)
   14    Column        0   0   4           0  r[4]=ephemeral(compound_dedupe).department
   15    ResultRow     4   1   0           0  output=r[4]

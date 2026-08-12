@@ -27,7 +27,7 @@ addr  opcode         p1  p2  p3  p4                  p5  comment
   10    Affinity      8   5   0                       0  r[8..13] = B, B, B, D, B
   11    MakeRecord    8   5  13                       0  r[13]=mkrec(r[8..12])
   12    Insert        0  13   7  sqlite_schema        8  intkey=r[7] data=r[13]
-  13  Next            0   3   0                       0
+  13  Next            0   3   0                       1
   14  SetCookie       0   1   3                       0
   15  DropColumn      0   0   0                       0  drop_column(t, 1)
   16  Halt            0   0   0                       0

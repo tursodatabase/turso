@@ -59,7 +59,7 @@ addr  opcode                    p1  p2  p3  p4                p5  comment
   25            NullRow          4   0   0                     0  Set cursor 4 to a (pseudo) NULL row
   26            NullRow          5   0   0                     0  Set cursor 5 to a (pseudo) NULL row
   27            Goto             0  16   0                     0
-  28          Next               3  11   0                     0
+  28          Next               3  11   0                     1
   29          OpenPseudo         2  14   4                     0  4 columns in r[14]
   30          SorterSort         1  47   0                     0
   31            SorterData       1  14   2                     0  r[14]=data

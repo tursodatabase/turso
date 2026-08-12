@@ -36,7 +36,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
    9            Column         0    1   5                          0  r[5]=employees.name
   10            Column         0    3   6                          0  r[6]=employees.salary
   11            Yield          2    0   0                          0
-  12          Next             1    6   0                          0
+  12          Next             1    6   0                          1
   13          EndCoroutine     2    0   0                          0
   14          OpenEphemeral    2    1   0                          0  cursor=2 is_table=true
   15          OpenDup          3    2   0                          0  new_cursor=3, original_cursor=2

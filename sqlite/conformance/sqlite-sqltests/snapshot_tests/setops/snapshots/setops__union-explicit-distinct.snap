@@ -33,7 +33,7 @@ addr  opcode                  p1  p2  p3  p4      p5  comment
    6    HashDistinct  1073741824   1   1  jmp=9    0
    7    MakeRecord             1   1   2           0  r[2]=mkrec(r[1..1]); for compound_dedupe
    8    IdxInsert              0   2   0           8  key=r[2]
-   9  Next                     1   5   0           0
+   9  Next                     1   5   0           1
   10  HashClear       1073741825   0   0           0
   11  OpenRead                 2   6   0  k(2,B)   0  index=idx_former_dept, root=6, iDb=0
   12  Rewind                   2  18   0           0  Rewind index idx_former_dept
@@ -41,7 +41,7 @@ addr  opcode                  p1  p2  p3  p4      p5  comment
   14    HashDistinct  1073741825   3   1  jmp=17   0
   15    MakeRecord             3   1   4           0  r[4]=mkrec(r[3..3]); for compound_dedupe
   16    IdxInsert              0   4   0           8  key=r[4]
-  17  Next                     2  13   0           0
+  17  Next                     2  13   0           1
   18  Rewind                   0  21   0           0  Rewind  ephemeral(compound_dedupe)
   19    Column                 0   0   5           0  r[5]=ephemeral(compound_dedupe).department
   20    ResultRow              5   1   0           0  output=r[5]

@@ -21,7 +21,7 @@ addr  opcode          p1  p2  p3  p4            p5  comment
    4  Rewind           1   8   0                 0  Rewind index t2_partial_aux_idx
    5    DeferredSeek   1   0   0                 0
    6    AggStep        0   3   2  count          0  accum=r[2] step(r[3])
-   7  Next             1   5   0                 0
+   7  Next             1   5   0                 1
    8  AggFinal         0   2   0  count          0  accum=r[2]
    9  Copy             2   1   0                 0  r[1]=r[2]
   10  ResultRow        1   1   0                 0  output=r[1]

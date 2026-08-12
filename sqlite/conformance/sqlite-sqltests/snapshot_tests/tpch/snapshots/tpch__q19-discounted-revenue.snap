@@ -108,7 +108,7 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   55    Subtract   72  73  71                                          0  r[71]=r[72]-r[73]
   56    Multiply   70  71  69                                          0  r[69]=r[70]*r[71]
   57    AggStep     0  69   2  sum                                     0  accum=r[2] step(r[69])
-  58  Next          0   5   0                                          0
+  58  Next          0   5   0                                          1
   59  AggFinal      0   2   0  sum                                     0  accum=r[2]
   60  Copy          2   1   0                                          0  r[1]=r[2]
   61  ResultRow     1   1   0                                          0  output=r[1]

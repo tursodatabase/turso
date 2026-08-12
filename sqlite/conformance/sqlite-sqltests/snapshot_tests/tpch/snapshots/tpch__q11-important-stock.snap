@@ -86,7 +86,7 @@ addr  opcode                       p1   p2  p3  p4                  p5  comment
   34                MakeRecord     12    3  11                       0  r[11]=mkrec(r[12..14])
   35                SorterInsert    1   11   0  0                    0  key=r[11]
   36              Next              4   29   0                       0
-  37            Next                5   11   0                       0
+  37            Next                5   11   0                       1
   38            OpenPseudo          2   11   3                       0  3 columns in r[11]
   39            SorterSort          1   57   0                       0
   40              SorterData        1   11   2                       0  r[11]=data
@@ -147,7 +147,7 @@ addr  opcode                       p1   p2  p3  p4                  p5  comment
   95            Multiply           48   49  47                       0  r[47]=r[48]*r[49]
   96            AggStep             0   47  35  sum                  0  accum=r[35] step(r[47])
   97          Next                  8   91   0                       0
-  98        Next                    9   74   0                       0
+  98        Next                    9   74   0                       1
   99        AggFinal                0   35   0  sum                  0  accum=r[35]
  100        Copy                   35   50   0                       0  r[50]=r[35]
  101        Real                    0   51   0  0.0001               0  r[51]=0.0001
