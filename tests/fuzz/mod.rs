@@ -4213,6 +4213,8 @@ mod fuzz_tests {
     /// compute log(X)/log(B) exactly like SQLite's logFunc instead of
     /// special-casing bases 2 and 10. mod() with a huge dividend amplifies any
     /// 1-ulp difference in the modulus far beyond fuzzer tolerance.
+    /// atanh() folds the sign before applying log1p rather than passing negative
+    /// values, since Rust's std diverges from glibc near log1p's asymptote at x=-1.
     #[turso_macros::test(mvcc)]
     pub fn math_ex(db: TempDatabase) {
         let _ = env_logger::try_init();
@@ -4228,6 +4230,10 @@ mod fuzz_tests {
             "SELECT log(0.5, 3.0)",
             "SELECT log(1.0, 3.0)",
             "SELECT mod(cosh(-2.0 - (0.5) * (-2.0 / 2.0 + (0.5) - degrees(1.0))), log10(2.0))",
+            "SELECT trunc(atanh(tanh(-2.0)))",
+            "SELECT atanh(-0.25)",
+            "SELECT atanh(0.25)",
+            "SELECT atanh(-0.9999)",
         ] {
             helpers::assert_differential(&limbo_conn, &sqlite_conn, query, "");
         }
