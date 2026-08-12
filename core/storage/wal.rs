@@ -5331,11 +5331,16 @@ impl WalFile {
     /// MVCC helper: check if WAL state changed and refresh local snapshot without starting a read tx.
     /// FIXME: this isn't TOCTOU safe because we're not taking WAL read locks.
     ///
-    /// This is only used to invalidate page cache, so false positives are sort of acceptable since
-    /// MVCC reads currently don't read from WAL frames ever.
-    /// FIXME: MVCC should start using pager read transactions anyway so that we can get rid of
-    /// the stop-the-world MVCC checkpoint that blocks all reads.
+    /// No-op while this connection holds a read guard: an active read tx pinned the
+    /// connection's WAL view, and an MVCC transaction's `read_mark` was captured from it.
+    /// Advancing `max_frame` here would let the transaction's B-tree reads see pages a
+    /// passive checkpoint materialized after its snapshot, leaking later commits into it.
+    /// The guard also keeps everything at-or-below the pinned view immutable, so the page
+    /// cache stays valid and needs no invalidation.
     pub fn mvcc_refresh_if_db_changed(&self) -> bool {
+        if self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD {
+            return false;
+        }
         let snapshot = self.load_coordination_snapshot();
         let local_state = self.connection_state();
         let changed = self.db_changed_against(snapshot, local_state);
@@ -7181,7 +7186,7 @@ pub mod test {
     }
 
     #[test]
-    fn test_mvcc_refresh_updates_snapshot_without_changing_read_guard() {
+    fn test_mvcc_refresh_updates_snapshot_only_when_no_read_guard_is_held() {
         let (shared, wal) = make_test_wal();
         let initial = WalSnapshot {
             max_frame: 4,
@@ -7207,13 +7212,23 @@ pub mod test {
         };
         set_shared_snapshot(&shared, updated);
 
-        assert!(wal.mvcc_refresh_if_db_changed());
+        // A held read guard pins this connection's WAL view; the refresh must not
+        // advance it past the snapshot an active transaction captured.
+        assert!(!wal.mvcc_refresh_if_db_changed());
         assert_eq!(
             wal.connection_state(),
             WalConnectionState::new(
-                updated,
+                initial,
                 ReadGuardKind::ReadMark(NonZeroUsize::new(2).unwrap())
             )
+        );
+
+        // With no read guard held the refresh picks up the new shared snapshot.
+        wal.install_connection_state(WalConnectionState::new(initial, ReadGuardKind::None));
+        assert!(wal.mvcc_refresh_if_db_changed());
+        assert_eq!(
+            wal.connection_state(),
+            WalConnectionState::new(updated, ReadGuardKind::None)
         );
     }
 
