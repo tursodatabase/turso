@@ -16172,23 +16172,14 @@ pub fn op_add_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        AddColumn {
-            db,
-            table,
-            column,
-            check_constraints,
-            foreign_keys
-        },
-        insn
-    );
+    load_insn!(AddColumn { data }, insn);
 
     let conn = program.connection.clone();
-    let normalized_table_name = normalize_ident(table.as_str());
-    let new_check_constraints = check_constraints.try_to_vec()?;
-    let new_foreign_keys = foreign_keys.try_to_vec()?;
+    let normalized_table_name = normalize_ident(data.table.as_str());
+    let new_check_constraints = data.check_constraints.try_to_vec()?;
+    let new_foreign_keys = data.foreign_keys.try_to_vec()?;
 
-    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
+    conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
         let table_ref = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -16201,7 +16192,7 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns_mut().try_push((**column).clone())?;
+        btree.columns_mut().try_push(data.column.clone())?;
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints = new_check_constraints;
         // Update foreign keys to include any FK constraints from the new column

@@ -2385,14 +2385,14 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
-            Insn::AddColumn { db: _, table, column, .. } => (
+            Insn::AddColumn { data } => (
                 "AddColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("add_column({table}, {column:?})"),
+                format!("add_column({}, {:?})", data.table, data.column),
             ),
             Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
                 "AlterColumn",

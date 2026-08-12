@@ -270,6 +270,16 @@ pub struct HashBuildData {
     pub track_matched: bool,
 }
 
+/// Data for AddColumn instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AddColumnData {
+    pub db: usize,
+    pub table: String,
+    pub column: Column,
+    pub check_constraints: Vec<CheckConstraint>,
+    pub foreign_keys: Vec<Arc<ForeignKey>>,
+}
+
 /// Data for HashDistinct instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct HashDistinctData {
@@ -1797,11 +1807,7 @@ pub enum Insn {
         column_index: usize,
     },
     AddColumn {
-        db: usize,
-        table: String,
-        column: Box<Column>,
-        check_constraints: Vec<CheckConstraint>,
-        foreign_keys: Vec<Arc<ForeignKey>>,
+        data: Box<AddColumnData>,
     },
     AlterColumn {
         db: usize,
