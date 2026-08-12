@@ -61,8 +61,23 @@ mod cmath {
     pub fn atan(x: f64) -> f64 {
         x.atan()
     }
+    // Mirror libc algorithm to prevent SQLite divergence at negatives
     pub fn atanh(x: f64) -> f64 {
-        x.atanh()
+        let xa = x.abs();
+        if xa < 0.5 {
+            // 0x1p-28: below this, atanh(x) == x to double precision
+            if xa < f64::from_bits(0x3E30000000000000) {
+                return x;
+            }
+            let t = xa + xa;
+            (0.5 * (t + t * xa / (1.0 - xa)).ln_1p()).copysign(x)
+        } else if xa < 1.0 {
+            (0.5 * ((xa + xa) / (1.0 - xa)).ln_1p()).copysign(x)
+        } else if xa > 1.0 {
+            f64::NAN
+        } else {
+            x / 0.0
+        }
     }
     pub fn atan2(x: f64, y: f64) -> f64 {
         x.atan2(y)
