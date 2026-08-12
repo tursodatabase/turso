@@ -556,6 +556,26 @@ expect {
     0|1|1|1|1
 }
 
+# SUM keeps SQLite's approximate-accumulator state in the hidden group table.
+# Loading that state for a later statement must remain approximate instead of
+# reverting to an integer accumulator.
+test matview-vdbe-sum-approximate-state-persists {
+    CREATE TABLE sum_overflow_state(x);
+    CREATE MATERIALIZED VIEW sum_overflow_state_view AS
+      SELECT SUM(x) AS s FROM sum_overflow_state;
+    INSERT INTO sum_overflow_state VALUES
+      (1.5), (9223372036854775807), (1);
+    SELECT typeof(s), s = (SELECT SUM(x) FROM sum_overflow_state)
+      FROM sum_overflow_state_view;
+    INSERT INTO sum_overflow_state VALUES (2);
+    SELECT typeof(s), s = (SELECT SUM(x) FROM sum_overflow_state)
+      FROM sum_overflow_state_view;
+}
+expect {
+    real|1
+    real|1
+}
+
 # The single row also exists when WHERE filters out every scanned row.
 test matview-vdbe-scalar-aggregate-where-filters-all {
     CREATE TABLE t28(x INTEGER);

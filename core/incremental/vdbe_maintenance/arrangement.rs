@@ -134,9 +134,9 @@ fn consolidate_arrangement_input(
         prev_largest_reg: 0,
     });
     program.emit_insn(Insn::MakeRecord {
-        start_reg: lookup_start as u16,
-        count: (key_width + 1) as u16,
-        dest_reg: index_record_reg as u16,
+        start_reg: to_u32(lookup_start),
+        count: to_u32(key_width + 1),
+        dest_reg: to_u32(index_record_reg),
         index_name: Some(index.name.clone()),
         affinity_str: None,
     });
@@ -144,7 +144,7 @@ fn consolidate_arrangement_input(
         cursor_id: index_cursor,
         record_reg: index_record_reg,
         unpacked_start: Some(lookup_start),
-        unpacked_count: Some((key_width + 1) as u16),
+        unpacked_count: Some(to_u32(key_width + 1)),
         flags: IdxInsertFlags::new(),
     });
     program.emit_insn(Insn::Goto {
@@ -175,9 +175,9 @@ fn consolidate_arrangement_input(
 
     program.preassign_label_to_next_insn(write_label);
     program.emit_insn(Insn::MakeRecord {
-        start_reg: record_start as u16,
-        count: consolidated.record_width() as u16,
-        dest_reg: record_reg as u16,
+        start_reg: to_u32(record_start),
+        count: to_u32(consolidated.record_width()),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });

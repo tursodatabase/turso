@@ -885,10 +885,14 @@ impl IncrementalView {
 mod tests {
     use super::*;
     use crate::alloc::vec;
+    use crate::incremental::yield_test_support::OneShotYieldInjector;
+    use crate::mvcc::yield_hooks::YieldPointMarker;
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
     };
+    use crate::storage::btree::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
     use crate::sync::Arc;
+    use crate::{Database, DatabaseOpts, OpenFlags, SqliteDialect, StepResult};
     use turso_parser::ast;
 
     #[test]
@@ -1145,6 +1149,71 @@ mod tests {
         assert_eq!(cursor.column(1), first[1]);
         assert_eq!(cursor.column(table.columns().len()), Value::from_i64(1));
         assert!(matches!(cursor.next(), Ok(IOResult::Done(false))));
+    }
+
+    #[test]
+    fn maintenance_insert_resumes_after_overflow_cell_yield() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "ivm-maintenance-overflow-yield.db",
+            OpenFlags::default(),
+            DatabaseOpts::new().with_views(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE overflow_base(id INTEGER PRIMARY KEY, payload BLOB)")
+            .unwrap();
+        for id in 1..260 {
+            conn.execute(format!(
+                "INSERT INTO overflow_base VALUES ({id}, zeroblob(3600))"
+            ))
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE MATERIALIZED VIEW overflow_view AS SELECT id, payload FROM overflow_base",
+        )
+        .unwrap();
+
+        let view_root_page = {
+            let view = conn
+                .schema
+                .read()
+                .get_materialized_view("overflow_view")
+                .expect("materialized view must be present in the schema");
+            let root_page = view.lock().get_root_page();
+            root_page
+        };
+        let injector = OneShotYieldInjector::new(
+            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+            BTREE_WRITE_YIELD_FAMILY ^ view_root_page as u64,
+        );
+        conn.set_yield_injector(Some(injector.clone()));
+
+        let mut stmt = conn
+            .prepare("INSERT INTO overflow_base VALUES (926, zeroblob(7200))")
+            .unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
+        assert!(injector.fired(), "targeted view B-tree yield did not fire");
+        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+        drop(stmt);
+        conn.set_yield_injector(None);
+
+        let mut query = conn
+            .prepare("SELECT count(*), max(length(payload)) FROM overflow_view WHERE id = 926")
+            .unwrap();
+        assert!(matches!(query.step().unwrap(), StepResult::Row));
+        let row = query.row().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        assert_eq!(row.get::<i64>(1).unwrap(), 7200);
+        drop(query);
+
+        let mut integrity = conn.prepare("PRAGMA integrity_check").unwrap();
+        assert!(matches!(integrity.step().unwrap(), StepResult::Row));
+        assert_eq!(integrity.row().unwrap().get::<String>(0).unwrap(), "ok");
     }
 
     // Helper function to create a test schema with multiple tables
