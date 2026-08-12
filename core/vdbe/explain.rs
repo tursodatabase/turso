@@ -14,6 +14,10 @@ pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
 ];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
+/// Columns of `EXPLAIN QUERY PLAN FORMAT=JSON`: one row holding the whole
+/// plan as a JSON document.
+pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS: [&str; 1] = ["plan_json"];
+pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE: [&str; 1] = ["TEXT"];
 
 pub fn insn_to_row(
     program: &PreparedProgram,

@@ -302,3 +302,91 @@ fn json_matches_explain_query_plan_rows(tmp_db: TempDatabase) -> anyhow::Result<
     }
     Ok(())
 }
+
+#[turso_macros::test]
+fn format_json_returns_the_plan_as_one_text_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let rows = limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM users WHERE age > 21",
+    );
+    assert_eq!(rows.len(), 1, "expected one row: {rows:?}");
+    assert_eq!(rows[0].len(), 1, "expected one column: {rows:?}");
+    let rusqlite::types::Value::Text(json) = &rows[0][0] else {
+        panic!("plan_json column must be text: {rows:?}");
+    };
+    let plan: serde_json::Value = serde_json::from_str(json)?;
+    assert_eq!(plan["version"], 1);
+    let searches: Vec<_> = find_node(&plan, "search").collect();
+    assert_eq!(searches.len(), 1, "{plan:#}");
+    assert_eq!(searches[0]["op"]["index"]["name"], "idx_users_age");
+    Ok(())
+}
+
+#[turso_macros::test]
+fn format_json_row_equals_the_rust_api_output(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let sql = "EXPLAIN QUERY PLAN FORMAT=JSON
+        SELECT u.name FROM users u JOIN orders o ON o.user_id = u.id";
+    let rows = limbo_exec_rows(&conn, sql);
+    let rusqlite::types::Value::Text(from_row) = &rows[0][0] else {
+        panic!("plan_json column must be text: {rows:?}");
+    };
+    let stmt = conn.prepare(sql)?;
+    let from_api = stmt
+        .query_plan_json()
+        .expect("FORMAT=JSON statement must expose query_plan_json");
+    assert_eq!(from_row, &from_api);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn format_json_statement_reports_one_text_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let stmt = conn.prepare("EXPLAIN QUERY PLAN FORMAT=JSON SELECT 1")?;
+    assert_eq!(stmt.num_columns(), 1);
+    assert_eq!(stmt.get_column_name(0), "plan_json");
+    assert_eq!(stmt.get_column_decltype(0).as_deref(), Some("TEXT"));
+    Ok(())
+}
+
+#[turso_macros::test]
+fn format_text_matches_the_default_text_output(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let sql = "SELECT u.name, o.amount FROM users u
+        LEFT JOIN orders o ON o.user_id = u.id WHERE u.age > 21";
+    let default_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+    let text_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN FORMAT=TEXT {sql}"));
+    assert_eq!(default_rows, text_rows);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn unknown_format_is_a_parse_error(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let err = conn
+        .prepare("EXPLAIN QUERY PLAN FORMAT=YAML SELECT 1")
+        .expect_err("unknown format must not prepare");
+    assert!(
+        err.to_string()
+            .contains("unknown EXPLAIN QUERY PLAN format"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn format_json_prepares_writes_without_executing_them(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let rows = limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN FORMAT=JSON INSERT INTO users(name) VALUES ('x')",
+    );
+    let rusqlite::types::Value::Text(json) = &rows[0][0] else {
+        panic!("plan_json column must be text: {rows:?}");
+    };
+    assert!(json.contains("\"version\""), "not a plan document: {json}");
+    let count = limbo_exec_rows(&conn, "SELECT count(*) FROM users");
+    assert_eq!(count[0][0], rusqlite::types::Value::Integer(0));
+    Ok(())
+}

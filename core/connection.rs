@@ -910,7 +910,7 @@ impl Connection {
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
         let schema = self.schema.read().clone();
         match translate::translate(
             &schema,
@@ -941,7 +941,8 @@ impl Connection {
                 let syms = self.syms.read();
                 let pager = self.pager.load().clone();
                 let mode = QueryMode::new(&cmd);
-                let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) =
+                    cmd;
                 let schema = self.schema.read().clone();
                 translate::translate(
                     &schema,

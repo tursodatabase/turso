@@ -167,11 +167,13 @@ pub use turso_macros::{
     turso_assert_sometimes_less_than, turso_assert_sometimes_less_than_or_equal,
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
+pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
-    FromValueRow, PrepareContext, PreparedProgram, Program, Register,
+    explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,
+    Program, Register,
 };
 pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 

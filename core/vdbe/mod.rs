@@ -87,12 +87,15 @@ use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
-use turso_parser::ast::ResolveType;
+use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
-use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
+use explain::{
+    insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS,
+    EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
+};
 use std::{
     collections::HashMap,
     num::NonZero,
@@ -1672,7 +1675,12 @@ impl Program {
         let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, pager, waker),
             QueryMode::Explain => self.explain_step(state, pager),
-            QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, pager),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Text,
+            } => self.explain_query_plan_step(state, pager),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Json,
+            } => self.explain_query_plan_json_step(state, pager),
         };
         match &result {
             Ok(StepResult::Done) => {
@@ -1830,6 +1838,40 @@ impl Program {
             state.pc += 1;
             return Ok(StepResult::Row);
         }
+    }
+
+    /// Step function of `EXPLAIN QUERY PLAN FORMAT=JSON`: emit the whole plan
+    /// as a single row holding one JSON document, then finish.
+    fn explain_query_plan_json_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<StepResult> {
+        turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len());
+        if self.connection.is_closed() {
+            // Connection is closed for whatever reason, rollback the transaction.
+            let tx_state = self.connection.get_tx_state();
+            if let TransactionState::Write { .. } = tx_state {
+                pager.rollback_tx(&self.connection);
+            }
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+            return Ok(StepResult::Interrupt);
+        }
+        // The single row has already been returned when pc is non-zero.
+        if state.pc != 0 {
+            return Ok(StepResult::Done);
+        }
+        state.registers[0].set_value(Value::from_text(crate::translate::eqp::program_plan_json(
+            self,
+        )));
+        state.result_row = Some(Row {
+            values: &state.registers[0] as *const Register,
+            count: EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(),
+        });
+        state.pc = 1;
+        Ok(StepResult::Row)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

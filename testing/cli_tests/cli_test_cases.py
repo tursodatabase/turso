@@ -19,6 +19,26 @@ def test_basic_queries():
     shell.quit()
 
 
+def test_explain_query_plan_format_json():
+    shell = TestTursoShell()
+    # The JSON plan prints as one raw line so it can be piped or pasted
+    # into tools, no matter the output mode.
+    expected = (
+        '{"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON SELECT 1;",'
+        '"result_columns":["1"],"nodes":[{"id":1,"parent":null,'
+        '"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row"}}]}'
+    )
+    shell.run_test("eqp-format-json", "EXPLAIN QUERY PLAN FORMAT=JSON SELECT 1;", expected)
+    # Switch back to list mode in the same round trip: the harness's
+    # END_OF_RESULT marker only syncs in list mode.
+    shell.run_test(
+        "eqp-format-json-pretty-mode-still-raw",
+        ".mode pretty\nEXPLAIN QUERY PLAN FORMAT=JSON SELECT 1;\n.mode list",
+        expected,
+    )
+    shell.quit()
+
+
 def test_schema_operations():
     shell = TestTursoShell(init_blobs_table=True)
     expected = (
@@ -507,6 +527,7 @@ def main():
     console.info("Running all turso CLI tests...")
     test_read_command()
     test_basic_queries()
+    test_explain_query_plan_format_json()
     test_schema_operations()
     test_file_operations()
     test_joins()

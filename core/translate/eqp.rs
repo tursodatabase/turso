@@ -4,6 +4,9 @@
 //! query plan. The `Display` impl produces the exact human-readable string
 //! shown in `EXPLAIN QUERY PLAN` output, and [`program_plan_json`] serializes
 //! the whole plan as JSON so tools don't have to parse those strings.
+//! `EXPLAIN QUERY PLAN FORMAT=JSON` returns that JSON as its result row.
+//!
+//! The JSON format is documented in `docs/eqp-json.md`.
 
 use std::fmt::{self, Display, Formatter, Write as _};
 

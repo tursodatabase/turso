@@ -36,8 +36,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    io_error, Connection, Database, LimboError, Numeric, OpenFlags, QueryMode, SqliteDialect,
-    Statement, Value,
+    io_error, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags, QueryMode,
+    SqliteDialect, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -979,8 +979,23 @@ impl Limbo {
                     (OutputMode::List, _) => {
                         self.print_list_mode(rows, statistics)?;
                     }
-                    (_, QueryMode::ExplainQueryPlan) => {
+                    (
+                        _,
+                        QueryMode::ExplainQueryPlan {
+                            format: EqpFormat::Text,
+                        },
+                    ) => {
                         self.print_explain_query_plan(rows, statistics)?;
+                    }
+                    // The one-column JSON row prints raw so it can be piped or
+                    // pasted somewhere, no matter the output mode.
+                    (
+                        _,
+                        QueryMode::ExplainQueryPlan {
+                            format: EqpFormat::Json,
+                        },
+                    ) => {
+                        self.print_list_mode(rows, statistics)?;
                     }
                     (_, QueryMode::Explain) => {
                         self.print_explain(rows, statistics)?;

@@ -547,13 +547,15 @@ impl CursorType {
 pub enum QueryMode {
     Normal,
     Explain,
-    ExplainQueryPlan,
+    ExplainQueryPlan { format: ast::EqpFormat },
 }
 
 impl QueryMode {
     pub const fn new(cmd: &ast::Cmd) -> Self {
         match cmd {
-            ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
+            ast::Cmd::ExplainQueryPlan { format, .. } => {
+                QueryMode::ExplainQueryPlan { format: *format }
+            }
             ast::Cmd::Explain(_) => QueryMode::Explain,
             ast::Cmd::Stmt(_) => QueryMode::Normal,
         }
@@ -587,7 +589,7 @@ impl ProgramBuilderOpts {
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
-        if let $crate::QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
+        if let $crate::QueryMode::ExplainQueryPlan { .. } = $builder.get_query_mode() {
             $builder.emit_explain($push, $detail);
         }
     };
@@ -1309,7 +1311,7 @@ impl ProgramBuilder {
     }
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
-        if let QueryMode::Explain | QueryMode::ExplainQueryPlan = self.query_mode {
+        if let QueryMode::Explain | QueryMode::ExplainQueryPlan { .. } = self.query_mode {
             self.comments.push((insn_index.as_offset_int(), comment));
         }
     }
@@ -1321,7 +1323,7 @@ impl ProgramBuilder {
     /// use emit_explain macro instead, because we don't want to build the
     /// plan step data if we are not in explain mode
     pub fn emit_explain(&mut self, push: bool, detail: crate::translate::eqp::EqpDetail) {
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
+        if let QueryMode::ExplainQueryPlan { .. } = self.query_mode {
             self.emit_insn(Insn::Explain {
                 p1: self.insns.len(),
                 p2: self.current_parent_explain_idx,
@@ -1342,7 +1344,7 @@ impl ProgramBuilder {
         name: &str,
         insns_start: usize,
     ) {
-        if !matches!(self.query_mode, QueryMode::ExplainQueryPlan) {
+        if !matches!(self.query_mode, QueryMode::ExplainQueryPlan { .. }) {
             return;
         }
         let node_ids: Vec<usize> = (insns_start..self.insns.len())
@@ -1365,7 +1367,7 @@ impl ProgramBuilder {
     }
 
     pub fn pop_current_parent_explain(&mut self) {
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
+        if let QueryMode::ExplainQueryPlan { .. } = self.query_mode {
             if let Some(current) = self.current_parent_explain_idx {
                 let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
                     unreachable!("current_parent_explain_idx must point to an Explain insn");
@@ -1437,7 +1439,7 @@ impl ProgramBuilder {
             *offset = old_to_new[*offset as usize] as u32;
         }
 
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
+        if let QueryMode::ExplainQueryPlan { .. } = self.query_mode {
             self.current_parent_explain_idx =
                 self.current_parent_explain_idx.map(|old| old_to_new[old]);
 
