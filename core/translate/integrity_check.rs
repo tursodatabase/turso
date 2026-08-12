@@ -13,7 +13,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, Insn},
+        insn::{CmpInsFlags, Insn, IntegrityCkData},
     },
     HashSet,
 };
@@ -218,11 +218,13 @@ fn translate_integrity_check_impl(
     let scratch_reg = program.alloc_register();
 
     program.emit_insn(Insn::IntegrityCk {
-        db: database_id,
-        max_errors,
-        roots: root_pages,
-        dropped_roots,
-        message_register: message_reg,
+        data: Box::new(IntegrityCkData {
+            db: database_id,
+            max_errors,
+            roots: root_pages,
+            dropped_roots,
+            message_register: message_reg,
+        }),
     });
 
     let no_structural_error_label = program.allocate_label();

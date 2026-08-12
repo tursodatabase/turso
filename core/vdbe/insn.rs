@@ -307,6 +307,54 @@ pub struct AddColumnData {
     pub foreign_keys: Vec<Arc<ForeignKey>>,
 }
 
+/// Data for IntegrityCk instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct IntegrityCkData {
+    pub db: usize,
+    pub max_errors: usize,
+    pub roots: Vec<i64>,
+    pub dropped_roots: Vec<i64>,
+    pub message_register: usize,
+}
+
+/// Data for AddSequence instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AddSequenceData {
+    pub db: usize,
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+/// Data for SorterOpen instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct SorterOpenData {
+    pub cursor_id: CursorID, // P1
+    pub columns: usize,      // P2
+    /// Combined order, collation, and nulls ordering per column.
+    pub order_collations_nulls: crate::alloc::Vec<(
+        SortOrder,
+        Option<CollationSeq>,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
+    /// Per-column custom type comparators for ORDER BY sorting.
+    /// When present, the comparator is used instead of standard value comparison.
+    pub comparators: crate::alloc::Vec<Option<SortComparatorType>>,
+}
+
+/// Data for ArrayEncode instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct ArrayEncodeData {
+    pub reg: usize,
+    pub element_affinity: Affinity,
+    pub element_type: Arc<str>,
+    pub table_name: Arc<str>,
+    pub col_name: Arc<str>,
+}
+
 /// Data for HashDistinct instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct HashDistinctData {
@@ -698,11 +746,7 @@ pub enum Insn {
     /// Input: reg = JSON text like '[1,2,3]'. Output: reg = record-format BLOB.
     /// Raises SQLITE_CONSTRAINT on type mismatch.
     ArrayEncode {
-        reg: usize,
-        element_affinity: Affinity,
-        element_type: Arc<str>,
-        table_name: Arc<str>,
-        col_name: Arc<str>,
+        data: Box<ArrayEncodeData>,
     },
 
     /// Convert a native record-format BLOB back to PostgreSQL-style array text for display.
@@ -1173,17 +1217,7 @@ pub enum Insn {
 
     /// Open a sorter.
     SorterOpen {
-        cursor_id: CursorID, // P1
-        columns: usize,      // P2
-        /// Combined order, collation, and nulls ordering per column.
-        order_collations_nulls: crate::alloc::Vec<(
-            SortOrder,
-            Option<CollationSeq>,
-            Option<turso_parser::ast::NullsOrder>,
-        )>,
-        /// Per-column custom type comparators for ORDER BY sorting.
-        /// When present, the comparator is used instead of standard value comparison.
-        comparators: crate::alloc::Vec<Option<SortComparatorType>>,
+        data: Box<SorterOpenData>,
     },
 
     /// Insert a row into the sorter.
@@ -1480,13 +1514,7 @@ pub enum Insn {
     /// Add a fully-configured sequence to the in-memory schema.
     /// Emitted by CREATE SEQUENCE after ParseSchema has added the backing table.
     AddSequence {
-        db: usize,
-        name: String,
-        start: i64,
-        increment: i64,
-        min_value: i64,
-        max_value: i64,
-        cycle: bool,
+        data: Box<AddSequenceData>,
     },
     /// Drop a sequence from the in-memory schema
     DropSequence {
@@ -1817,11 +1845,7 @@ pub enum Insn {
     /// In passive MVCC mode, `dropped_roots` lists checkpointed objects dropped before the next
     /// checkpoint; execute walks them after live roots and skips pages already accounted for.
     IntegrityCk {
-        db: usize,
-        max_errors: usize,
-        roots: Vec<i64>,
-        dropped_roots: Vec<i64>,
-        message_register: usize,
+        data: Box<IntegrityCkData>,
     },
     RenameTable {
         db: usize,
