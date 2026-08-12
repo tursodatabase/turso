@@ -244,7 +244,7 @@ fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDat
 
     // Second insert fails due to UNIQUE constraint
     let result = conn.execute("INSERT INTO t VALUES (2),(3)");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Third insert is valid again
     conn.execute("INSERT INTO t VALUES (4)").unwrap();
@@ -1636,7 +1636,7 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     let result =
         conn.execute("UPDATE t SET val = 'modified', u = CASE WHEN id = 1000 THEN 1 ELSE u END");
     assert!(
-        matches!(result, Err(LimboError::Constraint(_))),
+        matches!(result, Err(LimboError::UniqueConstraint(_))),
         "Expected UNIQUE constraint violation, got: {result:?}"
     );
 
@@ -1785,7 +1785,7 @@ fn test_insert_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
 
     // INSERT OR FAIL with multiple rows - (3, 'third') succeeds, then (1, 'conflict') fails
     let result = conn.execute("INSERT OR FAIL INTO t VALUES (3, 'third'), (1, 'conflict')");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify that row 3 was inserted (FAIL keeps prior changes)
     let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
@@ -1813,7 +1813,7 @@ fn test_insert_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
     // INSERT OR ABORT with multiple rows - (3, 'third') would succeed, but (1, 'conflict') fails
     // and rolls back the entire statement
     let result = conn.execute("INSERT OR ABORT INTO t VALUES (3, 'third'), (1, 'conflict')");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify that row 3 was NOT inserted (ABORT rolls back statement)
     let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
@@ -1843,7 +1843,7 @@ fn test_insert_or_rollback_rolls_back_transaction(tmp_db: TempDatabase) {
 
     // INSERT OR ROLLBACK causes the entire transaction to roll back
     let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (1, 'conflict')");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify that row 2 was rolled back (ROLLBACK affects entire transaction)
     let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
@@ -1874,7 +1874,7 @@ fn test_insert_or_rollback_unique_constraint_in_transaction(tmp_db: TempDatabase
 
     // INSERT OR ROLLBACK with unique constraint violation
     let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (3, 'alice')");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify that row 2 (bob) was rolled back
     let stmt = conn
@@ -1899,7 +1899,7 @@ fn test_insert_or_rollback_in_autocommit(tmp_db: TempDatabase) {
 
     // INSERT OR ROLLBACK in autocommit mode
     let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (1, 'conflict')");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify the original row is still there
     let stmt = conn
@@ -1922,7 +1922,7 @@ fn test_insert_or_fail_unique_constraint(tmp_db: TempDatabase) {
 
     // INSERT OR FAIL - (3, 'charlie') succeeds, then (4, 'alice') fails
     let result = conn.execute("INSERT OR FAIL INTO t VALUES (3, 'charlie'), (4, 'alice')");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify charlie was inserted (FAIL keeps prior changes)
     let stmt = conn
@@ -1953,7 +1953,7 @@ fn test_update_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
 
     // UPDATE OR FAIL - try to set val=20 which conflicts with id=2
     let result = conn.execute("UPDATE OR FAIL t SET val = 20 WHERE id = 1");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify original values (single row update, so nothing before the error to keep)
     let stmt = conn
@@ -1982,7 +1982,7 @@ fn test_update_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
 
     // UPDATE OR ABORT - try to set val=20 which conflicts with id=2
     let result = conn.execute("UPDATE OR ABORT t SET val = 20 WHERE id = 1");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify original values (ABORT rolls back statement)
     let stmt = conn
@@ -2015,7 +2015,7 @@ fn test_update_or_rollback_rolls_back_transaction(tmp_db: TempDatabase) {
 
     // UPDATE OR ROLLBACK causes the entire transaction to roll back
     let result = conn.execute("UPDATE OR ROLLBACK t SET val = 30 WHERE id = 2");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify that all changes were rolled back (including the first UPDATE)
     let stmt = conn
@@ -2048,7 +2048,7 @@ fn test_update_or_rollback_in_autocommit(tmp_db: TempDatabase) {
 
     // UPDATE OR ROLLBACK in autocommit mode
     let result = conn.execute("UPDATE OR ROLLBACK t SET val = 20 WHERE id = 1");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::UniqueConstraint(_))));
 
     // Verify original values
     let stmt = conn

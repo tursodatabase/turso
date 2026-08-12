@@ -728,9 +728,12 @@ pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
 impl From<LimboError> for TursoError {
     fn from(value: LimboError) -> Self {
         match value {
-            LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
-                TursoError::Constraint(e)
-            }
+            LimboError::ForeignKeyConstraint(e)
+            | LimboError::UniqueConstraint(e)
+            | LimboError::CheckConstraint(e)
+            | LimboError::NotNullConstraint(e)
+            | LimboError::ConstraintRaise(_, _, e)
+            | LimboError::Constraint(e) => TursoError::Constraint(e),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),

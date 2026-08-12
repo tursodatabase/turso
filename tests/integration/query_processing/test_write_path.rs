@@ -1203,7 +1203,7 @@ pub fn test_conflict_autocommit(limbo: TempDatabase) {
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     assert!(matches!(
         conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap_err(),
-        LimboError::Constraint(_)
+        LimboError::UniqueConstraint(_)
     ));
     conn2.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     assert_eq!(
@@ -1247,7 +1247,7 @@ pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
         conn1
             .execute("INSERT INTO t VALUES (2, 20), (1, 0), (3, 30)")
             .unwrap_err(),
-        LimboError::Constraint(_)
+        LimboError::UniqueConstraint(_)
     ));
     conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
     assert_eq!(
@@ -1291,7 +1291,7 @@ pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     assert!(matches!(
         conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap_err(),
-        LimboError::Constraint(_)
+        LimboError::UniqueConstraint(_)
     ));
     conn1.execute("INSERT INTO t VALUES (3, 30)").unwrap();
     conn1.execute("COMMIT").unwrap();
@@ -1364,7 +1364,7 @@ pub fn test_savepoint_rollback_uses_current_wal_snapshot(
         conn1.execute(format!(
             "UPDATE t SET payload = '{payload}', u2 = CASE WHEN u2 = 20 THEN 1 ELSE u2 END WHERE TRUE"
         )),
-        Err(LimboError::Constraint(_))
+        Err(LimboError::UniqueConstraint(_))
     ));
     conn1.execute("ROLLBACK TO sp")?;
     conn1.execute("RELEASE sp")?;
@@ -2019,6 +2019,25 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     let ic = run_integrity_check(&conn);
     assert_eq!(ic, "ok", "integrity_check after commit: {ic}");
+
+    Ok(())
+}
+#[turso_macros::test]
+fn test_strict_non_rowid_pk_null_is_not_null_constraint(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // A PostgreSQL-created STRICT table with a non-rowid TEXT primary key.
+    // Inserting NULL into the PK must surface as a NOT NULL constraint, not
+    // the generic Constraint catch-all.
+    conn.execute("CREATE TABLE t (id TEXT PRIMARY KEY, v INT) STRICT")?;
+    let err = conn.execute("INSERT INTO t VALUES (NULL, 1)").unwrap_err();
+    assert!(
+        matches!(err, LimboError::NotNullConstraint(_)),
+        "expected NotNullConstraint for NULL into STRICT non-rowid PK, got: {err:?}"
+    );
 
     Ok(())
 }

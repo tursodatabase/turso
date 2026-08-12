@@ -119,6 +119,10 @@ pub fn limbo_error_to_message(err: &LimboError) -> String {
         | LimboError::TxError(s)
         | LimboError::InvalidArgument(s)
         | LimboError::Constraint(s)
+        | LimboError::UniqueConstraint(s)
+        | LimboError::CheckConstraint(s)
+        | LimboError::NotNullConstraint(s)
+        | LimboError::ConstraintRaise(_, _, s)
         | LimboError::Conflict(s)
         | LimboError::CheckpointFailed(s) => s.clone(),
         other => other.to_string(),
@@ -136,7 +140,11 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::SchemaConflict => "SchemaConflict",
         LimboError::TableLocked => "TableLocked",
         LimboError::InvalidArgument(_) => "InvalidArgument",
-        LimboError::Constraint(_) => "Constraint",
+        LimboError::Constraint(_)
+        | LimboError::UniqueConstraint(_)
+        | LimboError::CheckConstraint(_)
+        | LimboError::NotNullConstraint(_)
+        | LimboError::ConstraintRaise(_, _, _) => "Constraint",
         LimboError::Corrupt(_) => "Corrupt",
         LimboError::ReadOnly => "ReadOnly",
         LimboError::Interrupt => "Interrupt",

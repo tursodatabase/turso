@@ -49,11 +49,30 @@ pub enum LimboError {
     InvalidArgument(String),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
+    /// A constraint failure that has no narrower variant: trigger `RAISE`,
+    /// JSON/blob/type-validation errors surfaced as SQLITE_CONSTRAINT, and the
+    /// undocumented-halt catch-all.
     #[error("{0}")]
     Constraint(String),
+    /// A UNIQUE or PRIMARY KEY violation. SQLite backs primary keys with a
+    /// unique index, so both surface as "UNIQUE constraint failed" and share
+    /// this variant (and PostgreSQL's 23505).
     #[error("{0}")]
-    /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
-    /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
+    UniqueConstraint(String),
+    #[error("{0}")]
+    CheckConstraint(String),
+    #[error("{0}")]
+    NotNullConstraint(String),
+    /// A constraint failure raised under ON CONFLICT FAIL/ROLLBACK, where the
+    /// resolve type is embedded (like `Raise`) so `abort()` knows whether to
+    /// roll back, but the constraint kind survives so the pgwire layer can map
+    /// the SQLSTATE.
+    #[error("{2}")]
+    ConstraintRaise(turso_parser::ast::ResolveType, ConstraintKind, String),
+    /// Split out from `Constraint` because ON CONFLICT never applies to a
+    /// foreign-key violation, so instead of matching on the message string we
+    /// give it its own variant. The pgwire layer maps it to 23503.
+    #[error("{0}")]
     ForeignKeyConstraint(String),
     #[error("{1}")]
     Raise(turso_parser::ast::ResolveType, String),
@@ -130,7 +149,13 @@ impl LimboError {
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
-            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            Self::Constraint(_)
+            | Self::UniqueConstraint(_)
+            | Self::CheckConstraint(_)
+            | Self::NotNullConstraint(_)
+            | Self::ForeignKeyConstraint(_)
+            | Self::ConstraintRaise(..)
+            | Self::Raise(..) => 19,
             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
@@ -144,6 +169,16 @@ impl LimboError {
             _ => 1,
         }
     }
+}
+
+/// The kind of a column-constraint violation. Carried by the typed constraint
+/// variants and by [`LimboError::ConstraintRaise`] so callers can map a
+/// violation to its SQLSTATE without parsing the VDBE message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintKind {
+    Unique,
+    Check,
+    NotNull,
 }
 
 impl From<crate::alloc::AllocError> for LimboError {

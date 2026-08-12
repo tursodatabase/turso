@@ -17522,7 +17522,13 @@ fn test_snapshot_stability_full() {
                         };
                         match conn.execute(&sql) {
                             Ok(_) => {}
-                            Err(LimboError::Constraint(_)) => {}
+                            Err(
+                                LimboError::Constraint(_)
+                                | LimboError::UniqueConstraint(_)
+                                | LimboError::CheckConstraint(_)
+                                | LimboError::NotNullConstraint(_)
+                                | LimboError::ForeignKeyConstraint(_),
+                            ) => {}
                             Err(LimboError::WriteWriteConflict)
                             | Err(LimboError::Busy)
                             | Err(LimboError::TxTerminated) => {

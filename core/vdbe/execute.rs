@@ -73,9 +73,9 @@ use crate::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
-        SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
-        SQLITE_ERROR, SQLITE_FULL,
+        ConstraintKind, LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK,
+        SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+        SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR, SQLITE_FULL,
     },
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
@@ -2344,12 +2344,12 @@ pub fn op_type_check(
             // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
             if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
             {
-                bail_constraint_error!(
+                return crate::error::cold_return(Err(LimboError::NotNullConstraint(format!(
                     "NOT NULL constraint failed: {}.{} ({})",
                     &table_reference.name,
                     col.name.as_deref().unwrap_or(""),
                     SQLITE_CONSTRAINT
-                )
+                ))));
             } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
                 // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
                 return Ok(());
@@ -3372,6 +3372,16 @@ pub fn op_prev(
     }
     Ok(InsnFunctionStepResult::Step)
 }
+/// Map a `SQLITE_CONSTRAINT_*` halt code to its constraint kind, or `None` for
+/// codes that are not a column constraint (foreign-key, trigger `RAISE`).
+fn constraint_kind_from_err_code(err_code: usize) -> Option<ConstraintKind> {
+    match err_code {
+        SQLITE_CONSTRAINT_PRIMARYKEY | SQLITE_CONSTRAINT_UNIQUE => Some(ConstraintKind::Unique),
+        SQLITE_CONSTRAINT_CHECK => Some(ConstraintKind::Check),
+        SQLITE_CONSTRAINT_NOTNULL => Some(ConstraintKind::NotNull),
+        _ => None,
+    }
+}
 
 pub fn halt(
     program: &Program,
@@ -3411,7 +3421,12 @@ pub fn halt(
         if err_code > 0 {
             let error = match resolve_type {
                 ResolveType::Abort | ResolveType::Rollback | ResolveType::Fail => {
-                    LimboError::Raise(resolve_type, description.to_string())
+                    match constraint_kind_from_err_code(err_code) {
+                        Some(kind) => {
+                            LimboError::ConstraintRaise(resolve_type, kind, description.to_string())
+                        }
+                        None => LimboError::Raise(resolve_type, description.to_string()),
+                    }
                 }
                 ResolveType::Ignore => unreachable!("handled above"),
                 ResolveType::Replace => unreachable!("Replace not valid for RAISE"),
@@ -3430,16 +3445,16 @@ pub fn halt(
     // Determine the constraint error (if any) based on error code
     let constraint_error = match err_code {
         0 => None,
-        SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
+        SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::UniqueConstraint(format!(
             "UNIQUE constraint failed: {description}"
         ))),
-        SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
+        SQLITE_CONSTRAINT_CHECK => Some(LimboError::CheckConstraint(format!(
             "CHECK constraint failed: {description}"
         ))),
-        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
+        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::NotNullConstraint(format!(
             "NOT NULL constraint failed: {description}"
         ))),
-        SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
+        SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::UniqueConstraint(format!(
             "UNIQUE constraint failed: {description}"
         ))),
         SQLITE_CONSTRAINT_FOREIGNKEY => {
@@ -3493,11 +3508,21 @@ pub fn halt(
         // before the error. Re-tag the constraint as a FAIL raise so the outer
         // program's abort() preserves and commits them instead of rolling the
         // statement back. FK errors do not respect ON CONFLICT, so leave them
-        // as-is.
         if program.resolve_type == ResolveType::Fail {
-            if let LimboError::Constraint(msg) = error {
-                return Err(LimboError::Raise(ResolveType::Fail, msg));
-            }
+            let raised = match error {
+                LimboError::UniqueConstraint(msg) => {
+                    LimboError::ConstraintRaise(ResolveType::Fail, ConstraintKind::Unique, msg)
+                }
+                LimboError::CheckConstraint(msg) => {
+                    LimboError::ConstraintRaise(ResolveType::Fail, ConstraintKind::Check, msg)
+                }
+                LimboError::NotNullConstraint(msg) => {
+                    LimboError::ConstraintRaise(ResolveType::Fail, ConstraintKind::NotNull, msg)
+                }
+                LimboError::Constraint(msg) => LimboError::Raise(ResolveType::Fail, msg),
+                other => return Err(other),
+            };
+            return Err(raised);
         }
 
         // For non-FAIL modes (or non-autocommit), just return the error.
@@ -5275,7 +5300,12 @@ pub fn op_program(
                                 return Err(LimboError::Busy);
                             }
                         },
-                        Err(LimboError::Constraint(constraint_err)) => {
+                        Err(
+                            e @ (LimboError::Constraint(_)
+                            | LimboError::UniqueConstraint(_)
+                            | LimboError::CheckConstraint(_)
+                            | LimboError::NotNullConstraint(_)),
+                        ) => {
                             if program.resolve_type != ResolveType::Ignore {
                                 subprogram_aborted = true;
                                 finish_subprogram(
@@ -5286,7 +5316,7 @@ pub fn op_program(
                                     saved_last_insert_rowid,
                                     saved_last_changes_value,
                                 );
-                                return Err(LimboError::Constraint(constraint_err));
+                                return Err(e);
                             }
                             subprogram_aborted = true;
                             break;
@@ -12184,7 +12214,7 @@ pub fn op_idx_insert(
                     if flags.has(IdxInsertFlags::NO_OP_DUPLICATE) {
                         break 'i true;
                     }
-                    return Err(LimboError::Constraint(
+                    return Err(LimboError::UniqueConstraint(
                         "UNIQUE constraint failed: duplicate key".into(),
                     ));
                 }

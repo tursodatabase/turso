@@ -2729,9 +2729,22 @@ impl Program {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
-                    && self.resolve_type == ResolveType::Fail)
-                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
+                let is_fail_constraint = (matches!(
+                    err,
+                    Some(
+                        LimboError::Constraint(_)
+                            | LimboError::UniqueConstraint(_)
+                            | LimboError::CheckConstraint(_)
+                            | LimboError::NotNullConstraint(_)
+                    )
+                ) && self.resolve_type == ResolveType::Fail)
+                    || matches!(
+                        err,
+                        Some(
+                            LimboError::Raise(ResolveType::Fail, _)
+                                | LimboError::ConstraintRaise(ResolveType::Fail, _, _)
+                        )
+                    );
                 if !is_fail_constraint {
                     if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
@@ -2796,9 +2809,17 @@ impl Program {
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
                 // - ABORT (default): rollback statement, rollback txn if autocommit
-                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
+                Some(
+                    LimboError::Constraint(_)
+                    | LimboError::UniqueConstraint(_)
+                    | LimboError::CheckConstraint(_)
+                    | LimboError::NotNullConstraint(_),
+                )
+                | Some(LimboError::Raise(_, _))
+                | Some(LimboError::ConstraintRaise(_, _, _)) => {
                     let effective_resolve = match err {
-                        Some(LimboError::Raise(rt, _)) => *rt,
+                        Some(LimboError::Raise(rt, _))
+                        | Some(LimboError::ConstraintRaise(rt, _, _)) => *rt,
                         _ => self.resolve_type,
                     };
                     match effective_resolve {

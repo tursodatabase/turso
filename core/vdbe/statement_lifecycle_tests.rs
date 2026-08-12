@@ -893,7 +893,7 @@ fn test_first_writer_without_statement_savepoint_error_rolls_back_joined_writer(
         .step()
         .expect_err("resumed INSERT SELECT should hit duplicate primary key");
     assert!(
-        matches!(err, LimboError::Constraint(_)),
+        matches!(err, LimboError::UniqueConstraint(_)),
         "expected duplicate-key constraint error, got {err:?}"
     );
     drop(insert_select);
@@ -1389,7 +1389,7 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
         .execute("INSERT INTO rows SELECT id, v FROM src")
         .expect_err("second insert should hit duplicate primary key");
     assert!(
-        matches!(err, LimboError::Constraint(_)),
+        matches!(err, LimboError::UniqueConstraint(_)),
         "expected duplicate-key constraint error, got {err:?}"
     );
 

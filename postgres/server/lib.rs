@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::Value;
+use turso_core::{ConstraintKind, LimboError, Value};
 use turso_pg::{split_statements, Connection, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
@@ -188,7 +188,7 @@ impl SimpleQueryHandler for TursoPgHandler {
         for sql in &statements {
             let mut stmt = conn
                 .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+                .map_err(|e| PgWireError::UserError(Box::new(error_info_from_core(&e))))?;
 
             self.cleanup_dropped_schema_file(sql);
 
@@ -227,7 +227,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
         let mut stmt = conn
             .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info_from_core(&e))))?;
 
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
@@ -254,7 +254,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info_from_core(&e))))?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -277,7 +277,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info_from_core(&e))))?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -401,7 +401,7 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(|e| PgWireError::UserError(Box::new(error_info_from_core(&e))))?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
@@ -410,7 +410,7 @@ fn execute_query(
 /// Execute a non-SELECT statement and build an Execution response.
 fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
     stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        .map_err(|e| PgWireError::UserError(Box::new(error_info_from_core(&e))))?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -755,6 +755,38 @@ fn is_create_table_as(upper: &str) -> bool {
     matches!(tokens.next(), Some(t) if t == "AS" || t.starts_with("AS("))
 }
 
+/// The PostgreSQL SQLSTATE that best describes a core error. Constraint
+/// failures get their real class-23 codes so drivers (node-postgres ->
+/// db-result) can tell unique / foreign-key / check / not-null apart. The
+/// engine distinguishes each with its own `LimboError` variant, so the mapping
+/// is structural. Everything else stays XX000 until the engine grows richer
+/// error typing.
+fn sqlstate_for_error(e: &LimboError) -> &'static str {
+    match e {
+        LimboError::ForeignKeyConstraint(_) => "23503",
+        LimboError::UniqueConstraint(_)
+        | LimboError::ConstraintRaise(_, ConstraintKind::Unique, _) => "23505",
+        LimboError::CheckConstraint(_)
+        | LimboError::ConstraintRaise(_, ConstraintKind::Check, _) => "23514",
+        LimboError::NotNullConstraint(_)
+        | LimboError::ConstraintRaise(_, ConstraintKind::NotNull, _) => "23502",
+        _ => "XX000",
+    }
+}
+
+/// Build the wire `ErrorInfo` for a core error: a real SQLSTATE when the
+/// engine distinguished the constraint, the engine's message verbatim either
+/// way.
+fn error_info_from_core(e: &LimboError) -> ErrorInfo {
+    ErrorInfo::new(
+        "ERROR".to_owned(),
+        sqlstate_for_error(e).to_owned(),
+        e.to_string(),
+    )
+}
+
+/// Build the wire `ErrorInfo` for a non-core error (statement splitting,
+/// parameter decoding) that has only a message.
 fn error_info(message: &str) -> ErrorInfo {
     ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
 }
@@ -762,6 +794,44 @@ fn error_info(message: &str) -> ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sqlstate_for_error_constraint_mapping() {
+        // The four constraint families the wire protocol must distinguish.
+        assert_eq!(
+            sqlstate_for_error(&LimboError::ForeignKeyConstraint("orphan".to_owned())),
+            "23503"
+        );
+        assert_eq!(
+            sqlstate_for_error(&LimboError::UniqueConstraint(
+                "UNIQUE constraint failed: post.slug".to_owned()
+            )),
+            "23505"
+        );
+        assert_eq!(
+            sqlstate_for_error(&LimboError::CheckConstraint(
+                "CHECK constraint failed: locale IN ('is', 'en')".to_owned()
+            )),
+            "23514"
+        );
+        assert_eq!(
+            sqlstate_for_error(&LimboError::NotNullConstraint(
+                "NOT NULL constraint failed: post.title".to_owned()
+            )),
+            "23502"
+        );
+        // Anything else stays the generic code.
+        assert_eq!(
+            sqlstate_for_error(&LimboError::Constraint(
+                "JSON cannot hold BLOB values".to_owned()
+            )),
+            "XX000"
+        );
+        assert_eq!(
+            sqlstate_for_error(&LimboError::ParseError("bad SQL".to_owned())),
+            "XX000"
+        );
+    }
 
     #[test]
     fn test_pg_bytes_to_value_integer() {
