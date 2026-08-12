@@ -15,6 +15,8 @@
  *   errmsg                      — most recent error message
  *   null ?value?                — get/set NULL representation string
  *   func name ?arg...? body     — register a Tcl-backed scalar SQL function
+ *   status step|sort|autoindex|vmstep — statement counters from the last
+ *                                 completed [db eval] statement
  *   transaction ?type? script   — run script inside a transaction
  *   close                       — close database and delete command
  *   limit ...                   — stub returning a default value
@@ -49,6 +51,12 @@ typedef struct TursoDb {
     CachedStmt  stmt_cache[STMT_CACHE_SIZE];
     int         cache_count;
     int         txn_depth;  /* nesting depth of [db transaction] scripts */
+    /* [db status] counters, captured from the last statement that ran to
+     * completion in [db eval], as in upstream tclsqlite.c */
+    int         n_step;     /* SQLITE_STMTSTATUS_FULLSCAN_STEP */
+    int         n_sort;     /* SQLITE_STMTSTATUS_SORT */
+    int         n_index;    /* SQLITE_STMTSTATUS_AUTOINDEX */
+    int         n_vm_step;  /* SQLITE_STMTSTATUS_VM_STEP */
 } TursoDb;
 
 /* ------------------------------------------------------------------ */
@@ -188,6 +196,17 @@ static void bind_tcl_variables(Tcl_Interp *interp, sqlite3_stmt *stmt)
     }
 }
 
+/* Save the [db status] counters from a statement that just ran to
+ * completion. The reset flag clears the statement's counters so a cached
+ * statement starts each run from zero, as in upstream tclsqlite.c. */
+static void capture_stmt_status(TursoDb *tdb, sqlite3_stmt *stmt)
+{
+    tdb->n_step    = sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, 1);
+    tdb->n_sort    = sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_SORT, 1);
+    tdb->n_index   = sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_AUTOINDEX, 1);
+    tdb->n_vm_step = sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_VM_STEP, 1);
+}
+
 /* ------------------------------------------------------------------ */
 /* Tcl scalar function bridge                                           */
 /* ------------------------------------------------------------------ */
@@ -302,6 +321,8 @@ static int exec_sql_collect(TursoDb *tdb,
             return TCL_ERROR;
         }
 
+        capture_stmt_status(tdb, cached_stmt);
+
         *result_list_out = result_list;
         return TCL_OK;
     }
@@ -356,6 +377,8 @@ static int exec_sql_collect(TursoDb *tdb,
             return TCL_ERROR;
         }
 
+        capture_stmt_status(tdb, stmt);
+
         /* Cache single-statement SQL with bind parameters */
         if (sqlite3_bind_parameter_count(stmt) > 0) {
             /* Check if tail is empty (single statement) */
@@ -403,13 +426,13 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     static const char *cmds[] = {
         "eval", "one", "exists", "changes", "total_changes",
         "last_insert_rowid", "errorcode", "errmsg", "null", "nullvalue",
-        "func", "function", "close", "limit", "transaction",
+        "func", "function", "close", "limit", "status", "transaction",
         NULL
     };
     enum {
         CMD_EVAL, CMD_ONE, CMD_EXISTS, CMD_CHANGES, CMD_TOTAL_CHANGES,
         CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL, CMD_NULLVALUE,
-        CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT, CMD_TRANSACTION
+        CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT, CMD_STATUS, CMD_TRANSACTION
     };
     int cmdIdx;
 
@@ -472,6 +495,41 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     case CMD_LIMIT:
         Tcl_SetObjResult(interp, Tcl_NewIntObj(1000000));
         return TCL_OK;
+
+    /* ---- status ---- */
+
+    case CMD_STATUS: {
+        /*
+         * db status step|sort|autoindex|vmstep
+         *
+         * Returns a counter from the last statement that ran to completion
+         * in [db eval]; tests use this to check that the planner picked an
+         * index scan (step) or avoided a sort pass (sort).
+         */
+        if (objc != 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "(step|sort|autoindex|vmstep)");
+            return TCL_ERROR;
+        }
+        const char *op = Tcl_GetString(objv[2]);
+        int v;
+        if (strcmp(op, "step") == 0) {
+            v = tdb->n_step;
+        } else if (strcmp(op, "sort") == 0) {
+            v = tdb->n_sort;
+        } else if (strcmp(op, "autoindex") == 0) {
+            v = tdb->n_index;
+        } else if (strcmp(op, "vmstep") == 0) {
+            v = tdb->n_vm_step;
+        } else {
+            /* same error text as upstream tclsqlite.c */
+            Tcl_AppendResult(interp,
+                "bad argument: should be autoindex, step, sort or vmstep",
+                NULL);
+            return TCL_ERROR;
+        }
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(v));
+        return TCL_OK;
+    }
 
     /* ---- transaction ---- */
 
@@ -640,6 +698,9 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
                     }
                 }
 
+                if (rc == SQLITE_DONE) {
+                    capture_stmt_status(tdb, stmt);
+                }
                 sqlite3_finalize(stmt);
 
                 if (loop_rc != TCL_OK) return loop_rc;
@@ -1673,6 +1734,10 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
     tdb->null_obj    = NULL;
     tdb->cache_count = 0;
     tdb->txn_depth   = 0;
+    tdb->n_step      = 0;
+    tdb->n_sort      = 0;
+    tdb->n_index     = 0;
+    tdb->n_vm_step   = 0;
 
     Tcl_CreateObjCommand(interp, handle_name, TursoDbCmd,
                          (ClientData)tdb, TursoDbFree);
