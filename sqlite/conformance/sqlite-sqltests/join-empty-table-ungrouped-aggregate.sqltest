@@ -34,8 +34,7 @@ setup empty-table-with-default {
     ALTER TABLE t ADD COLUMN y DEFAULT 99;
 }
 
-# Adjacent column reads are fused into ColumnRange. An unopened cursor's NULL
-# row must override column defaults just as it does for separate Column opcodes.
+# This fails if ColumnRange doesn't check for NullRow.
 @setup empty-table-with-default
 test inner-join-empty-table-ungrouped-aggregate-column-range {
     SELECT b.x, b.y, COUNT(*) FROM t a JOIN t b ON a.x=b.x;
