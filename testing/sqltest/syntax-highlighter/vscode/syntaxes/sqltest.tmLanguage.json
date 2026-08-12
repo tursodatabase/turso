@@ -43,7 +43,8 @@
       "patterns": [
         { "include": "#directive-skip-file" },
         { "include": "#directive-skip-file-if" },
-        { "include": "#directive-requires-file" }
+        { "include": "#directive-requires-file" },
+        { "include": "#directive-verify-materialized-views" }
       ]
     },
     "directive-skip-file": {
@@ -104,6 +105,13 @@
           "match": "\\\\."
         }
       ]
+    },
+    "directive-verify-materialized-views": {
+      "name": "meta.directive.verify-materialized-views.sqltest",
+      "match": "(@verify-materialized-views)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.directive.sqltest" }
+      }
     },
     "setup-block": {
       "name": "meta.setup-block.sqltest",

@@ -97,7 +97,6 @@ pub use functions::printf::{exec_printf_values, printf_c_arg_plan, PrintfCArg};
 
 use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
-    incremental::view::AllViewsTxState,
     index_method::IndexMethod,
     schema::Trigger,
     storage::encryption::AtomicCipherMode,

@@ -10,12 +10,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use differential_fuzzer::memory::MemorySimIO;
-use differential_fuzzer::oracle::{DifferentialOracle, QueryResult, Row};
+use differential_fuzzer::oracle::{DifferentialOracle, QueryResult, QueryValue, Row};
 use differential_fuzzer::printf_gen::{EDGE_CASE_BATTERY, PrintfGenerator};
 use rand::RngCore;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use sql_gen_prop::SqlValue;
 use turso_core::{Database, SqliteDialect};
 
 #[derive(Parser, Debug)]
@@ -187,7 +186,7 @@ fn rows_fuzzy_eq(a: &[Row], b: &[Row]) -> bool {
         }
         for (va, vb) in ra.0.iter().zip(rb.0.iter()) {
             match (va, vb) {
-                (SqlValue::Text(ta), SqlValue::Text(tb)) => {
+                (QueryValue::Text(ta), QueryValue::Text(tb)) => {
                     if !fuzzy_text_eq(ta, tb) {
                         // Different float-to-decimal algorithms can produce
                         // representations of different length (e.g. "1E+308" vs
@@ -242,9 +241,9 @@ fn fmt_text_diff(a: &str, b: &str) -> String {
 fn fmt_result_diff(turso: &QueryResult, sqlite: &QueryResult) -> String {
     match (turso, sqlite) {
         (QueryResult::Rows(t_rows), QueryResult::Rows(s_rows)) => {
-            for (tr, sr) in t_rows.iter().zip(s_rows.iter()) {
+            for (tr, sr) in t_rows.rows().iter().zip(s_rows.rows()) {
                 for (tv, sv) in tr.0.iter().zip(sr.0.iter()) {
-                    if let (SqlValue::Text(ta), SqlValue::Text(tb)) = (tv, sv) {
+                    if let (QueryValue::Text(ta), QueryValue::Text(tb)) = (tv, sv) {
                         if ta != tb {
                             return fmt_text_diff(ta, tb);
                         }
@@ -316,7 +315,9 @@ impl FuzzerState {
                     // Both produced rows — good enough for blob cases
                     let _ = (t_rows, s_rows);
                     None
-                } else if !rows_fuzzy_eq(t_rows, s_rows) {
+                } else if t_rows.column_count() != s_rows.column_count()
+                    || !rows_fuzzy_eq(t_rows.rows(), s_rows.rows())
+                {
                     Some(format!(
                         "Result mismatch:\n  {}",
                         fmt_result_diff(&turso_result, &sqlite_result),

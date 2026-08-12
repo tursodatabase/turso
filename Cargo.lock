@@ -1850,6 +1850,7 @@ dependencies = [
  "indexmap 2.11.1",
  "parking_lot",
  "proptest",
+ "query-result-oracle",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rusqlite",
@@ -4983,6 +4984,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "query-result-oracle"
+version = "0.8.0-pre.4"
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6266,6 +6271,7 @@ dependencies = [
  "num_cpus",
  "owo-colors 4.2.3",
  "pretty_assertions",
+ "query-result-oracle",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "regex",

@@ -42,6 +42,7 @@ pub fn insn_to_row(
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => virtual_table.name.as_str(),
             CursorType::MaterializedView(table, _) => table.name.as_str(),
+            CursorType::ViewDelta { view_name, .. } => view_name.as_str(),
             CursorType::Sorter => "sorter",
         };
         if ephemeral_cursors.contains(&cursor_id) {
@@ -590,6 +591,10 @@ pub fn insn_to_row(
                     CursorType::MaterializedView(table, _) => {
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
+                    }
+                    CursorType::ViewDelta { table, .. } => {
+                        // The trailing weight column has no schema entry.
+                        table.columns().get(*column).and_then(|v| v.name.as_ref())
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
@@ -1359,6 +1364,28 @@ pub fn insn_to_row(
                 Value::build_text(func.as_str()),
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
+            ),
+            Insn::AggContextLoad {
+                acc_reg,
+                payload_start_reg,
+                func,
+            } => (
+                "AggContextLoad",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
+            Insn::AggContextStore { acc_reg, payload_start_reg, func } => (
+                "AggContextStore",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
             ),
             Insn::SorterOpen {
                 cursor_id,

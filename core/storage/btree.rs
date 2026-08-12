@@ -2336,6 +2336,10 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
+                // Deleting the final row can leave this cursor carrying its
+                // old position while the cell bytes remain physically intact.
+                // A seek into the now-empty tree must invalidate that position.
+                self.set_has_record(false);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
             let min_cell_idx = 0;
@@ -2555,6 +2559,8 @@ impl BTreeCursor {
             let contents = page.get_contents();
             let cell_count = contents.cell_count();
             if cell_count == 0 {
+                // Match table seeks: an empty leaf never has a current record.
+                self.set_has_record(false);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
 
@@ -13096,6 +13102,100 @@ mod tests {
             usable_space - page.get_contents().header_size() - total_size
         );
         dbg!(free);
+    }
+
+    #[test]
+    fn seek_after_delete_to_empty_clears_record_position() {
+        let (pager, root_page, _, _) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+
+        insert_record(&mut cursor, &pager, 1, Value::from_i64(10)).unwrap();
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        assert!(!cursor.has_record());
+        assert_eq!(
+            run_until_done(|| cursor.rowid(), pager.deref()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn index_seek_after_delete_to_empty_clears_record_position() {
+        let (pager, _, _, _) = empty_btree();
+        let root_page = run_until_done(
+            || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
+            pager.deref(),
+        )
+        .unwrap() as i64;
+        let index = Index {
+            name: "seek_empty_index".to_string(),
+            where_clause: None,
+            columns: IndexColumn::new_many(["value".to_string()]),
+            table_name: "seek_empty_table".to_string(),
+            root_page,
+            unique: false,
+            ephemeral: false,
+            has_rowid: false,
+            index_method: None,
+            on_conflict: None,
+        };
+        let mut cursor = BTreeCursor::new_index(pager.clone(), root_page, &index, 1).unwrap();
+        let registers = [Register::Value(Value::from_i64(10))];
+        let record = ImmutableRecord::from_registers(&registers, registers.len()).unwrap();
+
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_index_key(record.as_record_ref())),
+            pager.deref(),
+        )
+        .unwrap();
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        assert!(!cursor.has_record());
     }
 
     #[test]

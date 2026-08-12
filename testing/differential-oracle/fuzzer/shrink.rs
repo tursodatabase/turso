@@ -25,7 +25,7 @@ use turso_parser::ast::{
 use turso_parser::parser::Parser;
 
 use crate::memory::MemorySimIO;
-use crate::oracle::{DifferentialOracle, QueryResult};
+use crate::oracle::{DifferentialOracle, QueryResult, QueryValue};
 
 /// Upper bound on candidate executions per shrink, so a pathological
 /// statement cannot stall a fuzzing loop.
@@ -140,8 +140,8 @@ impl EnginePair {
             let QueryResult::Rows(names) = sqlite_names else {
                 continue;
             };
-            for row in &names {
-                let Some(sql_gen_prop::SqlValue::Text(name)) = row.0.first() else {
+            for row in names.rows() {
+                let Some(QueryValue::Text(name)) = row.0.first() else {
                     continue;
                 };
                 let table_sql = format!("SELECT * FROM {db}.{name} ORDER BY rowid");
@@ -159,7 +159,7 @@ impl EnginePair {
 pub fn query_results_differ(a: &QueryResult, b: &QueryResult) -> bool {
     match (a, b) {
         (QueryResult::Rows(ra), QueryResult::Rows(rb)) => {
-            !sql_gen_prop::result::diff_results(ra, rb).is_empty()
+            !query_result_oracle::diff_result_sets(ra, rb).is_empty()
         }
         (QueryResult::Ok, QueryResult::Ok) => false,
         (QueryResult::Error(_), QueryResult::Error(_)) => false,

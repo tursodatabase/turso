@@ -798,6 +798,25 @@ expect {
     1|hello
 }
 
+# Differential-fuzzer regression: successful ADD COLUMN statements can expose
+# empty result metadata, so their observable result is the resulting schema.
+@cross-check-integrity
+test strict-alter-add-column-resulting-schema {
+    CREATE TABLE tbl_imaginative_chris (
+        col_captivating_building INTEGER PRIMARY KEY,
+        col_ravishing_yearzero TEXT UNIQUE
+    ) STRICT;
+    ALTER TABLE tbl_imaginative_chris ADD COLUMN col_loyal_sarnoff TEXT;
+    SELECT name, type
+      FROM pragma_table_info('tbl_imaginative_chris')
+     ORDER BY cid;
+}
+expect {
+    col_captivating_building|INTEGER
+    col_ravishing_yearzero|TEXT
+    col_loyal_sarnoff|TEXT
+}
+
 @cross-check-integrity
 test strict-alter-add-column-any {
     CREATE TABLE t(a INTEGER) STRICT;

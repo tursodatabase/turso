@@ -1,0 +1,3406 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# Materialized views are maintained by compiled VDBE programs (filter/project
+# shapes). These tests pin the maintenance semantics: population, insert,
+# delete, update (including across the filter boundary), and — critically —
+# that captured deltas from aborted statements and rolled-back transactions
+# never reach the view.
+
+test matview-vdbe-populate-and-maintain {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    INSERT INTO t1 VALUES (1,'x'),(2,'y'),(3,'z');
+    CREATE MATERIALIZED VIEW v1 AS SELECT a, b FROM t1 WHERE a >= 2;
+    INSERT INTO t1 VALUES (4,'w');
+    DELETE FROM t1 WHERE a = 2;
+    UPDATE t1 SET a = 10 WHERE a = 3;
+    SELECT * FROM v1 ORDER BY a;
+}
+expect {
+    4|w
+    10|z
+}
+
+# Even a stateless circuit persists its storage version. Missing this marker
+# made old filter/project views appear compatible after identity or lowering
+# changes because they had no operator-state tables to carry the version.
+test matview-vdbe-stateless-version-marker {
+    CREATE TABLE versioned_base(id INTEGER PRIMARY KEY, enabled INTEGER);
+    CREATE MATERIALIZED VIEW versioned_stateless AS
+      SELECT id FROM versioned_base WHERE enabled <> 0;
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name = '__turso_internal_dbsp_metadata_v2_versioned_stateless';
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE tbl_name = '__turso_internal_dbsp_metadata_v2_versioned_stateless';
+    INSERT INTO versioned_base VALUES (1, 1);
+    SELECT * FROM versioned_stateless;
+    DROP VIEW versioned_stateless;
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE name = '__turso_internal_dbsp_metadata_v2_versioned_stateless';
+}
+expect {
+    table|__turso_internal_dbsp_metadata_v2_versioned_stateless|__turso_internal_dbsp_metadata_v2_versioned_stateless
+    1
+    1
+    0
+}
+
+test matview-vdbe-update-across-filter-boundary {
+    CREATE TABLE t2(a INTEGER, b TEXT);
+    INSERT INTO t2 VALUES (1,'in'),(5,'out');
+    CREATE MATERIALIZED VIEW v2 AS SELECT a, b FROM t2 WHERE a >= 3;
+    UPDATE t2 SET a = 7 WHERE b = 'in';
+    UPDATE t2 SET a = 0 WHERE b = 'out';
+    SELECT * FROM v2 ORDER BY a;
+}
+expect {
+    7|in
+}
+
+test matview-vdbe-expression-projection {
+    CREATE TABLE t3(a INTEGER, b INTEGER);
+    INSERT INTO t3 VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW v3 AS SELECT a + b AS s FROM t3 WHERE b IS NOT NULL;
+    INSERT INTO t3 VALUES (3, NULL), (4, 40);
+    SELECT * FROM v3 ORDER BY s;
+}
+expect {
+    11
+    22
+    44
+}
+
+# Same-transaction reads must see uncommitted changes through the view.
+test matview-vdbe-read-your-own-writes {
+    CREATE TABLE t5(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t5 VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW v5 AS SELECT a, b + 1 AS b1 FROM t5 WHERE b >= 20;
+    BEGIN;
+    INSERT INTO t5 VALUES (3, 30);
+    UPDATE t5 SET b = 25 WHERE a = 1;
+    DELETE FROM t5 WHERE a = 2;
+    SELECT a, b1 FROM v5 ORDER BY a;
+    COMMIT;
+    SELECT a, b1 FROM v5 ORDER BY a;
+}
+expect {
+    1|26
+    3|31
+    1|26
+    3|31
+}
+
+# Overlay invalidation is a content revision, not a delta-row count. Rolling
+# back and replacing a change can otherwise reuse a stale overlay when the
+# transaction returns to the same number of captured rows.
+test matview-vdbe-read-your-own-writes-after-rewind-count-collision {
+    CREATE TABLE ryw_revision(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW ryw_revision_view AS SELECT id FROM ryw_revision;
+    BEGIN;
+    INSERT INTO ryw_revision VALUES (1);
+    SELECT * FROM ryw_revision_view ORDER BY id;
+    SAVEPOINT replace_change;
+    INSERT INTO ryw_revision VALUES (2);
+    SELECT * FROM ryw_revision_view ORDER BY id;
+    ROLLBACK TO replace_change;
+    INSERT INTO ryw_revision VALUES (3);
+    SELECT * FROM ryw_revision_view ORDER BY id;
+    COMMIT;
+    SELECT * FROM ryw_revision_view ORDER BY id;
+}
+expect {
+    1
+    1
+    2
+    1
+    3
+    1
+    3
+}
+
+# Compound NULL checks in WHERE: the retired circuit compiler's
+# projection-rewrite path collapsed 'a IS NOT NULL AND b IS NOT NULL' onto a
+# single column (fixed there in ef675eaec); the VDBE codegen translates the
+# whole predicate with the shared condition translator.
+test matview-vdbe-compound-null-check-filter {
+    CREATE TABLE tnn(a INTEGER, b INTEGER);
+    INSERT INTO tnn VALUES (1, NULL), (NULL, 2), (3, 4), (NULL, NULL);
+    CREATE MATERIALIZED VIEW vnn AS SELECT a, b FROM tnn WHERE a IS NOT NULL AND b IS NOT NULL;
+    INSERT INTO tnn VALUES (5, NULL), (6, 7);
+    SELECT * FROM vnn ORDER BY a;
+}
+expect {
+    3|4
+    6|7
+}
+
+# Negative literals in WHERE were rejected by the retired circuit compiler;
+# the VDBE codegen supports them.
+test matview-vdbe-negative-literal-filter {
+    CREATE TABLE t7(a INTEGER, b TEXT);
+    INSERT INTO t7 VALUES (-5,'neg'), (3,'pos');
+    CREATE MATERIALIZED VIEW v7 AS SELECT a, b FROM t7 WHERE a < -2;
+    INSERT INTO t7 VALUES (-10,'neg2');
+    SELECT * FROM v7 ORDER BY a;
+}
+expect {
+    -10|neg2
+    -5|neg
+}
+
+test matview-vdbe-nondeterministic-projection-rejected {
+    CREATE TABLE nondeterministic_projection_base(x INTEGER);
+    CREATE MATERIALIZED VIEW nondeterministic_projection AS
+      SELECT random() FROM nondeterministic_projection_base;
+}
+expect error {
+    materialized views with non-deterministic expressions are not yet supported
+}
+
+test matview-vdbe-nondeterministic-filter-rejected {
+    CREATE TABLE nondeterministic_filter_base(x INTEGER);
+    CREATE MATERIALIZED VIEW nondeterministic_filter AS
+      SELECT x FROM nondeterministic_filter_base WHERE random() > 0;
+}
+expect error {
+    materialized views with non-deterministic expressions are not yet supported
+}
+
+test matview-vdbe-virtual-generated-column-source-rejected {
+    CREATE TABLE generated_source_base(
+      x INTEGER,
+      doubled INTEGER GENERATED ALWAYS AS (x * 2) VIRTUAL
+    );
+    CREATE MATERIALIZED VIEW generated_source AS
+      SELECT x FROM generated_source_base;
+}
+expect error {
+    materialized views with base tables with virtual generated columns are not yet supported
+}
+
+test matview-vdbe-transaction-rollback {
+    CREATE TABLE t6(a INTEGER, b TEXT);
+    CREATE MATERIALIZED VIEW v6 AS SELECT a, b FROM t6;
+    BEGIN;
+    INSERT INTO t6 VALUES (1,'x');
+    ROLLBACK;
+    SELECT COUNT(*) FROM v6;
+}
+expect {
+    0
+}
+
+# GROUP BY views with invertible aggregates: populated, then maintained
+# through inserts, deletes, and group-moving updates.
+test matview-vdbe-aggregate-maintenance {
+    CREATE TABLE t8(g TEXT, x INTEGER, y REAL);
+    INSERT INTO t8 VALUES ('a', 10, 1.5), ('a', 20, 2.5), ('b', 5, 0.5);
+    CREATE MATERIALIZED VIEW v8 AS SELECT g, COUNT(*) AS cnt, SUM(x) AS sx, AVG(y) AS ay FROM t8 GROUP BY g;
+    INSERT INTO t8 VALUES ('b', 7, 1.0), ('c', 1, 9.0);
+    DELETE FROM t8 WHERE g = 'a' AND x = 10;
+    UPDATE t8 SET g = 'b' WHERE g = 'c';
+    SELECT * FROM v8 ORDER BY g;
+}
+expect {
+    a|1|20|2.5
+    b|3|13|3.5
+}
+
+# A group whose rows are all removed disappears from the view.
+test matview-vdbe-aggregate-group-disappears {
+    CREATE TABLE t9(g TEXT, x INTEGER);
+    INSERT INTO t9 VALUES ('a', 1), ('b', 2), ('b', 3);
+    CREATE MATERIALIZED VIEW v9 AS SELECT g, COUNT(*) AS cnt FROM t9 GROUP BY g;
+    DELETE FROM t9 WHERE g = 'b';
+    SELECT * FROM v9;
+}
+expect {
+    a|1
+}
+
+# SUM over integers stays integer-typed, and returns NULL again when every
+# non-NULL input is retracted while the group survives on NULL rows.
+test matview-vdbe-aggregate-sum-typing-and-empty {
+    CREATE TABLE t10(g TEXT, x INTEGER);
+    INSERT INTO t10 VALUES ('a', 5), ('a', NULL), ('a', 7);
+    CREATE MATERIALIZED VIEW v10 AS SELECT g, COUNT(*) AS cnt, COUNT(x) AS cx, SUM(x) AS sx FROM t10 GROUP BY g;
+    DELETE FROM t10 WHERE x = 5;
+    SELECT g, cnt, cx, sx, typeof(sx) FROM v10;
+    DELETE FROM t10 WHERE x = 7;
+    SELECT g, cnt, cx, sx, typeof(sx) FROM v10;
+}
+expect {
+    a|2|1|7|integer
+    a|1|0||null
+}
+
+# AVG of a group whose inputs are all NULL is NULL (a divergence bug in the
+# retired interpreter, which returned 0.0).
+test matview-vdbe-aggregate-avg-all-null {
+    CREATE TABLE t11(g TEXT, x INTEGER);
+    INSERT INTO t11 VALUES ('a', NULL), ('a', NULL);
+    CREATE MATERIALIZED VIEW v11 AS SELECT g, AVG(x) AS ax FROM t11 GROUP BY g;
+    SELECT g, ax IS NULL FROM v11;
+}
+expect {
+    a|1
+}
+
+# NULL group keys form a group like any other (lost entirely by the retired
+# interpreter).
+test matview-vdbe-aggregate-null-group-key {
+    CREATE TABLE t12(g TEXT, x INTEGER);
+    INSERT INTO t12 VALUES (NULL, 1), (NULL, 2), ('a', 3);
+    CREATE MATERIALIZED VIEW v12 AS SELECT g, COUNT(*) AS cnt, SUM(x) AS sx FROM t12 GROUP BY g;
+    DELETE FROM t12 WHERE x = 1;
+    SELECT * FROM v12 ORDER BY g;
+}
+expect {
+    |1|2
+    a|1|3
+}
+
+# A projected scalar GROUP BY expression is one published aggregate output,
+# not an attempt to read its source column through the aggregate boundary.
+test matview-vdbe-scalar-group-key-projection {
+    CREATE TABLE scalar_group_source(x INTEGER);
+    INSERT INTO scalar_group_source VALUES (-1), (1);
+    CREATE MATERIALIZED VIEW scalar_group_view AS
+      SELECT abs(x) AS key, COUNT(*) AS n
+      FROM scalar_group_source
+      GROUP BY key;
+    SELECT * FROM scalar_group_view;
+    INSERT INTO scalar_group_source VALUES (-2);
+    SELECT * FROM scalar_group_view ORDER BY key;
+}
+expect {
+    1|2
+    1|2
+    2|1
+}
+
+# Aggregate views serve same-transaction reads through the same maintenance
+# program that advances their persistent state.
+test matview-vdbe-aggregate-read-your-own-writes {
+    CREATE TABLE t13(g TEXT, x INTEGER);
+    INSERT INTO t13 VALUES ('a', 1);
+    CREATE MATERIALIZED VIEW v13 AS SELECT g, SUM(x) AS sx FROM t13 GROUP BY g;
+    BEGIN;
+    INSERT INTO t13 VALUES ('a', 10), ('b', 5);
+    SELECT * FROM v13 ORDER BY g;
+    ROLLBACK;
+    SELECT * FROM v13 ORDER BY g;
+}
+expect {
+    a|11
+    b|5
+    a|1
+}
+
+# A view read reached before the write statement halts must drive the same
+# maintenance batch, not recompute the defining SELECT with synthetic
+# identities. Rowids observed by RETURNING therefore remain stable after
+# statement completion and COMMIT.
+test matview-vdbe-stateful-read-during-write-stable-rowids {
+    CREATE TABLE ryw_rowid(g TEXT, x INTEGER);
+    INSERT INTO ryw_rowid VALUES ('a', 1);
+    CREATE MATERIALIZED VIEW ryw_rowid_view AS
+      SELECT g, SUM(x) AS sx FROM ryw_rowid GROUP BY g;
+    BEGIN;
+    INSERT INTO ryw_rowid VALUES ('b', 2)
+      RETURNING (
+        SELECT group_concat(rowid || ':' || g || ':' || sx, ',')
+          FROM (SELECT rowid, g, sx FROM ryw_rowid_view ORDER BY g)
+      );
+    SELECT rowid, g, sx FROM ryw_rowid_view ORDER BY g;
+    COMMIT;
+    SELECT rowid, g, sx FROM ryw_rowid_view ORDER BY g;
+}
+expect {
+    1:a:1,2:b:2
+    1|a|1
+    2|b|2
+    1|a|1
+    2|b|2
+}
+
+# MIN/MAX are maintained through a value multiset: duplicates carry
+# multiplicity, and retracting the current extreme falls back to the next
+# value without a rescan.
+test matview-vdbe-minmax-maintenance {
+    CREATE TABLE t14(g TEXT, x INTEGER);
+    INSERT INTO t14 VALUES ('a', 10), ('a', 20), ('a', 20), ('b', 5);
+    CREATE MATERIALIZED VIEW v14 AS SELECT g, MIN(x) AS mn, MAX(x) AS mx FROM t14 GROUP BY g;
+    DELETE FROM t14 WHERE rowid = (SELECT MAX(rowid) FROM t14 WHERE g='a' AND x=20);
+    SELECT 'dup', * FROM v14 ORDER BY g;
+    DELETE FROM t14 WHERE g = 'a' AND x = 20;
+    INSERT INTO t14 VALUES ('a', 3), ('b', NULL);
+    SELECT 'ext', * FROM v14 ORDER BY g;
+    UPDATE t14 SET x = 100 WHERE g = 'b' AND x = 5;
+    SELECT 'upd', * FROM v14 ORDER BY g;
+    DELETE FROM t14 WHERE g = 'b' AND x = 100;
+    SELECT 'nul', g, mn IS NULL, mx IS NULL FROM v14 ORDER BY g;
+}
+expect {
+    dup|a|10|20
+    dup|b|5|5
+    ext|a|3|10
+    ext|b|5|5
+    upd|a|3|10
+    upd|b|100|100
+    nul|a|0|0
+    nul|b|1|1
+}
+
+# Dropping a MIN/MAX view cleans up its multiset table and index.
+test matview-vdbe-minmax-drop-clean {
+    CREATE TABLE t15(g TEXT, x INTEGER);
+    INSERT INTO t15 VALUES ('a', 1);
+    CREATE MATERIALIZED VIEW v15 AS SELECT g, MIN(x) AS mn FROM t15 GROUP BY g;
+    DROP VIEW v15;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# DISTINCT aggregates track value multiplicity through the multiset table:
+# retracting one duplicate leaves the accumulator untouched; retracting the
+# last occurrence inverts it.
+test matview-vdbe-distinct-maintenance {
+    CREATE TABLE t16(g TEXT, x INTEGER);
+    INSERT INTO t16 VALUES ('a', 10), ('a', 10), ('a', 20), ('b', 5);
+    CREATE MATERIALIZED VIEW v16 AS SELECT g, COUNT(DISTINCT x) AS cd, SUM(DISTINCT x) AS sd, AVG(DISTINCT x) AS ad FROM t16 GROUP BY g;
+    DELETE FROM t16 WHERE rowid = 1;
+    SELECT 'dup', * FROM v16 ORDER BY g;
+    DELETE FROM t16 WHERE rowid = 2;
+    SELECT 'last', * FROM v16 ORDER BY g;
+    INSERT INTO t16 VALUES ('a', 20), ('a', NULL);
+    SELECT 'back', * FROM v16 ORDER BY g;
+}
+expect {
+    dup|a|2|30|15.0
+    dup|b|1|5|5.0
+    last|a|1|20|20.0
+    last|b|1|5|5.0
+    back|a|1|20|20.0
+    back|b|1|5|5.0
+}
+
+# A group can enter (via population or maintenance) with a NULL argument as
+# its first row: the DISTINCT accumulator must still materialize, empty.
+test matview-vdbe-distinct-null-first-row {
+    CREATE TABLE t26(g TEXT, x INTEGER);
+    INSERT INTO t26 VALUES ('a', NULL);
+    CREATE MATERIALIZED VIEW v26 AS SELECT g, COUNT(*) AS cnt, COUNT(DISTINCT x) AS cd, SUM(DISTINCT x) AS sd FROM t26 GROUP BY g;
+    SELECT g, cnt, cd, sd IS NULL FROM v26;
+    INSERT INTO t26 VALUES ('b', NULL), ('a', 4);
+    SELECT g, cnt, cd, sd IS NULL FROM v26 ORDER BY g;
+}
+expect {
+    a|1|0|1
+    a|2|1|0
+    b|1|0|1
+}
+
+# MIN/MAX see each value once by definition; DISTINCT on them is accepted and
+# behaves identically to the plain form.
+test matview-vdbe-distinct-minmax {
+    CREATE TABLE t17(g TEXT, x INTEGER);
+    INSERT INTO t17 VALUES ('a', 3), ('a', 3), ('a', 9);
+    CREATE MATERIALIZED VIEW v17 AS SELECT g, MIN(DISTINCT x) AS mn, MAX(DISTINCT x) AS mx FROM t17 GROUP BY g;
+    DELETE FROM t17 WHERE x = 9;
+    SELECT * FROM v17;
+}
+expect {
+    a|3|3
+}
+
+# HAVING gates only the view row: groups flip in and out of the view as their
+# aggregates cross the predicate, while their state stays maintained.
+test matview-vdbe-having-appear-disappear {
+    CREATE TABLE t18(g TEXT, x INTEGER);
+    INSERT INTO t18 VALUES ('a', 1), ('b', 1), ('b', 2);
+    CREATE MATERIALIZED VIEW v18 AS SELECT g, SUM(x) AS sx FROM t18 GROUP BY g HAVING COUNT(*) > 1;
+    SELECT 'init', * FROM v18 ORDER BY g;
+    INSERT INTO t18 VALUES ('a', 5);
+    SELECT 'grew', * FROM v18 ORDER BY g;
+    DELETE FROM t18 WHERE g = 'b' AND x = 2;
+    SELECT 'shrunk', * FROM v18 ORDER BY g;
+    DELETE FROM t18 WHERE g = 'a';
+    SELECT COUNT(*) FROM v18;
+}
+expect {
+    init|b|3
+    grew|a|6
+    grew|b|3
+    shrunk|a|6
+    0
+}
+
+# Aggregates appearing only in HAVING are computed as hidden accumulators;
+# group expressions are also usable in the predicate.
+test matview-vdbe-having-hidden-aggregate {
+    CREATE TABLE t19(g INTEGER, x INTEGER);
+    INSERT INTO t19 VALUES (1, 10), (1, 20), (2, 100), (NULL, 100);
+    CREATE MATERIALIZED VIEW v19 AS SELECT g, COUNT(*) AS cnt FROM t19 GROUP BY g HAVING SUM(x) >= 30 AND g IS NOT NULL;
+    SELECT 'init', * FROM v19 ORDER BY g;
+    DELETE FROM t19 WHERE g = 1 AND x = 20;
+    INSERT INTO t19 VALUES (2, 1);
+    SELECT 'after', * FROM v19 ORDER BY g;
+}
+expect {
+    init|1|2
+    init|2|1
+    after|2|2
+}
+
+# A NULL HAVING result excludes the group, matching WHERE-style three-valued
+# logic: SUM(x) of all-NULL inputs is NULL, so the comparison is NULL.
+test matview-vdbe-having-null-excluded {
+    CREATE TABLE t20(g TEXT, x INTEGER);
+    INSERT INTO t20 VALUES ('a', NULL), ('b', 7);
+    CREATE MATERIALIZED VIEW v20 AS SELECT g FROM t20 GROUP BY g HAVING SUM(x) > 0;
+    SELECT * FROM v20;
+    UPDATE t20 SET x = 3 WHERE g = 'a';
+    SELECT * FROM v20 ORDER BY g;
+}
+expect {
+    b
+    a
+    b
+}
+
+# HAVING over a MIN/MAX extreme recomputes through the multiset on every
+# group touch, so retracting the extreme can suppress the row.
+test matview-vdbe-having-minmax {
+    CREATE TABLE t21(g TEXT, x INTEGER);
+    INSERT INTO t21 VALUES ('a', 20), ('a', 5), ('b', 5);
+    CREATE MATERIALIZED VIEW v21 AS SELECT g, COUNT(*) AS cnt FROM t21 GROUP BY g HAVING MAX(x) >= 20;
+    SELECT 'init', * FROM v21;
+    DELETE FROM t21 WHERE x = 20;
+    SELECT 'gone', COUNT(*) FROM v21;
+    INSERT INTO t21 VALUES ('b', 99);
+    SELECT 'b_in', * FROM v21;
+}
+expect {
+    init|a|2
+    gone|0
+    b_in|b|2
+}
+
+# DISTINCT aggregates inside HAVING share the multiset machinery.
+test matview-vdbe-having-distinct {
+    CREATE TABLE t22(g TEXT, x INTEGER);
+    INSERT INTO t22 VALUES ('a', 1), ('a', 1), ('b', 1), ('b', 2);
+    CREATE MATERIALIZED VIEW v22 AS SELECT g, SUM(x) AS sx FROM t22 GROUP BY g HAVING COUNT(DISTINCT x) > 1;
+    SELECT 'init', * FROM v22;
+    INSERT INTO t22 VALUES ('a', 2);
+    SELECT 'grew', * FROM v22 ORDER BY g;
+}
+expect {
+    init|b|3
+    grew|a|4
+    grew|b|3
+}
+
+# HAVING and DISTINCT views serve same-transaction reads by recomputation.
+test matview-vdbe-having-read-your-own-writes {
+    CREATE TABLE t23(g TEXT, x INTEGER);
+    INSERT INTO t23 VALUES ('a', 1), ('a', 2);
+    CREATE MATERIALIZED VIEW v23 AS SELECT g, COUNT(DISTINCT x) AS cd FROM t23 GROUP BY g HAVING COUNT(*) > 1;
+    BEGIN;
+    INSERT INTO t23 VALUES ('b', 5), ('b', 5);
+    DELETE FROM t23 WHERE g = 'a' AND x = 2;
+    SELECT * FROM v23 ORDER BY g;
+    ROLLBACK;
+    SELECT * FROM v23 ORDER BY g;
+}
+expect {
+    b|1
+    a|2
+}
+
+# Dropping a DISTINCT-aggregate view cleans up its multiset table and index.
+test matview-vdbe-distinct-drop-clean {
+    CREATE TABLE t24(g TEXT, x INTEGER);
+    INSERT INTO t24 VALUES ('a', 1), ('a', 1);
+    CREATE MATERIALIZED VIEW v24 AS SELECT g, COUNT(DISTINCT x) AS cd FROM t24 GROUP BY g;
+    DROP VIEW v24;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Scalar aggregates (no GROUP BY) keep exactly one row that exists even over
+# an empty table, matching batch semantics: COUNT 0, other aggregates NULL.
+# Retracting every row returns to that state instead of deleting the row.
+test matview-vdbe-scalar-aggregate-maintenance {
+    CREATE TABLE t27(x INTEGER);
+    CREATE MATERIALIZED VIEW v27 AS SELECT COUNT(*) AS c, SUM(x) AS s, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx FROM t27;
+    SELECT c, s IS NULL, a IS NULL, mn IS NULL, mx IS NULL FROM v27;
+    INSERT INTO t27 VALUES (5), (10), (NULL);
+    SELECT c, s, typeof(s), a, mn, mx FROM v27;
+    DELETE FROM t27;
+    SELECT c, s IS NULL, a IS NULL, mn IS NULL, mx IS NULL FROM v27;
+}
+expect {
+    0|1|1|1|1
+    3|15|integer|7.5|5|10
+    0|1|1|1|1
+}
+
+# SUM keeps SQLite's approximate-accumulator state in the hidden group table.
+# Loading that state for a later statement must remain approximate instead of
+# reverting to an integer accumulator.
+test matview-vdbe-sum-approximate-state-persists {
+    CREATE TABLE sum_overflow_state(x);
+    CREATE MATERIALIZED VIEW sum_overflow_state_view AS
+      SELECT SUM(x) AS s FROM sum_overflow_state;
+    INSERT INTO sum_overflow_state VALUES
+      (1.5), (9223372036854775807), (1);
+    SELECT typeof(s), s = (SELECT SUM(x) FROM sum_overflow_state)
+      FROM sum_overflow_state_view;
+    INSERT INTO sum_overflow_state VALUES (2);
+    SELECT typeof(s), s = (SELECT SUM(x) FROM sum_overflow_state)
+      FROM sum_overflow_state_view;
+}
+expect {
+    real|1
+    real|1
+}
+
+# Aggregate maintenance must finalize after the full statement delta. SUM's
+# integer overflow is forgiven when a later REAL switches it to approximate
+# mode, even if the integer-only prefix would overflow on its own.
+test matview-vdbe-sum-later-real-forgives-transient-overflow {
+    CREATE TABLE sum_later_real(x);
+    CREATE MATERIALIZED VIEW sum_later_real_view AS
+      SELECT SUM(x) AS s FROM sum_later_real;
+    INSERT INTO sum_later_real VALUES
+      (9223372036854775807), (1), (1.5);
+    SELECT typeof(s), s = (SELECT SUM(x) FROM sum_later_real)
+      FROM sum_later_real_view;
+}
+expect {
+    real|1
+}
+
+# Deferring finalization must not suppress a genuine final overflow.
+test matview-vdbe-sum-final-integer-overflow-errors {
+    CREATE TABLE sum_final_overflow(x);
+    CREATE MATERIALIZED VIEW sum_final_overflow_view AS
+      SELECT SUM(x) AS s FROM sum_final_overflow;
+    INSERT INTO sum_final_overflow VALUES
+      (9223372036854775807), (1);
+}
+expect error {
+    integer overflow
+}
+
+# The single row also exists when WHERE filters out every scanned row.
+test matview-vdbe-scalar-aggregate-where-filters-all {
+    CREATE TABLE t28(x INTEGER);
+    INSERT INTO t28 VALUES (1), (2);
+    CREATE MATERIALIZED VIEW v28 AS SELECT COUNT(*) AS c, SUM(x) AS s FROM t28 WHERE x > 100;
+    SELECT c, s IS NULL FROM v28;
+    INSERT INTO t28 VALUES (200), (300);
+    DELETE FROM t28 WHERE x = 300;
+    SELECT * FROM v28;
+}
+expect {
+    0|1
+    1|200
+}
+
+# Scalar DISTINCT aggregates share the multiset machinery.
+test matview-vdbe-scalar-distinct {
+    CREATE TABLE t29(y TEXT);
+    INSERT INTO t29 VALUES ('a'), ('a'), ('b');
+    CREATE MATERIALIZED VIEW v29 AS SELECT COUNT(DISTINCT y) AS cd FROM t29;
+    DELETE FROM t29 WHERE rowid = 1;
+    SELECT * FROM v29;
+    DELETE FROM t29 WHERE rowid = 2;
+    SELECT * FROM v29;
+}
+expect {
+    2
+    1
+}
+
+# FILTER gates each aggregate's contribution independently of group
+# liveness. Predicate crossings and retractions must also gate the aggregate's
+# private DISTINCT/MIN multiset.
+test matview-vdbe-grouped-aggregate-filter {
+    CREATE TABLE aggregate_filter_grouped(
+      id INTEGER PRIMARY KEY,
+      g TEXT,
+      x INTEGER,
+      enabled INTEGER
+    );
+    INSERT INTO aggregate_filter_grouped VALUES
+      (1, 'a', 10, 1),
+      (2, 'a', 20, 0),
+      (3, 'a', 30, NULL),
+      (4, 'b', 5, 0);
+    CREATE MATERIALIZED VIEW aggregate_filter_grouped_view AS
+      SELECT
+        g,
+        COUNT(*) AS all_rows,
+        COUNT(*) FILTER (WHERE enabled) AS enabled_rows,
+        SUM(x) FILTER (WHERE enabled) AS enabled_sum,
+        COUNT(DISTINCT x) FILTER (WHERE enabled) AS enabled_distinct,
+        MIN(x) FILTER (WHERE enabled) AS enabled_min
+      FROM aggregate_filter_grouped
+      GROUP BY g;
+    SELECT * FROM aggregate_filter_grouped_view ORDER BY g;
+    INSERT INTO aggregate_filter_grouped VALUES (5, 'a', 10, 1);
+    SELECT * FROM aggregate_filter_grouped_view WHERE g = 'a';
+    UPDATE aggregate_filter_grouped SET enabled = 1 WHERE id = 2;
+    SELECT * FROM aggregate_filter_grouped_view WHERE g = 'a';
+    DELETE FROM aggregate_filter_grouped WHERE id IN (1, 5);
+    SELECT * FROM aggregate_filter_grouped_view WHERE g = 'a';
+    UPDATE aggregate_filter_grouped SET g = 'b' WHERE id = 2;
+    SELECT * FROM aggregate_filter_grouped_view ORDER BY g;
+    DELETE FROM aggregate_filter_grouped WHERE id = 3;
+    SELECT * FROM aggregate_filter_grouped_view ORDER BY g;
+}
+expect {
+    a|3|1|10|1|10
+    b|1|0||0|
+    a|4|2|20|1|10
+    a|4|3|40|2|10
+    a|2|1|20|1|20
+    a|1|0||0|
+    b|2|1|20|1|20
+    b|2|1|20|1|20
+}
+
+# Scalar aggregates retain their always-present row. An empty input and a
+# non-empty input for which FILTER is never true have the same filtered
+# aggregate values, while the unfiltered count still observes every row.
+test matview-vdbe-scalar-aggregate-filter {
+    CREATE TABLE aggregate_filter_scalar(
+      id INTEGER PRIMARY KEY,
+      x INTEGER,
+      enabled INTEGER
+    );
+    CREATE MATERIALIZED VIEW aggregate_filter_scalar_view AS
+      SELECT
+        COUNT(*) AS all_rows,
+        COUNT(*) FILTER (WHERE enabled) AS enabled_rows,
+        SUM(x) FILTER (WHERE enabled) AS enabled_sum,
+        COUNT(DISTINCT x) FILTER (WHERE enabled) AS enabled_distinct,
+        MAX(x) FILTER (WHERE enabled) AS enabled_max
+      FROM aggregate_filter_scalar;
+    SELECT * FROM aggregate_filter_scalar_view;
+    INSERT INTO aggregate_filter_scalar VALUES (1, 1, 0), (2, 2, NULL);
+    SELECT * FROM aggregate_filter_scalar_view;
+    INSERT INTO aggregate_filter_scalar VALUES (3, 4, 1), (4, 4, 2);
+    SELECT * FROM aggregate_filter_scalar_view;
+    UPDATE aggregate_filter_scalar SET x = 7, enabled = 1 WHERE id = 1;
+    SELECT * FROM aggregate_filter_scalar_view;
+    DELETE FROM aggregate_filter_scalar WHERE id = 3;
+    SELECT * FROM aggregate_filter_scalar_view;
+    UPDATE aggregate_filter_scalar SET enabled = NULL WHERE id = 1;
+    SELECT * FROM aggregate_filter_scalar_view;
+    DELETE FROM aggregate_filter_scalar;
+    SELECT * FROM aggregate_filter_scalar_view;
+}
+expect {
+    0|0||0|
+    2|0||0|
+    4|2|8|1|4
+    4|3|15|2|7
+    3|2|11|2|7
+    3|1|4|1|4
+    0|0||0|
+}
+
+# A filtered aggregate over a join resolves its predicate from the same typed
+# delta contract as its argument. Updates on either side can cross the filter
+# without a second expression evaluator.
+test matview-vdbe-join-aggregate-filter {
+    CREATE TABLE aggregate_filter_orders(
+      id INTEGER PRIMARY KEY,
+      customer_id INTEGER,
+      amount INTEGER
+    );
+    CREATE TABLE aggregate_filter_customers(
+      id INTEGER PRIMARY KEY,
+      active INTEGER
+    );
+    INSERT INTO aggregate_filter_customers VALUES (1, 1), (2, 0);
+    INSERT INTO aggregate_filter_orders VALUES
+      (1, 1, 5),
+      (2, 1, 7),
+      (3, 2, 9);
+    CREATE MATERIALIZED VIEW aggregate_filter_join_view AS
+      SELECT
+        o.customer_id,
+        COUNT(*) AS matched_rows,
+        SUM(o.amount) FILTER (WHERE c.active AND o.amount > 5) AS active_sum,
+        COUNT(*) FILTER (WHERE c.active AND o.amount > 5) AS active_count
+      FROM aggregate_filter_orders AS o
+      JOIN aggregate_filter_customers AS c ON o.customer_id = c.id
+      GROUP BY o.customer_id;
+    SELECT * FROM aggregate_filter_join_view ORDER BY customer_id;
+    UPDATE aggregate_filter_customers SET active = NOT active;
+    SELECT * FROM aggregate_filter_join_view ORDER BY customer_id;
+    UPDATE aggregate_filter_orders SET amount = 10 WHERE id = 1;
+    UPDATE aggregate_filter_customers SET active = 1 WHERE id = 1;
+    SELECT * FROM aggregate_filter_join_view ORDER BY customer_id;
+}
+expect {
+    1|2|7|1
+    2|1||0
+    1|2||0
+    2|1|9|1
+    1|2|17|2
+    2|1|9|1
+}
+
+# HAVING without GROUP BY gates the single row: over an empty table the
+# predicate sees empty-input aggregates and typically suppresses it.
+test matview-vdbe-scalar-having {
+    CREATE TABLE t30(x INTEGER);
+    CREATE MATERIALIZED VIEW v30 AS SELECT COUNT(*) AS c, MAX(x) AS mx FROM t30 HAVING COUNT(*) > 1;
+    SELECT COUNT(*) FROM v30;
+    INSERT INTO t30 VALUES (1), (2);
+    SELECT * FROM v30;
+    DELETE FROM t30 WHERE x = 2;
+    SELECT COUNT(*) FROM v30;
+}
+expect {
+    0
+    2|2
+    0
+}
+
+# Constant result columns alongside scalar aggregates.
+test matview-vdbe-scalar-constant-column {
+    CREATE TABLE t31(x INTEGER);
+    INSERT INTO t31 VALUES (7);
+    CREATE MATERIALIZED VIEW v31 AS SELECT 0, COUNT(*) AS c FROM t31;
+    INSERT INTO t31 VALUES (8);
+    SELECT * FROM v31;
+}
+expect {
+    0|2
+}
+
+# Scalar views serve same-transaction reads by recomputation.
+test matview-vdbe-scalar-read-your-own-writes {
+    CREATE TABLE t32(x INTEGER);
+    INSERT INTO t32 VALUES (1);
+    CREATE MATERIALIZED VIEW v32 AS SELECT COUNT(*) AS c, SUM(x) AS s FROM t32;
+    BEGIN;
+    INSERT INTO t32 VALUES (10);
+    SELECT * FROM v32;
+    ROLLBACK;
+    SELECT * FROM v32;
+}
+expect {
+    2|11
+    1|1
+}
+
+# Expressions over aggregate results are evaluated on the finalized group
+# row, exactly like HAVING: aggregate calls and group expressions inside them
+# resolve to their computed values.
+test matview-vdbe-expr-over-aggregates {
+    CREATE TABLE t40(g TEXT, x INTEGER);
+    INSERT INTO t40 VALUES ('a', 1), ('a', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v40 AS SELECT g, SUM(x) + 1 AS s1, COUNT(*) * 2 AS c2 FROM t40 GROUP BY g;
+    SELECT 'init', * FROM v40 ORDER BY g;
+    INSERT INTO t40 VALUES ('b', 20), ('c', 5);
+    UPDATE t40 SET x = x + 100 WHERE g = 'a';
+    DELETE FROM t40 WHERE g = 'b' AND x = 10;
+    SELECT 'after', * FROM v40 ORDER BY g;
+}
+expect {
+    init|a|4|4
+    init|b|11|2
+    after|a|204|4
+    after|b|21|2
+    after|c|6|2
+}
+
+# Group expressions and multiple aggregate references may mix inside one
+# output expression; the same aggregate can also appear both plain and
+# inside an expression.
+test matview-vdbe-expr-mixed-group-and-aggregates {
+    CREATE TABLE t41(g TEXT, x INTEGER);
+    INSERT INTO t41 VALUES ('a', 1), ('a', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v41 AS SELECT g || '!' AS tag, SUM(x) AS s, CASE WHEN SUM(x) > 5 THEN g ELSE 'small' END AS size FROM t41 GROUP BY g;
+    SELECT * FROM v41 ORDER BY s;
+    INSERT INTO t41 VALUES ('a', 10);
+    SELECT * FROM v41 ORDER BY s;
+}
+expect {
+    a!|3|small
+    b!|10|b
+    b!|10|b
+    a!|13|a
+}
+
+# MIN/MAX (multiset-backed) and DISTINCT aggregates work inside output
+# expressions.
+test matview-vdbe-expr-minmax-distinct {
+    CREATE TABLE t42(g TEXT, x INTEGER);
+    INSERT INTO t42 VALUES ('a', 1), ('a', 1), ('a', 5), ('b', 10);
+    CREATE MATERIALIZED VIEW v42 AS SELECT g, MAX(x) - MIN(x) AS spread, COUNT(DISTINCT x) + 100 AS cd FROM t42 GROUP BY g;
+    SELECT 'init', * FROM v42 ORDER BY g;
+    DELETE FROM t42 WHERE g = 'a' AND x = 5;
+    INSERT INTO t42 VALUES ('b', 40);
+    SELECT 'after', * FROM v42 ORDER BY g;
+}
+expect {
+    init|a|4|102
+    init|b|0|101
+    after|a|0|101
+    after|b|30|102
+}
+
+# A view whose only outputs are expressions still maintains group liveness
+# through the hidden COUNT(*): groups die when their last row is retracted.
+test matview-vdbe-expr-only-outputs {
+    CREATE TABLE t43(g TEXT, x INTEGER);
+    INSERT INTO t43 VALUES ('a', 1), ('b', 2);
+    CREATE MATERIALIZED VIEW v43 AS SELECT g, SUM(x) - SUM(x) AS zero FROM t43 GROUP BY g;
+    SELECT * FROM v43 ORDER BY g;
+    DELETE FROM t43 WHERE g = 'b';
+    SELECT * FROM v43 ORDER BY g;
+}
+expect {
+    a|0
+    b|0
+    a|0
+}
+
+# Scalar aggregates (no GROUP BY) support output expressions, including over
+# the empty table where COUNT is 0 and other aggregates are NULL.
+test matview-vdbe-expr-scalar {
+    CREATE TABLE t44(x INTEGER);
+    CREATE MATERIALIZED VIEW v44 AS SELECT SUM(x) * 10 + COUNT(*) AS blend FROM t44;
+    SELECT blend IS NULL FROM v44;
+    INSERT INTO t44 VALUES (1), (2);
+    SELECT * FROM v44;
+    DELETE FROM t44;
+    SELECT blend IS NULL FROM v44;
+}
+expect {
+    1
+    32
+    1
+}
+
+# Expressions over aggregates of a join input compose with the joined-delta
+# path.
+test matview-vdbe-expr-over-join-aggregate {
+    CREATE TABLE t45(g TEXT, x INTEGER);
+    CREATE TABLE t46(g TEXT, y INTEGER);
+    INSERT INTO t45 VALUES ('a', 1), ('a', 2), ('b', 10);
+    INSERT INTO t46 VALUES ('a', 100), ('b', 200), ('b', 300);
+    CREATE MATERIALIZED VIEW v45 AS SELECT t45.g, SUM(x + y) / COUNT(*) AS avg_pair FROM t45 JOIN t46 ON t45.g = t46.g GROUP BY t45.g;
+    SELECT 'init', * FROM v45 ORDER BY g;
+    INSERT INTO t45 VALUES ('b', 20);
+    DELETE FROM t46 WHERE y = 300;
+    SELECT 'after', * FROM v45 ORDER BY g;
+}
+expect {
+    init|a|101
+    init|b|260
+    after|a|101
+    after|b|215
+}
+
+# Expression outputs and HAVING share the finalized-group-row machinery.
+test matview-vdbe-expr-with-having {
+    CREATE TABLE t47(g TEXT, x INTEGER);
+    INSERT INTO t47 VALUES ('a', 1), ('a', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v47 AS SELECT g, SUM(x) + 1 AS s1 FROM t47 GROUP BY g HAVING COUNT(*) > 1;
+    SELECT * FROM v47 ORDER BY g;
+    INSERT INTO t47 VALUES ('b', 1);
+    DELETE FROM t47 WHERE g = 'a' AND x = 2;
+    SELECT * FROM v47 ORDER BY g;
+}
+expect {
+    a|4
+    b|12
+}
+
+# Expression-output views serve same-transaction reads by recomputation.
+test matview-vdbe-expr-read-your-own-writes {
+    CREATE TABLE t48(g TEXT, x INTEGER);
+    INSERT INTO t48 VALUES ('a', 1), ('a', 2);
+    CREATE MATERIALIZED VIEW v48 AS SELECT g, SUM(x) + 1 AS s1 FROM t48 GROUP BY g;
+    BEGIN;
+    INSERT INTO t48 VALUES ('a', 100);
+    SELECT * FROM v48;
+    ROLLBACK;
+    SELECT * FROM v48;
+}
+expect {
+    a|104
+    a|4
+}
+
+# Bare columns outside GROUP BY remain rejected, even buried inside an
+# otherwise-aggregate expression.
+test matview-vdbe-expr-bare-column-rejected {
+    CREATE TABLE t49(g TEXT, x INTEGER);
+    CREATE MATERIALIZED VIEW v49 AS SELECT g, x + SUM(x) FROM t49 GROUP BY g;
+}
+expect error {
+    non-aggregate result columns not in GROUP BY
+}
+
+# Two-table inner joins: rows are identified by their (left rowid, right
+# rowid) pair, and each side's changes are joined against the other side's
+# post-change state.
+test matview-vdbe-join-maintenance {
+    CREATE TABLE jl(id INTEGER PRIMARY KEY, k INTEGER, a TEXT);
+    CREATE TABLE jr(id INTEGER PRIMARY KEY, k INTEGER, b TEXT);
+    INSERT INTO jl VALUES (1, 10, 'l1'), (2, 20, 'l2');
+    INSERT INTO jr VALUES (1, 10, 'r1'), (2, 10, 'r2'), (3, 30, 'r3');
+    CREATE MATERIALIZED VIEW vj1 AS SELECT jl.a, jr.b FROM jl JOIN jr ON jl.k = jr.k;
+    SELECT 'pop', * FROM vj1 ORDER BY 1, 2, 3;
+    INSERT INTO jl VALUES (3, 30, 'l3');
+    DELETE FROM jr WHERE id = 2;
+    SELECT 'dml', * FROM vj1 ORDER BY 1, 2, 3;
+    UPDATE jl SET k = 30 WHERE id = 1;
+    SELECT 'mov', * FROM vj1 ORDER BY 1, 2, 3;
+    INSERT INTO jl VALUES (4, NULL, 'lnull');
+    INSERT INTO jr VALUES (4, NULL, 'rnull');
+    SELECT 'nul', COUNT(*) FROM vj1;
+}
+expect {
+    pop|l1|r1
+    pop|l1|r2
+    dml|l1|r1
+    dml|l3|r3
+    mov|l1|r3
+    mov|l3|r3
+    nul|2
+}
+
+# Both sides changing in one transaction exercises the dL x dR overlap term:
+# without it, a pair introduced by both sides would be double-counted.
+test matview-vdbe-join-both-sides-one-txn {
+    CREATE TABLE jl2(id INTEGER PRIMARY KEY, k INTEGER, a TEXT);
+    CREATE TABLE jr2(id INTEGER PRIMARY KEY, k INTEGER, b TEXT);
+    CREATE MATERIALIZED VIEW vj2 AS SELECT jl2.a, jr2.b FROM jl2 JOIN jr2 ON jl2.k = jr2.k;
+    BEGIN;
+    INSERT INTO jl2 VALUES (1, 5, 'l');
+    INSERT INTO jr2 VALUES (1, 5, 'r');
+    COMMIT;
+    SELECT 'ins', * FROM vj2;
+    BEGIN;
+    UPDATE jl2 SET a = 'lx';
+    UPDATE jr2 SET b = 'rx';
+    COMMIT;
+    SELECT 'upd', * FROM vj2;
+    BEGIN;
+    DELETE FROM jl2;
+    DELETE FROM jr2;
+    COMMIT;
+    SELECT 'del', COUNT(*) FROM vj2;
+}
+expect {
+    ins|l|r
+    upd|lx|rx
+    del|0
+}
+
+# Cartesian products (comma join) with WHERE, and expressions over both
+# sides.
+test matview-vdbe-join-cartesian {
+    CREATE TABLE jl3(x INTEGER);
+    CREATE TABLE jr3(y INTEGER);
+    INSERT INTO jl3 VALUES (1), (2);
+    INSERT INTO jr3 VALUES (10), (20);
+    CREATE MATERIALIZED VIEW vj3 AS SELECT x + y AS s FROM jl3, jr3 WHERE x + y > 11;
+    INSERT INTO jl3 VALUES (3);
+    SELECT * FROM vj3 ORDER BY s;
+}
+expect {
+    12
+    13
+    21
+    22
+    23
+}
+
+# Self-joins read the same table's delta and btree on both sides.
+test matview-vdbe-join-self {
+    CREATE TABLE js(id INTEGER PRIMARY KEY, mgr INTEGER, name TEXT);
+    INSERT INTO js VALUES (1, NULL, 'root'), (2, 1, 'mid');
+    CREATE MATERIALIZED VIEW vjs AS SELECT e.name, m.name AS mname FROM js AS e JOIN js AS m ON e.mgr = m.id;
+    INSERT INTO js VALUES (3, 2, 'leaf');
+    SELECT * FROM vjs ORDER BY 1;
+    DELETE FROM js WHERE id = 2;
+    SELECT COUNT(*) FROM vjs;
+}
+expect {
+    leaf|mid
+    mid|root
+    0
+}
+
+# SELECT * over a join expands both tables' columns; rollback discards the
+# captured deltas of both sides.
+test matview-vdbe-join-star-and-rollback {
+    CREATE TABLE jl4(x INTEGER);
+    CREATE TABLE jr4(y INTEGER);
+    INSERT INTO jl4 VALUES (1);
+    INSERT INTO jr4 VALUES (2);
+    CREATE MATERIALIZED VIEW vj4 AS SELECT * FROM jl4 JOIN jr4 ON jl4.x < jr4.y;
+    BEGIN;
+    INSERT INTO jl4 VALUES (0);
+    SELECT * FROM vj4 ORDER BY 1, 2;
+    ROLLBACK;
+    SELECT * FROM vj4 ORDER BY 1, 2;
+}
+expect {
+    0|2
+    1|2
+    1|2
+}
+
+# Dropping a join view cleans up its pair-map state table and index.
+test matview-vdbe-join-drop-clean {
+    CREATE TABLE jl5(x INTEGER);
+    CREATE TABLE jr5(y INTEGER);
+    INSERT INTO jl5 VALUES (1);
+    INSERT INTO jr5 VALUES (1);
+    CREATE MATERIALIZED VIEW vj5 AS SELECT x, y FROM jl5 JOIN jr5 ON x = y;
+    DROP VIEW vj5;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# RIGHT JOIN is maintained as a LEFT JOIN with the two tables swapped: an
+# unmatched right row keeps a view row with the left columns NULL.
+test matview-vdbe-join-right-outer {
+    CREATE TABLE jl6(a INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE jr6(b INTEGER PRIMARY KEY, y INTEGER);
+    INSERT INTO jl6 VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW v6 AS SELECT a, x, b, y FROM jl6 RIGHT JOIN jr6 ON x = y;
+    INSERT INTO jr6 VALUES (100, 10), (200, 20), (300, 30);
+    DELETE FROM jl6 WHERE a = 1;
+    SELECT a, x, b, y FROM v6 ORDER BY b;
+}
+expect {
+    ||100|10
+    2|20|200|20
+    ||300|30
+}
+
+test matview-vdbe-join-full-outer-rejected {
+    CREATE TABLE jl6f(x INTEGER);
+    CREATE TABLE jr6f(y INTEGER);
+    CREATE MATERIALIZED VIEW bad6f AS SELECT x, y FROM jl6f FULL OUTER JOIN jr6f ON x = y;
+}
+expect error {
+    materialized views with FULL outer joins are not yet supported
+}
+
+test matview-vdbe-full-outer-aggregate-rejected {
+    CREATE TABLE jl6fa(x INTEGER);
+    CREATE TABLE jr6fa(y INTEGER);
+    CREATE MATERIALIZED VIEW bad6fa AS
+        SELECT COUNT(*) FROM jl6fa FULL OUTER JOIN jr6fa ON x = y;
+}
+expect error {
+    materialized views with FULL outer joins are not yet supported
+}
+
+test matview-vdbe-full-outer-distinct-rejected {
+    CREATE TABLE jl6fd(x INTEGER);
+    CREATE TABLE jr6fd(y INTEGER);
+    CREATE MATERIALIZED VIEW bad6fd AS
+        SELECT DISTINCT x, y FROM jl6fd FULL OUTER JOIN jr6fd ON x = y;
+}
+expect error {
+    materialized views with FULL outer joins are not yet supported
+}
+
+test matview-vdbe-join-right-using {
+    CREATE TABLE jl6u(x INTEGER);
+    CREATE TABLE jr6u(x INTEGER);
+    INSERT INTO jl6u VALUES (1), (2);
+    INSERT INTO jr6u VALUES (2), (3);
+    CREATE MATERIALIZED VIEW v6u AS SELECT x FROM jl6u RIGHT JOIN jr6u USING (x);
+    SELECT 'pop', * FROM v6u ORDER BY 2;
+    INSERT INTO jr6u VALUES (4);
+    SELECT 'right', * FROM v6u ORDER BY 2;
+    INSERT INTO jl6u VALUES (3);
+    SELECT 'match', * FROM v6u ORDER BY 2;
+    DELETE FROM jr6u WHERE x = 2;
+    SELECT 'delete', * FROM v6u ORDER BY 2;
+}
+expect {
+    pop|2
+    pop|3
+    right|2
+    right|3
+    right|4
+    match|2
+    match|3
+    match|4
+    delete|3
+    delete|4
+}
+
+# LEFT JOIN: a NULL-padded row exists while its left row has no ON-match.
+# Matches arriving and leaving flip the padded row; the padded row only
+# leaves once the last match is gone.
+test matview-vdbe-left-join-maintenance {
+    CREATE TABLE ll(a INTEGER, b TEXT);
+    CREATE TABLE lr(a INTEGER, c TEXT);
+    INSERT INTO ll VALUES (1,'x'), (2,'y'), (3,'z');
+    INSERT INTO lr VALUES (1,'p'), (2,'q');
+    CREATE MATERIALIZED VIEW vl AS SELECT ll.a, b, c FROM ll LEFT JOIN lr ON ll.a = lr.a;
+    SELECT 'init', * FROM vl ORDER BY 2, 3;
+    INSERT INTO lr VALUES (3,'m'), (3,'n');
+    DELETE FROM lr WHERE c = 'p';
+    INSERT INTO ll VALUES (4,'w');
+    SELECT 'moved', * FROM vl ORDER BY 2, 3;
+    DELETE FROM lr WHERE c = 'm';
+    SELECT 'onegone', * FROM vl ORDER BY 2, 3;
+    DELETE FROM lr WHERE c = 'n';
+    DELETE FROM ll WHERE a = 4;
+    SELECT 'padback', * FROM vl ORDER BY 2, 3;
+}
+expect {
+    init|1|x|p
+    init|2|y|q
+    init|3|z|
+    moved|1|x|
+    moved|2|y|q
+    moved|3|z|m
+    moved|3|z|n
+    moved|4|w|
+    onegone|1|x|
+    onegone|2|y|q
+    onegone|3|z|n
+    onegone|4|w|
+    padback|1|x|
+    padback|2|y|q
+    padback|3|z|
+}
+
+# ON gates matching; WHERE gates output rows. A pair passing ON but failing
+# WHERE still counts as a match (no padded row) and produces nothing; a
+# padded row is subject to WHERE over its NULL-padded image with
+# three-valued logic.
+test matview-vdbe-left-join-on-vs-where {
+    CREATE TABLE wl(a INTEGER, b TEXT);
+    CREATE TABLE wr(a INTEGER, c TEXT);
+    INSERT INTO wl VALUES (1,'x'), (2,'y'), (3,'z');
+    INSERT INTO wr VALUES (1,'p'), (2,'q');
+    CREATE MATERIALIZED VIEW vw1 AS SELECT wl.a, b, c FROM wl LEFT JOIN wr ON wl.a = wr.a WHERE c <> 'q';
+    CREATE MATERIALIZED VIEW vw2 AS SELECT wl.a, b, c FROM wl LEFT JOIN wr ON wl.a = wr.a WHERE c IS NULL;
+    CREATE MATERIALIZED VIEW vw3 AS SELECT wl.a, b, c FROM wl LEFT JOIN wr ON wl.a = wr.a AND wr.c <> 'q';
+    SELECT 'vw1', * FROM vw1 ORDER BY 2;
+    SELECT 'vw2', * FROM vw2 ORDER BY 2;
+    SELECT 'vw3', * FROM vw3 ORDER BY 2;
+    UPDATE wr SET c = 'k' WHERE c = 'q';
+    SELECT 'uw1', * FROM vw1 ORDER BY 2;
+    SELECT 'uw2', * FROM vw2 ORDER BY 2;
+    SELECT 'uw3', * FROM vw3 ORDER BY 2;
+}
+expect {
+    vw1|1|x|p
+    vw2|3|z|
+    vw3|1|x|p
+    vw3|2|y|
+    vw3|3|z|
+    uw1|1|x|p
+    uw1|2|y|k
+    uw2|3|z|
+    uw3|1|x|p
+    uw3|2|y|k
+    uw3|3|z|
+}
+
+# LEFT JOIN composes with USING (star merges the join column) and serves
+# same-transaction reads by recomputation.
+test matview-vdbe-left-join-using-ryw {
+    CREATE TABLE ul2(a INTEGER, b TEXT);
+    CREATE TABLE ur2(a INTEGER, c TEXT);
+    INSERT INTO ul2 VALUES (1,'x'), (2,'y');
+    INSERT INTO ur2 VALUES (1,'p');
+    CREATE MATERIALIZED VIEW vu2 AS SELECT * FROM ul2 LEFT JOIN ur2 USING (a);
+    SELECT 'init', * FROM vu2 ORDER BY 2;
+    BEGIN;
+    INSERT INTO ur2 VALUES (2,'q');
+    SELECT 'ryw', * FROM vu2 ORDER BY 2;
+    ROLLBACK;
+    SELECT 'post', * FROM vu2 ORDER BY 2;
+}
+expect {
+    init|1|x|p
+    init|2|y|
+    ryw|1|x|p
+    ryw|2|y|q
+    post|1|x|p
+    post|2|y|
+}
+
+# LEFT JOIN publishes a normal arranged delta stream, so aggregate consumes
+# matched/padded transitions without a shape-specific fused evaluator.
+test matview-vdbe-left-join-aggregate {
+    CREATE TABLE al(a INTEGER);
+    CREATE TABLE ar(a INTEGER);
+    INSERT INTO al VALUES (1), (2), (3);
+    INSERT INTO ar VALUES (1), (1), (2);
+    CREATE MATERIALIZED VIEW left_agg AS
+        SELECT al.a, COUNT(*) AS rows, COUNT(ar.a) AS matches
+          FROM al LEFT JOIN ar ON al.a = ar.a
+         GROUP BY al.a;
+    SELECT 'init', * FROM left_agg ORDER BY 2;
+    BEGIN;
+    DELETE FROM ar WHERE rowid = (SELECT MIN(rowid) FROM ar WHERE a = 1);
+    DELETE FROM ar WHERE a = 2;
+    INSERT INTO ar VALUES (3), (3);
+    INSERT INTO al VALUES (4);
+    UPDATE al SET a = 5 WHERE a = 2;
+    DELETE FROM al WHERE a = 1;
+    COMMIT;
+    SELECT 'after', * FROM left_agg ORDER BY 2;
+    DELETE FROM ar WHERE a = 3;
+    SELECT 'padback', * FROM left_agg ORDER BY 2;
+}
+expect {
+    init|1|2|2
+    init|2|1|1
+    init|3|1|0
+    after|3|2|2
+    after|4|1|0
+    after|5|1|0
+    padback|3|1|0
+    padback|4|1|0
+    padback|5|1|0
+}
+
+# DISTINCT consumes the same LEFT JOIN stream and collapses duplicates across
+# both matched rows and independently keyed NULL-padded rows.
+test matview-vdbe-left-join-distinct {
+    CREATE TABLE dl(a INTEGER);
+    CREATE TABLE dr(a INTEGER, b TEXT);
+    INSERT INTO dl VALUES (1), (1), (2), (3);
+    INSERT INTO dr VALUES (1,'x'), (1,'x'), (2,'y');
+    CREATE MATERIALIZED VIEW left_distinct AS
+        SELECT DISTINCT dl.a, dr.b
+          FROM dl LEFT JOIN dr ON dl.a = dr.a;
+    SELECT 'init', * FROM left_distinct ORDER BY 2, 3;
+    BEGIN;
+    DELETE FROM dr WHERE rowid = (SELECT MIN(rowid) FROM dr WHERE a = 1);
+    DELETE FROM dr WHERE a = 2;
+    INSERT INTO dr VALUES (3,'z'), (3,'z');
+    DELETE FROM dl WHERE rowid = (SELECT MIN(rowid) FROM dl WHERE a = 1);
+    INSERT INTO dl VALUES (4);
+    COMMIT;
+    SELECT 'mid', * FROM left_distinct ORDER BY 2, 3;
+    DELETE FROM dl WHERE a = 1;
+    DELETE FROM dr WHERE a = 3;
+    SELECT 'after', * FROM left_distinct ORDER BY 2, 3;
+}
+expect {
+    init|1|x
+    init|2|y
+    init|3|
+    mid|1|x
+    mid|2|
+    mid|3|z
+    mid|4|
+    after|2|
+    after|3|
+    after|4|
+}
+
+# LEFT JOIN consumes an interior arrangement for both its presence pass and
+# its padded-row reprojection; the outer aggregate then consumes the same
+# matched/padded delta stream.
+test matview-vdbe-derived-input-left-join-aggregate {
+    CREATE TABLE derived_left(id INTEGER PRIMARY KEY, k INTEGER, enabled INTEGER);
+    CREATE TABLE derived_right(k INTEGER, label TEXT);
+    INSERT INTO derived_left VALUES (1,10,1), (2,20,1), (3,30,0);
+    INSERT INTO derived_right VALUES (10,'ten');
+    CREATE MATERIALIZED VIEW derived_left_agg AS
+      SELECT d.k, COUNT(*) AS rows, COUNT(r.k) AS matches
+      FROM (
+        SELECT id, k FROM derived_left WHERE enabled <> 0
+      ) AS d
+      LEFT JOIN derived_right AS r ON d.k = r.k
+      GROUP BY d.k;
+    SELECT 'init', * FROM derived_left_agg ORDER BY 2;
+    BEGIN;
+    INSERT INTO derived_right VALUES (20,'twenty');
+    UPDATE derived_left SET enabled = 1 WHERE id = 3;
+    DELETE FROM derived_right WHERE k = 10;
+    UPDATE derived_left SET k = 40 WHERE id = 2;
+    INSERT INTO derived_right VALUES (30,'thirty');
+    COMMIT;
+    SELECT 'after', * FROM derived_left_agg ORDER BY 2;
+}
+expect {
+    init|10|1|1
+    init|20|1|0
+    after|10|1|0
+    after|30|1|1
+    after|40|1|0
+}
+
+# Binary LEFT operators already compose through derived-input arrangements.
+# The flat three-table spelling below remains rejected only because lowering
+# has not yet preserved the SQL join tree as binary DAG nodes.
+test matview-vdbe-nested-left-join-arrangement {
+    CREATE TABLE nla(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE nlb(k INTEGER, v INTEGER);
+    CREATE TABLE nlc(v INTEGER, z INTEGER);
+    INSERT INTO nla VALUES (1, 10), (2, 20);
+    INSERT INTO nlb VALUES (10, 100);
+    INSERT INTO nlc VALUES (100, 1000);
+    CREATE MATERIALIZED VIEW nested_left AS
+      SELECT d.id, d.v, nlc.z
+      FROM (
+        SELECT nla.id, nlb.v
+        FROM nla
+        LEFT JOIN nlb ON nla.k = nlb.k
+      ) AS d
+      LEFT JOIN nlc ON d.v = nlc.v;
+    SELECT * FROM nested_left ORDER BY id;
+    INSERT INTO nlb VALUES (20, 200);
+    INSERT INTO nlc VALUES (200, 2000);
+    SELECT * FROM nested_left ORDER BY id;
+    DELETE FROM nlb WHERE k = 10;
+    SELECT * FROM nested_left ORDER BY id;
+}
+expect {
+    1|100|1000
+    2||
+    1|100|1000
+    2|200|2000
+    1||
+    2|200|2000
+}
+
+test matview-vdbe-left-join-three-way {
+    CREATE TABLE tl(a INTEGER);
+    CREATE TABLE tr1(a INTEGER, b TEXT);
+    CREATE TABLE tr2(b TEXT, c INTEGER);
+    INSERT INTO tl VALUES (1), (2), (3);
+    INSERT INTO tr1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO tr2 VALUES ('x', 10);
+    CREATE MATERIALIZED VIEW three_left AS
+      SELECT tl.a, tr1.b, tr2.c
+      FROM tl
+      LEFT JOIN tr1 ON tl.a = tr1.a
+      LEFT JOIN tr2 ON tr1.b = tr2.b;
+    SELECT 'init', * FROM three_left ORDER BY a;
+    BEGIN;
+    INSERT INTO tr1 VALUES (3, 'z');
+    INSERT INTO tr2 VALUES ('z', 30);
+    DELETE FROM tr2 WHERE b = 'x';
+    COMMIT;
+    SELECT 'after', * FROM three_left ORDER BY a;
+    DELETE FROM tr1 WHERE a = 2;
+    SELECT 'pad', * FROM three_left ORDER BY a;
+}
+expect {
+    init|1|x|10
+    init|2|y|
+    init|3||
+    after|1|x|
+    after|2|y|
+    after|3|z|30
+    pad|1|x|
+    pad|2||
+    pad|3|z|30
+}
+
+# Mixed join trees keep each outer boundary at its own binary node. The final
+# inner join removes the first LEFT JOIN's padded rows, while later right-side
+# changes can make them enter or leave the result.
+test matview-vdbe-left-then-inner-join {
+    CREATE TABLE mix_l(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE mix_m(k INTEGER, tag TEXT);
+    CREATE TABLE mix_r(tag TEXT, value INTEGER);
+    INSERT INTO mix_l VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO mix_m VALUES (10, 'a'), (20, 'b');
+    INSERT INTO mix_r VALUES ('a', 100);
+    CREATE MATERIALIZED VIEW mixed_join_tree AS
+      SELECT mix_l.id, mix_m.tag, mix_r.value
+      FROM mix_l
+      LEFT JOIN mix_m ON mix_l.k = mix_m.k
+      JOIN mix_r ON mix_m.tag = mix_r.tag;
+    SELECT 'init', * FROM mixed_join_tree ORDER BY id;
+    BEGIN;
+    INSERT INTO mix_r VALUES ('b', 200);
+    INSERT INTO mix_m VALUES (30, 'c');
+    INSERT INTO mix_r VALUES ('c', 300);
+    DELETE FROM mix_r WHERE tag = 'a';
+    COMMIT;
+    SELECT 'after', * FROM mixed_join_tree ORDER BY id;
+    DELETE FROM mix_m WHERE k = 20;
+    SELECT 'gone', * FROM mixed_join_tree ORDER BY id;
+}
+expect {
+    init|1|a|100
+    after|2|b|200
+    after|3|c|300
+    gone|3|c|300
+}
+
+# A downstream operator must be able to bind every source rowid even when an
+# outer-join arrangement replaces the delta's transport key with its own
+# state rowid.
+test matview-vdbe-left-then-inner-source-rowids {
+    CREATE TABLE rowid_l(k INTEGER);
+    CREATE TABLE rowid_m(k INTEGER, tag TEXT);
+    CREATE TABLE rowid_r(k INTEGER);
+    INSERT INTO rowid_l VALUES (10), (20);
+    INSERT INTO rowid_m VALUES (10, 'a');
+    INSERT INTO rowid_r VALUES (10), (20);
+    CREATE MATERIALIZED VIEW mixed_rowids AS
+      SELECT rowid_l.rowid, rowid_m.rowid, rowid_r.rowid
+      FROM rowid_l
+      LEFT JOIN rowid_m ON rowid_l.k = rowid_m.k
+      JOIN rowid_r ON rowid_l.k = rowid_r.k;
+    SELECT 'init', * FROM mixed_rowids ORDER BY 2;
+    DELETE FROM rowid_l WHERE rowid = 2;
+    SELECT 'removed', * FROM mixed_rowids ORDER BY 2;
+    INSERT INTO rowid_l VALUES (20);
+    SELECT 'readded', * FROM mixed_rowids ORDER BY 2;
+    INSERT INTO rowid_m VALUES (20, 'b');
+    SELECT 'after', * FROM mixed_rowids ORDER BY 2;
+    DELETE FROM rowid_r WHERE rowid = 1;
+    SELECT 'gone', * FROM mixed_rowids ORDER BY 2;
+}
+expect {
+    init|1|1|1
+    init|2||2
+    removed|1|1|1
+    readded|1|1|1
+    readded|2||2
+    after|1|1|1
+    after|2|2|2
+    gone|2|2|2
+}
+
+# USING desugars to equality predicates against the left-most table with
+# each merged column; the star expansion shows the merged column once, and
+# unqualified references to it resolve without ambiguity.
+test matview-vdbe-join-using {
+    CREATE TABLE ul(a INTEGER, b TEXT);
+    CREATE TABLE ur(a INTEGER, c TEXT);
+    INSERT INTO ul VALUES (1, 'x'), (2, 'y');
+    INSERT INTO ur VALUES (1, 'p'), (1, 'q'), (3, 'z');
+    CREATE MATERIALIZED VIEW vu AS SELECT * FROM ul JOIN ur USING (a) WHERE a >= 1;
+    SELECT 'init', * FROM vu ORDER BY 2, 4;
+    INSERT INTO ul VALUES (3, 'w');
+    DELETE FROM ur WHERE c = 'q';
+    SELECT 'after', * FROM vu ORDER BY 2, 4;
+}
+expect {
+    init|1|x|p
+    init|1|x|q
+    after|1|x|p
+    after|3|w|z
+}
+
+# NATURAL is USING over the common column names. table.* keeps the merged
+# column (only bare * merges), matching SQLite.
+test matview-vdbe-join-natural {
+    CREATE TABLE nl(a INTEGER, b TEXT);
+    CREATE TABLE nr(a INTEGER, c TEXT);
+    INSERT INTO nl VALUES (1, 'x');
+    INSERT INTO nr VALUES (1, 'p');
+    CREATE MATERIALIZED VIEW vn1 AS SELECT * FROM nl NATURAL JOIN nr;
+    CREATE MATERIALIZED VIEW vn2 AS SELECT a, nr.*, b FROM nl JOIN nr USING (a);
+    SELECT 'vn1', * FROM vn1;
+    SELECT 'vn2', * FROM vn2;
+    INSERT INTO nl VALUES (2, 'y');
+    INSERT INTO nr VALUES (2, 'q');
+    SELECT 'wn1', * FROM vn1 ORDER BY 2;
+}
+expect {
+    vn1|1|x|p
+    vn2|1|1|p|x
+    wn1|1|x|p
+    wn1|2|y|q
+}
+
+# Chained USING joins merge per join, and aggregates group by the merged
+# column through the shared binding rules.
+test matview-vdbe-join-using-chained-aggregate {
+    CREATE TABLE ca(a INTEGER, b TEXT);
+    CREATE TABLE cb(a INTEGER, c TEXT);
+    CREATE TABLE cc(c TEXT, d INTEGER);
+    INSERT INTO ca VALUES (1, 'x'), (2, 'y');
+    INSERT INTO cb VALUES (1, 'p'), (1, 'q'), (2, 'p');
+    INSERT INTO cc VALUES ('p', 10), ('q', 20);
+    CREATE MATERIALIZED VIEW vc1 AS SELECT * FROM ca JOIN cb USING (a) JOIN cc USING (c);
+    CREATE MATERIALIZED VIEW vc2 AS SELECT c, SUM(d) AS s FROM ca JOIN cb USING (a) JOIN cc USING (c) GROUP BY c;
+    SELECT 'vc1', * FROM vc1 ORDER BY 2, 3;
+    SELECT 'vc2', * FROM vc2 ORDER BY c;
+    DELETE FROM cb WHERE a = 1 AND c = 'q';
+    SELECT 'wc2', * FROM vc2 ORDER BY c;
+}
+expect {
+    vc1|1|x|p|10
+    vc1|1|x|q|20
+    vc1|2|y|p|10
+    vc2|p|20
+    vc2|q|20
+    wc2|p|20
+}
+
+# USING requires the column on both sides.
+test matview-vdbe-join-using-missing-column-rejected {
+    CREATE TABLE ml(a INTEGER, b TEXT);
+    CREATE TABLE mr(a INTEGER, c TEXT);
+    CREATE MATERIALIZED VIEW badm AS SELECT * FROM ml JOIN mr USING (b);
+}
+expect error {
+    cannot join using column b - column not present in both tables
+}
+
+test matview-vdbe-join-using-self {
+    CREATE TABLE sl(a INTEGER);
+    INSERT INTO sl VALUES (1), (1), (2);
+    CREATE MATERIALIZED VIEW self_using AS SELECT * FROM sl JOIN sl USING (a);
+    SELECT 'init', a, COUNT(*) FROM self_using GROUP BY a ORDER BY a;
+    INSERT INTO sl VALUES (2);
+    DELETE FROM sl WHERE rowid = (SELECT MIN(rowid) FROM sl WHERE a = 1);
+    SELECT 'after', a, COUNT(*) FROM self_using GROUP BY a ORDER BY a;
+}
+expect {
+    init|1|4
+    init|2|1
+    after|1|1
+    after|2|4
+}
+
+# DISTINCT over a join is GROUP BY every output column over the join: one
+# group per distinct output row, alive while any join pair produces it, so
+# duplicate source rows collapse and the row survives until its last pair
+# is gone.
+test matview-vdbe-join-distinct {
+    CREATE TABLE jl7(a INTEGER, b TEXT);
+    CREATE TABLE jr7(a INTEGER, c TEXT);
+    INSERT INTO jl7 VALUES (1,'x'), (2,'y'), (2,'y');
+    INSERT INTO jr7 VALUES (1,'p'), (1,'p'), (2,'q');
+    CREATE MATERIALIZED VIEW vd7 AS SELECT DISTINCT b, c FROM jl7 JOIN jr7 ON jl7.a = jr7.a;
+    SELECT 'init', * FROM vd7 ORDER BY 2, 3;
+    INSERT INTO jr7 VALUES (2, 'q');
+    DELETE FROM jl7 WHERE b = 'x';
+    INSERT INTO jl7 VALUES (3, 'z');
+    INSERT INTO jr7 VALUES (3, 'w');
+    SELECT 'after', * FROM vd7 ORDER BY 2, 3;
+    DELETE FROM jr7 WHERE c = 'q';
+    SELECT 'gone', * FROM vd7 ORDER BY 2, 3;
+}
+expect {
+    init|x|p
+    init|y|q
+    after|y|q
+    after|z|w
+    gone|z|w
+}
+
+# DISTINCT over a join with USING merges the join column once, then dedups.
+test matview-vdbe-join-distinct-star-using {
+    CREATE TABLE dl(a INTEGER, b TEXT);
+    CREATE TABLE dr(a INTEGER, c TEXT);
+    INSERT INTO dl VALUES (1,'x'), (1,'x');
+    INSERT INTO dr VALUES (1,'p'), (1,'p');
+    CREATE MATERIALIZED VIEW vds AS SELECT DISTINCT * FROM dl JOIN dr USING (a);
+    SELECT * FROM vds ORDER BY 1, 2, 3;
+    INSERT INTO dl VALUES (1, 'z');
+    SELECT * FROM vds ORDER BY 1, 2, 3;
+}
+expect {
+    1|x|p
+    1|x|p
+    1|z|p
+}
+
+# DISTINCT composes after an aggregate over a join. As grouped counts collide
+# and diverge, the downstream dedup node tracks result-row multiplicity.
+test matview-vdbe-join-distinct-aggregate {
+    CREATE TABLE jl8(x INTEGER);
+    CREATE TABLE jr8(y INTEGER);
+    INSERT INTO jl8 VALUES (1), (1), (2);
+    INSERT INTO jr8 VALUES (1), (1), (2);
+    CREATE MATERIALIZED VIEW vda8 AS
+      SELECT DISTINCT COUNT(*) AS c
+      FROM jl8 JOIN jr8 ON x = y
+      GROUP BY x;
+    SELECT * FROM vda8 ORDER BY c;
+    DELETE FROM jl8 WHERE rowid = 1;
+    SELECT * FROM vda8 ORDER BY c;
+    INSERT INTO jr8 VALUES (2);
+    SELECT * FROM vda8 ORDER BY c;
+    DELETE FROM jl8 WHERE x = 1;
+    SELECT * FROM vda8 ORDER BY c;
+    DELETE FROM jr8 WHERE y = 2;
+    SELECT COUNT(*) FROM vda8;
+}
+expect {
+    1
+    4
+    1
+    2
+    2
+    2
+    0
+}
+
+# SELECT DISTINCT is maintained as GROUP BY over every result column: one
+# group per distinct output row, alive while any source row produces it.
+test matview-vdbe-select-distinct {
+    CREATE TABLE t33(a INTEGER, b TEXT);
+    INSERT INTO t33 VALUES (1, 'x'), (1, 'x'), (NULL, 'z'), (NULL, 'z');
+    CREATE MATERIALIZED VIEW v33 AS SELECT DISTINCT a, b FROM t33;
+    DELETE FROM t33 WHERE rowid = 1;
+    SELECT 'dup', COUNT(*) FROM v33;
+    DELETE FROM t33 WHERE rowid = 2;
+    SELECT 'last', a IS NULL, b FROM v33;
+    INSERT INTO t33 VALUES (2, 'y'), (2, 'y');
+    SELECT 'back', COUNT(*) FROM v33;
+}
+expect {
+    dup|2
+    last|1|z
+    back|2
+}
+
+# Hidden state tables carry the key's comparison collation, so grouping over
+# a collated column merges exactly like the defining query.
+test matview-vdbe-collated-group-representative-retraction {
+    CREATE TABLE collated_group_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_group_source VALUES ('a'), ('A');
+    CREATE MATERIALIZED VIEW collated_group_view AS
+        SELECT value, COUNT(*) FROM collated_group_source GROUP BY value;
+    SELECT * FROM collated_group_view;
+    DELETE FROM collated_group_source WHERE rowid = 1;
+    SELECT * FROM collated_group_view;
+}
+expect {
+    a|2
+    A|1
+}
+
+# When GROUP BY is satisfied by scanning a descending index backwards, its
+# first collation-equivalent source has the largest rowid.
+test matview-vdbe-collated-group-index-representative {
+    CREATE TABLE collated_group_index_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_group_index_source VALUES ('a'), ('A');
+    CREATE INDEX collated_group_index ON collated_group_index_source(value DESC);
+    CREATE MATERIALIZED VIEW collated_group_index_view AS
+        SELECT value, COUNT(*) FROM collated_group_index_source GROUP BY value;
+    SELECT * FROM collated_group_index_view;
+}
+expect {
+    A|2
+}
+
+# NOCASE puts case variants in one group; the displayed key is the first
+# surviving input representative selected by the batch GROUP BY.
+test matview-vdbe-collated-group-key {
+    CREATE TABLE t34(g TEXT COLLATE NOCASE, x INTEGER);
+    INSERT INTO t34 VALUES ('a', 1), ('A', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v34 AS SELECT g, SUM(x) AS s FROM t34 GROUP BY g;
+    SELECT 'init', * FROM v34 ORDER BY g;
+    INSERT INTO t34 VALUES ('B', 5), ('c', 7);
+    SELECT 'grew', * FROM v34 ORDER BY g;
+    DELETE FROM t34 WHERE x IN (10, 5);
+    SELECT 'died', * FROM v34 ORDER BY g;
+}
+expect {
+    init|a|3
+    init|b|10
+    grew|a|3
+    grew|b|15
+    grew|c|7
+    died|a|3
+    died|c|7
+}
+
+# A collation-equivalent value must not keep the bytes of a source row that no
+# longer exists. The comparison key says these rows share one minimum; it does
+# not make the first row's payload permanent.
+test matview-vdbe-collated-min-representative-retraction {
+    CREATE TABLE collated_min_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_min_source VALUES ('a'), ('A');
+    CREATE MATERIALIZED VIEW collated_min_view AS SELECT MIN(value) FROM collated_min_source;
+    SELECT * FROM collated_min_view;
+    DELETE FROM collated_min_source WHERE rowid = 1;
+    SELECT * FROM collated_min_view;
+}
+expect {
+    a
+    A
+}
+
+# A simple MAX query may scan a compatible ascending index backwards, so the
+# first source identity in its maximum equivalence class is the largest rowid.
+test matview-vdbe-collated-max-index-representative {
+    CREATE TABLE collated_max_index_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_max_index_source VALUES ('a'), ('A');
+    CREATE INDEX collated_max_index ON collated_max_index_source(value);
+    CREATE MATERIALIZED VIEW collated_max_index_view AS
+        SELECT MAX(value) FROM collated_max_index_source;
+    SELECT * FROM collated_max_index_view;
+}
+expect {
+    A
+}
+
+# Reversing the physical index direction reverses the rowid tie-break used by
+# the simple MIN/MAX fast path.
+test matview-vdbe-collated-min-desc-index-representative {
+    CREATE TABLE collated_min_desc_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_min_desc_source VALUES ('a'), ('A');
+    CREATE INDEX collated_min_desc_index ON collated_min_desc_source(value DESC);
+    CREATE MATERIALIZED VIEW collated_min_desc_view AS
+        SELECT MIN(value) FROM collated_min_desc_source;
+    SELECT * FROM collated_min_desc_view;
+}
+expect {
+    A
+}
+
+# MIN/MAX and DISTINCT aggregates over a collated argument compare through
+# the multiset table's collated value column. Case variants share one SQL
+# equivalence class, while the displayed extreme follows a surviving input.
+test matview-vdbe-collated-minmax-distinct {
+    CREATE TABLE t50(g TEXT COLLATE NOCASE);
+    INSERT INTO t50 VALUES ('a'), ('A'), ('b');
+    CREATE MATERIALIZED VIEW v50 AS SELECT MAX(g) AS mx, MIN(g) AS mn, COUNT(DISTINCT g) AS cd FROM t50;
+    SELECT 'init', * FROM v50;
+    DELETE FROM t50 WHERE g = 'b';
+    SELECT 'shrunk', * FROM v50;
+    DELETE FROM t50 WHERE rowid = 1;
+    SELECT 'variant', * FROM v50;
+    DELETE FROM t50;
+    SELECT 'empty', mx IS NULL, mn IS NULL, cd FROM v50;
+}
+expect {
+    init|b|a|2
+    shrunk|a|a|1
+    variant|A|A|1
+    empty|1|1|0
+}
+
+# An explicit COLLATE on a DISTINCT aggregate's argument is honored.
+test matview-vdbe-collated-distinct-explicit {
+    CREATE TABLE t51(a TEXT);
+    INSERT INTO t51 VALUES ('x'), ('X'), ('y');
+    CREATE MATERIALIZED VIEW v51 AS SELECT COUNT(DISTINCT a COLLATE NOCASE) AS cd FROM t51;
+    SELECT * FROM v51;
+    INSERT INTO t51 VALUES ('Y');
+    SELECT * FROM v51;
+}
+expect {
+    2
+    2
+}
+
+# SELECT DISTINCT over a collated column dedups under that collation.
+test matview-vdbe-collated-distinct-representative-retraction {
+    CREATE TABLE collated_distinct_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_distinct_source VALUES ('a'), ('A');
+    CREATE MATERIALIZED VIEW collated_distinct_view AS
+        SELECT DISTINCT value FROM collated_distinct_source;
+    SELECT * FROM collated_distinct_view;
+    DELETE FROM collated_distinct_source WHERE rowid = 1;
+    SELECT * FROM collated_distinct_view;
+}
+expect {
+    a
+    A
+}
+
+test matview-vdbe-collated-select-distinct {
+    CREATE TABLE t52(g TEXT COLLATE NOCASE);
+    INSERT INTO t52 VALUES ('a'), ('A'), ('b');
+    CREATE MATERIALIZED VIEW v52 AS SELECT DISTINCT g FROM t52;
+    SELECT * FROM v52 ORDER BY g;
+    DELETE FROM t52 WHERE rowid <= 2;
+    SELECT * FROM v52 ORDER BY g;
+}
+expect {
+    a
+    b
+    b
+}
+
+# UNION uses the left-most branch's collation for deduplication, but SQLite's
+# compound index replaces the payload when a later branch contributes a
+# collation-equivalent row.
+test matview-vdbe-collated-union-representative-population {
+    CREATE TABLE collated_union_left(value TEXT COLLATE NOCASE);
+    CREATE TABLE collated_union_right(value TEXT);
+    INSERT INTO collated_union_left VALUES ('a');
+    INSERT INTO collated_union_right VALUES ('A');
+    CREATE MATERIALIZED VIEW collated_union_view AS
+        SELECT value FROM collated_union_left
+        UNION
+        SELECT value FROM collated_union_right;
+    SELECT * FROM collated_union_view;
+}
+expect {
+    A
+}
+
+# Removing the right branch's representative falls back to the first live
+# source in the accumulated left result.
+test matview-vdbe-collated-union-representative-fallback {
+    CREATE TABLE collated_union_fallback_left(value TEXT COLLATE NOCASE);
+    CREATE TABLE collated_union_fallback_right(value TEXT);
+    INSERT INTO collated_union_fallback_left VALUES ('a');
+    INSERT INTO collated_union_fallback_right VALUES ('A');
+    CREATE MATERIALIZED VIEW collated_union_fallback_view AS
+        SELECT value FROM collated_union_fallback_left
+        UNION
+        SELECT value FROM collated_union_fallback_right;
+    SELECT * FROM collated_union_fallback_view;
+    DELETE FROM collated_union_fallback_right;
+    SELECT * FROM collated_union_fallback_view;
+}
+expect {
+    A
+    a
+}
+
+# INTERSECT uses the accumulated left payload; the right branch contributes
+# membership only.
+test matview-vdbe-collated-intersect-representative {
+    CREATE TABLE collated_intersect_left(value TEXT COLLATE NOCASE);
+    CREATE TABLE collated_intersect_right(value TEXT);
+    INSERT INTO collated_intersect_left VALUES ('a');
+    INSERT INTO collated_intersect_right VALUES ('A');
+    CREATE MATERIALIZED VIEW collated_intersect_view AS
+        SELECT value FROM collated_intersect_left
+        INTERSECT
+        SELECT value FROM collated_intersect_right;
+    SELECT * FROM collated_intersect_view;
+    UPDATE collated_intersect_left SET value = 'A';
+    SELECT * FROM collated_intersect_view;
+}
+expect {
+    a
+    A
+}
+
+# EXCEPT likewise retains the left payload when a filtering right-side row
+# leaves the equivalence class.
+test matview-vdbe-collated-except-representative {
+    CREATE TABLE collated_except_left(value TEXT COLLATE NOCASE);
+    CREATE TABLE collated_except_right(value TEXT);
+    INSERT INTO collated_except_left VALUES ('a');
+    INSERT INTO collated_except_right VALUES ('z');
+    CREATE MATERIALIZED VIEW collated_except_view AS
+        SELECT value FROM collated_except_left
+        EXCEPT
+        SELECT value FROM collated_except_right;
+    SELECT * FROM collated_except_view;
+    INSERT INTO collated_except_right VALUES ('A');
+    DELETE FROM collated_except_right WHERE value = 'A';
+    SELECT * FROM collated_except_view;
+}
+expect {
+    a
+    a
+}
+
+# A deduplicated row continues to use the representative selected by the
+# defining compound query as branch membership changes.
+test matview-vdbe-collated-union {
+    CREATE TABLE t53(g TEXT COLLATE NOCASE);
+    CREATE TABLE t54(h TEXT);
+    INSERT INTO t53 VALUES ('a'), ('b');
+    INSERT INTO t54 VALUES ('A'), ('c');
+    CREATE MATERIALIZED VIEW v53 AS SELECT g FROM t53 UNION SELECT h FROM t54;
+    SELECT * FROM v53 ORDER BY 1;
+    DELETE FROM t53 WHERE g = 'a';
+    SELECT * FROM v53 ORDER BY 1;
+    DELETE FROM t54 WHERE h = 'A';
+    SELECT * FROM v53 ORDER BY 1;
+}
+expect {
+    A
+    b
+    c
+    A
+    b
+    c
+    b
+    c
+}
+
+# RTRIM group keys ignore trailing spaces, and the multiset table's group
+# prefix follows the same collation so MIN/MAX stay attached to their group.
+test matview-vdbe-collated-rtrim {
+    CREATE TABLE t55(p TEXT COLLATE RTRIM, q INTEGER);
+    INSERT INTO t55 VALUES ('m', 1), ('m  ', 2), ('n', 3);
+    CREATE MATERIALIZED VIEW v55 AS SELECT p, SUM(q) AS s, MAX(q) AS mx FROM t55 GROUP BY p;
+    SELECT * FROM v55 ORDER BY p;
+    DELETE FROM t55 WHERE q = 2;
+    SELECT * FROM v55 ORDER BY p;
+}
+expect {
+    m|3|2
+    n|3|3
+    m|1|1
+    n|3|3
+}
+
+# Each aggregate owns its value multiset, so its index can use the argument's
+# collation independently of every other aggregate in the same node.
+test matview-vdbe-collated-multisets-independent {
+    CREATE TABLE t56(a TEXT, b TEXT COLLATE NOCASE);
+    INSERT INTO t56 VALUES ('Z', 'A'), ('a', 'a'), ('B', 'B'), ('z', 'c');
+    CREATE MATERIALIZED VIEW v56 AS
+      SELECT MIN(a COLLATE BINARY), COUNT(DISTINCT b COLLATE NOCASE) FROM t56;
+    SELECT * FROM v56;
+    SELECT COUNT(*) FROM sqlite_schema
+      WHERE name LIKE '__turso_internal_dbsp_multiset_v2_v56__n%__a%';
+    DELETE FROM t56 WHERE a = 'B';
+    SELECT * FROM v56;
+    DELETE FROM t56 WHERE a = 'Z';
+    SELECT * FROM v56;
+    DROP VIEW v56;
+    SELECT COUNT(*) FROM sqlite_schema
+      WHERE name LIKE '__turso_internal_dbsp_multiset_v2_v56__n%__a%';
+}
+expect {
+    B|3
+    2
+    Z|2
+    a|2
+    0
+}
+
+# Projection and DISTINCT are independent downstream operators. Equivalent
+# aggregate results therefore share one output row until the last producing
+# group changes or disappears.
+test matview-vdbe-distinct-over-aggregates {
+    CREATE TABLE t35(id INTEGER PRIMARY KEY, g TEXT, x INTEGER);
+    INSERT INTO t35 VALUES
+      (1, 'a', 10),
+      (2, 'b', 20),
+      (3, 'c', 30),
+      (4, 'c', 40);
+    CREATE MATERIALIZED VIEW v35 AS
+      SELECT DISTINCT COUNT(*) AS c FROM t35 GROUP BY g;
+    SELECT * FROM v35 ORDER BY c;
+    INSERT INTO t35 VALUES (5, 'a', 50);
+    SELECT * FROM v35 ORDER BY c;
+    INSERT INTO t35 VALUES (6, 'b', 60);
+    SELECT * FROM v35 ORDER BY c;
+    DELETE FROM t35 WHERE id = 4;
+    SELECT * FROM v35 ORDER BY c;
+    DELETE FROM t35 WHERE id IN (1, 5);
+    SELECT * FROM v35 ORDER BY c;
+    DELETE FROM t35 WHERE id = 3;
+    SELECT * FROM v35 ORDER BY c;
+}
+expect {
+    1
+    2
+    1
+    2
+    2
+    1
+    2
+    1
+    2
+    2
+}
+
+# A pair can be retracted by the delta phases before its insertion arrives
+# (it exists only across the transaction's old/new generations: here the ON
+# predicate matches old-left with new-right and new-left with old-right, but
+# neither generation with itself). The pair map records the transiently
+# negative multiplicity; dropping it would materialize phantom rows.
+test matview-vdbe-join-cross-generation-pairs {
+    CREATE TABLE pl(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE pr(id INTEGER PRIMARY KEY, k INTEGER);
+    INSERT INTO pl VALUES (1, 20);
+    INSERT INTO pr VALUES (1, 10);
+    CREATE MATERIALIZED VIEW vp AS SELECT pl.k AS lk, pr.k AS rk FROM pl JOIN pr ON pl.k = pr.k;
+    BEGIN;
+    UPDATE pl SET k = 10;
+    UPDATE pr SET k = 20;
+    COMMIT;
+    SELECT 'phantom', COUNT(*) FROM vp;
+    BEGIN;
+    UPDATE pl SET k = 20;
+    UPDATE pr SET k = 20;
+    COMMIT;
+    SELECT 'match', * FROM vp;
+    PRAGMA integrity_check;
+}
+expect {
+    phantom|0
+    match|20|20
+    ok
+}
+
+# The same cross-generation retraction-before-insertion reaches groups when
+# aggregating over a join; contributions apply positives-first so group
+# weights never dip below zero.
+test matview-vdbe-join-aggregate-cross-generation {
+    CREATE TABLE ga(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER);
+    CREATE TABLE gb(id INTEGER PRIMARY KEY, k INTEGER);
+    INSERT INTO ga VALUES (1, 20, 7);
+    INSERT INTO gb VALUES (1, 10);
+    CREATE MATERIALIZED VIEW vg AS SELECT ga.g, COUNT(*) AS cnt FROM ga JOIN gb ON ga.k = gb.k GROUP BY ga.g;
+    BEGIN;
+    UPDATE ga SET k = 10, g = 8;
+    UPDATE gb SET k = 20;
+    COMMIT;
+    SELECT 'phantom', COUNT(*) FROM vg;
+    UPDATE gb SET k = 10;
+    SELECT 'match', * FROM vg;
+}
+expect {
+    phantom|0
+    match|8|1
+}
+
+# Aggregates over a join: the join delta phases pre-evaluate group keys,
+# aggregate arguments, and weights into a joined-delta relation that feeds
+# the same group machinery as single-table aggregates.
+test matview-vdbe-join-aggregate-maintenance {
+    CREATE TABLE jc(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE jo(id INTEGER PRIMARY KEY, cid INTEGER, amount INTEGER);
+    INSERT INTO jc VALUES (1, 'a'), (2, 'b');
+    INSERT INTO jo VALUES (1, 1, 100), (2, 1, 150), (3, 2, 200);
+    CREATE MATERIALIZED VIEW vja AS SELECT jc.name, COUNT(*) AS cnt, SUM(jo.amount) AS s, MIN(jo.amount) AS mn FROM jc JOIN jo ON jc.id = jo.cid GROUP BY jc.name;
+    SELECT 'pop', * FROM vja ORDER BY 2;
+    DELETE FROM jo WHERE id = 1;
+    SELECT 'del', * FROM vja ORDER BY 2;
+    UPDATE jo SET cid = 2 WHERE id = 2;
+    SELECT 'mov', * FROM vja ORDER BY 2;
+    BEGIN;
+    INSERT INTO jc VALUES (3, 'c');
+    INSERT INTO jo VALUES (4, 3, 70), (5, 3, 30);
+    COMMIT;
+    SELECT 'txn', * FROM vja ORDER BY 2;
+    DELETE FROM jc WHERE id = 2;
+    SELECT 'cgone', * FROM vja ORDER BY 2;
+}
+expect {
+    pop|a|2|250|100
+    pop|b|1|200|200
+    del|a|1|150|150
+    del|b|1|200|200
+    mov|b|2|350|150
+    txn|b|2|350|150
+    txn|c|2|100|30
+    cgone|c|2|100|30
+}
+
+# Scalar aggregates over a join keep their always-present row.
+test matview-vdbe-join-scalar-aggregate {
+    CREATE TABLE jl9(k INTEGER);
+    CREATE TABLE jr9(k INTEGER, x INTEGER);
+    CREATE MATERIALIZED VIEW vjs9 AS SELECT COUNT(*) AS c, SUM(jr9.x) AS s FROM jl9 JOIN jr9 ON jl9.k = jr9.k;
+    SELECT c, s IS NULL FROM vjs9;
+    INSERT INTO jl9 VALUES (1);
+    INSERT INTO jr9 VALUES (1, 10), (1, 20);
+    SELECT * FROM vjs9;
+    DELETE FROM jr9;
+    SELECT c, s IS NULL FROM vjs9;
+}
+expect {
+    0|1
+    2|30
+    0|1
+}
+
+# A derived-table alias is a SQL namespace boundary. A composite join key
+# remains valid transport identity, but must not be exposed as one binding
+# rowid per alias before the outer aggregate consumes it.
+test matview-vdbe-derived-multi-join-scalar-aggregate {
+    CREATE TABLE dma(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE dmb(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE dmc(id INTEGER PRIMARY KEY, k INTEGER);
+    INSERT INTO dma VALUES (1, 10), (2, 20);
+    INSERT INTO dmb VALUES (1, 10), (2, 10), (3, 20);
+    INSERT INTO dmc VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW vdm AS
+      SELECT COUNT(*)
+      FROM (
+        SELECT dma.k AS value
+        FROM dma
+        JOIN dmb ON dma.k = dmb.k
+        JOIN dmc ON dmb.k = dmc.k
+      ) AS derived;
+    SELECT * FROM vdm;
+    INSERT INTO dmc VALUES (3, 10);
+    SELECT * FROM vdm;
+    UPDATE dmb SET k = 10 WHERE id = 3;
+    SELECT * FROM vdm;
+    DELETE FROM dma WHERE id = 1;
+    SELECT * FROM vdm;
+}
+expect {
+    3
+    5
+    6
+    0
+}
+
+# Non-recursive CTEs arrive from the main planner as ordinary derived inputs.
+# Multiple references may duplicate the subgraph today, but they must preserve
+# the same dependency and delta semantics as spelling the subquery twice.
+test matview-vdbe-nonrecursive-cte-fanout {
+    CREATE TABLE cte_base(id INTEGER PRIMARY KEY, k INTEGER);
+    INSERT INTO cte_base VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW cte_pairs AS
+      WITH c AS (
+        SELECT id, k FROM cte_base WHERE k >= 10
+      )
+      SELECT l.id, r.id
+      FROM c AS l
+      JOIN c AS r ON l.k = r.k;
+    SELECT * FROM cte_pairs ORDER BY 1, 2;
+    INSERT INTO cte_base VALUES (3, 10);
+    SELECT * FROM cte_pairs ORDER BY 1, 2;
+    UPDATE cte_base SET k = 30 WHERE id = 2;
+    DELETE FROM cte_base WHERE id = 1;
+    SELECT * FROM cte_pairs ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|2
+    1|1
+    1|3
+    2|2
+    3|1
+    3|3
+    2|2
+    3|3
+}
+
+# HAVING over a join gates group rows as their aggregates cross the
+# predicate.
+test matview-vdbe-join-aggregate-having {
+    CREATE TABLE jc2(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE jo2(id INTEGER PRIMARY KEY, cid INTEGER);
+    INSERT INTO jc2 VALUES (1, 'a'), (2, 'b');
+    INSERT INTO jo2 VALUES (1, 1), (2, 1), (3, 2);
+    CREATE MATERIALIZED VIEW vjh2 AS SELECT jc2.name, COUNT(*) AS cnt FROM jc2 JOIN jo2 ON jc2.id = jo2.cid GROUP BY jc2.name HAVING COUNT(*) > 1;
+    SELECT 'init', * FROM vjh2;
+    INSERT INTO jo2 VALUES (4, 2);
+    SELECT 'grew', * FROM vjh2 ORDER BY 2;
+    DELETE FROM jo2 WHERE id IN (1, 2);
+    SELECT 'shrunk', * FROM vjh2;
+}
+expect {
+    init|a|2
+    grew|a|2
+    grew|b|2
+    shrunk|b|2
+}
+
+# UNION dedups across branches through a content-keyed state row whose
+# multiplicity counts copies: the view row survives while any branch still
+# produces the content.
+test matview-vdbe-union-maintenance {
+    CREATE TABLE ua(x INTEGER, s TEXT);
+    CREATE TABLE ub(y INTEGER, t TEXT);
+    INSERT INTO ua VALUES (1, 'a'), (2, 'both');
+    INSERT INTO ub VALUES (2, 'both'), (3, 'b');
+    CREATE MATERIALIZED VIEW vu1 AS SELECT x, s FROM ua UNION SELECT y, t FROM ub;
+    SELECT 'pop', * FROM vu1 ORDER BY 2, 3;
+    DELETE FROM ua WHERE x = 2;
+    SELECT 'one', * FROM vu1 ORDER BY 2, 3;
+    DELETE FROM ub WHERE y = 2;
+    SELECT 'gone', * FROM vu1 ORDER BY 2, 3;
+    BEGIN;
+    INSERT INTO ua VALUES (9, 'z');
+    INSERT INTO ub VALUES (9, 'z');
+    COMMIT;
+    SELECT 'txn', * FROM vu1 ORDER BY 2, 3;
+}
+expect {
+    pop|1|a
+    pop|2|both
+    pop|3|b
+    one|1|a
+    one|2|both
+    one|3|b
+    gone|1|a
+    gone|3|b
+    txn|1|a
+    txn|3|b
+    txn|9|z
+}
+
+# UNION ALL keeps duplicates: rows are identified by (branch, source rowid),
+# so per-branch updates and deletes hit the right copy.
+test matview-vdbe-union-all-maintenance {
+    CREATE TABLE uc(x INTEGER);
+    CREATE MATERIALIZED VIEW vu2 AS SELECT x FROM uc WHERE x < 5 UNION ALL SELECT x FROM uc WHERE x >= 0;
+    SELECT 'state', COUNT(*) FROM sqlite_schema
+      WHERE name LIKE '__turso_internal_dbsp_state_v%_vu2';
+    INSERT INTO uc VALUES (3), (7);
+    SELECT 'ins', * FROM vu2 ORDER BY 2;
+    UPDATE uc SET x = 4 WHERE x = 3;
+    SELECT 'upd', * FROM vu2 ORDER BY 2;
+    DELETE FROM uc WHERE x = 7;
+    SELECT 'del', * FROM vu2 ORDER BY 2;
+    BEGIN;
+    DELETE FROM uc;
+    ROLLBACK;
+    SELECT 'rb', * FROM vu2 ORDER BY 2;
+}
+expect {
+    state|0
+    ins|3
+    ins|3
+    ins|7
+    upd|4
+    upd|4
+    upd|7
+    del|4
+    del|4
+    rb|4
+    rb|4
+}
+
+# Dropping a union view cleans up its state table and index.
+test matview-vdbe-union-drop-clean {
+    CREATE TABLE ud(x INTEGER);
+    INSERT INTO ud VALUES (1);
+    CREATE MATERIALIZED VIEW vu3 AS SELECT x FROM ud UNION SELECT x + 1 FROM ud;
+    DROP VIEW vu3;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test matview-vdbe-union-arity-mismatch-rejected {
+    CREATE TABLE ue(x INTEGER, y INTEGER);
+    CREATE MATERIALIZED VIEW bad_u AS SELECT x FROM ue UNION ALL SELECT x, y FROM ue;
+}
+expect error {
+    SELECTs to the left and right of UNION ALL do not have the same number of result columns
+}
+
+# INTERSECT keeps a content row visible only while both sides produce it;
+# duplicate source rows do not multiply the result.
+test matview-vdbe-intersect-maintenance {
+    CREATE TABLE ia(x INTEGER);
+    CREATE TABLE ib(x INTEGER);
+    INSERT INTO ia VALUES (1), (2), (2), (3);
+    INSERT INTO ib VALUES (2), (3), (4);
+    CREATE MATERIALIZED VIEW vi AS SELECT x FROM ia INTERSECT SELECT x FROM ib;
+    SELECT 'init', * FROM vi ORDER BY x;
+    INSERT INTO ib VALUES (1);
+    DELETE FROM ib WHERE x = 2;
+    SELECT 'moved', * FROM vi ORDER BY x;
+    DELETE FROM ia WHERE x = 2;
+    INSERT INTO ib VALUES (2);
+    SELECT 'gone', * FROM vi ORDER BY x;
+}
+expect {
+    init|2
+    init|3
+    moved|1
+    moved|3
+    gone|1
+    gone|3
+}
+
+# EXCEPT removes a content row the moment the right side produces it, and
+# restores it when the right side stops.
+test matview-vdbe-except-maintenance {
+    CREATE TABLE ea(x INTEGER);
+    CREATE TABLE eb(x INTEGER);
+    INSERT INTO ea VALUES (1), (2), (3);
+    INSERT INTO eb VALUES (2);
+    CREATE MATERIALIZED VIEW ve AS SELECT x FROM ea EXCEPT SELECT x FROM eb;
+    SELECT 'init', * FROM ve ORDER BY x;
+    INSERT INTO eb VALUES (3);
+    SELECT 'shrunk', * FROM ve ORDER BY x;
+    DELETE FROM eb;
+    SELECT 'back', * FROM ve ORDER BY x;
+}
+expect {
+    init|1
+    init|3
+    shrunk|1
+    back|1
+    back|2
+    back|3
+}
+
+# Mixed chains fold left-associatively: (a UNION b) INTERSECT c, and a
+# UNION ALL before a deduplicating operator only feeds presence.
+test matview-vdbe-compound-mixed-chain {
+    CREATE TABLE ma(x INTEGER);
+    CREATE TABLE mb(x INTEGER);
+    CREATE TABLE mc(x INTEGER);
+    INSERT INTO ma VALUES (1), (2);
+    INSERT INTO mb VALUES (3);
+    INSERT INTO mc VALUES (2), (3), (4);
+    CREATE MATERIALIZED VIEW vm1 AS SELECT x FROM ma UNION SELECT x FROM mb INTERSECT SELECT x FROM mc;
+    CREATE MATERIALIZED VIEW vm2 AS SELECT x FROM ma UNION ALL SELECT x FROM mb INTERSECT SELECT x FROM mc;
+    CREATE MATERIALIZED VIEW vm3 AS SELECT x FROM ma EXCEPT SELECT x FROM mb UNION SELECT x FROM mc;
+    SELECT 'vm1', * FROM vm1 ORDER BY x;
+    SELECT 'vm2', * FROM vm2 ORDER BY x;
+    SELECT 'vm3', * FROM vm3 ORDER BY x;
+    INSERT INTO mb VALUES (2);
+    DELETE FROM mc WHERE x = 3;
+    SELECT 'wm1', * FROM vm1 ORDER BY x;
+    SELECT 'wm2', * FROM vm2 ORDER BY x;
+    SELECT 'wm3', * FROM vm3 ORDER BY x;
+}
+expect {
+    vm1|2
+    vm1|3
+    vm2|2
+    vm2|3
+    vm3|1
+    vm3|2
+    vm3|3
+    vm3|4
+    wm1|2
+    wm2|2
+    wm3|1
+    wm3|2
+    wm3|4
+}
+
+# A UNION prefix with a trailing UNION ALL keeps two kinds of rows: one
+# deduplicated row per distinct prefix content, plus every suffix row with
+# duplicates preserved. Their hidden-state rowids come from two tables and
+# map to disjoint view rowids.
+test matview-vdbe-compound-union-then-all {
+    CREATE TABLE na(x INTEGER);
+    CREATE TABLE nb(x INTEGER);
+    CREATE TABLE nc(x INTEGER);
+    INSERT INTO na VALUES (1), (2);
+    INSERT INTO nb VALUES (2), (3);
+    INSERT INTO nc VALUES (3), (3), (4);
+    CREATE MATERIALIZED VIEW vn AS SELECT x FROM na UNION SELECT x FROM nb UNION ALL SELECT x FROM nc;
+    SELECT 'init', * FROM vn ORDER BY x;
+    DELETE FROM nc WHERE rowid = 1;
+    INSERT INTO na VALUES (3);
+    SELECT 'after', * FROM vn ORDER BY x;
+    DELETE FROM na;
+    DELETE FROM nb;
+    DELETE FROM nc;
+    SELECT COUNT(*) FROM vn;
+}
+expect {
+    init|1
+    init|2
+    init|3
+    init|3
+    init|3
+    init|4
+    after|1
+    after|2
+    after|3
+    after|3
+    after|4
+    0
+}
+
+# A join in the trailing UNION ALL suffix carries a multi-row identity tuple.
+# The append arrangement stores that identity as one packed key rather than
+# assuming every branch is a single-table rowid stream.
+test matview-vdbe-compound-join-append-identity {
+    CREATE TABLE pack_c(x INTEGER);
+    CREATE TABLE pack_d(x INTEGER);
+    CREATE TABLE pack_a(k INTEGER);
+    CREATE TABLE pack_b(k INTEGER);
+    INSERT INTO pack_c VALUES (1);
+    INSERT INTO pack_d VALUES (2);
+    INSERT INTO pack_a VALUES (3), (3);
+    INSERT INTO pack_b VALUES (3);
+    CREATE MATERIALIZED VIEW pack_v AS
+      SELECT x FROM pack_c
+      UNION
+      SELECT x FROM pack_d
+      UNION ALL
+      SELECT pack_a.k FROM pack_a JOIN pack_b ON pack_a.k = pack_b.k;
+    SELECT 'init', * FROM pack_v ORDER BY 2;
+    BEGIN;
+    INSERT INTO pack_b VALUES (3);
+    DELETE FROM pack_a WHERE rowid = 1;
+    UPDATE pack_b SET k = 4 WHERE rowid = 1;
+    INSERT INTO pack_a VALUES (4);
+    DELETE FROM pack_c;
+    INSERT INTO pack_d VALUES (1);
+    DELETE FROM pack_d WHERE x = 2;
+    COMMIT;
+    SELECT 'after', * FROM pack_v ORDER BY 2;
+}
+expect {
+    init|1
+    init|2
+    init|3
+    init|3
+    after|1
+    after|3
+    after|4
+}
+
+# Compound views serve same-transaction reads by recomputation.
+test matview-vdbe-compound-read-your-own-writes {
+    CREATE TABLE ra(x INTEGER);
+    CREATE TABLE rb(x INTEGER);
+    INSERT INTO ra VALUES (1), (2);
+    INSERT INTO rb VALUES (2);
+    CREATE MATERIALIZED VIEW vr AS SELECT x FROM ra INTERSECT SELECT x FROM rb;
+    BEGIN;
+    INSERT INTO rb VALUES (1);
+    SELECT * FROM vr ORDER BY x;
+    ROLLBACK;
+    SELECT * FROM vr ORDER BY x;
+}
+expect {
+    1
+    2
+    2
+}
+
+# A pure UNION ALL whose branches are aggregates: each branch is maintained
+# by its own aggregate sub-program writing a disjoint rowid slice of the
+# shared view btree, with its own hidden state tables. The branches are
+# independent, so each quarter's totals update in place.
+test matview-vdbe-compound-all-aggregate-branches {
+    CREATE TABLE qa(p TEXT, n INTEGER);
+    CREATE TABLE qb(p TEXT, n INTEGER);
+    INSERT INTO qa VALUES ('x', 10), ('y', 50);
+    INSERT INTO qb VALUES ('x', 15), ('z', 30);
+    CREATE MATERIALIZED VIEW vca AS
+        SELECT 'A' AS q, SUM(n) AS s FROM qa
+        UNION ALL
+        SELECT 'B' AS q, SUM(n) AS s FROM qb;
+    SELECT 'init', * FROM vca ORDER BY q;
+    INSERT INTO qa VALUES ('w', 5);
+    DELETE FROM qb WHERE p = 'x';
+    SELECT 'after', * FROM vca ORDER BY q;
+}
+expect {
+    init|A|60
+    init|B|45
+    after|A|65
+    after|B|30
+}
+
+# Deduplicating compounds use the same DAG traversal as interior set-ops, so
+# stateful branches are not constrained to the old shallow branch pipeline.
+test matview-vdbe-compound-dedup-aggregate-branches {
+    CREATE TABLE dedup_agg_a(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER);
+    CREATE TABLE dedup_agg_b(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER);
+    INSERT INTO dedup_agg_a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5);
+    INSERT INTO dedup_agg_b VALUES (1, 1, 30), (2, 3, 7);
+    CREATE MATERIALIZED VIEW dedup_agg_v AS
+      SELECT g, SUM(x) AS total FROM dedup_agg_a GROUP BY g
+      UNION
+      SELECT g, SUM(x) AS total FROM dedup_agg_b GROUP BY g;
+    SELECT * FROM dedup_agg_v ORDER BY g, total;
+    UPDATE dedup_agg_a SET x = 10 WHERE id = 2;
+    SELECT * FROM dedup_agg_v ORDER BY g, total;
+    DELETE FROM dedup_agg_b WHERE id = 1;
+    SELECT * FROM dedup_agg_v ORDER BY g, total;
+}
+expect {
+    1|30
+    2|5
+    3|7
+    1|20
+    1|30
+    2|5
+    3|7
+    1|20
+    2|5
+    3|7
+}
+
+# A pure UNION ALL whose branches are joins: each branch's join maintenance
+# writes its slice. Duplicates across branches are preserved (UNION ALL),
+# and per-branch state tables track the join pairs independently.
+test matview-vdbe-compound-all-join-branches {
+    CREATE TABLE cu(id INTEGER PRIMARY KEY, name TEXT, kind TEXT);
+    CREATE TABLE ord(id INTEGER PRIMARY KEY, cid INTEGER, amt INTEGER);
+    CREATE TABLE quo(id INTEGER PRIMARY KEY, cid INTEGER, amt INTEGER);
+    INSERT INTO cu VALUES (1,'Alice','premium'), (2,'Bob','regular'), (3,'Charlie','premium');
+    INSERT INTO ord VALUES (1,1,1000), (2,2,500), (3,3,1500);
+    INSERT INTO quo VALUES (1,1,800), (2,2,300), (3,3,2000);
+    CREATE MATERIALIZED VIEW vcj AS
+        SELECT cu.name, 'order' AS t, ord.amt FROM cu JOIN ord ON cu.id = ord.cid WHERE cu.kind = 'premium'
+        UNION ALL
+        SELECT cu.name, 'quote' AS t, quo.amt FROM cu JOIN quo ON cu.id = quo.cid WHERE cu.kind = 'premium';
+    SELECT 'init', * FROM vcj ORDER BY name, t, amt;
+    UPDATE cu SET kind = 'premium' WHERE name = 'Bob';
+    DELETE FROM quo WHERE cid = 3;
+    SELECT 'after', * FROM vcj ORDER BY name, t, amt;
+}
+expect {
+    init|Alice|order|1000
+    init|Alice|quote|800
+    init|Charlie|order|1500
+    init|Charlie|quote|2000
+    after|Alice|order|1000
+    after|Alice|quote|800
+    after|Bob|order|500
+    after|Bob|quote|300
+    after|Charlie|order|1500
+}
+
+# Mixed branch shapes in one UNION ALL: a filter/project branch and an
+# aggregate branch, each maintained independently. Serves same-transaction
+# reads by recomputation, and survives reopen (per-branch state tables and
+# their indexes are reconstructed at schema load).
+test matview-vdbe-compound-all-mixed-branches {
+    CREATE TABLE mt(x INTEGER);
+    INSERT INTO mt VALUES (1), (2), (3);
+    CREATE MATERIALIZED VIEW vmx AS
+        SELECT x FROM mt WHERE x > 1
+        UNION ALL
+        SELECT COUNT(*) FROM mt;
+    SELECT 'init', * FROM vmx ORDER BY 2;
+    BEGIN;
+    INSERT INTO mt VALUES (5);
+    SELECT 'ryw', * FROM vmx ORDER BY 2;
+    ROLLBACK;
+    SELECT 'post', * FROM vmx ORDER BY 2;
+}
+expect {
+    init|2
+    init|3
+    init|3
+    ryw|2
+    ryw|3
+    ryw|4
+    ryw|5
+    post|2
+    post|3
+    post|3
+}
+
+# A LEFT JOIN branch publishes the same arranged identity contract as any
+# other branch. UNION ALL preserves duplicates while right-side mutations
+# drive padded/matched transitions inside only that branch.
+test matview-vdbe-compound-all-left-join-branch {
+    CREATE TABLE la(a INTEGER, v TEXT);
+    CREATE TABLE lb(a INTEGER, w TEXT);
+    CREATE TABLE lc(a INTEGER, w TEXT);
+    INSERT INTO la VALUES (1,'x'), (2,'y');
+    INSERT INTO lb VALUES (1,'p');
+    INSERT INTO lc VALUES (2,'c'), (3,'d');
+    CREATE MATERIALIZED VIEW union_left AS
+        SELECT la.a, lb.w FROM la LEFT JOIN lb ON la.a = lb.a
+        UNION ALL
+        SELECT a, w FROM lc;
+    SELECT 'init', * FROM union_left ORDER BY 2, 3;
+    BEGIN;
+    INSERT INTO lb VALUES (2,'q');
+    DELETE FROM lb WHERE a = 1;
+    DELETE FROM la WHERE a = 2;
+    INSERT INTO lc VALUES (4,'e');
+    COMMIT;
+    SELECT 'after', * FROM union_left ORDER BY 2, 3;
+}
+expect {
+    init|1|p
+    init|2|
+    init|2|c
+    init|3|d
+    after|1|
+    after|2|c
+    after|3|d
+    after|4|e
+}
+
+# Deduplicating set operators consume their branches' typed delta streams, so
+# a join branch composes with a linear branch without a fused branch evaluator.
+# Mutations through every leaf exercise both join cross-generations and
+# cross-branch visibility transitions.
+test matview-vdbe-compound-dedup-join-branch {
+    CREATE TABLE da(a INTEGER);
+    CREATE TABLE db(a INTEGER);
+    CREATE TABLE dc(a INTEGER);
+    INSERT INTO da VALUES (1), (2), (2);
+    INSERT INTO db VALUES (1), (2);
+    INSERT INTO dc VALUES (2), (3);
+    CREATE MATERIALIZED VIEW dedup_join AS
+        SELECT da.a FROM da JOIN db ON da.a = db.a
+        UNION
+        SELECT a FROM dc;
+    SELECT 'init', * FROM dedup_join ORDER BY 2;
+    BEGIN;
+    INSERT INTO dc VALUES (4);
+    DELETE FROM db WHERE a = 1;
+    DELETE FROM dc WHERE a = 2;
+    DELETE FROM da WHERE a = 2;
+    INSERT INTO da VALUES (5);
+    INSERT INTO db VALUES (5);
+    COMMIT;
+    SELECT 'after', * FROM dedup_join ORDER BY 2;
+}
+expect {
+    init|1
+    init|2
+    init|3
+    after|3
+    after|4
+    after|5
+}
+
+# Three-way joins compose two binary nodes. Each node emits the same three
+# bilinear phases and the interior arrangement preserves the rowid tuple.
+test matview-vdbe-three-way-join {
+    CREATE TABLE w1(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE w2(id INTEGER PRIMARY KEY, w1_id INTEGER, v TEXT);
+    CREATE TABLE w3(id INTEGER PRIMARY KEY, w2_id INTEGER, v TEXT);
+    INSERT INTO w1 VALUES (1, 'a'), (2, 'b');
+    INSERT INTO w2 VALUES (1, 1, 'x'), (2, 2, 'y');
+    INSERT INTO w3 VALUES (1, 1, 'p'), (2, 1, 'q'), (3, 2, 'r');
+    CREATE MATERIALIZED VIEW v3w AS SELECT w1.v, w2.v, w3.v FROM w1 JOIN w2 ON w1.id = w2.w1_id JOIN w3 ON w2.id = w3.w2_id;
+    SELECT 'pop', * FROM v3w ORDER BY 2, 3, 4;
+    DELETE FROM w2 WHERE id = 1;
+    SELECT 'mid', * FROM v3w ORDER BY 2, 3, 4;
+    BEGIN;
+    INSERT INTO w1 VALUES (3, 'c');
+    INSERT INTO w2 VALUES (3, 3, 'z');
+    INSERT INTO w3 VALUES (4, 3, 's');
+    COMMIT;
+    SELECT 'txn', * FROM v3w ORDER BY 2, 3, 4;
+}
+expect {
+    pop|a|x|p
+    pop|a|x|q
+    pop|b|y|r
+    mid|b|y|r
+    txn|b|y|r
+    txn|c|z|s
+}
+
+# Cross-generation tuples in a three-way join: rotate two tables' join keys
+# in one transaction so only mixed-generation combinations match; the signed
+# multiplicity nets them out to zero instead of leaving phantom rows.
+test matview-vdbe-three-way-cross-generation {
+    CREATE TABLE x1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE x2(id INTEGER PRIMARY KEY, k INTEGER, j INTEGER);
+    CREATE TABLE x3(id INTEGER PRIMARY KEY, j INTEGER);
+    INSERT INTO x1 VALUES (1, 20);
+    INSERT INTO x2 VALUES (1, 10, 5);
+    INSERT INTO x3 VALUES (1, 5);
+    CREATE MATERIALIZED VIEW v3x AS SELECT x1.k, x2.j FROM x1 JOIN x2 ON x1.k = x2.k JOIN x3 ON x2.j = x3.j;
+    BEGIN;
+    UPDATE x1 SET k = 10;
+    UPDATE x2 SET k = 20;
+    COMMIT;
+    SELECT 'phantom', COUNT(*) FROM v3x;
+    UPDATE x2 SET k = 10;
+    SELECT 'match', * FROM v3x;
+    PRAGMA integrity_check;
+}
+expect {
+    phantom|0
+    match|10|5
+    ok
+}
+
+# A left-deep tree emits three delta phases per binary join node, independent
+# of the total number of joined tables.
+test matview-vdbe-four-way-join {
+    CREATE TABLE f1(a INTEGER);
+    CREATE TABLE f2(a INTEGER);
+    CREATE TABLE f3(a INTEGER);
+    CREATE TABLE f4(a INTEGER);
+    INSERT INTO f1 VALUES (1);
+    INSERT INTO f2 VALUES (1);
+    INSERT INTO f3 VALUES (1);
+    INSERT INTO f4 VALUES (1), (2);
+    CREATE MATERIALIZED VIEW v4w AS SELECT COUNT(*) AS c FROM f1 JOIN f2 ON f1.a = f2.a JOIN f3 ON f2.a = f3.a JOIN f4 ON f3.a = f4.a;
+    SELECT * FROM v4w;
+    INSERT INTO f4 VALUES (1);
+    SELECT * FROM v4w;
+}
+expect {
+    1
+    2
+}
+
+test matview-vdbe-five-way-join {
+    CREATE TABLE g1(a INTEGER);
+    CREATE TABLE g2(a INTEGER);
+    CREATE TABLE g3(a INTEGER);
+    CREATE TABLE g4(a INTEGER);
+    CREATE TABLE g5(a INTEGER);
+    INSERT INTO g1 VALUES (1), (2);
+    INSERT INTO g2 VALUES (1), (2);
+    INSERT INTO g3 VALUES (1), (2);
+    INSERT INTO g4 VALUES (1), (2);
+    INSERT INTO g5 VALUES (1), (2);
+    CREATE MATERIALIZED VIEW v5w AS
+      SELECT g1.rowid AS left_rid, g5.rowid AS right_rid, g1.a
+      FROM g1
+      JOIN g2 ON g1.a = g2.a
+      JOIN g3 ON g2.a = g3.a
+      JOIN g4 ON g3.a = g4.a
+      JOIN g5 ON g4.a = g5.a;
+    SELECT 'init', * FROM v5w ORDER BY 2;
+    BEGIN;
+    INSERT INTO g1 VALUES (3);
+    INSERT INTO g2 VALUES (3);
+    INSERT INTO g3 VALUES (3);
+    INSERT INTO g4 VALUES (3);
+    INSERT INTO g5 VALUES (3);
+    COMMIT;
+    SELECT 'after', * FROM v5w ORDER BY 2;
+    DELETE FROM g3 WHERE a = 1;
+    SELECT 'gone', * FROM v5w ORDER BY 2;
+}
+expect {
+    init|1|1|1
+    init|2|2|2
+    after|1|1|1
+    after|2|2|2
+    after|3|3|3
+    gone|2|2|2
+    gone|3|3|3
+}
+
+test matview-vdbe-materialized-view-dependency-chain {
+    CREATE TABLE dep_base(x INTEGER);
+    INSERT INTO dep_base VALUES (1), (1), (2);
+    CREATE MATERIALIZED VIEW dep_first AS SELECT x FROM dep_base WHERE x > 0;
+    CREATE MATERIALIZED VIEW dep_second AS SELECT x, COUNT(*) AS n FROM dep_first GROUP BY x;
+    CREATE MATERIALIZED VIEW dep_third AS SELECT x, n * 10 AS score FROM dep_second;
+    SELECT * FROM dep_third ORDER BY x;
+    BEGIN;
+    INSERT INTO dep_base VALUES (1), (3);
+    UPDATE dep_base SET x = 3 WHERE x = 2;
+    SELECT * FROM dep_third ORDER BY x;
+    COMMIT;
+    SELECT * FROM dep_third ORDER BY x;
+    DELETE FROM dep_base WHERE rowid = (SELECT MIN(rowid) FROM dep_base WHERE x = 1);
+    SELECT * FROM dep_third ORDER BY x;
+}
+expect {
+    1|20
+    2|10
+    1|30
+    3|20
+    1|30
+    3|20
+    1|20
+    3|20
+}
+
+test matview-vdbe-materialized-view-dependency-drop-guard {
+    CREATE TABLE dep_drop_base(x INTEGER);
+    CREATE MATERIALIZED VIEW dep_drop_first AS SELECT x FROM dep_drop_base;
+    CREATE MATERIALIZED VIEW dep_drop_second AS SELECT x FROM dep_drop_first;
+    DROP VIEW dep_drop_first;
+}
+expect error {
+    cannot drop materialized view "dep_drop_first": it has dependent materialized view
+}
+
+test matview-vdbe-base-table-dependency-drop-guard {
+    CREATE TABLE dep_drop_table(x INTEGER);
+    CREATE MATERIALIZED VIEW dep_drop_table_view AS SELECT x FROM dep_drop_table;
+    DROP TABLE dep_drop_table;
+}
+expect error {
+    cannot drop table "dep_drop_table": it has dependent materialized view
+}
+
+# The transaction-wide capture log spills bounded batches through the regular
+# async IO path. Exercise insert, UPDATE's ordered delete+insert pair, and
+# delete with row images larger than the in-memory threshold.
+test matview-vdbe-spilled-transaction-log {
+    CREATE TABLE spill_base(id INTEGER PRIMARY KEY, payload BLOB);
+    CREATE MATERIALIZED VIEW spill_view AS SELECT id, length(payload) AS n FROM spill_base;
+    BEGIN;
+    INSERT INTO spill_base VALUES (1, zeroblob(300000));
+    COMMIT;
+    SELECT * FROM spill_view;
+    BEGIN;
+    UPDATE spill_base SET payload = zeroblob(350000) WHERE id = 1;
+    COMMIT;
+    SELECT * FROM spill_view;
+    DELETE FROM spill_base;
+    SELECT COUNT(*) FROM spill_view;
+}
+expect {
+    1|300000
+    1|350000
+    0
+}
+
+# A cached maintenance program must not survive a schema-cookie change, even
+# when the view name and physical root stay unchanged.
+test matview-vdbe-program-cache-schema-epoch {
+    CREATE TABLE cache_base(id INTEGER PRIMARY KEY, keep INTEGER);
+    CREATE MATERIALIZED VIEW cache_view AS
+        SELECT id FROM cache_base WHERE keep <> 0;
+    INSERT INTO cache_base VALUES (1, 1);
+    SELECT * FROM cache_view;
+    CREATE TABLE cache_epoch_bump(payload TEXT);
+    INSERT INTO cache_base VALUES (2, 1);
+    SELECT * FROM cache_view ORDER BY id;
+}
+expect {
+    1
+    1
+    2
+}
+
+test matview-vdbe-quoted-dml-target-uses-resolved-identity {
+    CREATE TABLE quoted_base(id INTEGER PRIMARY KEY, value TEXT);
+    CREATE MATERIALIZED VIEW quoted_view AS SELECT id, value FROM quoted_base;
+    INSERT INTO "quoted_base" VALUES (1, 'inserted');
+    SELECT * FROM quoted_view;
+    UPDATE [quoted_base] SET value = 'updated' WHERE id = 1;
+    SELECT * FROM quoted_view;
+    DELETE FROM `quoted_base` WHERE id = 1;
+    SELECT COUNT(*) FROM quoted_view;
+}
+expect {
+    1|inserted
+    1|updated
+    0
+}
+
+# Interior typed streams carry source identity separately from relational
+# values, so downstream aggregates can still bind rowid expressions.
+test matview-vdbe-typed-stream-rowid-binding {
+    CREATE TABLE stream_l(k INTEGER);
+    CREATE TABLE stream_r(k INTEGER);
+    CREATE MATERIALIZED VIEW stream_v AS
+      SELECT stream_l.rowid, COUNT(*)
+      FROM stream_l JOIN stream_r ON stream_l.k = stream_r.k
+      GROUP BY stream_l.rowid;
+    INSERT INTO stream_l VALUES (10), (20);
+    INSERT INTO stream_r VALUES (10), (10), (20);
+    SELECT * FROM stream_v ORDER BY 1;
+    DELETE FROM stream_r WHERE rowid = 1;
+    SELECT * FROM stream_v ORDER BY 1;
+}
+expect {
+    1|2
+    2|1
+    1|1
+    2|1
+}
+
+# A join input produced by linear operators owns an explicit output
+# arrangement. The join probes that arrangement rather than reopening the
+# derived input's base table and accidentally admitting rows rejected by its
+# filter.
+test matview-vdbe-filtered-derived-input-arrangement {
+    CREATE TABLE arranged_left(id INTEGER PRIMARY KEY, k INTEGER, enabled INTEGER);
+    CREATE TABLE arranged_right(k INTEGER PRIMARY KEY, label TEXT);
+    INSERT INTO arranged_left VALUES (1, 10, 1), (2, 20, 0), (3, 30, 1);
+    INSERT INTO arranged_right VALUES (10, 'ten'), (20, 'twenty'), (30, 'thirty');
+    CREATE MATERIALIZED VIEW arranged_join AS
+      SELECT filtered.id, arranged_right.label
+      FROM (
+        SELECT id, k
+        FROM arranged_left
+        WHERE enabled <> 0
+      ) AS filtered
+      JOIN arranged_right ON filtered.k = arranged_right.k;
+    SELECT * FROM arranged_join ORDER BY 1;
+    UPDATE arranged_left SET enabled = 1 WHERE id = 2;
+    SELECT * FROM arranged_join ORDER BY 1;
+    UPDATE arranged_left SET k = 20 WHERE id = 1;
+    SELECT * FROM arranged_join ORDER BY 1;
+    DELETE FROM arranged_left WHERE id = 3;
+    SELECT * FROM arranged_join ORDER BY 1;
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v2_arranged_join__n%';
+    DROP VIEW arranged_join;
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v2_arranged_join__n%';
+}
+expect {
+    1|ten
+    3|thirty
+    1|ten
+    2|twenty
+    3|thirty
+    1|twenty
+    2|twenty
+    3|thirty
+    1|twenty
+    2|twenty
+    2
+    0
+}
+
+# Stateful producers use the same arrangement contract. Updating a group
+# publishes -old/+new rows through the derived alias, and the downstream join
+# must probe the post-update aggregate values rather than its base input.
+test matview-vdbe-aggregate-derived-input-arrangement {
+    CREATE TABLE arranged_sales(k INTEGER, amount INTEGER);
+    CREATE TABLE arranged_labels(k INTEGER PRIMARY KEY, label TEXT);
+    INSERT INTO arranged_sales VALUES (1, 10), (1, 20), (2, 7);
+    INSERT INTO arranged_labels VALUES (1, 'one'), (2, 'two');
+    CREATE MATERIALIZED VIEW arranged_totals AS
+      SELECT grouped.k, grouped.total, arranged_labels.label
+      FROM (
+        SELECT k, SUM(amount) AS total
+        FROM arranged_sales
+        GROUP BY k
+      ) AS grouped
+      JOIN arranged_labels ON grouped.k = arranged_labels.k;
+    SELECT * FROM arranged_totals ORDER BY 1;
+    UPDATE arranged_sales SET amount = 30 WHERE k = 1 AND amount = 20;
+    SELECT * FROM arranged_totals ORDER BY 1;
+    DELETE FROM arranged_sales WHERE k = 2;
+    SELECT * FROM arranged_totals ORDER BY 1;
+    INSERT INTO arranged_sales VALUES (2, 9);
+    SELECT * FROM arranged_totals ORDER BY 1;
+}
+expect {
+    1|30|one
+    2|7|two
+    1|40|one
+    2|7|two
+    1|40|one
+    1|40|one
+    2|9|two
+}
+
+# A multi-rowid inner-join stream can itself be arranged and consumed by a
+# second join. The arrangement hides the producer's identity tuple behind one
+# stable rowid, so the outer join uses the same input interface as for a base
+# table or aggregate.
+test matview-vdbe-join-derived-input-arrangement {
+    CREATE TABLE arranged_a(id INTEGER PRIMARY KEY, bk INTEGER);
+    CREATE TABLE arranged_b(id INTEGER PRIMARY KEY, bk INTEGER, ck INTEGER);
+    CREATE TABLE arranged_c(ck INTEGER PRIMARY KEY, label TEXT);
+    INSERT INTO arranged_a VALUES (1, 10), (2, 20);
+    INSERT INTO arranged_b VALUES (11, 10, 100), (12, 10, 200), (13, 20, 200);
+    INSERT INTO arranged_c VALUES (100, 'x'), (200, 'y');
+    CREATE MATERIALIZED VIEW arranged_chain AS
+      SELECT ab.a_id, ab.b_id, arranged_c.label
+      FROM (
+        SELECT arranged_a.id AS a_id, arranged_b.id AS b_id, arranged_b.ck
+        FROM arranged_a
+        JOIN arranged_b ON arranged_a.bk = arranged_b.bk
+      ) AS ab
+      JOIN arranged_c ON ab.ck = arranged_c.ck;
+    SELECT * FROM arranged_chain ORDER BY 1, 2;
+    UPDATE arranged_b SET ck = 100 WHERE id = 13;
+    SELECT * FROM arranged_chain ORDER BY 1, 2;
+    DELETE FROM arranged_a WHERE id = 1;
+    SELECT * FROM arranged_chain ORDER BY 1, 2;
+}
+expect {
+    1|11|x
+    1|12|y
+    2|13|y
+    1|11|x
+    1|12|y
+    2|13|x
+    2|13|x
+}
+
+# UNION ALL publishes a fixed branch-plus-packed-source key, so branches with
+# independent rowid spaces can share one output arrangement and feed a join.
+test matview-vdbe-union-all-derived-input-arrangement {
+    CREATE TABLE arranged_u1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE arranged_u2(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE arranged_u_labels(k INTEGER PRIMARY KEY, label TEXT);
+    INSERT INTO arranged_u1 VALUES (1, 10), (2, 20);
+    INSERT INTO arranged_u2 VALUES (1, 10), (2, 30);
+    INSERT INTO arranged_u_labels VALUES (10, 'ten'), (20, 'twenty'), (30, 'thirty');
+    CREATE MATERIALIZED VIEW arranged_union_join AS
+      SELECT combined.k, arranged_u_labels.label
+      FROM (
+        SELECT k FROM arranged_u1
+        UNION ALL
+        SELECT k FROM arranged_u2
+      ) AS combined
+      JOIN arranged_u_labels ON combined.k = arranged_u_labels.k;
+    SELECT * FROM arranged_union_join ORDER BY 1, 2;
+    UPDATE arranged_u2 SET k = 20 WHERE id = 1;
+    SELECT * FROM arranged_union_join ORDER BY 1, 2;
+    DELETE FROM arranged_u1 WHERE id = 2;
+    SELECT * FROM arranged_union_join ORDER BY 1, 2;
+}
+expect {
+    10|ten
+    10|ten
+    20|twenty
+    30|thirty
+    10|ten
+    20|twenty
+    20|twenty
+    30|thirty
+    10|ten
+    20|twenty
+    30|thirty
+}
+
+# Deduplicating set operators already publish their state rowid. The generic
+# output arrangement turns that same delta contract into a join-probe
+# integral without a set-op-specific join path.
+test matview-vdbe-union-derived-input-arrangement {
+    CREATE TABLE arranged_d1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE arranged_d2(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE arranged_d_labels(k INTEGER PRIMARY KEY, label TEXT);
+    INSERT INTO arranged_d1 VALUES (1, 10), (2, 20);
+    INSERT INTO arranged_d2 VALUES (1, 10), (2, 30);
+    INSERT INTO arranged_d_labels VALUES (10, 'ten'), (20, 'twenty'), (30, 'thirty');
+    CREATE MATERIALIZED VIEW arranged_dedup_join AS
+      SELECT combined.k, arranged_d_labels.label
+      FROM (
+        SELECT k FROM arranged_d1
+        UNION
+        SELECT k FROM arranged_d2
+      ) AS combined
+      JOIN arranged_d_labels ON combined.k = arranged_d_labels.k;
+    SELECT * FROM arranged_dedup_join ORDER BY 1;
+    DELETE FROM arranged_d1 WHERE k = 10;
+    SELECT * FROM arranged_dedup_join ORDER BY 1;
+    DELETE FROM arranged_d2 WHERE k = 10;
+    SELECT * FROM arranged_dedup_join ORDER BY 1;
+    INSERT INTO arranged_d1 VALUES (3, 30);
+    SELECT * FROM arranged_dedup_join ORDER BY 1;
+}
+expect {
+    10|ten
+    20|twenty
+    30|thirty
+    10|ten
+    20|twenty
+    30|thirty
+    20|twenty
+    30|thirty
+    20|twenty
+    30|thirty
+}
+
+# A derived UNION ALL is a linear typed delta stream. The outer aggregate
+# consumes that stream through the same DAG edge used for a base scan or join;
+# mutations to either branch must update the shared group state.
+test matview-vdbe-union-all-to-aggregate {
+    CREATE TABLE ua_left(id INTEGER PRIMARY KEY, value INTEGER);
+    CREATE TABLE ua_right(id INTEGER PRIMARY KEY, value INTEGER);
+    INSERT INTO ua_left VALUES (1, 10), (2, 20);
+    INSERT INTO ua_right VALUES (1, 10), (2, 30);
+    CREATE MATERIALIZED VIEW ua_grouped AS
+      SELECT value, COUNT(*), SUM(value)
+      FROM (
+        SELECT value FROM ua_left
+        UNION ALL
+        SELECT value FROM ua_right
+      ) AS combined
+      GROUP BY value;
+    SELECT * FROM ua_grouped ORDER BY value;
+    INSERT INTO ua_right VALUES (3, 20);
+    SELECT * FROM ua_grouped ORDER BY value;
+    UPDATE ua_left SET value = 30 WHERE id = 1;
+    SELECT * FROM ua_grouped ORDER BY value;
+    DELETE FROM ua_right WHERE id = 2;
+    SELECT * FROM ua_grouped ORDER BY value;
+}
+expect {
+    10|2|20
+    20|1|20
+    30|1|30
+    10|2|20
+    20|2|40
+    30|1|30
+    10|1|10
+    20|2|40
+    30|2|60
+    10|1|10
+    20|2|40
+    30|1|30
+}
+
+# Stateful set operations publish their visibility transitions through the
+# same typed delta sink. The outer aggregate sees net set membership, not the
+# per-branch multiplicities maintained inside UNION.
+test matview-vdbe-dedup-set-op-to-aggregate {
+    CREATE TABLE du_left(id INTEGER PRIMARY KEY, value INTEGER);
+    CREATE TABLE du_right(id INTEGER PRIMARY KEY, value INTEGER);
+    INSERT INTO du_left VALUES (1, 10), (2, 20);
+    INSERT INTO du_right VALUES (1, 10), (2, 30);
+    CREATE MATERIALIZED VIEW du_count AS
+      SELECT COUNT(*)
+      FROM (
+        SELECT value FROM du_left
+        UNION
+        SELECT value FROM du_right
+      );
+    SELECT * FROM du_count;
+    INSERT INTO du_right VALUES (3, 20);
+    SELECT * FROM du_count;
+    DELETE FROM du_left WHERE id = 2;
+    SELECT * FROM du_count;
+    DELETE FROM du_right WHERE id = 3;
+    SELECT * FROM du_count;
+    UPDATE du_left SET value = 40 WHERE id = 1;
+    SELECT * FROM du_count;
+    DELETE FROM du_right WHERE id = 1;
+    SELECT * FROM du_count;
+}
+expect {
+    3
+    3
+    3
+    2
+    3
+    2
+}
+
+# A mixed compound publishes one stable operator identity space for both its
+# deduplicated prefix and trailing UNION ALL rows. Downstream stateful
+# operators must consume visibility-safe deltas rather than bypassing the
+# append arrangement.
+test matview-vdbe-mixed-set-op-to-aggregate {
+    CREATE TABLE mixed_a(id INTEGER PRIMARY KEY, value INTEGER);
+    CREATE TABLE mixed_b(id INTEGER PRIMARY KEY, value INTEGER);
+    CREATE TABLE mixed_c(id INTEGER PRIMARY KEY, value INTEGER);
+    INSERT INTO mixed_a VALUES (1, 10), (2, 20);
+    INSERT INTO mixed_b VALUES (1, 10), (2, 30);
+    INSERT INTO mixed_c VALUES (1, 10), (2, 10), (3, 20);
+    CREATE MATERIALIZED VIEW mixed_grouped AS
+      SELECT value, COUNT(*), SUM(value)
+      FROM (
+        SELECT value FROM mixed_a
+        UNION
+        SELECT value FROM mixed_b
+        UNION ALL
+        SELECT value FROM mixed_c
+      )
+      GROUP BY value;
+    SELECT * FROM mixed_grouped ORDER BY value;
+    BEGIN;
+    DELETE FROM mixed_c WHERE id = 1;
+    INSERT INTO mixed_b VALUES (3, 20);
+    DELETE FROM mixed_a WHERE id = 2;
+    DELETE FROM mixed_b WHERE id = 3;
+    UPDATE mixed_c SET value = 30 WHERE id = 2;
+    COMMIT;
+    SELECT * FROM mixed_grouped ORDER BY value;
+}
+expect {
+    10|3|30
+    20|2|40
+    30|1|30
+    10|1|10
+    20|1|20
+    30|2|60
+}
+
+# Aggregate state rows persist their finalized values as the node's output
+# arrangement. A downstream aggregate therefore receives -old/+new rows from
+# the same accumulator engine that maintains terminal aggregate views.
+test matview-vdbe-aggregate-to-aggregate {
+    CREATE TABLE aa_base(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER);
+    INSERT INTO aa_base VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5);
+    CREATE MATERIALIZED VIEW aa_totals AS
+      SELECT COUNT(*), SUM(subtotal)
+      FROM (
+        SELECT g, SUM(x) AS subtotal
+        FROM aa_base
+        GROUP BY g
+      ) AS grouped;
+    SELECT * FROM aa_totals;
+    INSERT INTO aa_base VALUES (4, 1, 5);
+    SELECT * FROM aa_totals;
+    DELETE FROM aa_base WHERE g = 2;
+    SELECT * FROM aa_totals;
+    UPDATE aa_base SET g = 3 WHERE id = 1;
+    SELECT * FROM aa_totals;
+    DELETE FROM aa_base WHERE id = 1;
+    SELECT * FROM aa_totals;
+}
+expect {
+    2|35
+    2|40
+    1|35
+    2|35
+    1|25
+}
+
+# A join consumes both the aggregate node's typed delta and its persisted
+# arrangement. The physical state layout starts with the natural aggregate
+# row, so join expression binding does not know about accumulator payloads.
+test matview-vdbe-aggregate-to-join {
+    CREATE TABLE aj_fact(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER);
+    CREATE TABLE aj_dim(g INTEGER PRIMARY KEY, label TEXT);
+    INSERT INTO aj_fact VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5);
+    INSERT INTO aj_dim VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    CREATE MATERIALIZED VIEW aj_view AS
+      SELECT grouped.g, grouped.subtotal, aj_dim.label
+      FROM (
+        SELECT g, SUM(x) AS subtotal
+        FROM aj_fact
+        GROUP BY g
+      ) AS grouped
+      JOIN aj_dim ON grouped.g = aj_dim.g;
+    SELECT * FROM aj_view ORDER BY 1;
+    INSERT INTO aj_fact VALUES (4, 3, 7);
+    SELECT * FROM aj_view ORDER BY 1;
+    UPDATE aj_fact SET x = 15 WHERE id = 1;
+    SELECT * FROM aj_view ORDER BY 1;
+    DELETE FROM aj_dim WHERE g = 2;
+    SELECT * FROM aj_view ORDER BY 1;
+    DELETE FROM aj_fact WHERE g = 1;
+    SELECT * FROM aj_view ORDER BY 1;
+}
+expect {
+    1|30|one
+    2|5|two
+    1|30|one
+    2|5|two
+    3|7|three
+    1|35|one
+    2|5|two
+    3|7|three
+    1|35|one
+    3|7|three
+    3|7|three
+}
+
+# Hidden storage is assigned by DAG node rather than by branch shape. The
+# aggregate owns its native state while the pure UNION ALL root owns the
+# arrangement that normalizes its composite branch identity.
+test matview-vdbe-node-owned-hidden-state {
+    CREATE TABLE node_a(k INTEGER);
+    CREATE TABLE node_b(k INTEGER);
+    CREATE MATERIALIZED VIEW node_catalog AS
+      SELECT COUNT(*) FROM node_a
+      UNION ALL
+      SELECT node_a.k FROM node_a JOIN node_b ON node_a.k = node_b.k;
+    SELECT name
+      FROM sqlite_schema
+     WHERE name LIKE '__turso_internal_dbsp_state_v2_node_catalog__n%'
+        OR name LIKE '__turso_internal_dbsp_arrangement_v2_node_catalog__n%'
+     ORDER BY name;
+    DROP VIEW node_catalog;
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE name LIKE '__turso_internal_dbsp_state_v2_node_catalog__n%';
+}
+expect {
+    __turso_internal_dbsp_arrangement_v2_node_catalog__n8
+    __turso_internal_dbsp_state_v2_node_catalog__n1
+    0
+}
+
+# Generated hidden-table DDL must quote names derived from a quoted view
+# identifier. The raw catalog name remains stable and DROP owns its cleanup.
+test matview-vdbe-quoted-stateful-view-name {
+    CREATE TABLE quoted_state_base(g INTEGER, x INTEGER);
+    INSERT INTO quoted_state_base VALUES (1, 10), (1, 20);
+    CREATE MATERIALIZED VIEW "stateful-view" AS
+      SELECT g, SUM(x) FROM quoted_state_base GROUP BY g;
+    SELECT * FROM "stateful-view";
+    UPDATE quoted_state_base SET x = 30 WHERE x = 20;
+    SELECT * FROM "stateful-view";
+    DROP VIEW "stateful-view";
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE name LIKE '__turso_internal_dbsp_%_stateful-view__n%';
+}
+expect {
+    1|30
+    1|40
+    0
+}
+
+# Hidden-state ownership parses the complete node suffix. A view whose name
+# itself contains "__n<digits>" must not be mistaken for another view's node.
+test matview-vdbe-hidden-state-owner-prefix-collision {
+    CREATE TABLE owner_base(x INTEGER);
+    INSERT INTO owner_base VALUES (1);
+    CREATE MATERIALIZED VIEW owner AS
+      SELECT x, COUNT(*) FROM owner_base GROUP BY x;
+    CREATE MATERIALIZED VIEW owner__n1 AS
+      SELECT x, SUM(x) FROM owner_base GROUP BY x;
+    DROP VIEW owner;
+    INSERT INTO owner_base VALUES (1);
+    SELECT * FROM owner__n1;
+    DROP VIEW owner__n1;
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE name LIKE '__turso_internal_dbsp_%_owner__n1__n%';
+}
+expect {
+    1|2
+    0
+}
+
+# Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
+# before the CREATE program allocates any btree pages.
+test matview-vdbe-rejected-create-is-clean {
+    CREATE TABLE t7(a INTEGER, b TEXT);
+    INSERT INTO t7 VALUES (1,'x');
+    CREATE MATERIALIZED VIEW bad7 AS SELECT group_concat(a) FROM t7 GROUP BY b;
+}
+expect error {
+    materialized views with the group_concat aggregate are not yet supported
+}
+
+# Bare columns in HAVING use SQLite's arbitrary-row semantics, which cannot
+# be maintained incrementally.
+test matview-vdbe-having-bare-column-rejected {
+    CREATE TABLE t25(g TEXT, x INTEGER);
+    CREATE MATERIALIZED VIEW bad25 AS SELECT g, COUNT(*) FROM t25 GROUP BY g HAVING x > 1;
+}
+expect error {
+    materialized views with HAVING referencing columns outside GROUP BY are not yet supported
+}
+
+# Delta capture must expose the same logical row image as a normal table scan.
+# Records written before ADD COLUMN are physically short, so their delete
+# delta needs the column default (including affinity) filled in.
+test matview-vdbe-delete-pre-alter-row {
+    CREATE TABLE pre_alter(a INTEGER);
+    INSERT INTO pre_alter VALUES (1);
+    ALTER TABLE pre_alter ADD COLUMN b TEXT DEFAULT 5;
+    CREATE MATERIALIZED VIEW pre_alter_view AS
+      SELECT b, COUNT(*) AS n FROM pre_alter GROUP BY b;
+    SELECT b, typeof(b), n FROM pre_alter_view;
+    DELETE FROM pre_alter;
+    SELECT COUNT(*) FROM pre_alter_view;
+}
+expect {
+    5|text|1
+    0
+}
+
+# Post-error state assertions (aborted statements must not leak captured
+# deltas into views; a rejected CREATE must leave the database intact) live
+# in tests/integration/query_processing/test_write_path.rs — each sqltest
+# block runs against a fresh database, so state after an expected error
+# cannot be asserted here.

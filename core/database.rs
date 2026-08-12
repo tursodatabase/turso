@@ -19,7 +19,7 @@ use crate::{
     alloc, bail_corrupt_error,
     busy::BusyHandler,
     ext,
-    incremental::view::AllViewsTxState,
+    incremental::view::TransactionChanges,
     io, io_error, io_yield_one, mvcc,
     progress::ProgressHandler,
     return_if_io,
@@ -2368,7 +2368,9 @@ impl Database {
             failure_injector: RwLock::new(None),
             #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
-            view_transaction_states: AllViewsTxState::new(),
+            transaction_changes: TransactionChanges::with_io(self.io.clone()),
+            maintenance_program_cache:
+                crate::incremental::vdbe_maintenance::MaintenanceProgramCache::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),

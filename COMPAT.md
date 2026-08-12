@@ -75,6 +75,7 @@ ongoing work to pass the full SQLite TCL test suite.
 * ✅ SQLite file format is fully supported
 * 🚧 SQLite query language [[status](#sqlite-query-language)] is partially supported
 * 🚧 SQLite C API [[status](#sqlite-c-api)] is partially supported
+* 🚧 Materialized views are experimental [[IVM status](IVM_COMPAT.md)]
 
 ### Limitations
 
