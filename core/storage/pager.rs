@@ -4956,7 +4956,16 @@ impl Pager {
                             }
                         );
                     }
-                    wal.publish_backfill(max_frame);
+                    let expected_checkpoint_seq = {
+                        let state = self.checkpoint_state.read();
+                        state
+                            .result
+                            .as_ref()
+                            .expect("result should be set")
+                            .checkpoint_seq
+                    };
+                    // Refuse cross-generation publish (SQLite WAL-reset bug class).
+                    wal.publish_backfill(max_frame, expected_checkpoint_seq)?;
                     let next_phase = {
                         let state = self.checkpoint_state.read();
                         if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) {

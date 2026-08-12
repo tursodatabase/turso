@@ -157,6 +157,8 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
+#[cfg(any(test, feature = "test_helper"))]
+pub use storage::wal::set_checkpoint_start_before_lock_hook;
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{

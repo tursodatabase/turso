@@ -1478,25 +1478,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     /// Publish `nbackfills` after Passive backfill + DB sync. Skip Truncate/Restart.
     /// Leaves the checkpoint guard held until Finalize (same as the pager).
-    fn publish_wal_backfill_if_needed(&mut self) {
+    fn publish_wal_backfill_if_needed(&mut self) -> Result<()> {
         if self.mode.should_restart_log() {
-            return;
+            return Ok(());
         }
         let Some(result) = self.checkpoint_result.as_ref() else {
-            return;
+            return Ok(());
         };
         if result.wal_checkpoint_backfilled == 0 {
-            return;
+            return Ok(());
         }
         let max_frame = result.wal_total_backfilled;
+        let expected_checkpoint_seq = result.checkpoint_seq;
         turso_assert!(self.pager.wal.is_some(), "No WAL to publish backfill");
         let wal = self.pager.wal.as_ref().unwrap();
         tracing::debug!(
             max_frame,
             backfilled = result.wal_checkpoint_backfilled,
+            expected_checkpoint_seq,
             "publishing WAL backfill after MVCC checkpoint"
         );
-        wal.publish_backfill(max_frame);
+        wal.publish_backfill(max_frame, expected_checkpoint_seq)?;
+        Ok(())
     }
 
     fn has_unpublished_schema_changes(&self) -> bool {
@@ -2878,7 +2881,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Crash after truncate but before fsync would lose checkpointed data.
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
-                    self.publish_wal_backfill_if_needed();
+                    self.publish_wal_backfill_if_needed()?;
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
@@ -2896,7 +2899,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 // Check if we already sent the sync
                 if checkpoint_result.db_sync_sent {
-                    self.publish_wal_backfill_if_needed();
+                    self.publish_wal_backfill_if_needed()?;
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
