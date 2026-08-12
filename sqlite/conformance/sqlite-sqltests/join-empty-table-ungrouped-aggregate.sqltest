@@ -29,6 +29,21 @@ expect {
     |0
 }
 
+setup empty-table-with-default {
+    CREATE TABLE t(x);
+    ALTER TABLE t ADD COLUMN y DEFAULT 99;
+}
+
+# Adjacent column reads are fused into ColumnRange. An unopened cursor's NULL
+# row must override column defaults just as it does for separate Column opcodes.
+@setup empty-table-with-default
+test inner-join-empty-table-ungrouped-aggregate-column-range {
+    SELECT b.x, b.y, COUNT(*) FROM t a JOIN t b ON a.x=b.x;
+}
+expect {
+    ||0
+}
+
 # RowId (not just Column) must also read NULL from the never-opened cursor.
 @setup empty-table
 test inner-join-empty-table-ungrouped-aggregate-rowid {

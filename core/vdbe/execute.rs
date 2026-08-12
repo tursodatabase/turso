@@ -2167,6 +2167,16 @@ fn op_column_range_fetch(
             let filled = {
                 let cursor_ref =
                     must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "ColumnRange");
+                if matches!(cursor_ref, Cursor::NullRow) {
+                    // The cursor slot holds the NullRow placeholder for a
+                    // never-opened cursor: every column reads as NULL, and
+                    // defaults must not apply (a null row is not a short record).
+                    tracing::trace!("op_column_range(null_row placeholder)");
+                    for reg in &mut state.registers[dest..dest + count] {
+                        reg.set_null();
+                    }
+                    return Ok(InsnFunctionStepResult::Step);
+                }
                 let cursor = cursor_ref.as_btree_mut();
 
                 if cursor.get_null_flag() {
