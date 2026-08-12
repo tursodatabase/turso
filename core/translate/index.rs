@@ -30,7 +30,7 @@ use crate::{
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
+        insn::{IdxInsertFlags, Insn, RegisterOrLiteral, SorterOpenData},
     },
 };
 use rustc_hash::FxHashMap as HashMap;
@@ -459,10 +459,12 @@ fn emit_refill_index(
             .map(|c| (c.order, c.collation, c.nulls_order))
             .try_collect()?;
         program.emit_insn(Insn::SorterOpen {
-            cursor_id: sorter_cursor_id,
-            columns: columns.len(),
-            order_collations_nulls,
-            comparators: crate::alloc::vec![],
+            data: Box::new(SorterOpenData {
+                cursor_id: sorter_cursor_id,
+                columns: columns.len(),
+                order_collations_nulls,
+                comparators: crate::alloc::vec![],
+            }),
         });
         // SorterData moves each sorted record into the pseudo cursor's
         // content register; the two must name the same register.

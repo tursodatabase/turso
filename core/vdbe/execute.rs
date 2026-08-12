@@ -129,7 +129,10 @@ use super::{
         exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
-    insn::{Cookie, RegisterOrLiteral, SortComparatorType},
+    insn::{
+        AddSequenceData, AggStepData, ArrayEncodeData, Cookie, IntegrityCkData, RegisterOrLiteral,
+        SortComparatorType, SorterOpenData,
+    },
     CommitState,
 };
 use crate::sync::{Mutex, RwLock};
@@ -2395,16 +2398,14 @@ pub fn op_array_encode(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        ArrayEncode {
-            reg,
-            element_affinity,
-            element_type,
-            table_name,
-            col_name,
-        },
-        insn
-    );
+    load_insn!(ArrayEncode { data }, insn);
+    let ArrayEncodeData {
+        reg,
+        element_affinity,
+        element_type,
+        table_name,
+        col_name,
+    } = data.as_ref();
 
     let val = state.registers[*reg].get_value();
     if matches!(val, Value::Null) {
@@ -8110,17 +8111,15 @@ pub fn op_agg_step(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        AggStep {
-            acc_reg,
-            col,
-            delimiter,
-            func,
-            comparator,
-            collation,
-        },
-        insn
-    );
+    load_insn!(AggStep { data }, insn);
+    let AggStepData {
+        acc_reg,
+        col,
+        delimiter,
+        func,
+        comparator,
+        collation,
+    } = data.as_ref();
 
     if let AccumulatorFunc::Window(win_func) = func {
         return op_window_step(state, *acc_reg, *col, win_func);
@@ -8383,15 +8382,13 @@ pub fn op_sorter_open(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        SorterOpen {
-            cursor_id,
-            columns: _,
-            order_collations_nulls,
-            comparators,
-        },
-        insn
-    );
+    load_insn!(SorterOpen { data }, insn);
+    let SorterOpenData {
+        cursor_id,
+        columns: _,
+        order_collations_nulls,
+        comparators,
+    } = data.as_ref();
     // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
     let page_size = match pager.with_header(|header| header.page_size) {
         Ok(IOResult::Done(page_size)) => page_size,
@@ -13338,18 +13335,16 @@ pub fn op_add_sequence(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        AddSequence {
-            db,
-            name,
-            start,
-            increment,
-            min_value,
-            max_value,
-            cycle,
-        },
-        insn
-    );
+    load_insn!(AddSequence { data }, insn);
+    let AddSequenceData {
+        db,
+        name,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+    } = data.as_ref();
     let seq = crate::schema::Sequence::new(
         name.clone(),
         Some(*start),
@@ -15537,16 +15532,14 @@ pub fn op_integrity_check(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        IntegrityCk {
-            db,
-            max_errors,
-            roots,
-            dropped_roots,
-            message_register,
-        },
-        insn
-    );
+    load_insn!(IntegrityCk { data }, insn);
+    let IntegrityCkData {
+        db,
+        max_errors,
+        roots,
+        dropped_roots,
+        message_register,
+    } = data.as_ref();
 
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
@@ -16172,23 +16165,14 @@ pub fn op_add_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        AddColumn {
-            db,
-            table,
-            column,
-            check_constraints,
-            foreign_keys
-        },
-        insn
-    );
+    load_insn!(AddColumn { data }, insn);
 
     let conn = program.connection.clone();
-    let normalized_table_name = normalize_ident(table.as_str());
-    let new_check_constraints = check_constraints.try_to_vec()?;
-    let new_foreign_keys = foreign_keys.try_to_vec()?;
+    let normalized_table_name = normalize_ident(data.table.as_str());
+    let new_check_constraints = data.check_constraints.try_to_vec()?;
+    let new_foreign_keys = data.foreign_keys.try_to_vec()?;
 
-    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
+    conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
         let table_ref = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -16201,7 +16185,7 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns_mut().try_push((**column).clone())?;
+        btree.columns_mut().try_push(data.column.clone())?;
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints = new_check_constraints;
         // Update foreign keys to include any FK constraints from the new column

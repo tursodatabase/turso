@@ -4,6 +4,7 @@ use crate::translate::{
     order_by::{custom_type_comparator, EmitOrderBy},
     window::EmitWindow,
 };
+use crate::vdbe::insn::AggStepData;
 
 use super::*;
 
@@ -259,12 +260,14 @@ fn emit_loop_source<'a>(
                     t_ctx.resolver.schema(),
                 );
                 program.emit_insn(Insn::AggStep {
-                    acc_reg: start_reg,
-                    col: expr_reg,
-                    delimiter: 0,
-                    func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
-                    comparator,
-                    collation: Some(arg_collation),
+                    data: Box::new(AggStepData {
+                        acc_reg: start_reg,
+                        col: expr_reg,
+                        delimiter: 0,
+                        func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
+                        comparator,
+                        collation: Some(arg_collation),
+                    }),
                 });
                 program.emit_insn(Insn::Goto {
                     target_pc: loop_end,

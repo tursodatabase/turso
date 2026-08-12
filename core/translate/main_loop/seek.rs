@@ -1,5 +1,6 @@
 use super::*;
 use crate::translate::plan::BitSet;
+use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
@@ -200,12 +201,13 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         // Which key components match NULL rather than comparing with `=`; the
         // seek and the bloom-filter probe keep their "NULL key cannot match"
         // shortcut for the rest.
-        let mut null_matching_mask = BitSet::default();
+        let mut null_matching_bits = BitSet::default();
         for i in 0..num_regs {
             if self.seek_def.is_null_matching_key_component(i) {
-                null_matching_mask.set(i)?;
+                null_matching_bits.set(i)?;
             }
         }
+        let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
             encode_seek_keys_for_custom_types(

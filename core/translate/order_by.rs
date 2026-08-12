@@ -14,7 +14,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, IdxInsertFlags, Insn},
+        insn::{to_u32, IdxInsertFlags, Insn, SorterOpenData},
     },
     Result,
 };
@@ -312,10 +312,12 @@ impl EmitOrderBy {
             let key_len = order_collations_nulls.len();
 
             program.emit_insn(Insn::SorterOpen {
-                cursor_id: sort_cursor,
-                columns: key_len,
-                order_collations_nulls,
-                comparators,
+                data: Box::new(SorterOpenData {
+                    cursor_id: sort_cursor,
+                    columns: key_len,
+                    order_collations_nulls,
+                    comparators,
+                }),
             });
         }
         Ok(())

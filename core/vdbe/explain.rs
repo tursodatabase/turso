@@ -1,4 +1,7 @@
-use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
+use crate::vdbe::{
+    builder::CursorType,
+    insn::{IntegrityCkData, RegisterOrLiteral, SorterOpenData},
+};
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
 
@@ -681,20 +684,17 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
-            Insn::ArrayEncode {
-                reg,
-                element_type,
-                table_name,
-                col_name,
-                ..
-            } => (
+            Insn::ArrayEncode { data } => (
                 "ArrayEncode",
-                *reg as i64,
+                data.reg as i64,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("{table_name}.{col_name} ({element_type})"),
+                format!(
+                    "{}.{} ({})",
+                    data.table_name, data.col_name, data.element_type
+                ),
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",
@@ -1304,24 +1304,17 @@ pub fn insn_to_row(
                 0,
                 format!("if (--r[{}]==0) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::AggStep {
-                func,
-                acc_reg,
-                delimiter: _,
-                col,
-                comparator: _,
-                collation,
-            } => (
+            Insn::AggStep { data } => (
                 "AggStep",
                 0,
-                *col as i64,
-                *acc_reg as i64,
-                Value::build_text(match collation {
-                    Some(collation) => format!("{}({collation})", func.as_str()),
-                    None => func.as_str().to_string(),
+                data.col as i64,
+                data.acc_reg as i64,
+                Value::build_text(match &data.collation {
+                    Some(collation) => format!("{}({collation})", data.func.as_str()),
+                    None => data.func.as_str().to_string(),
                 }),
                 0,
-                format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
+                format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
             ),
             Insn::AggInverse {
                 func,
@@ -1360,12 +1353,13 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
             ),
-            Insn::SorterOpen {
-                cursor_id,
-                columns,
-                order_collations_nulls,
-                ..
-            } => {
+            Insn::SorterOpen { data } => {
+                let SorterOpenData {
+                    cursor_id,
+                    columns,
+                    order_collations_nulls,
+                    ..
+                } = data.as_ref();
                 let to_print: Vec<String> = order_collations_nulls
                     .iter()
                     .map(|(order, collation, nulls)| {
@@ -1826,14 +1820,14 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TYPE {type_name}"),
             ),
-            Insn::AddSequence { db, name, .. } => (
+            Insn::AddSequence { data } => (
                 "AddSequence",
-                *db as i64,
+                data.db as i64,
                 0,
                 0,
-                Value::build_text(name.clone()),
+                Value::build_text(data.name.clone()),
                 0,
-                format!("ADD SEQUENCE {name}"),
+                format!("ADD SEQUENCE {}", data.name),
             ),
             Insn::DropSequence { db, seq_name } => (
                 "DropSequence",
@@ -2334,21 +2328,24 @@ pub fn insn_to_row(
                 0,
                 format!("r[{}]={}", *out_reg, *value),
             ),
-            Insn::IntegrityCk {
-                db,
-                max_errors,
-                roots,
-                dropped_roots,
-                message_register,
-            } => (
-                "IntegrityCk",
-                *max_errors as i64,
-                0,
-                0,
-                Value::build_text(""),
-                0,
-                format!("db={db} roots={roots:?} dropped_roots={dropped_roots:?} message_register={message_register}"),
-            ),
+            Insn::IntegrityCk { data } => {
+                let IntegrityCkData {
+                    db,
+                    max_errors,
+                    roots,
+                    dropped_roots,
+                    message_register,
+                } = data.as_ref();
+                (
+                    "IntegrityCk",
+                    *max_errors as i64,
+                    0,
+                    0,
+                    Value::build_text(""),
+                    0,
+                    format!("db={db} roots={roots:?} dropped_roots={dropped_roots:?} message_register={message_register}"),
+                )
+            }
             Insn::RowData { cursor_id, dest } => (
                 "RowData",
                 *cursor_id as i64,
@@ -2385,14 +2382,14 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
-            Insn::AddColumn { db: _, table, column, .. } => (
+            Insn::AddColumn { data } => (
                 "AddColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("add_column({table}, {column:?})"),
+                format!("add_column({}, {:?})", data.table, data.column),
             ),
             Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
                 "AlterColumn",

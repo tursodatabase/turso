@@ -11,7 +11,7 @@ use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{Insn, SorterOpenData};
 use crate::{emit_explain, LimboError};
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
@@ -880,10 +880,12 @@ fn emit_compound_order_by(
         .chain(std::iter::once(None))
         .try_collect()?;
     program.emit_insn(Insn::SorterOpen {
-        cursor_id: sort_cursor,
-        columns: order_collations_nulls.len(),
-        order_collations_nulls,
-        comparators,
+        data: Box::new(SorterOpenData {
+            cursor_id: sort_cursor,
+            columns: order_collations_nulls.len(),
+            order_collations_nulls,
+            comparators,
+        }),
     });
 
     // Read from collection index and insert into Sorter

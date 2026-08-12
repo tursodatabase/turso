@@ -7,7 +7,7 @@ use crate::{
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{HashDistinctData, Insn},
+        insn::{AggStepData, HashDistinctData, Insn},
     },
     LimboError, Result,
 };
@@ -370,12 +370,14 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Avg),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::Avg),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }
@@ -384,12 +386,14 @@ pub fn translate_aggregation_step(
             let expr_reg = translate_const_arg(program, referenced_tables, resolver, &expr)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Count0),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::Count0),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }
@@ -400,12 +404,14 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Count),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::Count),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }
@@ -426,12 +432,14 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
 
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: delimiter_reg,
-                func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: delimiter_reg,
+                    func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
+                    comparator: None,
+                    collation: None,
+                }),
             });
 
             target_register
@@ -447,12 +455,14 @@ pub fn translate_aggregation_step(
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Max),
-                comparator,
-                collation: Some(arg_collation),
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::Max),
+                    comparator,
+                    collation: Some(arg_collation),
+                }),
             });
             target_register
         }
@@ -467,12 +477,14 @@ pub fn translate_aggregation_step(
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Min),
-                comparator,
-                collation: Some(arg_collation),
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::Min),
+                    comparator,
+                    collation: Some(arg_collation),
+                }),
             });
             target_register
         }
@@ -486,12 +498,14 @@ pub fn translate_aggregation_step(
             let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
 
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: value_reg,
-                func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: value_reg,
+                    func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }
@@ -503,12 +517,14 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }
@@ -522,12 +538,14 @@ pub fn translate_aggregation_step(
                 agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
 
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: delimiter_reg,
-                func: AccumulatorFunc::Agg(AggFunc::StringAgg),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: delimiter_reg,
+                    func: AccumulatorFunc::Agg(AggFunc::StringAgg),
+                    comparator: None,
+                    collation: None,
+                }),
             });
 
             target_register
@@ -539,12 +557,14 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Sum),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::Sum),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }
@@ -555,12 +575,14 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Total),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::Total),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }
@@ -572,12 +594,14 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }
@@ -591,12 +615,14 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: value_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Mode),
-                comparator: None,
-                collation: Some(arg_collation),
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: value_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::Mode),
+                    comparator: None,
+                    collation: Some(arg_collation),
+                }),
             });
             target_register
         }
@@ -614,12 +640,14 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: value_reg,
-                delimiter: fraction_reg,
-                func: AccumulatorFunc::Agg(func.clone()),
-                comparator: None,
-                collation: Some(arg_collation),
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: value_reg,
+                    delimiter: fraction_reg,
+                    func: AccumulatorFunc::Agg(func.clone()),
+                    comparator: None,
+                    collation: Some(arg_collation),
+                }),
             });
             target_register
         }
@@ -650,16 +678,18 @@ pub fn translate_aggregation_step(
                 }
             }
             program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::External(if registered_argc < 0 {
-                    Arc::new(func.with_aggregate_arg_count(num_args))
-                } else {
-                    func.clone()
-                })),
-                comparator: None,
-                collation: None,
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::External(if registered_argc < 0 {
+                        Arc::new(func.with_aggregate_arg_count(num_args))
+                    } else {
+                        func.clone()
+                    })),
+                    comparator: None,
+                    collation: None,
+                }),
             });
             target_register
         }

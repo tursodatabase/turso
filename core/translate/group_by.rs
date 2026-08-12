@@ -26,7 +26,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::Insn,
+        insn::{Insn, SorterOpenData},
         BranchOffset,
     },
     Result,
@@ -189,10 +189,12 @@ impl EmitGroupBy {
                 .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {
-                cursor_id: sort_cursor,
-                columns: column_count,
-                order_collations_nulls,
-                comparators,
+                data: Box::new(SorterOpenData {
+                    cursor_id: sort_cursor,
+                    columns: column_count,
+                    order_collations_nulls,
+                    comparators,
+                }),
             });
             emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
