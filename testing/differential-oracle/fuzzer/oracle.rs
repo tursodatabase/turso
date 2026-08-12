@@ -133,7 +133,12 @@ impl Oracle for DifferentialOracle {
                 "SQLite errored but Turso succeeded:\n  SQL: {stmt}\n  Error: {sqlite_err}"
             )),
             (QueryResult::Rows(rows), QueryResult::Ok) => {
-                if has_unordered_limit {
+                if stmt.is_ddl && rows.is_empty() {
+                    // SQLite can expose result metadata for a schema change even
+                    // though it returns no rows. The runner compares the resulting
+                    // schemas after every successful DDL statement.
+                    OracleResult::Pass
+                } else if has_unordered_limit {
                     OracleResult::Warning(format_nondet_limit_warning(
                         stmt,
                         "rows_vs_ok",
@@ -151,7 +156,11 @@ impl Oracle for DifferentialOracle {
                 }
             }
             (QueryResult::Ok, QueryResult::Rows(rows)) => {
-                if has_unordered_limit {
+                if stmt.is_ddl && rows.is_empty() {
+                    // Keep the normalization symmetric in case either engine
+                    // reports metadata for a zero-row schema change.
+                    OracleResult::Pass
+                } else if has_unordered_limit {
                     OracleResult::Warning(format_nondet_limit_warning(
                         stmt,
                         "ok_vs_rows",
@@ -511,6 +520,43 @@ mod tests {
             }
             other => panic!("expected warning, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_result_schema_normalization_is_ddl_only() {
+        let empty_rows = || QueryResult::Rows(ResultSet::new(1, Vec::new()).unwrap());
+        let mut stmt = GeneratedStatement {
+            sql: "ALTER TABLE t ADD COLUMN b TEXT".to_string(),
+            is_ddl: true,
+            mutates_data: false,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+        };
+        let oracle = DifferentialOracle;
+
+        assert!(
+            oracle
+                .check(&stmt, &QueryResult::Ok, &empty_rows())
+                .is_pass()
+        );
+        assert!(
+            oracle
+                .check(&stmt, &empty_rows(), &QueryResult::Ok)
+                .is_pass()
+        );
+
+        stmt.sql = "SELECT b FROM t WHERE 0".to_string();
+        stmt.is_ddl = false;
+        assert!(
+            oracle
+                .check(&stmt, &QueryResult::Ok, &empty_rows())
+                .is_fail()
+        );
+        assert!(
+            oracle
+                .check(&stmt, &empty_rows(), &QueryResult::Ok)
+                .is_fail()
+        );
     }
 
     #[test]
