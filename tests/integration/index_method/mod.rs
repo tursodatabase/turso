@@ -18,7 +18,7 @@ use turso_core::{
     Numeric, Register, Result, Value, MAIN_DB_ID,
 };
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
 
 fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
     loop {
@@ -2862,4 +2862,167 @@ fn fts_streaming_dml_collects_stable_rowids() {
         "SELECT id FROM docs WHERE fts_match(content, 'updated')"
     )
     .is_empty());
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_fk_cascade_delete_flush(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys=ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE docs(\
+             id INTEGER PRIMARY KEY, \
+             parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE, \
+             title TEXT, \
+             body TEXT)",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(title, body)")
+        .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO docs VALUES (10, 1, 'cascade', 'x'), (20, 2, 'keep', 'y')")
+        .unwrap();
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+    let remaining: Vec<(i64,)> = conn.exec_rows("SELECT id FROM docs ORDER BY id");
+    assert_eq!(remaining, vec![(20,)]);
+
+    let stale: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM docs WHERE fts_match(title, body, 'cascade') ORDER BY id");
+    assert!(
+        stale.is_empty(),
+        "cascade-deleted row must be removed from the FTS index, got {stale:?}"
+    );
+    let alive: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM docs WHERE fts_match(title, body, 'keep') ORDER BY id");
+    assert_eq!(alive, vec![(20,)]);
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_trigger_subprogram_flush(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE source(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX audit_fts ON audit USING fts (body)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER src_trigger AFTER INSERT ON source BEGIN \
+             INSERT INTO audit(id, body) VALUES (NEW.id, NEW.body); \
+         END",
+    )
+    .unwrap();
+
+    // trigger fires once per row through the same cached subprogram
+    // 'charlie' is the last fire, and is flushed at its own halt
+    conn.execute("INSERT INTO source(id, body) VALUES (1, 'alpha'), (2, 'bravo'), (3, 'charlie')")
+        .unwrap();
+
+    for (term, expected_id) in [("alpha", 1), ("bravo", 2), ("charlie", 3)] {
+        let ids: Vec<(i64,)> = conn.exec_rows(&format!(
+            "SELECT id FROM audit WHERE fts_match(body, '{term}')"
+        ));
+        assert_eq!(
+            ids,
+            vec![(expected_id,)],
+            "FTS index updated by the trigger should return id {expected_id} for '{term}'"
+        );
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_trigger_update_subprogram_flush(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE message(id INTEGER PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts (body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs(id, body) VALUES (1, 'original text')")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER msg_update_trg AFTER UPDATE ON message BEGIN \
+             UPDATE docs SET body = 'updated text' WHERE id = NEW.id; \
+         END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO message(id, tag) VALUES (1, 'aba')")
+        .unwrap();
+
+    // UPDATE fires trigger, which re-indexes doc 1 inside the subprogram (FTS delete + insert)
+    conn.execute("UPDATE message SET tag = 'bab' WHERE id = 1")
+        .unwrap();
+
+    let updated: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM docs WHERE fts_match(body, 'updated')");
+    assert_eq!(
+        updated,
+        vec![(1,)],
+        "re-indexed doc must be found by its NEW term"
+    );
+
+    let stale: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM docs WHERE fts_match(body, 'original')");
+    assert!(
+        stale.is_empty(),
+        "the OLD term must be gone from the FTS index after the in-subprogram UPDATE, got {stale:?}"
+    );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_trigger_abort_not_flushed(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX log_fts ON log USING fts (body)")
+        .unwrap();
+    conn.execute("CREATE TABLE uniq_t(x INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO uniq_t(x) VALUES (1)").unwrap();
+
+    // trigger buffers FTS doc, then violates UNIQUE -> subprogram aborts
+    conn.execute(
+        "CREATE TRIGGER t_trg AFTER INSERT ON t BEGIN \
+             INSERT INTO log(id, body) VALUES (NEW.id, 'ghost'); \
+             INSERT INTO uniq_t(x) VALUES (1); \
+         END",
+    )
+    .unwrap();
+
+    // insert must fail: trigger's UNIQUE violation aborts the whole statement
+    let res = conn.execute("INSERT INTO t(id) VALUES (1)");
+    assert!(
+        res.is_err(),
+        "expected trigger's UNIQUE violation to abort the insert"
+    );
+
+    // whole statement rolled back
+    let t_rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t");
+    assert!(t_rows.is_empty(), "aborted top-level insert must roll back");
+
+    let log_rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM log");
+    assert!(log_rows.is_empty(), "aborted trigger insert must roll back");
+
+    let ghost: Vec<(i64,)> = conn.exec_rows("SELECT id FROM log WHERE fts_match(body, 'ghost')");
+    assert!(
+        ghost.is_empty(),
+        "aborted subprogram's FTS doc must not be indexed, got {ghost:?}"
+    );
 }
