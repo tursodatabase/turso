@@ -65,8 +65,8 @@ mod cmath {
     pub fn atanh(x: f64) -> f64 {
         let xa = x.abs();
         if xa < 0.5 {
-            // 0x1p-28: below this, atanh(x) == x to double precision
-            if xa < f64::from_bits(0x3E30000000000000) {
+            // 2^-28: below this, atanh(x) == x to double precision
+            if xa < 1.0 / 268_435_456.0 {
                 return x;
             }
             let t = xa + xa;
