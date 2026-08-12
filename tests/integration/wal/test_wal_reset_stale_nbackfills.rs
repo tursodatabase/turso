@@ -62,7 +62,11 @@ fn assert_integrity_ok(conn: &Arc<Connection>, context: &str) {
             r => panic!("unexpected integrity_check step: {r:?}"),
         }
     }
-    assert_eq!(rows, vec!["ok".to_string()], "integrity_check failed {context}");
+    assert_eq!(
+        rows,
+        vec!["ok".to_string()],
+        "integrity_check failed {context}"
+    );
 }
 
 /// Without post-lock re-sample of `nbackfills`, checkpoint A can publish a
@@ -118,7 +122,11 @@ fn wal_reset_stale_prelock_nbackfills_does_not_lose_frames() {
 
     // Partial backfill under the pinned reader. `ckpt_frames` is the stale floor P.
     let partial = exec_ints(&c, "PRAGMA wal_checkpoint(PASSIVE)").unwrap();
-    assert_eq!(partial.first().copied(), Some(0), "partial checkpoint busy flag: {partial:?}");
+    assert_eq!(
+        partial.first().copied(),
+        Some(0),
+        "partial checkpoint busy flag: {partial:?}"
+    );
     let log_frames = partial.get(1).copied().unwrap_or(0);
     let ckpt_frames = partial.get(2).copied().unwrap_or(0);
     assert!(
@@ -143,7 +151,8 @@ fn wal_reset_stale_prelock_nbackfills_does_not_lose_frames() {
         // Release the pin so RESTART can finish a full checkpoint and reset the WAL.
         drop(parked_reader.take());
 
-        let full = exec_ints(&writer, "PRAGMA wal_checkpoint(RESTART)").expect("restart checkpoint");
+        let full =
+            exec_ints(&writer, "PRAGMA wal_checkpoint(RESTART)").expect("restart checkpoint");
         assert_eq!(
             full.first().copied(),
             Some(0),

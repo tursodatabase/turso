@@ -122,7 +122,12 @@ impl CheckpointResult {
         wal_total_backfilled: u64,
         wal_checkpoint_backfilled: u64,
     ) -> Self {
-        Self::with_checkpoint_seq(wal_max_frame, wal_total_backfilled, wal_checkpoint_backfilled, 0)
+        Self::with_checkpoint_seq(
+            wal_max_frame,
+            wal_total_backfilled,
+            wal_checkpoint_backfilled,
+            0,
+        )
     }
 
     pub fn with_checkpoint_seq(
