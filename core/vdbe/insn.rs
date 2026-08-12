@@ -270,6 +270,33 @@ pub struct HashBuildData {
     pub track_matched: bool,
 }
 
+/// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
+/// them. Most seeks have no such columns, so the empty mask is a null pointer
+/// and only IS-seeks allocate (boxed to keep Insn small).
+///
+/// Build it from a [`BitSet`] via `From`; that keeps the invariant that the
+/// inner option is `None` exactly when the mask is empty.
+#[derive(Debug, Clone, Default)]
+pub struct NullMatchingMask(Option<Box<BitSet>>);
+
+impl NullMatchingMask {
+    /// Returns true if key column `idx` uses `IS`, so NULL may match in it.
+    pub fn get(&self, idx: usize) -> bool {
+        self.0.as_ref().is_some_and(|mask| mask.get(idx))
+    }
+
+    /// Returns true if no key column uses `IS`.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<BitSet> for NullMatchingMask {
+    fn from(mask: BitSet) -> Self {
+        Self((!mask.is_empty()).then(|| Box::new(mask)))
+    }
+}
+
 /// Data for AddColumn instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct AddColumnData {
@@ -1010,7 +1037,7 @@ pub enum Insn {
         eq_only: bool,
         /// Key columns that use `IS` instead of `=`. NULL may match in these
         /// columns, so the seek must not stop when their key value is NULL.
-        null_matching_mask: BitSet,
+        null_matching_mask: NullMatchingMask,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -1050,7 +1077,7 @@ pub enum Insn {
         eq_only: bool,
         /// Key columns that use `IS` instead of `=`. NULL may match in these
         /// columns, so the seek must not stop when their key value is NULL.
-        null_matching_mask: BitSet,
+        null_matching_mask: NullMatchingMask,
     },
 
     // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
