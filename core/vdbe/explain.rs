@@ -938,13 +938,16 @@ pub fn insn_to_row(
             Insn::Next {
                 cursor_id,
                 pc_if_next,
+                fullscan,
             } => (
                 "Next",
                 *cursor_id as i64,
                 pc_if_next.as_debug_int() as i64,
                 0,
                 Value::build_text(""),
-                0,
+                // SQLite sets P5 to SQLITE_STMTSTATUS_FULLSCAN_STEP (1) on
+                // full-table-scan steps
+                *fullscan as i64,
                 "".to_string(),
             ),
             Insn::Halt {
@@ -2015,13 +2018,16 @@ pub fn insn_to_row(
             Insn::Prev {
                 cursor_id,
                 pc_if_prev,
+                fullscan,
             } => (
                 "Prev",
                 *cursor_id as i64,
                 pc_if_prev.as_debug_int() as i64,
                 0,
                 Value::build_text(""),
-                0,
+                // SQLite sets P5 to SQLITE_STMTSTATUS_FULLSCAN_STEP (1) on
+                // full-table-scan steps
+                *fullscan as i64,
                 "".to_string(),
             ),
             Insn::ShiftRight { lhs, rhs, dest } => (

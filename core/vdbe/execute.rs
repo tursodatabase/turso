@@ -3264,6 +3264,7 @@ pub fn op_next(
         Next {
             cursor_id,
             pc_if_next,
+            fullscan,
         },
         insn
     );
@@ -3302,12 +3303,14 @@ pub fn op_next(
         state.record_rows_read(1);
         state.metrics.btree_next = state.metrics.btree_next.saturating_add(1);
         state.metrics.search_count = state.metrics.search_count.saturating_add(1);
-        // Track if this is a full table scan or index scan
+        // Only steps codegen marked as part of a full table scan count as
+        // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
+        if *fullscan {
+            state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
+        }
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
-            } else if matches!(cursor_type, CursorType::BTreeTable(_)) {
-                state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
         state.pc = pc_if_next.as_offset_int();
@@ -3327,6 +3330,7 @@ pub fn op_prev(
         Prev {
             cursor_id,
             pc_if_prev,
+            fullscan,
         },
         insn
     );
@@ -3350,12 +3354,14 @@ pub fn op_prev(
         state.record_rows_read(1);
         state.metrics.btree_prev = state.metrics.btree_prev.saturating_add(1);
         state.metrics.search_count = state.metrics.search_count.saturating_add(1);
-        // Track if this is a full table scan or index scan
+        // Only steps codegen marked as part of a full table scan count as
+        // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
+        if *fullscan {
+            state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
+        }
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
-            } else if matches!(cursor_type, CursorType::BTreeTable(_)) {
-                state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
         state.pc = pc_if_prev.as_offset_int();

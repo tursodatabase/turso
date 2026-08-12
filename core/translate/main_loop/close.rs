@@ -84,13 +84,25 @@ impl CloseLoop {
                                     )
                                 })
                             };
+                            // Stepping the table itself (or the prebuilt
+                            // ephemeral copy an UPDATE scans) is a full table
+                            // scan; stepping a covering index is not.
+                            let fullscan = index_cursor_id.is_none()
+                                || matches!(
+                                    &mode,
+                                    OperationMode::UPDATE(
+                                        UpdateRowSource::PrebuiltEphemeralTable { .. }
+                                    )
+                                );
                             if *iter_dir == IterationDirection::Backwards {
                                 program.emit_insn(Insn::Prev {
+                                    fullscan,
                                     cursor_id: iteration_cursor_id,
                                     pc_if_prev: loop_labels.loop_start,
                                 });
                             } else {
                                 program.emit_insn(Insn::Next {
+                                    fullscan,
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
                                 });
@@ -112,11 +124,13 @@ impl CloseLoop {
                                 {
                                     if *iter_dir == IterationDirection::Backwards {
                                         program.emit_insn(Insn::Prev {
+                                            fullscan: false,
                                             cursor_id: *cursor_id,
                                             pc_if_prev: loop_labels.loop_start,
                                         });
                                     } else {
                                         program.emit_insn(Insn::Next {
+                                            fullscan: false,
                                             cursor_id: *cursor_id,
                                             pc_if_next: loop_labels.loop_start,
                                         });
@@ -183,11 +197,13 @@ impl CloseLoop {
                         Search::Seek { seek_def, .. } => {
                             if seek_def.iter_dir == IterationDirection::Backwards {
                                 program.emit_insn(Insn::Prev {
+                                    fullscan: false,
                                     cursor_id: iteration_cursor_id,
                                     pc_if_prev: loop_labels.loop_start,
                                 });
                             } else {
                                 program.emit_insn(Insn::Next {
+                                    fullscan: false,
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
                                 });
@@ -208,6 +224,7 @@ impl CloseLoop {
                                 // keep scanning the current key's match range before advancing
                                 // the ephemeral cursor to the next IN value.
                                 program.emit_insn(Insn::Next {
+                                    fullscan: false,
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
                                 });
@@ -217,6 +234,7 @@ impl CloseLoop {
                             // advance the outer ephemeral cursor and restart the equality seek.
                             program.preassign_label_to_next_insn(next_val_label);
                             program.emit_insn(Insn::Next {
+                                fullscan: false,
                                 cursor_id: ephemeral_cursor_id,
                                 pc_if_next: outer_loop_start,
                             });
@@ -227,6 +245,7 @@ impl CloseLoop {
                 Operation::IndexMethodQuery(_) => {
                     resolve_next(program);
                     program.emit_insn(Insn::Next {
+                        fullscan: false,
                         cursor_id: index_cursor_id.unwrap(),
                         pc_if_next: loop_labels.loop_start,
                     });
@@ -255,6 +274,7 @@ impl CloseLoop {
                     program.preassign_label_to_next_insn(loop_labels.next);
                     let probe_cursor_id = table_cursor_id.expect("Probe table must have a cursor");
                     program.emit_insn(Insn::Next {
+                        fullscan: false,
                         cursor_id: probe_cursor_id,
                         pc_if_next: loop_labels.loop_start,
                     });
@@ -558,6 +578,7 @@ pub(super) fn emit_autoindex(
         flags: IdxInsertFlags::new().use_seek(false),
     });
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id: table_cursor_id,
         pc_if_next: label_ephemeral_build_loop_start,
     });

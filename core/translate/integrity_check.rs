@@ -581,6 +581,7 @@ fn translate_integrity_check_impl(
 
                     let next_exists = program.allocate_label();
                     program.emit_insn(Insn::Next {
+                        fullscan: false,
                         cursor_id: bound_index.cursor_id,
                         pc_if_next: next_exists,
                     });
@@ -612,6 +613,7 @@ fn translate_integrity_check_impl(
         }
 
         program.emit_insn(Insn::Next {
+            fullscan: false,
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
         });

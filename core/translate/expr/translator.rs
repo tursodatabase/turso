@@ -319,6 +319,7 @@ pub fn translate_expr(
                     });
                     program.preassign_label_to_next_insn(label_null_checks_next);
                     program.emit_insn(Insn::Next {
+                        fullscan: false,
                         cursor_id: *cursor_id,
                         pc_if_next: label_null_checks_loop_start,
                     });

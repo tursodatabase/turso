@@ -239,6 +239,7 @@ pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &Retur
         count: buf.num_columns,
     });
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id: buf.cursor_id,
         pc_if_next: scan_start,
     });

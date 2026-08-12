@@ -2436,6 +2436,7 @@ fn emit_window_full_scan(
     emit_function_step(program, t_ctx, plan, scan_cursor)?;
     program.preassign_label_to_next_insn(label_next);
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id: scan_cursor,
         pc_if_next: label_loop,
     });
@@ -2930,6 +2931,7 @@ fn emit_window_op(
     //     no peer check; label_done is the next instruction.
     let label_after_next = program.allocate_label();
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id: cursor_for_op,
         pc_if_next: label_after_next,
     });

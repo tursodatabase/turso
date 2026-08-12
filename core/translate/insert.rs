@@ -1251,6 +1251,7 @@ fn emit_epilogue(
             program.preassign_label_to_next_insn(ctx.loop_labels.row_done);
 
             program.emit_insn(Insn::Next {
+                fullscan: false,
                 cursor_id: temp_table_ctx.cursor_id,
                 pc_if_next: temp_table_ctx.loop_start_label,
             });
@@ -1754,6 +1755,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
 
     program.preassign_label_to_next_insn(found_label);
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id: seq_cursor_id,
         pc_if_next: loop_start_label,
     });
@@ -3414,6 +3416,7 @@ fn ensure_sequence_initialized(
     });
 
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id: seq_cursor_id,
         pc_if_next: loop_start_label,
     });
@@ -4325,6 +4328,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
             program.preassign_label_to_next_insn(next_row);
             program.emit_insn(Insn::Next {
+                fullscan: false,
                 cursor_id: ccur,
                 pc_if_next: loop_top,
             });

@@ -318,6 +318,7 @@ pub(super) fn translate_sequence_function(
             is_part_of_update: true,
         });
         program.emit_insn(Insn::Next {
+            fullscan: false,
             cursor_id,
             pc_if_next: loop_label,
         });

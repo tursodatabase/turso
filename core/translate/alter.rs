@@ -701,6 +701,7 @@ fn emit_add_virtual_column_validation(
     }
 
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id,
         pc_if_next: loop_start,
     });

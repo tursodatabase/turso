@@ -316,6 +316,7 @@ pub fn translate_analyze(
                 is_part_of_update: false,
             });
             program.emit_insn(Insn::Next {
+                fullscan: false,
                 cursor_id: stat_cursor,
                 pc_if_next: loop_start,
             });
@@ -331,6 +332,7 @@ pub fn translate_analyze(
                 is_part_of_update: false,
             });
             program.emit_insn(Insn::Next {
+                fullscan: false,
                 cursor_id: stat_cursor,
                 pc_if_next: loop_start,
             });
@@ -338,6 +340,7 @@ pub fn translate_analyze(
 
         program.preassign_label_to_next_insn(skip_label);
         program.emit_insn(Insn::Next {
+            fullscan: false,
             cursor_id: stat_cursor,
             pc_if_next: loop_start,
         });
@@ -576,6 +579,7 @@ fn emit_index_stats(
 
     // Next iteration
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id: idx_cursor,
         pc_if_next: lbl_loop,
     });

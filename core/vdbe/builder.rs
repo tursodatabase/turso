@@ -2026,6 +2026,7 @@ impl ProgramBuilder {
         f(self, rowid);
 
         self.emit_insn(Insn::Next {
+            fullscan: false,
             cursor_id,
             pc_if_next: loop_start,
         });

@@ -190,10 +190,12 @@ fn emit_seek_multi_index_branch(
     program.preassign_label_to_next_insn(branch_next);
     match seek_def.iter_dir {
         IterationDirection::Forwards => program.emit_insn(Insn::Next {
+            fullscan: false,
             cursor_id: branch_cursor_id,
             pc_if_next: branch_loop_start,
         }),
         IterationDirection::Backwards => program.emit_insn(Insn::Prev {
+            fullscan: false,
             cursor_id: branch_cursor_id,
             pc_if_prev: branch_loop_start,
         }),
@@ -320,6 +322,7 @@ fn emit_in_seek_multi_index_branch(
         );
         program.preassign_label_to_next_insn(branch_next);
         program.emit_insn(Insn::Next {
+            fullscan: false,
             cursor_id: branch_cursor_id,
             pc_if_next: branch_loop_start,
         });
@@ -360,6 +363,7 @@ fn emit_in_seek_multi_index_branch(
 
     program.preassign_label_to_next_insn(next_value_label);
     program.emit_insn(Insn::Next {
+        fullscan: false,
         cursor_id: ephemeral_cursor_id,
         pc_if_next: outer_loop_start,
     });

@@ -459,6 +459,7 @@ impl EmitOrderBy {
             });
         } else {
             program.emit_insn(Insn::Next {
+                fullscan: false,
                 cursor_id: sort_cursor,
                 pc_if_next: sort_loop_start_label,
             });
