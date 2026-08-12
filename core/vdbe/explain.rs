@@ -1304,24 +1304,17 @@ pub fn insn_to_row(
                 0,
                 format!("if (--r[{}]==0) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::AggStep {
-                func,
-                acc_reg,
-                delimiter: _,
-                col,
-                comparator: _,
-                collation,
-            } => (
+            Insn::AggStep { data } => (
                 "AggStep",
                 0,
-                *col as i64,
-                *acc_reg as i64,
-                Value::build_text(match collation {
-                    Some(collation) => format!("{}({collation})", func.as_str()),
-                    None => func.as_str().to_string(),
+                data.col as i64,
+                data.acc_reg as i64,
+                Value::build_text(match &data.collation {
+                    Some(collation) => format!("{}({collation})", data.func.as_str()),
+                    None => data.func.as_str().to_string(),
                 }),
                 0,
-                format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
+                format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
             ),
             Insn::AggInverse {
                 func,

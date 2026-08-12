@@ -345,6 +345,20 @@ pub struct SorterOpenData {
     pub comparators: crate::alloc::Vec<Option<SortComparatorType>>,
 }
 
+/// Data for AggStep instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AggStepData {
+    pub acc_reg: usize,
+    pub col: usize,
+    pub delimiter: usize,
+    pub func: AccumulatorFunc,
+    /// Optional custom type comparator for MIN/MAX aggregates.
+    pub comparator: Option<SortComparatorType>,
+    /// Collation for comparison-based aggregates (MIN/MAX), resolved at
+    /// translation time from the argument expression.
+    pub collation: Option<CollationSeq>,
+}
+
 /// Data for ArrayEncode instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
@@ -1178,15 +1192,7 @@ pub enum Insn {
     },
 
     AggStep {
-        acc_reg: usize,
-        col: usize,
-        delimiter: usize,
-        func: AccumulatorFunc,
-        /// Optional custom type comparator for MIN/MAX aggregates.
-        comparator: Option<SortComparatorType>,
-        /// Collation for comparison-based aggregates (MIN/MAX), resolved at
-        /// translation time from the argument expression.
-        collation: Option<CollationSeq>,
+        data: Box<AggStepData>,
     },
 
     /// Mirror-image of AggStep: fires when a row crosses the frame-start

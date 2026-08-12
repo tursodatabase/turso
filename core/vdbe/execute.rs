@@ -130,7 +130,7 @@ use super::{
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{
-        AddSequenceData, ArrayEncodeData, Cookie, IntegrityCkData, RegisterOrLiteral,
+        AddSequenceData, AggStepData, ArrayEncodeData, Cookie, IntegrityCkData, RegisterOrLiteral,
         SortComparatorType, SorterOpenData,
     },
     CommitState,
@@ -8111,17 +8111,15 @@ pub fn op_agg_step(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        AggStep {
-            acc_reg,
-            col,
-            delimiter,
-            func,
-            comparator,
-            collation,
-        },
-        insn
-    );
+    load_insn!(AggStep { data }, insn);
+    let AggStepData {
+        acc_reg,
+        col,
+        delimiter,
+        func,
+        comparator,
+        collation,
+    } = data.as_ref();
 
     if let AccumulatorFunc::Window(win_func) = func {
         return op_window_step(state, *acc_reg, *col, win_func);
