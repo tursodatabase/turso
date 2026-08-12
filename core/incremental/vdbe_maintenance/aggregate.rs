@@ -2,8 +2,8 @@ use super::binding::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table
 use super::output::{DeltaSource, EmittedNodeOutput, NodeOutputContract};
 use super::plan::{tracks_distinct_values, uses_multiset, OperatorStateDef};
 use super::stream::{
-    btree_arrangement, emit_operator_rowid_delta, open_ephemeral_delta, ArrangementIdentityColumn,
-    DeltaIdentity, EphemeralDelta,
+    btree_arrangement, emit_operator_rowid_delta, open_ephemeral_delta, synthesized_view_table,
+    ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
 };
 use super::MaintenanceInput;
 use crate::function::AggFunc;
@@ -280,6 +280,22 @@ fn emit_group_aggregate_rows(
         None
     };
 
+    // Aggregate payloads are updated once per input delta, but finalized
+    // values are statement-level results. Track each affected state rowid so
+    // the second phase can publish exactly one old/new pair per group after
+    // every contribution has been applied.
+    let touched_groups_table = Arc::new(synthesized_view_table(
+        &format!("{state_table_name}_touched"),
+        0,
+        0,
+    )?);
+    let touched_groups_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeTable(touched_groups_table));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: touched_groups_cursor_id,
+        is_table: true,
+    });
+
     // Register layout.
     let identity_width = channel.identity_width();
     turso_assert!(
@@ -348,13 +364,22 @@ fn emit_group_aggregate_rows(
     let group_rep_mult_reg = program.alloc_register();
     let group_rep_record_reg = program.alloc_register();
     let group_rep_found_reg = program.alloc_register();
+    let touched_group_record_reg = program.alloc_register();
 
     program.emit_insn(Insn::Null {
         dest: null_arg_reg,
         dest_end: None,
     });
     program.emit_int(0, zero_reg);
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(zero_reg),
+        count: 1,
+        dest_reg: to_u32(touched_group_record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
 
+    let finalize_label = program.allocate_label();
     let end_label = program.allocate_label();
     let loop_label = program.allocate_label();
     let next_label = program.allocate_label();
@@ -380,7 +405,7 @@ fn emit_group_aggregate_rows(
     let pass_done_label = if pass_reg.is_some() {
         program.allocate_label()
     } else {
-        end_label
+        finalize_label
     };
 
     program.emit_insn(Insn::Rewind {
@@ -515,6 +540,30 @@ fn emit_group_aggregate_rows(
             });
         }
     }
+    program.emit_insn(Insn::NewRowid {
+        cursor: state_cursor_id,
+        rowid_reg: state_rowid_reg,
+        prev_largest_reg: prev_rowid_scratch,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: group_start,
+        dst_reg: index_rec_start,
+        extra_amount: k.saturating_sub(1),
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(index_rec_start),
+        count: to_u32(k + 1),
+        dest_reg: to_u32(index_record_reg),
+        index_name: Some(state_index.name.clone()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: state_index_cursor_id,
+        record_reg: index_record_reg,
+        unpacked_start: Some(index_rec_start),
+        unpacked_count: Some(to_u32(k + 1)),
+        flags: IdxInsertFlags::new(),
+    });
     program.emit_insn(Insn::Goto {
         target_pc: apply_label,
     });
@@ -566,6 +615,36 @@ fn emit_group_aggregate_rows(
             default: None,
         });
     }
+
+    program.preassign_label_to_next_insn(apply_label);
+    let first_touch_label = program.allocate_label();
+    let touch_done_label = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: touched_groups_cursor_id,
+        rowid_reg: state_rowid_reg,
+        target_pc: first_touch_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: touch_done_label,
+    });
+    program.preassign_label_to_next_insn(first_touch_label);
+    program.emit_insn(Insn::Insert {
+        cursor: touched_groups_cursor_id,
+        key_reg: state_rowid_reg,
+        record_reg: touched_group_record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+    let retract_old_label = program.allocate_label();
+    program.emit_insn(Insn::If {
+        reg: found_reg,
+        target_pc: retract_old_label,
+        jump_if_null: false,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: touch_done_label,
+    });
+    program.preassign_label_to_next_insn(retract_old_label);
     program.emit_insn(Insn::Copy {
         src_reg: group_start,
         dst_reg: old_out_start,
@@ -584,8 +663,7 @@ fn emit_group_aggregate_rows(
         old_out_start,
         old_out_weight_reg,
     );
-
-    program.preassign_label_to_next_insn(apply_label);
+    program.preassign_label_to_next_insn(touch_done_label);
     if let Some(representatives) = &group_representative_cursors {
         let representative_found_label = program.allocate_label();
         let representative_upsert_label = program.allocate_label();
@@ -1065,82 +1143,10 @@ fn emit_group_aggregate_rows(
         program.preassign_label_to_next_insn(aggregate_done_label);
     }
 
-    // Group liveness: the hidden COUNT(*) is zero when every row of the
-    // group has been retracted. A scalar aggregate's single group is never
-    // deleted — retracting the last row rewrites its row with empty-input
-    // aggregate values instead.
-    if !scalar {
-        program.emit_insn(Insn::AggValue {
-            acc_reg: acc_start,
-            dest_reg: cnt_reg,
-            func: AccumulatorFunc::Agg(AggFunc::Count0),
-        });
-        let write_label = program.allocate_label();
-        program.emit_insn(Insn::Ne {
-            lhs: cnt_reg,
-            rhs: zero_reg,
-            target_pc: write_label,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-
-        // Group emptied: remove its state row and index entry. The old
-        // arrangement row was already retracted above. A
-        // fresh group cannot reach zero (its first change was an insert), so
-        // found_reg is always set here; stay total anyway.
-        let do_delete_label = program.allocate_label();
-        program.emit_insn(Insn::If {
-            reg: found_reg,
-            target_pc: do_delete_label,
-            jump_if_null: false,
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: next_label,
-        });
-        program.preassign_label_to_next_insn(do_delete_label);
-        if k > 1 {
-            program.emit_insn(Insn::Copy {
-                src_reg: group_start,
-                dst_reg: index_rec_start,
-                extra_amount: k - 1,
-            });
-        } else {
-            program.emit_insn(Insn::Copy {
-                src_reg: group_start,
-                dst_reg: index_rec_start,
-                extra_amount: 0,
-            });
-        }
-        program.emit_insn(Insn::IdxDelete {
-            start_reg: index_rec_start,
-            num_regs: k + 1,
-            cursor_id: state_index_cursor_id,
-            raise_error_if_no_matching_entry: true,
-        });
-        program.emit_insn(Insn::Delete {
-            cursor_id: state_cursor_id,
-            table_name: state_table_name.clone(),
-            is_part_of_update: true,
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: next_label,
-        });
-        program.preassign_label_to_next_insn(write_label);
-    }
-
-    // Group live: persist aggregate state and publish its natural delta.
-    let have_rowids_label = program.allocate_label();
-    program.emit_insn(Insn::If {
-        reg: found_reg,
-        target_pc: have_rowids_label,
-        jump_if_null: false,
-    });
-    program.emit_insn(Insn::NewRowid {
-        cursor: state_cursor_id,
-        rowid_reg: state_rowid_reg,
-        prev_largest_reg: prev_rowid_scratch,
-    });
-    program.preassign_label_to_next_insn(have_rowids_label);
+    // Persist only accumulator payloads while the input batch is still being
+    // applied. The finalized value columns deliberately remain the values
+    // from before the statement, so another contribution to the same group
+    // can neither observe nor publish a transient aggregate result.
     for (i, agg) in aggregates.iter().enumerate() {
         let Some(offset) = payload_offsets[i] else {
             continue; // MIN/MAX: state lives in the multiset table
@@ -1151,35 +1157,27 @@ fn emit_group_aggregate_rows(
             func: AccumulatorFunc::Agg(agg.func.clone()),
         });
     }
-    let skip_index_label = program.allocate_label();
-    program.emit_insn(Insn::If {
-        reg: found_reg,
-        target_pc: skip_index_label,
-        jump_if_null: false,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: group_start,
-        dst_reg: index_rec_start,
-        extra_amount: k.saturating_sub(1),
-    });
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(index_rec_start),
-        count: to_u32(k + 1),
-        dest_reg: to_u32(index_record_reg),
-        index_name: Some(state_index.name.clone()),
+        start_reg: to_u32(state_rec_start),
+        count: to_u32(k + total_payload + aggregates.len()),
+        dest_reg: to_u32(state_record_reg),
+        index_name: None,
         affinity_str: None,
     });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: state_index_cursor_id,
-        record_reg: index_record_reg,
-        unpacked_start: Some(index_rec_start),
-        unpacked_count: Some(to_u32(k + 1)),
-        flags: IdxInsertFlags::new(),
+    program.emit_insn(Insn::Insert {
+        cursor: state_cursor_id,
+        key_reg: state_rowid_reg,
+        record_reg: state_record_reg,
+        flag: InsertFlags(
+            InsertFlags::REQUIRE_SEEK
+                | InsertFlags::SKIP_LAST_ROWID
+                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+        ),
+        table_name: state_table_name.clone(),
     });
-    program.preassign_label_to_next_insn(skip_index_label);
 
-    // Finalize every aggregate and publish the node's natural row. HAVING is
-    // an ordinary downstream Filter node in the maintenance DAG.
+    // Finalize a fully applied group and publish its natural row. HAVING is an
+    // ordinary downstream Filter node in the maintenance DAG.
     let emit_row_tail = |program: &mut ProgramBuilder| -> Result<()> {
         for (i, agg) in aggregates.iter().enumerate() {
             let value_reg = agg_value_start + i;
@@ -1360,8 +1358,6 @@ fn emit_group_aggregate_rows(
         Ok(())
     };
 
-    emit_row_tail(program)?;
-
     program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
         cursor_id: input_cursor_id,
@@ -1371,7 +1367,7 @@ fn emit_group_aggregate_rows(
         program.preassign_label_to_next_insn(pass_done_label);
         program.emit_insn(Insn::If {
             reg: pass_reg,
-            target_pc: end_label,
+            target_pc: finalize_label,
             jump_if_null: false,
         });
         program.emit_int(1, pass_reg);
@@ -1379,6 +1375,101 @@ fn emit_group_aggregate_rows(
             target_pc: pass_start_label,
         });
     }
+
+    // The first phase left every touched state row present, including groups
+    // whose final liveness count is zero. Reload their completed payloads and
+    // publish or delete each group exactly once.
+    program.preassign_label_to_next_insn(finalize_label);
+    let finalize_loop_label = program.allocate_label();
+    let finalize_next_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: touched_groups_cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(finalize_loop_label);
+    program.emit_insn(Insn::Null {
+        dest: acc_start,
+        dest_end: Some(acc_start + aggregates.len() - 1),
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: touched_groups_cursor_id,
+        dest: state_rowid_reg,
+    });
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: state_cursor_id,
+        src_reg: state_rowid_reg,
+        target_pc: corrupt_label,
+    });
+    for i in 0..k {
+        program.emit_insn(Insn::Column {
+            cursor_id: state_cursor_id,
+            column: i,
+            dest: group_start + i,
+            default: None,
+        });
+    }
+    for (i, agg) in aggregates.iter().enumerate() {
+        let Some(offset) = payload_offsets[i] else {
+            continue; // MIN/MAX: state lives in the multiset table
+        };
+        for j in 0..payload_widths[i].expect("offset implies width") {
+            program.emit_insn(Insn::Column {
+                cursor_id: state_cursor_id,
+                column: k + aggregates.len() + offset + j,
+                dest: payload_start + offset + j,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::AggContextLoad {
+            acc_reg: acc_start + i,
+            payload_start_reg: payload_start + offset,
+            func: AccumulatorFunc::Agg(agg.func.clone()),
+        });
+    }
+
+    if !scalar {
+        program.emit_insn(Insn::AggValue {
+            acc_reg: acc_start,
+            dest_reg: cnt_reg,
+            func: AccumulatorFunc::Agg(AggFunc::Count0),
+        });
+        let live_group_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: cnt_reg,
+            rhs: zero_reg,
+            target_pc: live_group_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: group_start,
+            dst_reg: index_rec_start,
+            extra_amount: k.saturating_sub(1),
+        });
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: index_rec_start,
+            num_regs: k + 1,
+            cursor_id: state_index_cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: state_cursor_id,
+            table_name: state_table_name.clone(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: finalize_next_label,
+        });
+        program.preassign_label_to_next_insn(live_group_label);
+    }
+
+    emit_row_tail(program)?;
+
+    program.preassign_label_to_next_insn(finalize_next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: touched_groups_cursor_id,
+        pc_if_next: finalize_loop_label,
+    });
     program.emit_insn(Insn::Goto {
         target_pc: end_label,
     });

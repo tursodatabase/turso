@@ -576,6 +576,34 @@ expect {
     real|1
 }
 
+# Aggregate maintenance must finalize after the full statement delta. SUM's
+# integer overflow is forgiven when a later REAL switches it to approximate
+# mode, even if the integer-only prefix would overflow on its own.
+test matview-vdbe-sum-later-real-forgives-transient-overflow {
+    CREATE TABLE sum_later_real(x);
+    CREATE MATERIALIZED VIEW sum_later_real_view AS
+      SELECT SUM(x) AS s FROM sum_later_real;
+    INSERT INTO sum_later_real VALUES
+      (9223372036854775807), (1), (1.5);
+    SELECT typeof(s), s = (SELECT SUM(x) FROM sum_later_real)
+      FROM sum_later_real_view;
+}
+expect {
+    real|1
+}
+
+# Deferring finalization must not suppress a genuine final overflow.
+test matview-vdbe-sum-final-integer-overflow-errors {
+    CREATE TABLE sum_final_overflow(x);
+    CREATE MATERIALIZED VIEW sum_final_overflow_view AS
+      SELECT SUM(x) AS s FROM sum_final_overflow;
+    INSERT INTO sum_final_overflow VALUES
+      (9223372036854775807), (1);
+}
+expect error {
+    integer overflow
+}
+
 # The single row also exists when WHERE filters out every scanned row.
 test matview-vdbe-scalar-aggregate-where-filters-all {
     CREATE TABLE t28(x INTEGER);
