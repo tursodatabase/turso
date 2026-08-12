@@ -801,6 +801,10 @@ pub trait Wal: Debug + Send + Sync {
     /// `expected_checkpoint_seq` must match the current WAL generation; a mismatch
     /// means the WAL was reset under this checkpoint and publishing would poison
     /// the new generation (SQLite WAL-reset bug).
+    ///
+    /// This generation check is defense-in-depth only. The load-bearing fix is
+    /// re-sampling `nbackfills` under the checkpoint lock before fixing
+    /// `min_frame`. Callers must hold the checkpoint guard through publish.
     fn publish_backfill(&self, max_frame: u64, expected_checkpoint_seq: u32) -> Result<()>;
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
@@ -993,6 +997,12 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn publish_backfill(&self, max_frame: u64, expected_checkpoint_seq: u32) -> Result<()> {
+        // Defense-in-depth only. The load-bearing WAL-reset fix is re-sampling
+        // nbackfills under the checkpoint lock before fixing min_frame: if the
+        // checkpointer already observed the *new* generation's checkpoint_seq but
+        // kept a stale pre-lock min_frame, this seq check still passes and would
+        // publish a poisoned watermark. Callers must hold the checkpoint guard for
+        // the whole backfill→publish window so restart cannot race this store.
         let snapshot = self.load_snapshot();
         if snapshot.checkpoint_seq != expected_checkpoint_seq {
             tracing::warn!(
@@ -2017,6 +2027,8 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn publish_backfill(&self, max_frame: u64, expected_checkpoint_seq: u32) -> Result<()> {
+        // Defense-in-depth only — see InProcessWalCoordination::publish_backfill.
+        // Load-bearing fix remains post-lock nbackfills re-sample before min_frame.
         let snapshot = self.load_snapshot();
         if snapshot.checkpoint_seq != expected_checkpoint_seq {
             tracing::warn!(

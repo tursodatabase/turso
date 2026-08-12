@@ -67,6 +67,14 @@ fn assert_integrity_ok(conn: &Arc<Connection>, context: &str) {
 
 /// Without post-lock re-sample of `nbackfills`, checkpoint A can publish a
 /// watermark that skips low frames of a restarted WAL generation.
+///
+/// Proof shape (must fail without the Start-path re-sample):
+/// - Partial backfill leaves stale floor `P = nbackfills > 0`.
+/// - Hook restarts WAL and writes a new generation with frame count `N > P`.
+/// - Stale `min_frame = P+1` would skip frames `[1, P]` of the new gen and can
+///   still publish `nbackfills = N` (seq check alone does not catch this once
+///   the post-lock snapshot is already the new generation).
+/// - With the fix, range is rebased to `[1, N']` and no rows are lost.
 #[test]
 fn wal_reset_stale_prelock_nbackfills_does_not_lose_frames() {
     let tmp = TempDatabase::new("wal-reset-stale-nbackfills.db");
@@ -80,7 +88,6 @@ fn wal_reset_stale_prelock_nbackfills_does_not_lose_frames() {
     // Batch 1: enough pages that a pinned reader leaves a partial backfill window.
     const BATCH1: i64 = 80;
     const BATCH2: i64 = 120;
-    const NEW_GEN: i64 = 200;
 
     exec(&a, "BEGIN").unwrap();
     for i in 0..BATCH1 {
@@ -109,7 +116,7 @@ fn wal_reset_stale_prelock_nbackfills_does_not_lose_frames() {
     }
     exec(&a, "COMMIT").unwrap();
 
-    // Partial backfill under the pinned reader.
+    // Partial backfill under the pinned reader. `ckpt_frames` is the stale floor P.
     let partial = exec_ints(&c, "PRAGMA wal_checkpoint(PASSIVE)").unwrap();
     assert_eq!(partial.first().copied(), Some(0), "partial checkpoint busy flag: {partial:?}");
     let log_frames = partial.get(1).copied().unwrap_or(0);
@@ -117,6 +124,14 @@ fn wal_reset_stale_prelock_nbackfills_does_not_lose_frames() {
     assert!(
         ckpt_frames > 0 && ckpt_frames < log_frames,
         "need partial backfill for stale-nbackfills race: log={log_frames} ckpt={ckpt_frames} raw={partial:?}"
+    );
+
+    // New-gen frame count must exceed stale floor P. With ~1 page/row, rows = P + margin
+    // ensures a poisoned min_frame=P+1 still has frames to "checkpoint" and can hide data.
+    let new_gen_rows = ckpt_frames + 80;
+    assert!(
+        new_gen_rows > ckpt_frames,
+        "new generation must outgrow stale floor P={ckpt_frames}"
     );
 
     let hook_ran = Arc::new(AtomicBool::new(false));
@@ -135,9 +150,11 @@ fn wal_reset_stale_prelock_nbackfills_does_not_lose_frames() {
             "RESTART checkpoint must succeed inside hook: {full:?}"
         );
 
-        // New generation with enough frames that a stale min_frame would skip early ones.
+        // New generation large enough that stale min_frame=P+1 would skip early frames.
+        // Do not checkpoint here: that would backfill the new gen before A takes the lock
+        // and collapse the race window.
         exec(&writer, "BEGIN").unwrap();
-        for i in 0..NEW_GEN {
+        for i in 0..new_gen_rows {
             let id = 1_000_000 + i;
             exec(
                 &writer,
@@ -164,24 +181,48 @@ fn wal_reset_stale_prelock_nbackfills_does_not_lose_frames() {
         "checkpoint A must not fail after re-basing on the new generation: {after:?}"
     );
 
-    let expected_total = BATCH1 + BATCH2 + NEW_GEN;
+    // Checkpoint result is (busy, log, checkpointed). After a correct re-base onto the
+    // new generation, checkpointed is a prefix of that generation's log — never larger.
+    let after_log = after.get(1).copied().unwrap_or(0);
+    let after_ckpt = after.get(2).copied().unwrap_or(0);
+    assert!(
+        after_ckpt <= after_log,
+        "watermark cannot exceed WAL log: log={after_log} ckpt={after_ckpt} P={ckpt_frames} raw={after:?}"
+    );
+    // With ~1 frame per large blob row, new-gen log should exceed stale floor P. If the
+    // log shrank below P the stale min_frame path does no work and the test can false-pass.
+    assert!(
+        after_log > ckpt_frames,
+        "post-race WAL log ({after_log}) must exceed stale floor P={ckpt_frames} so a poisoned \
+         min_frame=P+1 would still attempt a partial new-gen backfill: {after:?}"
+    );
+
+    let expected_total = BATCH1 + BATCH2 + new_gen_rows;
     let count = exec_ints(&a, "SELECT count(*) FROM t").unwrap();
     assert_eq!(
         count,
         vec![expected_total],
-        "all committed rows must survive the WAL-reset race"
+        "all committed rows must survive the WAL-reset race (P={ckpt_frames}, new_gen={new_gen_rows}, \
+         after={after:?})"
     );
 
     let new_gen_count = exec_ints(
         &a,
-        "SELECT count(*) FROM t WHERE id >= 1000000 AND id < 1000000 + 100000",
+        &format!(
+            "SELECT count(*) FROM t WHERE id >= 1000000 AND id < {}",
+            1_000_000 + new_gen_rows
+        ),
     )
     .unwrap();
     assert_eq!(
         new_gen_count,
-        vec![NEW_GEN],
+        vec![new_gen_rows],
         "new-generation rows must all be visible"
     );
+
+    // Pre-reset rows were fully checkpointed by RESTART inside the hook.
+    let low_id = exec_ints(&a, "SELECT count(*) FROM t WHERE id < 1000000").unwrap();
+    assert_eq!(low_id, vec![BATCH1 + BATCH2], "pre-reset rows must remain");
 
     assert_integrity_ok(&a, "after WAL-reset stale-nbackfills race");
 
