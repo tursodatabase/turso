@@ -246,6 +246,85 @@ expect {
     4|
 }
 
+# Building group_concat for every inner key can make an unused string exceed
+# the size limit. Keep this form correlated so it reads only requested keys.
+@setup correlated_rows
+@skip-if sqlite "Turso names its correlated subquery in the query plan"
+test one-value-group-concat-does-not-build-unused-groups {
+    EXPLAIN QUERY PLAN
+    SELECT id, (SELECT group_concat(i.text_key, ':')
+                FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o;
+}
+expect pattern {
+    (?s)SCAN outer_rows AS o.*CORRELATED SCALAR SUBQUERY
+}
+
+# A direct comparison can join the requested rows before building each string.
+# This avoids both the correlated scan and strings for unused inner keys.
+@setup correlated_rows
+@skip-if sqlite "SQLite keeps this group_concat as a correlated subquery"
+test one-value-group-concat-joins-before-grouping {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows o
+    WHERE o.text_key = (
+        SELECT group_concat(i.text_key, ':')
+        FROM inner_rows i
+        WHERE i.key1 = o.key1
+    );
+}
+expect pattern {
+    (?s)JOIN inner_rows AS i.*SCAN outer_rows AS o.*USE SORTER FOR GROUP BY
+}
+
+# The joined form keeps a separate string for each outer row. A key with no
+# inner rows still gives NULL and does not match a text value.
+test one-value-group-concat-join-keeps-one-group-per-outer-row {
+    CREATE TABLE concat_join_outer(id INTEGER PRIMARY KEY, k INTEGER, wanted TEXT);
+    CREATE TABLE concat_join_inner(k INTEGER, value TEXT);
+    INSERT INTO concat_join_outer VALUES
+        (1,1,'a'),
+        (2,1,'a'),
+        (3,2,'x'),
+        (4,3,'');
+    INSERT INTO concat_join_inner VALUES
+        (1,'a'),
+        (2,NULL),
+        (99,'unused');
+
+    SELECT o.id
+    FROM concat_join_outer o
+    WHERE o.wanted = (
+        SELECT group_concat(i.value, ':')
+        FROM concat_join_inner i
+        WHERE i.k = o.k
+    )
+    ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+# A missing inner row gives group_concat no input rows. The NULL row made by
+# the left join must not turn group_concat('x') into 'x'.
+test one-value-group-concat-join-ignores-missing-inner-row {
+    CREATE TABLE concat_constant_outer(id INTEGER PRIMARY KEY, k INTEGER, wanted TEXT);
+    CREATE TABLE concat_constant_inner(k INTEGER);
+    INSERT INTO concat_constant_outer VALUES (1,7,'x');
+
+    SELECT o.id
+    FROM concat_constant_outer o
+    WHERE o.wanted = (
+        SELECT group_concat('x')
+        FROM concat_constant_inner i
+        WHERE i.k = o.k
+    );
+}
+expect {
+}
+
 @setup correlated_rows
 test one-value-distinct-aggregate {
     SELECT id, (SELECT count(DISTINCT i.key2) FROM inner_rows i WHERE i.key1 = o.key1)
@@ -748,6 +827,289 @@ expect {
     2|
 }
 
+# A sum can join the requested inner rows before grouping. This avoids one
+# subquery call per outer row without adding values for unused inner keys.
+@skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+test one-value-sum-joins-before-grouping {
+    CREATE TABLE sum_join_outer(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER);
+    CREATE TABLE sum_join_inner(k INTEGER, x INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM sum_join_outer o
+    WHERE o.max_sum > (
+        SELECT sum(i.x)
+        FROM sum_join_inner i
+        WHERE i.k = o.k
+    );
+}
+expect pattern {
+    (?s)HASH JOIN sum_join_inner AS i.*SCAN sum_join_outer AS o.*USE SORTER FOR GROUP BY
+}
+
+# Each outer row keeps its own sum. A missing match gives NULL. The values for
+# key 99 would overflow, but no outer row asks for that key.
+test one-value-sum-join-does-not-read-unused-overflowing-key {
+    CREATE TABLE sum_join_results(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER);
+    CREATE TABLE sum_join_values(k INTEGER, x INTEGER);
+    INSERT INTO sum_join_results VALUES
+        (1,1,11),
+        (2,1,9),
+        (3,2,1),
+        (4,NULL,1),
+        (5,3,1);
+    INSERT INTO sum_join_values VALUES
+        (1,5),
+        (1,5),
+        (2,NULL),
+        (99,9223372036854775807),
+        (99,9223372036854775807);
+
+    SELECT o.id
+    FROM sum_join_results o
+    WHERE o.max_sum > (
+        SELECT sum(i.x)
+        FROM sum_join_values i
+        WHERE i.k = o.k
+    )
+    ORDER BY o.id;
+}
+expect {
+    1
+}
+
+# A missing inner row gives sum no input rows. The NULL row made by the left
+# join must not turn sum(1) into 1.
+test one-value-sum-join-ignores-missing-inner-row {
+    CREATE TABLE sum_constant_outer(id INTEGER PRIMARY KEY, k INTEGER, wanted INTEGER);
+    CREATE TABLE sum_constant_inner(k INTEGER);
+    INSERT INTO sum_constant_outer VALUES (1,7,1);
+
+    SELECT o.id
+    FROM sum_constant_outer o
+    WHERE o.wanted = (
+        SELECT sum(1)
+        FROM sum_constant_inner i
+        WHERE i.k = o.k
+    );
+}
+expect {
+}
+
+# Moving a comparison to HAVING would also move its other subquery. Keep both
+# subqueries in WHERE until their planning stage can be moved with them.
+@skip-if sqlite "Turso names its subqueries in the query plan"
+test one-value-sum-compared-with-subquery-stays-correlated {
+    CREATE TABLE two_sum_outer(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE two_sum_left(k INTEGER, x INTEGER);
+    CREATE TABLE two_sum_right(k INTEGER, x INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM two_sum_outer o
+    WHERE (
+        SELECT sum(i.x)
+        FROM two_sum_left i
+        WHERE i.k = o.k
+    ) > (
+        SELECT sum(j.x)
+        FROM two_sum_right j
+        WHERE j.k = o.k
+    );
+}
+expect pattern {
+    (?s)CORRELATED SCALAR SUBQUERY.*CORRELATED SCALAR SUBQUERY
+}
+
+# The joined form makes each outer row appear once per matching inner row, and
+# the other WHERE terms then run once per copy. A nondeterministic term could
+# accept some copies and reject others, so the aggregate would see only some
+# of a row's inner rows. Keep the subquery correlated instead.
+@skip-if sqlite "Turso names its correlated subquery in the query plan"
+test one-value-sum-with-nondeterministic-where-term-stays-correlated {
+    CREATE TABLE nondet_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
+    CREATE TABLE nondet_inner(k INTEGER, x INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM nondet_outer o
+    WHERE o.id + (random() % 2) = o.id
+      AND o.lim > (
+          SELECT sum(i.x)
+          FROM nondet_inner i
+          WHERE i.k = o.k
+      );
+}
+expect pattern {
+    (?s)SCAN nondet_outer AS o.*CORRELATED SCALAR SUBQUERY
+}
+
+# Whatever random() returns, each key's full sum is 20 and 15 > 20 is false,
+# so the result must be empty. A joined form that ran the random check once
+# per copy could keep only one of a key's two rows and compare 15 > 10.
+test one-value-sum-with-nondeterministic-where-term-sums-all-rows {
+    CREATE TABLE nondet_sum_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
+    CREATE TABLE nondet_sum_inner(k INTEGER, x INTEGER);
+    INSERT INTO nondet_sum_outer VALUES
+        (1,1,15),(2,2,15),(3,3,15),(4,4,15),(5,5,15),
+        (6,6,15),(7,7,15),(8,8,15),(9,9,15),(10,10,15);
+    INSERT INTO nondet_sum_inner VALUES
+        (1,10),(1,10),(2,10),(2,10),(3,10),(3,10),(4,10),(4,10),(5,10),(5,10),
+        (6,10),(6,10),(7,10),(7,10),(8,10),(8,10),(9,10),(9,10),(10,10),(10,10);
+
+    SELECT o.id
+    FROM nondet_sum_outer o
+    WHERE o.id + (random() % 2) = o.id
+      AND o.lim > (
+          SELECT sum(i.x)
+          FROM nondet_sum_inner i
+          WHERE i.k = o.k
+      );
+}
+expect {
+}
+
+# A correlated subquery in another WHERE term would also run once per joined
+# copy of an outer row. Keep the aggregate subquery correlated instead.
+@skip-if sqlite "Turso names its subqueries in the query plan"
+test one-value-sum-with-correlated-subquery-term-stays-correlated {
+    CREATE TABLE corr_term_outer(id INTEGER PRIMARY KEY, k INTEGER, z INTEGER, lim INTEGER);
+    CREATE TABLE corr_term_inner(k INTEGER, x INTEGER);
+    CREATE TABLE corr_term_other(k INTEGER, v INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM corr_term_outer o
+    WHERE o.z = (
+        SELECT j.v
+        FROM corr_term_other j
+        WHERE j.k = o.k
+        LIMIT 1
+    )
+      AND o.lim > (
+          SELECT sum(i.x)
+          FROM corr_term_inner i
+          WHERE i.k = o.k
+      );
+}
+expect pattern {
+    (?s)CORRELATED SCALAR SUBQUERY.*CORRELATED SCALAR SUBQUERY
+}
+
+# An uncorrelated subquery in another WHERE term runs once and its stored
+# result is the same for every joined copy, so it does not block the joined
+# form. TPC-H q20 has this shape.
+@skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+test one-value-sum-join-allows-uncorrelated-subquery-term {
+    CREATE TABLE in_term_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
+    CREATE TABLE in_term_inner(k INTEGER, x INTEGER);
+    CREATE TABLE in_term_list(k INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM in_term_outer o
+    WHERE o.k IN (SELECT k FROM in_term_list)
+      AND o.lim > (
+          SELECT sum(i.x)
+          FROM in_term_inner i
+          WHERE i.k = o.k
+      );
+}
+expect pattern {
+    (?s)JOIN in_term_inner AS i.*USE SORTER FOR GROUP BY
+}
+
+# The subquery can be either side of the comparison.
+@skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+test one-value-sum-join-subquery-on-left-side {
+    CREATE TABLE left_side_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
+    CREATE TABLE left_side_inner(k INTEGER, x INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM left_side_outer o
+    WHERE (
+        SELECT sum(i.x)
+        FROM left_side_inner i
+        WHERE i.k = o.k
+    ) > o.lim;
+}
+expect pattern {
+    (?s)JOIN left_side_inner AS i.*USE SORTER FOR GROUP BY
+}
+
+# key 1: 20 > 15. key 2: 10 > 5. key 3: no rows, sum is NULL, not returned.
+# The values for key 99 would overflow, but no outer row asks for that key.
+test one-value-sum-join-subquery-on-left-side-results {
+    CREATE TABLE left_val_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
+    CREATE TABLE left_val_inner(k INTEGER, x INTEGER);
+    INSERT INTO left_val_outer VALUES (1,1,15),(2,2,5),(3,3,15);
+    INSERT INTO left_val_inner VALUES
+        (1,10),(1,10),(2,10),
+        (99,9223372036854775807),(99,9223372036854775807);
+
+    SELECT o.id
+    FROM left_val_outer o
+    WHERE (
+        SELECT sum(i.x)
+        FROM left_val_inner i
+        WHERE i.k = o.k
+    ) > o.lim
+    ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+# One result expression can hold two aggregates. Both move into the outer
+# query with the same check for a real inner row.
+# key 1: 20 - 2 = 18 > 15. key 2: 10 - 1 = 9 > 5. key 3: no rows, NULL.
+test one-value-sum-join-two-aggregates-in-one-expression {
+    CREATE TABLE two_agg_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
+    CREATE TABLE two_agg_inner(k INTEGER, x INTEGER, y INTEGER);
+    INSERT INTO two_agg_outer VALUES (1,1,15),(2,2,5),(3,3,15);
+    INSERT INTO two_agg_inner VALUES
+        (1,10,1),(1,10,1),(2,10,1),
+        (99,9223372036854775807,0),(99,9223372036854775807,0);
+
+    SELECT o.id
+    FROM two_agg_outer o
+    WHERE o.lim < (
+        SELECT sum(i.x) - sum(i.y)
+        FROM two_agg_inner i
+        WHERE i.k = o.k
+    )
+    ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+# Keep an aggregate's own filter when adding the check for a real inner row.
+# The left join's NULL-filled row makes i.k IS NULL true, but it is not an
+# input row from sum_constant_filter_inner and must not be counted.
+test one-value-sum-join-keeps-filter-for-missing-inner-row {
+    CREATE TABLE sum_constant_filter_outer(
+        id INTEGER PRIMARY KEY,
+        k INTEGER,
+        wanted INTEGER
+    );
+    CREATE TABLE sum_constant_filter_inner(k INTEGER);
+    INSERT INTO sum_constant_filter_outer VALUES (1,7,1);
+
+    SELECT o.id
+    FROM sum_constant_filter_outer o
+    WHERE o.wanted = (
+        SELECT sum(1) FILTER (WHERE i.k IS NULL)
+        FROM sum_constant_filter_inner i
+        WHERE i.k = o.k
+    );
+}
+expect {
+}
+
 # A group that no outer row uses must not make sum fail.
 test one-value-does-not-sum-unused-group {
     CREATE TABLE used_sum_key(id INTEGER, k INTEGER);
@@ -811,6 +1173,107 @@ test one-value-empty-outer-does-not-sum {
     FROM empty_sum_key o;
 }
 expect {
+}
+
+# The joined form must not sum any inner rows when the outer table is empty.
+test one-value-sum-join-does-not-read-inner-table-for-empty-outer {
+    CREATE TABLE empty_join_sum_key(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE unused_join_sum_values(k INTEGER, x INTEGER);
+    INSERT INTO unused_join_sum_values VALUES
+        (2,9223372036854775807),
+        (2,9223372036854775807);
+
+    SELECT o.id
+    FROM empty_join_sum_key o
+    WHERE 0 < (
+        SELECT sum(i.x)
+        FROM unused_join_sum_values i
+        WHERE i.k = o.k
+    );
+}
+expect {
+}
+
+# An outer filter can remove a key before its sum is made. The values for key
+# 99 would overflow, but that outer row does not pass keep = 1.
+test one-value-sum-join-does-not-read-key-rejected-by-outer-filter {
+    CREATE TABLE kept_sum_key(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER, keep INTEGER);
+    CREATE TABLE kept_sum_values(k INTEGER, x INTEGER);
+    INSERT INTO kept_sum_key VALUES (1,1,20,1),(2,99,20,0);
+    INSERT INTO kept_sum_values VALUES
+        (1,10),
+        (99,9223372036854775807),
+        (99,9223372036854775807);
+
+    SELECT o.id
+    FROM kept_sum_key o
+    WHERE o.keep = 1
+      AND o.max_sum > (
+          SELECT sum(i.x)
+          FROM kept_sum_values i
+          WHERE i.k = o.k
+      );
+}
+expect {
+    1
+}
+
+# The joined form only runs the aggregate function for keys read from the
+# outer table. Bad JSON under unused key 99 must not fail this query.
+test one-value-json-sum-joins-before-grouping {
+    CREATE TABLE json_sum_outer(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER);
+    CREATE TABLE json_sum_inner(k INTEGER, v TEXT);
+    INSERT INTO json_sum_outer VALUES (1,1,2);
+    INSERT INTO json_sum_inner VALUES (1,'{"n":1}'),(99,'bad JSON');
+
+    SELECT o.id
+    FROM json_sum_outer o
+    WHERE o.max_sum > (
+        SELECT sum(json_extract(i.v, '$.n'))
+        FROM json_sum_inner i
+        WHERE i.k = o.k
+    );
+}
+expect {
+    1
+}
+
+@skip-if sqlite "Turso uses a different plan for this query"
+test one-value-json-sum-uses-joined-form {
+    CREATE TABLE json_sum_plan_outer(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER);
+    CREATE TABLE json_sum_plan_inner(k INTEGER, v TEXT);
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM json_sum_plan_outer o
+    WHERE o.max_sum > (
+        SELECT sum(json_extract(i.v, '$.n'))
+        FROM json_sum_plan_inner i
+        WHERE i.k = o.k
+    );
+}
+expect pattern {
+    (?s)JOIN json_sum_plan_inner AS i.*SCAN json_sum_plan_outer AS o.*USE SORTER FOR GROUP BY
+}
+
+# json_extract runs before max. A grouped table would also run it for the
+# unused bad JSON row. The joined form reads only requested keys.
+test one-value-function-around-aggregate-does-not-read-unused-key {
+    CREATE TABLE wrapped_max_outer(id INTEGER PRIMARY KEY, k INTEGER, wanted INTEGER);
+    CREATE TABLE wrapped_max_inner(k INTEGER, value TEXT);
+    INSERT INTO wrapped_max_outer VALUES (1,1,1);
+    INSERT INTO wrapped_max_inner VALUES (1,'{"n":1}'),(99,'bad JSON');
+
+    SELECT o.id
+    FROM wrapped_max_outer o
+    WHERE o.wanted = (
+        SELECT json_extract(max(i.value), '$.n')
+        FROM wrapped_max_inner i
+        WHERE i.k = o.k
+    );
+}
+expect {
+    1
 }
 
 # LIMIT 1 can stop after the first matching row. When matches are expected to
@@ -1301,6 +1764,29 @@ test correlated-in-keeps-number-to-text-comparison {
 }
 expect {
     1
+}
+
+# IN reads every row on its right before it tests the left value. A semi-join
+# must not stop at the first match and hide an error from a later row.
+test correlated-in-keeps-errors-from-later-values {
+    CREATE TABLE in_error_outer(k INTEGER, wanted INTEGER);
+    CREATE TABLE in_error_inner(k INTEGER, value TEXT);
+    INSERT INTO in_error_outer VALUES
+        (1,1),(1,1),(1,1),(1,1),(1,1),
+        (1,1),(1,1),(1,1),(1,1),(1,1);
+    INSERT INTO in_error_inner VALUES (1,'1'),(1,'bad JSON');
+    ANALYZE;
+
+    SELECT count(*)
+    FROM in_error_outer o
+    WHERE o.wanted IN (
+        SELECT json_extract(i.value, '$')
+        FROM in_error_inner i
+        WHERE i.k = o.k
+    );
+}
+expect error {
+    .*malformed JSON.*
 }
 
 # These cases run every generated query against Turso and SQLite. The data has
