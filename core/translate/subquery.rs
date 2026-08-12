@@ -1311,19 +1311,19 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                         identifier = %table_reference.identifier,
                         "pre-materializing shared CTE"
                     );
-                    let insns_before_materialization = program.insn_count();
-                    let (result_columns_start, cte_cursor_id, cte_table) =
-                        emit_materialized_subquery_table(
-                            program,
-                            from_clause_subquery.plan.as_mut(),
-                            t_ctx,
-                            &from_clause_subquery.columns,
+                    let (result_columns_start, cte_cursor_id, cte_table) = program
+                        .with_cte_materialization_eqp(
+                            cte_id,
+                            &from_clause_subquery.name,
+                            |program| {
+                                emit_materialized_subquery_table(
+                                    program,
+                                    from_clause_subquery.plan.as_mut(),
+                                    t_ctx,
+                                    &from_clause_subquery.columns,
+                                )
+                            },
                         )?;
-                    program.record_cte_materialization_eqp(
-                        cte_id,
-                        &from_clause_subquery.name,
-                        insns_before_materialization,
-                    );
                     program.register_materialized_cte(
                         cte_id,
                         MaterializedCteInfo {

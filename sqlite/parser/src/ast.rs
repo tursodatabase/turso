@@ -15,6 +15,16 @@ pub struct ParameterInfo {
     pub names: Vec<String>,
 }
 
+/// Output format of an `EXPLAIN QUERY PLAN` statement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EqpFormat {
+    /// `FORMAT=TEXT`
+    #[default]
+    Text,
+    /// `FORMAT=JSON`
+    Json,
+}
+
 /// Statement or Explain statement
 // https://sqlite.org/syntax/sql-stmt.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,7 +32,7 @@ pub enum Cmd {
     /// `EXPLAIN` statement
     Explain(Stmt),
     /// `EXPLAIN QUERY PLAN` statement
-    ExplainQueryPlan(Stmt),
+    ExplainQueryPlan { stmt: Stmt, format: EqpFormat },
     /// statement
     Stmt(Stmt),
 }

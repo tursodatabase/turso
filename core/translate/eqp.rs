@@ -1,9 +1,7 @@
 //! Structured EXPLAIN QUERY PLAN data.
 //!
-//! Every `Insn::Explain` carries an [`EqpDetail`] describing one step of the
-//! query plan. The `Display` impl produces the exact human-readable string
-//! shown in `EXPLAIN QUERY PLAN` output, and [`program_plan_json`] serializes
-//! the whole plan as JSON so tools don't have to parse those strings.
+//! Can be serialized as both human-readable or machine-readable (JSON).
+//! The JSON format is documented in `docs/eqp-json.md`.
 
 use std::fmt::{self, Display, Formatter, Write as _};
 
@@ -17,11 +15,10 @@ use crate::{
     vdbe::{insn::Insn, Program},
 };
 
-/// How a table is named in the query: real name plus the alias used to refer
-/// to it, if different (e.g. `users AS u`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EqpTable {
     pub name: String,
+    /// `u` in `users AS u`
     pub alias: Option<String>,
 }
 
@@ -34,7 +31,7 @@ impl EqpTable {
         }
     }
 
-    /// `users AS u` form, used by SCAN and HASH JOIN details.
+    /// `users AS u` form
     fn name_with_alias(&self) -> String {
         match &self.alias {
             Some(alias) => format!("{} AS {}", self.name, alias),
@@ -52,25 +49,20 @@ impl EqpTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EqpIndex {
     pub name: String,
-    /// True when the index alone satisfies the query and the table itself is
-    /// never read.
     pub covering: bool,
-    /// True for synthesized in-memory indexes (e.g. over a materialized
-    /// subquery), as opposed to indexes that exist in the schema.
     pub ephemeral: bool,
 }
 
-/// How a table participates in the join, as seen from the join order.
+/// How a table participates in the final join order (not necessarily how the query is written down).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EqpJoin {
     Inner,
-    /// CROSS JOIN: inner join whose position the optimizer must not change.
     Cross,
     Left,
     Full,
-    /// EXISTS-style join: keep the outer row once a match is found.
+    /// semijoin (WHERE EXISTS)
     Semi,
-    /// NOT EXISTS-style join: keep the outer row only if no match is found.
+    /// antijoin (WHERE NOT EXISTS)
     Anti,
 }
 
@@ -138,7 +130,7 @@ pub enum EqpSubqueryExec {
     Coroutine,
     /// Fully evaluated into an in-memory table before the outer query runs.
     Materialized,
-    /// Fully evaluated into an in-memory index that the outer query seeks into.
+    /// Fully evaluated into an in-memory index.
     IndexedMaterialized,
     /// Reads a result someone else already materialized (shared CTE).
     MaterializedReuse,
@@ -160,10 +152,9 @@ impl EqpSubqueryExec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EqpSubquery {
     pub exec: EqpSubqueryExec,
-    /// Identity shared by all references to the same CTE, so tools can link
-    /// multiple reads of one materialized CTE together.
+    /// Storing the id of the CTE here allows us to link together reads of the same CTE.
     pub cte_id: Option<usize>,
-    /// True when the subquery is a recursive CTE.
+    /// Is this a recursive CTE
     pub recursive: bool,
 }
 
@@ -218,8 +209,7 @@ impl EqpCompoundOp {
     }
 }
 
-/// One structured EXPLAIN QUERY PLAN step. `Display` renders the exact detail
-/// string EXPLAIN QUERY PLAN prints for it.
+/// One structured EXPLAIN QUERY PLAN step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EqpDetail {
     /// A query with no FROM clause produces exactly one row.
@@ -300,10 +290,11 @@ pub enum EqpDetail {
     },
     /// The initial (non-recursive) part of a recursive CTE.
     RecursiveSetup,
-    /// The recursive part of a recursive CTE; runs once per queued row.
+    /// The recursive part of a recursive CTE.
     RecursiveStep,
 }
 
+/// Prints the exact string needed for the step in an `EXPLAIN QUERY PLAN`.
 impl Display for EqpDetail {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -441,8 +432,7 @@ fn eqp_index(index: &Index, covering: bool) -> EqpIndex {
     }
 }
 
-/// Build the structured detail for a joined table's access step. Shared by the
-/// SELECT loop emitter and the UPDATE/DELETE emitters.
+/// Build the [EqpDetail] for a joined table.
 pub(crate) fn eqp_detail_for_table_op(
     table: &JoinedTable,
     join: Option<EqpJoin>,
@@ -553,8 +543,7 @@ pub(crate) fn eqp_detail_for_table_op(
     }
 }
 
-/// A shared CTE materialized before the main query runs. Links the plan nodes
-/// that compute the CTE's rows to the `cte_id` its readers reference.
+/// A CTE materialized before the main query runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EqpCteMaterialization {
     pub cte_id: usize,
@@ -581,13 +570,13 @@ fn json_escape_into(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// Incrementally writes one JSON object, handling commas and escaping.
-struct JsonObject<'a> {
+/// Small Json utility to avoid importing serde_json into turso_core.
+struct JsonBuilder<'a> {
     out: &'a mut String,
     first: bool,
 }
 
-impl<'a> JsonObject<'a> {
+impl<'a> JsonBuilder<'a> {
     fn new(out: &'a mut String) -> Self {
         out.push('{');
         Self { out, first: true }
@@ -653,7 +642,7 @@ impl<'a> JsonObject<'a> {
 
 impl EqpDetail {
     fn write_table_fields(
-        obj: &mut JsonObject,
+        obj: &mut JsonBuilder,
         table: &EqpTable,
         join: Option<EqpJoin>,
         subquery: Option<&EqpSubquery>,
@@ -662,7 +651,7 @@ impl EqpDetail {
         obj.opt_str("alias", table.alias.as_deref());
         obj.opt_str("join", join.map(EqpJoin::as_str));
         if let Some(subquery) = subquery {
-            let mut sub = JsonObject::new(obj.key("subquery"));
+            let mut sub = JsonBuilder::new(obj.key("subquery"));
             sub.str("execution", subquery.exec.as_str());
             if let Some(cte_id) = subquery.cte_id {
                 sub.num("cte_id", cte_id);
@@ -674,9 +663,9 @@ impl EqpDetail {
         }
     }
 
-    fn write_index_field(obj: &mut JsonObject, index: Option<&EqpIndex>) {
+    fn write_index_field(obj: &mut JsonBuilder, index: Option<&EqpIndex>) {
         if let Some(index) = index {
-            let mut idx = JsonObject::new(obj.key("index"));
+            let mut idx = JsonBuilder::new(obj.key("index"));
             idx.str("name", &index.name);
             idx.bool("covering", index.covering);
             idx.bool("ephemeral", index.ephemeral);
@@ -684,9 +673,9 @@ impl EqpDetail {
         }
     }
 
-    /// Write this step's machine-readable fields as one JSON object.
+    /// Output the plan in json format for `EXPLAIN QUERY PLAN format=json`.
     fn write_json(&self, out: &mut String) {
-        let mut obj = JsonObject::new(out);
+        let mut obj = JsonBuilder::new(out);
         match self {
             Self::ConstantRow => obj.str("type", "constant_row"),
             Self::Scan {
@@ -814,7 +803,7 @@ impl EqpDetail {
 /// `parent` refers to another node's `id`; `null` marks a root node.
 pub fn program_plan_json(program: &Program) -> String {
     let mut out = String::with_capacity(1024);
-    let mut top = JsonObject::new(&mut out);
+    let mut top = JsonBuilder::new(&mut out);
     top.num("version", 1);
     top.str("sql", &program.sql);
 
@@ -840,7 +829,7 @@ pub fn program_plan_json(program: &Program) -> String {
             nodes.push(',');
         }
         first = false;
-        let mut node = JsonObject::new(nodes);
+        let mut node = JsonBuilder::new(nodes);
         node.num("id", *p1);
         match p2 {
             Some(parent) => node.num("parent", *parent),
@@ -852,14 +841,14 @@ pub fn program_plan_json(program: &Program) -> String {
     }
     nodes.push(']');
 
-    if !program.cte_materializations.is_empty() {
+    if !program.explain.cte_materializations.is_empty() {
         let ctes = top.key("cte_materializations");
         ctes.push('[');
-        for (i, cte) in program.cte_materializations.iter().enumerate() {
+        for (i, cte) in program.explain.cte_materializations.iter().enumerate() {
             if i > 0 {
                 ctes.push(',');
             }
-            let mut obj = JsonObject::new(ctes);
+            let mut obj = JsonBuilder::new(ctes);
             obj.num("cte_id", cte.cte_id);
             obj.str("name", &cte.name);
             obj.num_array("nodes", cte.node_ids.iter().copied());
