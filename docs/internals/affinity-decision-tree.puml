@@ -1,0 +1,459 @@
+@startuml affinity-decision-tree
+'=============================================================================
+' Turso affinity — unified decision tree
+'
+' Converted from the "unified decision tree" section of
+' affinity-rules-reference.md (its interactive treedata.json).
+'
+' Two boxes in the real flow are walked more than once:
+'
+'   $column_affinity  (§2)   — resolve a column's own declared affinity.
+'                              Walked 5 times: once on the write path, once
+'                              per comparison operand, and once per index
+'                              affinity check (text and numeric).
+'   $operand_affinity (§3.1) — resolve an expression's ExprAffinityInfo.
+'                              Walked twice, once for LHS and once for RHS.
+'
+' They are written once here as preprocessor procedures and expanded at every
+' call site, so every copy on the rendered diagram stays identical.
+'
+' Render:  java -jar plantuml.jar docs/internals/affinity-decision-tree.puml
+'=============================================================================
+
+title Turso affinity — unified decision tree
+
+skinparam defaultTextAlignment left
+skinparam ConditionEndStyle hline
+skinparam ArrowFontSize 11
+skinparam PartitionBorderColor #7F8C8D
+skinparam PartitionFontStyle bold
+skinparam ActivityDiamondBackgroundColor #FEF9E7
+skinparam NoteBackgroundColor #FDF6E3
+skinparam NoteBorderColor #B7950B
+
+legend top left
+  |<#E8F6F3>  | a resolved affinity value |
+  |<#D6EAF8>  | an ExprAffinityInfo result (has_affinity + affinity) |
+  |<#F9E79F>  | an override that beats whatever was just computed |
+  |<#F5B7B1>  | a known bug or a deliberate deviation from SQLite |
+  |<#ABEBC6>  | terminal outcome |
+endlegend
+
+
+'=============================================================================
+' §2 — resolve a column's own declared affinity
+'
+' $who names the column being resolved, so each of the five expansions is
+' labelled with the context it was reached from.
+'=============================================================================
+!procedure $column_affinity($who)
+partition "§2 · Resolve $who own declared affinity" {
+
+  :Start from $who declared type string;
+  note right
+    This first question only matters for STRICT tables using a
+    custom/domain type (registered via CREATE TYPE) or an array
+    column (e.g. INTEGER[]).
+
+    Turso needs the type's real base affinity //before// running the
+    substring rules, because those rules can be fooled by a custom
+    type's name — a domain named "doubled" contains "DOUB", which
+    the rules below would wrongly read as REAL. The override
+    sidesteps that by carrying the correct affinity directly.
+
+    Not a STRICT table, or a plain built-in type like
+    INTEGER / TEXT / REAL? Then the answer is always No.
+  end note
+
+  if (Does the column have a Turso custom-type\noverride with a packed affinity? (§2)) then (yes)
+    #E8F6F3:Use that override's affinity directly —
+    skip the substring cascade entirely;
+  else (no)
+
+    '--- §2.1 the substring cascade
+    if (§2.1 · Affinity::affinity(declared_type) —\nchecked top to bottom, first match wins.\nDoes the declared type contain "INT"?) then (yes)
+      #E8F6F3:**INTEGER**;
+      note right
+        Substring match, not a keyword match —
+        e.g. "POINTER" would also match.
+      end note
+    else (no)
+      if (Contains "CHAR", "CLOB" or "TEXT"?) then (yes)
+        #E8F6F3:**TEXT**;
+      else (no)
+        if (Contains "BLOB",\nor is the declared type string empty\n(no type at all)?) then (yes)
+          #E8F6F3:**BLOB**;
+        else (no)
+          if (Contains "REAL", "FLOA" or "DOUB"?) then (yes)
+            #E8F6F3:**REAL**;
+          else (no)
+            #E8F6F3:**NUMERIC**
+            (the default — none of the other
+            four substrings matched);
+          endif
+        endif
+      endif
+    endif
+
+  endif
+
+  '--- §2.2 the STRICT ANY escape hatch
+  if (§2.2 · Is the table STRICT and the\ndeclared type exactly "ANY"?) then (yes)
+    #F9E79F:Forced to **BLOB**, overriding
+    whatever was just computed;
+    note right
+      STRICT tables (CREATE TABLE ... STRICT) require every column to
+      have one of a fixed list of real types. ANY is the one escape
+      hatch: a STRICT column declared ANY can hold a value of any
+      type, completely unmodified.
+
+      Since it can hold anything, Turso does not try to parse or
+      convert it at all — it is always treated as BLOB, meaning
+      "keep the bytes exactly as given".
+
+      CREATE TABLE t(x ANY) STRICT;
+      x always behaves as BLOB here, no matter what is put in it.
+    end note
+  else (no)
+    :Keep the affinity computed above;
+  endif
+
+}
+!endprocedure
+
+
+'=============================================================================
+' §3.1 — resolve one comparison operand's ExprAffinityInfo
+'
+' $side is "LHS" or "RHS". The RHS walk is the identical tree fed the RHS
+' expression, which is why one procedure covers both.
+'=============================================================================
+!procedure $operand_affinity($side)
+partition "§3.1 · Resolve $side's ExprAffinityInfo { has_affinity, affinity }" {
+
+  :Look at the $side expression;
+  note right
+    has_affinity is really asking: does this expression have a REAL,
+    trustworthy declared type?
+
+    A table column does. A literal like 5 or 'abc', a computed
+    expression like a + 1, or a function call result does not —
+    Turso cannot know its type just by looking at it, so for
+    comparison purposes it is treated as untyped
+    (has_affinity = false, affinity = BLOB), no matter what value it
+    evaluates to at runtime.
+  end note
+
+  '--- Transparent wrappers recurse into the inner expression. The JSON
+  '--- models this as an edge back into this same node; unwrapping in a
+  '--- loop first is the same thing and reads better as a graph.
+  while (Is it a Parenthesized([e]) with a single element,\nor a Collate(e, _)?) is (yes)
+    :Transparent — recurse into e and inherit its answer verbatim.
+    COLLATE's own name plays no role in this decision (§4.6);
+  endwhile (no)
+
+  switch (What kind of expression is it?)
+
+  case (Resolved Column)
+    if (Is this column backed by a real BTree table?\n(the exact-token "INTEGER PRIMARY KEY"\nrowid-alias check also happens here, §7)) then (yes)
+      :has_affinity = true — read the column's own declared
+      affinity with the same box the WRITE path uses, just
+      being read here instead of applied to a new value;
+      note right
+        "Backed by a real BTree table" is asking: is this an actual
+        column of an actual on-disk table (CREATE TABLE), rather than
+        a column that only exists because of how the query is written?
+
+        In SELECT ... FROM t1, t1.a is backed by a real BTree — Yes.
+        In SELECT ... FROM (SELECT 1 AS x) d, d.x is not: it only
+        exists inside this query, so it is a FromClauseSubquery
+        column (same for a CTE or a VIEW) — No.
+      end note
+      $column_affinity("this $side column's")
+    else (no — Virtual, FromClauseSubquery\n(FROM-subquery / CTE / VIEW), or RecursiveCteInput)
+      #D6EAF8:§10 · has_affinity = true, affinity = whatever was
+      BAKED IN when this derived column was first constructed;
+      if (Did it come from a single SELECT arm,\nor a compound SELECT?) then (single arm —\nplain derived table / CTE / VIEW,\nno compound operator)
+        #F5B7B1:§10.1 · infer_type_from_expr(inner_expr, resolver=None)
+        → lossy get_expr_affinity(inner_expr, ..., None).
+        resolver is ALWAYS None here, so if inner_expr is itself a
+        scalar subquery it can never match the SubqueryResult arm and
+        always falls to BLOB, whatever the real inner type is
+        — **bug, doc summary #5**;
+      else (compound SELECT —\nUNION / UNION ALL / EXCEPT / INTERSECT,\nalgorithm identical for all four operators)
+        #F5B7B1:§10.2 · Start at arm 1's affinity via the same lossy
+        function. WHILE it reads BLOB, skip to the next arm and adopt
+        ITS affinity instead — **bug, doc summary #8**: a genuinely
+        BLOB-declared leading arm is indistinguishable from
+        "no affinity" here and gets skipped too.
+        Once an affinity settles, OR in the remaining arms' storage-class
+        masks: a Text-vs-numeric conflict downgrades the result to BLOB,
+        otherwise keep the settled value;
+      endif
+    endif
+
+  case (RowId / ROWID(...) /\n_ROWID_ / OID)
+    #D6EAF8:has_affinity = true, affinity = **INTEGER**, always —
+    this branch never looks at any column at all (§7);
+
+  case (CAST(expr AS T))
+    if (Is T given?) then (yes)
+      #D6EAF8:has_affinity = true, **Affinity::affinity(T)** —
+      expr's own affinity is NEVER consulted (§8);
+    else (no — rare AST form)
+      #D6EAF8:has_affinity = false, **BLOB**;
+    endif
+
+  case (Literal\n(number / string / blob / NULL /\nTRUE|FALSE / date-time keyword))
+    #D6EAF8:has_affinity = false, **BLOB**
+    (the "no affinity" sentinel value);
+
+  case (Register\n(UPDATE rewrote a column\nreference to a register))
+    if (Is this register mapping found in the resolver?) then (yes)
+      #D6EAF8:has_affinity = true, the looked-up affinity;
+    else (no)
+      #D6EAF8:has_affinity = false, **BLOB**;
+    endif
+    note right
+      An internal detail, not something you write in SQL. When
+      translating something like UPDATE t SET a = a + 1, Turso
+      sometimes needs to compare against the column's in-progress new
+      value before it is written back to the table, and that value
+      lives in a VDBE register rather than being read fresh from the
+      column. You only hit this branch reading generated bytecode.
+    end note
+
+  case (Scalar SubqueryResult\n(single-column subquery result))
+    if (Found in the resolver, and exactly 1 result register\n(not a multi-column row-value)?) then (yes)
+      #D6EAF8:Inherit the inner query's result column's answer
+      VERBATIM, has_affinity bit included — this is the one place
+      a subquery's real type survives intact;
+    else (no — not found, or a\nmulti-column row-value result)
+      #D6EAF8:has_affinity = false, **BLOB**;
+    endif
+
+  case (Anything else)
+    #D6EAF8:has_affinity = false, **BLOB**;
+    note right
+      No dedicated handling exists for ANY of these forms — they all
+      fall to this one wildcard arm:
+
+      Binary / arithmetic / concat / bitwise, FunctionCall(Star),
+      Case, Between, InList / InSelect / InTable, IsNull, NotNull,
+      Like, Unary, Variable, unresolved Column / Id, Exists,
+      DoublyQualified, Name, Qualified, Raise, bare Subquery,
+      multi-element Parenthesized, Array, Subscript, Default.
+    end note
+
+  endswitch
+
+}
+!endprocedure
+
+
+'=============================================================================
+' The tree itself
+'=============================================================================
+start
+
+if (What are you tracing?) then (writing a value into a column\n(INSERT / UPDATE / UPSERT))
+
+  '=========================================================================
+  ' WRITE PATH
+  '=========================================================================
+  $column_affinity("the target column's")
+
+  partition "§5.3 · apply_affinity_char(value, this affinity)" {
+    if (Is the value already Blob?) then (yes)
+      :No-op — stored exactly as given;
+    else (no)
+      if (Is the target affinity Blob?) then (yes)
+        :No-op — stored exactly as given;
+      else (no)
+        if (Is the target affinity Text?) then (yes)
+          :A numeric value gets stringified;
+        else (no)
+          if (Is the target affinity Integer or Numeric?) then (yes)
+            :Text gets trimmed and hex ("0x...") is excluded, then parsed
+            ONLY if the ENTIRE remaining string is a well-formed number
+            (try_for_float, §5.4) — otherwise left as text unchanged;
+          else (no — target is Real)
+            :An integer is unconditionally converted to float. Text follows
+            the same trim/parse rule, but a successful parse always becomes
+            a float — it never stays an int, unlike the Integer/Numeric case;
+          endif
+        endif
+      endif
+    endif
+  }
+
+  #ABEBC6:**DONE — value written**
+  The new value is physically written with this coercion applied;
+  note right
+    STRICT tables skip this entire box and run Insn::TypeCheck
+    instead — reject a type mismatch outright rather than coerce it.
+  end note
+  stop
+
+else (comparing two expressions\n(=, <>, <, <=, >, >=, IS, IN, JOIN ON,\nor preparing an index-seek key))
+
+  '=========================================================================
+  ' COMPARE PATH
+  '=========================================================================
+  $operand_affinity("LHS")
+
+  :Now resolve the RHS the exact same way — walk the identical tree,
+  starting again from "is it a resolved Column?", but feeding it the
+  RHS expression instead;
+
+  $operand_affinity("RHS")
+
+  partition "§4.1 · COMBINE — comparison_affinity_from_info(LHS, RHS)" {
+    if (Do BOTH LHS and RHS have has_affinity = true?) then (yes)
+      if (Is either side's affinity numeric\n(Integer / Real / Numeric)?) then (yes)
+        #E8F6F3:**NUMERIC**;
+      else (no — both Text, both Blob, or one of each)
+        #F5B7B1:**BLOB**
+        Deviation from SQLite: the textbook rule picks TEXT here if
+        either side is TEXT. This always picks BLOB instead, even for
+        TEXT-vs-TEXT — **doc summary #1**;
+      endif
+    else (no)
+      switch (Does exactly one side have has_affinity = true?)
+      case (only LHS has it)
+        if (Is LHS's affinity numeric?) then (yes)
+          #E8F6F3:**NUMERIC** — the #6715 downgrade, which stops a lone
+          REAL/INTEGER column affinity from surviving onto a no-affinity
+          literal and forcing it to f64 before it is even compared;
+        else (no)
+          #E8F6F3:**LHS.affinity**, unchanged;
+        endif
+      case (only RHS has it)
+        if (Is RHS's affinity numeric?) then (yes)
+          #E8F6F3:**NUMERIC** — the #6715 downgrade, mirrored for RHS;
+        else (no)
+          #E8F6F3:**RHS.affinity**, unchanged;
+        endif
+      case (neither has it)
+        #E8F6F3:**BLOB** — nothing on either side to coerce toward;
+      endswitch
+    endif
+  }
+
+  :ONE resolved Affinity value falls out here.
+  If this comparison came from a WHERE/ON term it is cached on the
+  Constraint right now (§9.2) — every consumer below reads this same
+  cached value, none of them recompute it;
+
+  if (What consumes it?) then (a PLAIN comparison actually\nbeing executed, not just planned)
+
+    '-----------------------------------------------------------------
+    ' PLAIN COMPARISON
+    '-----------------------------------------------------------------
+    partition "§4.3–4.5 · Executing a plain comparison" {
+      if (§4.4 · Is either operand NULL?) then (yes)
+        #ABEBC6:**NULL short-circuit**
+        Short-circuit on the null_eq / jump_if_null flags right now —
+        the affinity value computed above is NEVER consulted for this
+        pair of operands (§4.5);
+        stop
+      else (no)
+        if (§4.4 · Are both operands already plain integers?) then (yes)
+          #ABEBC6:**Fast path**
+          Direct compare, no affinity work at all;
+          stop
+        else (no)
+          :§4.3 · Affinity::convert_for_compare(...) runs
+          INDEPENDENTLY on both operands;
+          if (Is an operand Text?) then (yes)
+            #ABEBC6:**Text operand coerced**
+            Parsed/stringified using the exact same rules as the
+            apply_affinity_char box at the top of this tree
+            (Text / Integer / Numeric / Real target cases).
+            Any operand that WAS converted has its register physically
+            overwritten with the coerced value as a side effect;
+            stop
+          else (no)
+            if (Is the operand already numeric\nand the target affinity Real?) then (yes)
+              #ABEBC6:**Left alone**
+              No forced int→float. This is what the #6695 fix changed
+              relative to storage's Affinity::convert, and it is
+              why #6056 / #6272 do not reproduce here anymore;
+              stop
+            else (no — target is Blob)
+              #ABEBC6:**No-op**
+              Target is Blob → no-op regardless of the operand;
+              stop
+            endif
+          endif
+        endif
+      endif
+    }
+
+  else (an INDEX SEEK — deciding whether an index can\ndrive this predicate, then coercing the seek key if so)
+
+    '-----------------------------------------------------------------
+    ' INDEX SEEK
+    '-----------------------------------------------------------------
+    switch (§9.1 · index_affinity_ok —\nwhat is the resolved comparison affinity?)
+
+    case (BLOB)
+      :index_affinity_ok = true, unconditionally — any index column
+      affinity is safe against a BLOB comparison;
+
+    case (TEXT)
+      :Only ok if the INDEXED COLUMN's own affinity is ALSO Text —
+      walk the "resolve the column's own declared affinity" box
+      again, this time for the indexed column;
+      $column_affinity("the indexed column's")
+      if (Is the indexed column's own affinity Text?) then (yes)
+        :index_affinity_ok = true;
+      else (no)
+        #F5B7B1:**INDEX PRUNED**
+        This index is excluded from cost-based selection entirely for
+        this predicate, before cost-based selection even runs. Exactly
+        the same check, reading the exact same cached Constraint value,
+        whether the index came from a real CREATE INDEX or an
+        optimizer-synthesized auto-index for an unindexed join side (§9.3);
+        stop
+      endif
+
+    case (Numeric\n(Integer / Real / Numeric))
+      :Only ok if the indexed column's own affinity is ALSO numeric —
+      otherwise the column's stored values were coerced to text at
+      insert time and a numeric seek key could never match them
+      by memcmp;
+      $column_affinity("the indexed column's")
+      if (Is the indexed column's own affinity numeric\n(Integer / Real / Numeric)?) then (yes)
+        :index_affinity_ok = true;
+      else (no)
+        #F5B7B1:**INDEX PRUNED**
+        The column's stored values were coerced to text at insert time,
+        so a numeric seek key could never match them by memcmp. The
+        index is excluded from cost-based selection entirely for this
+        predicate, before cost-based selection even runs — same check
+        for a real CREATE INDEX and for an optimizer-synthesized
+        auto-index on an unindexed join side (§9.3);
+        stop
+      endif
+
+    endswitch
+
+    #ABEBC6:**SEEK PROCEEDS** (§9.4)
+    Insn::Affinity is emitted on the seek-key register(s), coercing the
+    key toward the resolved comparison affinity using the same
+    apply_affinity_char rules from the top of this tree (skipped if
+    provably a no-op) — THEN the SeekGE / SeekGT / SeekLE / SeekLT
+    opcode actually runs;
+    note right
+      A range predicate's lower and upper bound are each their own
+      independent walk through this entire tree. There is no combined
+      "range affinity".
+    end note
+    stop
+
+  endif
+
+endif
+
+@enduml
