@@ -71,8 +71,7 @@ pub fn generate_tableless_select<C: Capabilities>(
     })
 }
 
-/// Controls whether `generate_select_impl` produces a full SELECT or a
-/// single-column scalar subquery.
+/// Controls the SELECT shape required by its caller.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectMode {
     /// Normal SELECT — arbitrary columns, clauses governed by `SelectConfig`.
@@ -80,6 +79,10 @@ enum SelectMode {
     /// Scalar subquery — exactly 1 output column, LIMIT 1, no alias/offset.
     /// Probabilities come from the `subquery_*` fields in `SelectConfig`.
     Scalar,
+    /// EXISTS subquery — one table, no clauses that prevent a semi-join.
+    Exists,
+    /// IN subquery — one column and no clauses that prevent a semi-join.
+    In,
 }
 
 /// Generate correlation keys accepted by the subquery unnesting optimizer.
@@ -132,11 +135,30 @@ fn generate_supported_correlation_predicate(ctx: &mut Context) -> Option<Expr> {
 ///
 /// Always returns exactly one column. Non-aggregate forms use `LIMIT 1`;
 /// ungrouped aggregate forms already return one row.
+#[trace_gen(Origin::Subquery)]
 pub fn generate_simple_select<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<SelectStmt, GenError> {
     generate_select_impl(generator, ctx, SelectMode::Scalar)
+}
+
+/// Generate the SELECT inside an EXISTS expression.
+#[trace_gen(Origin::Subquery)]
+pub fn generate_exists_select<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<SelectStmt, GenError> {
+    generate_select_impl(generator, ctx, SelectMode::Exists)
+}
+
+/// Generate the single-column SELECT inside an IN expression.
+#[trace_gen(Origin::Subquery)]
+pub fn generate_in_select<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<SelectStmt, GenError> {
+    generate_select_impl(generator, ctx, SelectMode::In)
 }
 
 /// Shared implementation for both full and scalar SELECT generation.
@@ -175,7 +197,7 @@ fn generate_select_impl<C: Capabilities>(
     };
 
     // --- Alias for primary table ---
-    let from_alias = if mode == SelectMode::Scalar
+    let from_alias = if mode != SelectMode::Full
         && !ctx.tables_in_scope().is_empty()
         && select_config.subquery_correlation_probability > 0.0
     {
@@ -241,14 +263,18 @@ fn generate_select_impl_inner<C: Capabilities>(
     let gb_prob = match mode {
         SelectMode::Full => select_config.group_by_probability,
         SelectMode::Scalar => select_config.subquery_group_by_probability,
+        SelectMode::Exists | SelectMode::In => 0.0,
     };
     let where_prob = match mode {
         SelectMode::Full => select_config.where_probability,
-        SelectMode::Scalar => select_config.subquery_where_probability,
+        SelectMode::Scalar | SelectMode::Exists | SelectMode::In => {
+            select_config.subquery_where_probability
+        }
     };
     let order_by_prob = match mode {
         SelectMode::Full => select_config.order_by_probability,
         SelectMode::Scalar => select_config.subquery_order_by_probability,
+        SelectMode::Exists | SelectMode::In => 0.0,
     };
 
     // --- GROUP BY ---
@@ -263,7 +289,7 @@ fn generate_select_impl_inner<C: Capabilities>(
                     having: None,
                 })
             }
-            _ => None,
+            SelectMode::Scalar | SelectMode::Exists | SelectMode::In => None,
         }
     } else {
         None
@@ -295,6 +321,10 @@ fn generate_select_impl_inner<C: Capabilities>(
                 }]
             }
         }
+        SelectMode::Exists | SelectMode::In => vec![SelectColumn {
+            expr: pick_scoped_column_ref(ctx)?,
+            alias: None,
+        }],
     };
 
     // When there is no GROUP BY and `restrict_mixed_aggregates` is enabled,
@@ -319,7 +349,7 @@ fn generate_select_impl_inner<C: Capabilities>(
     } else {
         None
     };
-    let correlated = (mode == SelectMode::Scalar
+    let correlated = (mode != SelectMode::Full
         && ctx.gen_bool_with_prob(select_config.subquery_correlation_probability))
     .then(|| generate_supported_correlation_predicate(ctx))
     .flatten();
@@ -340,7 +370,7 @@ fn generate_select_impl_inner<C: Capabilities>(
         // key survives is the engine's choice, so SQLite and Turso can return
         // different rows and both are allowed. No tiebreaker can help because
         // a unique column cannot be added through the deduplication.
-        SelectMode::Scalar => false,
+        SelectMode::Scalar | SelectMode::Exists | SelectMode::In => false,
     };
 
     let from = {
@@ -436,6 +466,7 @@ fn generate_select_impl_inner<C: Capabilities>(
             SelectMode::Full => generate_limit_offset(generator, ctx),
             SelectMode::Scalar if scalar_aggregate_without_group => (None, None),
             SelectMode::Scalar => (Some(1), None),
+            SelectMode::Exists | SelectMode::In => (None, None),
         };
 
         // Enforce deterministic LIMIT semantics when configured.
@@ -2884,6 +2915,45 @@ mod tests {
         );
         assert!(sql.contains("outer.key"), "expected outer reference: {sql}");
         assert!(ctx.take_generated_correlated_subquery());
+    }
+
+    #[test]
+    fn semi_join_subqueries_can_reference_an_outer_column() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            subquery_where_probability: 0.0,
+            subquery_correlation_probability: 1.0,
+            ..Default::default()
+        });
+        let outer = Table::new("outer_rows", vec![ColumnDef::new("key", DataType::Integer)]);
+        let schema = SchemaBuilder::new()
+            .table(outer.clone())
+            .table(Table::new(
+                "inner_rows",
+                vec![
+                    ColumnDef::new("key", DataType::Integer),
+                    ColumnDef::new("amount", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for mode in [SelectMode::Exists, SelectMode::In] {
+            let mut ctx = Context::new_with_seed(7);
+            let select = ctx
+                .with_table_scope([(outer.clone(), Some("outer".to_string()))], |ctx| {
+                    generate_select_impl(&generator, ctx, mode)
+                })
+                .unwrap();
+            let sql = select.to_string();
+
+            assert_eq!(select.columns.len(), 1, "expected one result: {sql}");
+            assert!(select.limit.is_none(), "expected no LIMIT: {sql}");
+            assert!(select.group_by.is_none(), "expected no GROUP BY: {sql}");
+            assert!(select.order_by.is_empty(), "expected no ORDER BY: {sql}");
+            assert!(!select.distinct, "expected no DISTINCT: {sql}");
+            assert!(sql.contains("outer.key"), "expected outer reference: {sql}");
+            assert!(ctx.take_generated_correlated_subquery());
+        }
     }
 
     #[test]

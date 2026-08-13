@@ -237,6 +237,8 @@ pub struct SimStats {
     pub oracle_failures: usize,
     /// Number of errors encountered.
     pub errors: usize,
+    /// Correlated SELECTs checked with unnesting forced and disabled.
+    pub unnesting_invariants_checked: usize,
 }
 
 impl SimStats {
@@ -314,6 +316,10 @@ impl SimStats {
             Cell::new(self.errors).fg(Color::Green)
         };
         table.add_row(vec![Cell::new("Errors").fg(Color::Red), errors_cell]);
+        table.add_row(vec![
+            Cell::new("Unnesting invariants").fg(Color::Blue),
+            Cell::new(self.unnesting_invariants_checked).fg(Color::Blue),
+        ]);
 
         table
     }
@@ -641,6 +647,11 @@ impl Fuzzer {
             match oracle_result {
                 OracleResult::Pass => {
                     stats.statements_executed += 1;
+                    executed_sql.push(stmt.sql.clone());
+                }
+                OracleResult::PassWithUnnestingInvariant => {
+                    stats.statements_executed += 1;
+                    stats.unnesting_invariants_checked += 1;
                     executed_sql.push(stmt.sql.clone());
                 }
                 OracleResult::Skipped(reason) => {
