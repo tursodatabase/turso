@@ -1,0 +1,268 @@
+@database :memory:
+
+# Type affinity determination rules from https://sqlite.org/datatype3.html#type_affinity
+#
+# Each rule gets two tests:
+#
+#   *-probe       stores a fixed set of values and reads back typeof(). Runs on
+#                 BOTH Turso and SQLite, so it is the differential check.
+#   *-affinity    reads the affinity directly via test_affinity(). Turso-only,
+#                 because SQLite has no equivalent function.
+#
+# The pair localizes a failure. If the probe fails but the affinity test passes,
+# Turso picked the right affinity and applied it wrong. If both fail, Turso
+# picked the wrong affinity.
+#
+# The probe cannot see everything. INTEGER and NUMERIC produce byte-identical
+# typeof() output for every possible input, so only test_affinity() separates
+# them. That is the main reason the direct readout exists.
+#
+# Every expected value below was read out of real SQLite, not from the prose in
+# the docs: column affinities come from the MakeRecord P4 string in
+# `EXPLAIN INSERT ...`, which is the affinity string SQLite itself builds.
+
+# ============================================
+# Rule 1: declared type contains "INT" -> INTEGER affinity
+# ============================================
+
+@cross-check-integrity
+test rule1-int-probe {
+    CREATE TABLE t(v INTEGER);
+    INSERT INTO t VALUES (1), (1.0), (1.5), ('1'), (x'31');
+    SELECT typeof(v) FROM t;
+}
+expect {
+    integer
+    integer
+    real
+    integer
+    blob
+}
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test rule1-int-affinity {
+    CREATE TABLE t(a INT, b INTEGER, c BIGINT, d INT8, e TINYINT);
+    SELECT test_affinity(a), test_affinity(b), test_affinity(c),
+           test_affinity(d), test_affinity(e) FROM t;
+}
+expect {
+    INTEGER|INTEGER|INTEGER|INTEGER|INTEGER
+}
+
+# ============================================
+# Rule 2: declared type contains "CHAR", "CLOB" or "TEXT" -> TEXT affinity
+# ============================================
+
+@cross-check-integrity
+test rule2-text-probe {
+    CREATE TABLE t(v TEXT);
+    INSERT INTO t VALUES (1), (1.0), (1.5), ('1'), (x'31');
+    SELECT typeof(v) FROM t;
+}
+expect {
+    text
+    text
+    text
+    text
+    blob
+}
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test rule2-text-affinity {
+    CREATE TABLE t(a TEXT, b CLOB, c VARCHAR(255), d CHARACTER(20), e NCHAR(55));
+    SELECT test_affinity(a), test_affinity(b), test_affinity(c),
+           test_affinity(d), test_affinity(e) FROM t;
+}
+expect {
+    TEXT|TEXT|TEXT|TEXT|TEXT
+}
+
+# ============================================
+# Rule 3: declared type contains "BLOB", or no type given -> BLOB affinity
+# ============================================
+
+@cross-check-integrity
+test rule3-blob-probe {
+    CREATE TABLE t(v BLOB);
+    INSERT INTO t VALUES (1), (1.0), (1.5), ('1'), (x'31');
+    SELECT typeof(v) FROM t;
+}
+expect {
+    integer
+    real
+    real
+    text
+    blob
+}
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test rule3-blob-affinity {
+    CREATE TABLE t(a BLOB, b);
+    SELECT test_affinity(a), test_affinity(b) FROM t;
+}
+expect {
+    BLOB|BLOB
+}
+
+# ============================================
+# Rule 4: declared type contains "REAL", "FLOA" or "DOUB" -> REAL affinity
+# ============================================
+
+@cross-check-integrity
+test rule4-real-probe {
+    CREATE TABLE t(v REAL);
+    INSERT INTO t VALUES (1), (1.0), (1.5), ('1'), (x'31');
+    SELECT typeof(v) FROM t;
+}
+expect {
+    real
+    real
+    real
+    real
+    blob
+}
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test rule4-real-affinity {
+    CREATE TABLE t(a REAL, b DOUBLE, c DOUBLE PRECISION, d FLOAT);
+    SELECT test_affinity(a), test_affinity(b), test_affinity(c),
+           test_affinity(d) FROM t;
+}
+expect {
+    REAL|REAL|REAL|REAL
+}
+
+# ============================================
+# Rule 5: anything else -> NUMERIC affinity
+# ============================================
+
+# No probe pairs with this rule. NUMERIC and INTEGER produce identical typeof()
+# output for every input, so a probe cannot tell rule 5 from rule 1. The direct
+# readout is the only check that distinguishes them.
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test rule5-numeric-affinity {
+    CREATE TABLE t(a NUMERIC, b DECIMAL(10,5), c BOOLEAN, d DATE, e DATETIME);
+    SELECT test_affinity(a), test_affinity(b), test_affinity(c),
+           test_affinity(d), test_affinity(e) FROM t;
+}
+expect {
+    NUMERIC|NUMERIC|NUMERIC|NUMERIC|NUMERIC
+}
+
+@cross-check-integrity
+test rule5-numeric-vs-integer-probe {
+    -- Shows what the probe cannot do: both columns behave identically.
+    -- Only rule5-numeric-affinity above proves they differ.
+    CREATE TABLE t(n NUMERIC, i INTEGER);
+    INSERT INTO t VALUES (1,1), (1.0,1.0), (1.5,1.5), ('1','1'), (x'31',x'31');
+    SELECT typeof(n) = typeof(i) FROM t;
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+}
+
+# ============================================
+# Rule order: the first matching rule wins, even when a later rule looks
+# like the better fit. These are the cases that surprise people.
+# ============================================
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test rule-order-first-match-wins {
+    -- "FLOATING POINT" contains "INT", so rule 1 beats rule 4 and it is
+    -- INTEGER, not REAL.
+    -- "CHARINT" contains "INT", so rule 1 beats rule 2 and it is INTEGER,
+    -- not TEXT.
+    -- "STRING" matches no rule at all, so it falls through to rule 5.
+    CREATE TABLE t(a FLOATING POINT, b CHARINT, c STRING);
+    SELECT test_affinity(a), test_affinity(b), test_affinity(c) FROM t;
+}
+expect {
+    INTEGER|INTEGER|NUMERIC
+}
+
+@cross-check-integrity
+test rule-order-floating-point-probe {
+    -- Confirms the surprise behaviorally: a column typed "FLOATING POINT"
+    -- stores 1.0 as an integer, which only INTEGER affinity does.
+    CREATE TABLE t(v FLOATING POINT);
+    INSERT INTO t VALUES (1.0);
+    SELECT typeof(v) FROM t;
+}
+expect {
+    integer
+}
+
+# ============================================
+# Expression affinity
+# ============================================
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test expression-affinity {
+    -- A bare column keeps its affinity through parentheses. Arithmetic and
+    -- concatenation produce values with no affinity. CAST takes the affinity
+    -- of the type it names.
+    CREATE TABLE t(i INTEGER, x TEXT);
+    SELECT test_affinity(i),
+           test_affinity((i)),
+           test_affinity(i + 1),
+           test_affinity(x || ''),
+           test_affinity(CAST(i AS TEXT)),
+           test_affinity(1),
+           test_affinity('a')
+    FROM t;
+}
+expect {
+    INTEGER|INTEGER|BLOB|BLOB|TEXT|BLOB|BLOB
+}
+
+# ============================================
+# Subqueries and views
+# ============================================
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test subquery-plain-column-keeps-affinity {
+    CREATE TABLE t(i INTEGER, x TEXT);
+    SELECT test_affinity(s.v) FROM (SELECT i AS v FROM t) AS s;
+    SELECT test_affinity(s.v) FROM (SELECT x AS v FROM t) AS s;
+}
+expect {
+    INTEGER
+    TEXT
+}
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test subquery-expression-loses-affinity {
+    CREATE TABLE t(x TEXT);
+    SELECT test_affinity(s.v) FROM (SELECT x || '' AS v FROM t) AS s;
+}
+expect {
+    BLOB
+}
+
+@skip-if sqlite "test_affinity() is turso-only; SQLite has no way to report affinity from SQL"
+test view-column-keeps-affinity {
+    CREATE TABLE t(x TEXT);
+    CREATE VIEW vw AS SELECT x AS v FROM t;
+    SELECT test_affinity(vw.v) FROM vw;
+}
+expect {
+    TEXT
+}
+
+@cross-check-integrity
+test subquery-affinity-applies-in-outer-comparison-probe {
+    -- The subquery column keeps TEXT affinity, so comparing it to the integer
+    -- 1 converts 1 to '1' and the row matches. Without the inherited affinity
+    -- the comparison would find nothing.
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES ('1');
+    SELECT count(*) FROM (SELECT x AS v FROM t) AS s WHERE s.v = 1;
+}
+expect {
+    1
+}
