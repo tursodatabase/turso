@@ -661,6 +661,40 @@ expect {
     4
 }
 
+# The queue ORDER BY may be an expression that matches the output expression
+# of the recursive term, including one that names the CTE itself.
+test recursive-cte-order-qualified-expression {
+    WITH RECURSIVE cnt(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT cnt.x + 1 FROM cnt WHERE cnt.x < 5
+        ORDER BY cnt.x + 1 DESC
+    )
+    SELECT x FROM cnt;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+# A qualified column that matches no output expression of either term is
+# rejected, even though the CTE's own column is named that way.
+test recursive-cte-order-qualified-non-result-column-errors {
+    WITH RECURSIVE cnt(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT cnt.x + 1 FROM cnt WHERE cnt.x < 5
+        ORDER BY cnt.x DESC
+    )
+    SELECT x FROM cnt;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
+
 test recursive-cte-two-independent-producers {
     WITH RECURSIVE
       a(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM a WHERE x < 3),

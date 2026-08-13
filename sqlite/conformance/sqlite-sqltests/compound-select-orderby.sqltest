@@ -615,6 +615,202 @@ expect {
     honeydew
 }
 
+# The ORDER BY term may match the output expression of any SELECT arm, not
+# just the first one.
+@setup schema
+test union-all-order-by-qualified-second-arm {
+    SELECT t1.b FROM t1
+    UNION ALL
+    SELECT t2.b FROM t2
+    ORDER BY t2.b;
+}
+expect {
+    apple
+    banana
+    banana
+    cherry
+    date
+    date
+    elderberry
+    fig
+    grape
+    honeydew
+}
+
+@setup schema
+test union-all-order-by-qualified-desc {
+    SELECT t1.a FROM t1
+    UNION ALL
+    SELECT t2.a FROM t2
+    ORDER BY t1.a DESC;
+}
+expect {
+    8
+    7
+    6
+    5
+    4
+    4
+    3
+    2
+    2
+    1
+}
+
+@setup schema
+test union-all-order-by-arithmetic-expression {
+    SELECT a + c FROM t1
+    UNION ALL
+    SELECT a + c FROM t2
+    ORDER BY a + c;
+}
+expect {
+    11
+    22
+    22
+    33
+    44
+    44
+    55
+    66
+    77
+    88
+}
+
+@setup schema
+test union-all-order-by-function-expression {
+    SELECT upper(b) FROM t1
+    UNION ALL
+    SELECT upper(b) FROM t2
+    ORDER BY upper(b);
+}
+expect {
+    APPLE
+    BANANA
+    BANANA
+    CHERRY
+    DATE
+    DATE
+    ELDERBERRY
+    FIG
+    GRAPE
+    HONEYDEW
+}
+
+@setup schema
+test union-all-order-by-qualified-collate-nocase-desc {
+    SELECT t1.b FROM t1
+    UNION ALL
+    SELECT t2.b FROM t2
+    ORDER BY t1.b COLLATE NOCASE DESC;
+}
+expect {
+    honeydew
+    grape
+    fig
+    elderberry
+    date
+    date
+    cherry
+    banana
+    banana
+    apple
+}
+
+# A qualified name matches the output expression even when the first arm
+# renames the column with an alias.
+@setup schema
+test union-all-order-by-qualified-with-alias {
+    SELECT b AS fruit FROM t1
+    UNION ALL
+    SELECT b FROM t2
+    ORDER BY t1.b;
+}
+expect {
+    apple
+    banana
+    banana
+    cherry
+    date
+    date
+    elderberry
+    fig
+    grape
+    honeydew
+}
+
+@setup schema
+test except-order-by-qualified-result-column {
+    SELECT t1.b FROM t1
+    EXCEPT
+    SELECT t2.b FROM t2
+    ORDER BY t1.b;
+}
+expect {
+    apple
+    cherry
+    elderberry
+}
+
+@setup schema
+test intersect-order-by-qualified-second-arm {
+    SELECT t1.b FROM t1
+    INTERSECT
+    SELECT t2.b FROM t2
+    ORDER BY t2.b;
+}
+expect {
+    banana
+    date
+}
+
+@setup schema
+test three-arm-compound-order-by-qualified-last-arm {
+    SELECT t1.b FROM t1
+    UNION
+    SELECT t2.b FROM t2
+    UNION ALL
+    SELECT t3.y FROM t3
+    ORDER BY t3.y;
+}
+expect {
+    alpha
+    apple
+    banana
+    cherry
+    date
+    echo
+    elderberry
+    fig
+    grape
+    honeydew
+    zulu
+}
+
+# A qualified column that is not part of the result set is still rejected.
+@setup schema
+test union-all-order-by-qualified-non-result-column-errors {
+    SELECT t1.b FROM t1
+    UNION ALL
+    SELECT t2.b FROM t2
+    ORDER BY t1.c;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
+
+# A column from a table that appears in no SELECT arm is rejected.
+@setup schema
+test union-all-order-by-unknown-table-errors {
+    SELECT t1.b FROM t1
+    UNION ALL
+    SELECT t2.b FROM t2
+    ORDER BY t3.y;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
+
 # ===== Compound with NULLs + ORDER BY =====
 
 @setup schema
