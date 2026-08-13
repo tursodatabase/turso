@@ -399,6 +399,32 @@ expect {
     5
 }
 
+# An outer query with no input rows does not need to build or probe a grouped
+# table for its scalar subquery.
+@setup correlated_rows
+test one-value-under-false-where-stays-unused {
+    SELECT (SELECT avg(i.amount) FROM inner_rows i WHERE i.key1 = o.key1) / 2
+    FROM outer_rows o
+    WHERE 0;
+}
+expect {
+}
+
+# Unnesting the IN subquery moves its WHERE clause to the outer query, and the
+# text term there is always false. The grouped table built for the scalar
+# subquery then has nothing to read, so the outer query keeps its correlated
+# form.
+@setup correlated_rows
+test one-value-beside-in-subquery-with-false-text-term {
+    SELECT (SELECT count(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    WHERE o.amount IN (
+        SELECT k.key2 FROM outer_key2 k WHERE 'not a number' AND o.key1 = k.key2
+    );
+}
+expect {
+}
+
 @setup correlated_rows
 test one-value-math-with-null-result {
     SELECT id
