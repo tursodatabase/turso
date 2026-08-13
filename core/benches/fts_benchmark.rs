@@ -253,6 +253,56 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: warm queries against a tombstone-heavy segment.
+///
+/// Every query builds a searcher-cache key from the visible segment set.
+/// The key fingerprints each segment's tombstone set instead of cloning and
+/// comparing it, so warm-query latency must stay flat as the tombstone
+/// count grows (100 vs 50000 deleted docs).
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_warm_query_with_tombstones(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("FTS Warm Query With Tombstones");
+
+    let row_count = 100_000;
+    for deleted_count in [100, 50_000] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = setup_fts_db(&temp_dir, row_count);
+        let conn = db.connect().unwrap();
+        // Delete without dropping every 'database' match (ids 0, 7, 14, ...
+        // survive whenever they fall outside the deleted prefix remainder).
+        conn.execute(format!("DELETE FROM docs WHERE id < {deleted_count}"))
+            .unwrap();
+
+        // Warm up: populate byte and searcher caches.
+        let mut stmt = conn
+            .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
+            .unwrap()
+            .unwrap();
+        run_to_completion(&mut stmt, &db).unwrap();
+
+        group.bench_function(
+            BenchmarkId::new("warm_query_tombstones", format!("{deleted_count}_deleted")),
+            |b| {
+                iter_custom_or_iter!(b, |iters| {
+                    let mut total = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        let start = std::time::Instant::now();
+                        let mut stmt = conn
+                            .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
+                            .unwrap()
+                            .unwrap();
+                        let _rows = run_and_count_rows(&mut stmt, &db).unwrap();
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 /// Benchmark: warm queries alternating across active connections.
 ///
 /// Each connection owns a snapshot cache. Alternating between readers should
@@ -581,14 +631,14 @@ criterion_group! {
     config = Criterion::default()
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
         .sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_warm_query_with_tombstones, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = fts_benches;
     config = Criterion::default().sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_warm_query_with_tombstones, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
 }
 
 criterion_main!(fts_benches);

@@ -626,6 +626,121 @@ fn abandoning_after_index_method_prepare_rolls_back_without_drop_io() {
     );
 }
 
+#[cfg(feature = "fts")]
+#[test]
+fn fts_abandoning_mid_flush_publication_rolls_back_cleanly() {
+    use crate::index_method::IndexMethodYieldPoint;
+
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:index-method-flush-abandon",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    // Abandon the statement while its flush publication is staged but not
+    // yet driven: the statement's savepoint rollback must undo everything
+    // and the connection must stay fully usable.
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        IndexMethodYieldPoint::AfterStatementFlushStaged.point(),
+    ])));
+    let mut insert = conn
+        .prepare("INSERT INTO docs VALUES (1, 'abandoned mid flush')")
+        .unwrap();
+    loop {
+        match insert.step().unwrap() {
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => break,
+            StepResult::Done => panic!("INSERT completed before the injected mid-flush yield"),
+            other => panic!("unexpected INSERT result: {other:?}"),
+        }
+    }
+    drop(insert);
+    conn.set_yield_injector(None);
+
+    assert!(get_rows(&conn, "SELECT id FROM docs").is_empty());
+    assert!(get_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(body, 'abandoned')"
+    )
+    .is_empty());
+
+    conn.execute("INSERT INTO docs VALUES (2, 'surviving mid-flush retry')")
+        .unwrap();
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'surviving')"
+        ),
+        vec![vec![Value::from_i64(2)]]
+    );
+}
+
+#[cfg(feature = "fts")]
+#[test]
+fn fts_flush_publication_resumes_after_injected_yield() {
+    use crate::index_method::IndexMethodYieldPoint;
+
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:index-method-flush-resume",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    // Interrupt the statement between staging the flush's rows and
+    // publishing them, then keep stepping: the re-driven statement must
+    // resume the staged publication without duplicating or dropping rows
+    // (the row inserter re-seeks but never re-probes).
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        IndexMethodYieldPoint::AfterStatementFlushStaged.point(),
+    ])));
+    let mut insert = conn
+        .prepare("INSERT INTO docs VALUES (1, 'resumed alpha'), (2, 'resumed bravo')")
+        .unwrap();
+    let mut yielded = false;
+    loop {
+        match insert.step().unwrap() {
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => yielded = true,
+            StepResult::Done => break,
+            other => panic!("unexpected INSERT result: {other:?}"),
+        }
+    }
+    assert!(yielded, "the injected mid-publish yield must fire");
+    drop(insert);
+    conn.set_yield_injector(None);
+
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'resumed') ORDER BY id"
+        ),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
+        "the resumed publication must index each document exactly once"
+    );
+}
+
 fn open_mvcc_database_with_opts(path: &str, opts: DatabaseOpts) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file_with_flags(

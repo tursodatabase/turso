@@ -146,7 +146,11 @@ fn build_and_load_segment(
         let mut doc = TantivyDocument::default();
         doc.add_i64(attachment.rowid_field, *rowid);
         doc.add_text(attachment.text_fields[0].1, *text);
-        cursor_docs.push(BufferedDoc { rowid: *rowid, doc });
+        cursor_docs.push(BufferedDoc {
+            rowid: *rowid,
+            doc,
+            bytes: text.len(),
+        });
     }
     let mut cursor = FtsCursor::new(attachment);
     cursor.doc_buffer = cursor_docs;
@@ -251,14 +255,19 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     let mut cursor = FtsCursor::new(&attachment);
     cursor.segments = vec![segment.clone()];
     cursor.snapshot_loaded = true;
-    let postings = cursor.live_postings_for_rowid(2).unwrap();
-    assert_eq!(postings.len(), 1);
-    let (segment_id, doc_id) = postings[0];
+    cursor.ensure_searcher().unwrap();
+    let missing = cursor.apply_tombstones_for_rowids(&[2]).unwrap();
+    assert!(missing.is_empty());
+    assert_eq!(cursor.pending_tombstone_rows.len(), 1);
+    let (segment_id, doc_id) = cursor.pending_tombstone_rows[0];
     assert_eq!(segment_id, segment.id());
+    // This raw cursor never flushes; drop the staged row so Drop's
+    // pending-work assert stays quiet.
+    cursor.pending_tombstone_rows.clear();
 
     // Tombstone rowid 2 and rebuild the view: the posting must disappear
     // from every query path, including counts.
-    segment.deleted.insert(doc_id);
+    segment.add_tombstone(doc_id);
     let mut cursor = FtsCursor::new(&attachment);
     cursor.segments = vec![segment];
     cursor.snapshot_loaded = true;
@@ -269,7 +278,11 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     let (query, _) = parser.parse_query_lenient("hello");
     let hits = searcher.search(&query, &tantivy::collector::Count).unwrap();
     assert_eq!(hits, 1, "the tombstoned posting must not match");
-    assert!(cursor.live_postings_for_rowid(2).unwrap().is_empty());
+    // The posting still exists (found, so not "missing"), but it is already
+    // tombstoned and must not stage a second tombstone row.
+    let missing = cursor.apply_tombstones_for_rowids(&[2]).unwrap();
+    assert!(missing.is_empty());
+    assert!(cursor.pending_tombstone_rows.is_empty());
 }
 
 #[test]
@@ -284,7 +297,7 @@ fn snapshots_with_different_segment_sets_do_not_share_searchers() {
 
     // Tombstone state is part of the identity.
     let mut tombstoned = segment_a.clone();
-    tombstoned.deleted.insert(0);
+    tombstoned.add_tombstone(0);
     assert_ne!(
         searcher_key(std::slice::from_ref(&segment_a)),
         searcher_key(std::slice::from_ref(&tombstoned))
@@ -302,19 +315,26 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     let a = SegmentId::generate_random();
     let b = SegmentId::generate_random();
     let c = SegmentId::generate_random();
-    cache.put(a, make_data(100), 250);
-    cache.put(b, make_data(100), 250);
-    cache.put(c, make_data(100), 250);
+    assert!(cache.put(a, make_data(100), 250));
+    assert!(cache.put(b, make_data(100), 250));
+    assert!(cache.put(c, make_data(100), 250));
     assert!(cache.get(&a).is_none(), "oldest entry evicted over budget");
     assert!(cache.get(&b).is_some());
     assert!(cache.get(&c).is_some());
 
-    // An entry larger than the whole budget is still kept (it is the
-    // newest); older entries are evicted to make room.
-    cache.put(a, make_data(1000), 250);
-    assert!(cache.get(&a).is_some());
+    // An entry larger than the whole budget is refused outright — keeping
+    // it would pin the oversized bytes until some future put displaced
+    // them. Existing entries stay.
+    assert!(!cache.put(a, make_data(1000), 250));
+    assert!(cache.get(&a).is_none(), "over-budget entry never admitted");
+    assert!(cache.get(&b).is_some());
+    assert!(cache.get(&c).is_some());
+
+    // Replacing an entry with an over-budget version also drops the old
+    // version instead of retaining stale bytes under the same id.
+    assert!(!cache.put(b, make_data(1000), 250));
     assert!(cache.get(&b).is_none());
-    assert!(cache.get(&c).is_none());
+    assert!(cache.get(&c).is_some());
 }
 
 // ===================== D3(a): decoder corruption fuzz =====================

@@ -4043,6 +4043,76 @@ fn fts_mvcc_repeated_reads_reuse_the_cached_searcher() {
 
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
+fn fts_mvcc_repeated_reads_in_one_txn_scan_the_registry_once() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    // Separate statements build separate segments; the delete leaves
+    // tombstone rows, so the cached scan must carry those too.
+    for (id, body) in [(1, "alpha one"), (2, "alpha two"), (3, "alpha three")] {
+        conn.execute(format!("INSERT INTO docs VALUES ({id}, '{body}')"))
+            .unwrap();
+    }
+    conn.execute("DELETE FROM docs WHERE id = 2").unwrap();
+
+    let expected = vec![
+        vec![rusqlite::types::Value::Integer(1)],
+        vec![rusqlite::types::Value::Integer(3)],
+    ];
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'alpha') ORDER BY id"
+        ),
+        expected
+    );
+    let after_first = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
+    for _ in 0..4 {
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                "SELECT id FROM docs WHERE fts_match(body, 'alpha') ORDER BY id"
+            ),
+            expected
+        );
+    }
+    let after_repeat = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
+    conn.execute("COMMIT").unwrap();
+
+    // Each SELECT closes (and resets) its cursor, so without the scan cache
+    // every one of them would walk the registry and tombstone rows again.
+    assert_eq!(
+        after_repeat.registry_scans, after_first.registry_scans,
+        "repeated reads at one snapshot must reuse the cached registry scan"
+    );
+
+    // A new snapshot after a write must not be served the stale scan.
+    conn.execute("INSERT INTO docs VALUES (4, 'alpha four')")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'alpha') ORDER BY id"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(3)],
+            vec![rusqlite::types::Value::Integer(4)],
+        ],
+        "a read after a write must see the new document, not a cached scan"
+    );
+}
+
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
 fn fts_savepoint_rollback_purges_segments_from_every_statement_it_reverts() {
     // A full-transaction ROLLBACK reloads the schema, which rebuilds the
     // attachment and drops its caches wholesale — no residue is possible
@@ -4107,6 +4177,150 @@ fn fts_savepoint_rollback_purges_segments_from_every_statement_it_reverts() {
             "SELECT id FROM docs WHERE fts_match(body, 'committed')"
         ),
         vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+}
+
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_bulk_update_batches_tombstone_resolution() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    // Six insert statements build six segments.
+    const SEGMENTS: usize = 6;
+    const ROWS_PER_SEGMENT: usize = 500;
+    for segment in 0..SEGMENTS {
+        let mut sql = String::from("INSERT INTO docs(id, body) VALUES ");
+        for row in 0..ROWS_PER_SEGMENT {
+            let id = segment * ROWS_PER_SEGMENT + row;
+            if row > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({id}, 'original text {id}')"));
+        }
+        conn.execute(sql).unwrap();
+    }
+    let rows = (SEGMENTS * ROWS_PER_SEGMENT) as i64;
+
+    let before = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
+    assert_eq!(before.segment_count, Some(SEGMENTS));
+
+    // One bulk update touches every row: per row one delete + one re-insert.
+    conn.execute("UPDATE docs SET body = 'rewritten text'")
+        .unwrap();
+
+    let after = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
+
+    // Rewritten rows must all be found under the new term and none under
+    // the old one (a mis-resolved delete would leave stale postings).
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'rewritten')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(rows)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'original')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(0)]]
+    );
+
+    // Deletes resolve in flush-sized batches with one fast-field sweep per
+    // segment, so probes stay near batches × segments. The per-row scheme
+    // this replaces cost rows × segments (3000 × 6 = 18000 here).
+    let probes = after.rowid_resolution_probes.unwrap() - before.rowid_resolution_probes.unwrap();
+    assert!(
+        probes < 1000,
+        "bulk update should batch tombstone resolution, made {probes} probes"
+    );
+
+    // Same-statement flushes must not force a view rebuild per flush; the
+    // stale view resolves later batches (all target rows pre-date the
+    // statement). Cache misses count actual view builds.
+    let view_builds = after.read_cache_misses.unwrap() - before.read_cache_misses.unwrap();
+    assert!(
+        view_builds <= 4,
+        "bulk update should build O(1) views, built {view_builds}"
+    );
+}
+
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_wal_autocommit_reads_reuse_the_registry_scan_across_statements() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for (id, body) in [(1, "alpha one"), (2, "alpha two"), (3, "alpha three")] {
+        conn.execute(format!("INSERT INTO docs VALUES ({id}, '{body}')"))
+            .unwrap();
+    }
+    conn.execute("DELETE FROM docs WHERE id = 2").unwrap();
+
+    let expected = vec![
+        vec![rusqlite::types::Value::Integer(1)],
+        vec![rusqlite::types::Value::Integer(3)],
+    ];
+    // WAL read snapshots are (checkpoint_seq, max_frame), which autocommit
+    // statements share until the next write — so the scan cache carries
+    // across whole statements here, not just within one transaction.
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'alpha') ORDER BY id"
+        ),
+        expected
+    );
+    let after_first = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
+    for _ in 0..4 {
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                "SELECT id FROM docs WHERE fts_match(body, 'alpha') ORDER BY id"
+            ),
+            expected
+        );
+    }
+    let after_repeat = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
+    assert_eq!(
+        after_repeat.registry_scans, after_first.registry_scans,
+        "autocommit reads at one WAL position must reuse the cached registry scan"
+    );
+
+    // A write advances the WAL position: the next read must scan afresh and
+    // see the new document.
+    conn.execute("INSERT INTO docs VALUES (4, 'alpha four')")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'alpha') ORDER BY id"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(3)],
+            vec![rusqlite::types::Value::Integer(4)],
+        ]
+    );
+    let after_write = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
+    assert!(
+        after_write.registry_scans > after_repeat.registry_scans,
+        "a write must move reads onto a fresh registry scan"
     );
 }
 

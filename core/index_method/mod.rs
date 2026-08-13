@@ -141,6 +141,9 @@ pub enum IndexMethodSnapshotIdentity {
 pub(crate) enum IndexMethodYieldPoint {
     BeforePrepareStatement = 0,
     AfterPrepareStatement = 1,
+    /// Fired between staging a statement flush's rows and driving their
+    /// publication, so tests can re-drive a statement mid-publish.
+    AfterStatementFlushStaged = 2,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -502,6 +505,12 @@ pub struct IndexMethodTestStats {
     pub writer_cache_rollback_discards: Option<usize>,
     /// Retained-writer cache lookups with no reusable entry.
     pub writer_cache_misses: Option<usize>,
+    /// Full registry+tombstone row scans driven through the backing cursor
+    /// (snapshot scan-cache misses and ineligible opens).
+    pub registry_scans: Option<usize>,
+    /// Segment probes made to resolve deleted rowids into tombstones (term
+    /// seeks for small batches, one fast-field sweep per segment for bulk).
+    pub rowid_resolution_probes: Option<usize>,
     /// Read-snapshot cache lookups.
     pub read_cache_lookups: Option<usize>,
     /// Snapshot cache checkouts that avoided a backing-directory scan.

@@ -19,6 +19,7 @@ use crate::{
     index_method::{
         open_index_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
         IndexMethodConfiguration, IndexMethodContext, IndexMethodCursor, IndexMethodDefinition,
+        IndexMethodSnapshotIdentity, IndexMethodTransactionMode,
     },
     return_if_io,
     schema::IndexColumn,
@@ -83,6 +84,21 @@ pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
 /// Documents and tombstones buffered before an intra-statement flush builds
 /// an immutable segment. Statement end always flushes whatever is buffered.
 pub const BATCH_COMMIT_SIZE: usize = 1000;
+
+/// Buffered document bytes that force an intra-statement flush even below
+/// [`BATCH_COMMIT_SIZE`] operations, bounding writer memory for very large
+/// documents.
+const FTS_FLUSH_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Fixed per-document contribution to the buffered byte estimate (rowid
+/// field, per-doc bookkeeping).
+const FTS_BUFFERED_DOC_OVERHEAD_BYTES: usize = 64;
+
+/// Smallest segment-writer budget: enough for the term hash table and
+/// arena of a small flush without the multi-MB table the default budget
+/// sizes up front. (Tantivy's 15MB floor applies to `IndexWriter` threads,
+/// not to a directly driven `SegmentWriter`.)
+const FTS_MIN_SEGMENT_WRITER_BUDGET_BYTES: usize = 1024 * 1024;
 
 /// Longest accepted `fts_match` / MATCH query string, in bytes.
 const FTS_MAX_QUERY_BYTES: usize = 16 * 1024;
@@ -360,6 +376,14 @@ struct FtsWriterSlot {
 struct FtsRuntimeStats {
     /// Immutable segments built by this attachment (one per flush boundary).
     segment_builds: AtomicUsize,
+    /// Full registry+tombstone row scans driven through the backing cursor
+    /// (scan-cache misses and ineligible opens).
+    registry_scans: AtomicUsize,
+    /// Segment probes made to resolve deleted rowids into tombstones: one
+    /// per rowid-term seek (small batches) or one per segment fast-field
+    /// sweep (large batches). Bulk deletes must stay near
+    /// batches × segments, not rows × segments.
+    rowid_resolution_probes: AtomicUsize,
     /// Searcher-cache lookups / hits / misses.
     read_cache_lookups: AtomicUsize,
     read_cache_hits: AtomicUsize,
@@ -367,6 +391,9 @@ struct FtsRuntimeStats {
     /// Segments whose chunks were loaded from backing storage (byte-cache
     /// misses).
     segment_loads: AtomicUsize,
+    /// Segments refused byte-cache admission because they alone exceed the
+    /// cache budget.
+    byte_cache_admission_rejections: AtomicUsize,
     /// Merge-mutex (lease) acquisitions and rejections; maintenance only.
     write_lease_acquisitions: AtomicUsize,
     write_lease_rejections: AtomicUsize,
@@ -400,13 +427,22 @@ impl SegmentByteCache {
         Some(data)
     }
 
-    fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) {
+    /// Admit `data`, evicting oldest entries to fit the budget. Returns
+    /// false (and admits nothing) when the entry alone exceeds the whole
+    /// budget: readers hold their own `Arc` to the bytes they loaded, so
+    /// rejection never breaks them — retention would pin the oversized
+    /// segment in memory for as long as no other put displaced it.
+    fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) -> bool {
         self.entries.retain(|(entry, _)| *entry != id);
+        if data.total_bytes > budget {
+            return false;
+        }
         self.entries.push((id, data));
-        // Always keep the newest entry; evict older ones to fit the budget.
-        while self.entries.len() > 1 && self.total_bytes() > budget {
+        // Keep the newest entry (it fits by itself); evict older ones.
+        while self.total_bytes() > budget {
             self.entries.remove(0);
         }
+        true
     }
 
     fn remove(&mut self, id: &SegmentId) {
@@ -415,9 +451,12 @@ impl SegmentByteCache {
 }
 
 /// Cache identity of one assembled searcher: the visible segment set with
-/// each segment's tombstone state. Exact comparison — a wrong reuse would
-/// silently produce wrong query results.
-type SearcherKey = Vec<(SegmentId, u32, BTreeSet<u32>)>;
+/// each segment's tombstone state as `(count, fingerprint)`. The
+/// fingerprint stands in for the full tombstone set so building and
+/// comparing keys costs the same no matter how many tombstones a segment
+/// carries; segment ids are unguessable uuids, so a colliding fingerprint
+/// would additionally need the same segment at the same tombstone count.
+type SearcherKey = Vec<(SegmentId, u32, usize, u64)>;
 
 fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
     let mut key: SearcherKey = segments
@@ -426,11 +465,12 @@ fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
             (
                 segment.id(),
                 segment.descriptor.max_doc,
-                segment.deleted.clone(),
+                segment.deleted.len(),
+                segment.deleted_fingerprint,
             )
         })
         .collect();
-    key.sort_by_key(|(id, _, _)| id.uuid_string());
+    key.sort_by_key(|(id, _, _, _)| id.uuid_string());
     key
 }
 
@@ -473,9 +513,12 @@ impl SearcherCache {
 
     fn purge_segments(&mut self, ids: &[SegmentId]) {
         self.entries
-            .retain(|entry| !entry.key.iter().any(|(id, _, _)| ids.contains(id)));
+            .retain(|entry| !entry.key.iter().any(|(id, _, _, _)| ids.contains(id)));
     }
 }
+
+/// How many distinct snapshots' registry scans to retain per index.
+const FTS_MAX_CACHED_SCANS: usize = 4;
 
 /// Which transaction published a segment into the shared caches. MVCC
 /// transactions are identified by transaction id; WAL mode runs one write
@@ -486,11 +529,60 @@ enum PublishOwner {
     Connection(usize),
 }
 
+/// Cache key pinning one exact view of the registry and tombstone rows: the
+/// reader's snapshot coordinates plus the MVCC index-rows epoch (0 in WAL
+/// mode). Only read-mode transactions use the scan cache — they cannot have
+/// written rows of their own, so two read transactions with equal keys see
+/// identical backing rows by snapshot isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanCacheKey {
+    snapshot: IndexMethodSnapshotIdentity,
+    index_rows_epoch: u64,
+}
+
+/// One cached registry+tombstone scan, with the control row that headed it.
+struct ScanCacheEntry {
+    key: ScanCacheKey,
+    control: FtsControlV2,
+    descriptors: Vec<SegmentDescriptor>,
+    tombs: HashMap<SegmentId, BTreeSet<u32>>,
+}
+
+/// Cache of complete registry scans keyed by snapshot. Repeated statements
+/// at one snapshot skip the whole descriptor/tombstone row walk (the
+/// dominant read-path cost) and go straight to chunk loading, which the
+/// byte cache usually absorbs too. Entries for superseded snapshots age out
+/// by LRU; they are never wrong, only unused, because the key pins the
+/// visible row set exactly.
+#[derive(Default)]
+struct ScanCache {
+    /// Least recently used first.
+    entries: Vec<ScanCacheEntry>,
+}
+
+impl ScanCache {
+    fn get(&mut self, key: &ScanCacheKey) -> Option<&ScanCacheEntry> {
+        let position = self.entries.iter().position(|entry| entry.key == *key)?;
+        let entry = self.entries.remove(position);
+        self.entries.push(entry);
+        self.entries.last()
+    }
+
+    fn put(&mut self, entry: ScanCacheEntry) {
+        self.entries.retain(|existing| existing.key != entry.key);
+        self.entries.push(entry);
+        while self.entries.len() > FTS_MAX_CACHED_SCANS {
+            self.entries.remove(0);
+        }
+    }
+}
+
 /// Attachment-level shared state.
 #[derive(Default)]
 struct FtsShared {
     segment_bytes: Mutex<SegmentByteCache>,
     searchers: Mutex<SearcherCache>,
+    scans: Mutex<ScanCache>,
     /// Uncommitted segments each open transaction has published into the
     /// shared caches. Owned per transaction, not per cursor: a statement's
     /// cursor is replaced (closed without transaction hooks) by the next
@@ -908,6 +1000,10 @@ fn bounded_query_limit(limit: Option<i64>, live_docs: u64) -> usize {
 struct BufferedDoc {
     rowid: i64,
     doc: TantivyDocument,
+    /// Rough indexed size: the text bytes this document buffers, plus a
+    /// fixed overhead. Drives the flush byte-bound and the segment
+    /// writer's memory budget.
+    bytes: usize,
 }
 
 /// In-memory effects to apply once a publish's rows are durably staged.
@@ -1063,6 +1159,13 @@ pub struct FtsCursor {
     scan_descriptors: Vec<SegmentDescriptor>,
     scan_tombs: HashMap<SegmentId, BTreeSet<u32>>,
     scan_data: HashMap<SegmentId, Arc<SegmentData>>,
+    /// Scan-cache key for this open, present only when the transaction is
+    /// eligible (read mode — it cannot have own writes). Cleared by every
+    /// write-path entry point.
+    scan_cache_key: Option<ScanCacheKey>,
+    /// True when the current scan scratch came from the scan cache instead
+    /// of a real row walk (skips re-storing it).
+    scan_from_cache: bool,
     /// When true, `open` stops after format detection instead of loading
     /// the snapshot (the insert fast path).
     probe_only: bool,
@@ -1072,9 +1175,20 @@ pub struct FtsCursor {
     reader: Option<IndexReader>,
     searcher: Option<Searcher>,
     cached_parser: Option<Arc<tantivy::query::QueryParser>>,
+    /// True when `segments` changed since the view was built (a
+    /// same-statement flush appended a segment). Queries rebuild before
+    /// use; delete resolution deliberately tolerates the stale view and
+    /// rebuilds only if a rowid is not found (the row may live in a segment
+    /// flushed earlier in this same statement).
+    view_stale: bool,
 
     // Write buffers.
     doc_buffer: Vec<BufferedDoc>,
+    /// Deleted rowids awaiting batched resolution into per-segment
+    /// tombstones. Resolution runs before anything reads tombstone state
+    /// (flush, query, statement commit) and walks the segments once for the
+    /// whole batch instead of once per deleted row.
+    pending_delete_rowids: Vec<i64>,
     /// Tombstone rows queued for the next flush. The same tombstones are
     /// already applied to `segments[..].deleted`, which is the source of
     /// truth for this transaction's own reads.
@@ -1148,12 +1262,16 @@ impl FtsCursor {
             scan_descriptors: Vec::new(),
             scan_tombs: HashMap::default(),
             scan_data: HashMap::default(),
+            scan_cache_key: None,
+            scan_from_cache: false,
             probe_only: false,
             index: None,
             reader: None,
             searcher: None,
             cached_parser: None,
+            view_stale: false,
             doc_buffer: Vec::new(),
+            pending_delete_rowids: Vec::new(),
             pending_tombstone_rows: Vec::new(),
             publish: None,
             auto_merge_pending: false,
@@ -1170,7 +1288,7 @@ impl FtsCursor {
     }
 
     fn pending_op_count(&self) -> usize {
-        self.doc_buffer.len() + self.pending_tombstone_rows.len()
+        self.doc_buffer.len() + self.pending_tombstone_rows.len() + self.pending_delete_rowids.len()
     }
 
     fn is_publishing(&self) -> bool {
@@ -1220,6 +1338,10 @@ impl FtsCursor {
             });
         }
         self.holds_writer_slot = true;
+        // Every write path claims the slot first; from here on this
+        // transaction may have own rows, so the shared scan cache is off
+        // limits in both directions.
+        self.scan_cache_key = None;
         Ok(())
     }
 
@@ -1467,10 +1589,14 @@ impl FtsCursor {
         self.reader = None;
         self.searcher = None;
         self.cached_parser = None;
+        self.view_stale = false;
     }
 
     /// Make sure `self.searcher` reflects the current in-memory segment set.
     fn ensure_searcher(&mut self) -> Result<()> {
+        if self.view_stale {
+            self.invalidate_snapshot_view();
+        }
         if self.searcher.is_some() {
             return Ok(());
         }
@@ -1505,7 +1631,23 @@ impl FtsCursor {
                     self.scan_descriptors.clear();
                     self.scan_tombs.clear();
                     self.scan_data.clear();
-                    self.state = FtsState::SeekControl;
+                    self.scan_from_cache = false;
+                    if !self.probe_only {
+                        if let Some(key) = self.scan_cache_key {
+                            let mut cache = self.shared.scans.lock();
+                            if let Some(entry) = cache.get(&key) {
+                                self.control = Some(entry.control.clone());
+                                self.scan_descriptors = entry.descriptors.clone();
+                                self.scan_tombs = entry.tombs.clone();
+                                self.scan_from_cache = true;
+                            }
+                        }
+                    }
+                    self.state = if self.scan_from_cache {
+                        self.chunk_load_state()
+                    } else {
+                        FtsState::SeekControl
+                    };
                 }
                 FtsState::SeekControl => {
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
@@ -1778,6 +1920,20 @@ impl FtsCursor {
                     };
                     let segment_id = self.scan_descriptors[descriptor_idx].segment_id;
                     let prefix = segment_chunk_prefix(&segment_id);
+                    if !*seeked {
+                        // Re-check the byte cache right before loading: a
+                        // concurrent reader that finished the same load
+                        // since the queue was built spares us the row walk.
+                        // (True request coalescing — blocking on another
+                        // connection's in-flight load — has no primitive in
+                        // the IOResult model; this shrinks the stampede
+                        // window to one segment's load instead.)
+                        if let Some(data) = self.shared.segment_bytes.lock().get(&segment_id) {
+                            self.scan_data.insert(segment_id, data);
+                            *pos += 1;
+                            continue;
+                        }
+                    }
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
@@ -1833,11 +1989,16 @@ impl FtsCursor {
                             .stats
                             .segment_loads
                             .fetch_add(1, Ordering::Relaxed);
-                        self.shared.segment_bytes.lock().put(
+                        if !self.shared.segment_bytes.lock().put(
                             descriptor.segment_id,
                             Arc::clone(&data),
                             fts_max_retained_cache_bytes(),
-                        );
+                        ) {
+                            self.shared
+                                .stats
+                                .byte_cache_admission_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         self.scan_data.insert(descriptor.segment_id, data);
                         *pos += 1;
                         *seeked = false;
@@ -1846,6 +2007,27 @@ impl FtsCursor {
                 }
                 FtsState::BuildIndex => {
                     if !self.snapshot_loaded {
+                        if !self.scan_from_cache {
+                            self.shared
+                                .stats
+                                .registry_scans
+                                .fetch_add(1, Ordering::Relaxed);
+                            // Share this scan with other statements at the
+                            // same snapshot. Only clean read-mode cursors
+                            // carry a key, so cached rows are always exactly
+                            // the committed rows visible at those snapshot
+                            // coordinates.
+                            if let (Some(key), Some(control)) =
+                                (self.scan_cache_key, self.control.as_ref())
+                            {
+                                self.shared.scans.lock().put(ScanCacheEntry {
+                                    key,
+                                    control: control.clone(),
+                                    descriptors: self.scan_descriptors.clone(),
+                                    tombs: self.scan_tombs.clone(),
+                                });
+                            }
+                        }
                         // Adopt the scan results as the visible set.
                         let descriptors = std::mem::take(&mut self.scan_descriptors);
                         let mut tombs = std::mem::take(&mut self.scan_tombs);
@@ -2021,6 +2203,22 @@ impl FtsCursor {
         result
     }
 
+    /// Admit one segment's bytes into the shared byte cache, counting
+    /// refusals (a segment alone larger than the whole budget is never
+    /// retained; see [`SegmentByteCache::put`]).
+    fn cache_segment_bytes(&self, id: SegmentId, data: &Arc<SegmentData>) {
+        if !self.shared.segment_bytes.lock().put(
+            id,
+            Arc::clone(data),
+            fts_max_retained_cache_bytes(),
+        ) {
+            self.shared
+                .stats
+                .byte_cache_admission_rejections
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Mint a fresh on-disk index incarnation. Drawn from the IO's random
     /// source when the cursor is attached to a database: two processes
     /// creating the same index in different files get different values,
@@ -2075,11 +2273,7 @@ impl FtsCursor {
             if let Some(segment) = segment {
                 inserts.extend(rows);
                 self.record_own_published(segment.id());
-                self.shared.segment_bytes.lock().put(
-                    segment.id(),
-                    Arc::clone(&segment.data),
-                    fts_max_retained_cache_bytes(),
-                );
+                self.cache_segment_bytes(segment.id(), &segment.data);
                 new_segment = Some(segment);
             }
         }
@@ -2133,7 +2327,16 @@ impl FtsCursor {
         self.register_tokenizers(&index);
         let segment_id = self.mint_segment_id();
         let segment = index.segment(index.new_segment_meta(segment_id, 0));
-        let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
+        // Scale the writer budget to what is actually buffered: the budget
+        // sizes the term hash table up front, and the default would hand a
+        // single-row insert a multi-MB table. Underestimation only costs a
+        // table reallocation, so generous headroom plus a small floor is
+        // enough.
+        let budget = self.doc_buffer_bytes().saturating_mul(10).clamp(
+            FTS_MIN_SEGMENT_WRITER_BUDGET_BYTES,
+            DEFAULT_MEMORY_BUDGET_BYTES,
+        );
+        let mut writer = SegmentWriter::for_segment(budget, segment)
             .map_err(|e| LimboError::InternalError(format!("FTS segment writer: {e}")))?;
         for buffered in self.doc_buffer.drain(..) {
             writer
@@ -2190,7 +2393,15 @@ impl FtsCursor {
                         .visible_segment_estimate
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                self.invalidate_snapshot_view();
+                // Keep the built view but mark it stale instead of dropping
+                // it: the next same-statement delete batch resolves against
+                // it as-is (rows in the just-flushed segment are rare) and
+                // only a query or an actual lookup miss pays the rebuild.
+                if self.searcher.is_some() {
+                    self.view_stale = true;
+                } else {
+                    self.invalidate_snapshot_view();
+                }
             }
             PublishApply::ReplaceSegments(segments) => {
                 self.segments = segments;
@@ -2296,11 +2507,7 @@ impl FtsCursor {
             );
             inserts = rows;
             self.record_own_published(segment.id());
-            self.shared.segment_bytes.lock().put(
-                segment.id(),
-                Arc::clone(&segment.data),
-                fts_max_retained_cache_bytes(),
-            );
+            self.cache_segment_bytes(segment.id(), &segment.data);
             new_segments.push(segment);
         }
         self.publish = Some(PendingPublish {
@@ -2447,28 +2654,74 @@ impl FtsCursor {
         // `>=`, not `==`: a delete can push several tombstones past the gate
         // in one step (one per live posting for the rowid), so the count can
         // legitimately overshoot the batch size between gates.
-        if self.pending_op_count() >= BATCH_COMMIT_SIZE {
+        if self.pending_op_count() >= BATCH_COMMIT_SIZE
+            || self.doc_buffer_bytes() >= FTS_FLUSH_BUFFER_BYTES
+        {
+            return_if_io!(self.resolve_pending_deletes());
             self.stage_flush()?;
             return_if_io!(self.drive_publish());
         }
         Ok(IOResult::Done(()))
     }
 
-    /// Locate every live posting for `rowid` across the in-memory segment
-    /// set. One rowid-term lookup per segment, checked against the
-    /// transaction's own tombstone state (the searcher's alive bitsets may
-    /// lag behind tombstones applied since the view was built).
-    fn live_postings_for_rowid(&mut self, rowid: i64) -> Result<Vec<(SegmentId, u32)>> {
-        if self.segments.is_empty() {
-            return Ok(Vec::new());
+    /// Estimated bytes buffered for the next segment build.
+    fn doc_buffer_bytes(&self) -> usize {
+        self.doc_buffer.iter().map(|doc| doc.bytes).sum()
+    }
+
+    /// Resolve the buffered delete rowids into per-segment tombstones, one
+    /// pass over the visible segments for the whole batch. Runs before
+    /// anything reads tombstone state (flush, query, statement commit).
+    ///
+    /// The first pass deliberately tolerates a stale view (one whose
+    /// segment set lags a same-statement flush): rowids that resolve there
+    /// are done. Only if some rowid has no posting anywhere — it may live
+    /// in a segment flushed earlier in this statement — is the view rebuilt,
+    /// once, and the leftovers retried. Leftovers that still miss were
+    /// buffer-only rows (un-buffered by `delete` before ever reaching a
+    /// segment) and need no tombstone.
+    fn resolve_pending_deletes(&mut self) -> Result<IOResult<()>> {
+        if self.pending_delete_rowids.is_empty() {
+            return Ok(IOResult::Done(()));
         }
-        self.ensure_searcher()?;
+        // The insert fast path skips loading the segment set; resolution
+        // needs it. Resumable: buffered rowids are consumed only below,
+        // after the load completes.
+        return_if_io!(self.ensure_snapshot_loaded());
+        let mut rowids = std::mem::take(&mut self.pending_delete_rowids);
+        if self.segments.is_empty() {
+            return Ok(IOResult::Done(()));
+        }
+        rowids.sort_unstable();
+        rowids.dedup();
+        if self.searcher.is_none() {
+            self.ensure_searcher()?;
+        }
+        let missing = self.apply_tombstones_for_rowids(&rowids)?;
+        if !missing.is_empty() && self.view_stale {
+            self.ensure_searcher()?;
+            self.apply_tombstones_for_rowids(&missing)?;
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Tombstone every live posting of the given sorted rowids across the
+    /// current view, returning the rowids with no posting anywhere. Small
+    /// batches do one rowid-term lookup per rowid per segment; large ones
+    /// walk each segment's rowid fast field once, so bulk deletes cost
+    /// ~rows + segments instead of rows × segments.
+    fn apply_tombstones_for_rowids(&mut self, rowids: &[i64]) -> Result<Vec<i64>> {
+        /// Above this many rowids, one fast-field pass per segment beats
+        /// per-rowid term-dictionary seeks.
+        const FTS_DELETE_SWEEP_THRESHOLD: usize = 128;
+
         let searcher = self
             .searcher
             .as_ref()
-            .expect("searcher built by ensure_searcher");
-        let term = Term::from_field_i64(self.rowid_field, rowid);
-        let mut hits = Vec::new();
+            .expect("caller builds the searcher before resolving deletes");
+        let mut hits: Vec<(SegmentId, u32)> = Vec::new();
+        let mut found = vec![false; rowids.len()];
+        let stats = &self.shared.stats;
         for segment_reader in searcher.segment_readers() {
             let segment_id = segment_reader.segment_id();
             let Some(segment) = self
@@ -2478,29 +2731,75 @@ impl FtsCursor {
             else {
                 continue;
             };
-            let inverted = segment_reader
-                .inverted_index(self.rowid_field)
-                .map_err(|e| LimboError::InternalError(format!("FTS rowid lookup: {e}")))?;
-            let Some(mut postings) = inverted
-                .read_postings(&term, IndexRecordOption::Basic)
-                .map_err(|e| LimboError::InternalError(format!("FTS rowid postings: {e}")))?
-            else {
-                continue;
-            };
-            loop {
-                let doc_id = postings.doc();
-                if doc_id == TERMINATED {
-                    break;
+            if rowids.len() >= FTS_DELETE_SWEEP_THRESHOLD {
+                stats
+                    .rowid_resolution_probes
+                    .fetch_add(1, Ordering::Relaxed);
+                let column = segment_reader
+                    .fast_fields()
+                    .i64(ROWID_FIELD)
+                    .map_err(|e| LimboError::InternalError(format!("FTS rowid column: {e}")))?;
+                for doc_id in 0..segment.descriptor.max_doc {
+                    let Some(rowid) = column.first(doc_id) else {
+                        continue;
+                    };
+                    let Ok(idx) = rowids.binary_search(&rowid) else {
+                        continue;
+                    };
+                    found[idx] = true;
+                    // Raw postings are not alive-filtered; consult the
+                    // transaction's own tombstone state.
+                    if !segment.deleted.contains(&doc_id) {
+                        hits.push((segment_id, doc_id));
+                    }
                 }
-                // Raw postings are not alive-filtered; consult the
-                // transaction's own tombstone state.
-                if !segment.deleted.contains(&doc_id) {
-                    hits.push((segment_id, doc_id));
+            } else {
+                let inverted = segment_reader
+                    .inverted_index(self.rowid_field)
+                    .map_err(|e| LimboError::InternalError(format!("FTS rowid lookup: {e}")))?;
+                for (idx, rowid) in rowids.iter().enumerate() {
+                    stats
+                        .rowid_resolution_probes
+                        .fetch_add(1, Ordering::Relaxed);
+                    let term = Term::from_field_i64(self.rowid_field, *rowid);
+                    let Some(mut postings) = inverted
+                        .read_postings(&term, IndexRecordOption::Basic)
+                        .map_err(|e| {
+                            LimboError::InternalError(format!("FTS rowid postings: {e}"))
+                        })?
+                    else {
+                        continue;
+                    };
+                    loop {
+                        let doc_id = postings.doc();
+                        if doc_id == TERMINATED {
+                            break;
+                        }
+                        found[idx] = true;
+                        if !segment.deleted.contains(&doc_id) {
+                            hits.push((segment_id, doc_id));
+                        }
+                        postings.advance();
+                    }
                 }
-                postings.advance();
             }
         }
-        Ok(hits)
+        for (segment_id, doc_id) in hits {
+            if let Some(segment) = self
+                .segments
+                .iter_mut()
+                .find(|segment| segment.id() == segment_id)
+            {
+                if segment.add_tombstone(doc_id) {
+                    self.pending_tombstone_rows.push((segment_id, doc_id));
+                }
+            }
+        }
+        Ok(rowids
+            .iter()
+            .zip(&found)
+            .filter_map(|(rowid, found)| (!found).then_some(*rowid))
+            .collect())
     }
 
     fn constant_integer_expression(expr: &turso_parser::ast::Expr) -> Option<i64> {
@@ -2592,6 +2891,7 @@ impl FtsCursor {
     fn reset_to_init(&mut self) {
         self.release_writer_slot();
         self.doc_buffer.clear();
+        self.pending_delete_rowids.clear();
         self.pending_tombstone_rows.clear();
         self.publish = None;
         self.auto_merge_pending = false;
@@ -2600,6 +2900,8 @@ impl FtsCursor {
         self.scan_descriptors.clear();
         self.scan_tombs.clear();
         self.scan_data.clear();
+        self.scan_cache_key = None;
+        self.scan_from_cache = false;
         self.control = None;
         self.invalidate_snapshot_view();
         self.fts_dir_cursor = None;
@@ -3009,6 +3311,21 @@ impl IndexMethodCursor for FtsCursor {
         let database_id = context.database().id;
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        // Only read-mode transactions may use the scan cache: they cannot
+        // have written rows of their own, so the snapshot coordinates fully
+        // determine what a scan would see. A write transaction's scan must
+        // observe its own flushed rows, which no shared entry can carry.
+        if context.transaction_mode() == IndexMethodTransactionMode::Read {
+            let index_rows_epoch = conn
+                .mv_store_for_db(database_id)
+                .map_or(0, |mv_store| mv_store.index_rows_epoch());
+            self.scan_cache_key = Some(ScanCacheKey {
+                snapshot: context.snapshot(),
+                index_rows_epoch,
+            });
+        } else {
+            self.scan_cache_key = None;
+        }
         if matches!(self.state, FtsState::Ready) {
             return self.ensure_snapshot_loaded();
         }
@@ -3024,6 +3341,9 @@ impl IndexMethodCursor for FtsCursor {
         let database_id = context.database().id;
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        // Writers may see (and must see) their own rows; never serve or
+        // populate the shared scan cache from a write open.
+        self.scan_cache_key = None;
         self.opening_for_write = true;
         if matches!(self.state, FtsState::Ready) {
             return Ok(IOResult::Done(()));
@@ -3060,10 +3380,13 @@ impl IndexMethodCursor for FtsCursor {
         let mut doc = TantivyDocument::default();
         doc.add_i64(self.rowid_field, rowid);
 
+        let mut bytes = FTS_BUFFERED_DOC_OVERHEAD_BYTES;
         for ((_col, field), reg) in self.text_fields.iter().zip(&values[..values.len() - 1]) {
             match reg {
                 Register::Value(Value::Text(t)) => {
-                    doc.add_text(*field, t.as_str());
+                    let text = t.as_str();
+                    bytes += text.len();
+                    doc.add_text(*field, text);
                 }
                 Register::Value(Value::Null) => continue,
                 // Coerce every non-NULL value to text before tokenizing, the
@@ -3071,6 +3394,7 @@ impl IndexMethodCursor for FtsCursor {
                 // make the index silently miss rows a plain scan matches.
                 Register::Value(value) => {
                     if let Some(text) = value.cast_text() {
+                        bytes += text.len();
                         doc.add_text(*field, &text);
                     }
                 }
@@ -3078,13 +3402,15 @@ impl IndexMethodCursor for FtsCursor {
             }
         }
 
-        self.doc_buffer.push(BufferedDoc { rowid, doc });
+        self.doc_buffer.push(BufferedDoc { rowid, doc, bytes });
         Ok(IOResult::Done(()))
     }
 
     /// Deletes a document by rowid: drop it from the buffer if it has not
-    /// been serialized yet, and tombstone every live posting it has in the
-    /// visible segment set.
+    /// been serialized yet, and queue the rowid for batched tombstone
+    /// resolution. Resolution (one pass over the visible segments for the
+    /// whole batch, see [`Self::resolve_pending_deletes`]) runs at the next
+    /// flush boundary or query — nothing reads tombstone state before then.
     fn delete(&mut self, values: &[Register]) -> IOResultOr<()> {
         self.claim_writer_slot()?;
         // Announce this transaction as a tombstone writer before any
@@ -3092,9 +3418,6 @@ impl IndexMethodCursor for FtsCursor {
         // segments out from under it.
         self.register_mvcc_deleter()?;
         return_if_io!(self.flush_gate());
-        // A delete must see the visible segment set; the insert fast path
-        // skips loading it.
-        return_if_io!(self.ensure_snapshot_loaded());
 
         // Last register is rowid
         let rowid_reg = values.last().ok_or_else(|| {
@@ -3108,23 +3431,10 @@ impl IndexMethodCursor for FtsCursor {
         };
 
         // The transaction's own unflushed documents are simply un-buffered.
+        // The rowid is still queued: an older posting for it may live in a
+        // visible segment (UPDATE re-inserts into the buffer after deleting).
         self.doc_buffer.retain(|buffered| buffered.rowid != rowid);
-
-        // Postings in visible segments get tombstone rows, applied to the
-        // in-memory set immediately (own-write visibility) and queued as
-        // rows for the next flush.
-        let postings = self.live_postings_for_rowid(rowid)?;
-        for (segment_id, doc_id) in postings {
-            if let Some(segment) = self
-                .segments
-                .iter_mut()
-                .find(|segment| segment.id() == segment_id)
-            {
-                if segment.deleted.insert(doc_id) {
-                    self.pending_tombstone_rows.push((segment_id, doc_id));
-                }
-            }
-        }
+        self.pending_delete_rowids.push(rowid);
 
         Ok(IOResult::Done(()))
     }
@@ -3132,6 +3442,8 @@ impl IndexMethodCursor for FtsCursor {
     /// Starts an FTS query. Parses the query string and executes the search.
     /// Returns true if there are results, false otherwise.
     fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool> {
+        // A same-cursor query must see this statement's deletes.
+        return_if_io!(self.resolve_pending_deletes());
         self.ensure_searcher()?;
         let searcher = self
             .searcher
@@ -3463,20 +3775,32 @@ impl IndexMethodCursor for FtsCursor {
     /// new segment and the visible set exceeds `PRAGMA fts_merge_threshold`,
     /// merges it down in the same transaction (skipped silently on
     /// maintenance contention).
-    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
+    fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        let _ = context;
         if self.is_publishing() {
             return_if_io!(self.drive_publish());
         } else if self.pending_op_count() > 0 {
-            tracing::debug!(
-                "FTS stage_statement_commit: flushing {} pending operations",
-                self.pending_op_count()
-            );
-            self.stage_flush()?;
-            self.auto_merge_pending = matches!(
-                self.publish.as_ref().map(|publish| &publish.apply),
-                Some(PublishApply::AppendSegment(Some(_)))
-            );
-            return_if_io!(self.drive_publish());
+            return_if_io!(self.resolve_pending_deletes());
+            // Resolution may have consumed everything (deletes of rows that
+            // only ever lived in the statement buffer stage no rows).
+            if self.pending_op_count() > 0 {
+                tracing::debug!(
+                    "FTS stage_statement_commit: flushing {} pending operations",
+                    self.pending_op_count()
+                );
+                self.stage_flush()?;
+                self.auto_merge_pending = matches!(
+                    self.publish.as_ref().map(|publish| &publish.apply),
+                    Some(PublishApply::AppendSegment(Some(_)))
+                );
+                // Safe to interrupt here: the publication is staged, so a
+                // re-driven statement resumes through `is_publishing()`.
+                crate::mvcc::yield_points::inject_io_yield!(
+                    context,
+                    crate::index_method::IndexMethodYieldPoint::AfterStatementFlushStaged
+                );
+                return_if_io!(self.drive_publish());
+            }
         }
         if self.auto_merge_pending {
             return_if_io!(self.try_auto_merge());
@@ -3725,7 +4049,11 @@ impl IndexMethodCursor for FtsCursor {
             segment_count: self.snapshot_loaded.then_some(self.segments.len()),
             cached_connection_count: Some(self.shared.searchers.lock().entries.len()),
             cached_bytes: Some(self.shared.segment_bytes.lock().total_bytes()),
-            cache_admission_rejections: None,
+            cache_admission_rejections: Some(
+                stats
+                    .byte_cache_admission_rejections
+                    .load(Ordering::Relaxed),
+            ),
             // Writers are transaction-private in format v2; there is no
             // shared retained writer.
             cached_writer: Some(false),
@@ -3735,6 +4063,8 @@ impl IndexMethodCursor for FtsCursor {
             writer_cache_validation_failures: None,
             writer_cache_rollback_discards: None,
             writer_cache_misses: None,
+            registry_scans: Some(stats.registry_scans.load(Ordering::Relaxed)),
+            rowid_resolution_probes: Some(stats.rowid_resolution_probes.load(Ordering::Relaxed)),
             read_cache_lookups: Some(stats.read_cache_lookups.load(Ordering::Relaxed)),
             read_cache_hits: Some(stats.read_cache_hits.load(Ordering::Relaxed)),
             read_cache_misses: Some(stats.read_cache_misses.load(Ordering::Relaxed)),

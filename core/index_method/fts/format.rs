@@ -298,8 +298,29 @@ pub(super) struct LoadedSegment {
     pub descriptor: SegmentDescriptor,
     pub data: Arc<SegmentData>,
     /// Doc ids whose postings are dead at this snapshot. Ordered so cache
-    /// identity comparisons and bitset builds are deterministic.
+    /// identity comparisons and bitset builds are deterministic. Mutate only
+    /// through [`LoadedSegment::add_tombstone`], which keeps
+    /// `deleted_fingerprint` in sync.
     pub deleted: BTreeSet<u32>,
+    /// Order-independent 64-bit fingerprint of `deleted` (xor of each doc
+    /// id's `splitmix64`). Searcher-cache keys use `(len, fingerprint)`
+    /// instead of comparing the whole set, so cache lookups cost the same
+    /// no matter how many tombstones a segment carries.
+    pub deleted_fingerprint: u64,
+}
+
+/// `splitmix64` finalizer: a cheap 64-bit mixer whose outputs xor into an
+/// order-independent set fingerprint.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn tombstone_fingerprint(doc_id: u32) -> u64 {
+    // +1 so doc id 0 does not fingerprint an empty set.
+    splitmix64(u64::from(doc_id) + 1)
 }
 
 impl LoadedSegment {
@@ -308,10 +329,14 @@ impl LoadedSegment {
         data: Arc<SegmentData>,
         deleted: BTreeSet<u32>,
     ) -> Self {
+        let deleted_fingerprint = deleted
+            .iter()
+            .fold(0u64, |fp, doc| fp ^ tombstone_fingerprint(*doc));
         Self {
             descriptor,
             data,
             deleted,
+            deleted_fingerprint,
         }
     }
 
@@ -321,6 +346,16 @@ impl LoadedSegment {
 
     pub fn live_docs(&self) -> u64 {
         u64::from(self.descriptor.max_doc).saturating_sub(self.deleted.len() as u64)
+    }
+
+    /// Record a tombstone, returning whether it was new. The only way to
+    /// grow `deleted` — keeps the fingerprint in sync.
+    pub fn add_tombstone(&mut self, doc_id: u32) -> bool {
+        let inserted = self.deleted.insert(doc_id);
+        if inserted {
+            self.deleted_fingerprint ^= tombstone_fingerprint(doc_id);
+        }
+        inserted
     }
 }
 
