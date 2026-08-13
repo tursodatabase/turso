@@ -55,7 +55,7 @@ cli_only = []
 test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
-fts = ["dep:tantivy"]
+fts = ["dep:tantivy", "dep:serde_json", "dep:crc32fast"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
@@ -84,6 +84,7 @@ libc = { version = "0.2.172" }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8.6"
 tantivy = { version = "0.26.0", optional = true }
+crc32fast = { version = "1", optional = true }
 
 [dependencies]
 # aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument

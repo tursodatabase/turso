@@ -64,13 +64,14 @@ pub enum IndexMethodMvccSupport {
     /// Persistent state is stored exclusively through core-provided,
     /// MVCC-aware backing storage.
     ///
-    /// Under MVCC, at most one transaction may write a given index at a time
-    /// (a per-index write lease, taken on the first document mutation).
-    /// Contention is a retryable `Busy`; a writer whose read snapshot
-    /// predates the index's last publication gets `WriteWriteConflict` and
-    /// must restart its transaction. `BEGIN CONCURRENT` therefore does not
-    /// parallelize writes to one index of this kind — that is the write
-    /// throughput ceiling per index.
+    /// Under MVCC, concurrent `BEGIN CONCURRENT` transactions may write one
+    /// index of this kind at the same time when the method's writes commute
+    /// (FTS appends immutable segments under fresh ids). Deletes and
+    /// updates that target existing entries are mutually excluded with
+    /// index maintenance: merge/OPTIMIZE holds the per-index lease (the
+    /// merge mutex, `Busy` on contention, `WriteWriteConflict` when its
+    /// snapshot is stale), and tombstone writers overlapping a merge are
+    /// refused the same way so their deletes cannot be lost.
     TransactionalBackingStore,
     /// Persistent state is external and implements transaction outcome hooks.
     ExternalTransactional,
