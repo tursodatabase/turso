@@ -43,9 +43,11 @@ RUN for f in sdk-kit/Cargo.toml sync/sdk-kit/Cargo.toml; do \
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
         export RUSTFLAGS="--cfg=tokio_unstable --cfg=antithesis -Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
-        cargo build --bin turso_stress --profile antithesis; \
+        cargo build --bin turso_stress --profile antithesis && \
+        cargo build -p turso_wal_workload --profile antithesis; \
     else \
-        cargo build --bin turso_stress --release; \
+        cargo build --bin turso_stress --release && \
+        cargo build -p turso_wal_workload --release; \
     fi
 
 WORKDIR /app/bindings/python
@@ -67,7 +69,8 @@ EXPOSE 8080
 COPY --from=builder /usr/lib/libvoidstar.so* /usr/lib/
 COPY --from=builder /app/testing/unreliable-libc/unreliable-libc.so /usr/lib/
 COPY --from=builder /app/target/antithesis/turso_stress /bin/turso_stress
-COPY --from=builder /app/target/antithesis/turso_stress /symbols
+COPY --from=builder /app/target/antithesis/wal_workload /bin/wal_workload
+COPY --from=builder /app/target/antithesis/turso_stress /app/target/antithesis/wal_workload /symbols/
 COPY testing/stress/docker-entrypoint.sh /bin
 RUN chmod +x /bin/docker-entrypoint.sh
 
@@ -83,6 +86,8 @@ COPY ./testing/antithesis/stress-io_uring /opt/antithesis/test/v1/stress-io_urin
 COPY ./testing/antithesis/stress-mvcc /opt/antithesis/test/v1/stress-mvcc
 COPY ./testing/antithesis/stress-io_uring-mvcc /opt/antithesis/test/v1/stress-io_uring-mvcc
 COPY ./testing/antithesis/stress-unreliable /opt/antithesis/test/v1/stress-unreliable
+COPY ./testing/antithesis/stress-oracle /opt/antithesis/test/v1/stress-oracle
+COPY ./testing/antithesis/wal/*.sh /opt/antithesis/test/v1/wal/
 RUN chmod 777 -R /opt/antithesis/test/v1
 
 RUN mkdir /opt/antithesis/catalog

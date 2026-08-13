@@ -161,6 +161,42 @@ int fsync(int fd)
 	return libc_fsync(fd);
 }
 
+static int (*libc_ftruncate) (int, off_t);
+
+int ftruncate(int fd, off_t length)
+{
+	if (libc_ftruncate == NULL) {
+		libc_ftruncate = dlsym(RTLD_NEXT, "ftruncate");
+	}
+	if (inject_fault(ENOSPC)) {
+		printf("%s: injecting fault NOSPC\n", __func__);
+		return -1;
+	}
+	if (inject_fault(EIO)) {
+		printf("%s: injecting fault EIO\n", __func__);
+		return -1;
+	}
+	return libc_ftruncate(fd, length);
+}
+
+static int (*libc_ftruncate64) (int, off64_t);
+
+int ftruncate64(int fd, off64_t length)
+{
+	if (libc_ftruncate64 == NULL) {
+		libc_ftruncate64 = dlsym(RTLD_NEXT, "ftruncate64");
+	}
+	if (inject_fault(ENOSPC)) {
+		printf("%s: injecting fault NOSPC\n", __func__);
+		return -1;
+	}
+	if (inject_fault(EIO)) {
+		printf("%s: injecting fault EIO\n", __func__);
+		return -1;
+	}
+	return libc_ftruncate64(fd, length);
+}
+
 __attribute__((constructor))
 static void init(void)
 {

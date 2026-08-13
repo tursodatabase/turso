@@ -1,8 +1,10 @@
 use rand::Rng;
+mod checkpoint;
 mod conn;
 mod counter;
 mod logging;
 mod opts;
+mod oracle;
 mod progress;
 mod sql_logging;
 
@@ -624,6 +626,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     let mut stress_counter = StressCounter::new(opts.nr_threads, opts.nr_iterations);
 
+    // Watermarks carried in memory across reopens so recovery is verified,
+    // not just exercised.
+    let recovery_expectations = oracle::RecoveryExpectations::new(opts.nr_threads);
+
     let threads: Vec<_> = (0..opts.nr_threads)
         .map(ThreadId::new)
         .enumerate()
@@ -675,6 +681,24 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
 
+    if opts.oracle && !stop {
+        match oracle::init_schema(&conn).await {
+            Ok(()) => {}
+            Err(
+                turso::Error::DatabaseFull(_)
+                | turso::Error::IoError(std::io::ErrorKind::StorageFull, _)
+                | turso::Error::IoError(_, _),
+            ) => {
+                // Same as the schema-creation loop above: an injected IO
+                // fault during setup stops the run instead of failing it.
+                stop = true;
+            }
+            Err(e) => {
+                turso_macros::turso_assert_unreachable!("fatal error creating oracle schema", { "error": e });
+            }
+        }
+    }
+
     while !stop && !stress_counter.all_done() {
         let mut handles = Vec::with_capacity(opts.nr_threads);
         let reopen_requested = Arc::new(AtomicBool::new(false));
@@ -698,6 +722,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             let sql_logger = sql_logger.clone();
             let all_threads_ready = all_threads_ready.clone();
             let stress_counter = stress_counter.clone();
+            let recovery_expectations = recovery_expectations.clone();
 
             let handle = turso_stress::future::spawn(async move {
                 let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
@@ -707,6 +732,23 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         .wrapping_add(iteration_idx as u64 * 1000),
                 );
                 let mut iteration_count_this_batch = 0;
+
+                // Attaching re-reads the durable watermark and checks that
+                // all committed oracle state survived: every batch but the
+                // first starts right after a database reopen, so this is
+                // also the recovery check.
+                let mut oracle = if opts.oracle {
+                    oracle::Oracle::attach(
+                        &db,
+                        &thread,
+                        thread_idx,
+                        opts.busy_timeout,
+                        &recovery_expectations,
+                    )
+                    .await
+                } else {
+                    None
+                };
 
                 all_threads_ready.wait().await;
                 for interaction_idx in stress_counter.iteration_idx(thread_idx)..opts.nr_iterations
@@ -765,6 +807,26 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         let _ = conn.execute(end_tx, ()).await;
                     }
 
+                    // Occasionally checkpoint the WAL so backfills, full
+                    // drains, and WAL restarts race the other threads'
+                    // commits instead of only happening on autocheckpoint.
+                    if rng.random_ratio(1, 20) {
+                        let mode = checkpoint::pick_mode(&mut rng, opts.tx_mode);
+                        checkpoint::run_wal_checkpoint(&conn, &sql_logger, &thread, mode).await;
+                    }
+
+                    // Oracle: commit a tracked row and its watermark
+                    // atomically, and spot-check that no committed row was
+                    // ever lost.
+                    if let Some(oracle) = oracle.as_mut() {
+                        if rng.random_ratio(1, 4) {
+                            oracle.write(&thread).await;
+                        }
+                        if rng.random_ratio(1, 20) {
+                            oracle.verify(&thread).await;
+                        }
+                    }
+
                     const INTEGRITY_CHECK_INTERVAL: usize = 100;
                     if interaction_idx % INTEGRITY_CHECK_INTERVAL == 0 {
                         let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
@@ -820,6 +882,12 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     turso_stress::note_progress();
                 }
 
+                // Record the final watermark so the attach after the
+                // upcoming reopen can verify recovery preserved it.
+                if let Some(oracle) = oracle.take() {
+                    oracle.detach(&recovery_expectations).await;
+                }
+
                 // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
                 let _ = conn.execute("COMMIT", ()).await;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
@@ -843,6 +911,13 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     progress_bars
         .into_iter()
         .for_each(|mut progress_bar| progress_bar.finish());
+
+    if opts.oracle {
+        // The database was reset after the last batch, so this checks the
+        // durable state through a fresh reopen.
+        let conn = StressDb::connect(&db, ThreadId::new(usize::MAX), opts.busy_timeout).await?;
+        oracle::verify_all(&conn, opts.nr_threads, &recovery_expectations).await;
+    }
 
     println!("Database file: {db_file}");
 

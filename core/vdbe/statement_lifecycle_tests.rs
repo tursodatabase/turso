@@ -1400,3 +1400,98 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
         "pins the deferred-commit gap: a failing joined writer discards the completed writer's row"
     );
 }
+
+/// Park a PASSIVE checkpoint at every WalCheckpointYieldPoint in turn and
+/// check the invariants of the parked window: a concurrent writer can still
+/// commit, a WAL-resetting checkpoint from another connection stays locked
+/// out for the entire window (the defense against the stale-publish bug
+/// class of #7722/#7744), and the resumed checkpoint completes with sane
+/// counters and an intact database.
+#[test]
+fn test_wal_checkpoint_parked_at_each_yield_point_survives_concurrent_commit() {
+    use crate::storage::pager::WalCheckpointYieldPoint;
+
+    let points = [
+        WalCheckpointYieldPoint::AfterCheckpointStartFrameRangeFixed,
+        WalCheckpointYieldPoint::AfterBackfill,
+        WalCheckpointYieldPoint::AfterSyncDbFile,
+        WalCheckpointYieldPoint::BeforePublishBackfill,
+        WalCheckpointYieldPoint::AfterPublishBackfill,
+    ];
+    for point in points {
+        let env = SameConnectionWal::new(&format!("wal-checkpoint-yield-{point:?}.db"));
+        env.setup_rows_table();
+        env.conn
+            .execute("INSERT INTO rows VALUES (1, 'one')")
+            .unwrap();
+
+        env.conn
+            .set_yield_injector(Some(FixedYieldInjector::new([point.point()])));
+        let mut stmt = env.conn.prepare("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        expect_injected_yield(&mut stmt, "PASSIVE wal_checkpoint");
+        env.conn.set_yield_injector(None);
+
+        // Once the backfill count is published, the WAL is fully
+        // backfilled, so new snapshots on other connections want read-mark
+        // 0 — which the parked guard holds exclusively until Finalize. At
+        // every earlier point, other connections read and write freely.
+        let concurrent_access = !matches!(point, WalCheckpointYieldPoint::AfterPublishBackfill);
+        if concurrent_access {
+            // A writer on another connection commits while the checkpoint
+            // is parked (PASSIVE checkpoints do not exclude writers).
+            env.observer
+                .execute("INSERT INTO rows VALUES (2, 'two')")
+                .unwrap();
+
+            // A WAL-resetting checkpoint must be locked out for the whole
+            // parked window; it reports busy=1 instead of running.
+            let busy = scalar_i64(&env.observer, "PRAGMA wal_checkpoint(TRUNCATE)");
+            assert_eq!(
+                busy, 1,
+                "TRUNCATE checkpoint must report busy while a checkpoint is parked at {point:?}"
+            );
+        } else {
+            let result = env.observer.execute("INSERT INTO rows VALUES (2, 'two')");
+            assert!(
+                matches!(result, Err(crate::LimboError::Busy)),
+                "a new snapshot must back off busy while parked at {point:?}, got {result:?}"
+            );
+        }
+
+        // Resume the parked checkpoint; it must complete with sane counters.
+        let (busy, log, checkpointed) = loop {
+            match stmt.step().unwrap() {
+                crate::StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    break (
+                        row.get::<i64>(0).unwrap(),
+                        row.get::<i64>(1).unwrap(),
+                        row.get::<i64>(2).unwrap(),
+                    );
+                }
+                crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+                other => panic!("expected checkpoint result row at {point:?}, got {other:?}"),
+            }
+        };
+        finish_without_rows(&mut stmt);
+        assert_eq!(busy, 0, "resumed checkpoint must not be busy at {point:?}");
+        assert!(
+            checkpointed > 0 && checkpointed <= log,
+            "resumed checkpoint at {point:?} reported log={log} checkpointed={checkpointed}"
+        );
+
+        // Every commit is intact and the database is consistent.
+        let expected_rows = if concurrent_access { 2 } else { 1 };
+        assert_eq!(
+            scalar_i64(&env.observer, "SELECT COUNT(*) FROM rows"),
+            expected_rows,
+            "committed rows must survive the parked checkpoint at {point:?}"
+        );
+        let integrity = get_rows(&env.observer, "PRAGMA integrity_check");
+        assert_eq!(
+            integrity,
+            vec![vec![Value::Text("ok".to_string().into())]],
+            "integrity_check must pass after resuming from {point:?}"
+        );
+    }
+}
