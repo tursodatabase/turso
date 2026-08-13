@@ -887,6 +887,19 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     optimize_select_plan_with_cache(plan, resolver, &mut cache)
 }
 
+/// Whether the unnested form can be emitted.
+///
+/// Unnesting moves a subquery's WHERE clause into the outer query, so a term
+/// that is always false can travel with it, as in
+/// `WHERE a IN (SELECT z FROM t WHERE 'abc' AND t.z = o.b)`. The emitter skips
+/// loop setup for a query that returns no rows, and that setup is where a table
+/// the rewrite added to the FROM clause gets its result registers. Reading
+/// those registers afterwards is a bug, so run the correlated form instead. It
+/// returns the same rows.
+fn rewritten_form_is_emittable(rewritten: &SelectPlan) -> bool {
+    !rewritten.contains_constant_false_condition
+}
+
 #[turso_macros::trace_stack]
 fn optimize_select_plan_with_cache(
     plan: &mut SelectPlan,
@@ -930,6 +943,9 @@ fn optimize_select_plan_with_cache(
     if full_join_rewrite_is_complete {
         let rewritten_table_plan =
             find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        if !rewritten_form_is_emittable(&rewritten) {
+            return optimize_select_plan_form(plan, resolver, cache);
+        }
         *plan = rewritten;
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
         return Ok(());
@@ -939,19 +955,30 @@ fn optimize_select_plan_with_cache(
     if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
         let rewritten_table_plan =
             find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        if !rewritten_form_is_emittable(&rewritten) {
+            return optimize_select_plan_form(plan, resolver, cache);
+        }
         *plan = rewritten;
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
         return Ok(());
     }
 
     let original_table_plan = find_select_plan_form(plan, resolver, cache, true, None)?;
+    // The query already returns no rows, so a cheaper form cannot be found.
+    if plan.contains_constant_false_condition {
+        apply_select_table_plan(plan, original_table_plan, resolver)?;
+        return Ok(());
+    }
     let cost_limit = plan.estimated_cost.map(Cost);
     let rewritten_table_plan =
         find_select_plan_form(&mut rewritten, resolver, cache, false, cost_limit)?;
-    let use_rewritten = matches!(
-        (plan.estimated_cost, rewritten.estimated_cost),
-        (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
-    );
+    // A form that returns no rows costs nothing, so it would always win the
+    // comparison below. Check that it can be emitted before comparing costs.
+    let use_rewritten = rewritten_form_is_emittable(&rewritten)
+        && matches!(
+            (plan.estimated_cost, rewritten.estimated_cost),
+            (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
+        );
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;
