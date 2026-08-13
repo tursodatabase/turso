@@ -78,6 +78,13 @@ pub struct Opts {
         help = "If true, this will run a modified minimal version of turso_stress that ensure the DB is deterministic (no sources of randomness that are not controlled by the seed)"
     )]
     pub check_uncontrolled_nondeterminism: bool,
+
+    /// Lost-write oracle
+    #[clap(
+        long,
+        help = "Track committed writes in fixed oracle side tables and assert that none are ever lost, across reconnects and reopens"
+    )]
+    pub oracle: bool,
 }
 
 /// Returns a constrained value when running under miri or shuttle,

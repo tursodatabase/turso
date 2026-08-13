@@ -4,6 +4,7 @@ mod conn;
 mod counter;
 mod logging;
 mod opts;
+mod oracle;
 mod progress;
 mod sql_logging;
 
@@ -676,6 +677,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
 
+    if opts.oracle {
+        oracle::init_schema(&conn).await?;
+    }
+
     while !stop && !stress_counter.all_done() {
         let mut handles = Vec::with_capacity(opts.nr_threads);
         let reopen_requested = Arc::new(AtomicBool::new(false));
@@ -708,6 +713,16 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         .wrapping_add(iteration_idx as u64 * 1000),
                 );
                 let mut iteration_count_this_batch = 0;
+
+                // Attaching re-reads the durable watermark and checks that
+                // all committed oracle state survived: every batch but the
+                // first starts right after a database reopen, so this is
+                // also the recovery check.
+                let mut oracle = if opts.oracle {
+                    oracle::Oracle::attach(&conn, &thread, thread_idx).await
+                } else {
+                    None
+                };
 
                 all_threads_ready.wait().await;
                 for interaction_idx in stress_counter.iteration_idx(thread_idx)..opts.nr_iterations
@@ -772,6 +787,18 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     if rng.random_ratio(1, 20) {
                         let mode = checkpoint::pick_mode(&mut rng, opts.tx_mode);
                         checkpoint::run_wal_checkpoint(&conn, &sql_logger, &thread, mode).await;
+                    }
+
+                    // Oracle: commit a tracked row and its watermark
+                    // atomically, and spot-check that no committed row was
+                    // ever lost.
+                    if let Some(oracle) = oracle.as_mut() {
+                        if rng.random_ratio(1, 4) {
+                            oracle.write(&conn, &thread).await;
+                        }
+                        if rng.random_ratio(1, 20) {
+                            oracle.verify(&conn, &thread).await;
+                        }
                     }
 
                     const INTEGRITY_CHECK_INTERVAL: usize = 100;
@@ -852,6 +879,13 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     progress_bars
         .into_iter()
         .for_each(|mut progress_bar| progress_bar.finish());
+
+    if opts.oracle {
+        // The database was reset after the last batch, so this checks the
+        // durable state through a fresh reopen.
+        let conn = StressDb::connect(&db, ThreadId::new(usize::MAX), opts.busy_timeout).await?;
+        oracle::verify_all(&conn, opts.nr_threads).await;
+    }
 
     println!("Database file: {db_file}");
 
