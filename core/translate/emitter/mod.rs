@@ -178,6 +178,8 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    #[cfg(feature = "simulator")]
+    subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
@@ -315,6 +317,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
             dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
             trigger_context: None,
             has_temp_schema,
@@ -325,6 +329,16 @@ impl<'a> Resolver<'a> {
 
     pub fn schema(&self) -> &Schema {
         self.schema
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn set_subquery_unnesting_mode(&mut self, mode: crate::SubqueryUnnestingMode) {
+        self.subquery_unnesting_mode = mode;
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn subquery_unnesting_mode(&self) -> crate::SubqueryUnnestingMode {
+        self.subquery_unnesting_mode
     }
 
     pub fn has_temp_database(&self) -> bool {
@@ -348,6 +362,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
@@ -373,6 +389,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,

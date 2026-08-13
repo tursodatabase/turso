@@ -126,6 +126,8 @@ pub fn translate(
         },
         &prepare_options.unqualified_database_search_path,
     );
+    #[cfg(feature = "simulator")]
+    resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here

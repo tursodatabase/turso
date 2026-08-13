@@ -200,6 +200,18 @@ pub struct ReparseSchemaInner {
     phase: ReparsePhase,
 }
 
+/// Test-only control over correlated-subquery rewrites.
+#[cfg(feature = "simulator")]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryUnnestingMode {
+    /// Let the cost model choose between the correlated and rewritten plans.
+    Auto = 0,
+    /// Keep the original correlated plan.
+    Disabled = 1,
+    /// Use the rewritten plan whenever the rewrite applies.
+    Forced = 2,
+}
+
 enum ReparsePhase {
     /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
     ParseSchema {
@@ -411,6 +423,9 @@ pub struct Connection {
     pub(super) full_column_names: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
+    /// Simulator-only planner control used by the differential fuzzer.
+    #[cfg(feature = "simulator")]
+    pub(super) subquery_unnesting_mode: AtomicSubqueryUnnestingMode,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -815,6 +830,18 @@ impl Connection {
     #[inline]
     pub(crate) fn prepare_context_generation(&self) -> u64 {
         self.prepare_context_generation.load(Ordering::Acquire)
+    }
+
+    /// Choose how correlated subqueries are planned in newly prepared statements.
+    #[cfg(feature = "simulator")]
+    pub fn set_subquery_unnesting_mode(&self, mode: SubqueryUnnestingMode) {
+        self.subquery_unnesting_mode.set(mode);
+        self.bump_prepare_context_generation();
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn subquery_unnesting_mode(&self) -> SubqueryUnnestingMode {
+        self.subquery_unnesting_mode.get()
     }
 
     /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)

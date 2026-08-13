@@ -22,6 +22,9 @@ use crate::{
         ROWID_SENTINEL,
     },
     translate::{
+        expr::{
+            expr_references_any_subquery, expr_references_outer_query, expression_can_fail_on_input,
+        },
         insert::ROWID_COLUMN,
         optimizer::{
             access_method::{AccessMethod, AccessMethodParams},
@@ -884,6 +887,19 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     optimize_select_plan_with_cache(plan, resolver, &mut cache)
 }
 
+/// Whether the unnested form can be emitted.
+///
+/// Unnesting moves a subquery's WHERE clause into the outer query, so a term
+/// that is always false can travel with it, as in
+/// `WHERE a IN (SELECT z FROM t WHERE 'abc' AND t.z = o.b)`. The emitter skips
+/// loop setup for a query that returns no rows, and that setup is where a table
+/// the rewrite added to the FROM clause gets its result registers. Reading
+/// those registers afterwards is a bug, so run the correlated form instead. It
+/// returns the same rows.
+fn rewritten_form_is_emittable(rewritten: &SelectPlan) -> bool {
+    !rewritten.contains_constant_false_condition
+}
+
 #[turso_macros::trace_stack]
 fn optimize_select_plan_with_cache(
     plan: &mut SelectPlan,
@@ -895,6 +911,11 @@ fn optimize_select_plan_with_cache(
         .iter()
         .any(|subquery| subquery.correlated)
     {
+        return optimize_select_plan_form(plan, resolver, cache);
+    }
+
+    #[cfg(feature = "simulator")]
+    if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Disabled {
         return optimize_select_plan_form(plan, resolver, cache);
     }
 
@@ -922,19 +943,42 @@ fn optimize_select_plan_with_cache(
     if full_join_rewrite_is_complete {
         let rewritten_table_plan =
             find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        if !rewritten_form_is_emittable(&rewritten) {
+            return optimize_select_plan_form(plan, resolver, cache);
+        }
+        *plan = rewritten;
+        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
+        return Ok(());
+    }
+
+    #[cfg(feature = "simulator")]
+    if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
+        let rewritten_table_plan =
+            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        if !rewritten_form_is_emittable(&rewritten) {
+            return optimize_select_plan_form(plan, resolver, cache);
+        }
         *plan = rewritten;
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
         return Ok(());
     }
 
     let original_table_plan = find_select_plan_form(plan, resolver, cache, true, None)?;
+    // The query already returns no rows, so a cheaper form cannot be found.
+    if plan.contains_constant_false_condition {
+        apply_select_table_plan(plan, original_table_plan, resolver)?;
+        return Ok(());
+    }
     let cost_limit = plan.estimated_cost.map(Cost);
     let rewritten_table_plan =
         find_select_plan_form(&mut rewritten, resolver, cache, false, cost_limit)?;
-    let use_rewritten = matches!(
-        (plan.estimated_cost, rewritten.estimated_cost),
-        (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
-    );
+    // A form that returns no rows costs nothing, so it would always win the
+    // comparison below. Check that it can be emitted before comparing costs.
+    let use_rewritten = rewritten_form_is_emittable(&rewritten)
+        && matches!(
+            (plan.estimated_cost, rewritten.estimated_cost),
+            (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
+        );
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;
@@ -2710,7 +2754,11 @@ fn apply_table_access_plan(
                     );
                     *index = Some(Arc::new(ephemeral_index_build(
                         &table_references.joined_tables()[table_idx],
+                        table_references,
+                        &constraints_per_table[table_idx].constraints,
                         constraint_refs,
+                        where_clause,
+                        resolver,
                     )?));
                     *build_index = false;
                 }
@@ -3610,7 +3658,11 @@ impl Optimizable for ast::Expr {
 
 fn ephemeral_index_build(
     table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
+    where_clause: &[WhereTerm],
+    resolver: &Resolver<'_>,
 ) -> Result<Index> {
     let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
         .columns()
@@ -3662,7 +3714,15 @@ fn ephemeral_index_build(
         ephemeral: true,
         table_name: table_reference.table.get_name().to_string(),
         root_page: 0,
-        where_clause: None,
+        where_clause: autoindex_prefilter(
+            table_reference,
+            table_references,
+            constraints,
+            constraint_refs,
+            where_clause,
+            resolver,
+        )
+        .map(Box::new),
         has_rowid: table_reference
             .table
             .btree()
@@ -3672,6 +3732,98 @@ fn ephemeral_index_build(
     };
 
     Ok(ephemeral_index)
+}
+
+/// Find conditions that can filter rows while an automatic index is built.
+///
+/// For example, given:
+///
+/// ```sql
+/// SELECT *
+/// FROM accounts AS a
+/// JOIN events AS e ON e.account_id = a.id
+/// WHERE e.created_at >= '2024-01-01';
+/// ```
+///
+/// `e.account_id = a.id` needs the current account, so it is applied when the
+/// index is searched. The date condition needs only an event row and a fixed
+/// value, so rows before that date can be left out of the index entirely.
+fn autoindex_prefilter(
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    constraints: &[Constraint],
+    constraint_refs: &[RangeConstraintRef],
+    where_clause: &[WhereTerm],
+    resolver: &Resolver<'_>,
+) -> Option<Expr> {
+    let is_outer_join = table_reference
+        .join_info
+        .as_ref()
+        .is_some_and(JoinInfo::is_outer);
+    if table_reference
+        .join_info
+        .as_ref()
+        .is_some_and(JoinInfo::is_full_outer)
+    {
+        return None;
+    }
+
+    let mut term_positions = SmallVec::<[usize; 4]>::new();
+    for constraint_ref in constraint_refs {
+        for constraint_pos in [
+            constraint_ref.eq.as_ref().map(|eq| eq.constraint_pos),
+            constraint_ref.lower_bound,
+            constraint_ref.upper_bound,
+        ] {
+            let Some(constraint_pos) = constraint_pos else {
+                continue;
+            };
+            let constraint = &constraints[constraint_pos];
+            let Some(column_pos) = constraint.table_col_pos else {
+                continue;
+            };
+            let column = &table_reference.columns()[column_pos];
+            let depends_on_another_table = !constraint.lhs_mask.is_empty();
+            let is_virtual_column = column.is_virtual_generated();
+            let is_array = column.is_array();
+            let has_custom_type = resolver
+                .schema()
+                .get_type_def(&column.ty_str, table_reference.table.is_strict())
+                .is_some();
+            if depends_on_another_table || is_virtual_column || is_array || has_custom_type {
+                continue;
+            }
+
+            let term_pos = constraint.where_clause_pos.0;
+            let term = &where_clause[term_pos];
+            let runs_before_outer_join_condition =
+                is_outer_join && term.from_outer_join != Some(table_reference.internal_id);
+            let comes_from_another_outer_join = term
+                .from_outer_join
+                .is_some_and(|table_id| table_id != table_reference.internal_id);
+            let depends_on_outer_query = expr_references_outer_query(&term.expr, table_references);
+            let contains_subquery = expr_references_any_subquery(&term.expr);
+            // The build scans inner rows whose keys might never be searched.
+            // Do not make a possibly failing expression run for those rows.
+            let can_fail_for_unused_row = expression_can_fail_on_input(&term.expr);
+            let was_already_added = term_positions.contains(&term_pos);
+            if runs_before_outer_join_condition
+                || comes_from_another_outer_join
+                || depends_on_outer_query
+                || contains_subquery
+                || can_fail_for_unused_row
+                || was_already_added
+            {
+                continue;
+            }
+            term_positions.push(term_pos);
+        }
+    }
+
+    term_positions
+        .into_iter()
+        .map(|term_pos| where_clause[term_pos].expr.clone())
+        .reduce(|left, right| Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right)))
 }
 
 /// Build a [SeekDef] for a given list of [Constraint]s
