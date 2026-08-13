@@ -28,7 +28,11 @@ pub fn pick_mode(rng: &mut ThreadRng, tx_mode: TxMode) -> &'static str {
                 "FULL"
             }
         }
-        TxMode::Concurrent => *rng.choose(&["FULL", "RESTART", "TRUNCATE"]),
+        TxMode::Concurrent => match rng.random_range(0..3u32) {
+            0 => "FULL",
+            1 => "RESTART",
+            _ => "TRUNCATE",
+        },
     }
 }
 
