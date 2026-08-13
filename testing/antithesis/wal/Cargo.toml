@@ -1,0 +1,26 @@
+# Copyright 2026 the Limbo authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_wal_workload"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Antithesis workload stressing WAL commits, checkpoints, and WAL restarts across processes"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wal_workload"
+path = "src/main.rs"
+
+[dependencies]
+antithesis_sdk = { workspace = true, features = ["full", "rand_v0_9"] }
+clap = { workspace = true, features = ["derive"] }
+rand = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+turso = { workspace = true }

@@ -7702,6 +7702,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_wal_workload"
+version = "0.8.0-pre.4"
+dependencies = [
+ "antithesis_sdk",
+ "clap",
+ "rand 0.9.4",
+ "serde_json",
+ "tokio",
+ "turso",
+]
+
+[[package]]
 name = "turso_whopper"
 version = "0.8.0-pre.4"
 dependencies = [
