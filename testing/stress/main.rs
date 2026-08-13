@@ -675,16 +675,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
 
+    let mut batch_idx: u64 = 0;
     while !stop && !stress_counter.all_done() {
         let mut handles = Vec::with_capacity(opts.nr_threads);
         let reopen_requested = Arc::new(AtomicBool::new(false));
         let all_threads_ready = Arc::new(Barrier::new(stress_counter.incomplete_threads()));
 
-        for (iteration_idx, ((thread_idx, thread), mut progress_bar)) in threads
-            .iter()
-            .cloned()
-            .zip(progress_bars.iter().cloned())
-            .enumerate()
+        for ((thread_idx, thread), mut progress_bar) in
+            threads.iter().cloned().zip(progress_bars.iter().cloned())
         {
             if stress_counter.done(thread_idx) {
                 continue;
@@ -704,7 +702,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 let mut rng = ThreadRng::new(
                     global_seed
                         .wrapping_add(thread_idx as u64)
-                        .wrapping_add(iteration_idx as u64 * 1000),
+                        .wrapping_add(batch_idx.wrapping_mul(1000)),
                 );
                 let mut iteration_count_this_batch = 0;
 
@@ -838,6 +836,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         // This is what triggers MVCC recovery
         db.lock().await.reset();
         clear_database_registry();
+        batch_idx += 1;
     }
 
     progress_bars
