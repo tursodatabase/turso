@@ -732,6 +732,9 @@ impl Whopper {
         let db = {
             let db_opts = DatabaseOpts::new()
                 .with_encryption(encryption_opts.is_some())
+                // Index methods power the FTS workloads; the flag only
+                // gates `CREATE INDEX ... USING`, so it is safe globally.
+                .with_index_method(true)
                 .with_experimental_mvcc_passive_checkpoint(
                     opts.experimental_mvcc_passive_checkpoint,
                 );
@@ -1649,6 +1652,7 @@ impl Whopper {
     fn open_connections(&mut self) -> anyhow::Result<()> {
         let db_opts = DatabaseOpts::new()
             .with_encryption(self.encryption_opts.is_some())
+            .with_index_method(true)
             .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
         let db = Database::open_file_with_flags(
             self.io.clone(),

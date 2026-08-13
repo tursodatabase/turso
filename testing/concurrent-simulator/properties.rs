@@ -305,6 +305,39 @@ impl Property for IntegrityCheckProperty {
     }
 }
 
+/// The FTS self-differential: `fts_match` and a base-table token scan run
+/// inside one statement (one snapshot), so their id sets must be equal —
+/// the operation's SQL reports the size of the symmetric difference.
+pub struct FtsSelfDifferentialProperty;
+
+impl Property for FtsSelfDifferentialProperty {
+    fn finish_op(
+        &mut self,
+        step: usize,
+        fiber_id: usize,
+        _txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        let Operation::FtsMatchDifferential { token } = op else {
+            return Ok(());
+        };
+        let Ok(rows) = result else {
+            // Contention errors are the driver's business; nothing to check.
+            return Ok(());
+        };
+        match rows.first().and_then(|row| row.first()) {
+            Some(value) if value.as_int() == Some(0) => Ok(()),
+            other => bail!(
+                "step {step} fiber {fiber_id}: fts_match and the base-table \
+                 scan disagree for token {token:?}: symmetric difference {other:?}"
+            ),
+        }
+    }
+}
+
 /// Check if an integrity_check result is informational (not actual corruption).
 /// In MVCC mode, "Page N: never used" is expected for allocated but unused pages.
 fn is_integrity_check_informational(text: &str) -> bool {

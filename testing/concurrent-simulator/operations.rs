@@ -154,6 +154,11 @@ pub enum Operation {
     /// the table some non-trivial churn so the watermark/btree interplay
     /// has fewer trivially-flat scenarios.
     AutoincDelete { id: i64 },
+    /// Self-differential FTS check: within one statement (one snapshot),
+    /// compare the ids `fts_match` returns against a base-table token scan.
+    /// The result must be 0 (empty symmetric difference); the
+    /// `FtsSelfDifferentialProperty` asserts it.
+    FtsMatchDifferential { token: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -297,6 +302,23 @@ impl Operation {
                 format!(
                     "DELETE FROM {table} WHERE id = {id} RETURNING id",
                     table = crate::AUTOINC_TABLE_NAME
+                )
+            }
+            Operation::FtsMatchDifferential { token } => {
+                // Bodies are space-joined single tokens, so the padded LIKE
+                // is an exact token match — an FTS-free oracle in the same
+                // snapshot as the fts_match probe.
+                let table = crate::workloads::FTS_SIM_TABLE;
+                format!(
+                    "SELECT \
+                       (SELECT count(*) FROM (\
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')) \
+                     + (SELECT count(*) FROM (\
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
                 )
             }
         }
