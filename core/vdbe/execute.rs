@@ -3522,6 +3522,7 @@ pub fn halt(
     }
 
     if program.is_trigger_subprogram() {
+        index_method_pre_commit_all(state, pager)?;
         return Ok(InsnFunctionStepResult::Done);
     }
 
