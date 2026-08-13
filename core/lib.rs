@@ -119,6 +119,8 @@ pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
 };
+#[cfg(feature = "simulator")]
+pub use connection::SubqueryUnnestingMode;
 pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
