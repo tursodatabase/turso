@@ -4,15 +4,15 @@ use turso_parser::ast::{CompoundOperator, Distinctness, Materialized, NullsOrder
 
 use super::{
     BoundColumnTypePrograms, ColumnRef, CteId, DatabaseId, Expr, OutputId, QueryBlockId, QueryId,
-    ResolvedIndex, ResolvedTable, SourceId, TypeFact, WindowSpec,
+    ResolvedIndex, ResolvedTable, ResolvedWindow, SourceId, TypeFact,
 };
 use crate::vdbe::affinity::Affinity;
 
 #[derive(Clone, Debug)]
 pub struct Query {
     pub id: QueryId,
-    /// Lexical query whose scope this query may capture. Root statement and
-    /// uncorrelated CTE queries have no parent.
+    /// Lexical query whose scope this query may capture. Queries without an
+    /// enclosing query scope have no parent.
     pub parent: Option<QueryId>,
     /// Exact source identities read from outside this query's own blocks.
     /// Kept sorted by document-local identity for stable planning and tests.
@@ -41,7 +41,23 @@ pub struct QueryBlock {
     pub aggregate_count: usize,
     /// Number of stable window-function identities owned by this block.
     pub window_function_count: usize,
+    /// Effective windows referenced by functions in this block.
+    pub windows: Vec<ResolvedWindow>,
     pub body: QueryBlockBody,
+}
+
+impl QueryBlock {
+    pub(crate) fn new(id: QueryBlockId, body: QueryBlockBody) -> Self {
+        Self {
+            id,
+            from: None,
+            outputs: Vec::new(),
+            aggregate_count: 0,
+            window_function_count: 0,
+            windows: Vec::new(),
+            body,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +66,6 @@ pub enum QueryBlockBody {
         distinctness: Option<Distinctness>,
         filter: Option<Expr>,
         grouping: Option<Grouping>,
-        windows: Vec<NamedWindow>,
     },
     Values {
         rows: Vec<Vec<Expr>>,
@@ -95,12 +110,6 @@ pub struct Grouping {
     /// Resolved SQL collations aligned with `keys`.
     pub key_collations: Vec<Option<super::ResolvedCollation>>,
     pub having: Option<Expr>,
-}
-
-#[derive(Clone, Debug)]
-pub struct NamedWindow {
-    pub name: String,
-    pub spec: WindowSpec,
 }
 
 #[derive(Clone, Debug)]
@@ -243,11 +252,19 @@ pub enum SourceKind {
     },
     Cte(CteId),
     Derived(QueryId),
+    FromGroup(FromGroup),
     RecursiveInput(CteId),
     Pseudo {
         kind: PseudoSource,
         table: ResolvedTable,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct FromGroup {
+    pub from: Box<From>,
+    /// Value supplied by each group column, aligned with `Source::columns`.
+    pub columns: Vec<Expr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

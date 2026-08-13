@@ -8,10 +8,10 @@ use turso_parser::ast::{
 };
 
 use super::{
-    BoundCastPrograms, BoundSchemaCall, DatabaseId, MergedColumnValue, OutputId, QueryBlockId,
-    QueryId, ResolvedCollation, ResolvedFunction, ResolvedTable, ResolvedType, SourceId, TypeFact,
+    BoundCastPrograms, BoundSchemaCall, MergedColumnValue, OutputId, QueryBlockId, QueryId,
+    ResolvedCollation, ResolvedFunction, ResolvedSequence, ResolvedTable, ResolvedType, SourceId,
+    TypeFact, WindowId,
 };
-use crate::schema::Sequence;
 use crate::sync::Arc;
 use crate::vdbe::affinity::Affinity;
 
@@ -69,10 +69,11 @@ pub struct OrderTerm {
 }
 
 #[derive(Clone, Debug)]
-pub struct WindowSpec {
+pub struct ResolvedWindow {
+    pub id: WindowId,
     pub partition_by: Vec<Expr>,
     pub order_by: Vec<OrderTerm>,
-    pub frame: Option<WindowFrame>,
+    pub frame: WindowFrame,
 }
 
 #[derive(Clone, Debug)]
@@ -99,7 +100,6 @@ pub enum CustomTypeOperation {
     UnionValue {
         union_type: ResolvedType,
         tag_index: u8,
-        result_type: TypeFact,
     },
     UnionTag {
         union_type: ResolvedType,
@@ -108,12 +108,10 @@ pub enum CustomTypeOperation {
     UnionExtract {
         union_type: ResolvedType,
         tag_index: u8,
-        result_type: TypeFact,
     },
     StructExtract {
         struct_type: ResolvedType,
         field_index: usize,
-        result_type: TypeFact,
     },
 }
 
@@ -172,44 +170,100 @@ pub enum SequenceOperationKind {
 #[derive(Clone, Debug)]
 pub struct SequenceOperation {
     pub kind: SequenceOperationKind,
-    pub database: DatabaseId,
     /// The string supplied by SQL, without its outer quotes. Runtime currval
     /// tracking uses this spelling, including an optional schema prefix.
     pub user_name: String,
     pub normalized_name: String,
+    pub sequence: ResolvedSequence,
     pub backing_table: ResolvedTable,
     /// Present only for the internal sequence behind an AUTOINCREMENT table.
     /// Physical lowering uses this frozen object to keep sqlite_sequence in
     /// sync without reopening the catalog.
     pub sqlite_sequence: Option<ResolvedTable>,
-    pub sequence: Arc<Sequence>,
-    pub schema_cookie: u32,
+}
+
+#[derive(Clone, Debug)]
+pub enum FunctionOperation {
+    Ordinary,
+    CustomType(CustomTypeOperation),
+    Sequence(SequenceOperation),
 }
 
 #[derive(Clone, Debug)]
 pub struct FunctionCall {
     pub function: ResolvedFunction,
     /// How this call is evaluated after semantic analysis. Aggregate and
-    /// window identities are owned by one query block; physical planning maps
-    /// those identities to runtime state without matching expression trees.
+    /// window identities are owned by one query block, so later stages do not
+    /// need to match expression trees to identify shared function state.
     pub evaluation: FunctionEvaluation,
-    pub star: bool,
-    pub arguments: Vec<Expr>,
-    pub distinctness: Option<Distinctness>,
-    pub argument_order: Vec<OrderTerm>,
-    pub within_group: Vec<OrderTerm>,
-    pub filter: Option<Box<Expr>>,
-    pub window: Option<WindowSpec>,
+    pub arguments: FunctionArguments,
     pub result_type: TypeFact,
-    pub custom_type_operation: Option<CustomTypeOperation>,
-    pub sequence_operation: Option<SequenceOperation>,
+    pub operation: FunctionOperation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Resolved function argument shape. Star cannot coexist with expression
+/// arguments.
+#[derive(Clone, Debug)]
+pub enum FunctionArguments {
+    Star,
+    Expressions {
+        values: Vec<Expr>,
+        distinctness: Option<Distinctness>,
+        order_by: Vec<OrderTerm>,
+    },
+    OrderedSet {
+        direct: Vec<Expr>,
+        order_by: Box<OrderTerm>,
+    },
+}
+
+impl FunctionArguments {
+    pub fn expressions(&self) -> &[Expr] {
+        match self {
+            Self::Star => &[],
+            Self::Expressions { values, .. } => values,
+            Self::OrderedSet { direct, .. } => direct,
+        }
+    }
+
+    pub fn order_terms(&self) -> &[OrderTerm] {
+        match self {
+            Self::Star => &[],
+            Self::Expressions { order_by, .. } => order_by,
+            Self::OrderedSet { order_by, .. } => std::slice::from_ref(order_by.as_ref()),
+        }
+    }
+
+    pub fn distinctness(&self) -> Option<Distinctness> {
+        match self {
+            Self::Star => None,
+            Self::Expressions { distinctness, .. } => *distinctness,
+            Self::OrderedSet { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum FunctionEvaluation {
     Scalar,
-    Aggregate(AggregateId),
-    Window(WindowFunctionId),
+    Aggregate {
+        id: AggregateId,
+        filter: Option<Box<Expr>>,
+    },
+    Window {
+        id: WindowFunctionId,
+        window: WindowId,
+        filter: Option<Box<Expr>>,
+    },
+}
+
+impl FunctionEvaluation {
+    pub fn filter(&self) -> Option<&Expr> {
+        match self {
+            Self::Aggregate { filter, .. } | Self::Window { filter, .. } => filter.as_deref(),
+            Self::Scalar => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -256,6 +310,9 @@ pub enum SubqueryExpr {
     Scalar {
         query: QueryId,
         output: usize,
+    },
+    Row {
+        query: QueryId,
     },
     Exists(QueryId),
     In {
@@ -369,7 +426,9 @@ impl Expr {
             | Self::Column(_)
             | Self::RowId(_)
             | Self::Output(_)
-            | Self::Subquery(SubqueryExpr::Scalar { .. } | SubqueryExpr::Exists(_)) => {}
+            | Self::Subquery(
+                SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
+            ) => {}
             Self::MergedColumn(column) => column.left.walk(visitor),
             Self::Unary { expr, .. }
             | Self::IsNull(expr)
@@ -421,13 +480,9 @@ impl Expr {
                 }
             }
             Self::Function(call) => {
-                walk_exprs(&call.arguments, visitor);
-                walk_order_terms(&call.argument_order, visitor);
-                walk_order_terms(&call.within_group, visitor);
-                walk_optional_expr(call.filter.as_deref(), visitor);
-                if let Some(window) = &call.window {
-                    walk_window_spec(window, visitor);
-                }
+                walk_exprs(call.arguments.expressions(), visitor);
+                walk_order_terms(call.arguments.order_terms(), visitor);
+                walk_optional_expr(call.evaluation.filter(), visitor);
             }
             Self::InList { lhs, values, .. } => {
                 lhs.walk(visitor);
@@ -477,23 +532,4 @@ fn walk_order_terms<'expr>(terms: &'expr [OrderTerm], visitor: &mut impl FnMut(&
 
 fn walk_schema_call<'expr>(call: &'expr BoundSchemaCall, visitor: &mut impl FnMut(&'expr Expr)) {
     walk_exprs(&call.arguments, visitor);
-}
-
-fn walk_window_spec<'expr>(window: &'expr WindowSpec, visitor: &mut impl FnMut(&'expr Expr)) {
-    walk_exprs(&window.partition_by, visitor);
-    walk_order_terms(&window.order_by, visitor);
-    let Some(frame) = &window.frame else {
-        return;
-    };
-    walk_window_bound(&frame.start, visitor);
-    if let Some(end) = &frame.end {
-        walk_window_bound(end, visitor);
-    }
-}
-
-fn walk_window_bound<'expr>(bound: &'expr WindowFrameBound, visitor: &mut impl FnMut(&'expr Expr)) {
-    if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
-    {
-        expression.walk(visitor);
-    }
 }

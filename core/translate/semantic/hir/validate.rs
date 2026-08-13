@@ -6,13 +6,6 @@ use super::*;
 
 type ValidationResult<T = ()> = std::result::Result<T, HirValidationError>;
 
-fn expression_width(expression: &Expr) -> usize {
-    match expression {
-        Expr::Row(values) => values.len(),
-        _ => 1,
-    }
-}
-
 /// A broken document-local identity, owner, shape, or reachability invariant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HirValidationError {
@@ -110,7 +103,7 @@ impl<'document> HirValidator<'document> {
         if let Some(sequence) = &cdc.sequence {
             self.visit_sequence_operation(sequence)?;
             self.require(
-                sequence.database.index() == crate::MAIN_DB_ID,
+                sequence.sequence.database().map(DatabaseId::index) == Some(crate::MAIN_DB_ID),
                 "CDC sequence must belong to the main database",
             )?;
         }
@@ -200,14 +193,26 @@ impl<'document> HirValidator<'document> {
         match root {
             HirRoot::Query(root) => {
                 self.visit_query(root.query)?;
-                self.visit_optional_trigger_environment(root.trigger.as_ref())
+                Ok(())
             }
-            HirRoot::Insert(insert) => self.visit_insert(insert),
-            HirRoot::Update(update) => self.visit_update(update),
-            HirRoot::Delete(delete) => self.visit_delete(delete),
-            HirRoot::TriggerPredicate(predicate) => {
-                self.visit_trigger_environment(&predicate.environment)?;
-                self.visit_expr(&predicate.expression)
+            HirRoot::Insert(insert) => self.visit_insert(insert, false),
+            HirRoot::Update(update) => self.visit_update(update, false),
+            HirRoot::Delete(delete) => self.visit_delete(delete, false),
+            HirRoot::Trigger(root) => {
+                self.visit_trigger_environment(&root.environment)?;
+                match &root.body {
+                    TriggerBody::Predicate(expression) => self.visit_expr(expression),
+                    TriggerBody::Command(command) => self.visit_trigger_command(command),
+                    TriggerBody::Program(program) => {
+                        if let Some(predicate) = &program.predicate {
+                            self.visit_expr(predicate)?;
+                        }
+                        for command in &program.commands {
+                            self.visit_trigger_command(command)?;
+                        }
+                        Ok(())
+                    }
+                }
             }
             HirRoot::SchemaExpressions(root) => {
                 self.visit_source(root.source, Some(SourceOwner::Root))?;
@@ -219,50 +224,124 @@ impl<'document> HirValidator<'document> {
         }
     }
 
-    fn visit_insert(&self, insert: &Insert) -> ValidationResult {
+    fn visit_trigger_command(&self, command: &TriggerCommand) -> ValidationResult {
+        match command {
+            TriggerCommand::Select(query) => self.visit_query(*query),
+            TriggerCommand::Insert(insert) => self.visit_insert(insert, true),
+            TriggerCommand::Update(update) => self.visit_update(update, true),
+            TriggerCommand::Delete(delete) => self.visit_delete(delete, true),
+        }
+    }
+
+    fn visit_insert(&self, insert: &Insert, trigger_command: bool) -> ValidationResult {
         self.visit_source(insert.target, Some(SourceOwner::Root))?;
-        self.require_complete_row_image(insert.target)?;
-        self.require_complete_index_metadata(insert.target)?;
-        self.visit_dml_triggers(
-            insert.target,
-            &insert.triggers,
-            turso_parser::ast::TriggerEvent::Insert,
-            &[],
-        )?;
-        let upsert_assignments = insert
-            .upserts
-            .iter()
-            .filter_map(|upsert| match &upsert.action {
-                UpsertAction::Update { assignments, .. } => Some(assignments.as_slice()),
-                UpsertAction::Nothing => None,
-            })
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-        self.visit_dml_triggers(
-            insert.target,
-            &insert.upsert_triggers,
-            turso_parser::ast::TriggerEvent::Update,
-            &upsert_assignments,
-        )?;
-        self.visit_dml_foreign_keys(insert.target, &insert.foreign_keys)?;
-        self.visit_optional_catalog_object(
-            insert.autoincrement.as_ref(),
-            "AUTOINCREMENT sequence table",
-        )?;
-        if let Some(sequence) = &insert.autoincrement_sequence {
-            self.visit_sequence_operation(sequence)?;
-            self.require(
-                insert.autoincrement.is_some(),
-                "MVCC AUTOINCREMENT sequence has no sqlite_sequence table",
-            )?;
+        let target = self.source(insert.target)?;
+        let SourceKind::Table(target_table) = &target.kind else {
+            return Err(HirValidationError::new(
+                "INSERT target source is not a table",
+            ));
+        };
+        match &insert.target_kind {
+            InsertTargetKind::BTree {
+                autoincrement,
+                defaults,
+                triggers,
+                foreign_keys,
+            } => {
+                self.require(
+                    target_table.value().btree().is_some(),
+                    "B-tree INSERT metadata belongs to a non-B-tree target",
+                )?;
+                self.require_complete_row_image(insert.target)?;
+                self.require_complete_index_metadata(insert.target)?;
+                self.visit_dml_triggers(
+                    insert.target,
+                    &triggers.insert,
+                    turso_parser::ast::TriggerEvent::Insert,
+                    &[],
+                )?;
+                let upsert_assignments = insert
+                    .upserts
+                    .iter()
+                    .filter_map(|upsert| match &upsert.action {
+                        UpsertAction::Update { assignments, .. } => Some(assignments.as_slice()),
+                        UpsertAction::Nothing => None,
+                    })
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.visit_dml_triggers(
+                    insert.target,
+                    &triggers.upsert_update,
+                    turso_parser::ast::TriggerEvent::Update,
+                    &upsert_assignments,
+                )?;
+                self.visit_dml_foreign_keys(insert.target, insert.target, foreign_keys)?;
+                let target_has_autoincrement = target_table
+                    .value()
+                    .btree()
+                    .is_some_and(|table| table.has_autoincrement);
+                self.require(
+                    target_has_autoincrement == autoincrement.is_some(),
+                    "INSERT AUTOINCREMENT metadata disagrees with its target",
+                )?;
+                if let Some(autoincrement) = autoincrement {
+                    self.visit_catalog_object(
+                        &autoincrement.sqlite_sequence,
+                        "AUTOINCREMENT sqlite_sequence table",
+                    )?;
+                    self.require(
+                        autoincrement.sqlite_sequence.database() == target_table.database(),
+                        "INSERT target and sqlite_sequence belong to different databases",
+                    )?;
+                    self.require(
+                        autoincrement
+                            .sqlite_sequence
+                            .value()
+                            .get_name()
+                            .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
+                        "INSERT AUTOINCREMENT metadata carries the wrong sqlite_sequence table",
+                    )?;
+                    if let Some(sequence) = &autoincrement.mvcc_sequence {
+                        self.visit_sequence_operation(sequence)?;
+                        self.require(
+                            sequence.sqlite_sequence.as_ref()
+                                == Some(&autoincrement.sqlite_sequence),
+                            "MVCC AUTOINCREMENT sequence disagrees with sqlite_sequence",
+                        )?;
+                    }
+                }
+                for default in defaults {
+                    self.validate_column_position(insert.target, default.column)?;
+                    self.visit_expr(&default.value)?;
+                }
+            }
+            InsertTargetKind::Virtual => {
+                self.require(
+                    target_table.value().virtual_table().is_some(),
+                    "virtual INSERT metadata belongs to a non-virtual target",
+                )?;
+                self.require(
+                    target.check_constraints.is_none()
+                        && matches!(target.index_coverage, IndexCoverage::Selective),
+                    "virtual-table INSERT target carries B-tree constraint metadata",
+                )?;
+                self.require(
+                    insert.upserts.is_empty() && insert.excluded_source.is_none(),
+                    "virtual-table INSERT carries UPSERT metadata",
+                )?;
+                self.require(
+                    !matches!(insert.source, InsertSource::Query(_)),
+                    "virtual-table INSERT carries a query source",
+                )?;
+                self.require(
+                    !trigger_command,
+                    "trigger command writes an unsafe virtual-table target",
+                )?;
+            }
         }
         for target in &insert.columns {
             self.validate_target_column(insert.target, target.column)?;
-        }
-        for default in &insert.defaults {
-            self.validate_column_position(insert.target, default.column)?;
-            self.visit_expr(&default.value)?;
         }
         match &insert.source {
             InsertSource::DefaultValues => {}
@@ -319,31 +398,66 @@ impl<'document> HirValidator<'document> {
             self.visit_source(excluded, Some(SourceOwner::Root))?;
             self.require_pseudo_source(excluded, PseudoSource::Excluded)?;
         }
-        self.visit_optional_returning(insert.returning.as_ref())?;
-        self.visit_optional_trigger_environment(insert.trigger.as_ref())
+        self.visit_optional_returning(insert.returning.as_ref())
     }
 
-    fn visit_update(&self, update: &Update) -> ValidationResult {
+    fn visit_update(&self, update: &Update, trigger_command: bool) -> ValidationResult {
         self.visit_source(update.target, Some(SourceOwner::Root))?;
         self.visit_source(update.new_source, Some(SourceOwner::Root))?;
+        let target_table = match &self.source(update.target)?.kind {
+            SourceKind::Table(table) => table,
+            _ => return self.invalid("UPDATE target is not a catalog table source"),
+        };
+        self.require_pseudo_source(update.new_source, PseudoSource::New)?;
+        self.require_pseudo_table(update.new_source, target_table)?;
         self.require(
             update.target != update.new_source,
             "UPDATE OLD and NEW rows must have distinct source identities",
         )?;
-        self.require_complete_row_image(update.target)?;
-        self.require_complete_row_image(update.new_source)?;
-        self.require_complete_index_metadata(update.target)?;
-        self.require_complete_index_metadata(update.new_source)?;
-        self.visit_dml_triggers(
-            update.target,
-            &update.triggers,
-            turso_parser::ast::TriggerEvent::Update,
-            &update.assignments,
-        )?;
-        self.visit_dml_foreign_keys(update.target, &update.foreign_keys)?;
-        for default in &update.defaults {
-            self.validate_column_position(update.new_source, default.column)?;
-            self.visit_expr(&default.value)?;
+        match &update.target_kind {
+            UpdateTargetKind::BTree {
+                defaults,
+                triggers,
+                foreign_keys,
+            } => {
+                self.require(
+                    target_table.value().btree().is_some(),
+                    "B-tree UPDATE metadata belongs to a non-B-tree target",
+                )?;
+                self.require_complete_row_image(update.target)?;
+                self.require_complete_row_image(update.new_source)?;
+                self.require_complete_index_metadata(update.target)?;
+                self.require_complete_index_metadata(update.new_source)?;
+                self.visit_dml_triggers(
+                    update.target,
+                    triggers,
+                    turso_parser::ast::TriggerEvent::Update,
+                    &update.assignments,
+                )?;
+                self.visit_dml_foreign_keys(update.target, update.new_source, foreign_keys)?;
+                for default in defaults {
+                    self.validate_column_position(update.new_source, default.column)?;
+                    self.visit_expr(&default.value)?;
+                }
+            }
+            UpdateTargetKind::Virtual => {
+                self.require(
+                    target_table.value().virtual_table().is_some(),
+                    "virtual UPDATE metadata belongs to a non-virtual target",
+                )?;
+                for source in [update.target, update.new_source] {
+                    let source = self.source(source)?;
+                    self.require(
+                        source.check_constraints.is_none()
+                            && matches!(source.index_coverage, IndexCoverage::Selective),
+                        "virtual-table UPDATE row carries B-tree constraint metadata",
+                    )?;
+                }
+                self.require(
+                    !trigger_command,
+                    "trigger command writes an unsafe virtual-table target",
+                )?;
+            }
         }
         if let Some(from) = &update.from {
             self.visit_from(from, SourceOwner::Root)?;
@@ -352,26 +466,55 @@ impl<'document> HirValidator<'document> {
         self.visit_optional_expr(update.predicate.as_ref())?;
         self.visit_order_terms(&update.order_by)?;
         self.visit_optional_limit(update.limit.as_ref())?;
-        self.visit_optional_returning(update.returning.as_ref())?;
-        self.visit_optional_trigger_environment(update.trigger.as_ref())
+        self.visit_optional_returning(update.returning.as_ref())
     }
 
-    fn visit_delete(&self, delete: &Delete) -> ValidationResult {
+    fn visit_delete(&self, delete: &Delete, trigger_command: bool) -> ValidationResult {
         self.visit_source(delete.target, Some(SourceOwner::Root))?;
-        self.require_complete_row_image(delete.target)?;
-        self.require_complete_index_metadata(delete.target)?;
-        self.visit_dml_triggers(
-            delete.target,
-            &delete.triggers,
-            turso_parser::ast::TriggerEvent::Delete,
-            &[],
-        )?;
-        self.visit_dml_foreign_keys(delete.target, &delete.foreign_keys)?;
+        let target_table = match &self.source(delete.target)?.kind {
+            SourceKind::Table(table) => table,
+            _ => return self.invalid("DELETE target is not a catalog table source"),
+        };
+        match &delete.target_kind {
+            DeleteTargetKind::BTree {
+                triggers,
+                foreign_keys,
+            } => {
+                self.require(
+                    target_table.value().btree().is_some(),
+                    "B-tree DELETE metadata belongs to a non-B-tree target",
+                )?;
+                self.require_complete_row_image(delete.target)?;
+                self.require_complete_index_metadata(delete.target)?;
+                self.visit_dml_triggers(
+                    delete.target,
+                    triggers,
+                    turso_parser::ast::TriggerEvent::Delete,
+                    &[],
+                )?;
+                self.visit_dml_foreign_keys(delete.target, delete.target, foreign_keys)?;
+            }
+            DeleteTargetKind::Virtual => {
+                self.require(
+                    target_table.value().virtual_table().is_some(),
+                    "virtual DELETE metadata belongs to a non-virtual target",
+                )?;
+                let source = self.source(delete.target)?;
+                self.require(
+                    source.check_constraints.is_none()
+                        && matches!(source.index_coverage, IndexCoverage::Selective),
+                    "virtual-table DELETE row carries B-tree constraint metadata",
+                )?;
+                self.require(
+                    !trigger_command,
+                    "trigger command writes an unsafe virtual-table target",
+                )?;
+            }
+        }
         self.visit_optional_expr(delete.predicate.as_ref())?;
         self.visit_order_terms(&delete.order_by)?;
         self.visit_optional_limit(delete.limit.as_ref())?;
-        self.visit_optional_returning(delete.returning.as_ref())?;
-        self.visit_optional_trigger_environment(delete.trigger.as_ref())
+        self.visit_optional_returning(delete.returning.as_ref())
     }
 
     fn visit_assignments(&self, target: SourceId, assignments: &[Assignment]) -> ValidationResult {
@@ -380,6 +523,14 @@ impl<'document> HirValidator<'document> {
                 self.validate_target_column(target, *column)?;
             }
             self.visit_expr(&assignment.value)?;
+            let value_width = self.expression_width(&assignment.value)?;
+            self.require(
+                assignment.columns.len() == value_width,
+                format!(
+                    "assignment has {} target columns but value width {value_width}",
+                    assignment.columns.len()
+                ),
+            )?;
         }
         Ok(())
     }
@@ -405,15 +556,6 @@ impl<'document> HirValidator<'document> {
             self.visit_output(output, OutputId::root(index))?;
         }
         Ok(())
-    }
-
-    fn visit_optional_trigger_environment(
-        &self,
-        environment: Option<&TriggerEnvironment>,
-    ) -> ValidationResult {
-        environment.map_or(Ok(()), |environment| {
-            self.visit_trigger_environment(environment)
-        })
     }
 
     fn visit_trigger_environment(&self, environment: &TriggerEnvironment) -> ValidationResult {
@@ -517,6 +659,7 @@ impl<'document> HirValidator<'document> {
     fn visit_dml_foreign_keys(
         &self,
         target: SourceId,
+        outgoing_child_source: SourceId,
         foreign_keys: &DmlForeignKeys,
     ) -> ValidationResult {
         let target_source = self.source(target)?;
@@ -533,7 +676,11 @@ impl<'document> HirValidator<'document> {
                 &foreign_key.child_table == target_table,
                 format!("outgoing foreign key belongs to another DML target than {target}"),
             )?;
-            self.visit_resolved_foreign_key(foreign_key, true)?;
+            self.require(
+                foreign_key.child_source == outgoing_child_source,
+                "outgoing foreign key uses the wrong DML row source",
+            )?;
+            self.visit_resolved_foreign_key(foreign_key, true, outgoing_child_source != target)?;
             self.require(
                 outgoing_identities.insert((
                     foreign_key.child_table.database(),
@@ -549,7 +696,7 @@ impl<'document> HirValidator<'document> {
                 &foreign_key.parent_table == target_table,
                 format!("incoming foreign key belongs to another DML target than {target}"),
             )?;
-            self.visit_resolved_foreign_key(foreign_key, false)?;
+            self.visit_resolved_foreign_key(foreign_key, false, false)?;
             self.require(
                 incoming_identities.insert((
                     foreign_key.child_table.database(),
@@ -566,6 +713,7 @@ impl<'document> HirValidator<'document> {
         &self,
         foreign_key: &ResolvedForeignKey,
         require_parent_index: bool,
+        allow_new_child_source: bool,
     ) -> ValidationResult {
         self.visit_catalog_object(&foreign_key.child_table, "foreign-key child table")?;
         self.visit_catalog_object(&foreign_key.parent_table, "foreign-key parent table")?;
@@ -574,9 +722,17 @@ impl<'document> HirValidator<'document> {
             Some(crate::translate::semantic::hir::SourceOwner::Root),
         )?;
         let child_source = self.source(foreign_key.child_source)?;
+        let child_source_matches = match &child_source.kind {
+            SourceKind::Table(table) => table == &foreign_key.child_table,
+            SourceKind::Pseudo {
+                kind: PseudoSource::New,
+                table,
+            } => allow_new_child_source && table == &foreign_key.child_table,
+            _ => false,
+        };
         self.require(
-            matches!(&child_source.kind, SourceKind::Table(table) if table == &foreign_key.child_table),
-            "foreign-key child scan source belongs to another table",
+            child_source_matches,
+            "foreign-key child source belongs to another table or row identity",
         )?;
         self.require(
             foreign_key.child_table.database() == foreign_key.parent_table.database(),
@@ -837,22 +993,29 @@ impl<'document> HirValidator<'document> {
             let Some(from) = &block.from else {
                 continue;
             };
-            self.add_source_cte(from.first, &mut ctes)?;
-            for join in &from.joins {
-                self.add_source_cte(join.right, &mut ctes)?;
-            }
+            self.add_from_ctes(from, &mut ctes)?;
         }
         Ok(ctes)
     }
 
+    fn add_from_ctes(&self, from: &From, ctes: &mut Vec<CteId>) -> ValidationResult {
+        self.add_source_cte(from.first, ctes)?;
+        for join in &from.joins {
+            self.add_source_cte(join.right, ctes)?;
+        }
+        Ok(())
+    }
+
     fn add_source_cte(&self, source: SourceId, ctes: &mut Vec<CteId>) -> ValidationResult {
         let source = self.source(source)?;
-        let cte = match source.kind {
-            SourceKind::Cte(cte) | SourceKind::RecursiveInput(cte) => cte,
-            _ => return Ok(()),
-        };
-        if !ctes.contains(&cte) {
-            ctes.push(cte);
+        match &source.kind {
+            SourceKind::Cte(cte) | SourceKind::RecursiveInput(cte) => {
+                if !ctes.contains(cte) {
+                    ctes.push(*cte);
+                }
+            }
+            SourceKind::FromGroup(group) => self.add_from_ctes(&group.from, ctes)?,
+            _ => {}
         }
         Ok(())
     }
@@ -866,10 +1029,7 @@ impl<'document> HirValidator<'document> {
         }
         match &block.body {
             QueryBlockBody::Select {
-                filter,
-                grouping,
-                windows,
-                ..
+                filter, grouping, ..
             } => {
                 self.visit_optional_expr(filter.as_ref())?;
                 if let Some(grouping) = grouping {
@@ -893,9 +1053,6 @@ impl<'document> HirValidator<'document> {
                     }
                     self.visit_optional_expr(grouping.having.as_ref())?;
                 }
-                for window in windows {
-                    self.visit_window_spec(&window.spec)?;
-                }
             }
             QueryBlockBody::Values { rows } => {
                 for row in rows {
@@ -912,6 +1069,13 @@ impl<'document> HirValidator<'document> {
                 }
             }
         }
+        for (index, window) in block.windows.iter().enumerate() {
+            self.require(
+                window.id == WindowId::new(block.id, index),
+                format!("window {:?} is stored at the wrong block index", window.id),
+            )?;
+            self.visit_resolved_window(window)?;
+        }
         Ok(())
     }
 
@@ -923,7 +1087,21 @@ impl<'document> HirValidator<'document> {
                 JoinConstraint::None => {}
                 JoinConstraint::On(expression) => self.visit_expr(expression)?,
                 JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
+                    let expected_value = match join.kind {
+                        JoinKind::Right => MergedColumnValue::Right,
+                        JoinKind::Full => MergedColumnValue::Coalesce,
+                        JoinKind::Comma | JoinKind::Inner | JoinKind::Cross | JoinKind::Left => {
+                            MergedColumnValue::Left
+                        }
+                    };
                     for column in columns {
+                        self.require(
+                            column.value == expected_value,
+                            format!(
+                                "join source {} has {:?} merged value for {:?} join",
+                                join.right, column.value, join.kind
+                            ),
+                        )?;
                         self.require(
                             column.right.source == join.right,
                             format!(
@@ -988,6 +1166,23 @@ impl<'document> HirValidator<'document> {
             SourceKind::Pseudo { table, .. } => self.visit_source_table(source, table, false)?,
             SourceKind::TableFunction { table, arguments } => {
                 self.visit_source_table(source, table, false)?;
+                self.require(
+                    table.value().virtual_table().is_some(),
+                    format!("table-function source {id} does not resolve to a virtual table"),
+                )?;
+                let maximum = table
+                    .value()
+                    .columns()
+                    .iter()
+                    .filter(|column| column.hidden())
+                    .count();
+                self.require(
+                    arguments.len() <= maximum,
+                    format!(
+                        "table-function source {id} has {} arguments but accepts at most {maximum}",
+                        arguments.len()
+                    ),
+                )?;
                 self.visit_exprs(arguments)?;
             }
             SourceKind::Cte(cte) | SourceKind::RecursiveInput(cte) => {
@@ -1009,6 +1204,16 @@ impl<'document> HirValidator<'document> {
                     ),
                 )?;
             }
+            SourceKind::FromGroup(group) => {
+                self.require(
+                    group.columns.len() == width,
+                    format!(
+                        "FROM group source {id} column mapping width does not match its columns"
+                    ),
+                )?;
+                self.visit_from(&group.from, source.owner)?;
+                self.visit_exprs(&group.columns)?;
+            }
         }
 
         for column in &source.columns {
@@ -1017,7 +1222,17 @@ impl<'document> HirValidator<'document> {
         }
         match &source.index_hint {
             IndexHint::None | IndexHint::NotIndexed => {}
-            IndexHint::Indexed(index) => self.visit_catalog_object(index, "index hint")?,
+            IndexHint::Indexed(index) => {
+                self.visit_catalog_object(index, "index hint")?;
+                self.require(
+                    index.database() == source.database,
+                    format!("source {id} index hint belongs to a different database"),
+                )?;
+                self.require(
+                    index.value().table_name == source.name,
+                    format!("source {id} index hint belongs to a different table"),
+                )?;
+            }
         }
 
         self.visit_column_read_expressions(&source.generated_expressions)?;
@@ -1381,14 +1596,37 @@ impl<'document> HirValidator<'document> {
                 if let Some(comparison) = comparison {
                     self.visit_expression_comparison(comparison, lhs, rhs, "binary comparison")?;
                 }
-                if let Some(encoding) = custom
-                    .as_ref()
-                    .and_then(|custom| custom.literal_encoding.as_ref())
-                    .and_then(|encoding| encoding.encoder.as_ref())
-                {
-                    self.visit_schema_call(encoding)?;
-                }
                 if let Some(custom) = custom {
+                    self.require(
+                        matches!(
+                            operator,
+                            turso_parser::ast::Operator::Add
+                                | turso_parser::ast::Operator::Subtract
+                                | turso_parser::ast::Operator::Multiply
+                                | turso_parser::ast::Operator::Divide
+                                | turso_parser::ast::Operator::Modulus
+                                | turso_parser::ast::Operator::Less
+                                | turso_parser::ast::Operator::LessEquals
+                                | turso_parser::ast::Operator::Greater
+                                | turso_parser::ast::Operator::GreaterEquals
+                                | turso_parser::ast::Operator::Equals
+                                | turso_parser::ast::Operator::NotEquals
+                        ),
+                        "unsupported binary expression has custom operator metadata",
+                    )?;
+                    if let Some(encoding) = &custom.literal_encoding {
+                        let literal = match encoding.operand {
+                            BinaryOperand::Left => lhs,
+                            BinaryOperand::Right => rhs,
+                        };
+                        self.require(
+                            matches!(literal.as_ref(), Expr::Literal(_)),
+                            "custom operator literal encoding refers to a non-literal operand",
+                        )?;
+                        if let Some(encoder) = &encoding.encoder {
+                            self.visit_schema_call(encoder)?;
+                        }
+                    }
                     self.visit_catalog_object(&custom.function, "custom operator function")?;
                 }
                 Ok(())
@@ -1465,19 +1703,18 @@ impl<'document> HirValidator<'document> {
                 self.visit_catalog_object(&function.function, "function call")?;
                 self.visit_type_fact(&function.result_type)?;
                 self.visit_function_evaluation(function)?;
-                if let Some(operation) = &function.custom_type_operation {
-                    self.visit_custom_type_operation(operation)?;
+                match &function.operation {
+                    FunctionOperation::Ordinary => {}
+                    FunctionOperation::CustomType(operation) => {
+                        self.visit_custom_type_operation(function, operation)?;
+                    }
+                    FunctionOperation::Sequence(operation) => {
+                        self.visit_sequence_function(function, operation)?;
+                    }
                 }
-                if let Some(operation) = &function.sequence_operation {
-                    self.visit_sequence_operation(operation)?;
-                }
-                self.visit_exprs(&function.arguments)?;
-                self.visit_order_terms(&function.argument_order)?;
-                self.visit_order_terms(&function.within_group)?;
-                self.visit_optional_expr(function.filter.as_deref())?;
-                if let Some(window) = &function.window {
-                    self.visit_window_spec(window)?;
-                }
+                self.visit_exprs(function.arguments.expressions())?;
+                self.visit_order_terms(function.arguments.order_terms())?;
+                self.visit_optional_expr(function.evaluation.filter())?;
                 Ok(())
             }
             Expr::InList {
@@ -1503,9 +1740,24 @@ impl<'document> HirValidator<'document> {
                 rhs,
                 escape,
                 function,
+                operator,
+                argument_count,
                 ..
             } => {
                 self.visit_catalog_object(function, "LIKE function")?;
+                let lhs_width = self.expression_width(lhs)?;
+                self.require(
+                    lhs_width == 1 || *operator == turso_parser::ast::LikeOperator::Match,
+                    "only MATCH accepts a row-valued left expression",
+                )?;
+                self.require(
+                    escape.is_none() || *operator == turso_parser::ast::LikeOperator::Like,
+                    "only LIKE accepts an ESCAPE expression",
+                )?;
+                self.require(
+                    *argument_count == lhs_width + 1 + usize::from(escape.is_some()),
+                    "LIKE-family argument count does not match its expressions",
+                )?;
                 self.visit_expr(lhs)?;
                 self.visit_expr(rhs)?;
                 self.visit_optional_expr(escape.as_deref())
@@ -1518,7 +1770,8 @@ impl<'document> HirValidator<'document> {
             Expr::FieldAccess(access) => {
                 self.visit_catalog_object(&access.container_type, "field-access type")?;
                 self.visit_type_fact(&access.result_type)?;
-                self.visit_expr(&access.base)
+                self.visit_expr(&access.base)?;
+                self.visit_field_access(access)
             }
             Expr::Raise { message, .. } => self.visit_optional_expr(message.as_deref()),
         }
@@ -1530,17 +1783,30 @@ impl<'document> HirValidator<'document> {
             crate::function::Func::External(function) => function.func.is_aggregate(),
             _ => false,
         };
-        let window = call.window.is_some()
-            || matches!(call.function.value(), crate::function::Func::Window(_));
-        match call.evaluation {
+        let window_function = matches!(call.function.value(), crate::function::Func::Window(_));
+        let window_evaluation = matches!(call.evaluation, FunctionEvaluation::Window { .. });
+        self.require(
+            !matches!(&call.arguments, FunctionArguments::Star) || aggregate,
+            "star function arguments belong to a non-aggregate call",
+        )?;
+        self.require(
+            call.arguments.distinctness().is_none() || (aggregate && !window_evaluation),
+            "DISTINCT belongs to a non-aggregate call",
+        )?;
+        self.require(
+            call.arguments.order_terms().is_empty() || (aggregate && !window_evaluation),
+            "argument ORDER BY belongs to a non-aggregate call",
+        )?;
+        self.visit_ordered_set_arguments(call)?;
+        match &call.evaluation {
             FunctionEvaluation::Scalar => self.require(
-                !aggregate && !window,
+                !aggregate && !window_function,
                 "aggregate or window function has scalar evaluation identity",
             ),
-            FunctionEvaluation::Aggregate(id) => {
+            FunctionEvaluation::Aggregate { id, .. } => {
                 let block = self.query_block(id.block)?;
                 self.require(
-                    aggregate && !window,
+                    aggregate && !window_function,
                     format!("aggregate identity {id:?} belongs to a non-aggregate call"),
                 )?;
                 self.require(
@@ -1548,18 +1814,51 @@ impl<'document> HirValidator<'document> {
                     format!("aggregate identity {id:?} is outside its block"),
                 )
             }
-            FunctionEvaluation::Window(id) => {
+            FunctionEvaluation::Window { id, window, filter } => {
                 let block = self.query_block(id.block)?;
                 self.require(
-                    window,
+                    aggregate || window_function,
                     format!("window identity {id:?} belongs to a non-window call"),
+                )?;
+                self.require(
+                    filter.is_none() || aggregate,
+                    "FILTER belongs to a non-aggregate window function",
                 )?;
                 self.require(
                     id.index < block.window_function_count,
                     format!("window identity {id:?} is outside its block"),
+                )?;
+                self.require(
+                    window.block == id.block && window.index < block.windows.len(),
+                    format!("resolved window {window:?} is outside its block"),
                 )
             }
         }
+    }
+
+    fn visit_ordered_set_arguments(&self, call: &FunctionCall) -> ValidationResult {
+        let FunctionArguments::OrderedSet { direct, order_by } = &call.arguments else {
+            return Ok(());
+        };
+        self.require(
+            !matches!(call.evaluation, FunctionEvaluation::Window { .. }),
+            "ordered-set arguments belong to a window call",
+        )?;
+        let expected_direct = match call.function.value() {
+            crate::function::Func::Agg(crate::function::AggFunc::Mode) => 0,
+            crate::function::Func::Agg(
+                crate::function::AggFunc::PercentileCont | crate::function::AggFunc::PercentileDisc,
+            ) => 1,
+            _ => return self.invalid("ordered-set arguments belong to an unsupported function"),
+        };
+        self.require(
+            direct.len() == expected_direct,
+            "ordered-set direct argument count does not match its function",
+        )?;
+        self.require(
+            order_by.order == turso_parser::ast::SortOrder::Asc && order_by.nulls.is_none(),
+            "ordered-set ordering uses unsupported direction or NULLS placement",
+        )
     }
 
     fn visit_subquery(&self, subquery: &SubqueryExpr) -> ValidationResult {
@@ -1572,6 +1871,14 @@ impl<'document> HirValidator<'document> {
                     format!("scalar subquery {query} output {output} is out of range"),
                 )
             }
+            SubqueryExpr::Row { query } => {
+                self.visit_query(*query)?;
+                let width = self.query(*query)?.output.len();
+                self.require(
+                    width > 1,
+                    format!("row subquery {query} has scalar width {width}"),
+                )
+            }
             SubqueryExpr::Exists(query) => self.visit_query(*query),
             SubqueryExpr::In {
                 lhs,
@@ -1581,7 +1888,7 @@ impl<'document> HirValidator<'document> {
             } => {
                 self.visit_expr(lhs)?;
                 self.visit_query(*query)?;
-                let lhs_width = expression_width(lhs);
+                let lhs_width = self.expression_width(lhs)?;
                 let output_width = self.query(*query)?.output.len();
                 self.require(
                     output_width == lhs_width,
@@ -1599,13 +1906,21 @@ impl<'document> HirValidator<'document> {
         rhs: &Expr,
         context: &str,
     ) -> ValidationResult {
-        let lhs_width = expression_width(lhs);
-        let rhs_width = expression_width(rhs);
+        let lhs_width = self.expression_width(lhs)?;
+        let rhs_width = self.expression_width(rhs)?;
         self.require(
             lhs_width == rhs_width,
             format!("{context} compares widths {lhs_width} and {rhs_width}"),
         )?;
         self.visit_comparison(comparison, lhs_width, context)
+    }
+
+    fn expression_width(&self, expression: &Expr) -> ValidationResult<usize> {
+        match expression {
+            Expr::Row(values) => Ok(values.len()),
+            Expr::Subquery(SubqueryExpr::Row { query }) => Ok(self.query(*query)?.output.len()),
+            _ => Ok(1),
+        }
     }
 
     fn visit_comparison(
@@ -1630,17 +1945,15 @@ impl<'document> HirValidator<'document> {
         Ok(())
     }
 
-    fn visit_window_spec(&self, window: &WindowSpec) -> ValidationResult {
+    fn visit_resolved_window(&self, window: &ResolvedWindow) -> ValidationResult {
         self.visit_exprs(&window.partition_by)?;
         self.visit_order_terms(&window.order_by)?;
-        let Some(frame) = &window.frame else {
-            return Ok(());
-        };
+        let frame = &window.frame;
         self.visit_window_bound(&frame.start)?;
-        if let Some(end) = &frame.end {
-            self.visit_window_bound(end)?;
-        }
-        Ok(())
+        let Some(end) = &frame.end else {
+            return self.invalid("window effective frame has no end bound");
+        };
+        self.visit_window_bound(end)
     }
 
     fn visit_window_bound(&self, bound: &WindowFrameBound) -> ValidationResult {
@@ -1734,6 +2047,12 @@ impl<'document> HirValidator<'document> {
             let require_complete = matches!(
                 &self.document.root,
                 HirRoot::Insert(insert) if insert.target == source.id
+            ) || matches!(
+                &self.document.root,
+                HirRoot::Trigger(TriggerRoot {
+                    body: TriggerBody::Command(TriggerCommand::Insert(insert)),
+                    ..
+                }) if insert.target == source.id
             );
             if require_complete {
                 self.require(
@@ -1772,7 +2091,11 @@ impl<'document> HirValidator<'document> {
         Ok(())
     }
 
-    fn visit_custom_type_operation(&self, operation: &CustomTypeOperation) -> ValidationResult {
+    fn visit_custom_type_operation(
+        &self,
+        call: &FunctionCall,
+        operation: &CustomTypeOperation,
+    ) -> ValidationResult {
         let resolved_type = match operation {
             CustomTypeOperation::UnionValue { union_type, .. }
             | CustomTypeOperation::UnionTag { union_type, .. }
@@ -1780,45 +2103,269 @@ impl<'document> HirValidator<'document> {
             CustomTypeOperation::StructExtract { struct_type, .. } => struct_type,
         };
         self.visit_catalog_object(resolved_type, "custom-type operation")?;
+        let result_name = call
+            .result_type
+            .declared
+            .as_ref()
+            .map(|declaration| declaration.name.as_str());
         match operation {
-            CustomTypeOperation::UnionValue { result_type, .. }
-            | CustomTypeOperation::UnionExtract { result_type, .. }
-            | CustomTypeOperation::StructExtract { result_type, .. } => {
-                self.visit_type_fact(result_type)
+            CustomTypeOperation::UnionValue {
+                union_type,
+                tag_index,
+            } => {
+                self.require(
+                    matches!(
+                        call.function.value(),
+                        crate::function::Func::Scalar(crate::function::ScalarFunc::UnionValueFunc)
+                    ),
+                    "union-value operation belongs to the wrong function",
+                )?;
+                let union = union_type.value().union_def();
+                self.require(
+                    union.is_some(),
+                    "union-value operation names a non-union type",
+                )?;
+                self.require(
+                    union.is_some_and(|union| {
+                        union
+                            .variants
+                            .iter()
+                            .any(|variant| variant.tag_index == *tag_index)
+                    }),
+                    "union-value operation has an unknown tag index",
+                )?;
+                self.require(
+                    result_name
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&union_type.value().name)),
+                    "union-value result type disagrees with its union",
+                )
             }
-            CustomTypeOperation::UnionTag { .. } => Ok(()),
+            CustomTypeOperation::UnionTag {
+                union_type,
+                tag_names,
+            } => {
+                self.require(
+                    matches!(
+                        call.function.value(),
+                        crate::function::Func::Scalar(crate::function::ScalarFunc::UnionTagFunc)
+                    ),
+                    "union-tag operation belongs to the wrong function",
+                )?;
+                let union = union_type.value().union_def();
+                self.require(
+                    union.is_some(),
+                    "union-tag operation names a non-union type",
+                )?;
+                self.require(
+                    union.is_some_and(|union| union.tag_names.as_ref() == tag_names.as_ref()),
+                    "union-tag names disagree with its union",
+                )?;
+                self.require(
+                    call.result_type == TypeFact::known(crate::schema::Type::Text),
+                    "union-tag result is not TEXT",
+                )
+            }
+            CustomTypeOperation::UnionExtract {
+                union_type,
+                tag_index,
+            } => {
+                self.require(
+                    matches!(
+                        call.function.value(),
+                        crate::function::Func::Scalar(
+                            crate::function::ScalarFunc::UnionExtractFunc
+                        )
+                    ),
+                    "union-extract operation belongs to the wrong function",
+                )?;
+                let variant = union_type.value().union_def().and_then(|union| {
+                    union
+                        .variants
+                        .iter()
+                        .find(|variant| variant.tag_index == *tag_index)
+                });
+                self.require(
+                    variant.is_some(),
+                    "union-extract operation has an unknown tag index",
+                )?;
+                self.require(
+                    variant.is_some_and(|variant| {
+                        result_name
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&variant.type_name))
+                    }),
+                    "union-extract result type disagrees with its variant",
+                )
+            }
+            CustomTypeOperation::StructExtract {
+                struct_type,
+                field_index,
+            } => {
+                self.require(
+                    matches!(
+                        call.function.value(),
+                        crate::function::Func::Scalar(
+                            crate::function::ScalarFunc::StructExtractFunc
+                        )
+                    ),
+                    "struct-extract operation belongs to the wrong function",
+                )?;
+                let field = struct_type
+                    .value()
+                    .struct_def()
+                    .and_then(|structure| structure.fields.get(*field_index));
+                self.require(
+                    field.is_some(),
+                    "struct-extract operation has an unknown field index",
+                )?;
+                self.require(
+                    field.is_some_and(|field| {
+                        result_name.is_some_and(|name| name.eq_ignore_ascii_case(&field.type_name))
+                    }),
+                    "struct-extract result type disagrees with its field",
+                )
+            }
+        }
+    }
+
+    fn visit_field_access(&self, access: &FieldAccess) -> ValidationResult {
+        let result_name = access
+            .result_type
+            .declared
+            .as_ref()
+            .map(|declaration| declaration.name.as_str());
+        match access.kind {
+            FieldAccessKind::Struct { field_index } => {
+                let field = access
+                    .container_type
+                    .value()
+                    .struct_def()
+                    .and_then(|structure| structure.fields.get(field_index));
+                self.require(field.is_some(), "field access has an unknown struct field")?;
+                self.require(
+                    field.is_some_and(|field| {
+                        field.name.eq_ignore_ascii_case(&access.field_name)
+                            && result_name
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&field.type_name))
+                    }),
+                    "field access disagrees with its struct field",
+                )
+            }
+            FieldAccessKind::Union { tag_index } => {
+                let variant = access.container_type.value().union_def().and_then(|union| {
+                    union
+                        .variants
+                        .iter()
+                        .find(|variant| variant.tag_index == tag_index)
+                });
+                self.require(
+                    variant.is_some(),
+                    "field access has an unknown union variant",
+                )?;
+                self.require(
+                    variant.is_some_and(|variant| {
+                        variant.tag_name.eq_ignore_ascii_case(&access.field_name)
+                            && result_name
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&variant.type_name))
+                    }),
+                    "field access disagrees with its union variant",
+                )
+            }
         }
     }
 
     fn visit_sequence_operation(&self, operation: &SequenceOperation) -> ValidationResult {
-        self.require_database(operation.database)?;
+        self.visit_catalog_object(&operation.sequence, "sequence")?;
         self.visit_catalog_object(&operation.backing_table, "sequence backing table")?;
         if let Some(sqlite_sequence) = &operation.sqlite_sequence {
             self.visit_catalog_object(sqlite_sequence, "sqlite_sequence table")?;
         }
-        let expected = self
-            .document
-            .databases
-            .iter()
-            .find(|snapshot| snapshot.database == operation.database)
-            .map(|snapshot| snapshot.schema_version)
-            .ok_or_else(|| {
-                HirValidationError::new(format!(
-                    "sequence database {} is absent from the catalog snapshot",
-                    operation.database.index()
-                ))
-            })?;
+        let database = operation
+            .sequence
+            .database()
+            .ok_or_else(|| HirValidationError::new("sequence has no owning database"))?;
         self.require(
-            operation.schema_cookie == expected,
-            format!(
-                "sequence schema cookie {} does not match snapshot version {expected}",
-                operation.schema_cookie
+            operation.backing_table.database() == Some(database),
+            "sequence and backing table belong to different databases",
+        )?;
+        self.require(
+            operation
+                .sequence
+                .value()
+                .name
+                .eq_ignore_ascii_case(&operation.normalized_name),
+            "sequence descriptor name disagrees with resolved name",
+        )?;
+        let expected_backing =
+            crate::translate::sequence::sequence_backing_table_name(&operation.normalized_name);
+        self.require(
+            operation
+                .backing_table
+                .value()
+                .get_name()
+                .eq_ignore_ascii_case(&expected_backing),
+            "sequence backing table name disagrees with resolved name",
+        )?;
+        if let Some(sqlite_sequence) = &operation.sqlite_sequence {
+            self.require(
+                sqlite_sequence.database() == Some(database),
+                "sequence and sqlite_sequence belong to different databases",
+            )?;
+            self.require(
+                sqlite_sequence
+                    .value()
+                    .get_name()
+                    .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
+                "sequence operation carries the wrong sqlite_sequence table",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn visit_sequence_function(
+        &self,
+        call: &FunctionCall,
+        operation: &SequenceOperation,
+    ) -> ValidationResult {
+        self.visit_sequence_operation(operation)?;
+        let expected = match operation.kind {
+            SequenceOperationKind::NextValue => crate::function::ScalarFunc::NextVal,
+            SequenceOperationKind::SetValue => crate::function::ScalarFunc::SetVal,
+        };
+        self.require(
+            matches!(
+                call.function.value(),
+                crate::function::Func::Scalar(function) if function == &expected
             ),
+            "sequence operation belongs to the wrong function",
+        )?;
+        self.require(
+            matches!(call.evaluation, FunctionEvaluation::Scalar),
+            "sequence operation is not scalar",
+        )?;
+        self.require(
+            call.result_type == TypeFact::known(crate::schema::Type::Integer),
+            "sequence function result is not INTEGER",
         )
     }
 
     fn visit_type_fact(&self, fact: &TypeFact) -> ValidationResult {
+        if fact.array_dimensions > 0 {
+            self.require(
+                fact.storage == Some(crate::schema::Type::Blob),
+                "array type fact does not use BLOB runtime storage",
+            )?;
+        }
         if let Some(declared) = &fact.declared {
+            self.require(
+                declared.array_dimensions == fact.array_dimensions,
+                "declared type rank disagrees with its type fact",
+            )?;
+            if fact.array_dimensions == 0 {
+                self.require(
+                    fact.storage == Some(declared.storage),
+                    "declared scalar storage disagrees with its type fact",
+                )?;
+            }
             for resolved_type in &declared.custom_chain {
                 self.visit_catalog_object(resolved_type, "declared type")?;
             }
@@ -1907,8 +2454,12 @@ impl<'document> HirValidator<'document> {
             )?;
         }
         let type_fact = &source_definition.columns[column].type_fact;
-        let needs_type_programs = type_fact.array_dimensions > 0
-            || type_fact
+        let reads_catalog_storage = matches!(
+            &source_definition.kind,
+            SourceKind::Table(_) | SourceKind::TableFunction { .. }
+        );
+        let needs_type_programs = reads_catalog_storage
+            && type_fact
                 .declared
                 .as_ref()
                 .is_some_and(|declared| !declared.custom_chain.is_empty());
@@ -1936,11 +2487,6 @@ impl<'document> HirValidator<'document> {
                         .filter(|definition| definition.value().decode().is_some())
                         .count(),
                 format!("source {source} column {column} has incomplete DECODE programs"),
-            )?;
-            self.require(
-                programs.array.as_ref().map(|array| array.dimensions)
-                    == (type_fact.array_dimensions > 0).then_some(type_fact.array_dimensions),
-                format!("source {source} column {column} has incorrect array storage metadata"),
             )?;
             let expected_encode_nulls = type_fact.array_dimensions == 0
                 && chain.iter().any(|definition| definition.value().not_null);

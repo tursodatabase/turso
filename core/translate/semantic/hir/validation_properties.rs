@@ -79,29 +79,25 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
         .collect::<Vec<_>>();
     let query_outputs = outputs.iter().map(|output| output.id).collect();
     let block = QueryBlock {
-        id: block_id,
         from: Some(From {
             first: source_id,
             joins: Vec::new(),
         }),
         outputs,
-        aggregate_count: 0,
-        window_function_count: 0,
-        body: QueryBlockBody::Select {
-            distinctness: None,
-            filter: None,
-            grouping: None,
-            windows: Vec::new(),
-        },
+        ..QueryBlock::new(
+            block_id,
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        )
     };
 
     HirDocument {
         snapshot: CatalogSnapshot::from_id(1),
         databases: Vec::new(),
-        root: HirRoot::Query(QueryRoot {
-            query: query_id,
-            trigger: None,
-        }),
+        root: HirRoot::Query(QueryRoot { query: query_id }),
         queries: vec![Query {
             id: query_id,
             parent: None,
@@ -197,10 +193,7 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
     HirDocument {
         snapshot: CatalogSnapshot::from_id(1),
         databases: Vec::new(),
-        root: HirRoot::Query(QueryRoot {
-            query: root_query,
-            trigger: None,
-        }),
+        root: HirRoot::Query(QueryRoot { query: root_query }),
         queries: vec![
             Query {
                 id: root_query,
@@ -208,20 +201,19 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
                 captures: Vec::new(),
                 reachable_ctes: vec![cte_id],
                 blocks: vec![QueryBlock {
-                    id: root_block,
                     from: Some(From {
                         first: source_id,
                         joins: Vec::new(),
                     }),
                     outputs: root_outputs,
-                    aggregate_count: 0,
-                    window_function_count: 0,
-                    body: QueryBlockBody::Select {
-                        distinctness: None,
-                        filter: None,
-                        grouping: None,
-                        windows: Vec::new(),
-                    },
+                    ..QueryBlock::new(
+                        root_block,
+                        QueryBlockBody::Select {
+                            distinctness: None,
+                            filter: None,
+                            grouping: None,
+                        },
+                    )
                 }],
                 first: root_block,
                 compounds: Vec::new(),
@@ -235,17 +227,15 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
                 captures: Vec::new(),
                 reachable_ctes: Vec::new(),
                 blocks: vec![QueryBlock {
-                    id: body_block,
-                    from: None,
                     outputs: body_outputs,
-                    aggregate_count: 0,
-                    window_function_count: 0,
-                    body: QueryBlockBody::Select {
-                        distinctness: None,
-                        filter: None,
-                        grouping: None,
-                        windows: Vec::new(),
-                    },
+                    ..QueryBlock::new(
+                        body_block,
+                        QueryBlockBody::Select {
+                            distinctness: None,
+                            filter: None,
+                            grouping: None,
+                        },
+                    )
                 }],
                 first: body_block,
                 compounds: Vec::new(),
@@ -442,35 +432,29 @@ fn referenced_columns_require_their_stored_read_programs(tc: hegel::TestCase) {
     assert!(document.validate().is_err());
 }
 
-// Example: `SELECT array_value FROM items` must carry the array storage bundle
-// for that referenced column even when it has no custom ENCODE/DECODE calls.
-// Clearing the aligned type-program slot makes the document incomplete.
+// Example: `SELECT array_value FROM items` carries all built-in array meaning
+// in the column type fact and needs no synthetic custom-type program bundle.
 #[hegel::test]
-fn referenced_array_columns_require_their_type_programs(tc: hegel::TestCase) {
+fn referenced_array_columns_are_self_describing(tc: hegel::TestCase) {
     let mut document = generated_query_document(&tc);
     let Expr::Column(reference) = &first_output_mut(&mut document).expr else {
         unreachable!("the generator emits a column output");
     };
     let reference = *reference;
     let source = &mut document.sources[reference.source.index()];
-    source.columns[reference.column].type_fact = TypeFact::known_array(1);
-    source.column_type_programs[reference.column] = Some(BoundColumnTypePrograms {
-        encode: Vec::new(),
-        decode: Vec::new(),
-        array: Some(BoundArrayStorage {
-            element_affinity: Affinity::Integer,
-            element_type: "INTEGER".to_string(),
-            table_name: "items".to_string(),
-            column_name: "array_value".to_string(),
-            dimensions: 1,
-        }),
-        encode_nulls: false,
+    source.columns[reference.column].type_fact = TypeFact::declared(DeclaredType {
+        name: "INTEGER".to_string(),
+        storage: Type::Integer,
+        custom_chain: Vec::new(),
+        array_dimensions: 1,
     });
     document
         .validate()
-        .expect("the referenced array column carries its storage program");
+        .expect("the referenced array column is described by its type fact");
 
-    document.sources[reference.source.index()].column_type_programs[reference.column] = None;
+    document.sources[reference.source.index()].columns[reference.column]
+        .type_fact
+        .storage = Some(Type::Integer);
     assert!(document.validate().is_err());
 }
 

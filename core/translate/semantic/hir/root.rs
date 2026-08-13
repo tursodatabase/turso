@@ -21,7 +21,7 @@ pub enum HirRoot {
     Insert(Insert),
     Update(Update),
     Delete(Delete),
-    TriggerPredicate(TriggerPredicate),
+    Trigger(TriggerRoot),
     SchemaExpressions(SchemaExpressionRoot),
 }
 
@@ -35,13 +35,33 @@ pub struct SchemaExpressionRoot {
 #[derive(Clone, Debug)]
 pub struct QueryRoot {
     pub query: QueryId,
-    pub trigger: Option<TriggerEnvironment>,
 }
 
 #[derive(Clone, Debug)]
-pub struct TriggerPredicate {
-    pub expression: Expr,
+pub struct TriggerRoot {
     pub environment: TriggerEnvironment,
+    pub body: TriggerBody,
+}
+
+#[derive(Clone, Debug)]
+pub enum TriggerBody {
+    Predicate(Expr),
+    Command(TriggerCommand),
+    Program(TriggerProgram),
+}
+
+#[derive(Clone, Debug)]
+pub struct TriggerProgram {
+    pub predicate: Option<Expr>,
+    pub commands: Vec<TriggerCommand>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TriggerCommand {
+    Select(QueryId),
+    Insert(Insert),
+    Update(Update),
+    Delete(Delete),
 }
 
 /// Pseudo-sources visible while analyzing one trigger command or predicate.
@@ -55,25 +75,43 @@ pub struct TriggerEnvironment {
 #[derive(Clone, Debug)]
 pub struct Insert {
     pub target: SourceId,
-    /// Resolved sqlite_sequence table for an AUTOINCREMENT target.
-    pub autoincrement: Option<ResolvedTable>,
-    /// Hidden MVCC sequence used instead of scanning sqlite_sequence for key
-    /// allocation. Present only when the target database exposes that
-    /// sequence in the semantic snapshot.
-    pub autoincrement_sequence: Option<super::SequenceOperation>,
+    pub target_kind: InsertTargetKind,
     pub columns: Vec<InsertTarget>,
-    pub defaults: Vec<ResolvedDefault>,
     pub source: InsertSource,
     pub conflict: Option<ResolveType>,
     pub upserts: Vec<Upsert>,
     pub excluded_source: Option<SourceId>,
     pub returning: Option<Returning>,
-    pub trigger: Option<TriggerEnvironment>,
-    /// Exact schema and temp triggers that can fire for this write.
-    pub triggers: Vec<ResolvedTrigger>,
-    /// Exact UPDATE triggers that can fire from an UPSERT DO UPDATE arm.
-    pub upsert_triggers: Vec<ResolvedTrigger>,
-    pub foreign_keys: DmlForeignKeys,
+}
+
+/// Metadata required by the concrete kind of INSERT destination.
+#[derive(Clone, Debug)]
+pub enum InsertTargetKind {
+    BTree {
+        autoincrement: Option<ResolvedAutoincrement>,
+        defaults: Vec<ResolvedDefault>,
+        triggers: InsertTriggers,
+        foreign_keys: DmlForeignKeys,
+    },
+    Virtual,
+}
+
+/// Trigger identities selected for an INSERT and its possible UPSERT update.
+#[derive(Clone, Debug, Default)]
+pub struct InsertTriggers {
+    pub insert: Vec<ResolvedTrigger>,
+    pub upsert_update: Vec<ResolvedTrigger>,
+}
+
+/// Catalog objects needed to allocate and persist an AUTOINCREMENT key.
+#[derive(Clone, Debug)]
+pub struct ResolvedAutoincrement {
+    /// SQLite-compatible sequence storage required in every journal mode.
+    pub sqlite_sequence: ResolvedTable,
+    /// Hidden MVCC sequence used instead of scanning sqlite_sequence for key
+    /// allocation. Present only when the target database exposes that
+    /// sequence in the semantic snapshot.
+    pub mvcc_sequence: Option<super::SequenceOperation>,
 }
 
 #[derive(Clone, Debug)]
@@ -149,7 +187,7 @@ pub struct Update {
     /// NEW row identity used by generated values, constraints, index insertion,
     /// and RETURNING.
     pub new_source: SourceId,
-    pub defaults: Vec<ResolvedDefault>,
+    pub target_kind: UpdateTargetKind,
     pub from: Option<From>,
     pub assignments: Vec<Assignment>,
     pub predicate: Option<Expr>,
@@ -157,24 +195,40 @@ pub struct Update {
     pub limit: Option<Limit>,
     pub conflict: Option<ResolveType>,
     pub returning: Option<Returning>,
-    pub trigger: Option<TriggerEnvironment>,
-    pub triggers: Vec<ResolvedTrigger>,
-    pub foreign_keys: DmlForeignKeys,
     /// For an internal sqlite_schema update, CDC stores the user's DDL text in
     /// the changed `sql` field instead of the generated UPDATE statement.
     pub cdc_updates_override: Option<(usize, String)>,
 }
 
+/// Metadata required by the concrete kind of UPDATE destination.
+#[derive(Clone, Debug)]
+pub enum UpdateTargetKind {
+    BTree {
+        defaults: Vec<ResolvedDefault>,
+        triggers: Vec<ResolvedTrigger>,
+        foreign_keys: DmlForeignKeys,
+    },
+    Virtual,
+}
+
 #[derive(Clone, Debug)]
 pub struct Delete {
     pub target: SourceId,
+    pub target_kind: DeleteTargetKind,
     pub predicate: Option<Expr>,
     pub order_by: Vec<OrderTerm>,
     pub limit: Option<Limit>,
     pub returning: Option<Returning>,
-    pub trigger: Option<TriggerEnvironment>,
-    pub triggers: Vec<ResolvedTrigger>,
-    pub foreign_keys: DmlForeignKeys,
+}
+
+/// Metadata required by the concrete kind of DELETE destination.
+#[derive(Clone, Debug)]
+pub enum DeleteTargetKind {
+    BTree {
+        triggers: Vec<ResolvedTrigger>,
+        foreign_keys: DmlForeignKeys,
+    },
+    Virtual,
 }
 
 /// Foreign-key identities and positions frozen for one DML target.

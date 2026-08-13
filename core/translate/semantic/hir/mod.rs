@@ -18,7 +18,7 @@ use std::fmt;
 
 use crate::{
     function::Func,
-    schema::{Index, Table, Trigger, Type, TypeDef},
+    schema::{Index, Sequence, Table, Trigger, Type, TypeDef},
     sync::Arc,
     translate::collate::CollationSeq,
 };
@@ -73,6 +73,19 @@ pub struct QueryBlockId {
 impl QueryBlockId {
     pub const fn new(query: QueryId, index: usize) -> Self {
         Self { query, index }
+    }
+}
+
+/// Identifies one effective window owned by a query block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowId {
+    pub block: QueryBlockId,
+    pub index: usize,
+}
+
+impl WindowId {
+    pub const fn new(block: QueryBlockId, index: usize) -> Self {
+        Self { block, index }
     }
 }
 
@@ -228,6 +241,7 @@ pub type ResolvedFunction = CatalogObject<Func>;
 pub type ResolvedCollation = CatalogObject<CollationSeq>;
 pub type ResolvedType = CatalogObject<TypeDef>;
 pub type ResolvedTrigger = CatalogObject<Trigger>;
+pub type ResolvedSequence = CatalogObject<Sequence>;
 
 /// A declared SQL type whose meaning was resolved during analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -319,7 +333,11 @@ impl TypeFact {
 
     pub fn declared(declared: DeclaredType) -> Self {
         Self {
-            storage: Some(declared.storage),
+            storage: Some(if declared.array_dimensions > 0 {
+                Type::Blob
+            } else {
+                declared.storage
+            }),
             array_dimensions: declared.array_dimensions,
             array_rank_unbounded: false,
             declared: Some(declared),
@@ -328,6 +346,32 @@ impl TypeFact {
 
     pub const fn is_array(&self) -> bool {
         self.array_dimensions > 0 || self.array_rank_unbounded
+    }
+
+    /// Type of one value stored inside this array. The declared type keeps the
+    /// scalar storage class while the outer fact uses BLOB storage.
+    pub fn array_element(&self) -> Option<Self> {
+        if self.array_dimensions == 0 {
+            return self.array_rank_unbounded.then(Self::dynamic);
+        }
+        let dimensions = self.array_dimensions - 1;
+        let mut declared = self.declared.clone();
+        if let Some(declared) = &mut declared {
+            declared.array_dimensions = dimensions;
+            if dimensions == 0 && declared.name.eq_ignore_ascii_case("ANY") {
+                return Some(Self::dynamic());
+            }
+        }
+        Some(Self {
+            storage: if dimensions > 0 {
+                Some(Type::Blob)
+            } else {
+                declared.as_ref().map(|declared| declared.storage)
+            },
+            declared,
+            array_dimensions: dimensions,
+            array_rank_unbounded: self.array_rank_unbounded,
+        })
     }
 
     /// Merge expressions whose runtime value is selected from one argument,
@@ -476,6 +520,20 @@ impl TypeFact {
         result
     }
 
+    /// Infer an array operation that changes values but preserves the
+    /// container shape, such as ARRAY_REMOVE or ARRAY_SLICE.
+    pub fn array_transform_result(container: &Self) -> Self {
+        if container.is_array() {
+            return container.clone();
+        }
+        Self {
+            storage: Some(Type::Blob),
+            declared: None,
+            array_dimensions: 1,
+            array_rank_unbounded: container.storage.is_none(),
+        }
+    }
+
     fn array_concat_result_with_rank(
         lhs: &Self,
         rhs: &Self,
@@ -508,19 +566,16 @@ impl TypeFact {
                     && lhs.custom_chain == rhs.custom_chain =>
             {
                 let mut declared = lhs.clone();
-                declared.storage = Type::Blob;
                 declared.array_dimensions = array_dimensions;
                 Some(declared)
             }
             (Some(declared), None) if !rhs.is_array() => {
                 let mut declared = declared.clone();
-                declared.storage = Type::Blob;
                 declared.array_dimensions = array_dimensions;
                 Some(declared)
             }
             (None, Some(declared)) if !lhs.is_array() => {
                 let mut declared = declared.clone();
-                declared.storage = Type::Blob;
                 declared.array_dimensions = array_dimensions;
                 Some(declared)
             }
@@ -614,9 +669,30 @@ impl HirDocument {
                     .outputs
                     .get(id.index)
                     .filter(|output| output.id == id),
-                HirRoot::Query(_)
-                | HirRoot::TriggerPredicate(_)
-                | HirRoot::SchemaExpressions(_) => None,
+                HirRoot::Trigger(root) => match &root.body {
+                    TriggerBody::Command(TriggerCommand::Insert(insert)) => insert
+                        .returning
+                        .as_ref()?
+                        .outputs
+                        .get(id.index)
+                        .filter(|output| output.id == id),
+                    TriggerBody::Command(TriggerCommand::Update(update)) => update
+                        .returning
+                        .as_ref()?
+                        .outputs
+                        .get(id.index)
+                        .filter(|output| output.id == id),
+                    TriggerBody::Command(TriggerCommand::Delete(delete)) => delete
+                        .returning
+                        .as_ref()?
+                        .outputs
+                        .get(id.index)
+                        .filter(|output| output.id == id),
+                    TriggerBody::Predicate(_)
+                    | TriggerBody::Command(TriggerCommand::Select(_))
+                    | TriggerBody::Program(_) => None,
+                },
+                HirRoot::Query(_) | HirRoot::SchemaExpressions(_) => None,
             },
         }
     }

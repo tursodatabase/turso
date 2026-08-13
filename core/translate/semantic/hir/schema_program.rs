@@ -1,7 +1,6 @@
 //! Bound schema expressions owned by one HIR document.
 
 use super::{Expr, SchemaProgramId, SourceId};
-use crate::vdbe::affinity::Affinity;
 
 /// One schema expression bound against a synthetic document-local source.
 #[derive(Clone, Debug)]
@@ -19,22 +18,11 @@ pub struct BoundSchemaCall {
     pub arguments: Vec<Expr>,
 }
 
-/// Static metadata needed to encode an array into its stored representation.
-#[derive(Clone, Debug)]
-pub struct BoundArrayStorage {
-    pub element_affinity: Affinity,
-    pub element_type: String,
-    pub table_name: String,
-    pub column_name: String,
-    pub dimensions: u32,
-}
-
 /// Bound transformations for one source column's declared type.
 #[derive(Clone, Debug)]
 pub struct BoundColumnTypePrograms {
     pub encode: Vec<BoundSchemaCall>,
     pub decode: Vec<BoundSchemaCall>,
-    pub array: Option<BoundArrayStorage>,
     /// Scalar NOT NULL custom types still run their encoder for NULL. Arrays
     /// always leave NULL untouched.
     pub encode_nulls: bool,
