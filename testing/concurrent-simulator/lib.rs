@@ -297,6 +297,10 @@ pub struct WhopperOpts {
     /// If true, MVCC's auto-checkpoint is disabled on the Database immediately after open.
     /// Recovery bugs need uncheckpointed schema rows to remain in the logical log to exercise recovery.
     pub disable_mvcc_auto_checkpoint: bool,
+    /// If set, overrides the MVCC auto-checkpoint threshold (bytes of logical log) on the
+    /// Database immediately after open. A small value makes checkpoints fire often enough for
+    /// short runs to exercise them. Ignored when `disable_mvcc_auto_checkpoint` is true.
+    pub mvcc_checkpoint_threshold: Option<i64>,
     /// If false, don't close connections before dropping them
     pub close_connections_gracefully: bool,
     /// Probabilty of a reopen fault.
@@ -348,6 +352,7 @@ impl Default for WhopperOpts {
             chaotic_profiles: vec![],
             schema_bias: SchemaBias::default(),
             disable_mvcc_auto_checkpoint: false,
+            mvcc_checkpoint_threshold: None,
             close_connections_gracefully: true,
             reopen_probability: 0.0,
             allocation_fault_probability: 0.0,
@@ -463,6 +468,11 @@ impl WhopperOpts {
 
     pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
         self.experimental_mvcc_passive_checkpoint = enable;
+        self
+    }
+
+    pub fn with_mvcc_checkpoint_threshold(mut self, threshold: Option<i64>) -> Self {
+        self.mvcc_checkpoint_threshold = threshold;
         self
     }
 
@@ -649,6 +659,8 @@ pub struct Whopper {
     chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     /// Setting this to true sets `pramga mvcc_checkpoint_threshold = -1` (disabled).
     disable_mvcc_auto_checkpoint: bool,
+    /// If set, overrides the MVCC auto-checkpoint threshold (bytes of logical log) after open.
+    mvcc_checkpoint_threshold: Option<i64>,
     /// Open databases with the experimental non-blocking (passive) MVCC checkpoint enabled.
     experimental_mvcc_passive_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
@@ -809,6 +821,7 @@ impl Whopper {
             stats: Stats::default(),
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
+            mvcc_checkpoint_threshold: opts.mvcc_checkpoint_threshold,
             experimental_mvcc_passive_checkpoint: opts.experimental_mvcc_passive_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
             allocation_fault_injector,
@@ -1536,6 +1549,10 @@ impl Whopper {
         if self.disable_mvcc_auto_checkpoint {
             if let Some(mv_store) = db.get_mv_store().as_ref() {
                 mv_store.set_checkpoint_threshold(-1);
+            }
+        } else if let Some(threshold) = self.mvcc_checkpoint_threshold {
+            if let Some(mv_store) = db.get_mv_store().as_ref() {
+                mv_store.set_checkpoint_threshold(threshold);
             }
         }
 

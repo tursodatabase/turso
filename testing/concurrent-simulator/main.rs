@@ -64,6 +64,11 @@ struct Args {
     /// Enable the experimental non-blocking (passive) MVCC checkpoint (requires --enable-mvcc)
     #[arg(long)]
     enable_experimental_mvcc_passive_checkpoint: bool,
+    /// Override the MVCC auto-checkpoint threshold in bytes of logical log (requires --enable-mvcc).
+    /// Elle runs write the logical log slowly, so a small value here makes checkpoints actually
+    /// fire during the run.
+    #[arg(long)]
+    mvcc_checkpoint_threshold: Option<i64>,
     /// Enable database encryption
     #[arg(long)]
     enable_encryption: bool,
@@ -150,6 +155,12 @@ fn main() -> anyhow::Result<()> {
     if args.enable_experimental_mvcc_passive_checkpoint && !args.enable_mvcc {
         return Err(anyhow::anyhow!(
             "--enable-experimental-mvcc-passive-checkpoint requires --enable-mvcc"
+        ));
+    }
+
+    if args.mvcc_checkpoint_threshold.is_some() && !args.enable_mvcc {
+        return Err(anyhow::anyhow!(
+            "--mvcc-checkpoint-threshold requires --enable-mvcc"
         ));
     }
 
@@ -507,6 +518,7 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc || is_schema_clone_fault_mode(&args.mode))
         .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
+        .with_mvcc_checkpoint_threshold(args.mvcc_checkpoint_threshold)
         .with_enable_encryption(args.enable_encryption)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
