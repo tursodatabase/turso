@@ -59,3 +59,142 @@ QUERY PLAN
 |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 `--USE SORTER FOR ORDER BY
+
+BYTECODE
+addr  opcode                       p1   p2   p3  p4                                     p5  comment
+   0          Init                  0  130    0                                          0  Start at 130
+   1          Once                107    0    0                                          0  goto 107
+   2          OpenEphemeral         1    0    0                                          0  cursor=1 is_table=false
+   3          Once                 14    0    0                                          0  goto 14
+   4          OpenEphemeral         0    0    0                                          0  cursor=0 is_table=false
+   5          OpenRead              2    4    0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
+   6          Rewind                2   14    0                                          0  Rewind table part
+   7            Column              2    1    5                                          0  r[5]=part.P_NAME
+   8            Function            1    4    3  like(2)                                 0  r[3]=func(r[4..5])
+   9            IfNot               3   13    1                                          0  if !r[3] goto 13
+  10            RowId               2    2    0                                          0  r[2]=part.rowid
+  11            MakeRecord          2    1    6                                          0  r[6]=mkrec(r[2..2]); for ephemeral_index_where_sub_t5
+  12            IdxInsert           0    6    0                                          8  key=r[6]
+  13          Next                  2    7    0                                          0
+  14          Null                  0   15    0                                          0  r[15]=NULL
+  15          SorterOpen            3    5    0  k(1,B)                                  0  cursor=3
+  16          Integer               0   10    0                                          0  r[10]=0; clear group by abort flag
+  17          Null                  0   11    0                                          0  r[11]=NULL; initialize group by comparison registers to NULL
+  18          Gosub                22  104    0                                          0  ; go to clear accumulator subroutine
+  19          OpenRead              5    6    0  k(6,B,B,B,B,B)                          0  table=partsupp, root=6, iDb=0
+  20          OpenRead              6    7    0  k(3,B,B)                                0  index=sqlite_autoindex_partsupp_1, root=7, iDb=0
+  21          OpenRead              7   10    0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+  22          NullRow               0    0    0                                          0  Set cursor 0 to a (pseudo) NULL row
+  23          Rewind                0   67    0                                          0  Rewind  ephemeral(ephemeral_index_where_sub_t5)
+  24            Column              0    0   24                                          0  r[24]=ephemeral(ephemeral_index_where_sub_t5).P_PARTKEY
+  25            IsNull             24   66    0                                          0  if (r[24]==NULL) goto 66
+  26            SeekGE              6   66   24                                          0  key=[24..24]
+  27              IdxGT             6   66   24                                          0  key=[24..24]
+  28              DeferredSeek      6    5    0                                          0
+  29              Integer           0   23    0                                          0  r[23]=0
+  30              Once             44    0    0                                          0  goto 44
+  31              OpenAutoindex     8    0    0                                          0  cursor=8
+  32              Rewind            7   33    0                                          0  Rewind table lineitem
+  33                Column          7   10   26                                          0  r[26]=lineitem.L_SHIPDATE
+  34                Lt             26   27   43  Binary                                  0  if r[26]<r[27] goto 43
+  35                Column          7   10   29                                          0  r[29]=lineitem.L_SHIPDATE
+  36                Ge             29   30   43  Binary                                  0  if r[29]>=r[30] goto 43
+  37                ColumnRange     7    1   31  2                                       0  r[31..32]=lineitem.L_PARTKEY..L_SUPPKEY
+  38                Column          7   10   33                                          0  r[33]=lineitem.L_SHIPDATE
+  39                Column          7    4   34                                          0  r[34]=lineitem.L_QUANTITY
+  40                RowId           7   35    0                                          0  r[35]=lineitem.rowid
+  41                MakeRecord     31    5   36                                          0  r[36]=mkrec(r[31..35]); for ephemeral_lineitem_t8
+  42                IdxInsert       8   36   31                                          0  key=r[36]
+  43              Next              7   33    0                                          0
+  44              ColumnRange       6    0   37  2                                       0  r[37..38]=sqlite_autoindex_partsupp_1.ps_partkey..ps_suppkey
+  45              String8           0   39    0  1994-01-01                              0  r[39]='1994-01-01'
+  46              Affinity         37    3    0                                          0  r[37..40] = C, C, C
+  47              SeekGE            8   61   37                                          0  key=[37..39]
+  48              String8           0   39    0  1995-01-01                              0  r[39]='1995-01-01'
+  49              Affinity         37    3    0                                          0  r[37..40] = C, C, C
+  50                IdxGE           8   61   37                                          0  key=[37..39]
+  51                DeferredSeek    8    7    0                                          0
+  52                Integer         1   23    0                                          0  r[23]=1
+  53                RowId           5   17    0                                          0  r[17]=partsupp.rowid
+  54                Column          6    1   18                                          0  r[18]=sqlite_autoindex_partsupp_1.ps_suppkey
+  55                Column          5    2   19                                          0  r[19]=partsupp.PS_AVAILQTY
+  56                Column          8    3   20                                          0  r[20]=ephemeral(ephemeral_lineitem_t8).L_QUANTITY
+  57                IdxRowId        8   21    0                                          0  r[21]=cursor 8 for index ephemeral(ephemeral_lineitem_t8).rowid
+  58                MakeRecord     17    5   16                                          0  r[16]=mkrec(r[17..21])
+  59                SorterInsert    3   16    0  0                                       0  key=r[16]
+  60              Next              8   50    0                                          0
+  61              IfPos            23   65    0                                          0  r[23]>0 -> r[23]-=0, goto 65
+  62              NullRow           7    0    0                                          0  Set cursor 7 to a (pseudo) NULL row
+  63              NullRow           8    0    0                                          0  Set cursor 8 to a (pseudo) NULL row
+  64              Goto              0   52    0                                          0
+  65            Next                6   27    0                                          0
+  66          Next                  0   24    0                                          0
+  67          OpenPseudo            4   16    5                                          0  5 columns in r[16]
+  68          SorterSort            3   88    0                                          0
+  69            SorterData          3   16    4                                          0  r[16]=data
+  70            Column              4    0   40                                          0  r[40]=pseudo.column 0
+  71            Compare            11   40    1  k(1, Binary)                            0  r[11..11]==r[40..40]
+  72            Jump               73   77   73                                          0  ; start new group if comparison is not equal
+  73            Gosub               8   92    0                                          0  ; check if ended group had data, and output if so
+  74            Move               40   11    1                                          0  r[11..11]=r[40..40]
+  75            IfPos              10  107    0                                          0  r[10]>0 -> r[10]-=0, goto 107; check abort flag
+  76            Gosub              22  104    0                                          0  ; goto clear accumulator subroutine
+  77            ColumnRange         4    3   41  2                                       0  r[41..42]=pseudo.column 3..column 4
+  78            Copy               42   44    0                                          0  r[44]=r[42]
+  79            Integer             1   43    0                                          0  r[43]=1
+  80            NotNull            44   82    0                                          0  r[44]!=NULL -> goto 82
+  81            Integer             0   43    0                                          0  r[43]=0
+  82            IfNot              43   84    1                                          0  if !r[43] goto 84
+  83            AggStep             0   41   15  sum                                     0  accum=r[15] step(r[41])
+  84            If                  9   86    0                                          0  if r[9] goto 86; don't emit group columns if continuing existing group
+  85            ColumnRange         4    1   12  2                                       0  r[12..13]=pseudo.column 1..column 2
+  86            Integer             1    9    0                                          0  r[9]=1; indicate data in accumulator
+  87          SorterNext            3   69    0                                          0
+  88          Gosub                 8   92    0                                          0  ; emit row for final group
+  89          Goto                  0  107    0                                          0  ; group by finished
+  90          Integer               1   10    0                                          0  r[10]=1
+  91        Return                  8    0    0                                          0
+  92        IfPos                   9   94    0                                          0  r[9]>0 -> r[9]-=0, goto 94; output group by row subroutine start
+  93      Return                    8    0    0                                          0
+  94      AggFinal                  0   15    0  sum                                     0  accum=r[15]
+  95      Copy                     13   46    0                                          0  r[46]=r[13]
+  96      Real                      0   48    0  0.5                                     0  r[48]=0.5
+  97      Copy                     15   49    0                                          0  r[49]=r[15]
+  98      Multiply                 48   49   47                                          0  r[47]=r[48]*r[49]
+  99      Le                       46   47   93  Binary                                  0  if r[46]<=r[47] goto 93
+ 100      Copy                     12    7    0                                          0  r[7]=r[12]
+ 101      MakeRecord                7    1   50                                          0  r[50]=mkrec(r[7..7]); for ephemeral_index_where_sub_t3
+ 102      IdxInsert                 1   50    0                                          8  key=r[50]
+ 103    Return                      8    0    0                                          0
+ 104    Null                        0   12   15                                          0  r[12..15]=NULL; clear accumulator subroutine start
+ 105    Integer                     0    9    0                                          0  r[9]=0
+ 106  Return                       22    0    0                                          0
+ 107  SorterOpen                    9    1    0  k(1,B)                                  0  cursor=9
+ 108  OpenRead                     10    5    0  k(7,B,B,B,B,B,B,B)                      0  table=supplier, root=5, iDb=0
+ 109  OpenRead                     11    2    0  k(4,B,B,B,B)                            0  table=nation, root=2, iDb=0
+ 110  NullRow                       1    0    0                                          0  Set cursor 1 to a (pseudo) NULL row
+ 111  Rewind                        1  123    0                                          0  Rewind  ephemeral(ephemeral_index_where_sub_t3)
+ 112    Column                      1    0   54                                          0  r[54]=ephemeral(ephemeral_index_where_sub_t3).PS_SUPPKEY
+ 113    IsNull                     54  122    0                                          0  if (r[54]==NULL) goto 122
+ 114    SeekRowid                  10   54  122                                          0  if (r[54]!=cursor 10 for table supplier.rowid) goto 122
+ 115    Column                     10    3   55                                          0  r[55]=supplier.S_NATIONKEY
+ 116    SeekRowid                  11   55  122                                          0  if (r[55]!=cursor 11 for table nation.rowid) goto 122
+ 117    Column                     11    1   57                                          0  r[57]=nation.N_NAME
+ 118    Ne                         57   58  122  Binary                                  0  if r[57]!=r[58] goto 122
+ 119    ColumnRange                10    1   59  2                                       0  r[59..60]=supplier.S_NAME..S_ADDRESS
+ 120    MakeRecord                 59    2   53                                          0  r[53]=mkrec(r[59..60])
+ 121    SorterInsert                9   53    0  0                                       0  key=r[53]
+ 122  Next                          1  112    0                                          0
+ 123  OpenPseudo                   12   53    2                                          0  2 columns in r[53]
+ 124  SorterSort                    9  129    0                                          0
+ 125    SorterData                  9   53   12                                          0  r[53]=data
+ 126    ColumnRange                12    0   51  2                                       0  r[51..52]=pseudo.column 0..column 1
+ 127    ResultRow                  51    2    0                                          0  output=r[51..52]
+ 128  SorterNext                    9  125    0                                          0
+ 129  Halt                          0    0    0                                          0
+ 130  Transaction                   0    1    8                                          0  iDb=0 tx_mode=Read
+ 131  String8                       0    4    0  frosted%                                0  r[4]='frosted%'
+ 132  String8                       0   27    0  1994-01-01                              0  r[27]='1994-01-01'
+ 133  String8                       0   30    0  1995-01-01                              0  r[30]='1995-01-01'
+ 134  String8                       0   58    0  IRAN                                    0  r[58]='IRAN'
+ 135  Goto                          0    1    0                                          0

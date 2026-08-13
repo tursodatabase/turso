@@ -494,6 +494,28 @@ pub(super) fn emit_autoindex(
         pc_if_empty: label_ephemeral_build_loop_start,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_loop_start);
+    let label_ephemeral_build_loop_next = program.allocate_label();
+    if let Some(filter) = &index.where_clause {
+        let filter_passed = program.allocate_label();
+        // The table's planned operation reads from the new index. While that
+        // index is being built, expressions must read the source cursor.
+        program.set_cursor_override(table_ref_id, table_cursor_id);
+        let result = translate_condition_expr(
+            program,
+            table_references,
+            filter,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: filter_passed,
+                jump_target_when_false: label_ephemeral_build_loop_next,
+                jump_target_when_null: label_ephemeral_build_loop_next,
+            },
+            resolver,
+        );
+        program.clear_cursor_override(table_ref_id);
+        result?;
+        program.preassign_label_to_next_insn(filter_passed);
+    }
     // Emit all columns from source table that are needed in the ephemeral index.
     // Also reserve a register for the rowid if the source table has rowids.
     let num_regs_to_reserve = index.columns.len() + table_has_rowid as usize;
@@ -557,6 +579,7 @@ pub(super) fn emit_autoindex(
         unpacked_count: Some(num_regs_to_reserve as u32),
         flags: IdxInsertFlags::new().use_seek(false),
     });
+    program.preassign_label_to_next_insn(label_ephemeral_build_loop_next);
     program.emit_insn(Insn::Next {
         cursor_id: table_cursor_id,
         pc_if_next: label_ephemeral_build_loop_start,

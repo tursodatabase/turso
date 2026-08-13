@@ -1812,6 +1812,27 @@ matrix one-value-aggregate-comparisons {
     ORDER BY o.id;
 }
 
+# Check that automatic-index prefiltering preserves results for equality and
+# range conditions, reversed operands, NULLs, and one- or two-column keys.
+@setup correlated_rows
+@var comparison { = | < | <= | > | >= }
+@var link { i.key1 = o.key1 | i.key1 = o.key1 AND i.key2 = o.key2 }
+@var inner_filter { AND i.amount = 7 | AND i.amount > 6 | AND i.amount <= 20 | AND i.amount >= 6 AND i.amount < 20 | AND 20 >= i.amount AND 6 <= i.amount | AND i.amount IS NULL }
+matrix join-first-autoindex-prefilter {
+    SELECT candidate.id
+    FROM outer_rows candidate
+    WHERE candidate.id IN (
+        SELECT o.id
+        FROM outer_rows o
+        WHERE o.amount $comparison (
+            SELECT sum(i.amount)
+            FROM inner_rows i
+            WHERE $link $inner_filter
+        )
+    )
+    ORDER BY candidate.id;
+}
+
 @setup correlated_rows
 @var aggregate { avg(i.amount) | min(i.amount) | max(i.amount) | count(*) | count(i.amount) | total(i.amount) }
 matrix two-copies-of-one-aggregate {

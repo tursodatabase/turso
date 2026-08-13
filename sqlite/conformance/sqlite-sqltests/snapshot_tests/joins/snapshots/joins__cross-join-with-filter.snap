@@ -26,34 +26,37 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4              p5  comment
-   0  Init               0  28   0                   0  Start at 28
+   0  Init               0  30   0                   0  Start at 30
    1  OpenRead           0   2   0  k(5,B,B,B,B,B)   0  table=customers, root=2, iDb=0
    2  OpenRead           1   3   0  k(5,B,B,B,B,B)   0  table=products, root=3, iDb=0
-   3  Rewind             0  27   0                   0  Rewind table customers
+   3  Rewind             0  29   0                   0  Rewind table customers
    4    Column           0   3   5                   0  r[5]=customers.city
-   5    Ne               5   6  26  Binary           0  if r[5]!=r[6] goto 26
-   6    Once            17   0   0                   0  goto 17
+   5    Ne               5   6  28  Binary           0  if r[5]!=r[6] goto 28
+   6    Once            19   0   0                   0  goto 19
    7    OpenAutoindex    2   0   0                   0  cursor=2
    8    Rewind           1   9   0                   0  Rewind table products
-   9      Column         1   2   7                   0  r[7]=products.category
-  10      Column         1   1   8                   0  r[8]=products.name
-  11      Column         1   3   9                   0  r[9]=products.price
-  12      RowId          1  10   0                   0  r[10]=products.rowid
-  13      MakeRecord     7   4  11                   0  r[11]=mkrec(r[7..10]); for ephemeral_products_t2
-  14      FilterAdd      2   7   1                   0  bloom_filter_add(r[7..8])
-  15      IdxInsert      2  11   7                   0  key=r[11]
-  16    Next             1   9   0                   0
-  17    String8          0  12   0  Books            0  r[12]='Books'
-  18    Filter           2  26  12                   1  if !bloom_filter(r[12..13]) goto 26
-  19    SeekGE           2  26  12                   0  key=[12..12]
-  20      IdxGT          2  26  12                   0  key=[12..12]
-  21      DeferredSeek   2   1   0                   0
-  22      Column         0   1   1                   0  r[1]=customers.name
-  23      ColumnRange    2   1   2  2                0  r[2..3]=ephemeral(ephemeral_products_t2).name..price
-  24      ResultRow      1   3   0                   0  output=r[1..3]
-  25    Next             2  20   0                   0
-  26  Next               0   4   0                   0
-  27  Halt               0   0   0                   0
-  28  Transaction        0   1  10                   0  iDb=0 tx_mode=Read
-  29  String8            0   6   0  Boston           0  r[6]='Boston'
-  30  Goto               0   1   0                   0
+   9      Column         1   2   8                   0  r[8]=products.category
+  10      Ne             8   9  18  Binary           0  if r[8]!=r[9] goto 18
+  11      Column         1   2  10                   0  r[10]=products.category
+  12      Column         1   1  11                   0  r[11]=products.name
+  13      Column         1   3  12                   0  r[12]=products.price
+  14      RowId          1  13   0                   0  r[13]=products.rowid
+  15      MakeRecord    10   4  14                   0  r[14]=mkrec(r[10..13]); for ephemeral_products_t2
+  16      FilterAdd      2  10   1                   0  bloom_filter_add(r[10..11])
+  17      IdxInsert      2  14  10                   0  key=r[14]
+  18    Next             1   9   0                   0
+  19    String8          0  15   0  Books            0  r[15]='Books'
+  20    Filter           2  28  15                   1  if !bloom_filter(r[15..16]) goto 28
+  21    SeekGE           2  28  15                   0  key=[15..15]
+  22      IdxGT          2  28  15                   0  key=[15..15]
+  23      DeferredSeek   2   1   0                   0
+  24      Column         0   1   1                   0  r[1]=customers.name
+  25      ColumnRange    2   1   2  2                0  r[2..3]=ephemeral(ephemeral_products_t2).name..price
+  26      ResultRow      1   3   0                   0  output=r[1..3]
+  27    Next             2  22   0                   0
+  28  Next               0   4   0                   0
+  29  Halt               0   0   0                   0
+  30  Transaction        0   1  10                   0  iDb=0 tx_mode=Read
+  31  String8            0   6   0  Boston           0  r[6]='Boston'
+  32  String8            0   9   0  Books            0  r[9]='Books'
+  33  Goto               0   1   0                   0
