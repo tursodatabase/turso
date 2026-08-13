@@ -1904,21 +1904,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 // in-flight tombstones (end: TxID) from other transactions.
                 if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end() {
                     if other_tx_id != self.tx_id {
-                        let other_tx = mvcc_store.txs.get(&other_tx_id).expect(
-                            "check_version_conflicts: tombstone end TxID not found in txn map",
+                        // The other transaction may already have moved from
+                        // `txs` to `finalized_tx_states`; consult both
+                        // instead of panicking on the race.
+                        let other_state = lookup_tx_state(
+                            &mvcc_store.txs,
+                            &mvcc_store.finalized_tx_states,
+                            other_tx_id,
                         );
-                        let other_tx = other_tx.value();
-                        match other_tx.state.load() {
-                            TransactionState::Committed(_) => {
+                        match other_state {
+                            Some(TransactionState::Committed(_)) => {
                                 return Err(LimboError::WriteWriteConflict);
                             }
-                            TransactionState::Preparing(other_end_ts) => {
+                            Some(TransactionState::Preparing(other_end_ts)) => {
                                 if other_end_ts < end_ts {
                                     return Err(LimboError::WriteWriteConflict);
                                 }
                             }
-                            TransactionState::Active => {}
-                            TransactionState::Aborted | TransactionState::Terminated => {}
+                            Some(TransactionState::Active) => {}
+                            Some(TransactionState::Aborted | TransactionState::Terminated)
+                            | None => {}
                         }
                     }
                 }

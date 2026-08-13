@@ -20568,3 +20568,67 @@ fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
     // Now that the reader is gone, Truncate can proceed.
     writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
+
+/// What this test checks: commit-time conflict validation reports a
+/// write-write conflict, instead of panicking, when it meets an in-flight
+/// B-tree tombstone whose writer has already been evicted from the live
+/// transaction map into `finalized_tx_states`.
+/// Why this matters: eviction (`remove_tx`) runs concurrently with other
+/// transactions' commit validation. Validation reads the tombstone's TxID
+/// marker first and looks the writer up second, so the writer can move maps
+/// in between; this used to panic with "tombstone end TxID not found in txn
+/// map" and take the process down. Found by the FTS concurrent-writers fuzz
+/// soak.
+#[test]
+fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
+    let db = MvccTestDb::new();
+
+    // T1 creates the row so a version chain exists.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx1, generate_simple_string_row((-2).into(), 1, "original"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // T2 updates the row, putting it into T2's write set so T2's commit
+    // walks this version chain.
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+    assert!(db
+        .mvcc_store
+        .update(tx2, generate_simple_string_row((-2).into(), 1, "updated"))
+        .unwrap());
+
+    // Recreate the state T2's validation observes mid-race: another
+    // transaction deleted the B-tree-resident row, its tombstone still
+    // carries the in-flight TxID marker, and the writer itself has already
+    // committed and been evicted from `txs` into `finalized_tx_states`.
+    let evicted_writer: TxID = 9999;
+    db.mvcc_store
+        .insert_finalized_tx_state(evicted_writer, 1000)
+        .unwrap();
+    let row_id = RowID {
+        table_id: (-2).into(),
+        row_id: RowKey::Int(1),
+    };
+    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    entry.value().write().push(RowVersion {
+        id: 0,
+        begin: PackedTs::pack(None),
+        end: PackedTs::pack(Some(TxTimestampOrID::TxID(evicted_writer))),
+        row: generate_simple_string_row((-2).into(), 1, "original"),
+        btree_resident: true,
+        materialized_at: WalPos::ORIGIN,
+    });
+    drop(entry);
+
+    // The evicted writer committed, so T2 must lose with a write-write
+    // conflict — not a panic.
+    assert!(matches!(
+        commit_tx(db.mvcc_store.clone(), &conn2, tx2),
+        Err(LimboError::WriteWriteConflict)
+    ));
+}
