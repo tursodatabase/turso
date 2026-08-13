@@ -4041,6 +4041,75 @@ fn fts_mvcc_repeated_reads_reuse_the_cached_searcher() {
     );
 }
 
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_savepoint_rollback_purges_segments_from_every_statement_it_reverts() {
+    // A full-transaction ROLLBACK reloads the schema, which rebuilds the
+    // attachment and drops its caches wholesale — no residue is possible
+    // there. The leak window is ROLLBACK TO a savepoint spanning several
+    // statements: the attachment survives, and only the newest statement's
+    // cursor is still parked (earlier ones were replaced and closed without
+    // ever seeing the outcome), so per-cursor bookkeeping alone would leave
+    // the earlier statements' reverted segments in the shared caches.
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'committed baseline')")
+        .unwrap();
+    // Warm the cache with the committed segment; it must stay cached.
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'committed')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+    let baseline = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts")
+        .cached_bytes
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT sp").unwrap();
+    conn.execute("INSERT INTO docs VALUES (2, 'first uncommitted statement')")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (3, 'second uncommitted statement')")
+        .unwrap();
+    conn.execute("ROLLBACK TO sp").unwrap();
+
+    // Mid-transaction: both reverted statements' segments must be gone from
+    // the shared caches, not just the newest cursor's.
+    let after_savepoint = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts")
+        .cached_bytes
+        .unwrap();
+    assert_eq!(
+        after_savepoint, baseline,
+        "segments reverted by ROLLBACK TO must leave the caches, from every \
+         statement the savepoint covered"
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'uncommitted')"
+        ),
+        Vec::<Vec<rusqlite::types::Value>>::new()
+    );
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'committed')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
 fn fts_savepoint_rollback_discards_statement_documents() {

@@ -112,6 +112,15 @@ fn verify_checksum<'a>(bytes: &'a [u8], what: &str) -> Result<&'a [u8]> {
     Ok(&bytes[..payload_len])
 }
 
+/// Hash of the Tantivy schema an index was built with. The schema JSON
+/// covers field names, order, types, and tokenizer configuration — exactly
+/// what must match between the stored postings and the reader; query-time
+/// boosts are not part of it and may change freely.
+pub(super) fn schema_content_hash(schema: &Schema) -> u64 {
+    let json = serde_json::to_vec(schema).expect("tantivy schema serializes to JSON");
+    fts2_checksum(&json)
+}
+
 /// Rare index-level facts. Written once when the index is created and
 /// never rewritten; its presence marks a registry-format store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,21 +128,26 @@ pub(super) struct FtsControlV2 {
     pub format_version: u32,
     /// Distinguishes drop/recreate lifetimes of the same index name.
     pub index_incarnation: u64,
+    /// [`schema_content_hash`] of the schema the index was built with, or 0
+    /// for stores written before this field existed.
+    pub schema_hash: u64,
 }
 
 impl FtsControlV2 {
-    pub fn new(index_incarnation: u64) -> Self {
+    pub fn new(index_incarnation: u64, schema_hash: u64) -> Self {
         Self {
             format_version: FTS_STORAGE_FORMAT_V2,
             index_incarnation,
+            schema_hash,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 + 4 + 8 + 8);
+        let mut bytes = Vec::with_capacity(8 + 4 + 8 + 8 + 8);
         bytes.extend_from_slice(FTS2_CONTROL_MAGIC);
         bytes.extend_from_slice(&self.format_version.to_le_bytes());
         bytes.extend_from_slice(&self.index_incarnation.to_le_bytes());
+        bytes.extend_from_slice(&self.schema_hash.to_le_bytes());
         append_checksum(bytes)
     }
 
@@ -152,6 +166,13 @@ impl FtsControlV2 {
             )));
         }
         let index_incarnation = u64::from_le_bytes(take(payload, &mut offset)?);
+        // Stores written before the schema hash existed end here; 0 means
+        // "unknown" and is never checked against.
+        let schema_hash = if offset < payload.len() {
+            u64::from_le_bytes(take(payload, &mut offset)?)
+        } else {
+            0
+        };
         if offset != payload.len() {
             return Err(LimboError::Corrupt(
                 "FTS control record has trailing payload bytes".into(),
@@ -160,6 +181,7 @@ impl FtsControlV2 {
         Ok(Self {
             format_version,
             index_incarnation,
+            schema_hash,
         })
     }
 }
@@ -411,13 +433,49 @@ pub(super) fn with_tantivy_footer(mut body: Vec<u8>) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Check the Tantivy per-file footer on an assembled segment file: the stored
+/// CRC must match a fresh crc32 of the file body. Chunk rows carry no checksum
+/// of their own, so this is the only guard that catches a same-length bit flip
+/// in segment bytes before they reach Tantivy's decoders.
+pub(super) fn verify_tantivy_footer(name: &str, bytes: &[u8]) -> Result<()> {
+    let corrupt =
+        |detail: &str| LimboError::Corrupt(format!("FTS segment file {name} has {detail}"));
+    let Some(footer_start) = bytes.len().checked_sub(8) else {
+        return Err(corrupt("no room for a footer"));
+    };
+    let magic = u32::from_le_bytes(bytes[footer_start + 4..].try_into().expect("4 bytes"));
+    if magic != FOOTER_MAGIC_NUMBER {
+        return Err(corrupt("a bad footer magic number"));
+    }
+    let payload_len = u32::from_le_bytes(
+        bytes[footer_start..footer_start + 4]
+            .try_into()
+            .expect("4 bytes"),
+    ) as usize;
+    let Some(body_len) = footer_start.checked_sub(payload_len) else {
+        return Err(corrupt("a footer longer than the file"));
+    };
+    let footer: serde_json::Value = serde_json::from_slice(&bytes[body_len..footer_start])
+        .map_err(|_| corrupt("an unparseable footer"))?;
+    let stored_crc = footer
+        .get("crc")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|crc| u32::try_from(crc).ok())
+        .ok_or_else(|| corrupt("a footer without a crc"))?;
+    let actual_crc = crc32fast::hash(&bytes[..body_len]);
+    if stored_crc != actual_crc {
+        return Err(corrupt("bytes that do not match its footer crc"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn control_record_round_trips_and_detects_corruption() {
-        let control = FtsControlV2::new(0xdead_beef);
+        let control = FtsControlV2::new(0xdead_beef, 0x5c4e_a4a5);
         let bytes = control.encode();
         assert_eq!(FtsControlV2::decode(&bytes).unwrap(), control);
 
@@ -425,6 +483,19 @@ mod tests {
         let mut corrupted = bytes;
         corrupted[9] ^= 0xff;
         assert!(FtsControlV2::decode(&corrupted).is_err());
+    }
+
+    #[test]
+    fn control_record_without_schema_hash_decodes_as_unknown() {
+        // A store written before the schema-hash field: magic + version +
+        // incarnation only, checksummed.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(FTS2_CONTROL_MAGIC);
+        payload.extend_from_slice(&FTS_STORAGE_FORMAT_V2.to_le_bytes());
+        payload.extend_from_slice(&0xdead_beef_u64.to_le_bytes());
+        let decoded = FtsControlV2::decode(&append_checksum(payload)).unwrap();
+        assert_eq!(decoded.index_incarnation, 0xdead_beef);
+        assert_eq!(decoded.schema_hash, 0, "missing field reads as unknown");
     }
 
     #[test]

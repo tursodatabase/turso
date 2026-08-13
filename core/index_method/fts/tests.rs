@@ -316,3 +316,286 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     assert!(cache.get(&b).is_none());
     assert!(cache.get(&c).is_none());
 }
+
+// ===================== D3(a): decoder corruption fuzz =====================
+//
+// Every persisted FTS blob must parse to `Err` (never panic, never OOM) no
+// matter how it is mutated. Two batteries per decoder:
+// - raw mutations: the record checksum must reject them;
+// - checksum-fixed mutations: the structural validation behind the checksum
+//   must hold on its own (an attacker-shaped or torn write can have a valid
+//   checksum over garbage).
+
+/// Deterministic xorshift64* so failures reproduce without a seed printout.
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound.max(1) as u64) as usize
+    }
+}
+
+/// Re-checksum a mutated payload so it reaches the structural parser.
+fn with_valid_checksum(payload: &[u8]) -> Vec<u8> {
+    super::format::append_checksum(payload.to_vec())
+}
+
+fn assert_all_mutations_rejected(what: &str, original: &[u8], decode: &dyn Fn(&[u8]) -> bool) {
+    // Every single-bit flip must be rejected by the checksum.
+    for byte in 0..original.len() {
+        for bit in 0..8 {
+            let mut mutated = original.to_vec();
+            mutated[byte] ^= 1 << bit;
+            assert!(
+                decode(&mutated),
+                "{what}: single-bit flip at byte {byte} bit {bit} must be rejected"
+            );
+        }
+    }
+    // Every truncation must be rejected.
+    for len in 0..original.len() {
+        assert!(
+            decode(&original[..len]),
+            "{what}: truncation to {len} bytes must be rejected"
+        );
+    }
+    // Trailing junk must be rejected.
+    let mut extended = original.to_vec();
+    extended.extend_from_slice(b"junk");
+    assert!(decode(&extended), "{what}: trailing bytes must be rejected");
+
+    // Random multi-byte splats (raw): checksum must reject.
+    let mut rng = XorShift64(0x5eed_0d3a);
+    for _ in 0..2_000 {
+        let mut mutated = original.to_vec();
+        for _ in 0..=rng.below(8) {
+            let pos = rng.below(mutated.len());
+            mutated[pos] = rng.next() as u8;
+        }
+        if mutated != original {
+            assert!(decode(&mutated), "{what}: random splat must be rejected");
+        }
+    }
+}
+
+/// Checksum-fixed payload mutations must never panic; structural validation
+/// decides Ok/Err on its own.
+fn splat_payloads_never_panic(original: &[u8], decode: &dyn Fn(&[u8]) -> bool) {
+    let payload_len = original.len() - 8;
+    let payload = &original[..payload_len];
+    let mut rng = XorShift64(0xdead_beef_cafe);
+    for _ in 0..2_000 {
+        let mut mutated = payload.to_vec();
+        match rng.below(3) {
+            // byte splats
+            0 => {
+                for _ in 0..=rng.below(8) {
+                    let pos = rng.below(mutated.len());
+                    mutated[pos] = rng.next() as u8;
+                }
+            }
+            // truncation
+            1 => {
+                mutated.truncate(rng.below(mutated.len() + 1));
+            }
+            // length-field-shaped inflation: overwrite an aligned u32 with
+            // a huge value
+            _ => {
+                if mutated.len() >= 4 {
+                    let pos = rng.below(mutated.len() - 3);
+                    let inflated = (u32::MAX - rng.below(1024) as u32).to_le_bytes();
+                    mutated[pos..pos + 4].copy_from_slice(&inflated);
+                }
+            }
+        }
+        // Must return (Ok or Err), never panic or hang.
+        let _ = decode(&with_valid_checksum(&mutated));
+    }
+}
+
+#[test]
+fn corrupted_control_records_always_error_and_never_panic() {
+    let control = FtsControlV2::new(42, 0x1234_5678);
+    let encoded = control.encode();
+    assert!(FtsControlV2::decode(&encoded).is_ok());
+
+    let rejects = |bytes: &[u8]| FtsControlV2::decode(bytes).is_err();
+    assert_all_mutations_rejected("control", &encoded, &rejects);
+    splat_payloads_never_panic(&encoded, &rejects);
+
+    // Targeted structural cases behind a valid checksum.
+    let payload = &encoded[..encoded.len() - 8];
+    // Wrong magic.
+    let mut wrong_magic = payload.to_vec();
+    wrong_magic[0] ^= 0xff;
+    assert!(FtsControlV2::decode(&with_valid_checksum(&wrong_magic)).is_err());
+    // Unsupported version.
+    let mut wrong_version = payload.to_vec();
+    wrong_version[8] = 0xff;
+    assert!(FtsControlV2::decode(&with_valid_checksum(&wrong_version)).is_err());
+    // Trailing payload bytes.
+    let mut trailing = payload.to_vec();
+    trailing.push(0);
+    assert!(FtsControlV2::decode(&with_valid_checksum(&trailing)).is_err());
+}
+
+#[test]
+fn schema_hash_mismatch_is_rejected_with_a_rebuild_hint() {
+    let attachment = test_attachment();
+    let cursor = FtsCursor::new(&attachment);
+
+    // Matching hash and pre-hash (0) stores open fine.
+    assert!(cursor
+        .check_schema_hash(&FtsControlV2::new(1, cursor.schema_hash))
+        .is_ok());
+    assert!(cursor.check_schema_hash(&FtsControlV2::new(1, 0)).is_ok());
+
+    // A store built under any other schema is refused, naming the remedy.
+    let err = cursor
+        .check_schema_hash(&FtsControlV2::new(1, cursor.schema_hash ^ 1))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("DROP INDEX"),
+        "error must name the rebuild remedy, got: {err}"
+    );
+
+    // The hash actually varies with the indexed schema (different column
+    // set), so cross-schema opens cannot collide into acceptance.
+    let other = FtsIndexAttachment::new(IndexMethodConfiguration {
+        table_name: "docs".to_string(),
+        index_name: "docs_other".to_string(),
+        columns: vec![IndexColumn::new("body", 1)],
+        parameters: FxHashMap::<String, Value>::default(),
+    })
+    .unwrap();
+    assert_ne!(attachment.schema_hash, other.schema_hash);
+}
+
+#[test]
+fn corrupted_segment_descriptors_always_error_and_never_panic() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(
+        &attachment,
+        &[(1, "hello corruption"), (2, "goodbye corruption")],
+    );
+    let descriptor = &segment.descriptor;
+    let encoded = descriptor.encode().unwrap();
+    let id = descriptor.segment_id;
+    assert!(SegmentDescriptor::decode(id, &encoded).is_ok());
+
+    let rejects = |bytes: &[u8]| SegmentDescriptor::decode(id, bytes).is_err();
+    assert_all_mutations_rejected("descriptor", &encoded, &rejects);
+    splat_payloads_never_panic(&encoded, &rejects);
+
+    // Length-field inflation behind a valid checksum must be rejected by
+    // bounds checks, not by allocating file_count/name_len bytes.
+    let payload = &encoded[..encoded.len() - 8];
+    let mut inflated_count = payload.to_vec();
+    // Layout: magic(8) max_doc(4) file_count(4) ...
+    inflated_count[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(SegmentDescriptor::decode(id, &with_valid_checksum(&inflated_count)).is_err());
+
+    let mut inflated_name = payload.to_vec();
+    // First file entry: name_len at offset 16.
+    inflated_name[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(SegmentDescriptor::decode(id, &with_valid_checksum(&inflated_name)).is_err());
+
+    // Zero-chunk file entries are structurally invalid.
+    let zero_chunks = SegmentDescriptor {
+        segment_id: id,
+        max_doc: 1,
+        files: vec![SegmentFileEntry {
+            name: "f.term".to_string(),
+            size: 10,
+            num_chunks: 0,
+        }],
+    };
+    let encoded_zero = zero_chunks.encode().unwrap();
+    assert!(SegmentDescriptor::decode(id, &encoded_zero).is_err());
+}
+
+#[test]
+fn corrupted_chunk_layouts_always_error() {
+    // Real v2 segment files end in a Tantivy footer; build the fixture bytes
+    // the same way so the valid layout passes the crc check.
+    let file_a = with_tantivy_footer(vec![1, 2, 3, 4, 5, 6]).unwrap();
+    let file_b = with_tantivy_footer(vec![7, 8, 9]).unwrap();
+    let a_split = file_a.len() / 2;
+    let descriptor = SegmentDescriptor {
+        segment_id: SegmentId::generate_random(),
+        max_doc: 1,
+        files: vec![
+            SegmentFileEntry {
+                name: "a.term".to_string(),
+                size: file_a.len() as u64,
+                num_chunks: 2,
+            },
+            SegmentFileEntry {
+                name: "b.store".to_string(),
+                size: file_b.len() as u64,
+                num_chunks: 1,
+            },
+        ],
+    };
+    let valid_chunks = || {
+        let mut chunks: HashMap<u32, HashMap<i64, Vec<u8>>> = HashMap::default();
+        let mut a: HashMap<i64, Vec<u8>> = HashMap::default();
+        a.insert(0, file_a[..a_split].to_vec());
+        a.insert(1, file_a[a_split..].to_vec());
+        chunks.insert(0, a);
+        let mut b: HashMap<i64, Vec<u8>> = HashMap::default();
+        b.insert(0, file_b.clone());
+        chunks.insert(1, b);
+        chunks
+    };
+    assert!(assemble_segment_data(&descriptor, valid_chunks()).is_ok());
+
+    // A same-length bit flip in chunk bytes passes every structural check;
+    // only the footer crc catches it.
+    let mut flipped = valid_chunks();
+    flipped.get_mut(&0).unwrap().get_mut(&0).unwrap()[1] ^= 0x01;
+    assert!(assemble_segment_data(&descriptor, flipped).is_err());
+
+    // Missing file.
+    let mut missing_file = valid_chunks();
+    missing_file.remove(&1);
+    assert!(assemble_segment_data(&descriptor, missing_file).is_err());
+
+    // Missing chunk within a file.
+    let mut missing_chunk = valid_chunks();
+    missing_chunk.get_mut(&0).unwrap().remove(&1);
+    assert!(assemble_segment_data(&descriptor, missing_chunk).is_err());
+
+    // Chunk-count mismatch with a hole (still 2 entries, wrong numbers).
+    let mut hole = valid_chunks();
+    let moved = hole.get_mut(&0).unwrap().remove(&1).unwrap();
+    hole.get_mut(&0).unwrap().insert(5, moved);
+    assert!(assemble_segment_data(&descriptor, hole).is_err());
+
+    // Negative chunk number.
+    let mut negative = valid_chunks();
+    let moved = negative.get_mut(&0).unwrap().remove(&1).unwrap();
+    negative.get_mut(&0).unwrap().insert(-1, moved);
+    assert!(assemble_segment_data(&descriptor, negative).is_err());
+
+    // Assembled size differs from the descriptor.
+    let mut resized = valid_chunks();
+    let mut longer = file_b.clone();
+    longer.push(10);
+    resized.get_mut(&1).unwrap().insert(0, longer);
+    assert!(assemble_segment_data(&descriptor, resized).is_err());
+
+    // Orphan chunks for a file the descriptor does not list.
+    let mut orphan = valid_chunks();
+    let mut extra: HashMap<i64, Vec<u8>> = HashMap::default();
+    extra.insert(0, vec![0]);
+    orphan.insert(9, extra);
+    assert!(assemble_segment_data(&descriptor, orphan).is_err());
+}

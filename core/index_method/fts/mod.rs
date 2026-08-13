@@ -61,10 +61,11 @@ mod rows;
 
 use directory::{BuildDirectory, SnapshotDirectory};
 use format::{
-    alive_bitset_bytes, parse_segment_id, segment_chunk_path, segment_chunk_prefix,
-    segment_registry_path, segment_tombstone_path, synthesize_meta_json, tombstone_del_file_name,
-    with_tantivy_footer, FtsControlV2, LoadedSegment, SegmentData, SegmentDescriptor,
-    SegmentFileEntry, FTS2_CONTROL_PATH, FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
+    alive_bitset_bytes, parse_segment_id, schema_content_hash, segment_chunk_path,
+    segment_chunk_prefix, segment_registry_path, segment_tombstone_path, synthesize_meta_json,
+    tombstone_del_file_name, verify_tantivy_footer, with_tantivy_footer, FtsControlV2,
+    LoadedSegment, SegmentData, SegmentDescriptor, SegmentFileEntry, FTS2_CONTROL_PATH,
+    FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
 };
 use rows::{
     chunk_rows, row_fields, seek_key_for_path, PathTarget, PendingRow, RowDeleter, RowInserter,
@@ -476,11 +477,26 @@ impl SearcherCache {
     }
 }
 
+/// Which transaction published a segment into the shared caches. MVCC
+/// transactions are identified by transaction id; WAL mode runs one write
+/// transaction per connection, so the connection stands in for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishOwner {
+    Mvcc(u64),
+    Connection(usize),
+}
+
 /// Attachment-level shared state.
 #[derive(Default)]
 struct FtsShared {
     segment_bytes: Mutex<SegmentByteCache>,
     searchers: Mutex<SearcherCache>,
+    /// Uncommitted segments each open transaction has published into the
+    /// shared caches. Owned per transaction, not per cursor: a statement's
+    /// cursor is replaced (closed without transaction hooks) by the next
+    /// statement's cursor, so rollback must be able to purge every segment
+    /// the whole transaction published, whichever cursor published it.
+    own_published: Mutex<Vec<(PublishOwner, SegmentId)>>,
     /// The one cursor currently allowed to flush this index per connection.
     writer_slot: Mutex<Option<FtsWriterSlot>>,
     /// Throwaway index used only to mint `SegmentMeta` values for
@@ -544,6 +560,9 @@ pub struct FtsIndexAttachment {
     /// (min_gram, max_gram) for the ngram tokenizer, from the WITH clause
     /// `min_gram`/`max_gram` keys. [DEFAULT_NGRAM_WINDOW] unless configured.
     ngram_window: (usize, usize),
+    /// [`schema_content_hash`] of `schema`, persisted in the control row so
+    /// a store built under a different schema is rejected on open.
+    schema_hash: u64,
     shared: Arc<FtsShared>,
 }
 
@@ -744,6 +763,7 @@ impl FtsIndexAttachment {
             &match_limit,            // 5
             &match_pattern,          // 6
         ])?;
+        let schema_hash = schema_content_hash(&schema);
         Ok(Self {
             cfg,
             schema,
@@ -752,6 +772,7 @@ impl FtsIndexAttachment {
             patterns,
             field_weights,
             ngram_window,
+            schema_hash,
             shared: Arc::new(FtsShared::default()),
         })
     }
@@ -1004,6 +1025,9 @@ impl FtsHitStream {
 /// statements never load the existing index at all.
 pub struct FtsCursor {
     schema: Schema,
+    /// [`schema_content_hash`] of `schema`; checked against the control
+    /// row's persisted hash on open.
+    schema_hash: u64,
     rowid_field: Field,
     /// (min_gram, max_gram) window for the ngram tokenizer
     ngram_window: (usize, usize),
@@ -1103,6 +1127,7 @@ impl FtsCursor {
             .collect();
         Self {
             schema: attachment.schema.clone(),
+            schema_hash: attachment.schema_hash,
             rowid_field: attachment.rowid_field,
             ngram_window: attachment.ngram_window,
             text_fields,
@@ -1524,7 +1549,9 @@ impl FtsCursor {
                         self.state = FtsState::ProbeFormat { rewound: false };
                         continue;
                     }
-                    self.control = Some(FtsControlV2::decode(&bytes)?);
+                    let control = FtsControlV2::decode(&bytes)?;
+                    self.check_schema_hash(&control)?;
+                    self.control = Some(control);
                     if self.probe_only {
                         // Insert fast path: the store is v2; nothing else
                         // needs loading to append segments.
@@ -1918,6 +1945,24 @@ impl FtsCursor {
         self.drive_open()
     }
 
+    /// Reject a store whose persisted schema hash disagrees with this
+    /// cursor's schema: the stored postings and the reader's field layout /
+    /// tokenizer would silently disagree. Hash 0 marks a store written
+    /// before the field existed and is never checked. Scan-cache hits skip
+    /// this: entries are per-attachment, so their control row already
+    /// passed the check when it was first read.
+    fn check_schema_hash(&self, control: &FtsControlV2) -> Result<()> {
+        if control.schema_hash != 0 && control.schema_hash != self.schema_hash {
+            return Err(LimboError::InvalidArgument(format!(
+                "FTS index storage {} was built with a different schema \
+                 (columns or tokenizer changed); DROP INDEX and CREATE INDEX \
+                 to rebuild it",
+                self.dir_table_name
+            )));
+        }
+        Ok(())
+    }
+
     /// Make sure the backing table and its `backing_btree` index exist,
     /// creating them on the first `create`. Every later open takes the
     /// fast path and never prepares a statement.
@@ -2029,7 +2074,7 @@ impl FtsCursor {
             let (segment, rows) = self.build_segment()?;
             if let Some(segment) = segment {
                 inserts.extend(rows);
-                self.own_published.push(segment.id());
+                self.record_own_published(segment.id());
                 self.shared.segment_bytes.lock().put(
                     segment.id(),
                     Arc::clone(&segment.data),
@@ -2038,6 +2083,15 @@ impl FtsCursor {
                 new_segment = Some(segment);
             }
         }
+        // Duplicate-tombstone safety is transitive through the base row:
+        // two deleters of the same row conflict on the base-table row, so a
+        // tombstone insert must only ever be driven by base-table DML
+        // (`delete()`, which registers the deleter first). A tombstone
+        // staged any other way would silently escape that conflict cover.
+        debug_assert!(
+            self.pending_tombstone_rows.is_empty() || self.registered_deleter,
+            "FTS tombstone rows staged outside base-table DML"
+        );
         for (segment_id, doc_id) in self.pending_tombstone_rows.drain(..) {
             inserts.push(PendingRow {
                 path: segment_tombstone_path(&segment_id),
@@ -2241,7 +2295,7 @@ impl FtsCursor {
                 "FTS merge: merged candidate segments"
             );
             inserts = rows;
-            self.own_published.push(segment.id());
+            self.record_own_published(segment.id());
             self.shared.segment_bytes.lock().put(
                 segment.id(),
                 Arc::clone(&segment.data),
@@ -2466,20 +2520,70 @@ impl FtsCursor {
 
     /// Purge this transaction's published-but-uncommitted segments from the
     /// shared caches (rollback paths).
-    fn purge_own_published(&mut self) {
-        if self.own_published.is_empty() {
+    fn purge_own_published(&mut self, owner: Option<PublishOwner>) {
+        // Purge everything this cursor's transaction published, from any
+        // cursor — a statement's cursor is replaced by the next statement's
+        // and never sees the transaction outcome hooks itself.
+        let mut ids = std::mem::take(&mut self.own_published);
+        if let Some(owner) = owner {
+            self.shared
+                .own_published
+                .lock()
+                .retain(|(entry_owner, id)| {
+                    if *entry_owner == owner {
+                        ids.push(*id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+        }
+        if ids.is_empty() {
             return;
         }
         let mut bytes = self.shared.segment_bytes.lock();
-        for id in &self.own_published {
+        for id in &ids {
             bytes.remove(id);
         }
         drop(bytes);
-        self.shared
-            .searchers
-            .lock()
-            .purge_segments(&self.own_published);
-        self.own_published.clear();
+        self.shared.searchers.lock().purge_segments(&ids);
+    }
+
+    /// The transaction identity to record shared-cache publications under,
+    /// read from the live connection. Valid while the transaction is open
+    /// (publish time); outcome hooks must use [`Self::owner_from_context`]
+    /// instead — by rollback-hook time the MVCC transaction is already torn
+    /// down and the live lookup would miss. `None` only when the cursor has
+    /// no live connection (teardown, nothing left to record).
+    fn publish_owner(&self) -> Option<PublishOwner> {
+        let conn = self.connection.as_ref()?.upgrade()?;
+        let database_id = self.database_id?;
+        Some(match conn.get_mv_tx_id_for_db(database_id) {
+            Some(tx_id) => PublishOwner::Mvcc(tx_id),
+            None => PublishOwner::Connection(Arc::as_ptr(&conn) as *const () as usize),
+        })
+    }
+
+    /// The transaction identity as captured by the hook's context when the
+    /// statement ran — the parked context outlives the transaction itself.
+    fn owner_from_context(&self, context: &IndexMethodContext) -> Option<PublishOwner> {
+        if let Some(tx_id) = context.transaction_id() {
+            return Some(PublishOwner::Mvcc(tx_id));
+        }
+        let conn = self.connection.as_ref()?.upgrade()?;
+        Some(PublishOwner::Connection(
+            Arc::as_ptr(&conn) as *const () as usize
+        ))
+    }
+
+    /// Record one published-but-uncommitted segment, both cursor-locally
+    /// (own-view bookkeeping) and in the per-transaction registry rollback
+    /// purges from.
+    fn record_own_published(&mut self, id: SegmentId) {
+        self.own_published.push(id);
+        if let Some(owner) = self.publish_owner() {
+            self.shared.own_published.lock().push((owner, id));
+        }
     }
 
     /// Reset every piece of per-transaction state. Used by abort, rollback,
@@ -2542,6 +2646,11 @@ fn assemble_segment_data(
                 entry.size
             )));
         }
+        // Chunk rows have no checksum of their own, so a same-length bit flip
+        // survives every structural check above. Each captured v2 file ends in
+        // a Tantivy footer; verify its crc here, once, while the bytes are
+        // resident.
+        verify_tantivy_footer(&entry.name, &assembled)?;
         files.insert(entry.name.clone(), assembled);
     }
     if !chunks.is_empty() {
@@ -2819,7 +2928,7 @@ impl IndexMethodCursor for FtsCursor {
         return_if_io!(self.ensure_backing_store(&conn, database_id));
         self.open_cursor(&conn, database_id)?;
         self.claim_writer_slot()?;
-        let control = FtsControlV2::new(self.mint_index_incarnation());
+        let control = FtsControlV2::new(self.mint_index_incarnation(), self.schema_hash);
         self.publish = Some(PendingPublish {
             inserter: Some(RowInserter::new(vec![PendingRow {
                 path: FTS2_CONTROL_PATH.to_string(),
@@ -3378,30 +3487,41 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn abort_statement(&mut self, _context: &IndexMethodContext) {
+    fn abort_statement(&mut self, context: &IndexMethodContext) {
         // The statement's backing rows (if any were staged) are undone by
         // the engine's savepoint rollback; drop the in-memory mirror and
-        // rescan on the next access.
-        self.purge_own_published();
+        // rescan on the next access. Purging the whole transaction's
+        // publications is coarse (earlier statements' rows are still
+        // visible and reload on demand) but never wrong.
+        let owner = self.owner_from_context(context);
+        self.purge_own_published(owner);
         self.reset_to_init();
     }
 
-    fn on_transaction_committed(&mut self, _context: &IndexMethodContext) {
+    fn on_transaction_committed(&mut self, context: &IndexMethodContext) {
         // Own segments are durable now; the shared byte cache entries stay.
         self.own_published.clear();
+        if let Some(owner) = self.owner_from_context(context) {
+            self.shared
+                .own_published
+                .lock()
+                .retain(|(entry_owner, _)| *entry_owner != owner);
+        }
     }
 
-    fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {
-        self.purge_own_published();
+    fn on_transaction_rolled_back(&mut self, context: &IndexMethodContext) {
+        let owner = self.owner_from_context(context);
+        self.purge_own_published(owner);
         self.reset_to_init();
     }
 
-    fn on_savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {
+    fn on_savepoint_rolled_back(&mut self, context: &IndexMethodContext) {
         // Correct but coarse: the hook carries no savepoint identity, so we
         // cannot tell whether the rollback reverted rows this cursor's view
         // depends on. Discard everything; the next FTS access reloads from
         // the (correctly reverted) backing B-tree.
-        self.purge_own_published();
+        let owner = self.owner_from_context(context);
+        self.purge_own_published(owner);
         self.reset_to_init();
     }
 

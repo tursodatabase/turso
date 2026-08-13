@@ -275,4 +275,173 @@ mod tests {
             assert_matches_model(&observer, &visible, token, seed, &history, "observer");
         }
     }
+
+    /// Run a query on a corrupted store and pull integer ids out of the first
+    /// column. A clean `Err` from anywhere (prepare, step, row decode) is a
+    /// legitimate corruption outcome; a panic never is.
+    fn try_query_ids(conn: &Arc<Connection>, sql: &str) -> turso_core::Result<Vec<i64>> {
+        let mut stmt = conn.prepare(sql)?;
+        let mut ids = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            let id = row.get::<i64>(0)?;
+            ids.push(id);
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    /// End-to-end corruption fuzzing: flip bits inside FTS-owned regions of a
+    /// checkpointed db file, reopen, and run queries and one insert. Every
+    /// statement must either succeed with model-correct results or return a
+    /// clean error — never panic, never silently return wrong rows.
+    ///
+    /// The corpus has no deletes or updates, so no tombstone rows exist:
+    /// tombstone doc ids live in row keys with no checksum, so a flip there
+    /// would silently change results (a known format limitation). Everything
+    /// this test flips is covered by a checksum (control/descriptor blobs),
+    /// the per-file Tantivy footer crc (chunk bytes), or path/structure
+    /// validation.
+    #[test]
+    fn fts_bit_flip_corruption_fuzz() {
+        let (mut rng, seed) = helpers::init_fuzz_test_tracing("fts_bit_flip_corruption_fuzz");
+        let opts = || turso_core::DatabaseOpts::new().with_index_method(true);
+        let db = TempDatabase::builder().with_opts(opts()).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(content)")
+            .unwrap();
+
+        // Insert-only corpus, one statement each so several segments publish
+        // (and auto-merge runs at least once before the checkpoint).
+        let mut model = Model::new();
+        for id in 1..=60i64 {
+            let content = random_content(&mut rng);
+            conn.execute(format!(
+                "INSERT INTO docs(id, content) VALUES ({id}, {})",
+                sql_text(&content)
+            ))
+            .unwrap();
+            model.insert(id, content);
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+        let pristine_path = db.path.clone();
+        drop(db);
+        let pristine = std::fs::read(&pristine_path).unwrap();
+
+        // Every FTS row key starts with "fts2/", so occurrences mark the
+        // FTS-owned regions of the file (live rows, plus freed space from
+        // merged-away segments — flips there must be harmless).
+        let needle = b"fts2/";
+        let regions: Vec<usize> = (0..pristine.len().saturating_sub(needle.len()))
+            .filter(|&start| &pristine[start..start + needle.len()] == needle)
+            .collect();
+        assert!(
+            !regions.is_empty(),
+            "checkpointed db file must contain FTS2 rows; seed={seed}"
+        );
+
+        let iterations = helpers::fuzz_iterations(30);
+        for iteration in 0..iterations {
+            helpers::log_progress("fts_bit_flip_corruption_fuzz", iteration, iterations, 10);
+            let mut mutated = pristine.clone();
+            let mut flips = Vec::new();
+            for _ in 0..rng.random_range(1..=4) {
+                let region = *regions.choose(&mut rng).unwrap();
+                let offset = (region + rng.random_range(0..256)).min(mutated.len() - 1);
+                let bit = rng.random_range(0..8u8);
+                mutated[offset] ^= 1 << bit;
+                flips.push(format!("offset={offset} bit={bit}"));
+            }
+            let context = format!(
+                "seed={seed} iteration={iteration} flips=[{}]",
+                flips.join(", ")
+            );
+
+            let mutated_path = pristine_path.with_extension(format!("mut{iteration}"));
+            std::fs::write(&mutated_path, &mutated).unwrap();
+            // Open fallibly: rejecting the corrupted file outright is a
+            // legitimate outcome, so no TempDatabase (its builder unwraps).
+            let io: Arc<dyn turso_core::IO + Send> =
+                Arc::new(turso_core::PlatformIO::new().unwrap());
+            let Ok(reopened) = turso_core::Database::open_file_with_flags(
+                io,
+                mutated_path.to_str().unwrap(),
+                turso_core::OpenFlags::default(),
+                opts(),
+                None,
+                Arc::new(turso_core::SqliteDialect),
+            ) else {
+                let _ = std::fs::remove_file(&mutated_path);
+                continue;
+            };
+            let Ok(conn) = reopened.connect() else {
+                let _ = std::fs::remove_file(&mutated_path);
+                continue;
+            };
+
+            for token in TOKENS {
+                if let Ok(ids) = try_query_ids(
+                    &conn,
+                    &format!("SELECT id FROM docs WHERE fts_match(content, '{token}') ORDER BY id"),
+                ) {
+                    assert_eq!(
+                        ids,
+                        expected_ids(&model, token),
+                        "corrupted store silently returned wrong rows for {token:?}; {context}"
+                    );
+                }
+            }
+
+            // One score query: scores have no oracle, but the matched id set
+            // still must be model-correct when the query succeeds.
+            let token = TOKENS.choose(&mut rng).unwrap();
+            if let Ok(ids) = try_query_ids(
+                &conn,
+                &format!(
+                    "SELECT id, fts_score(content, '{token}') FROM docs \
+                     WHERE fts_match(content, '{token}') ORDER BY id"
+                ),
+            ) {
+                assert_eq!(
+                    ids,
+                    expected_ids(&model, token),
+                    "corrupted store silently returned wrong scored rows for {token:?}; {context}"
+                );
+            }
+
+            // One insert. Writes are allowed one extra outcome queries are
+            // not: a B-tree write that detects a corrupted page stops with
+            // an invariant assert instead of returning an error (the
+            // crash-don't-corrupt policy; queries above must still never
+            // panic). What a write must never do is claim success and then
+            // serve wrong rows — so a successful insert is verified.
+            let insert_id = 100_000 + iteration as i64;
+            let insert_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                conn.execute(format!(
+                    "INSERT INTO docs(id, content) VALUES ({insert_id}, 'alpha bravo')"
+                ))
+            }));
+            if let Ok(Ok(_)) = insert_result {
+                let mut model_after = model.clone();
+                model_after.insert(insert_id, Some("alpha bravo".to_string()));
+                if let Ok(ids) = try_query_ids(
+                    &conn,
+                    "SELECT id FROM docs WHERE fts_match(content, 'alpha') ORDER BY id",
+                ) {
+                    assert_eq!(
+                        ids,
+                        expected_ids(&model_after, "alpha"),
+                        "post-insert query returned wrong rows; {context}"
+                    );
+                }
+            }
+
+            drop(conn);
+            drop(reopened);
+            let _ = std::fs::remove_file(&mutated_path);
+            let _ = std::fs::remove_file(format!("{}-wal", mutated_path.display()));
+        }
+    }
 }
