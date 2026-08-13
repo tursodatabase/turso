@@ -82,9 +82,56 @@ enum SelectMode {
     Scalar,
 }
 
+/// Generate correlation keys accepted by the subquery unnesting optimizer.
+///
+/// Unnesting currently accepts only `=` between an inner column and an outer
+/// column. Generate one or two such keys, with either operand order. Other
+/// correlation operators cannot exercise rewritten-versus-correlated plans
+/// until the optimizer knows how to rewrite them.
+fn generate_supported_correlation_predicate(ctx: &mut Context) -> Option<Expr> {
+    let outer_tables = ctx.outer_tables()?.to_vec();
+    let inner_tables = ctx.tables_in_scope().to_vec();
+    let mut pairs = Vec::new();
+    for inner in &inner_tables {
+        for inner_column in inner.table.filterable_columns() {
+            for outer in &outer_tables {
+                for outer_column in outer.table.filterable_columns() {
+                    if inner_column.data_type == outer_column.data_type {
+                        pairs.push((
+                            inner.qualifier.clone(),
+                            inner_column.name.clone(),
+                            outer.qualifier.clone(),
+                            outer_column.name.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let pairs = ctx.subsequence(&pairs, 1..=2);
+    let mut predicates = Vec::with_capacity(pairs.len());
+    for (inner_table, inner_column, outer_table, outer_column) in pairs {
+        let inner = Expr::column_ref(ctx, Some(inner_table), inner_column);
+        let outer = Expr::column_ref(ctx, Some(outer_table), outer_column);
+        let (left, right) = if ctx.gen_bool() {
+            (inner, outer)
+        } else {
+            (outer, inner)
+        };
+        predicates.push(Expr::binary_op(ctx, left, BinOp::Eq, right));
+    }
+    let mut predicates = predicates.into_iter();
+    let first = predicates.next()?;
+    ctx.record_correlated_subquery();
+    Some(predicates.fold(first, |left, right| {
+        Expr::binary_op(ctx, left, BinOp::And, right)
+    }))
+}
+
 /// Generate a simple single-column SELECT (for scalar subqueries).
 ///
-/// Always returns exactly 1 column with LIMIT 1.
+/// Always returns exactly one column. Non-aggregate forms use `LIMIT 1`;
+/// ungrouped aggregate forms already return one row.
 pub fn generate_simple_select<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
@@ -128,7 +175,23 @@ fn generate_select_impl<C: Capabilities>(
     };
 
     // --- Alias for primary table ---
-    let from_alias = if mode == SelectMode::Full
+    let from_alias = if mode == SelectMode::Scalar
+        && !ctx.tables_in_scope().is_empty()
+        && select_config.subquery_correlation_probability > 0.0
+    {
+        let enclosing_qualifiers: Vec<String> = ctx
+            .tables_in_scope()
+            .iter()
+            .map(|table| table.qualifier.clone())
+            .collect();
+        let alias = loop {
+            let candidate = ctx.next_table_alias();
+            if !enclosing_qualifiers.contains(&candidate) {
+                break candidate;
+            }
+        };
+        Some(alias)
+    } else if mode == SelectMode::Full
         && ident_config.generate_table_aliases
         && ctx.gen_bool_with_prob(select_config.table_alias_probability)
     {
@@ -205,6 +268,9 @@ fn generate_select_impl_inner<C: Capabilities>(
     } else {
         None
     };
+    let scalar_aggregate_without_group = mode == SelectMode::Scalar
+        && group_by.is_none()
+        && ctx.gen_bool_with_prob(select_config.subquery_aggregate_probability);
 
     // --- Columns ---
     let mut columns = match mode {
@@ -216,7 +282,7 @@ fn generate_select_impl_inner<C: Capabilities>(
             }
         }
         SelectMode::Scalar => {
-            if group_by.is_some() {
+            if group_by.is_some() || scalar_aggregate_without_group {
                 // Aggregate output column
                 vec![SelectColumn {
                     expr: generate_aggregate_call(generator, ctx)?,
@@ -248,10 +314,22 @@ fn generate_select_impl_inner<C: Capabilities>(
     }
 
     // --- WHERE ---
-    let where_clause = if ctx.gen_bool_with_prob(where_prob) {
+    let generated_where = if ctx.gen_bool_with_prob(where_prob) {
         Some(generate_condition(generator, ctx)?)
     } else {
         None
+    };
+    let correlated = (mode == SelectMode::Scalar
+        && ctx.gen_bool_with_prob(select_config.subquery_correlation_probability))
+    .then(|| generate_supported_correlation_predicate(ctx))
+    .flatten();
+    let where_clause = match (generated_where, correlated) {
+        (Some(generated), Some(correlated)) => {
+            Some(Expr::binary_op(ctx, generated, BinOp::And, correlated))
+        }
+        (Some(generated), None) => Some(generated),
+        (None, Some(correlated)) => Some(correlated),
+        (None, None) => None,
     };
 
     // --- DISTINCT ---
@@ -341,7 +419,9 @@ fn generate_select_impl_inner<C: Capabilities>(
         })
     } else {
         // --- ORDER BY ---
-        let mut order_by = if ctx.gen_bool_with_prob(order_by_prob) {
+        let mut order_by = if scalar_aggregate_without_group {
+            vec![]
+        } else if ctx.gen_bool_with_prob(order_by_prob) {
             if let Some(gb) = &group_by {
                 generate_grouped_order_by(generator, ctx, &gb.exprs)?
             } else {
@@ -354,6 +434,7 @@ fn generate_select_impl_inner<C: Capabilities>(
         // --- LIMIT / OFFSET ---
         let (limit, offset) = match mode {
             SelectMode::Full => generate_limit_offset(generator, ctx),
+            SelectMode::Scalar if scalar_aggregate_without_group => (None, None),
             SelectMode::Scalar => (Some(1), None),
         };
 
@@ -371,7 +452,7 @@ fn generate_select_impl_inner<C: Capabilities>(
         // order. Grouped: order by every GROUP BY expression — groups are
         // distinct combinations of them, so that is a total order. Ungrouped:
         // append the table's primary key as a final tiebreaker.
-        if mode == SelectMode::Scalar {
+        if mode == SelectMode::Scalar && !scalar_aggregate_without_group {
             if let Some(gb) = &group_by {
                 let covered: Vec<String> = order_by.iter().map(|i| i.expr.to_string()).collect();
                 for expr in &gb.exprs {
@@ -2761,6 +2842,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scalar_aggregate_subquery_can_reference_an_outer_column() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            subquery_where_probability: 0.0,
+            subquery_correlation_probability: 1.0,
+            subquery_aggregate_probability: 1.0,
+            subquery_group_by_probability: 0.0,
+            subquery_order_by_probability: 0.0,
+            ..Default::default()
+        });
+        let outer = Table::new("outer_rows", vec![ColumnDef::new("key", DataType::Integer)]);
+        let schema = SchemaBuilder::new()
+            .table(outer.clone())
+            .table(Table::new(
+                "inner_rows",
+                vec![
+                    ColumnDef::new("key", DataType::Integer),
+                    ColumnDef::new("amount", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(7);
+        let select = ctx
+            .with_table_scope([(outer, Some("outer".to_string()))], |ctx| {
+                generate_select_impl(&generator, ctx, SelectMode::Scalar)
+            })
+            .unwrap();
+        let sql = select.to_string();
+
+        assert!(
+            select.limit.is_none(),
+            "one aggregate row needs no LIMIT: {sql}"
+        );
+        assert!(
+            select.columns[0].expr.contains_aggregate(),
+            "expected an aggregate result: {sql}"
+        );
+        assert!(sql.contains("outer.key"), "expected outer reference: {sql}");
+        assert!(ctx.take_generated_correlated_subquery());
+    }
+
+    #[test]
+    fn supported_correlation_keys_vary_count_and_operand_order() {
+        let outer = Table::new(
+            "outer_rows",
+            vec![
+                ColumnDef::new("key1", DataType::Integer),
+                ColumnDef::new("key2", DataType::Integer),
+            ],
+        );
+        let inner = Table::new(
+            "inner_rows",
+            vec![
+                ColumnDef::new("key1", DataType::Integer),
+                ColumnDef::new("key2", DataType::Integer),
+            ],
+        );
+        let mut saw_two_keys = false;
+        let mut saw_outer_column_on_left = false;
+        let mut saw_inner_column_on_left = false;
+
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            let predicate =
+                ctx.with_table_scope([(outer.clone(), Some("outer".to_string()))], |ctx| {
+                    ctx.with_table_scope(
+                        [(inner.clone(), Some("inner".to_string()))],
+                        generate_supported_correlation_predicate,
+                    )
+                });
+            let sql = predicate
+                .expect("matching key types should correlate")
+                .to_string();
+            saw_two_keys |= sql.matches(" = ").count() == 2;
+            for equality in sql.split(" AND ") {
+                saw_outer_column_on_left |= equality.starts_with("outer.");
+                saw_inner_column_on_left |= equality.starts_with("inner.");
+            }
+        }
+
+        assert!(saw_two_keys, "expected at least one composite correlation");
+        assert!(
+            saw_outer_column_on_left && saw_inner_column_on_left,
+            "expected both equality operand orders"
+        );
     }
 
     #[test]
