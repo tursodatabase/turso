@@ -626,6 +626,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     let mut stress_counter = StressCounter::new(opts.nr_threads, opts.nr_iterations);
 
+    // Watermarks carried in memory across reopens so recovery is verified,
+    // not just exercised.
+    let recovery_expectations = oracle::RecoveryExpectations::new(opts.nr_threads);
+
     let threads: Vec<_> = (0..opts.nr_threads)
         .map(ThreadId::new)
         .enumerate()
@@ -677,8 +681,22 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
 
-    if opts.oracle {
-        oracle::init_schema(&conn).await?;
+    if opts.oracle && !stop {
+        match oracle::init_schema(&conn).await {
+            Ok(()) => {}
+            Err(
+                turso::Error::DatabaseFull(_)
+                | turso::Error::IoError(std::io::ErrorKind::StorageFull, _)
+                | turso::Error::IoError(_, _),
+            ) => {
+                // Same as the schema-creation loop above: an injected IO
+                // fault during setup stops the run instead of failing it.
+                stop = true;
+            }
+            Err(e) => {
+                turso_macros::turso_assert_unreachable!("fatal error creating oracle schema", { "error": e });
+            }
+        }
     }
 
     while !stop && !stress_counter.all_done() {
@@ -704,6 +722,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             let sql_logger = sql_logger.clone();
             let all_threads_ready = all_threads_ready.clone();
             let stress_counter = stress_counter.clone();
+            let recovery_expectations = recovery_expectations.clone();
 
             let handle = turso_stress::future::spawn(async move {
                 let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
@@ -719,7 +738,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 // first starts right after a database reopen, so this is
                 // also the recovery check.
                 let mut oracle = if opts.oracle {
-                    oracle::Oracle::attach(&conn, &thread, thread_idx).await
+                    oracle::Oracle::attach(
+                        &db,
+                        &thread,
+                        thread_idx,
+                        opts.busy_timeout,
+                        &recovery_expectations,
+                    )
+                    .await
                 } else {
                     None
                 };
@@ -794,10 +820,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     // ever lost.
                     if let Some(oracle) = oracle.as_mut() {
                         if rng.random_ratio(1, 4) {
-                            oracle.write(&conn, &thread).await;
+                            oracle.write(&thread).await;
                         }
                         if rng.random_ratio(1, 20) {
-                            oracle.verify(&conn, &thread).await;
+                            oracle.verify(&thread).await;
                         }
                     }
 
@@ -856,6 +882,12 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     turso_stress::note_progress();
                 }
 
+                // Record the final watermark so the attach after the
+                // upcoming reopen can verify recovery preserved it.
+                if let Some(oracle) = oracle.take() {
+                    oracle.detach(&recovery_expectations).await;
+                }
+
                 // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
                 let _ = conn.execute("COMMIT", ()).await;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
@@ -884,7 +916,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         // The database was reset after the last batch, so this checks the
         // durable state through a fresh reopen.
         let conn = StressDb::connect(&db, ThreadId::new(usize::MAX), opts.busy_timeout).await?;
-        oracle::verify_all(&conn, opts.nr_threads).await;
+        oracle::verify_all(&conn, opts.nr_threads, &recovery_expectations).await;
     }
 
     println!("Database file: {db_file}");

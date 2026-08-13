@@ -18,35 +18,82 @@
 //! ambiguity is resolved by rolling back any transaction left open on the
 //! connection and probing whether the row is durably visible.
 
-use crate::conn::StressConn;
+use crate::conn::{StressConn, StressDb};
 use turso::Value;
+use turso_stress::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use turso_stress::sync::Arc;
+use turso_stress::sync::AsyncMutex as Mutex;
 use turso_stress::ThreadId;
 
+/// Per-writer watermarks carried in memory across database reopens.
+///
+/// The durable watermark alone cannot detect a lost committed suffix: rows
+/// and watermark commit atomically, so a database that lost its last
+/// committed transactions during recovery still looks self-consistent. The
+/// reopen is in-process, so memory survives it: the next attach can demand
+/// that the durable watermark exactly match what this writer had committed
+/// before the reopen.
+pub struct RecoveryExpectations {
+    /// Expected watermark per writer; -1 means no expectation yet.
+    seqs: Vec<AtomicI64>,
+    /// The writer's last commit outcome stayed unknown, so the durable
+    /// watermark is allowed to be one higher than expected.
+    ambiguous: Vec<AtomicBool>,
+}
+
+impl RecoveryExpectations {
+    pub fn new(nr_writers: usize) -> Arc<Self> {
+        Arc::new(Self {
+            seqs: (0..nr_writers).map(|_| AtomicI64::new(-1)).collect(),
+            ambiguous: (0..nr_writers).map(|_| AtomicBool::new(false)).collect(),
+        })
+    }
+
+    fn store(&self, writer: usize, seq: i64, ambiguous: bool) {
+        self.seqs[writer].store(seq, Ordering::Release);
+        self.ambiguous[writer].store(ambiguous, Ordering::Release);
+    }
+
+    fn load(&self, writer: usize) -> Option<(i64, bool)> {
+        let seq = self.seqs[writer].load(Ordering::Acquire);
+        (seq >= 0).then(|| (seq, self.ambiguous[writer].load(Ordering::Acquire)))
+    }
+}
+
 pub struct Oracle {
+    /// Dedicated connection, used for nothing but oracle transactions. On a
+    /// connection shared with the random DML, a failed oracle transaction
+    /// can be left open and a later unrelated COMMIT can land parts of it,
+    /// breaking the row/watermark atomicity the checks depend on.
+    conn: StressConn,
     writer: usize,
     committed_seq: i64,
-    /// A COMMIT failed and we do not yet know whether it landed.
+    /// An oracle transaction failed after BEGIN and we do not yet know
+    /// whether it landed.
     ambiguous: bool,
 }
 
 /// Create the oracle tables. Called once during setup, before the worker
-/// threads start.
+/// threads start. Retries lock contention; any other error is returned for
+/// the caller to handle like the random-schema creation loop does.
 pub async fn init_schema(conn: &StressConn) -> turso::connection::Result<()> {
-    conn.execute(
+    let statements = [
         "CREATE TABLE IF NOT EXISTS stress_oracle(id INTEGER PRIMARY KEY, writer INTEGER, seq INTEGER)",
-        (),
-    )
-    .await?;
-    conn.execute(
         "CREATE INDEX IF NOT EXISTS stress_oracle_writer_seq ON stress_oracle(writer, seq)",
-        (),
-    )
-    .await?;
-    conn.execute(
         "CREATE TABLE IF NOT EXISTS stress_oracle_progress(writer INTEGER PRIMARY KEY, committed_seq INTEGER)",
-        (),
-    )
-    .await?;
+    ];
+    for sql in statements {
+        let mut retries = 0;
+        loop {
+            match conn.execute(sql, ()).await {
+                Ok(_) => break,
+                Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) if retries < 10 => {
+                    retries += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -75,7 +122,21 @@ impl Oracle {
     /// right after a database reopen for every batch but the first, so this
     /// is also the recovery check. Returns None when the oracle state could
     /// not be read; the batch then runs without the oracle.
-    pub async fn attach(conn: &StressConn, thread: &ThreadId, writer: usize) -> Option<Oracle> {
+    pub async fn attach(
+        db: &Arc<Mutex<StressDb>>,
+        thread: &ThreadId,
+        writer: usize,
+        busy_timeout: u64,
+        expectations: &RecoveryExpectations,
+    ) -> Option<Oracle> {
+        let own_conn = match StressDb::connect(db, thread.clone(), busy_timeout).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("oracle: failed to connect for writer {writer}: {e}");
+                return None;
+            }
+        };
+        let conn = &own_conn;
         for _ in 0..10 {
             match conn
                 .execute(
@@ -121,7 +182,21 @@ impl Oracle {
             "oracle: committed rows exactly match the durable watermark after reopen",
             { "thread": thread, "writer": writer, "count": count, "max_seq": max_seq, "watermark": watermark }
         );
+        // The self-consistency check above cannot see a lost committed
+        // suffix (rows and watermark vanish together), so also compare
+        // against the watermark this writer held before the reopen.
+        if let Some((expected, ambiguous)) = expectations.load(writer) {
+            turso_macros::turso_assert!(
+                watermark == expected || (ambiguous && watermark == expected + 1),
+                "oracle: recovery preserved this writer's committed watermark across reopen",
+                { "thread": thread, "writer": writer, "watermark": watermark, "expected": expected, "ambiguous_commit": ambiguous }
+            );
+        }
+        // The durable state is the ground truth from here on; remember it in
+        // case this batch ends without reaching a clean detach.
+        expectations.store(writer, watermark, false);
         Some(Oracle {
+            conn: own_conn,
             writer,
             committed_seq: watermark,
             ambiguous: false,
@@ -131,17 +206,19 @@ impl Oracle {
     /// Settle an ambiguous commit: roll back any transaction still open on
     /// this connection, then probe whether the row landed durably. Returns
     /// false while the ambiguity could not be resolved yet.
-    async fn resolve(&mut self, conn: &StressConn) -> bool {
+    async fn resolve(&mut self) -> bool {
         if !self.ambiguous {
             return true;
         }
         // Harmless if no transaction is open; guarantees the probe below
-        // reads committed state instead of our own uncommitted row.
-        let _ = conn.execute("ROLLBACK", ()).await;
+        // reads committed state instead of our own uncommitted row. Because
+        // the connection is exclusively ours, the probe outcome is
+        // definitive: the transaction either committed whole or not at all.
+        let _ = self.conn.execute("ROLLBACK", ()).await;
         let candidate = self.committed_seq + 1;
         let w = self.writer;
         match query_i64(
-            conn,
+            &self.conn,
             &format!("SELECT count(*) FROM stress_oracle WHERE writer = {w} AND seq = {candidate}"),
         )
         .await
@@ -162,13 +239,13 @@ impl Oracle {
     }
 
     /// Commit one oracle row and the watermark in a single transaction.
-    pub async fn write(&mut self, conn: &StressConn, thread: &ThreadId) {
-        if !self.resolve(conn).await {
+    pub async fn write(&mut self, thread: &ThreadId) {
+        if !self.resolve().await {
             return;
         }
         let w = self.writer;
         let seq = self.committed_seq + 1;
-        match conn.execute("BEGIN IMMEDIATE", ()).await {
+        match self.conn.execute("BEGIN IMMEDIATE", ()).await {
             Ok(_) => {}
             Err(turso::Error::Corrupt(e)) => {
                 turso_macros::turso_assert_unreachable!("corrupt error starting oracle transaction", { "thread": thread, "writer": w, "error": e });
@@ -180,20 +257,23 @@ impl Oracle {
             format!("UPDATE stress_oracle_progress SET committed_seq = {seq} WHERE writer = {w}"),
         ];
         for sql in &statements {
-            if let Err(e) = conn.execute(sql, ()).await {
-                let _ = conn.execute("ROLLBACK", ()).await;
+            if let Err(e) = self.conn.execute(sql, ()).await {
+                // The transaction may be left open with partial changes; a
+                // later resolve settles what actually landed.
+                self.ambiguous = true;
+                let _ = self.conn.execute("ROLLBACK", ()).await;
                 if let turso::Error::Corrupt(e) = e {
                     turso_macros::turso_assert_unreachable!("corrupt error in oracle transaction", { "thread": thread, "writer": w, "error": e });
                 }
                 return;
             }
         }
-        match conn.execute("COMMIT", ()).await {
+        match self.conn.execute("COMMIT", ()).await {
             Ok(_) => {
                 self.committed_seq = seq;
                 // Our own commit must be immediately visible.
                 if let Ok(Some(n)) = query_i64(
-                    conn,
+                    &self.conn,
                     &format!(
                         "SELECT count(*) FROM stress_oracle WHERE writer = {w} AND seq = {seq}"
                     ),
@@ -208,24 +288,33 @@ impl Oracle {
                 }
             }
             Err(e) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
+                // The commit may still have landed; settle it later.
+                self.ambiguous = true;
+                let _ = self.conn.execute("ROLLBACK", ()).await;
                 if let turso::Error::Corrupt(e) = e {
                     turso_macros::turso_assert_unreachable!("corrupt error committing oracle transaction", { "thread": thread, "writer": w, "error": e });
                 }
-                // The commit may still have landed; settle it later.
-                self.ambiguous = true;
             }
         }
     }
 
+    /// Record this writer's final watermark before the database is reopened
+    /// so the next attach can verify that recovery preserved it. A last
+    /// resolve attempt settles any ambiguous commit; if it stays unresolved,
+    /// the next attach accepts the watermark being one higher.
+    pub async fn detach(mut self, expectations: &RecoveryExpectations) {
+        let resolved = self.resolve().await;
+        expectations.store(self.writer, self.committed_seq, !resolved);
+    }
+
     /// Spot-check that every committed row is still present with no gaps.
-    pub async fn verify(&mut self, conn: &StressConn, thread: &ThreadId) {
-        if !self.resolve(conn).await {
+    pub async fn verify(&mut self, thread: &ThreadId) {
+        if !self.resolve().await {
             return;
         }
         let w = self.writer;
         let Ok(Some(count)) = query_i64(
-            conn,
+            &self.conn,
             &format!("SELECT count(*) FROM stress_oracle WHERE writer = {w}"),
         )
         .await
@@ -233,7 +322,7 @@ impl Oracle {
             return;
         };
         let Ok(Some(max_seq)) = query_i64(
-            conn,
+            &self.conn,
             &format!("SELECT coalesce(max(seq), 0) FROM stress_oracle WHERE writer = {w}"),
         )
         .await
@@ -250,7 +339,7 @@ impl Oracle {
 
 /// Final check from durable state only, after all worker threads are done:
 /// for every writer, the rows must exactly match the durable watermark.
-pub async fn verify_all(conn: &StressConn, nr_threads: usize) {
+pub async fn verify_all(conn: &StressConn, nr_threads: usize, expectations: &RecoveryExpectations) {
     for writer in 0..nr_threads {
         let Ok(Some(watermark)) = query_i64(
             conn,
@@ -280,6 +369,13 @@ pub async fn verify_all(conn: &StressConn, nr_threads: usize) {
             "oracle: final state has no lost committed writes for any writer",
             { "writer": writer, "count": count, "max_seq": max_seq, "watermark": watermark }
         );
+        if let Some((expected, ambiguous)) = expectations.load(writer) {
+            turso_macros::turso_assert!(
+                watermark == expected || (ambiguous && watermark == expected + 1),
+                "oracle: final durable watermark matches the writer's last committed watermark",
+                { "writer": writer, "watermark": watermark, "expected": expected, "ambiguous_commit": ambiguous }
+            );
+        }
         println!(
             "oracle: writer {writer}: count={count:?} max_seq={max_seq:?} watermark={watermark}"
         );
