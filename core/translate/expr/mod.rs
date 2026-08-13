@@ -112,5 +112,6 @@ pub use utils::{
 pub use vectors::expr_vector_size;
 pub use walk::{
     expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_subquery_id, walk_expr, walk_expr_mut, WalkControl,
+    expr_references_outer_query, expr_references_subquery_id, expression_can_fail_on_input,
+    walk_expr, walk_expr_mut, WalkControl,
 };
