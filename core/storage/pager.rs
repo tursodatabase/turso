@@ -3,6 +3,11 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+use crate::mvcc::yield_points::inject_io_yield;
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_points::YieldInjector;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
@@ -1028,6 +1033,43 @@ enum CommitState {
     AutoCheckpoint,
 }
 
+/// Safe pause points in the classic WAL checkpoint, listed in flow order.
+/// Each one sits after the state machine has already advanced to a resumable
+/// state, so an injected yield parks the checkpoint there and stepping the
+/// statement again resumes it. Append new variants at the end: simulator
+/// yield plans store raw ordinals, so reordering retargets existing seeds.
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum WalCheckpointYieldPoint {
+    /// The WAL-level checkpoint holds its guard and has fixed the frame
+    /// range to copy, but has not copied anything yet.
+    AfterCheckpointStartFrameRangeFixed,
+    /// The WAL-level checkpoint finished backfilling; the checkpoint guard
+    /// is parked inside the pager's checkpoint result and the pager still
+    /// has to sync the database file and publish the backfill count.
+    AfterBackfill,
+    /// The database file sync completed; the backfill count is still
+    /// unpublished.
+    AfterSyncDbFile,
+    /// Right before the backfill count is published to shared WAL state.
+    BeforePublishBackfill,
+    /// The backfill count is published; the guard is not yet released.
+    AfterPublishBackfill,
+}
+
+#[cfg(any(test, injected_yields))]
+pub(crate) const WAL_CHECKPOINT_YIELD_FAMILY: u64 = 0x5741_4c43_4b50_5459;
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for WalCheckpointYieldPoint {
+    const POINT_COUNT: u8 = 5;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
 #[derive(Debug, Default)]
 struct CheckpointState {
     phase: CheckpointPhase,
@@ -1037,6 +1079,25 @@ struct CheckpointState {
     mode: Option<CheckpointMode>,
     /// The checkpoint state machine should acquire the lock or use the one by caller
     lock_source: CheckpointLockSource,
+    /// Injector consulted at WalCheckpointYieldPoint hooks; installed from
+    /// the initiating connection when a checkpoint starts.
+    #[cfg(any(test, injected_yields))]
+    yield_injector: Option<Arc<dyn YieldInjector>>,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id: u64,
+}
+
+#[cfg(any(test, injected_yields))]
+impl ProvidesYieldContext for Pager {
+    fn yield_context(&self) -> YieldContext {
+        let state = self.checkpoint_state.read();
+        YieldContext::new(
+            state.yield_injector.clone(),
+            None,
+            state.yield_instance_id,
+            WAL_CHECKPOINT_YIELD_FAMILY,
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4652,6 +4713,19 @@ impl Pager {
     }
 
     #[aristo::intent("The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n", id = "aristos:wal_nbackfills_orders_with_recovery", verify = "full", parent = "wal_protocol_correctness")]
+    /// Adopt the initiating connection's yield injector for the checkpoint
+    /// that is about to start. A no-op while a checkpoint is already in
+    /// flight, so re-entry after a yield keeps the original context.
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn install_checkpoint_yield_context(&self, connection: &crate::Connection) {
+        let mut state = self.checkpoint_state.write();
+        if !matches!(state.phase, CheckpointPhase::NotCheckpointing) {
+            return;
+        }
+        state.yield_injector = connection.yield_injector();
+        state.yield_instance_id = connection.next_yield_instance_id();
+    }
+
     fn checkpoint_inner(
         &self,
         mode: CheckpointMode,
@@ -4711,6 +4785,8 @@ impl Pager {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                     }
                     state.result = Some(res);
+                    drop(state);
+                    inject_io_yield!(self, WalCheckpointYieldPoint::AfterBackfill);
                 }
                 CheckpointPhase::TruncateDbFile {
                     sync_mode,
@@ -4811,6 +4887,7 @@ impl Pager {
                         );
                         self.checkpoint_state.write().phase =
                             self.next_post_sync_checkpoint_phase(clear_page_cache);
+                        inject_io_yield!(self, WalCheckpointYieldPoint::AfterSyncDbFile);
                         continue;
                     }
 
@@ -4926,6 +5003,7 @@ impl Pager {
                     clear_page_cache,
                     max_frame,
                 } => {
+                    inject_io_yield!(self, WalCheckpointYieldPoint::BeforePublishBackfill);
                     {
                         let state = self.checkpoint_state.read();
                         let result = state.result.as_ref().expect("result should be set");
@@ -4966,6 +5044,7 @@ impl Pager {
                         }
                     };
                     self.checkpoint_state.write().phase = next_phase;
+                    inject_io_yield!(self, WalCheckpointYieldPoint::AfterPublishBackfill);
                     continue;
                 }
                 CheckpointPhase::TruncateWalFile { clear_page_cache } => {
@@ -5003,6 +5082,10 @@ impl Pager {
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
                     state.lock_source = CheckpointLockSource::Acquire;
+                    #[cfg(any(test, injected_yields))]
+                    {
+                        state.yield_injector = None;
+                    }
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
@@ -6147,6 +6230,11 @@ mod tests {
     use crate::sync::RwLock;
 
     use crate::io::{MemoryIO, OpenFlags, IO};
+    #[cfg(any(test, injected_yields))]
+    use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+    use crate::mvcc::yield_points::inject_io_yield;
+    #[cfg(any(test, injected_yields))]
+    use crate::mvcc::yield_points::YieldInjector;
     use crate::storage::buffer_pool::BufferPool;
     use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::{PageCache, PageCacheKey};
@@ -6326,6 +6414,11 @@ mod ptrmap_tests {
     use super::ptrmap::*;
     use super::*;
     use crate::io::{MemoryIO, OpenFlags, IO};
+    #[cfg(any(test, injected_yields))]
+    use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+    use crate::mvcc::yield_points::inject_io_yield;
+    #[cfg(any(test, injected_yields))]
+    use crate::mvcc::yield_points::YieldInjector;
     use crate::storage::buffer_pool::BufferPool;
     use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::PageCache;

@@ -662,6 +662,8 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    #[cfg(any(test, injected_yields))]
+    pager.install_checkpoint_yield_context(&program.connection);
     let step_result = pager.checkpoint(*checkpoint_mode, program.connection.get_sync_mode(), true);
     match step_result {
         Ok(IOResult::Done(CheckpointResult {

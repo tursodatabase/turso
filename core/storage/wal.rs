@@ -19,6 +19,8 @@ use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
+#[cfg(any(test, injected_yields))]
+use super::pager::WalCheckpointYieldPoint;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{
     self, checksum_wal, DatabaseHeader, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE,
@@ -27,6 +29,7 @@ use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
+use crate::mvcc::yield_points::inject_io_yield;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::page_transform::{
     page_codec_completion_error, PageCodecContext, PageLocation, PageTransform,
@@ -4883,6 +4886,10 @@ impl WalFile {
                         "checkpoint_start(min_frame={}, max_frame={})",
                         oc_min_frame,
                         oc_max_frame,
+                    );
+                    inject_io_yield!(
+                        pager,
+                        WalCheckpointYieldPoint::AfterCheckpointStartFrameRangeFixed
                     );
                 }
                 // Durability barrier: fsync the WAL so every frame selected
