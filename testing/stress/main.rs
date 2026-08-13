@@ -1,4 +1,5 @@
 use rand::Rng;
+mod checkpoint;
 mod conn;
 mod counter;
 mod logging;
@@ -763,6 +764,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     if tx.is_some() {
                         let end_tx = *rng.choose(&["COMMIT;", "ROLLBACK;"]);
                         let _ = conn.execute(end_tx, ()).await;
+                    }
+
+                    // Occasionally checkpoint the WAL so backfills, full
+                    // drains, and WAL restarts race the other threads'
+                    // commits instead of only happening on autocheckpoint.
+                    if rng.random_ratio(1, 20) {
+                        let mode = checkpoint::pick_mode(&mut rng, opts.tx_mode);
+                        checkpoint::run_wal_checkpoint(&conn, &sql_logger, &thread, mode).await;
                     }
 
                     const INTEGRITY_CHECK_INTERVAL: usize = 100;
