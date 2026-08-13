@@ -114,6 +114,8 @@ use tracing::instrument;
 use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd};
 
+#[cfg(feature = "simulator")]
+pub use connection::SubqueryUnnestingMode;
 pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]

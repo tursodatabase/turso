@@ -2385,6 +2385,10 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             full_column_names: AtomicBool::new(false),
             short_column_names: AtomicBool::new(true),
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: crate::connection::AtomicSubqueryUnnestingMode::new(
+                crate::connection::SubqueryUnnestingMode::Auto,
+            ),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),

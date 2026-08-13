@@ -901,6 +901,11 @@ fn optimize_select_plan_with_cache(
         return optimize_select_plan_form(plan, resolver, cache);
     }
 
+    #[cfg(feature = "simulator")]
+    if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Disabled {
+        return optimize_select_plan_form(plan, resolver, cache);
+    }
+
     // TODO: Let join search run a correlated subquery as soon as all columns
     // that it needs are ready. It can then compare that step with the added
     // join tables in one search. Until then, both forms need their own search.
@@ -923,6 +928,15 @@ fn optimize_select_plan_with_cache(
             .iter()
             .any(|subquery| subquery.correlated);
     if full_join_rewrite_is_complete {
+        let rewritten_table_plan =
+            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        *plan = rewritten;
+        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
+        return Ok(());
+    }
+
+    #[cfg(feature = "simulator")]
+    if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
         let rewritten_table_plan =
             find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
         *plan = rewritten;
