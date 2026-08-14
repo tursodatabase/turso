@@ -130,7 +130,11 @@ jobs:
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
+        # turso_masstree is vendored with its files kept untouched, so its doc
+        # examples still say `use masstree::...` (the upstream crate name) and
+        # cannot compile here. Its Cargo.toml sets doctest = false, but an
+        # explicit `--doc` runs doctests regardless of that flag.
+        run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark --exclude turso_masstree
       - name: Upload coverage report
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
