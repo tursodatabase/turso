@@ -407,9 +407,25 @@ impl<P: LeafPolicy> ReverseScanCtx<P> {
             );
         }
 
-        // Handle inline keys - only emit if emit_equal or at upper_bound
-        if !emit_equal && !upper_bound {
-            return EmitResult::NoMatch;
+        // Handle inline keys.
+        //
+        // TURSO PATCH: `lower_reverse` positions at the bound key's slot only
+        // when the bound key is actually stored; for an absent bound key it
+        // positions at the first key strictly BELOW the bound, which every
+        // bound kind must emit. The original `if !emit_equal { NoMatch }`
+        // assumed the candidate is the bound key itself, so an exclusive end
+        // bound sitting in a gap right above a stored key dropped that key
+        // (`x < K ORDER BY x DESC` lost the row right under K).
+        if !upper_bound {
+            #[expect(clippy::cast_possible_truncation, reason = "Known const")]
+            let key_len: usize = std::cmp::min(keylenx, IKEY_SIZE as u8) as usize;
+            match cursor_key.compare(slot_ikey, key_len) {
+                // Bound is strictly above this key: always emit.
+                Ordering::Greater => {}
+                // This key IS the bound key: emit only for an inclusive end.
+                Ordering::Equal if emit_equal => {}
+                Ordering::Equal | Ordering::Less => return EmitResult::NoMatch,
+            }
         }
 
         if leaf.is_value_empty_relaxed(slot) {
@@ -465,11 +481,30 @@ impl<P: LeafPolicy> ReverseScanCtx<P> {
         // When upper_bound is true, we're scanning from the maximum position,
         // skip suffix comparison since the 1-byte sentinel [0xFF] can't represent
         // a true maximum for multi-byte suffixes.
+        //
+        // TURSO PATCH: only compare suffixes when this slot's ikey IS the
+        // bound's ikey. For an absent bound key, `lower_reverse` may position
+        // at a slot whose ikey is strictly below the bound's — that slot's
+        // suffix belongs to a different key, and comparing it against the
+        // bound's suffix wrongly rejected keys below the bound.
         if !upper_bound {
-            let cmp: Ordering = stored_suffix.cmp(cursor_key.suffix());
-
-            if !ReverseScanHelper::initial_ksuf_match_reverse(cmp, emit_equal) {
-                return EmitResult::NoMatch;
+            match slot_ikey.cmp(&cursor_key.current_ikey()) {
+                // Slot ikey strictly below the bound ikey: always emit.
+                Ordering::Less => {}
+                // Slot ikey above the bound ikey: outside the range.
+                Ordering::Greater => return EmitResult::NoMatch,
+                Ordering::Equal => {
+                    if cursor_key.has_suffix() {
+                        let cmp: Ordering = stored_suffix.cmp(cursor_key.suffix());
+                        if !ReverseScanHelper::initial_ksuf_match_reverse(cmp, emit_equal) {
+                            return EmitResult::NoMatch;
+                        }
+                    } else {
+                        // The bound ends at this ikey with no suffix, so this
+                        // suffixed slot's key is longer, i.e. above the bound.
+                        return EmitResult::NoMatch;
+                    }
+                }
             }
         }
 

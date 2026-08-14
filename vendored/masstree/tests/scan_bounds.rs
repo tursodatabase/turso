@@ -171,3 +171,83 @@ fn forward_excluded_and_reverse_seeks_stay_exact() {
         assert_eq!(last, Some(i), "reverse Included end at key {i}");
     }
 }
+
+/// TURSO PATCH regression test: a reverse scan with an upper bound landing in
+/// a gap right above a stored key skipped that key (`x < 1` over stored key 0
+/// returned nothing; in MVCC fuzzing, `x < K ORDER BY x DESC` lost the row
+/// right under K). Sweep gap and stored-key probes for every bound kind in
+/// both directions on a single-ikey-layer tree.
+#[test]
+fn every_bound_kind_is_exact_at_gap_probes() {
+    let tree: MassTree15<u64> = MassTree15::new();
+    let guard = tree.guard();
+    let keys: Vec<u64> = (0..40u64).map(|i| i * 3).collect();
+    for &k in &keys {
+        tree.insert_with_guard(&k.to_be_bytes(), k, &guard);
+    }
+    let collect_fwd = |lo: RangeBound<'_>, hi: RangeBound<'_>| {
+        let mut out = Vec::new();
+        tree.scan(
+            lo,
+            hi,
+            |hit, _value| {
+                out.push(u64::from_be_bytes(hit.try_into().unwrap()));
+                true
+            },
+            &guard,
+        );
+        out
+    };
+    let collect_rev = |lo: RangeBound<'_>, hi: RangeBound<'_>| {
+        let mut out = Vec::new();
+        tree.scan_rev_batch(
+            lo,
+            hi,
+            |hit, _value| {
+                out.push(u64::from_be_bytes(hit.try_into().unwrap()));
+                true
+            },
+            &guard,
+        );
+        out
+    };
+    for probe in 0..=121u64 {
+        let b = probe.to_be_bytes();
+        let lt: Vec<u64> = keys.iter().copied().filter(|&k| k < probe).collect();
+        let le: Vec<u64> = keys.iter().copied().filter(|&k| k <= probe).collect();
+        let gt: Vec<u64> = keys.iter().copied().filter(|&k| k > probe).collect();
+        let ge: Vec<u64> = keys.iter().copied().filter(|&k| k >= probe).collect();
+        let rev = |v: &[u64]| v.iter().rev().copied().collect::<Vec<u64>>();
+
+        assert_eq!(
+            collect_fwd(RangeBound::Unbounded, RangeBound::Excluded(&b)),
+            lt,
+            "forward x < {probe}"
+        );
+        assert_eq!(
+            collect_rev(RangeBound::Unbounded, RangeBound::Excluded(&b)),
+            rev(&lt),
+            "reverse x < {probe}"
+        );
+        assert_eq!(
+            collect_rev(RangeBound::Unbounded, RangeBound::Included(&b)),
+            rev(&le),
+            "reverse x <= {probe}"
+        );
+        assert_eq!(
+            collect_fwd(RangeBound::Excluded(&b), RangeBound::Unbounded),
+            gt,
+            "forward x > {probe}"
+        );
+        assert_eq!(
+            collect_rev(RangeBound::Excluded(&b), RangeBound::Unbounded),
+            rev(&gt),
+            "reverse x > {probe}"
+        );
+        assert_eq!(
+            collect_fwd(RangeBound::Included(&b), RangeBound::Unbounded),
+            ge,
+            "forward x >= {probe}"
+        );
+    }
+}

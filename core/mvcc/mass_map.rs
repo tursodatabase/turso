@@ -635,6 +635,66 @@ mod tests {
         assert_eq!(empty, vec![], "inverted-edge range is empty");
     }
 
+    /// Regression test for a reverse seek that skipped the first entry below
+    /// an excluded upper bound (`x < K ORDER BY x DESC` lost the row right
+    /// under K). Sweep every bound kind at every position, in both
+    /// directions, so seek-position off-by-ones cannot hide.
+    #[test]
+    fn every_bound_kind_is_exact_at_every_position() {
+        let map: MassMap<u64, u64> = MassMap::new();
+        let keys: Vec<u64> = (0..40).map(|i| i * 3).collect();
+        for &key in &keys {
+            map.insert(key, key);
+        }
+        // Probe stored keys, gaps next to them, and range edges.
+        let probes: Vec<u64> = (0..=121).collect();
+        for &probe in &probes {
+            let expect_lt: Vec<u64> = keys.iter().copied().filter(|&k| k < probe).collect();
+            let expect_le: Vec<u64> = keys.iter().copied().filter(|&k| k <= probe).collect();
+            let expect_gt: Vec<u64> = keys.iter().copied().filter(|&k| k > probe).collect();
+            let expect_ge: Vec<u64> = keys.iter().copied().filter(|&k| k >= probe).collect();
+
+            let rev = |v: &[u64]| v.iter().rev().copied().collect::<Vec<u64>>();
+
+            let lt: Vec<u64> = map
+                .range((Bound::Unbounded, Bound::Excluded(probe)))
+                .map(|e| *e.key())
+                .collect();
+            assert_eq!(lt, expect_lt, "forward x < {probe}");
+            let lt_rev: Vec<u64> = map
+                .range((Bound::Unbounded, Bound::Excluded(probe)))
+                .rev()
+                .map(|e| *e.key())
+                .collect();
+            assert_eq!(lt_rev, rev(&expect_lt), "reverse x < {probe}");
+
+            let le_rev: Vec<u64> = map
+                .range((Bound::Unbounded, Bound::Included(probe)))
+                .rev()
+                .map(|e| *e.key())
+                .collect();
+            assert_eq!(le_rev, rev(&expect_le), "reverse x <= {probe}");
+
+            let gt: Vec<u64> = map
+                .range((Bound::Excluded(probe), Bound::Unbounded))
+                .map(|e| *e.key())
+                .collect();
+            assert_eq!(gt, expect_gt, "forward x > {probe}");
+            let gt_rev: Vec<u64> = map
+                .range((Bound::Excluded(probe), Bound::Unbounded))
+                .rev()
+                .map(|e| *e.key())
+                .collect();
+            assert_eq!(gt_rev, rev(&expect_gt), "reverse x > {probe}");
+
+            let ge: Vec<u64> = map
+                .range((Bound::Included(probe), Bound::Unbounded))
+                .map(|e| *e.key())
+                .collect();
+            assert_eq!(ge, expect_ge, "forward x >= {probe}");
+        }
+    }
+
     #[test]
     fn signed_encoding_orders_negative_before_positive() {
         assert!(encode_i64(i64::MIN) < encode_i64(-1));
