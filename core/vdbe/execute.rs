@@ -10579,18 +10579,25 @@ pub fn op_function(
                     };
                     let rename_to = normalize_ident(original_rename_to.as_str());
 
-                    let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
+                    // Schema rows store the user's original spelling, so
+                    // every comparison against the rename source must fold
+                    // ASCII case, and the rewritten row keeps the spelling
+                    // the user gave in RENAME TO.
+                    let autoindex_prefix = format!("sqlite_autoindex_{rename_from}_");
+                    let new_name = if name
+                        .get(..autoindex_prefix.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(&autoindex_prefix))
                     {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
-                    } else if name == rename_from {
-                        rename_to.clone()
+                        let column = &name[autoindex_prefix.len()..];
+                        format!("sqlite_autoindex_{original_rename_to}_{column}")
+                    } else if name.eq_ignore_ascii_case(&rename_from) {
+                        original_rename_to.as_str().to_string()
                     } else {
                         name
                     };
 
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                    let new_tbl_name = if tbl_name.eq_ignore_ascii_case(&rename_from) {
+                        original_rename_to.as_str().to_string()
                     } else {
                         tbl_name
                     };
