@@ -34,6 +34,7 @@
 pub mod clock;
 pub mod cursor;
 pub mod database;
+pub mod mass_map;
 pub mod persistent_storage;
 #[cfg(feature = "conn_raw_api")]
 pub mod portable_logical;
