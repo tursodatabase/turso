@@ -30,6 +30,7 @@ use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
 use turso_parser::ast::{Expr, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 
@@ -157,7 +158,7 @@ fn prepare_window_subquery(
         //
         // If the generated name is not unique across the entire query, that’s acceptable —
         // the final plan always associates exactly one window with one subquery.
-        current_window.name = Some(format!("window_{processed_window_count}"));
+        current_window.name = Some(Identifier::new(format!("window_{processed_window_count}")));
     }
 
     let mut ctx = WindowSubqueryContext {
@@ -253,7 +254,7 @@ fn prepare_window_subquery(
     )?;
 
     let subquery = JoinedTable::new_subquery(
-        format!("window_subquery_{processed_window_count}"),
+        Identifier::new(format!("window_subquery_{processed_window_count}")),
         inner_plan,
         None,
         subquery_id,
@@ -419,7 +420,7 @@ fn push_into_source_subquery(
 /// `WindowFunction`.
 fn rewrite_expr_referencing_current_window(
     aggregates: &mut Vec<Aggregate>,
-    window_name: String,
+    window_name: Identifier,
     ctx: &mut WindowSubqueryContext,
     expr: &mut Expr,
     func: &AccumulatorFunc,
@@ -454,7 +455,7 @@ fn rewrite_expr_referencing_current_window(
         push_into_source_subquery(filter_expr, aggregates, ctx)?;
     }
     let filter_expr = filter_over.filter_clause.as_deref().cloned();
-    filter_over.over_clause = Some(Over::Name(Name::exact(window_name)));
+    filter_over.over_clause = Some(Over::Name(Name::from(window_name)));
     Ok(RewrittenWindowCall {
         expr: expr.clone(),
         filter_expr,
@@ -579,7 +580,7 @@ pub struct WindowMetadata<'a> {
     /// Maps expressions in the current query that reference subquery columns
     /// to their corresponding column indexes in the subquery’s result.
     pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
-    pub buffer_table_name: String,
+    pub buffer_table_name: Identifier,
     /// For each window function, a sorted index used to compute `min()` or
     /// `max()` when the frame's start can move (so rows leave the frame as
     /// it slides). Most aggregates can cheaply undo one row's contribution
@@ -645,12 +646,16 @@ fn allocate_window_minmax(
             .expect("min/max window calls must have one argument");
         let collation = get_collseq_from_expr(arg, table_references)?;
         let index = Arc::new(Index {
-            name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
-            table_name: String::new(),
+            name: Identifier::new(format!(
+                "window_minmax_{}_{}",
+                program.offset().as_offset_int(),
+                i
+            )),
+            table_name: Identifier::empty(),
             root_page: 0,
             columns: crate::alloc::vec![
                 IndexColumn {
-                    name: "0".to_string(),
+                    name: Identifier::new("0"),
                     order: if matches!(agg, AggFunc::Min) {
                         SortOrder::Desc
                     } else {
@@ -1123,7 +1128,7 @@ impl EmitWindow {
             //  attached database. Other ephemeral tables are created similarly, so it's left
             //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
             //  they can be handled differently from regular tables.
-            format!("buffer_table_{window_name}"),
+            Identifier::new(format!("buffer_table_{window_name}")),
             crate::alloc::vec![],
             src_columns,
             BTreeCharacteristics::HAS_ROWID,
@@ -2914,7 +2919,7 @@ fn emit_window_op(
     if window_delete_op(window) == Some(op) {
         program.emit_insn(Insn::Delete {
             cursor_id: cursor_for_op,
-            table_name: buffer_table_name,
+            table_name: buffer_table_name.to_string(),
             is_part_of_update: false,
         });
     }

@@ -20,13 +20,7 @@ use crate::translate::{
     },
     plan::{NonFromClauseSubquery, SubqueryState},
 };
-use crate::{
-    ast::Limit,
-    function::Func,
-    schema::Table,
-    util::{exprs_are_equivalent, normalize_ident},
-    Result,
-};
+use crate::{ast::Limit, function::Func, schema::Table, util::exprs_are_equivalent, Result};
 use crate::{
     function::{AccumulatorFunc, AggFunc, ExtFunc, WindowFunc},
     translate::expr::bind_and_rewrite_expr,
@@ -41,6 +35,7 @@ use turso_parser::ast::{
     self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
     TableInternalId, With,
 };
+use turso_parser::identifier::Identifier;
 
 /// Data needed to plan each reference to a CTE separately.
 ///
@@ -49,12 +44,12 @@ use turso_parser::ast::{
 struct CteDefinition {
     /// Identifies materialized results shared by references to this CTE.
     cte_id: usize,
-    /// Normalized CTE name.
-    name: String,
+    /// CTE name.
+    name: Identifier,
     /// SELECT syntax used to build a plan for each reference.
     select: Select,
     /// Explicit column names from `WITH t(a, b) AS (...)`.
-    explicit_columns: Vec<String>,
+    explicit_columns: Vec<Identifier>,
     /// Other CTE definitions referenced by this CTE.
     referenced_cte_indices: SmallVec<[usize; 2]>,
     /// True when `AS MATERIALIZED` requires one stored result.
@@ -68,7 +63,7 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
     let mut referenced_table_names_by_cte = Vec::with_capacity(with.ctes.len());
 
     for cte in with.ctes {
-        let name = normalize_ident(cte.tbl_name.as_str());
+        let name = cte.tbl_name.identifier().clone();
         if definitions
             .iter()
             .any(|definition: &CteDefinition| definition.name == name)
@@ -89,7 +84,7 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
             explicit_columns: cte
                 .columns
                 .iter()
-                .map(|column| normalize_ident(column.col_name.as_str()))
+                .map(|column| column.col_name.identifier().clone())
                 .collect(),
             referenced_cte_indices: SmallVec::new(),
             materialize_hint: cte.materialized == Materialized::Yes,
@@ -112,19 +107,19 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
 
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
-fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<Identifier>) {
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
 }
 
-fn collect_from_select_body(body: &ast::SelectBody, out: &mut Vec<String>) {
+fn collect_from_select_body(body: &ast::SelectBody, out: &mut Vec<Identifier>) {
     collect_from_one_select(&body.select, out);
     for compound in &body.compounds {
         collect_from_one_select(&compound.select, out);
     }
 }
 
-fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
+fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<Identifier>) {
     match one {
         ast::OneSelect::Select { from, .. } => {
             if let Some(from_clause) = from {
@@ -146,24 +141,24 @@ fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
 ///   not make the query recursive), weighted by how many references its body
 ///   contains.
 struct RecursiveRefCounter<'a> {
-    cte_name: &'a str,
+    cte_name: &'a Identifier,
 }
 
 /// Names visible at the current point, innermost last. Each entry carries the
 /// number of recursive references that using the name implies: 0 for a name
 /// that shadows the recursive table, and the body's own reference count for
 /// any other nested CTE.
-type RecursiveRefScope = Vec<(String, usize)>;
+type RecursiveRefScope = Vec<(Identifier, usize)>;
 
 impl RecursiveRefCounter<'_> {
     /// The number of recursive references implied by referring to `name`.
-    fn name_weight(&self, name: &str, scope: &RecursiveRefScope) -> usize {
+    fn name_weight(&self, name: &ast::Name, scope: &RecursiveRefScope) -> usize {
         for (scope_name, weight) in scope.iter().rev() {
-            if scope_name == name {
+            if *scope_name == *name {
                 return *weight;
             }
         }
-        usize::from(name == self.cte_name)
+        usize::from(*self.cte_name == *name)
     }
 
     /// Brings the CTEs of a nested `WITH` into scope with their reference
@@ -173,10 +168,9 @@ impl RecursiveRefCounter<'_> {
             return;
         };
         for cte in &with.ctes {
-            let name = normalize_ident(cte.tbl_name.as_str());
             // The CTE's own name is visible inside its body, where it refers
             // to the nested CTE itself rather than the recursive table.
-            scope.push((name, 0));
+            scope.push((cte.tbl_name.identifier().clone(), 0));
             let weight = self.count_select(&cte.select, scope);
             scope.last_mut().expect("scope entry pushed above").1 = weight;
         }
@@ -255,14 +249,14 @@ impl RecursiveRefCounter<'_> {
         match table {
             ast::SelectTable::Table(name, _, _) => {
                 if name.db_name.is_none() {
-                    self.name_weight(&normalize_ident(name.name.as_str()), scope)
+                    self.name_weight(&name.name, scope)
                 } else {
                     0
                 }
             }
             ast::SelectTable::TableCall(name, args, _) => {
                 let mut count = if name.db_name.is_none() {
-                    self.name_weight(&normalize_ident(name.name.as_str()), scope)
+                    self.name_weight(&name.name, scope)
                 } else {
                     0
                 };
@@ -337,12 +331,11 @@ impl RecursiveRefCounter<'_> {
                     if name.db_name.is_some() {
                         return 0;
                     }
-                    let name = normalize_ident(name.name.as_str());
                     // A direct reference only counts when nothing shadows the
                     // recursive table's name.
                     usize::from(
-                        name == counter.cte_name
-                            && !scope.iter().any(|(scope_name, _)| *scope_name == name),
+                        *counter.cte_name == name.name
+                            && !scope.iter().any(|(scope_name, _)| *scope_name == name.name),
                     )
                 }
                 ast::SelectTable::Select(_, _) => 0,
@@ -375,16 +368,16 @@ impl RecursiveRefCounter<'_> {
     }
 }
 
-fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
+fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<Identifier>) {
     match table {
         ast::SelectTable::Table(qualified_name, _, _) => {
             if qualified_name.db_name.is_none() {
-                out.push(normalize_ident(qualified_name.name.as_str()));
+                out.push(qualified_name.name.identifier().clone());
             }
         }
         ast::SelectTable::TableCall(qualified_name, args, _) => {
             if qualified_name.db_name.is_none() {
-                out.push(normalize_ident(qualified_name.name.as_str()));
+                out.push(qualified_name.name.identifier().clone());
             }
             for arg in args {
                 collect_subquery_table_refs_in_expr(arg, out);
@@ -406,7 +399,7 @@ fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
 }
 
 /// Collect table references from subqueries embedded in expressions.
-fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<String>) {
+fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<Identifier>) {
     collect_subquery_table_refs_in_one_select(&select.body.select, out);
     for compound in &select.body.compounds {
         collect_subquery_table_refs_in_one_select(&compound.select, out);
@@ -424,7 +417,7 @@ fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<St
     }
 }
 
-fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
+fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec<Identifier>) {
     match one {
         ast::OneSelect::Select {
             columns,
@@ -469,7 +462,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
     }
 }
 
-fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
+fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<Identifier>) {
     let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
         match node {
             Expr::Exists(select) | Expr::Subquery(select) => {
@@ -523,7 +516,7 @@ pub fn resolve_window_and_aggregate_functions(
                 order_by,
                 within_group,
             } => {
-                let ordered_set_func = ordered_set_agg_func(&normalize_ident(name.as_str()));
+                let ordered_set_func = ordered_set_agg_func(&name.as_str().to_ascii_lowercase());
 
                 if !within_group.is_empty() {
                     let new_agg = build_ordered_set_aggregate(
@@ -812,12 +805,11 @@ fn link_with_window(
                     // Named windows store their FRAME clause on the
                     // `NamedWindowDef`. Look it up and validate the
                     // clause as this function's user_frame.
-                    let window_name = normalize_ident(name.as_str());
                     let def = named_windows
                         .iter()
-                        .rfind(|d| d.name == window_name)
+                        .rfind(|d| d.name == *name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!("no such window: {window_name}"))
+                            crate::LimboError::ParseError(format!("no such window: {name}"))
                         })?;
                     // `bound` may already be `None` (taken on an earlier
                     // attachment), but the def's order_by length we
@@ -828,7 +820,7 @@ fn link_with_window(
                         Some(b) => b.order_by.len(),
                         None => windows
                             .iter()
-                            .rfind(|w| w.name.as_ref() == Some(&window_name))
+                            .rfind(|w| w.name.as_ref().is_some_and(|n| *n == *name))
                             .expect("sister Window exists after def bound was taken")
                             .order_by
                             .len(),
@@ -969,12 +961,11 @@ fn chain_inline_window_base(
     windows: &[Window],
 ) -> Result<ast::Window> {
     let base = window.base.as_ref().expect("caller checked base.is_some()");
-    let base_name = normalize_ident(base.as_str());
-    let Some(base_def) = named_windows.iter().rfind(|d| d.name == base_name) else {
-        crate::bail_parse_error!("no such window: {}", base_name);
+    let Some(base_def) = named_windows.iter().rfind(|d| d.name == *base) else {
+        crate::bail_parse_error!("no such window: {}", base);
     };
     if !window.partition_by.is_empty() {
-        crate::bail_parse_error!("cannot override PARTITION clause of window: {}", base_name);
+        crate::bail_parse_error!("cannot override PARTITION clause of window: {}", base);
     }
     // The base's bound clauses move into the first `Window` attached under
     // its name, so read them from wherever they currently live.
@@ -983,19 +974,16 @@ fn chain_inline_window_base(
         None => {
             let sister = windows
                 .iter()
-                .rfind(|w| w.name.as_deref() == Some(base_name.as_str()))
+                .rfind(|w| w.name.as_ref().is_some_and(|n| *n == *base))
                 .expect("sister Window must exist after the named def's bound was taken");
             (sister.partition_by.clone(), sister.order_by.clone())
         }
     };
     if !base_order.is_empty() && !window.order_by.is_empty() {
-        crate::bail_parse_error!("cannot override ORDER BY clause of window: {}", base_name);
+        crate::bail_parse_error!("cannot override ORDER BY clause of window: {}", base);
     }
     if base_def.user_frame_clause.is_some() {
-        crate::bail_parse_error!(
-            "cannot override frame specification of window: {}",
-            base_name
-        );
+        crate::bail_parse_error!("cannot override frame specification of window: {}", base);
     }
     let mut merged = window.clone();
     merged.base = None;
@@ -1028,21 +1016,20 @@ fn resolve_window<'a>(
             Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
         Over::Name(name) => {
-            let window_name = normalize_ident(name.as_str());
+            let window_name = name;
             // Reuse an existing resolved entry with the same name AND
             // frame so functions sharing one coerced frame fold into one
             // ephemeral-table pass. SQLite uses the most recent
             // definition when names collide, so iterate in reverse.
-            if let Some(idx) = windows
-                .iter()
-                .rposition(|w| w.name.as_ref() == Some(&window_name) && w.frame == frame)
-            {
+            if let Some(idx) = windows.iter().rposition(|w| {
+                w.name.as_ref().is_some_and(|n| *n == *window_name) && w.frame == frame
+            }) {
                 return Ok(&mut windows[idx]);
             }
             // Need a new resolved entry. Verify the name exists.
             let def = named_windows
                 .iter_mut()
-                .rfind(|d| d.name == window_name)
+                .rfind(|d| d.name == *window_name)
                 .ok_or_else(|| {
                     crate::LimboError::ParseError(format!("no such window: {window_name}"))
                 })?;
@@ -1055,7 +1042,7 @@ fn resolve_window<'a>(
                 None => {
                     let sister = windows
                         .iter()
-                        .rfind(|w| w.name.as_ref() == Some(&window_name))
+                        .rfind(|w| w.name.as_ref().is_some_and(|n| *n == *window_name))
                         .expect("sister Window must exist after the named def was taken");
                     NamedWindowBound {
                         partition_by: sister.partition_by.clone(),
@@ -1063,7 +1050,11 @@ fn resolve_window<'a>(
                     }
                 }
             };
-            windows.push(Window::from_named_bound(window_name, bound, frame));
+            windows.push(Window::from_named_bound(
+                window_name.identifier().clone(),
+                bound,
+                frame,
+            ));
             Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
     }
@@ -1645,8 +1636,8 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
-                .map(|a| normalize_ident(a.name().as_str()))
-                .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
+                .map(|a| a.name().identifier().clone())
+                .unwrap_or_else(|| Identifier::new(format!("(subquery-{cur_table_index})")));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
@@ -1689,7 +1680,7 @@ fn parse_table(
     indexed: Option<ast::Indexed>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
+    let normalized_qualified_name = qualified_name.name.identifier().clone();
     let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
 
@@ -1719,7 +1710,7 @@ fn parse_table(
 
             // If there's an alias provided, update the identifier to use that alias
             if let Some(a) = maybe_alias {
-                cte_table.identifier = normalize_ident(a.name().as_str());
+                cte_table.identifier = a.name().identifier().clone();
             }
 
             // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -1754,7 +1745,7 @@ fn parse_table(
                 }
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
-            let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
+            let alias = maybe_alias.map(|a| a.name().identifier().clone());
             let cte_select_syntax = outer_ref.cte_select.clone();
             let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
             let cte_id = outer_ref.cte_id;
@@ -1834,7 +1825,7 @@ fn parse_table(
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
-        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
+        let alias = maybe_alias.map(|a| a.name().identifier().clone());
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -1878,7 +1869,7 @@ fn parse_table(
                 if let (Some(name_str), ast::ResultColumn::Expr(_, ref mut alias)) =
                     (&col.name, result_col)
                 {
-                    *alias = Some(ast::As::As(ast::Name::exact(name_str.clone())));
+                    *alias = Some(ast::As::As(ast::Name::from(name_str.clone())));
                 }
             }
         }
@@ -1943,7 +1934,7 @@ fn parse_table(
         let columns = view_guard.column_schema.flat_columns();
         let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
-            view_guard.name().to_string(),
+            Identifier::new(view_guard.name()),
             crate::alloc::vec![],
             columns,
             crate::schema::BTreeCharacteristics::HAS_ROWID,
@@ -1954,7 +1945,7 @@ fn parse_table(
         ));
         drop(view_guard);
 
-        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
+        let alias = maybe_alias.map(|a| a.name().identifier().clone());
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -2601,7 +2592,7 @@ fn parse_join(
                         .zip(right_col.name.as_deref())
                         .is_some_and(|(l, r)| l.eq_ignore_ascii_case(r))
                     {
-                        distinct_names.push(ast::Name::exact(
+                        distinct_names.push(ast::Name::from(
                             left_col.name.clone().expect("column name is None"),
                         ));
                         found_match = true;
@@ -2647,7 +2638,6 @@ fn parse_join(
             ast::JoinConstraint::Using(distinct_names) => {
                 // USING join is replaced with a list of equality predicates
                 for distinct_name in distinct_names.iter() {
-                    let name_normalized = normalize_ident(distinct_name.as_str());
                     let cur_table_idx = table_references.joined_tables().len() - 1;
                     let left_tables = &table_references.joined_tables()[..cur_table_idx];
                     turso_assert!(!left_tables.is_empty());
@@ -2661,8 +2651,8 @@ fn parse_join(
                             .filter(|(_, col)| !natural || !col.hidden())
                             .find(|(_, col)| {
                                 col.name
-                                    .as_deref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
+                                    .as_ref()
+                                    .is_some_and(|name| *name == *distinct_name)
                             })
                             .map(|(idx, col)| {
                                 (left_table_offset, left_table.internal_id, idx, col)
@@ -2679,8 +2669,8 @@ fn parse_join(
                     }
                     let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
                         col.name
-                            .as_deref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
+                            .as_ref()
+                            .is_some_and(|name| *name == *distinct_name)
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(

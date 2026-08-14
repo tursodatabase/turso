@@ -11,7 +11,6 @@ use crate::translate::{
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
-use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
@@ -420,8 +419,8 @@ fn rewrite_trigger_expr_single_for_subprogram(
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-            let ns = normalize_ident(ns.as_str());
-            let col = normalize_ident(col.as_str());
+            let ns = ns.identifier().clone();
+            let col = col.identifier().clone();
 
             // Handle NEW.column references
             if ns.eq_ignore_ascii_case("new") {
@@ -708,8 +707,7 @@ pub fn has_relevant_triggers_type_only(
                     updated_column_indices.expect("UPDATE should contain some updated columns");
                 // Check if any of the trigger's specified columns are being updated
                 trigger_cols.iter().any(|col_name| {
-                    let normalized_col = normalize_ident(col_name.as_str());
-                    if let Some((col_idx, _)) = table.get_column(&normalized_col) {
+                    if let Some((col_idx, _)) = table.get_column(col_name.as_str()) {
                         updated_cols.get(col_idx)
                     } else {
                         // Column doesn't exist - according to SQLite docs, unrecognized
@@ -750,8 +748,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
                     if let Some(ref updated_cols) = updated_column_indices {
                         // Check if any of the trigger's specified columns are being updated
                         trigger_cols.iter().any(|col_name| {
-                            let normalized_col = normalize_ident(col_name.as_str());
-                            if let Some((col_idx, _)) = table.get_column(&normalized_col) {
+                            if let Some((col_idx, _)) = table.get_column(col_name.as_str()) {
                                 updated_cols.get(col_idx)
                             } else {
                                 // Column doesn't exist - according to SQLite docs, unrecognized
@@ -1316,11 +1313,8 @@ fn rewrite_trigger_expr_single_for_when_clause(
         // Bare column references are not valid in trigger WHEN clauses.
         // Per SQLite docs, columns must be qualified with NEW or OLD.
         Expr::Id(name) if !allow_non_trigger_qualified => {
-            let ident = normalize_ident(name.as_str());
-            if table.get_column(&ident).is_some()
-                || ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident))
-            {
-                crate::bail_parse_error!("no such column: {}", ident);
+            if table.get_column(name.as_str()).is_some() || ROWID_STRS.iter().any(|s| *name == *s) {
+                crate::bail_parse_error!("no such column: {}", name.as_str());
             }
             return Ok(());
         }
@@ -1333,8 +1327,8 @@ fn rewrite_trigger_expr_single_for_when_clause(
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-            let ns = normalize_ident(ns.as_str());
-            let col = normalize_ident(col.as_str());
+            let ns = ns.identifier().clone();
+            let col = col.identifier().clone();
 
             // Handle NEW.column references
             if ns.eq_ignore_ascii_case("new") {

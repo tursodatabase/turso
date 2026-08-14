@@ -47,7 +47,6 @@ use crate::{
         },
         ProgramBuilder,
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
@@ -60,6 +59,7 @@ use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
+use turso_parser::identifier::Identifier;
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {
@@ -166,7 +166,7 @@ pub fn emit_program_for_update(
         let mut write_phase_tables = TableReferences::new(
             vec![JoinedTable {
                 table: Table::BTree(scratch_table),
-                identifier: "ephemeral_scratch".to_string(),
+                identifier: Identifier::new("ephemeral_scratch"),
                 internal_id: scratch_table_internal_id,
                 op: Operation::Scan(Scan::BTreeTable {
                     iter_dir: IterationDirection::Forwards,
@@ -1524,10 +1524,10 @@ fn emit_update_insns<'a>(
     if let Table::BTree(ref btree) = target_table.table {
         let has_check_constraints = !btree.check_constraints.is_empty();
         let cols = btree.columns();
-        let virtual_col_names: HashSet<String> = cols
+        let virtual_col_names: HashSet<Identifier> = cols
             .iter()
             .filter(|c| c.is_virtual_generated())
-            .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
+            .filter_map(|c| c.name.clone())
             .collect();
         let expr_references_virtual = |expr: &ast::Expr| {
             !virtual_col_names.is_empty()
@@ -1707,8 +1707,7 @@ fn emit_update_insns<'a>(
                 .iter()
                 .enumerate()
                 .filter(|(idx, _)| affected_columns.get(*idx))
-                .filter_map(|(_, col)| col.name.as_deref())
-                .map(normalize_ident)
+                .filter_map(|(_, col)| col.name.as_ref().map(ToString::to_string))
                 .collect();
 
             // If the rowid is being updated (either directly via ROWID_SENTINEL or
@@ -2321,7 +2320,7 @@ fn emit_update_insns<'a>(
                 } else {
                     InsertFlags::new().skip_last_rowid()
                 },
-                table_name: target_table.identifier.clone(),
+                table_name: target_table.identifier.to_string(),
             });
 
             // MVCC AUTOINCREMENT: an UPDATE that moves the rowid forward

@@ -356,6 +356,6 @@ fn emit_values_to_table(
         key_reg: rowid_reg,
         record_reg,
         flag: InsertFlags::new().is_ephemeral_table_insert(),
-        table_name: table.name.clone(),
+        table_name: table.name.to_string(),
     });
 }

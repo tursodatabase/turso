@@ -18,6 +18,7 @@ use crate::{
     HashSet,
 };
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
 /// short circuit the procedure and return early to not waste time. SQLite uses 100 as default.
@@ -182,7 +183,7 @@ fn translate_integrity_check_impl(
             }
             root_pages.push(table_root);
             live_root_pages.insert(table_root);
-            if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
+            if let Some(indexes) = schema.indexes.get(&btree_table.name) {
                 for index in indexes {
                     let index_root = resolve_root(index.root_page);
                     if index_root > 0 {
@@ -287,7 +288,7 @@ fn translate_integrity_check_impl(
         );
 
         let mut bound_indexes = Vec::new();
-        if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
+        if let Some(indexes) = schema.indexes.get(&btree_table.name) {
             for index in indexes {
                 if index.root_page <= 0 {
                     continue;
@@ -349,13 +350,16 @@ fn translate_integrity_check_impl(
             )?);
         }
 
-        let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
+        let not_null_columns: Vec<(BoundIndexColumn, Identifier)> = btree_table
             .columns()
             .iter()
             .enumerate()
             .filter(|(_, col)| col.notnull() && !col.is_rowid_alias())
             .filter_map(|(idx, col)| {
-                let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
+                let name = col
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| Identifier::new(format!("column{idx}")));
                 match col.generated_type() {
                     GeneratedType::Virtual { expr, .. } => {
                         let bound =

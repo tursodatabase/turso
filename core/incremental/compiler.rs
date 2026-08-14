@@ -2308,7 +2308,7 @@ mod tests {
             let mut schema = Schema::new();
             let columns = crate::alloc::vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2321,17 +2321,13 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new_default_integer(
-                    Some("age".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_integer(Some("age".into()), "INTEGER".to_string(), None,),
             ];
             let users_table = BTreeTable::new(
                 2,
-                "users".to_string(),
-                crate::alloc::vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                "users".into(),
+                crate::alloc::vec![("id".into(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 crate::alloc::vec![],
@@ -2346,7 +2342,7 @@ mod tests {
             // Add products table for join tests
             let columns = crate::alloc::vec![
                 SchemaColumn::new(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2360,20 +2356,20 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_text(
-                    Some("product_name".to_string()),
+                    Some("product_name".into()),
                     "TEXT".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("price".to_string()),
+                    Some("price".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let products_table = BTreeTable::new(
                 3,
-                "products".to_string(),
-                crate::alloc::vec![("product_id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                "products".into(),
+                crate::alloc::vec![("product_id".into(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 crate::alloc::vec![],
@@ -2388,7 +2384,7 @@ mod tests {
             // Add orders table for join tests
             let columns = crate::alloc::vec![
                 SchemaColumn::new(
-                    Some("order_id".to_string()),
+                    Some("order_id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2402,25 +2398,25 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("user_id".to_string()),
+                    Some("user_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("quantity".to_string()),
+                    Some("quantity".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let orders_table = BTreeTable::new(
                 4,
-                "orders".to_string(),
-                crate::alloc::vec![("order_id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                "orders".into(),
+                crate::alloc::vec![("order_id".into(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 crate::alloc::vec![],
@@ -2435,7 +2431,7 @@ mod tests {
             // Add customers table with id and name for testing column ambiguity
             let columns = crate::alloc::vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2448,12 +2444,12 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
             ];
             let customers_table = BTreeTable::new(
                 6,
-                "customers".to_string(),
-                crate::alloc::vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                "customers".into(),
+                crate::alloc::vec![("id".into(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 crate::alloc::vec![],
@@ -2468,7 +2464,7 @@ mod tests {
             // Add purchases table (junction table for three-way join)
             let columns = crate::alloc::vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2482,25 +2478,25 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("customer_id".to_string()),
+                    Some("customer_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("vendor_id".to_string()),
+                    Some("vendor_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("quantity".to_string()),
+                    Some("quantity".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let purchases_table = BTreeTable::new(
                 7,
-                "purchases".to_string(),
-                crate::alloc::vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                "purchases".into(),
+                crate::alloc::vec![("id".into(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 crate::alloc::vec![],
@@ -2515,7 +2511,7 @@ mod tests {
             // Add vendors table with id, name, and price (ambiguous columns with customers)
             let columns = crate::alloc::vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2528,17 +2524,17 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
                 SchemaColumn::new_default_integer(
-                    Some("price".to_string()),
+                    Some("price".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let vendors_table = BTreeTable::new(
                 8,
-                "vendors".to_string(),
-                crate::alloc::vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                "vendors".into(),
+                crate::alloc::vec![("id".into(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 crate::alloc::vec![],
@@ -2552,19 +2548,19 @@ mod tests {
 
             let columns = crate::alloc::vec![
                 SchemaColumn::new_default_integer(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("amount".to_string()),
+                    Some("amount".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let sales_table = BTreeTable::new(
                 2,
-                "sales".to_string(),
+                "sales".into(),
                 crate::alloc::vec![],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
@@ -5851,14 +5847,14 @@ mod tests {
                 name: "id".to_string(),
                 ty: Type::Integer,
                 database: None,
-                table: Some("left".to_string()),
+                table: Some("left".into()),
                 table_alias: None,
             },
             ColumnInfo {
                 name: "name".to_string(),
                 ty: Type::Text,
                 database: None,
-                table: Some("left".to_string()),
+                table: Some("left".into()),
                 table_alias: None,
             },
         ]);
@@ -5867,25 +5863,25 @@ mod tests {
                 name: "id".to_string(),
                 ty: Type::Integer,
                 database: None,
-                table: Some("right".to_string()),
+                table: Some("right".into()),
                 table_alias: None,
             },
             ColumnInfo {
                 name: "value".to_string(),
                 ty: Type::Integer,
                 database: None,
-                table: Some("right".to_string()),
+                table: Some("right".into()),
                 table_alias: None,
             },
         ]);
 
         let left_col = Column {
             name: "id".to_string(),
-            table: Some("left".to_string()),
+            table: Some("left".into()),
         };
         let right_col = Column {
             name: "id".to_string(),
-            table: Some("right".to_string()),
+            table: Some("right".into()),
         };
 
         let result =
@@ -5893,10 +5889,10 @@ mod tests {
         assert!(result.is_ok());
         let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
         assert_eq!(actual_left.name, "id");
-        assert_eq!(actual_left.table, Some("left".to_string()));
+        assert_eq!(actual_left.table, Some("left".into()));
         assert_eq!(left_idx, 0);
         assert_eq!(actual_right.name, "id");
-        assert_eq!(actual_right.table, Some("right".to_string()));
+        assert_eq!(actual_right.table, Some("right".into()));
         assert_eq!(right_idx, 0);
     }
 
@@ -5914,11 +5910,11 @@ mod tests {
 
         let right_col = Column {
             name: "id".to_string(),
-            table: Some("right".to_string()),
+            table: Some("right".into()),
         };
         let left_col = Column {
             name: "id".to_string(),
-            table: Some("left".to_string()),
+            table: Some("left".into()),
         };
 
         let result =
@@ -5926,10 +5922,10 @@ mod tests {
         assert!(result.is_ok());
         let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
         assert_eq!(actual_left.name, "id");
-        assert_eq!(actual_left.table, Some("left".to_string()));
+        assert_eq!(actual_left.table, Some("left".into()));
         assert_eq!(left_idx, 0);
         assert_eq!(actual_right.name, "id");
-        assert_eq!(actual_right.table, Some("right".to_string()));
+        assert_eq!(actual_right.table, Some("right".into()));
         assert_eq!(right_idx, 0);
     }
 
@@ -5952,7 +5948,7 @@ mod tests {
         };
         let other_id_col = Column {
             name: "other_id".to_string(),
-            table: Some("left".to_string()),
+            table: Some("left".into()),
         };
 
         // id from right, other_id from left
@@ -5981,7 +5977,7 @@ mod tests {
         // Qualified left.id with unqualified name
         let left_id = Column {
             name: "id".to_string(),
-            table: Some("left".to_string()),
+            table: Some("left".into()),
         };
         let name_unqualified = Column {
             name: "name".to_string(),
@@ -6015,11 +6011,11 @@ mod tests {
 
         let left_id = Column {
             name: "id".to_string(),
-            table: Some("left".to_string()),
+            table: Some("left".into()),
         };
         let left_other_id = Column {
             name: "other_id".to_string(),
-            table: Some("left".to_string()),
+            table: Some("left".into()),
         };
 
         let result = DbspCompiler::resolve_join_columns(
@@ -6074,11 +6070,11 @@ mod tests {
 
         let left_id = Column {
             name: "id".to_string(),
-            table: Some("left".to_string()),
+            table: Some("left".into()),
         };
         let right_id = Column {
             name: "id".to_string(),
-            table: Some("right".to_string()),
+            table: Some("right".into()),
         };
 
         let result =

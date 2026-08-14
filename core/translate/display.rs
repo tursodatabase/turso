@@ -45,7 +45,7 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
     match &table.op {
         Operation::Scan(scan) => {
             let table_name = if table.table.get_name() == table.identifier {
-                table.identifier.clone()
+                table.identifier.to_string()
             } else {
                 format!("{} AS {}", table.table.get_name(), table.identifier)
             };
@@ -129,7 +129,7 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
         }
         Operation::HashJoin(_) => {
             let table_name = if table.table.get_name() == table.identifier {
-                table.identifier.clone()
+                table.identifier.to_string()
             } else {
                 format!("{} AS {}", table.table.get_name(), table.identifier)
             };
@@ -262,7 +262,7 @@ impl Display for SelectPlan {
             match &reference.op {
                 Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
+                        reference.identifier.to_string()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
@@ -397,7 +397,7 @@ impl Display for DeletePlan {
             match &reference.op {
                 Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
+                        reference.identifier.to_string()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
@@ -524,7 +524,7 @@ impl fmt::Display for UpdatePlan {
             match &reference.op {
                 Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
+                        reference.identifier.to_string()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
@@ -978,7 +978,7 @@ impl ToTokens for UpdatePlan {
                     .unwrap();
 
                 ast::Set {
-                    col_names: vec![ast::Name::exact(col_name.clone())],
+                    col_names: vec![ast::Name::from(col_name.clone())],
                     expr: set_clause.expr.clone(),
                 }
             }),

@@ -221,9 +221,8 @@ pub(super) fn translate_sequence_function(
     let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
 
     let seq_name_raw = extract_string_literal(&args[0])?;
-    let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.')
-    {
-        let schema_norm = normalize_ident(schema);
+    let (database_id, sequence_name) = if let Some((schema, name)) = seq_name_raw.split_once('.') {
+        let schema_norm = schema.to_ascii_lowercase();
         let db_id = match schema_norm.as_str() {
             "main" => crate::MAIN_DB_ID,
             "temp" => crate::TEMP_DB_ID,
@@ -231,16 +230,16 @@ pub(super) fn translate_sequence_function(
                 .get_attached_database(&schema_norm)
                 .map(|(idx, _)| idx)
                 .ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
+                    LimboError::InvalidArgument(format!("no such database: {schema}"))
                 })?,
         };
-        (db_id, normalize_ident(name))
+        (db_id, name.to_string())
     } else {
-        (crate::MAIN_DB_ID, normalize_ident(&seq_name_raw))
+        (crate::MAIN_DB_ID, seq_name_raw.clone())
     };
 
     let backing_table_name =
-        crate::translate::sequence::sequence_backing_table_name(&normalized_name);
+        crate::translate::sequence::sequence_backing_table_name(&sequence_name);
     let backing_table =
         resolver.with_schema(database_id, |s| s.get_btree_table(&backing_table_name));
     if backing_table.is_none() {
@@ -251,7 +250,7 @@ pub(super) fn translate_sequence_function(
     // baked into the bytecode as literal Integers since they never change
     // for a given sequence object.
     let seq_arc = resolver
-        .with_schema(database_id, |s| s.get_sequence(&normalized_name).cloned())
+        .with_schema(database_id, |s| s.get_sequence(&sequence_name).cloned())
         .ok_or_else(|| {
             LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
         })?;
@@ -275,7 +274,7 @@ pub(super) fn translate_sequence_function(
             program,
             resolver,
             database_id,
-            &normalized_name,
+            &sequence_name,
             &seq_arc,
             target_register,
             Some(start_reg),
@@ -313,7 +312,7 @@ pub(super) fn translate_sequence_function(
         program.preassign_label_to_next_insn(loop_label);
         program.emit_insn(Insn::Delete {
             cursor_id,
-            table_name: normalized_name.clone(),
+            table_name: sequence_name.clone(),
             // Sequence storage is internal bookkeeping, not a SQL row change.
             is_part_of_update: true,
         });
@@ -356,7 +355,7 @@ pub(super) fn translate_sequence_function(
             key_reg: start_reg + 1,
             record_reg,
             flag: InsertFlags::new().require_seek().skip_all_change_counts(),
-            table_name: normalized_name.clone(),
+            table_name: sequence_name.clone(),
         });
         program.emit_insn(Insn::SetSequenceCurrval {
             seq_name_reg: start_reg,
@@ -372,7 +371,7 @@ pub(super) fn translate_sequence_function(
             program,
             resolver,
             database_id,
-            &normalized_name,
+            &sequence_name,
             start_reg + 1,
         )?;
     }

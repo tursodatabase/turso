@@ -9,7 +9,6 @@ use crate::{
         emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
@@ -36,16 +35,16 @@ fn resolve_analyze_targets(
 ) -> Result<(usize, Vec<AnalyzeTarget>)> {
     match target_opt {
         Some(target) => {
-            let normalized = normalize_ident(target.name.as_str());
+            let normalized = target.name.as_str();
 
             // If db_name is specified, resolve to that database
             if let Some(db_name) = &target.db_name {
                 let database_id = resolver.resolve_database_id(target)?;
-                let db_normalized = normalize_ident(db_name.as_str());
+                let db_normalized = db_name.as_str();
 
                 // "ANALYZE db.table" — the name part is the table/index
                 // But first check if the name is actually a database name too (shouldn't be with db_name set)
-                let targets = resolve_targets_in_db(&normalized, database_id, resolver)?;
+                let targets = resolve_targets_in_db(normalized, database_id, resolver)?;
                 if targets.is_empty() {
                     bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
                 }
@@ -59,13 +58,13 @@ fn resolve_analyze_targets(
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = resolver.get_attached_database(&normalized) {
+            if let Some((db_id, _)) = resolver.get_attached_database(normalized) {
                 let targets = collect_all_tables_in_db(db_id, resolver);
                 return Ok((db_id, targets));
             }
 
             // Not a database name — search main schema for table/index
-            let targets = resolve_targets_in_db(&normalized, 0, resolver)?;
+            let targets = resolve_targets_in_db(normalized, 0, resolver)?;
             if targets.is_empty() {
                 bail_parse_error!("no such table or index: {}", target.name);
             }

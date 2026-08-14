@@ -4,6 +4,7 @@ use crate::alloc::{TryClone, TursoSliceExt};
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use crate::{
     alloc::TursoIteratorExt,
@@ -1001,7 +1002,7 @@ fn get_subquery_parser<'a>(
                     .map(|(i, c)| {
                         let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
                         Ok::<_, crate::LimboError>(IndexColumn {
-                            name: c.name(table_references).unwrap_or("").to_string(),
+                            name: Identifier::new(c.name(table_references).unwrap_or("")),
                             order: SortOrder::Asc,
                             nulls_order: None,
                             pos_in_table: i,
@@ -1014,8 +1015,8 @@ fn get_subquery_parser<'a>(
 
                 let ephemeral_index = Arc::new(Index {
                     columns,
-                    name: format!("ephemeral_index_where_sub_{subquery_id}"),
-                    table_name: String::new(),
+                    name: Identifier::new(format!("ephemeral_index_where_sub_{subquery_id}")),
+                    table_name: Identifier::empty(),
                     ephemeral: true,
                     has_rowid: false,
                     root_page: 0,
@@ -1426,7 +1427,7 @@ pub fn emit_from_clause_subqueries(
                 Operation::Scan(scan) => {
                     let table_name =
                         if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
+                            table_reference.identifier.to_string()
                         } else {
                             format!(
                                 "{} AS {}",
@@ -1508,7 +1509,7 @@ pub fn emit_from_clause_subqueries(
                 Operation::HashJoin(_) => {
                     let table_name =
                         if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
+                            table_reference.identifier.to_string()
                         } else {
                             format!(
                                 "{} AS {}",
@@ -1872,7 +1873,7 @@ fn emit_materialized_subquery_table(
     // materialized rows through the normal table-cursor path.
     let ephemeral_table = Arc::new(BTreeTable::new(
         0,
-        String::new(),
+        Identifier::empty(),
         crate::alloc::vec![],
         columns.try_to_vec()?,
         BTreeCharacteristics::HAS_ROWID,

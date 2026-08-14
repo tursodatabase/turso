@@ -3,6 +3,7 @@ use crate::sync::Arc;
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
+    identifier::Identifier,
     parser::Parser,
 };
 
@@ -369,7 +370,7 @@ fn emit_delete_sqlite_sequence_entry(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
-    table_name_norm: &str,
+    canonical_table_name: &str,
 ) {
     let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
         s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
@@ -379,7 +380,7 @@ fn emit_delete_sqlite_sequence_entry(
 
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
     let sequence_name_reg = program.alloc_register();
-    let row_name_to_delete_reg = program.emit_string8_new_reg(table_name_norm.to_string());
+    let row_name_to_delete_reg = program.emit_string8_new_reg(canonical_table_name.to_string());
     program.mark_last_insn_constant();
 
     program.emit_insn(Insn::OpenWrite {
@@ -908,7 +909,11 @@ pub fn translate_alter_table(
     if !dependent_views.is_empty() {
         return Err(LimboError::ParseError(format!(
             "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
-            dependent_views.join(", ")
+            dependent_views
+                .iter()
+                .map(|view| view.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
 
@@ -990,7 +995,7 @@ pub fn translate_alter_table(
                     let mut table_references = TableReferences::new(
                         vec![],
                         vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
+                            identifier: Identifier::new(table_name),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
                             using_dedup_hidden_cols: ColumnMask::default(),
@@ -1062,9 +1067,8 @@ pub fn translate_alter_table(
 
             // Check if column is used in a foreign key constraint (child side)
             // SQLite does not allow dropping a column that is part of a FK constraint
-            let column_name_norm = normalize_ident(column_name);
             for fk in &btree.foreign_keys {
-                if fk.child_columns.contains(&column_name_norm) {
+                if fk.child_columns.iter().any(|col| col == column_name) {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: unknown column \"{column_name}\" in foreign key definition"
                     )));
@@ -1223,7 +1227,7 @@ pub fn translate_alter_table(
 
                     program.emit_insn(Insn::DropColumn {
                         db: database_id,
-                        table: btree.name.clone(),
+                        table: btree.name.to_string(),
                         column_index: dropped_index,
                     })
                 },
@@ -1355,11 +1359,11 @@ pub fn translate_alter_table(
                             .max()
                             .map_or(0, |order| order + 1);
                         let fk = ForeignKey {
-                            parent_table: normalize_ident(clause.tbl_name.as_str()),
+                            parent_table: clause.tbl_name.identifier().clone(),
                             parent_columns: clause
                                 .columns
                                 .iter()
-                                .map(|c| normalize_ident(c.col_name.as_str()))
+                                .map(|c| c.col_name.identifier().clone())
                                 .collect::<Vec<_>>()
                                 .into_boxed_slice(),
                             on_delete: clause
@@ -1384,7 +1388,7 @@ pub fn translate_alter_table(
                                     }
                                 })
                                 .unwrap_or(ast::RefAct::NoAction),
-                            child_columns: Box::from([new_column_name.to_string()]),
+                            child_columns: Box::from([new_column_name.clone()]),
                             deferred: match defer_clause {
                                 Some(d) => {
                                     d.deferrable
@@ -1558,7 +1562,7 @@ pub fn translate_alter_table(
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
-            let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
+            let mut temp_triggers_to_rewrite: Vec<(Identifier, String, bool)> = Vec::new();
 
             if resolver.with_schema(database_id, |s| {
                 s.get_table(new_name).is_some()
@@ -1943,8 +1947,8 @@ pub fn translate_alter_table(
 
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
-            let mut triggers_to_rewrite: Vec<(usize, String, String)> = Vec::new();
-            let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
+            let mut triggers_to_rewrite: Vec<(usize, Identifier, String)> = Vec::new();
+            let mut views_to_rewrite: Vec<(usize, Identifier, String)> = Vec::new();
             if rename {
                 // Try to rewrite every trigger's SQL for the column rename.
                 // If the rewritten SQL differs from the original, include it
@@ -2280,8 +2284,14 @@ pub fn translate_alter_table(
             }
 
             if clears_autoincrement_sequence {
-                let table_name_norm = normalize_ident(table_name);
-                emit_delete_sqlite_sequence_entry(program, resolver, database_id, &table_name_norm);
+                // Match the stored row by the canonical spelling that the
+                // AUTOINCREMENT machinery wrote, not the user's ALTER spelling.
+                emit_delete_sqlite_sequence_entry(
+                    program,
+                    resolver,
+                    database_id,
+                    original_btree.name.as_str(),
+                );
             }
 
             program.emit_insn(Insn::SetCookie {
@@ -2363,7 +2373,7 @@ fn emit_rewrite_table_rows(
         if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id,
-                table_name: table_name.clone(),
+                table_name: table_name.to_string(),
                 is_part_of_update: true,
             });
         }
@@ -2373,7 +2383,7 @@ fn emit_rewrite_table_rows(
             key_reg: rowid,
             record_reg: record,
             flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: table_name.clone(),
+            table_name: table_name.to_string(),
         });
     });
 }
@@ -2786,9 +2796,9 @@ fn rewrite_trigger_sql_for_column_rename(
     // breaking cross-table body refs.
     if trigger_database_id == crate::TEMP_DB_ID && is_renaming_trigger_table {
         let rewritten_trigger = crate::schema::Trigger::new(
-            trigger_name.name.as_str().to_string(),
+            trigger_name.name.identifier().clone(),
             new_sql.clone(),
-            tbl_name.name.as_str().to_string(),
+            tbl_name.name.identifier().clone(),
             time,
             new_event,
             for_each_row,
@@ -4217,7 +4227,7 @@ fn validate_trigger_table_refs_after_rename(
         trigger_database_id,
         altered_database_id,
     ) {
-        return Ok(Some(trigger.table_name.clone()));
+        return Ok(Some(trigger.table_name.to_string()));
     }
 
     if let Some(when_expr) = &trigger.when_clause {

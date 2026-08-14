@@ -8,19 +8,18 @@ use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
-use crate::util::{
-    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-};
+use crate::util::{escape_sql_string_literal, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 
 fn validate_materialized(
     connection: &Arc<crate::Connection>,
     database_id: usize,
     resolver: &Resolver,
-    normalized_view_name: &str,
+    normalized_view_name: &Identifier,
 ) -> Result<()> {
     // Check if experimental views are enabled
     if !connection.experimental_views_enabled() {
@@ -36,7 +35,7 @@ fn validate_materialized(
     }
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
+        .any(|prefix| normalized_view_name.starts_with_ignore_ascii_case(prefix))
     {
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
@@ -65,7 +64,7 @@ pub fn translate_create_materialized_view(
     let database_id = resolver.resolve_database_id(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let normalized_view_name = view_name.name.identifier().clone();
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -154,7 +153,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_loop_label);
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
-        table_name: normalized_view_name.clone(),
+        table_name: normalized_view_name.to_string(),
         is_part_of_update: false,
     });
     program.emit_insn(Insn::Next {
@@ -267,7 +266,7 @@ pub fn translate_create_materialized_view(
     });
 
     // Populate the materialized view
-    let cursor_info = vec![(normalized_view_name.clone(), view_cursor_id)];
+    let cursor_info = vec![(normalized_view_name.to_string(), view_cursor_id)];
     program.emit_insn(Insn::PopulateMaterializedViews {
         cursors: cursor_info,
     });
@@ -284,7 +283,7 @@ fn validate_create_view(
     resolver: &Resolver,
     database_id: usize,
     view_name: &ast::Name,
-    normalized_view_name: &str,
+    normalized_view_name: &Identifier,
 ) -> Result<()> {
     // Check if view already exists. A broken view (unparseable sqlite_schema
     // row) also counts: creating over it would produce a duplicate row, so
@@ -301,7 +300,7 @@ fn validate_create_view(
     }
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
+        .any(|prefix| normalized_view_name.starts_with_ignore_ascii_case(prefix))
     {
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
@@ -326,7 +325,7 @@ pub fn translate_create_view(
     };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let normalized_view_name = view_name.name.identifier().clone();
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -445,7 +444,7 @@ pub fn translate_drop_view(
     let database_id = resolver.resolve_existing_table_database_id_qualified(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let normalized_view_name = view_name.name.identifier().clone();
 
     // Check if view exists: regular, materialized, or a broken sqlite_schema
     // row whose stored SQL failed to parse at load time. Broken views have no
@@ -546,7 +545,7 @@ pub fn translate_drop_view(
     // Set the view name and type we're looking for
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: normalized_view_name.clone(),
+        value: normalized_view_name.to_string(),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
@@ -729,7 +728,7 @@ pub fn translate_drop_view(
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
         db: database_id,
-        view_name: normalized_view_name,
+        view_name: normalized_view_name.to_string(),
     });
 
     // Update schema version (increment schema cookie)

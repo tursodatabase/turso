@@ -21,7 +21,7 @@ use crate::schema::{
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
-use crate::util::{escape_sql_string_literal, normalize_ident};
+use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, AddSequenceData, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral,
@@ -816,7 +816,7 @@ pub fn translate_create_sequence(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let normalized_name = normalize_ident(seq_name.name.as_str());
+    let normalized_name = seq_name.name.identifier().clone();
 
     // `__turso_internal_autoincrement_<table>` is reserved for the
     // implicit sequences CREATE TABLE ... AUTOINCREMENT installs.
@@ -882,7 +882,7 @@ pub fn translate_create_sequence(
     program.emit_insn(Insn::AddSequence {
         data: Box::new(AddSequenceData {
             db: database_id,
-            name: normalized_name,
+            name: normalized_name.to_string(),
             start: seq.start_value,
             increment: seq.increment_by,
             min_value: seq.min_value,
@@ -1015,7 +1015,7 @@ pub fn translate_drop_sequence(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let normalized_name = normalize_ident(seq_name.name.as_str());
+    let normalized_name = seq_name.name.identifier().clone();
     let dropped = emit_drop_sequence_cleanup(program, resolver, database_id, &normalized_name)?;
     if !dropped {
         if if_exists {

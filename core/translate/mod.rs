@@ -562,6 +562,7 @@ mod tests {
     use crate::vdbe::insn::Insn;
     use crate::Database;
     use crate::SqliteDialect;
+    use turso_parser::identifier::IdentifierStr;
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]
@@ -651,7 +652,7 @@ mod tests {
             BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
                 .expect("malformed sqlite_sequence SQL should parse");
         schema.tables.insert(
-            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            SQLITE_SEQUENCE_TABLE_NAME.into(),
             Arc::new(Table::BTree(Arc::new(malformed_seq))),
         );
 
@@ -697,7 +698,9 @@ mod tests {
             .unwrap();
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+        schema
+            .tables
+            .remove(IdentifierStr::new(SQLITE_SEQUENCE_TABLE_NAME));
 
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();

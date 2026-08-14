@@ -45,12 +45,12 @@ pub(super) enum QualifiedMatch {
 pub(super) fn resolve_qualified_on_ref(
     table: &Table,
     internal_id: TableInternalId,
-    normalized_id: &str,
+    id_str: &str,
 ) -> Result<Option<QualifiedMatch>> {
     if let Some(col_idx) = table.columns().iter().position(|c| {
         c.name
             .as_ref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
+            .is_some_and(|name| name.eq_ignore_ascii_case(id_str))
     }) {
         let col = table.columns().get(col_idx).unwrap();
         return Ok(Some(QualifiedMatch::Column {
@@ -60,9 +60,9 @@ pub(super) fn resolve_qualified_on_ref(
     }
 
     if let Table::BTree(btree) = table {
-        if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
+        if parse_row_id(id_str, internal_id, || false)?.is_some() {
             if !btree.has_rowid {
-                crate::bail_parse_error!("no such column: {}", normalized_id);
+                crate::bail_parse_error!("no such column: {}", id_str);
             }
             return Ok(Some(QualifiedMatch::RowId));
         }
@@ -94,13 +94,13 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such column: {}", id.as_str());
                     };
-                    let normalized_id = normalize_ident(id.as_str());
+                    let id_str = id.as_str();
 
                     if binding_behavior == BindingBehavior::TryResultColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                    if alias.eq_ignore_ascii_case(id_str) {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
                                     }
@@ -116,7 +116,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         let col_idx = joined_table.table.columns().iter().position(|c| {
                             c.name
                                 .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                                .is_some_and(|name| name.eq_ignore_ascii_case(id_str))
                         });
                         if col_idx.is_some() {
                             if match_result.is_some() {
@@ -125,7 +125,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 // and the left table is used.
                                 if let Some(join_info) = &joined_table.join_info {
                                     if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
+                                        using_col.as_str().eq_ignore_ascii_case(id_str)
                                     }) {
                                         ok = true;
                                     }
@@ -148,7 +148,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
                             if let Some(row_id_expr) =
-                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
+                                parse_row_id(id_str, joined_tables[0].internal_id, || {
                                     joined_tables.len() != 1
                                 })?
                             {
@@ -193,7 +193,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             let col_idx = outer_ref.table.columns().iter().position(|c| {
                                 c.name
                                     .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(id_str))
                             });
                             if col_idx.is_some() {
                                 let col_idx = col_idx.unwrap();
@@ -229,7 +229,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                    if alias.eq_ignore_ascii_case(id_str) {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
                                     }
@@ -270,8 +270,8 @@ pub fn bind_and_rewrite_expr<'a>(
                             id.as_str()
                         );
                     };
-                    let normalized_table_name = normalize_ident(tbl.as_str());
-                    let normalized_id = normalize_ident(id.as_str());
+                    let table_name_str = tbl.as_str();
+                    let id_str = id.as_str();
 
                     // `resolved` holds the accepted binding (at most one).
                     // `identifier_matched` is true once *any* scope produced a table whose
@@ -292,13 +292,13 @@ pub fn bind_and_rewrite_expr<'a>(
                     for joined_table in referenced_tables
                         .joined_tables()
                         .iter()
-                        .filter(|t| t.identifier == normalized_table_name)
+                        .filter(|t| t.identifier == table_name_str)
                     {
                         identifier_matched = true;
                         let Some(candidate) = resolve_qualified_on_ref(
                             &joined_table.table,
                             joined_table.internal_id,
-                            &normalized_id,
+                            id_str,
                         )?
                         else {
                             continue;
@@ -312,9 +312,9 @@ pub fn bind_and_rewrite_expr<'a>(
                             let allowed_by_using =
                                 matches!(candidate, QualifiedMatch::Column { .. })
                                     && joined_table.join_info.as_ref().is_some_and(|ji| {
-                                        ji.using.iter().any(|u| {
-                                            u.as_str().eq_ignore_ascii_case(&normalized_id)
-                                        })
+                                        ji.using
+                                            .iter()
+                                            .any(|u| u.as_str().eq_ignore_ascii_case(id_str))
                                     });
                             if !allowed_by_using {
                                 return Err(ambiguous());
@@ -340,9 +340,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         let nearest_outer_scope = referenced_tables
                             .outer_query_refs()
                             .iter()
-                            .filter(|t| {
-                                !t.cte_definition_only && t.identifier == normalized_table_name
-                            })
+                            .filter(|t| !t.cte_definition_only && t.identifier == table_name_str)
                             .map(|t| t.scope_depth)
                             .min();
 
@@ -352,13 +350,13 @@ pub fn bind_and_rewrite_expr<'a>(
                                 referenced_tables.outer_query_refs().iter().filter(|t| {
                                     !t.cte_definition_only
                                         && t.scope_depth == scope_depth
-                                        && t.identifier == normalized_table_name
+                                        && t.identifier == table_name_str
                                 })
                             {
                                 let Some(candidate) = resolve_qualified_on_ref(
                                     &outer_ref.table,
                                     outer_ref.internal_id,
-                                    &normalized_id,
+                                    id_str,
                                 )?
                                 else {
                                     continue;
@@ -397,7 +395,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // definition refs so any other future use of `cte_definition_only`
                         // still falls through to "no such table".
                         let is_definition_only_cte = referenced_tables
-                            .find_outer_query_ref_by_identifier(&normalized_table_name)
+                            .find_outer_query_ref_by_identifier(table_name_str)
                             .is_some_and(|outer_ref| {
                                 outer_ref.cte_definition_only
                                     && (outer_ref.cte_id.is_some()
@@ -424,28 +422,26 @@ pub fn bind_and_rewrite_expr<'a>(
                         // We do NOT reject ambiguous schemas at CREATE TABLE time because
                         // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
                         // makes that impractical. Deterministic precedence is sufficient.
-                        let field_name = normalize_ident(id.as_str());
-                        if let Some(m) = find_custom_type_column(
-                            referenced_tables,
-                            &normalized_table_name,
-                            resolver,
-                        )? {
+                        let field_name = id.as_str();
+                        if let Some(m) =
+                            find_custom_type_column(referenced_tables, table_name_str, resolver)?
+                        {
                             *expr = make_field_access_expr(
                                 m.table_id,
                                 m.col_idx,
                                 m.is_rowid_alias,
-                                &field_name,
+                                field_name,
                                 m.type_def,
                             );
                             referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                        crate::bail_parse_error!("no such table: {}", table_name_str);
                     }
                     // Identifier matched somewhere but no column/rowid binding was
                     // produced — the table exists, the column doesn't.
                     let Some((tbl_id, binding)) = resolved else {
-                        crate::bail_parse_error!("no such column: {}", normalized_id);
+                        crate::bail_parse_error!("no such column: {}", id_str);
                     };
 
                     match binding {
@@ -494,7 +490,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             col_name_str
                         );
                     };
-                    let normalized_col_name = normalize_ident(&col_name_str);
+                    let col_name = col_name_str.as_str();
 
                     // DoublyQualified: `a.b.c` — DuckDB-style precedence:
                     //   1. a=database, b=table, c=column     (tried first)
@@ -518,17 +514,17 @@ pub fn bind_and_rewrite_expr<'a>(
 
                         if let Some(table) = table {
                             let col_idx = table.columns().iter().position(|c| {
-                                c.name.as_ref().is_some_and(|name| {
-                                    name.eq_ignore_ascii_case(&normalized_col_name)
-                                })
+                                c.name
+                                    .as_ref()
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
                             });
 
                             if let Some(col_idx) = col_idx {
                                 let col = table.columns().get(col_idx).unwrap();
                                 let is_rowid_alias = col.is_rowid_alias();
-                                let normalized_tbl_name = normalize_ident(&tbl_name_str);
+                                let table_name = tbl_name_str.as_str();
                                 let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                                    .find_table_and_internal_id_by_identifier(table_name);
 
                                 if let Some((tbl_id, _)) = matching_tbl {
                                     *expr = Expr::Column {
@@ -542,7 +538,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 } else {
                                     // Table exists in database but not in FROM clause
                                     return Err(LimboError::ParseError(format!(
-                                        "table {normalized_tbl_name} is not in FROM clause — \
+                                        "table {table_name} is not in FROM clause — \
                                          cross-database column references require the table to be explicitly joined"
                                     )));
                                 }
@@ -551,16 +547,16 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                     if !resolved_as_db_table_col {
                         // db.table.column failed — try table.column.field for struct/union
-                        let normalized_tbl_name = normalize_ident(&db_name_str);
-                        let normalized_col = normalize_ident(&tbl_name_str);
-                        let field_name = normalize_ident(&col_name_str);
-                        let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                        let table_name = db_name_str.as_str();
+                        let column_name = tbl_name_str.as_str();
+                        let field_name = col_name_str.as_str();
+                        let matching_tbl =
+                            referenced_tables.find_table_and_internal_id_by_identifier(table_name);
                         if let Some((tbl_id, tbl)) = matching_tbl {
                             let col_idx = tbl.columns().iter().position(|c| {
                                 c.name
                                     .as_ref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(column_name))
                             });
                             if let Some(col_idx) = col_idx {
                                 let col = &tbl.columns()[col_idx];
@@ -574,7 +570,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                         tbl_id,
                                         col_idx,
                                         col.is_rowid_alias(),
-                                        &field_name,
+                                        field_name,
                                         type_def.unwrap(),
                                     );
                                     referenced_tables.mark_column_used(tbl_id, col_idx);
@@ -582,7 +578,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 } else {
                                     // Column exists but is not a struct/union type
                                     return Err(LimboError::ParseError(format!(
-                                        "column '{normalized_col}' is not a STRUCT or UNION type; \
+                                        "column '{column_name}' is not a STRUCT or UNION type; \
                                          cannot access field '{field_name}'"
                                     )));
                                 }
@@ -592,15 +588,15 @@ pub fn bind_and_rewrite_expr<'a>(
                         // Handles:
                         //   data.telegram.chat_id — UNION column, variant with struct type
                         //   data.sub.a            — STRUCT column, struct-typed field, sub-field
-                        let col_name_norm = normalize_ident(&db_name_str);
-                        let mid_name = normalize_ident(&tbl_name_str);
-                        let leaf_field = normalize_ident(&col_name_str);
+                        let column_name_outer = db_name_str.as_str();
+                        let mid_name = tbl_name_str.as_str();
+                        let leaf_field = col_name_str.as_str();
                         if let Some((nested_expr, tbl_id, col_idx)) =
                             try_resolve_nested_field_access(
                                 referenced_tables,
-                                &col_name_norm,
-                                &mid_name,
-                                &leaf_field,
+                                column_name_outer,
+                                mid_name,
+                                leaf_field,
                                 resolver,
                             )?
                         {
@@ -645,9 +641,13 @@ pub fn bind_and_rewrite_expr<'a>(
                                             }
 
                                             // Add column name as a string literal
-                                            let col_name = col.name.clone().unwrap_or_else(|| {
-                                                format!("column{}", col_idx + 1)
-                                            });
+                                            let col_name = col
+                                                .name
+                                                .as_ref()
+                                                .map(ToString::to_string)
+                                                .unwrap_or_else(|| {
+                                                    format!("column{}", col_idx + 1)
+                                                });
                                             let quoted_col_name = format!("'{col_name}'");
                                             args.push(Box::new(ast::Expr::Literal(
                                                 ast::Literal::String(quoted_col_name),
@@ -750,8 +750,8 @@ pub(super) fn resolve_struct_from_expr(
         ast::Expr::Column { .. } => resolve_typedef_from_column(expr, referenced_tables, resolver)
             .filter(|td| td.is_struct()),
         ast::Expr::FunctionCall { name, args, .. } => {
-            let normalized = crate::util::normalize_ident(name.as_str());
-            match normalized.as_str() {
+            let name_str = name.as_str().to_ascii_lowercase();
+            match name_str.as_str() {
                 // union_extract(col, 'tag') → variant's type
                 "union_extract" if args.len() == 2 => {
                     let tag_name = extract_string_literal(&args[1]).ok()?;
@@ -979,12 +979,12 @@ pub(super) fn resolve_expr_output_type<'a>(
         }
         ast::Expr::FieldAccess { base, field, .. } => {
             let parent_td = resolve_expr_output_type(base, referenced_tables, resolver)?;
-            let field_name = normalize_ident(field.as_str());
+            let field_name = field.as_str();
             // Find what type this field/variant produces
             let inner_type_name =
-                if let Some((_, variant)) = parent_td.find_union_variant(&field_name) {
+                if let Some((_, variant)) = parent_td.find_union_variant(field_name) {
                     &variant.type_name
-                } else if let Some((_, f)) = parent_td.find_struct_field(&field_name) {
+                } else if let Some((_, f)) = parent_td.find_struct_field(field_name) {
                     &f.type_name
                 } else {
                     let kind = if parent_td.is_union() {
@@ -1021,8 +1021,8 @@ pub(super) fn validate_custom_type_function_call(
     args: &[Box<ast::Expr>],
     resolver: &Resolver<'_>,
 ) -> Result<()> {
-    let normalized = crate::util::normalize_ident(name);
-    match normalized.as_str() {
+    let name_str = name.to_ascii_lowercase();
+    match name_str.as_str() {
         // Arrays
         "array" | "array_element" | "array_set_element" | "array_length" | "array_append"
         | "array_prepend" | "array_cat" | "array_remove" | "array_contains" | "array_position"

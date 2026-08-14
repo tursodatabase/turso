@@ -16,6 +16,7 @@ use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Insn};
 use crate::{emit_explain, LimboError, Result};
 use turso_parser::ast::{NullsOrder, SortOrder};
+use turso_parser::identifier::Identifier;
 
 pub(crate) fn emit_recursive_cte(
     program: &mut ProgramBuilder,
@@ -47,7 +48,7 @@ pub(crate) fn emit_recursive_cte(
             let nulls_override = nulls.filter(|nulls| *nulls != default_nulls);
             if nulls_override.is_some() {
                 queue_index_columns.try_push(IndexColumn {
-                    name: format!("null-rank-{}", queue_sort_keys.len()),
+                    name: Identifier::new(format!("null-rank-{}", queue_sort_keys.len())),
                     order: SortOrder::Asc,
                     nulls_order: None,
                     pos_in_table: queue_index_columns.len(),
@@ -61,7 +62,7 @@ pub(crate) fn emit_recursive_cte(
                 *result_column_index,
             )?);
             queue_index_columns.try_push(IndexColumn {
-                name: format!("priority-{}", queue_sort_keys.len()),
+                name: Identifier::new(format!("priority-{}", queue_sort_keys.len())),
                 order: *order,
                 nulls_order: None,
                 pos_in_table: queue_index_columns.len(),
@@ -85,8 +86,8 @@ pub(crate) fn emit_recursive_cte(
     }
 
     let queue_index = Arc::new(Index {
-        name: format!("recursive-queue-{}", recursive_cte.name),
-        table_name: String::new(),
+        name: Identifier::new(format!("recursive-queue-{}", recursive_cte.name)),
+        table_name: Identifier::empty(),
         root_page: 0,
         columns: queue_index_columns,
         unique: true,
@@ -107,7 +108,7 @@ pub(crate) fn emit_recursive_cte(
         let mut seen_row_index_columns = crate::alloc::try_vec![]?;
         for result_column_index in 0..num_result_columns {
             seen_row_index_columns.try_push(IndexColumn {
-                name: format!("distinct-{result_column_index}"),
+                name: Identifier::new(format!("distinct-{result_column_index}")),
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: result_column_index,
@@ -120,8 +121,8 @@ pub(crate) fn emit_recursive_cte(
             })?;
         }
         let seen_row_index = Arc::new(Index {
-            name: format!("recursive-distinct-{}", recursive_cte.name),
-            table_name: String::new(),
+            name: Identifier::new(format!("recursive-distinct-{}", recursive_cte.name)),
+            table_name: Identifier::empty(),
             root_page: 0,
             columns: seen_row_index_columns,
             unique: false,

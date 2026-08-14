@@ -3,6 +3,7 @@ pub mod fmt;
 
 use std::{num::NonZeroU32, sync::Arc};
 
+use crate::identifier::{Identifier, Quote};
 use crate::lexer::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
 
@@ -1144,22 +1145,56 @@ pub struct GroupBy {
 /// identifier or string or `CROSS` or `FULL` or `INNER` or `LEFT` or `NATURAL` or `OUTER` or `RIGHT`.
 ///
 /// Two Names are equal if they refer to the same identifier, regardless of
-/// quoting style (e.g. `ABORT` and `"ABORT"` are the same identifier).
-#[derive(Clone, Debug, Eq)]
-pub struct Name {
-    quote: Option<char>,
-    value: String,
-}
+/// quoting style or ASCII case (e.g. `ABORT`, `abort` and `"ABORT"` are the
+/// same identifier).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Name(Identifier);
 
-impl PartialEq for Name {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
+impl PartialEq<str> for Name {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == *other
     }
 }
 
-impl std::hash::Hash for Name {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.value.hash(state);
+impl PartialEq<&str> for Name {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == **other
+    }
+}
+
+impl PartialEq<Name> for str {
+    fn eq(&self, other: &Name) -> bool {
+        other.0 == *self
+    }
+}
+
+impl PartialEq<Name> for &str {
+    fn eq(&self, other: &Name) -> bool {
+        other.0 == **self
+    }
+}
+
+impl PartialEq<Identifier> for Name {
+    fn eq(&self, other: &Identifier) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<Name> for Identifier {
+    fn eq(&self, other: &Name) -> bool {
+        *self == other.0
+    }
+}
+
+impl From<Identifier> for Name {
+    fn from(identifier: Identifier) -> Self {
+        Self(identifier)
+    }
+}
+
+impl From<Name> for Identifier {
+    fn from(name: Name) -> Self {
+        name.0
     }
 }
 
@@ -1169,7 +1204,7 @@ impl serde::Serialize for Name {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.value)
+        serializer.collect_str(&self.0.display_quoted())
     }
 }
 
@@ -1202,95 +1237,69 @@ impl Name {
     /// Create name which will have exactly the value of given string
     /// (e.g. if s = "\"str\"" - the name value will contain quotes and translation to SQL will give us """str""")
     pub fn exact(s: String) -> Self {
-        Self {
-            value: s,
-            quote: None,
-        }
+        Self(Identifier::new(s))
     }
     /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
     pub fn from_bytes(s: &[u8]) -> Self {
         Self::from_string(unsafe { std::str::from_utf8_unchecked(s) })
     }
     pub const fn empty() -> Self {
-        Self {
-            value: String::new(),
-            quote: None,
-        }
+        Self(Identifier::empty())
     }
     /// Create a name parsed from a bracket-quoted identifier (`[name]`),
     /// remembering the bracket quoting so the name renders back as written.
-    pub const fn bracketed(s: String) -> Self {
-        Self {
-            value: s,
-            quote: Some('['),
-        }
+    pub fn bracketed(s: String) -> Self {
+        Self(Identifier::with_quote(s, Quote::Bracket))
     }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
     pub fn from_string(s: impl AsRef<str>) -> Self {
-        let s = s.as_ref();
-        let bytes = s.as_bytes();
-
-        if s.is_empty() {
-            return Name::exact(s.to_string());
-        }
-
-        if matches!(bytes[0], b'"' | b'\'' | b'`') {
-            assert!(s.len() >= 2);
-            assert!(bytes[bytes.len() - 1] == bytes[0]);
-            let s = match bytes[0] {
-                b'"' => s[1..s.len() - 1].replace("\"\"", "\""),
-                b'\'' => s[1..s.len() - 1].replace("''", "'"),
-                b'`' => s[1..s.len() - 1].replace("``", "`"),
-                _ => unreachable!(),
-            };
-            Name {
-                value: s,
-                quote: Some(bytes[0] as char),
-            }
-        } else if bytes[0] == b'[' {
-            assert!(s.len() >= 2);
-            assert!(bytes[bytes.len() - 1] == b']');
-            Name::bracketed(s[1..s.len() - 1].to_string())
-        } else {
-            Name::exact(s.to_string())
-        }
+        Self(Identifier::parse(s.as_ref()))
     }
 
     /// Return string value of the name
     pub fn as_str(&self) -> &str {
-        &self.value
+        self.0.as_str()
+    }
+
+    /// The identifier this name refers to.
+    pub fn identifier(&self) -> &Identifier {
+        &self.0
+    }
+
+    pub fn into_identifier(self) -> Identifier {
+        self.0
     }
 
     /// Convert value to the string literal (e.g. single-quoted string with escaped single quotes)
     pub fn as_literal(&self) -> String {
-        format!("'{}'", self.value.replace("'", "''"))
+        format!("'{}'", self.as_str().replace("'", "''"))
     }
 
     /// Convert value to the name string (e.g. double-quoted string with escaped double quotes)
     pub fn as_ident(&self) -> String {
+        let value = self.as_str();
         // let's keep original quotes if they were set
         // (parser.rs tests validates that behaviour)
-        if self.quote == Some('[') {
-            // A `]` cannot be escaped inside a bracket-quoted identifier, so
-            // fall back to double quotes when the name contains one.
-            if !self.value.contains(']') {
-                return format!("[{}]", self.value);
+        match self.0.quote() {
+            Some(Quote::Bracket) => {
+                // A `]` cannot be escaped inside a bracket-quoted identifier,
+                // so fall back to double quotes when the name contains one.
+                if !value.contains(']') {
+                    format!("[{value}]")
+                } else {
+                    format!("\"{}\"", value.replace('"', "\"\""))
+                }
             }
-            return format!("\"{}\"", self.value.replace('"', "\"\""));
-        }
-        if let Some(quote) = self.quote {
-            let single = quote.to_string();
-            let double = single.clone() + &single;
-            return quote.to_string()
-                + self.value.replace(&single, &double).as_str()
-                + quote.to_string().as_str();
-        }
-        let value = self.value.as_bytes();
-        let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
-            self.value.clone()
-        } else {
-            format!("\"{}\"", self.value.replace("\"", "\"\""))
+            Some(_) => self.0.to_quoted_string(),
+            None => {
+                let bytes = value.as_bytes();
+                let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
+                if !bytes.is_empty() && bytes.iter().all(safe_char) && !is_quotable_keyword(bytes) {
+                    value.to_owned()
+                } else {
+                    format!("\"{}\"", value.replace("\"", "\"\""))
+                }
+            }
         }
     }
 
@@ -1300,11 +1309,11 @@ impl Name {
     ///
     /// Also, used to detect string literals in PRAGMA cases
     pub fn quoted_with(&self, quote: char) -> bool {
-        self.quote == Some(quote)
+        self.0.quote().map(Quote::open) == Some(quote)
     }
 
-    pub const fn quoted(&self) -> bool {
-        self.quote.is_some()
+    pub fn quoted(&self) -> bool {
+        self.0.quote().is_some()
     }
 }
 
@@ -1354,11 +1363,12 @@ impl QualifiedName {
         }
     }
 
-    /// Return the resolved identifier as a String
-    pub fn identifier(&self) -> String {
+    /// The identifier this name resolves to: the alias when one is set,
+    /// otherwise the object name.
+    pub fn identifier(&self) -> Identifier {
         self.alias.as_ref().map_or_else(
-            || self.name.as_str().to_string(),
-            |alias| alias.as_str().to_string(),
+            || self.name.identifier().clone(),
+            |alias| alias.identifier().clone(),
         )
     }
 }

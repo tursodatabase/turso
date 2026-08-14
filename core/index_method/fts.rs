@@ -42,6 +42,7 @@ use tantivy::{
     SegmentMeta, TantivyDocument, TERMINATED,
 };
 use turso_parser::ast::{Select, SortOrder};
+use turso_parser::identifier::Identifier;
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
@@ -1408,15 +1409,15 @@ fn key_info() -> KeyInfo {
 
 /// Parse field weights from a string like "body=2.0,title=1.0"
 /// Returns a HashMap mapping column names to tantivy 'boost factors'
-fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<HashMap<String, f32>> {
+fn parse_field_weights(
+    weights_str: &str,
+    columns: &[IndexColumn],
+) -> Result<HashMap<Identifier, f32>> {
     let mut weights = HashMap::default();
 
     if weights_str.is_empty() {
         return Ok(weights);
     }
-
-    // Get valid column names for validation
-    let valid_columns: HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
 
     // Parse format: "col1=1.5,col2=2.0"
     for part in weights_str.split(',') {
@@ -1434,8 +1435,8 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
         let col_name = col_name.trim();
         let weight_str = weight_str.trim();
 
-        // Validate column exists in index
-        if !valid_columns.contains(col_name) {
+        // Validate column exists in index (identifier comparison folds case)
+        if !columns.iter().any(|c| c.name == col_name) {
             return Err(LimboError::ParseError(format!(
                 "unknown column '{}' in weights. Valid columns: {}",
                 col_name,
@@ -1458,7 +1459,7 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
             )));
         }
 
-        weights.insert(col_name.to_string(), weight);
+        weights.insert(Identifier::new(col_name), weight);
     }
 
     Ok(weights)
@@ -1608,7 +1609,7 @@ pub struct FtsIndexAttachment {
     /// Weights for each field in FTS scoring.
     /// Created from WITH clause parameters,
     /// e.g. `WITH (tokenizer='default',weights='col1=1.0,col2=2.0')`.
-    field_weights: HashMap<String, f32>,
+    field_weights: HashMap<Identifier, f32>,
     /// (min_gram, max_gram) for the ngram tokenizer, from the WITH clause
     /// `min_gram`/`max_gram` keys. [DEFAULT_NGRAM_WINDOW] unless configured.
     ngram_window: (usize, usize),
@@ -4143,8 +4144,8 @@ mod tests {
     #[test]
     fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
         let attachment = FtsIndexAttachment::new(IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "docs_fts".to_string(),
+            table_name: "docs".into(),
+            index_name: "docs_fts".into(),
             columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
             parameters: FxHashMap::<String, Value>::default(),
         })
@@ -4160,8 +4161,8 @@ mod tests {
 
     fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstimate {
         let attachment = FtsIndexAttachment::new(IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "docs_fts".to_string(),
+            table_name: "docs".into(),
+            index_name: "docs_fts".into(),
             columns: vec![IndexColumn::new("body", 1)],
             parameters: FxHashMap::<String, Value>::default(),
         })

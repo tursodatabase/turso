@@ -1,4 +1,5 @@
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
+use turso_parser::identifier::Identifier;
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::translate::emitter::emit_columns_and_dependencies;
@@ -453,7 +454,7 @@ pub(super) fn emit_skip_if_any_null(
 fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     child_tbl: &Arc<BTreeTable>,
-    child_cols: &[String],
+    child_cols: &[Identifier],
     parent_key_start: usize,
     self_exclude_rowid: Option<usize>,
     database_id: usize,
@@ -963,7 +964,7 @@ fn emit_fk_parent_key_probe(
 fn build_parent_key(
     program: &mut ProgramBuilder,
     parent_bt: &BTreeTable,
-    parent_cols: &[String],
+    parent_cols: &[Identifier],
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     dest_start: usize,
@@ -1047,7 +1048,7 @@ pub fn emit_fk_child_update_counters(
     // The null_skip_label is unresolved and must be resolved by the caller after the FK check
     // block, so that when any OLD column is NULL the entire FK check is skipped.
     let load_old_fk_values = |program: &mut ProgramBuilder,
-                              fk_cols: &[String]|
+                              fk_cols: &[Identifier]|
      -> Result<Option<(DmlColumnContext, Vec<usize>, BranchOffset)>> {
         let null_skip_label = program.allocate_label();
 
@@ -1367,7 +1368,7 @@ fn emit_fk_delete_parent_existence_check_single(
     let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict);
 
     // Build parent key in FK's parent-column order
-    let parent_cols: &[String] = &fk_ref.parent_cols;
+    let parent_cols: &[Identifier] = &fk_ref.parent_cols;
     let ncols = parent_cols.len();
 
     let parent_key_start = program.alloc_registers(ncols);
@@ -1609,7 +1610,7 @@ fn decode_fk_key_registers(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     parent_bt: &BTreeTable,
-    parent_cols: &[String],
+    parent_cols: &[Identifier],
     key_start: usize,
 ) -> Result<()> {
     for (i, pcol) in parent_cols.iter().enumerate() {
@@ -1629,7 +1630,7 @@ fn decode_fk_key_registers(
 fn copy_key_from_values(
     program: &mut ProgramBuilder,
     parent_bt: &BTreeTable,
-    parent_cols: &[String],
+    parent_cols: &[Identifier],
     values_start: usize,
     layout: &ColumnLayout,
     rowid_reg: usize,
@@ -1776,7 +1777,7 @@ fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedNam
 /// DELETE FROM child_table WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
 fn generate_cascade_delete_stmt(
     child_table: &str,
-    child_cols: &[String],
+    child_cols: &[Identifier],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -1793,7 +1794,7 @@ fn generate_cascade_delete_stmt(
 /// UPDATE child_table SET fk_col1 = NULL, fk_col2 = NULL ... WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
 fn generate_set_null_stmt(
     child_table: &str,
-    child_cols: &[String],
+    child_cols: &[Identifier],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -1821,7 +1822,7 @@ fn generate_set_null_stmt(
 /// UPDATE child_table SET fk_col1 = default1, fk_col2 = default2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
 fn generate_set_default_stmt(
     child_table: &BTreeTable,
-    child_cols: &[String],
+    child_cols: &[Identifier],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -1857,7 +1858,7 @@ fn generate_set_default_stmt(
 /// UPDATE child_table SET fk_col1 = ?new1, fk_col2 = ?new2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
 fn generate_cascade_update_stmt(
     child_table: &str,
-    child_cols: &[String],
+    child_cols: &[Identifier],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -1896,7 +1897,7 @@ fn generate_cascade_update_stmt(
 
 /// Build a WHERE clause that matches FK columns to parameter values:
 /// fk_col1 = ?1 AND fk_col2 = ?2 ...
-fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext) -> Expr {
+fn build_fk_match_where_clause(child_cols: &[Identifier], ctx: &FkSubprogramContext) -> Expr {
     let mut conditions: Vec<Expr> = Vec::with_capacity(child_cols.len());
 
     for (i, col) in child_cols.iter().enumerate() {
@@ -2107,7 +2108,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         for fk_ref in resolver.with_schema(database_id, |s| {
             s.resolved_fks_referencing(parent_table_name)
         })? {
-            let parent_cols: &[String] = &fk_ref.parent_cols;
+            let parent_cols: &[Identifier] = &fk_ref.parent_cols;
             let ncols = parent_cols.len();
             let key_regs_start = program.alloc_registers(ncols);
 
@@ -2290,7 +2291,7 @@ pub fn fire_fk_update_actions(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
     })? {
-        let parent_cols: &[String] = &fk_ref.parent_cols;
+        let parent_cols: &[Identifier] = &fk_ref.parent_cols;
         let ncols = parent_cols.len();
 
         // Copy OLD and NEW parent key values using the helper
@@ -2478,7 +2479,7 @@ pub fn emit_fk_drop_table_check(
 
     // Fire FK actions for CASCADE, SET NULL, SET DEFAULT
     for fk_ref in &action_fk_refs {
-        let parent_cols: &[String] = &fk_ref.parent_cols;
+        let parent_cols: &[Identifier] = &fk_ref.parent_cols;
         let ncols = parent_cols.len();
         let key_regs_start = program.alloc_registers(ncols);
 
@@ -2520,7 +2521,7 @@ pub fn emit_fk_drop_table_check(
         let child_cols = &fk_ref.fk.child_columns;
 
         // Determine which parent columns are referenced
-        let parent_cols: &[String] = &fk_ref.parent_cols;
+        let parent_cols: &[Identifier] = &fk_ref.parent_cols;
         let ncols = parent_cols.len();
 
         // Build the parent key vector from the current parent row

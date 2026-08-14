@@ -2221,6 +2221,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 #[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
+    use turso_parser::identifier::Identifier;
 
     use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
@@ -2696,8 +2697,8 @@ mod tests {
         let mut access_methods_arena = Vec::new();
         let mut available_indexes = AvailableIndexes::default();
         let index = Arc::new(Index {
-            name: "sqlite_autoindex_test_table_1".to_string(),
-            table_name: "test_table".to_string(),
+            name: "sqlite_autoindex_test_table_1".into(),
+            table_name: "test_table".into(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new("id", 0)],
             unique: true,
@@ -2786,8 +2787,8 @@ mod tests {
         let mut available_indexes = AvailableIndexes::default();
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
-            name: "index1".to_string(),
-            table_name: "table1".to_string(),
+            name: "index1".into(),
+            table_name: "table1".into(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new("id", 0)],
             unique: true,
@@ -2921,9 +2922,9 @@ mod tests {
                 // add primary key index called sqlite_autoindex_<tablename>_1
                 let index_name = format!("sqlite_autoindex_{table_name}_1");
                 let index = Arc::new(Index {
-                    name: index_name,
+                    name: Identifier::new(index_name),
                     where_clause: None,
-                    table_name: table_name.to_string(),
+                    table_name: Identifier::new(table_name),
                     columns: crate::alloc::vec![IndexColumn::new("id", 0)],
                     unique: true,
                     ephemeral: false,
@@ -2939,8 +2940,8 @@ mod tests {
                 );
             });
         let customer_id_idx = Arc::new(Index {
-            name: "orders_customer_id_idx".to_string(),
-            table_name: "orders".to_string(),
+            name: "orders_customer_id_idx".into(),
+            table_name: "orders".into(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new("customer_id", 1)],
             unique: false,
@@ -2951,8 +2952,8 @@ mod tests {
             on_conflict: None,
         });
         let order_id_idx = Arc::new(Index {
-            name: "order_items_order_id_idx".to_string(),
-            table_name: "order_items".to_string(),
+            name: "order_items_order_id_idx".into(),
+            table_name: "order_items".into(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new("order_id", 1)],
             unique: false,
@@ -3449,8 +3450,8 @@ mod tests {
 
         // Create a two-column index on (x,y)
         let index = Arc::new(Index {
-            name: "idx_xy".to_string(),
-            table_name: "t1".to_string(),
+            name: "idx_xy".into(),
+            table_name: "t1".into(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new("x", 0), IndexColumn::new("y", 1),],
             unique: false,
@@ -3468,7 +3469,7 @@ mod tests {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            identifier: "t1".into(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -3544,8 +3545,8 @@ mod tests {
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
         let index = Arc::new(Index {
-            name: "idx1".to_string(),
-            table_name: "t1".to_string(),
+            name: "idx1".into(),
+            table_name: "t1".into(),
             where_clause: None,
             columns: crate::alloc::vec![
                 IndexColumn::new("c1", 0),
@@ -3564,7 +3565,7 @@ mod tests {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            identifier: "t1".into(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -3661,8 +3662,8 @@ mod tests {
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
         let index = Arc::new(Index {
-            name: "idx1".to_string(),
-            table_name: "t1".to_string(),
+            name: "idx1".into(),
+            table_name: "t1".into(),
             where_clause: None,
             columns: IndexColumn::new_many(vec!["c1", "c2", "c3"]),
             root_page: 2,
@@ -3677,7 +3678,7 @@ mod tests {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            identifier: "t1".into(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -3783,7 +3784,7 @@ mod tests {
 
     fn _create_column(c: &TestColumn) -> Column {
         Column::new(
-            Some(c.name.clone()),
+            Some(Identifier::new(c.name.clone())),
             c.ty.to_string(),
             None,
             None,
@@ -3823,7 +3824,7 @@ mod tests {
     fn _create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
         Arc::new(BTreeTable::new(
             1, // root_page, doesn't matter for tests
-            name.to_string(),
+            name.into(),
             crate::alloc::vec![],
             columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
             BTreeCharacteristics::HAS_ROWID,
@@ -3841,8 +3842,8 @@ mod tests {
         unique: bool,
     ) -> Arc<Index> {
         Arc::new(Index {
-            name: name.to_string(),
-            table_name: table_name.to_string(),
+            name: name.into(),
+            table_name: table_name.into(),
             where_clause: None,
             columns: columns
                 .iter()
@@ -3987,8 +3988,8 @@ mod tests {
         // Index on t2.a
         let mut available_indexes = AvailableIndexes::default();
         let index_t2_a = Arc::new(Index {
-            name: "idx_t2_a".to_string(),
-            table_name: "t2".to_string(),
+            name: "idx_t2_a".into(),
+            table_name: "t2".into(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new("a", 0)],
             unique: false, // Non-unique index

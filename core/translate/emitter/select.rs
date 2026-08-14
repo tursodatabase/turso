@@ -31,6 +31,7 @@ use crate::{
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
 use turso_parser::ast::Expr;
+use turso_parser::identifier::Identifier;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -443,7 +444,7 @@ pub(crate) fn emit_materialized_build_inputs(
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
         let build_table_name = if build_table.table.get_name() == build_table.identifier {
-            build_table.identifier.clone()
+            build_table.identifier.to_string()
         } else {
             format!(
                 "{} AS {}",
@@ -463,7 +464,7 @@ pub(crate) fn emit_materialized_build_inputs(
         };
         let ephemeral_table = Arc::new(BTreeTable::new(
             0,
-            format!("hash_build_input_{internal_id}"),
+            Identifier::new(format!("hash_build_input_{internal_id}")),
             crate::alloc::vec![],
             columns,
             BTreeCharacteristics::HAS_ROWID,
@@ -742,9 +743,15 @@ fn build_materialized_input_columns(
     payload_columns: &[MaterializedColumnRef],
 ) -> Result<crate::alloc::Vec<Column>> {
     Ok((0..num_keys)
-        .map(|i| Column::new_default_text(Some(format!("key_{i}")), "BLOB".to_string(), None))
+        .map(|i| {
+            Column::new_default_text(
+                Some(Identifier::new(format!("key_{i}"))),
+                "BLOB".to_string(),
+                None,
+            )
+        })
         .chain(payload_columns.iter().enumerate().map(|(i, payload)| {
-            let name = Some(format!("payload_{i}"));
+            let name = Some(Identifier::new(format!("payload_{i}")));
             match payload {
                 MaterializedColumnRef::RowId { .. } => {
                     Column::new_default_integer(name, "INTEGER".to_string(), None)

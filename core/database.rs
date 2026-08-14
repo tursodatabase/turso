@@ -64,6 +64,7 @@ use storage::database::DatabaseFile;
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use tracing::{instrument, Level};
+use turso_parser::identifier::{Identifier, IdentifierStr};
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3188,7 +3189,7 @@ impl Database {
 
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
-    pub(crate) name_to_index: HashMap<String, usize>,
+    pub(crate) name_to_index: HashMap<Identifier, usize>,
     allocated: Vec<u64>,
     pub(crate) index_to_data: HashMap<usize, (Arc<Database>, Arc<Pager>)>,
 }
@@ -3213,11 +3214,11 @@ impl DatabaseCatalog {
         self.name_to_index
             .iter()
             .find(|(_, &idx)| idx == index)
-            .map(|(name, _)| name.clone())
+            .map(|(name, _)| name.to_string())
     }
 
     pub(crate) fn get_database_by_name(&self, s: &str) -> Option<(usize, Arc<Database>)> {
-        match self.name_to_index.get(s) {
+        match self.name_to_index.get(IdentifierStr::new(s)) {
             None => None,
             Some(idx) => self
                 .index_to_data
@@ -3236,13 +3237,13 @@ impl DatabaseCatalog {
 
     fn add(&mut self, s: &str) -> usize {
         turso_assert!(
-            !self.name_to_index.contains_key(s),
+            !self.name_to_index.contains_key(IdentifierStr::new(s)),
             "lib: database name already exists in catalog",
             { "name": s }
         );
 
         let index = self.allocate_index();
-        self.name_to_index.insert(s.to_string(), index);
+        self.name_to_index.insert(Identifier::new(s), index);
         index
     }
 
@@ -3253,7 +3254,7 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn remove(&mut self, s: &str) -> Option<usize> {
-        if let Some(index) = self.name_to_index.remove(s) {
+        if let Some(index) = self.name_to_index.remove(IdentifierStr::new(s)) {
             // Should be impossible to remove main or temp.
             turso_assert_greater_than_or_equal!(index, 2);
             self.deallocate_index(index);

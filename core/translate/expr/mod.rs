@@ -23,7 +23,7 @@ use crate::translate::expression_index::{
 };
 use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
-use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
 use crate::vdbe::{

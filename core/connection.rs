@@ -44,6 +44,7 @@ use std::path::Path;
 use tempfile::TempDir;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
+use turso_parser::identifier::{Identifier, IdentifierStr};
 
 #[cfg(feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
@@ -196,7 +197,7 @@ pub struct ReparseSchemaInner {
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
-    preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+    preserved_sequences: Option<rustc_hash::FxHashMap<Identifier, Arc<crate::schema::Sequence>>>,
     phase: ReparsePhase,
 }
 
@@ -212,7 +213,7 @@ enum ReparsePhase {
     PopulateSequences {
         /// `(backing_table_name, seq_name)` worklist; `None` until lazily
         /// computed. Left empty when preserved sequences are grafted.
-        pending: Option<crate::alloc::Vec<(String, String)>>,
+        pending: Option<crate::alloc::Vec<(Identifier, String)>>,
         /// Index of the backing table currently being read.
         idx: usize,
         /// In-flight descriptor `SELECT`, created lazily per backing table.
@@ -290,7 +291,7 @@ pub enum LoadSequenceDescriptorsState {
     Start,
     Reading {
         /// `(backing_table_name, seq_name)` worklist captured from the schema.
-        pending: crate::alloc::Vec<(String, String)>,
+        pending: crate::alloc::Vec<(Identifier, String)>,
         /// Index of the backing table currently being read.
         idx: usize,
         /// In-flight descriptor `SELECT`, created lazily per backing table.
@@ -1315,7 +1316,7 @@ impl Connection {
     pub(crate) fn reparse_schema_with_cookie_keeping_sequences(
         self: &Arc<Connection>,
         cookie: u32,
-        sequences: rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>,
+        sequences: rustc_hash::FxHashMap<Identifier, Arc<crate::schema::Sequence>>,
     ) -> Result<()> {
         let io = self.pager.load().io.clone();
         let mut state = ReparseSchemaState::default();
@@ -1358,7 +1359,9 @@ impl Connection {
     fn init_reparse_building(
         self: &Arc<Connection>,
         cookie: u32,
-        preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+        preserved_sequences: Option<
+            rustc_hash::FxHashMap<Identifier, Arc<crate::schema::Sequence>>,
+        >,
     ) -> Result<ReparseSchemaInner> {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
@@ -1448,10 +1451,13 @@ impl Connection {
 
                     // Rehydrate built-in table-valued functions captured at init.
                     for vtab in &inner.tvfs {
-                        let normalized = crate::util::normalize_ident(&vtab.name);
-                        inner.fresh.tables.entry(normalized).or_insert_with(|| {
-                            Arc::new(crate::schema::Table::Virtual(vtab.clone()))
-                        });
+                        inner
+                            .fresh
+                            .tables
+                            .entry(Identifier::new(vtab.name.as_str()))
+                            .or_insert_with(|| {
+                                Arc::new(crate::schema::Table::Virtual(vtab.clone()))
+                            });
                     }
 
                     // Next: recover sequence descriptors (or graft the VACUUM map).
@@ -1508,8 +1514,11 @@ impl Connection {
                             work[*idx].clone()
                         };
                         let (backing_table_name, seq_name) = entry;
-                        let normalized = crate::util::normalize_ident(&seq_name);
-                        if inner.fresh.sequences.contains_key(&normalized) {
+                        if inner
+                            .fresh
+                            .sequences
+                            .contains_key(IdentifierStr::new(&seq_name))
+                        {
                             *idx += 1;
                             *stmt = None;
                             *meta = None;
@@ -1546,10 +1555,13 @@ impl Connection {
                             *watermark_row,
                         )?;
                         if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                            mv_store.set_sequence_watermark(&normalized, watermark);
+                            mv_store.set_sequence_watermark(&seq_name, watermark);
                         }
                         let sequence = seq.take().expect("sequence set above");
-                        inner.fresh.sequences.insert(normalized, Arc::new(sequence));
+                        inner
+                            .fresh
+                            .sequences
+                            .insert(Identifier::new(seq_name), Arc::new(sequence));
                         *idx += 1;
                         *stmt = None;
                         *meta = None;
@@ -1562,7 +1574,7 @@ impl Connection {
                         && inner
                             .fresh
                             .tables
-                            .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+                            .contains_key(IdentifierStr::new(crate::schema::TURSO_TYPES_TABLE_NAME))
                     {
                         // Temporarily install the schema so we can query against it.
                         self.with_schema_mut(|schema| {
@@ -1924,7 +1936,8 @@ impl Connection {
     pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
         let has_types_table = {
             let s = self.schema.read();
-            s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+            s.tables
+                .contains_key(IdentifierStr::new(crate::schema::TURSO_TYPES_TABLE_NAME))
         };
         if !has_types_table {
             return Ok(Vec::new());
@@ -2917,7 +2930,7 @@ impl Connection {
             .read()
             .name_to_index
             .keys()
-            .cloned()
+            .map(ToString::to_string)
             .collect()
     }
 
@@ -3196,7 +3209,7 @@ impl Connection {
         self.attached_databases
             .read()
             .name_to_index
-            .contains_key(alias)
+            .contains_key(IdentifierStr::new(alias))
     }
 
     /// Returns the reserved-space value inherited from the main connection's pager.
@@ -3591,7 +3604,11 @@ impl Connection {
         // must not hold the write lock during the rollback.
         let database_id = {
             let attached_dbs = self.attached_databases.read();
-            match attached_dbs.name_to_index.get(alias).copied() {
+            match attached_dbs
+                .name_to_index
+                .get(IdentifierStr::new(alias))
+                .copied()
+            {
                 Some(id) => id,
                 None => {
                     return Err(LimboError::InvalidArgument(format!(
@@ -3647,7 +3664,7 @@ impl Connection {
             .read()
             .name_to_index
             .keys()
-            .cloned()
+            .map(ToString::to_string)
             .collect()
     }
 
@@ -3803,7 +3820,7 @@ impl Connection {
             } else {
                 String::new()
             };
-            databases.push((seq_number, alias.clone(), file_path));
+            databases.push((seq_number, alias.to_string(), file_path));
         }
 
         // Sort by sequence number to ensure consistent ordering
@@ -4009,9 +4026,8 @@ impl Connection {
                         pending[*idx].clone()
                     };
                     let (backing_table_name, seq_name) = entry;
-                    let normalized = crate::util::normalize_ident(&seq_name);
                     let already_present =
-                        self.with_schema(MAIN_DB_ID, |s| s.get_sequence(&normalized).is_some());
+                        self.with_schema(MAIN_DB_ID, |s| s.get_sequence(&seq_name).is_some());
                     if already_present {
                         *idx += 1;
                         *stmt = None;
@@ -4049,13 +4065,13 @@ impl Connection {
                         *watermark_row,
                     )?;
                     if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                        mv_store.set_sequence_watermark(&normalized, watermark);
+                        mv_store.set_sequence_watermark(&seq_name, watermark);
                     }
                     let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
                         schema
                             .sequences
-                            .insert(normalized.clone(), Arc::new(sequence));
+                            .insert(Identifier::new(seq_name.as_str()), Arc::new(sequence));
                     })?;
                     *idx += 1;
                     *stmt = None;
@@ -4133,7 +4149,7 @@ impl Connection {
             ))
         })?;
         crate::schema::Sequence::new(
-            seq_name.to_string(),
+            Identifier::new(seq_name),
             Some(start),
             Some(inc),
             Some(min),
@@ -5204,7 +5220,10 @@ mod tests {
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let catalog = conn.attached_databases.read();
-        let index = *catalog.name_to_index.get(alias).unwrap();
+        let index = *catalog
+            .name_to_index
+            .get(IdentifierStr::new(alias))
+            .unwrap();
         catalog.index_to_data.get(&index).unwrap().clone()
     }
 

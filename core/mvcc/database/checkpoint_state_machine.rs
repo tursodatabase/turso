@@ -1613,7 +1613,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         schema.table_names_by_root_page.remove(&old_root_page);
                         schema
                             .table_names_by_root_page
-                            .insert(btree_table.root_page, name.clone());
+                            .insert(btree_table.root_page, name.to_string());
                     }
                 }
             }

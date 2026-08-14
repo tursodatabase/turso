@@ -41,9 +41,7 @@ use crate::{
     function::Func,
     sync::Arc,
     turso_assert_ne,
-    util::{
-        check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
-    },
+    util::{check_expr_references_column, exprs_are_equivalent, parse_numeric_literal},
     CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
     SymbolTable,
 };
@@ -53,6 +51,7 @@ use std::cell::RefCell;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
+use turso_parser::identifier::Identifier;
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
@@ -273,7 +272,7 @@ pub(crate) struct TriggerDatabaseContext {
     /// The database ID the trigger belongs to.
     database_id: usize,
     /// The trigger name (for error messages).
-    trigger_name: String,
+    trigger_name: Identifier,
 }
 
 impl TriggerDatabaseContext {
@@ -486,7 +485,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Set trigger database context to restrict table resolution to the trigger's database.
-    pub(crate) fn set_trigger_context(&mut self, database_id: usize, trigger_name: String) {
+    pub(crate) fn set_trigger_context(&mut self, database_id: usize, trigger_name: Identifier) {
         self.trigger_context = Some(TriggerDatabaseContext {
             database_id,
             trigger_name,
@@ -755,8 +754,10 @@ impl<'a> Resolver<'a> {
             return self.resolve_database_id(qualified_name);
         }
 
-        let index_name = normalize_ident(qualified_name.name.as_str());
-        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index)
+        self.resolve_unqualified_existing_database_id(
+            qualified_name.name.as_str(),
+            Self::schema_has_index,
+        )
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
@@ -775,7 +776,7 @@ impl<'a> Resolver<'a> {
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
         // Check if this is a qualified name (database.table) or unqualified
         let resolved_id = if let Some(db_name) = &qualified_name.db_name {
-            let db_name_normalized = normalize_ident(db_name.as_str());
+            let db_name_normalized = db_name.as_str().to_ascii_lowercase();
             match db_name_normalized.as_str() {
                 "main" => Ok(crate::MAIN_DB_ID),
                 "temp" => Ok(crate::TEMP_DB_ID),
@@ -1152,7 +1153,11 @@ pub fn emit_program(
 
 /// Returns the single-column schema used by rowid-only hash build inputs.
 fn build_rowid_column() -> Column {
-    Column::new_default_integer(Some("build_rowid".to_string()), "INTEGER".to_string(), None)
+    Column::new_default_integer(
+        Some(Identifier::new("build_rowid")),
+        "INTEGER".to_string(),
+        None,
+    )
 }
 
 pub fn prepare_cdc_if_necessary(
@@ -2186,7 +2191,7 @@ fn emit_check_constraint_bytecode(
             if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
                 // CHECK expressions come from schema SQL and may use the base table name
                 // even when the query references the table through an alias.
-                joined_table.identifier = table_name.to_string();
+                joined_table.identifier = Identifier::new(table_name);
             }
             bind_and_rewrite_expr(
                 &mut rewritten_expr,

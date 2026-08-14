@@ -82,7 +82,9 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
                 let Ok(schema) = Schema::try_make_mut(&mut guard) else {
                     return ResultCode::Error;
                 };
-                schema.tables.insert(name_str, table);
+                schema
+                    .tables
+                    .insert(turso_parser::identifier::Identifier::new(name_str), table);
             } else {
                 return ResultCode::Error;
             }
