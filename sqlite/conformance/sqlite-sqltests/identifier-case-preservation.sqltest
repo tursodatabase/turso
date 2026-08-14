@@ -1,0 +1,172 @@
+@database :memory:
+
+# SQLite compares identifiers ASCII-case-insensitively but remembers the
+# spelling the user wrote: sqlite_schema rows, PRAGMA output, and error
+# messages all echo the original case. These tests pin both halves of that
+# contract — folded resolution and preserved spelling.
+
+@cross-check-integrity
+test table-names-resolve-case-insensitively {
+    CREATE TABLE CamelCase (x INTEGER);
+    INSERT INTO camelcase VALUES (1);
+    INSERT INTO CAMELCASE VALUES (2);
+    SELECT sum(x) FROM cAmElCaSe;
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test column-names-resolve-case-insensitively {
+    CREATE TABLE t1 (MixedCol INTEGER);
+    INSERT INTO t1 (mixedcol) VALUES (7);
+    UPDATE t1 SET MIXEDCOL = MIXEDCOL + 1;
+    SELECT MiXeDcOl FROM t1;
+}
+expect {
+    8
+}
+
+@cross-check-integrity
+test quoting-does-not-affect-resolution {
+    CREATE TABLE "Quoted Name" (a INTEGER);
+    INSERT INTO "quoted name" VALUES (5);
+    SELECT a FROM [QUOTED NAME];
+}
+expect {
+    5
+}
+
+test sqlite-schema-preserves-original-case {
+    CREATE TABLE PreservedCase (x INTEGER);
+    SELECT name, tbl_name FROM sqlite_schema WHERE name = 'PreservedCase';
+}
+expect {
+    PreservedCase|PreservedCase
+}
+
+test pragma-table-info-preserves-column-case {
+    CREATE TABLE t2 (FirstCol INTEGER, secondCOL TEXT);
+    SELECT name FROM pragma_table_info('T2');
+}
+expect {
+    FirstCol
+    secondCOL
+}
+
+@cross-check-integrity
+test drop-table-matches-any-case {
+    CREATE TABLE DropMe (x INTEGER);
+    DROP TABLE dropme;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE 'dropme';
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test drop-index-matches-any-case {
+    CREATE TABLE t3 (a INTEGER);
+    CREATE INDEX MyIdx ON t3 (a);
+    DROP INDEX MYIDX;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test alter-rename-references-any-case {
+    CREATE TABLE OldName (a INTEGER);
+    INSERT INTO OldName VALUES (9);
+    ALTER TABLE oldname RENAME TO NewName;
+    SELECT a FROM newname;
+}
+expect {
+    9
+}
+
+@cross-check-integrity
+test alter-rename-column-references-any-case {
+    CREATE TABLE t4 (Alpha INTEGER);
+    ALTER TABLE T4 RENAME COLUMN alpha TO Beta;
+    SELECT name FROM pragma_table_info('t4');
+}
+expect {
+    Beta
+}
+
+@cross-check-integrity
+test result-alias-resolves-case-insensitively {
+    CREATE TABLE t5 (a INTEGER);
+    INSERT INTO t5 VALUES (3), (1), (2);
+    SELECT a AS SortKey FROM t5 ORDER BY sortkey;
+}
+expect {
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test cte-name-resolves-case-insensitively {
+    WITH MyCte AS (SELECT 42 AS v)
+    SELECT v FROM MYCTE;
+}
+expect {
+    42
+}
+
+@cross-check-integrity
+test using-join-folds-column-case {
+    CREATE TABLE l (Key INTEGER, lv TEXT);
+    CREATE TABLE r (KEY INTEGER, rv TEXT);
+    INSERT INTO l VALUES (1, 'a');
+    INSERT INTO r VALUES (1, 'b');
+    SELECT lv, rv FROM l JOIN r USING (key);
+}
+expect {
+    a|b
+}
+
+@cross-check-integrity
+test trigger-names-fold-case {
+    CREATE TABLE t6 (a INTEGER);
+    CREATE TRIGGER TrigOne AFTER INSERT ON t6 BEGIN
+        UPDATE t6 SET a = a + 1;
+    END;
+    DROP TRIGGER trigone;
+    INSERT INTO t6 VALUES (1);
+    SELECT a FROM t6;
+}
+expect {
+    1
+}
+
+test no-such-table-error-echoes-user-spelling {
+    SELECT * FROM MissingTable;
+}
+expect error {
+    no such table: MissingTable
+}
+
+@cross-check-integrity
+test autoincrement-sequence-row-uses-original-case {
+    CREATE TABLE SeqOwner (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO seqowner (v) VALUES ('x');
+    SELECT name FROM sqlite_sequence;
+}
+expect {
+    SeqOwner
+}
+
+@cross-check-integrity
+test drop-table-clears-sequence-row-any-case {
+    CREATE TABLE SeqOwner2 (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO seqowner2 (v) VALUES ('x');
+    DROP TABLE SEQOWNER2;
+    SELECT count(*) FROM sqlite_sequence WHERE name LIKE 'seqowner2';
+}
+expect {
+    0
+}

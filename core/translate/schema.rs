@@ -2827,9 +2827,7 @@ pub fn translate_create_domain(
 
     // Validate no cycles — check if base type chain is acyclic
     if !is_primitive {
-        resolver
-            .schema()
-            .resolve_base_type_chain(base_normalized)?;
+        resolver.schema().resolve_base_type_chain(base_normalized)?;
     }
 
     // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)

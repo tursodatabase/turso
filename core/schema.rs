@@ -2305,12 +2305,7 @@ impl Schema {
                             }
 
                             // Create regular view
-                            let view = View::new(
-                                view_name,
-                                sql.to_string(),
-                                select,
-                                final_columns,
-                            );
+                            let view = View::new(view_name, sql.to_string(), select, final_columns);
                             self.add_view(view)?;
                         }
                         _ => {}
