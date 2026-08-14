@@ -34,7 +34,7 @@
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 
-use masstree::{MassTree15, RangeBound};
+use turso_masstree::{MassTree15, RangeBound};
 
 use crate::sync::Mutex;
 
@@ -458,6 +458,71 @@ mod tests {
         assert_eq!(*iter.next().unwrap().key(), 3);
         assert_eq!(*iter.next().unwrap().key(), 5);
         assert!(iter.next().is_none());
+    }
+
+    /// Two-u64 key: encodes to 16 bytes, so it exercises the trie's sublayer
+    /// path the way `RowID` does.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct WideKey(u64, u64);
+
+    impl MassKey for WideKey {
+        type Bytes = [u8; 16];
+
+        fn encode(&self) -> [u8; 16] {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&self.0.to_be_bytes());
+            bytes[8..].copy_from_slice(&self.1.to_be_bytes());
+            bytes
+        }
+
+        fn decode(bytes: &[u8]) -> Self {
+            Self(
+                u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_be_bytes(bytes[8..].try_into().unwrap()),
+            )
+        }
+    }
+
+    /// Regression test: masstree 0.9.5's forward scan drops an `Included`
+    /// start key that lives past the first leaf of a sublayer, which broke
+    /// eq-only point seeks on 16-byte row keys. `MassRange` must stay exact
+    /// at every position, on both range edges, in both directions.
+    #[test]
+    fn included_start_is_exact_past_leaf_boundaries() {
+        let map: MassMap<WideKey, u64> = MassMap::new();
+        for i in 0..60 {
+            map.insert(WideKey(7, i), i);
+        }
+        for i in 0..60 {
+            let key = WideKey(7, i);
+            let singleton: Vec<u64> = map
+                .range((Bound::Included(key), Bound::Included(key)))
+                .map(|entry| *entry.value())
+                .collect();
+            assert_eq!(singleton, vec![i], "singleton range at suffix {i}");
+
+            let first = map
+                .range((Bound::Included(key), Bound::Unbounded))
+                .next()
+                .unwrap();
+            assert_eq!(*first.key(), key, "forward start at suffix {i}");
+
+            let last = map
+                .range((Bound::Unbounded, Bound::Included(key)))
+                .next_back()
+                .unwrap();
+            assert_eq!(*last.key(), key, "reverse end at suffix {i}");
+        }
+        let absent_start: Vec<WideKey> = map
+            .range((Bound::Included(WideKey(7, 100)), Bound::Unbounded))
+            .map(|entry| *entry.key())
+            .collect();
+        assert_eq!(absent_start, vec![], "absent Included start past the end");
+        let empty: Vec<WideKey> = map
+            .range((Bound::Included(WideKey(7, 20)), Bound::Excluded(WideKey(7, 20))))
+            .map(|entry| *entry.key())
+            .collect();
+        assert_eq!(empty, vec![], "inverted-edge range is empty");
     }
 
     #[test]

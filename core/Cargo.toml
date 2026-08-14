@@ -102,7 +102,7 @@ turso_macros = { workspace = true }
 miette = { workspace = true }
 strum = { workspace = true }
 parking_lot = { workspace = true, features = ["arc_lock"] }
-masstree = { workspace = true }
+turso_masstree = { workspace = true }
 crossbeam-epoch = "0.9.18"
 crossbeam-utils = "0.8.21"
 tracing = { workspace = true }

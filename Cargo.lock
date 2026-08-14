@@ -3817,19 +3817,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db9a0d582c2874f68138a16ce1867e0ffde6c0bb0a0df85e1f36d04146db488a"
 
 [[package]]
-name = "masstree"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac224d232d7cb4853aa10bbc18d6433c5fe4ede750ccf992b7cf8efaf31a425b"
-dependencies = [
- "arrayvec",
- "crossbeam-queue",
- "rustc-hash 2.1.1",
- "seize",
- "static_assertions",
-]
-
-[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7369,7 +7356,6 @@ dependencies = [
  "libloading 0.8.6",
  "libm",
  "loom",
- "masstree",
  "memory-stats",
  "miette",
  "mimalloc",
@@ -7411,6 +7397,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_ext",
  "turso_macros",
+ "turso_masstree",
  "turso_parser",
  "twox-hash",
  "uncased",
@@ -7445,6 +7432,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.100",
+]
+
+[[package]]
+name = "turso_masstree"
+version = "0.8.0-pre.4"
+dependencies = [
+ "arrayvec",
+ "crossbeam-queue",
+ "rustc-hash 2.1.1",
+ "seize",
+ "static_assertions",
 ]
 
 [[package]]

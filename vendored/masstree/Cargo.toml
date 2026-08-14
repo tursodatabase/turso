@@ -1,0 +1,38 @@
+# Vendored from the `masstree` crate v0.9.5 (https://crates.io/crates/masstree,
+# https://github.com/consistent-milk12/masstree), licensed MIT; see LICENSE and
+# NOTICE.md. Vendored because the MVCC row maps need two scan fixes that do not
+# exist upstream (see src/tree/range/reverse_ctx.rs and the regression tests in
+# tests/scan_bounds.rs). Local modifications are kept minimal; prefer
+# upstreaming fixes.
+[package]
+name = "turso_masstree"
+version = "0.8.0-pre.4"
+edition = "2024"
+rust-version = "1.92.0"
+license = "MIT"
+repository = "https://github.com/tursodatabase/turso"
+description = "Vendored Masstree (trie of B+trees) concurrent ordered map used by Turso's MVCC store"
+
+[lib]
+name = "turso_masstree"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+arrayvec = "0.7.6"
+crossbeam-queue = "0.3.12"
+rustc-hash = "2.1.1"
+seize = "0.5.1"
+static_assertions = "1.1.0"
+
+[lints.rust]
+# The vendored source carries `#[expect(...)]` attributes for pedantic clippy
+# groups this workspace does not enable, and some helpers whose only callers
+# were the upstream test modules stripped from this copy; keep the vendored
+# files untouched.
+unfulfilled_lint_expectations = "allow"
+dead_code = "allow"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(feature, values(\"debug-print\", \"debug-routing\", \"tracing\", \"mimalloc\", \"no-prefetch\", \"sidecar-suffix\", \"small-suffix-capacity\"))"]

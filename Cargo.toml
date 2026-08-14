@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "vendored/masstree",
     "bindings/java",
     "bindings/javascript",
     "bindings/javascript/sync",
@@ -137,7 +138,7 @@ tracing = "0.1.41"
 schemars = "1.0.4"
 garde = "0.22"
 parking_lot = "0.12.4"
-masstree = { version = "0.9.5", default-features = false }
+turso_masstree = { path = "vendored/masstree", version = "0.8.0-pre.4" }
 tokio = { version = "1.0", default-features = false }
 tracing-subscriber = "0.3.20"
 futures = "0.3"

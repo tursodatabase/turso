@@ -47,6 +47,11 @@ This project includes a vendored copy of crossbeam-skiplist (in `core/skiplist`)
 * License: licenses/core/crossbeam-skiplist-mit-license.md (MIT License)
 * Homepage: https://github.com/crossbeam-rs/crossbeam
 
+This project includes a vendored copy of masstree v0.9.5 (in `vendored/masstree`), distributed by its author (consistent-milk12):
+
+* License: licenses/core/masstree-mit-license.md (MIT License)
+* Homepage: https://github.com/consistent-milk12/masstree
+
 This project depends on pastey, distributed by the pastey authors:
 
 * License: licenses/core/pastey-apache-license.md (Apache License v2.0)

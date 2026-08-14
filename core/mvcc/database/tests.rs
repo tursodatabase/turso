@@ -240,6 +240,10 @@ fn test_mvcc_storage(name: &str) -> Arc<dyn crate::mvcc::persistent_storage::Dur
     ))
 }
 
+// The store allocator only reaches the insert path through the nightly
+// Vec<T, A> version chains since the maps moved to Masstree (global
+// allocator), so failure injection is only observable under cfg(nightly).
+#[cfg(nightly)]
 #[test]
 fn mv_store_version_chain_allocations_are_fallible() {
     // The Masstree-backed maps allocate through the global allocator, so
@@ -336,6 +340,10 @@ fn seqcompact_tombstone_payload_uses_store_allocator() {
     store.seqcompact_commit_delete(row_id, 1, 10);
 }
 
+// The store allocator only reaches the insert path through the nightly
+// Vec<T, A> version chains since the maps moved to Masstree (global
+// allocator), so failure injection is only observable under cfg(nightly).
+#[cfg(nightly)]
 #[test]
 fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     let alloc = FailOnDemandAlloc::default();
