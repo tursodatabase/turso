@@ -4525,9 +4525,12 @@ impl Wal for WalFile {
         let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
-        let mut rolling_checksum: (u32, u32) = *self.last_checksum.read();
-
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
+        let mut rolling_checksum = if next_frame_id == 1 {
+            (header.checksum_1, header.checksum_2)
+        } else {
+            *self.last_checksum.read()
+        };
         // Build every frame in order, updating the rolling checksum
         for page in pages.iter() {
             tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
