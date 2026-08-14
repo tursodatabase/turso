@@ -1045,10 +1045,14 @@ fn reject_outer_query_refs_in_group_by_expr(
                         .expect(
                             "bound outer-scope Expr::Column must point to a named column in schema",
                         );
+                    // Binding already replaced the user's token with a column
+                    // index, so the original spelling is gone. Report the
+                    // lowercased schema name, which matches SQLite's message
+                    // for the common lowercase query text.
                     crate::bail_parse_error!(
                         "no such column: {}.{}",
                         outer_ref.identifier,
-                        column_name
+                        column_name.to_ascii_lowercase()
                     );
                 }
             }
@@ -1131,7 +1135,14 @@ fn reject_outer_scope_refs_inside_select_plan(
                 .get(col_idx)
                 .and_then(|col| col.name.as_deref())
                 .expect("bound outer-scope Expr::Column must point to a named column in schema");
-            crate::bail_parse_error!("no such column: {}.{}", outer_ref.identifier, column_name);
+            // See the note above: the original token is gone after binding,
+            // so report the lowercased schema name like SQLite's message for
+            // lowercase query text.
+            crate::bail_parse_error!(
+                "no such column: {}.{}",
+                outer_ref.identifier,
+                column_name.to_ascii_lowercase()
+            );
         }
         if outer_ref.rowid_referenced {
             crate::bail_parse_error!("no such column: {}.rowid", outer_ref.identifier);

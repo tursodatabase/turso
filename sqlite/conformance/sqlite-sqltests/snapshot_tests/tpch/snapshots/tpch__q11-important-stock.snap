@@ -39,12 +39,12 @@ info:
 QUERY PLAN
 |--SCAN supplier
 |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH partsupp USING COVERING INDEX ephemeral_partsupp_t1 (PS_SUPPKEY=?)
+|--SEARCH partsupp USING COVERING INDEX ephemeral_PARTSUPP_t1 (PS_SUPPKEY=?)
 |--USE SORTER FOR GROUP BY
 |--SCALAR SUBQUERY 1
 |  |--SCAN supplier
 |  |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|  `--SEARCH partsupp USING COVERING INDEX ephemeral_partsupp_t5 (PS_SUPPKEY=?)
+|  `--SEARCH partsupp USING COVERING INDEX ephemeral_PARTSUPP_t5 (PS_SUPPKEY=?)
 `--USE SORTER FOR ORDER BY
 
 BYTECODE
@@ -56,33 +56,33 @@ addr  opcode                       p1   p2  p3  p4                  p5  comment
    4            Integer             0    7   0                       0  r[7]=0; clear group by abort flag
    5            Null                0    8   0                       0  r[8]=NULL; initialize group by comparison registers to NULL
    6            Gosub              15  113   0                       0  ; go to clear accumulator subroutine
-   7            OpenRead            3    6   0  k(6,B,B,B,B,B)       0  table=partsupp, root=6, iDb=0
-   8            OpenRead            5    5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
-   9            OpenRead            6    2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
-  10            Rewind              5   38   0                       0  Rewind table supplier
-  11              Column            5    3  16                       0  r[16]=supplier.S_NATIONKEY
-  12              SeekRowid         6   16  37                       0  if (r[16]!=cursor 6 for table nation.rowid) goto 37
-  13              Column            6    1  18                       0  r[18]=nation.N_NAME
+   7            OpenRead            3    6   0  k(6,B,B,B,B,B)       0  table=PARTSUPP, root=6, iDb=0
+   8            OpenRead            5    5   0  k(7,B,B,B,B,B,B,B)   0  table=SUPPLIER, root=5, iDb=0
+   9            OpenRead            6    2   0  k(4,B,B,B,B)         0  table=NATION, root=2, iDb=0
+  10            Rewind              5   38   0                       0  Rewind table SUPPLIER
+  11              Column            5    3  16                       0  r[16]=SUPPLIER.S_NATIONKEY
+  12              SeekRowid         6   16  37                       0  if (r[16]!=cursor 6 for table NATION.rowid) goto 37
+  13              Column            6    1  18                       0  r[18]=NATION.N_NAME
   14              Ne               18   19  37  Binary               0  if r[18]!=r[19] goto 37
   15              Once             26    0   0                       0  goto 26
   16              OpenAutoindex     4    0   0                       0  cursor=4
-  17              Rewind            3   18   0                       0  Rewind table partsupp
-  18                Column          3    1  20                       0  r[20]=partsupp.PS_SUPPKEY
-  19                Column          3    0  21                       0  r[21]=partsupp.PS_PARTKEY
-  20                ColumnRange     3    2  22  2                    0  r[22..23]=partsupp.PS_AVAILQTY..PS_SUPPLYCOST
-  21                RowId           3   24   0                       0  r[24]=partsupp.rowid
-  22                MakeRecord     20    5  25                       0  r[25]=mkrec(r[20..24]); for ephemeral_partsupp_t1
+  17              Rewind            3   18   0                       0  Rewind table PARTSUPP
+  18                Column          3    1  20                       0  r[20]=PARTSUPP.PS_SUPPKEY
+  19                Column          3    0  21                       0  r[21]=PARTSUPP.PS_PARTKEY
+  20                ColumnRange     3    2  22  2                    0  r[22..23]=PARTSUPP.PS_AVAILQTY..PS_SUPPLYCOST
+  21                RowId           3   24   0                       0  r[24]=PARTSUPP.rowid
+  22                MakeRecord     20    5  25                       0  r[25]=mkrec(r[20..24]); for ephemeral_PARTSUPP_t1
   23                FilterAdd       4   20   1                       0  bloom_filter_add(r[20..21])
   24                IdxInsert       4   25  20                       0  key=r[25]
   25              Next              3   18   0                       0
-  26              RowId             5   26   0                       0  r[26]=supplier.rowid
+  26              RowId             5   26   0                       0  r[26]=SUPPLIER.rowid
   27              Filter            4   37  26                       1  if !bloom_filter(r[26..27]) goto 37
   28              SeekGE            4   37  26                       0  key=[26..26]
   29                IdxGT           4   37  26                       0  key=[26..26]
   30                DeferredSeek    4    3   0                       0
-  31                Column          4    1  12                       0  r[12]=ephemeral(ephemeral_partsupp_t1).PS_PARTKEY
-  32                Column          4    3  13                       0  r[13]=ephemeral(ephemeral_partsupp_t1).PS_SUPPLYCOST
-  33                Column          4    2  14                       0  r[14]=ephemeral(ephemeral_partsupp_t1).PS_AVAILQTY
+  31                Column          4    1  12                       0  r[12]=ephemeral(ephemeral_PARTSUPP_t1).PS_PARTKEY
+  32                Column          4    3  13                       0  r[13]=ephemeral(ephemeral_PARTSUPP_t1).PS_SUPPLYCOST
+  33                Column          4    2  14                       0  r[14]=ephemeral(ephemeral_PARTSUPP_t1).PS_AVAILQTY
   34                MakeRecord     12    3  11                       0  r[11]=mkrec(r[12..14])
   35                SorterInsert    1   11   0  0                    0  key=r[11]
   36              Next              4   29   0                       0
@@ -119,31 +119,31 @@ addr  opcode                       p1   p2  p3  p4                  p5  comment
   67        Null                    0   35   0                       0  r[35]=NULL
   68        Integer                 1   36   0                       0  r[36]=1; LIMIT counter
   69        IfNot                  36   99   0                       0  if !r[36] goto 99
-  70        OpenRead                7    6   0  k(6,B,B,B,B,B)       0  table=partsupp, root=6, iDb=0
-  71        OpenRead                9    5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
-  72        OpenRead               10    2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
-  73        Rewind                  9   99   0                       0  Rewind table supplier
-  74          Column                9    3  37                       0  r[37]=supplier.S_NATIONKEY
-  75          SeekRowid            10   37  98                       0  if (r[37]!=cursor 10 for table nation.rowid) goto 98
-  76          Column               10    1  39                       0  r[39]=nation.N_NAME
+  70        OpenRead                7    6   0  k(6,B,B,B,B,B)       0  table=PARTSUPP, root=6, iDb=0
+  71        OpenRead                9    5   0  k(7,B,B,B,B,B,B,B)   0  table=SUPPLIER, root=5, iDb=0
+  72        OpenRead               10    2   0  k(4,B,B,B,B)         0  table=NATION, root=2, iDb=0
+  73        Rewind                  9   99   0                       0  Rewind table SUPPLIER
+  74          Column                9    3  37                       0  r[37]=SUPPLIER.S_NATIONKEY
+  75          SeekRowid            10   37  98                       0  if (r[37]!=cursor 10 for table NATION.rowid) goto 98
+  76          Column               10    1  39                       0  r[39]=NATION.N_NAME
   77          String8               0   40   0  ARGENTINA            0  r[40]='ARGENTINA'
   78          Ne                   39   40  98  Binary               0  if r[39]!=r[40] goto 98
   79          Once                 88    0   0                       0  goto 88
   80          OpenAutoindex         8    0   0                       0  cursor=8
-  81          Rewind                7   82   0                       0  Rewind table partsupp
-  82            ColumnRange         7    1  41  3                    0  r[41..43]=partsupp.PS_SUPPKEY..PS_SUPPLYCOST
-  83            RowId               7   44   0                       0  r[44]=partsupp.rowid
-  84            MakeRecord         41    4  45                       0  r[45]=mkrec(r[41..44]); for ephemeral_partsupp_t5
+  81          Rewind                7   82   0                       0  Rewind table PARTSUPP
+  82            ColumnRange         7    1  41  3                    0  r[41..43]=PARTSUPP.PS_SUPPKEY..PS_SUPPLYCOST
+  83            RowId               7   44   0                       0  r[44]=PARTSUPP.rowid
+  84            MakeRecord         41    4  45                       0  r[45]=mkrec(r[41..44]); for ephemeral_PARTSUPP_t5
   85            FilterAdd           8   41   1                       0  bloom_filter_add(r[41..42])
   86            IdxInsert           8   45  41                       0  key=r[45]
   87          Next                  7   82   0                       0
-  88          RowId                 9   46   0                       0  r[46]=supplier.rowid
+  88          RowId                 9   46   0                       0  r[46]=SUPPLIER.rowid
   89          Filter                8   98  46                       1  if !bloom_filter(r[46..47]) goto 98
   90          SeekGE                8   98  46                       0  key=[46..46]
   91            IdxGT               8   98  46                       0  key=[46..46]
   92            DeferredSeek        8    7   0                       0
-  93            Column              8    2  48                       0  r[48]=ephemeral(ephemeral_partsupp_t5).PS_SUPPLYCOST
-  94            Column              8    1  49                       0  r[49]=ephemeral(ephemeral_partsupp_t5).PS_AVAILQTY
+  93            Column              8    2  48                       0  r[48]=ephemeral(ephemeral_PARTSUPP_t5).PS_SUPPLYCOST
+  94            Column              8    1  49                       0  r[49]=ephemeral(ephemeral_PARTSUPP_t5).PS_AVAILQTY
   95            Multiply           48   49  47                       0  r[47]=r[48]*r[49]
   96            AggStep             0   47  35  sum                  0  accum=r[35] step(r[47])
   97          Next                  8   91   0                       0

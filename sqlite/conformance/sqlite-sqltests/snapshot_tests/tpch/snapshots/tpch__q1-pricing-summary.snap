@@ -42,12 +42,12 @@ addr  opcode                  p1  p2  p3  p4                                    
    3          Integer          0  13   0                                          0  r[13]=0; clear group by abort flag
    4          Null             0  14  15                                          0  r[14..15]=NULL; initialize group by comparison registers to NULL
    5          Gosub           33  75   0                                          0  ; go to clear accumulator subroutine
-   6          OpenRead         2  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   7          Rewind           2  15   0                                          0  Rewind table lineitem
-   8            Column         2  10  35                                          0  r[35]=lineitem.L_SHIPDATE
+   6          OpenRead         2  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=LINEITEM, root=10, iDb=0
+   7          Rewind           2  15   0                                          0  Rewind table LINEITEM
+   8            Column         2  10  35                                          0  r[35]=LINEITEM.L_SHIPDATE
    9            Gt            35  36  14  Binary                                  0  if r[35]>r[36] goto 14
-  10            ColumnRange    2   8  27  2                                       0  r[27..28]=lineitem.L_RETURNFLAG..L_LINESTATUS
-  11            ColumnRange    2   4  29  4                                       0  r[29..32]=lineitem.L_QUANTITY..L_TAX
+  10            ColumnRange    2   8  27  2                                       0  r[27..28]=LINEITEM.L_RETURNFLAG..L_LINESTATUS
+  11            ColumnRange    2   4  29  4                                       0  r[29..32]=LINEITEM.L_QUANTITY..L_TAX
   12            MakeRecord    27   6  26                                          0  r[26]=mkrec(r[27..32])
   13            SorterInsert   0  26   0  0                                       0  key=r[26]
   14          Next             2   8   0                                          0
