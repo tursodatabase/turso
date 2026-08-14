@@ -30,8 +30,34 @@ where
         return StdPtr::null_mut();
     }
 
+    // TURSO PATCH: `start` may be a stale layer pointer — a leaf that has
+    // since split (parent slots are not eagerly repointed at the layer's
+    // internode root). The point-lookup path climbs to the true root before
+    // descending (`maybe_parent_generic`); without the same climb here every
+    // sublayer scan entered at the pre-split first leaf and walked the leaf
+    // chain linearly, making bounded scans O(position in layer).
+    let mut root: *const u8 = start;
+    loop {
+        // SAFETY: root is valid, both node types have NodeVersion as first field
+        #[expect(clippy::cast_ptr_alignment, reason = "proper alignment")]
+        let version: &NodeVersion = unsafe { &*(root.cast::<NodeVersion>()) };
+        let parent: *mut u8 = if version.is_leaf() {
+            // SAFETY: version.is_leaf() confirmed
+            let leaf: &LeafNode15<P> = unsafe { &*(root.cast::<LeafNode15<P>>()) };
+            unsafe { leaf.parent_unguarded() }
+        } else {
+            // SAFETY: !version.is_leaf() confirmed
+            let inode: &InternodeNode = unsafe { &*(root.cast::<InternodeNode>()) };
+            unsafe { inode.parent_unguarded() }
+        };
+        if parent.is_null() {
+            break;
+        }
+        root = parent;
+    }
+
     let target_ikey: u64 = cursor_key.current_ikey();
-    let mut node: *const u8 = start;
+    let mut node: *const u8 = root;
 
     loop {
         // SAFETY: node is valid, both node types have NodeVersion as first field
@@ -60,8 +86,8 @@ where
         prefetch_read(child);
 
         if child.is_null() {
-            // Concurrent split in progress - retry from start
-            node = start;
+            // Concurrent split in progress - retry from the climbed root
+            node = root;
             continue;
         }
 
@@ -69,8 +95,8 @@ where
         if inode.version().has_changed(v) {
             // Version changed - check for split
             if inode.version().has_split(v) {
-                // Key might have escaped to sibling - retry from start
-                node = start;
+                // Key might have escaped to sibling - retry from the climbed root
+                node = root;
                 continue;
             }
             // Just retry this internode
