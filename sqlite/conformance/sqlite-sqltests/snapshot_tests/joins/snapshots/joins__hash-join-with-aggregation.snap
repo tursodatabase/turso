@@ -21,85 +21,85 @@ QUERY PLAN
 `--USE SORTER FOR GROUP BY
 
 BYTECODE
-addr  opcode                      p1  p2  p3  p4                                       p5  comment
-   0          Init                 0  78   0                                            0  Start at 78
-   1          Null                 0   9  10                                            0  r[9..10]=NULL
-   2          SorterOpen           0   2   0  k(1,B)                                    0  cursor=0
-   3          Integer              0   6   0                                            0  r[6]=0; clear group by abort flag
-   4          Null                 0   7   0                                            0  r[7]=NULL; initialize group by comparison registers to NULL
-   5          Gosub               14  74   0                                            0  ; go to clear accumulator subroutine
-   6          OpenRead             2   2   0  k(3,B,B,B)                                0  table=h_orders, root=2, iDb=0
-   7          OpenRead             3   3   0  k(4,B,B,B,B)                              0  table=h_items, root=3, iDb=0
-   8          Once                17   0   0                                            0  goto 17
-   9          OpenRead             4   2   0  k(3,B,B,B)                                0  table=h_orders, root=2, iDb=0
-  10          Rewind               4  16   0                                            0  Rewind table h_orders
-  11            Column             4   1  15                                            0  r[15]=h_orders.customer_name
-  12            Affinity          15   1   0                                            0  r[15..16] = A
-  13            Column             4   1  16                                            0  r[16]=h_orders.customer_name
-  14            HashBuild          4  15   1  r=[1] budget=32768 payload=r[16]..r[16]   0
-  15          Next                 4  11   0                                            0
-  16          HashBuildFinalize    1   0   0                                            0
-  17          Rewind               3  31   0                                            0  Rewind table h_items
-  18            Column             3   1  17                                            0  r[17]=h_items.order_name
-  19            Affinity          17   1   0                                            0  r[17..18] = A
-  20            RowId              3  19   0                                            0  r[19]=h_items.rowid
-  21            Integer            0  20   0                                            0  r[20]=0
-  22            HashProbe          1  17   1  r[21]=30 payload=r[18]..r[18]             0
-  23            Copy              18  12   0                                            0  r[12]=r[18]
-  24            Column             3   3  13                                            0  r[13]=h_items.quantity
-  25            MakeRecord        12   2  11                                            0  r[11]=mkrec(r[12..13])
-  26            SorterInsert       0  11   0  0                                         0  key=r[11]
-  27            IfPos             20  38   0                                            0  r[20]>0 -> r[20]-=0, goto 38
-  28            HashNext           1  21  30   payload=r[18]..r[18]                     0
-  29            Goto               0  23   0                                            0
-  30          Next                 3  18   0                                            0
-  31          HashGraceInit        1   0  43                                            0  hash_table_id=1
-  32          Integer              1  20   0                                            0  r[20]=1
-  33          HashGraceLoadPart    1   0  42                                            0  hash_table_id=1
-  34          HashGraceNextProbe   1  17  40                                            0  hash_table_id=1 keys=r[17]..r[17] probe_rowid_dest=r[19]
-  35          SeekRowid            3  19  34                                            0  if (r[19]!=cursor 3 for table h_items.rowid) goto 34
-  36          HashProbe            1  17   1  r[21]=34 payload=r[18]..r[18]             0
-  37          Goto                 0  23   0                                            0
-  38          HashNext             1  21  34   payload=r[18]..r[18]                     0
-  39          Goto                 0  23   0                                            0
-  40          HashGraceAdvPart     1   0  42                                            0  hash_table_id=1
-  41          Goto                 0  33   0                                            0
-  42          Integer              0  20   0                                            0  r[20]=0
-  43          HashClose            1   0   0                                            0
-  44          OpenPseudo           1  11   2                                            0  2 columns in r[11]
-  45          SorterSort           0  61   0                                            0
-  46            SorterData         0  11   1                                            0  r[11]=data
-  47            Column             1   0  22                                            0  r[22]=pseudo.column 0
-  48            Compare            7  22   1  k(1, Binary)                              0  r[7..7]==r[22..22]
-  49            Jump              50  54  50                                            0  ; start new group if comparison is not equal
-  50            Gosub              4  65   0                                            0  ; check if ended group had data, and output if so
-  51            Move              22   7   1                                            0  r[7..7]=r[22..22]
-  52            IfPos              6  77   0                                            0  r[6]>0 -> r[6]-=0, goto 77; check abort flag
-  53            Gosub             14  74   0                                            0  ; goto clear accumulator subroutine
-  54            Column             1   1  23                                            0  r[23]=pseudo.column 1
-  55            AggStep            0  24   9  count                                     0  accum=r[9] step(r[24])
-  56            AggStep            0  23  10  sum                                       0  accum=r[10] step(r[23])
-  57            If                 5  59   0                                            0  if r[5] goto 59; don't emit group columns if continuing existing group
-  58            Column             1   0   8                                            0  r[8]=pseudo.column 0
-  59            Integer            1   5   0                                            0  r[5]=1; indicate data in accumulator
-  60          SorterNext           0  46   0                                            0
-  61          Gosub                4  65   0                                            0  ; emit row for final group
-  62          Goto                 0  77   0                                            0  ; group by finished
-  63          Integer              1   6   0                                            0  r[6]=1
-  64        Return                 4   0   0                                            0
-  65        IfPos                  5  67   0                                            0  r[5]>0 -> r[5]-=0, goto 67; output group by row subroutine start
-  66      Return                   4   0   0                                            0
-  67      AggFinal                 0   9   0  count                                     0  accum=r[9]
-  68      AggFinal                 0  10   0  sum                                       0  accum=r[10]
-  69      Copy                     8   1   0                                            0  r[1]=r[8]
-  70      Copy                     9   2   0                                            0  r[2]=r[9]
-  71      Copy                    10   3   0                                            0  r[3]=r[10]
-  72      ResultRow                1   3   0                                            0  output=r[1..3]
-  73    Return                     4   0   0                                            0
-  74    Null                       0   8  10                                            0  r[8..10]=NULL; clear accumulator subroutine start
-  75    Integer                    0   5   0                                            0  r[5]=0
-  76  Return                      14   0   0                                            0
-  77  Halt                         0   0   0                                            0
-  78  Transaction                  0   1   3                                            0  iDb=0 tx_mode=Read
-  79  Integer                      1  24   0                                            0  r[24]=1
-  80  Goto                         0   1   0                                            0
+addr  opcode                      p1  p2  p3  p4                                          p5  comment
+   0          Init                 0  78   0                                               0  Start at 78
+   1          Null                 0   9  10                                               0  r[9..10]=NULL
+   2          SorterOpen           0   2   0  k(1,B)                                       0  cursor=0
+   3          Integer              0   6   0                                               0  r[6]=0; clear group by abort flag
+   4          Null                 0   7   0                                               0  r[7]=NULL; initialize group by comparison registers to NULL
+   5          Gosub               14  74   0                                               0  ; go to clear accumulator subroutine
+   6          OpenRead             2   2   0  k(3,B,B,B)                                   0  table=h_orders, root=2, iDb=0
+   7          OpenRead             3   3   0  k(4,B,B,B,B)                                 0  table=h_items, root=3, iDb=0
+   8          Once                17   0   0                                               0  goto 17
+   9          OpenRead             4   2   0  k(3,B,B,B)                                   0  table=h_orders, root=2, iDb=0
+  10          Rewind               4  16   0                                               0  Rewind table h_orders
+  11            Column             4   1  15                                               0  r[15]=h_orders.customer_name
+  12            Affinity          15   1   0                                               0  r[15..16] = A
+  13            Column             4   1  16                                               0  r[16]=h_orders.customer_name
+  14            HashBuild          4  15   1  r=[1] budget=67108864 payload=r[16]..r[16]   0
+  15          Next                 4  11   0                                               0
+  16          HashBuildFinalize    1   0   0                                               0
+  17          Rewind               3  31   0                                               0  Rewind table h_items
+  18            Column             3   1  17                                               0  r[17]=h_items.order_name
+  19            Affinity          17   1   0                                               0  r[17..18] = A
+  20            RowId              3  19   0                                               0  r[19]=h_items.rowid
+  21            Integer            0  20   0                                               0  r[20]=0
+  22            HashProbe          1  17   1  r[21]=30 payload=r[18]..r[18]                0
+  23            Copy              18  12   0                                               0  r[12]=r[18]
+  24            Column             3   3  13                                               0  r[13]=h_items.quantity
+  25            MakeRecord        12   2  11                                               0  r[11]=mkrec(r[12..13])
+  26            SorterInsert       0  11   0  0                                            0  key=r[11]
+  27            IfPos             20  38   0                                               0  r[20]>0 -> r[20]-=0, goto 38
+  28            HashNext           1  21  30   payload=r[18]..r[18]                        0
+  29            Goto               0  23   0                                               0
+  30          Next                 3  18   0                                               0
+  31          HashGraceInit        1   0  43                                               0  hash_table_id=1
+  32          Integer              1  20   0                                               0  r[20]=1
+  33          HashGraceLoadPart    1   0  42                                               0  hash_table_id=1
+  34          HashGraceNextProbe   1  17  40                                               0  hash_table_id=1 keys=r[17]..r[17] probe_rowid_dest=r[19]
+  35          SeekRowid            3  19  34                                               0  if (r[19]!=cursor 3 for table h_items.rowid) goto 34
+  36          HashProbe            1  17   1  r[21]=34 payload=r[18]..r[18]                0
+  37          Goto                 0  23   0                                               0
+  38          HashNext             1  21  34   payload=r[18]..r[18]                        0
+  39          Goto                 0  23   0                                               0
+  40          HashGraceAdvPart     1   0  42                                               0  hash_table_id=1
+  41          Goto                 0  33   0                                               0
+  42          Integer              0  20   0                                               0  r[20]=0
+  43          HashClose            1   0   0                                               0
+  44          OpenPseudo           1  11   2                                               0  2 columns in r[11]
+  45          SorterSort           0  61   0                                               0
+  46            SorterData         0  11   1                                               0  r[11]=data
+  47            Column             1   0  22                                               0  r[22]=pseudo.column 0
+  48            Compare            7  22   1  k(1, Binary)                                 0  r[7..7]==r[22..22]
+  49            Jump              50  54  50                                               0  ; start new group if comparison is not equal
+  50            Gosub              4  65   0                                               0  ; check if ended group had data, and output if so
+  51            Move              22   7   1                                               0  r[7..7]=r[22..22]
+  52            IfPos              6  77   0                                               0  r[6]>0 -> r[6]-=0, goto 77; check abort flag
+  53            Gosub             14  74   0                                               0  ; goto clear accumulator subroutine
+  54            Column             1   1  23                                               0  r[23]=pseudo.column 1
+  55            AggStep            0  24   9  count                                        0  accum=r[9] step(r[24])
+  56            AggStep            0  23  10  sum                                          0  accum=r[10] step(r[23])
+  57            If                 5  59   0                                               0  if r[5] goto 59; don't emit group columns if continuing existing group
+  58            Column             1   0   8                                               0  r[8]=pseudo.column 0
+  59            Integer            1   5   0                                               0  r[5]=1; indicate data in accumulator
+  60          SorterNext           0  46   0                                               0
+  61          Gosub                4  65   0                                               0  ; emit row for final group
+  62          Goto                 0  77   0                                               0  ; group by finished
+  63          Integer              1   6   0                                               0  r[6]=1
+  64        Return                 4   0   0                                               0
+  65        IfPos                  5  67   0                                               0  r[5]>0 -> r[5]-=0, goto 67; output group by row subroutine start
+  66      Return                   4   0   0                                               0
+  67      AggFinal                 0   9   0  count                                        0  accum=r[9]
+  68      AggFinal                 0  10   0  sum                                          0  accum=r[10]
+  69      Copy                     8   1   0                                               0  r[1]=r[8]
+  70      Copy                     9   2   0                                               0  r[2]=r[9]
+  71      Copy                    10   3   0                                               0  r[3]=r[10]
+  72      ResultRow                1   3   0                                               0  output=r[1..3]
+  73    Return                     4   0   0                                               0
+  74    Null                       0   8  10                                               0  r[8..10]=NULL; clear accumulator subroutine start
+  75    Integer                    0   5   0                                               0  r[5]=0
+  76  Return                      14   0   0                                               0
+  77  Halt                         0   0   0                                               0
+  78  Transaction                  0   1   3                                               0  iDb=0 tx_mode=Read
+  79  Integer                      1  24   0                                               0  r[24]=1
+  80  Goto                         0   1   0                                               0
