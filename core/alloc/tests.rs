@@ -86,8 +86,13 @@ fn dyn_allocator_delegates_skiplist_allocations() {
     assert!(allocations.load(Ordering::Relaxed) > 0);
 }
 
+// On stable the allocator-parameterized collections are erased to global
+// ones, and the Masstree-backed maps allocate globally too, so the injected
+// allocator is only observable under cfg(nightly) (version chains and
+// logical-log buffers).
+#[cfg(nightly)]
 #[test]
-fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
+fn database_open_with_allocator_uses_allocator_for_mvcc_commit() {
     let allocations = StdArc::new(AtomicUsize::new(0));
     let deallocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
@@ -113,10 +118,16 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     .unwrap();
     let conn = db.connect().unwrap();
 
-    allocations.store(0, Ordering::Relaxed);
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-
     assert!(db.get_mv_store().is_some());
+
+    // The MvStore maps allocate through the global allocator since the
+    // Masstree migration; the injected allocator reaches MVCC through the
+    // logical-log commit buffers (and, under cfg(nightly), the version
+    // chains), so exercise a commit.
+    allocations.store(0, Ordering::Relaxed);
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
     assert!(allocations.load(Ordering::Relaxed) > 0);
 }
 
