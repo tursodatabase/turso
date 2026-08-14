@@ -36,6 +36,7 @@ use std::ops::{Bound, RangeBounds};
 
 use turso_masstree::{MassTree15, RangeBound};
 
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
 
 /// Fixed-width, order-preserving byte encoding for [`MassMap`] keys.
@@ -117,6 +118,14 @@ pub struct MassMap<K: MassKey, V: Clone + Send + Sync + 'static> {
     /// value — possibly already holding row versions — would be dropped.
     /// Reads and scans never take this lock.
     mutation: Mutex<()>,
+    /// Bumped whenever the key set may have grown (every insert). Iterators
+    /// buffer a batch of entries per tree seek and re-seek when this changes,
+    /// so a key inserted ahead of an iterator's served position is never
+    /// hidden by the buffer — the same weak-consistency guarantee skip-list
+    /// iterators give. Removals don't bump it: a buffered removed entry
+    /// mirrors a skip-list iterator visiting an entry right before its
+    /// removal, and MVCC chains stay readable through their `Arc`.
+    key_set_epoch: AtomicU64,
     _key: PhantomData<K>,
 }
 
@@ -137,6 +146,7 @@ impl<K: MassKey, V: Clone + Send + Sync + 'static> MassMap<K, V> {
         Self {
             tree: MassTree15::new(),
             mutation: Mutex::new(()),
+            key_set_epoch: AtomicU64::new(0),
             _key: PhantomData,
         }
     }
@@ -176,6 +186,10 @@ impl<K: MassKey, V: Clone + Send + Sync + 'static> MassMap<K, V> {
         let guard = self.tree.guard();
         self.tree
             .insert_with_guard(bytes.as_ref(), value.clone(), &guard);
+        // Publish the key-set mutation after the key is visible: an iterator
+        // that buffered lookahead entries before this insert observes the
+        // bump no later than its next lookahead serve and re-seeks.
+        self.key_set_epoch.fetch_add(1, Ordering::Release);
         MassEntry { key, value }
     }
 
@@ -216,6 +230,9 @@ impl<K: MassKey, V: Clone + Send + Sync + 'static> MassMap<K, V> {
             previous.is_none(),
             "insert-if-absent raced despite the structural lock"
         );
+        // Publish the key-set mutation after the key is visible (see
+        // `insert`).
+        self.key_set_epoch.fetch_add(1, Ordering::Release);
         Ok(MassEntry { key, value })
     }
 
@@ -254,6 +271,10 @@ impl<K: MassKey, V: Clone + Send + Sync + 'static> MassMap<K, V> {
             map: self,
             front: Bound::Unbounded,
             back: Bound::Unbounded,
+            buf: Vec::new(),
+            buf_pos: 0,
+            buf_reversed: false,
+            buf_epoch: 0,
             exhausted: false,
         }
     }
@@ -270,6 +291,10 @@ impl<K: MassKey, V: Clone + Send + Sync + 'static> MassMap<K, V> {
             map: self,
             front: encode_bound(range.start_bound()),
             back: encode_bound(range.end_bound()),
+            buf: Vec::new(),
+            buf_pos: 0,
+            buf_reversed: false,
+            buf_epoch: 0,
             exhausted: false,
         }
     }
@@ -293,81 +318,137 @@ fn as_range_bound<B: AsRef<[u8]>>(bound: &Bound<B>) -> RangeBound<'_> {
     }
 }
 
+/// Entries buffered per tree seek. One leaf holds 15, so two leaves'
+/// worth keeps refills rare without holding a large snapshot.
+const SCAN_BUFFER: usize = 32;
+
 /// A double-ended, weakly consistent range iterator over a [`MassMap`].
 ///
-/// Each step re-seeks the tree: one bounded scan finds the next entry past
-/// the last one returned, clones it out, and tightens the bound. Nothing is
-/// buffered, so like the skip-list iterators this replaces, every step
-/// observes the live map beyond the current position.
+/// Each refill runs one bounded tree scan that buffers up to [`SCAN_BUFFER`]
+/// entries; served entries tighten the window edge so a refill always
+/// resumes past the last entry handed out. The buffer is only trusted while
+/// the map's [key-set epoch](MassMap::key_set_epoch) is unchanged: any
+/// insert discards it and the next step re-seeks. That keeps the guarantee
+/// the skip-list iterators gave — an entry inserted ahead of the served
+/// position is seen, one at or behind it is not — while amortizing the
+/// descent cost across the buffer.
 pub struct MassRange<'a, K: MassKey, V: Clone + Send + Sync + 'static> {
     map: &'a MassMap<K, V>,
-    /// Lower edge of the remaining window; tightened by `next`.
+    /// Lower edge of the remaining window; tightened as entries are served
+    /// from the front.
     front: Bound<K::Bytes>,
-    /// Upper edge of the remaining window; tightened by `next_back`.
+    /// Upper edge of the remaining window; tightened as entries are served
+    /// from the back.
     back: Bound<K::Bytes>,
-    /// Set once either end runs out of entries; the window edges only track
-    /// consumed entries, so crossed bounds cannot be detected from them
-    /// alone.
+    /// Lookahead entries in iteration order for the direction that filled
+    /// them, served front-to-back via `buf_pos`.
+    buf: Vec<MassEntry<K, V>>,
+    buf_pos: usize,
+    /// True when `buf` was filled by `next_back` (descending order).
+    buf_reversed: bool,
+    /// [`MassMap::key_set_epoch`] at fill time; a mismatch discards the
+    /// buffer.
+    buf_epoch: u64,
+    /// Set once the fill direction ran out of entries; the window edges only
+    /// track consumed entries, so crossed bounds cannot be detected from
+    /// them alone.
     exhausted: bool,
+}
+
+impl<K: MassKey, V: Clone + Send + Sync + 'static> MassRange<'_, K, V> {
+    /// Serve the next buffered entry, tightening the served edge.
+    fn take_buffered(&mut self, reversed: bool) -> MassEntry<K, V> {
+        let entry = self.buf[self.buf_pos].clone();
+        self.buf_pos += 1;
+        if reversed {
+            self.back = Bound::Excluded(entry.key.encode());
+        } else {
+            self.front = Bound::Excluded(entry.key.encode());
+        }
+        entry
+    }
+
+    /// Serve a LOOKAHEAD entry (anything after the first of a refill). Only
+    /// valid while no insert has completed since before the refill's scan:
+    /// a completed insert may have landed inside the buffered window, so a
+    /// changed epoch discards the lookahead and forces a re-seek.
+    fn serve_lookahead(&mut self, reversed: bool) -> Option<MassEntry<K, V>> {
+        if self.buf_reversed != reversed || self.buf_pos >= self.buf.len() {
+            return None;
+        }
+        if self.map.key_set_epoch.load(Ordering::Acquire) != self.buf_epoch {
+            self.buf.clear();
+            self.buf_pos = 0;
+            return None;
+        }
+        Some(self.take_buffered(reversed))
+    }
+
+    fn refill(&mut self, reversed: bool) {
+        self.buf.clear();
+        self.buf_pos = 0;
+        self.buf_reversed = reversed;
+        // Snapshot the epoch before scanning: an insert that completes
+        // during or after the scan bumps the epoch afterwards, so lookahead
+        // serves observe the mismatch (inserts publish the bump only after
+        // the key is visible).
+        self.buf_epoch = self.map.key_set_epoch.load(Ordering::Acquire);
+        let guard = self.map.tree.guard();
+        let buf = &mut self.buf;
+        let visitor = |key: &[u8], value: turso_masstree::ValuePtr<V>| {
+            buf.push(MassEntry {
+                key: K::decode(key),
+                value: V::clone(&value),
+            });
+            buf.len() < SCAN_BUFFER
+        };
+        if reversed {
+            self.map.tree.scan_rev_batch(
+                as_range_bound(&self.front),
+                as_range_bound(&self.back),
+                visitor,
+                &guard,
+            );
+        } else {
+            self.map.tree.scan(
+                as_range_bound(&self.front),
+                as_range_bound(&self.back),
+                visitor,
+                &guard,
+            );
+        }
+    }
+
+    fn step(&mut self, reversed: bool) -> Option<MassEntry<K, V>> {
+        if self.exhausted {
+            return None;
+        }
+        if let Some(entry) = self.serve_lookahead(reversed) {
+            return Some(entry);
+        }
+        self.refill(reversed);
+        if self.buf.is_empty() {
+            self.exhausted = true;
+            return None;
+        }
+        // The first entry of a fresh seek needs no epoch validation: the
+        // scan observed the live tree from the served edge, exactly like the
+        // unbuffered re-seek this replaces. Only lookahead needs the epoch.
+        Some(self.take_buffered(reversed))
+    }
 }
 
 impl<K: MassKey, V: Clone + Send + Sync + 'static> Iterator for MassRange<'_, K, V> {
     type Item = MassEntry<K, V>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.exhausted {
-            return None;
-        }
-        let guard = self.map.tree.guard();
-        let mut found: Option<(K, V)> = None;
-        self.map.tree.scan(
-            as_range_bound(&self.front),
-            as_range_bound(&self.back),
-            |key, value| {
-                found = Some((K::decode(key), V::clone(&value)));
-                false
-            },
-            &guard,
-        );
-        match found {
-            Some((key, value)) => {
-                self.front = Bound::Excluded(key.encode());
-                Some(MassEntry { key, value })
-            }
-            None => {
-                self.exhausted = true;
-                None
-            }
-        }
+        self.step(false)
     }
 }
 
 impl<K: MassKey, V: Clone + Send + Sync + 'static> DoubleEndedIterator for MassRange<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.exhausted {
-            return None;
-        }
-        let guard = self.map.tree.guard();
-        let mut found: Option<(K, V)> = None;
-        self.map.tree.scan_rev_batch(
-            as_range_bound(&self.front),
-            as_range_bound(&self.back),
-            |key, value| {
-                found = Some((K::decode(key), V::clone(&value)));
-                false
-            },
-            &guard,
-        );
-        match found {
-            Some((key, value)) => {
-                self.back = Bound::Excluded(key.encode());
-                Some(MassEntry { key, value })
-            }
-            None => {
-                self.exhausted = true;
-                None
-            }
-        }
+        self.step(true)
     }
 }
 
