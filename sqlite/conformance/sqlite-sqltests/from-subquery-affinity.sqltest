@@ -76,6 +76,30 @@ expect {
 1
 }
 
+@setup text-column-derived-table-schema
+test derived-table-literal-column-join-on-converts-reversed-operands {
+    SELECT t1.a FROM t1 JOIN (SELECT 1 AS x) d ON d.x = t1.a;
+}
+expect {
+1
+}
+
+@setup text-column-derived-table-schema
+test derived-table-literal-column-scalar-equality-converts {
+    SELECT a FROM t1 WHERE a = (SELECT x FROM (SELECT 1 AS x));
+}
+expect {
+1
+}
+
+@setup text-column-derived-table-schema
+test derived-table-literal-column-range-comparison-converts {
+    SELECT a FROM t1 WHERE a < (SELECT x FROM (SELECT 2 AS x)) ORDER BY a;
+}
+expect {
+1
+}
+
 # Same bug, reached through a UNION where every arm is a bare literal.
 @setup text-column-derived-table-schema
 test derived-table-compound-select-all-literal-arms-converts {
@@ -102,4 +126,19 @@ test derived-table-real-column-keeps-declared-affinity {
 }
 expect {
 1
+}
+
+setup blob-and-text-tables-schema {
+    CREATE TABLE blobcol(x BLOB);
+    INSERT INTO blobcol VALUES(3);
+    CREATE TABLE t4(a TEXT);
+    INSERT INTO t4 VALUES('3');
+}
+
+@setup blob-and-text-tables-schema
+test derived-table-compound-select-real-blob-leading-arm-not-skipped {
+    WITH u(x) AS (SELECT x FROM blobcol UNION ALL SELECT 'unused_arm')
+    SELECT a FROM t4 WHERE a IN (SELECT x FROM u);
+}
+expect {
 }
