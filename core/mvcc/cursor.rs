@@ -1,10 +1,11 @@
 use crate::alloc::{ConcurrentAllocator, TryReserveError, TursoAllocator};
-use crate::skiplist::{comparator::BasicComparator, map::Entry};
+use crate::mvcc::mass_map::MassEntry;
 use crate::turso_assert;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
+    create_seek_range, owned_index_entry, MVTableId, MvStore, OwnedIndexIter, Row, RowID, RowKey,
+    RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -332,32 +333,29 @@ pub enum MvccCursorType {
     Index(Arc<IndexInfo>),
 }
 
-pub(crate) type MvccEntry<'l, T, A = TursoAllocator> =
-    Entry<'l, T, RowVersions<A>, BasicComparator, A>;
+/// Owned key/version-chain snapshot yielded by MVCC iterators. Table
+/// iterators produce these directly from the Masstree-backed row map; index
+/// iterators clone the key `Arc` and chain `Arc` out of the per-index skip
+/// list, so neither carries a borrow of the underlying map.
+pub(crate) type MvccEntry<T, A = TursoAllocator> = MassEntry<T, RowVersions<A>>;
 
 pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
-    Box<dyn Iterator<Item = MvccEntry<'l, T, A>> + Send + Sync>;
+    Box<dyn Iterator<Item = MvccEntry<T, A>> + Send + Sync + 'l>;
 
-/// Extends the lifetime of a SkipMap iterator to `'static`.
+/// Extends the lifetime of a map iterator to `'static`.
 ///
-/// # Why a macro instead of a function?
-///
-/// Rust's `crate::skiplist::map::Entry<'a, K, V>` is *invariant* over `K`, meaning
-/// the lifetime `'a` cannot be coerced through a function boundary. When we try to pass
-/// `Box<dyn Iterator<Item = Entry<'_, K, V>>>` to a function expecting a generic lifetime,
-/// the compiler cannot unify the lifetimes across the function call.
-///
-/// A macro expands inline at the call site, avoiding the function boundary entirely and
-/// allowing the explicit transmute with both source and destination types specified.
+/// The items are owned snapshots, but the iterator itself still borrows the
+/// map it walks (`MvStore.rows` or a per-index map inside
+/// `MvStore.index_rows`), so storing it in a cursor needs its borrow erased.
 ///
 /// # Safety
 ///
-/// The caller must ensure that the underlying `SkipMap` from which the iterator was created
+/// The caller must ensure that the underlying map the iterator walks
 /// outlives the returned iterator. This is guaranteed when:
-/// - For table iterators: The `MvStore.rows` SkipMap is held in an `Arc<MvStore>` that
+/// - For table iterators: `MvStore.rows` is held in an `Arc<MvStore>` that
 ///   outlives the cursor.
-/// - For index iterators: The `MvStore.index_rows` SkipMap is held in an `Arc<MvStore>`
-///   that outlives the cursor.
+/// - For index iterators: the per-index map is held via an `Arc` inside
+///   `MvStore.index_rows`, and the `Arc<MvStore>` outlives the cursor.
 macro_rules! static_iterator_hack {
     ($iter:expr, $key_type:ty) => {
         static_iterator_hack!($iter, $key_type, crate::alloc::TursoAllocator)
@@ -366,16 +364,8 @@ macro_rules! static_iterator_hack {
         // SAFETY: See macro documentation above.
         unsafe {
             std::mem::transmute::<
-                Box<
-                    dyn Iterator<Item = crate::mvcc::cursor::MvccEntry<'_, $key_type, $alloc>>
-                        + Send
-                        + Sync,
-                >,
-                Box<
-                    dyn Iterator<Item = crate::mvcc::cursor::MvccEntry<'static, $key_type, $alloc>>
-                        + Send
-                        + Sync,
-                >,
+                crate::mvcc::cursor::MvccIterator<'_, $key_type, $alloc>,
+                crate::mvcc::cursor::MvccIterator<'static, $key_type, $alloc>,
             >($iter)
         }
     };
@@ -437,26 +427,27 @@ impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
         key: &Arc<SortableIndexKey>,
     ) -> bool {
         if matches!(self, Self::Uninitialized) {
-            // Scoped so the skiplist guard drops before `step` re-borrows `db`.
-            let iter = {
-                // Avoid allocating skiplist here with `try_get_or_insert_with`
-                let index_rows = db.index_rows.get(&table_id);
-                // Seed the finger at the first index key >= the B-tree key rather
-                // than at the start of `index_rows`, so a seek-initiated scan does
-                // not re-walk every preceding version on its first row check.
-                let iter_box: Box<
-                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
-                > = match index_rows {
+            // Avoid allocating the per-index map here with `try_get_or_insert_with`
+            let iter: MvccIterator<'static, Arc<SortableIndexKey>, A> =
+                match db.index_rows.get(&table_id) {
                     Some(index_rows) => {
-                        Box::new(index_rows.value().range::<SortableIndexKey, _>((
-                            std::ops::Bound::Included(key.as_ref()),
-                            std::ops::Bound::Unbounded,
-                        )))
+                        let map = index_rows.value().clone();
+                        // Seed the finger at the first index key >= the B-tree key rather
+                        // than at the start of `index_rows`, so a seek-initiated scan does
+                        // not re-walk every preceding version on its first row check.
+                        let start = key.as_ref().clone();
+                        Box::new(OwnedIndexIter::new(map, move |m| {
+                            Box::new(
+                                m.range::<SortableIndexKey, _>((
+                                    std::ops::Bound::Included(start),
+                                    std::ops::Bound::Unbounded,
+                                ))
+                                .map(owned_index_entry),
+                            )
+                        }))
                     }
                     None => Box::new(std::iter::empty()),
                 };
-                static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A)
-            };
             *self = Self::advance(iter);
         }
         loop {
@@ -1176,12 +1167,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             }
             MvccCursorType::Index(_) => {
                 let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
-                let index_rows = index_rows.value();
-                let iter_box: Box<
-                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
-                > = Box::new(index_rows.iter());
-                self.index_iterator =
-                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
+                let map = index_rows.value().clone();
+                self.index_iterator = Some(Box::new(OwnedIndexIter::new(map, |m| {
+                    Box::new(m.iter().map(owned_index_entry))
+                })));
             }
         }
         Ok(())
@@ -2159,12 +2148,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning
                 let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
-                let index_rows = index_rows.value();
-                let iter_box: Box<
-                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
-                > = Box::new(index_rows.iter());
-                self.index_iterator =
-                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
+                let map = index_rows.value().clone();
+                self.index_iterator = Some(Box::new(OwnedIndexIter::new(map, |m| {
+                    Box::new(m.iter().map(owned_index_entry))
+                })));
             }
         }
 
