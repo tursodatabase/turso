@@ -138,9 +138,22 @@ test trigger-names-fold-case {
     DROP TRIGGER trigone;
     INSERT INTO t6 VALUES (1);
     SELECT a FROM t6;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'trigger';
 }
 expect {
     1
+    0
+}
+
+@cross-check-integrity
+test drop-view-matches-any-case {
+    CREATE TABLE t7 (a INTEGER);
+    CREATE VIEW MyView AS SELECT a FROM t7;
+    DROP VIEW MYVIEW;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'view';
+}
+expect {
+    0
 }
 
 test no-such-table-error-echoes-user-spelling {

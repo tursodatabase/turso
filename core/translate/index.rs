@@ -1260,7 +1260,14 @@ pub fn translate_drop_index(
     program.emit_null(null_reg, None);
 
     // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(idx_name.to_string());
+    // Match the schema row by the canonical stored spelling, not the spelling
+    // the user typed in DROP INDEX (index names compare case-insensitively).
+    let canonical_index_name = maybe_index
+        .as_ref()
+        .expect("index resolved above")
+        .name
+        .to_string();
+    let index_name_reg = program.emit_string8_new_reg(canonical_index_name);
     // String8; r[4] = 'index'
     let index_str_reg = program.emit_string8_new_reg("index".to_string());
 

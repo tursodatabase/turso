@@ -450,12 +450,25 @@ pub fn translate_drop_view(
     // row whose stored SQL failed to parse at load time. Broken views have no
     // in-memory representation, but DROP VIEW must still delete their row so
     // affected databases can be cleaned up.
-    let (is_regular_view, is_materialized_view, is_broken_view) =
-        resolver.with_schema(database_id, |s| {
+    let (canonical_view_name, is_regular_view, is_materialized_view, is_broken_view) = resolver
+        .with_schema(database_id, |s| {
+            let regular = s.get_view(&normalized_view_name).map(|v| v.name.clone());
+            let materialized = s
+                .materialized_view_names
+                .get(&normalized_view_name)
+                .cloned();
+            let broken = s.broken_views.get(&normalized_view_name).cloned();
             (
-                s.get_view(&normalized_view_name).is_some(),
-                s.is_materialized_view(&normalized_view_name),
-                s.broken_views.contains(&normalized_view_name),
+                // The schema rows are matched byte-wise below, so use the
+                // stored spelling, not the spelling the user typed.
+                regular
+                    .clone()
+                    .or_else(|| materialized.clone())
+                    .or_else(|| broken.clone())
+                    .unwrap_or_else(|| normalized_view_name.clone()),
+                regular.is_some(),
+                materialized.is_some(),
+                broken.is_some(),
             )
         });
     let view_exists = is_regular_view || is_materialized_view || is_broken_view;
@@ -491,7 +504,7 @@ pub fn translate_drop_view(
         // Construct the DBSP state table name
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         Some(format!(
-            "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
+            "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{canonical_view_name}"
         ))
     } else {
         None
@@ -545,7 +558,7 @@ pub fn translate_drop_view(
     // Set the view name and type we're looking for
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: normalized_view_name.to_string(),
+        value: canonical_view_name.to_string(),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
@@ -728,7 +741,7 @@ pub fn translate_drop_view(
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
         db: database_id,
-        view_name: normalized_view_name.to_string(),
+        view_name: canonical_view_name.to_string(),
     });
 
     // Update schema version (increment schema cookie)

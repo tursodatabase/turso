@@ -830,7 +830,7 @@ pub fn translate_create_sequence(
     // namespace at CREATE time. Covered by
     // `create-sequence-rejects-autoincrement-internal-prefix` in
     // `sqlite/conformance/turso-sqltests/sequence.sqltest`.
-    if normalized_name.starts_with(AUTOINCREMENT_SEQ_PREFIX) {
+    if normalized_name.starts_with_ignore_ascii_case(AUTOINCREMENT_SEQ_PREFIX) {
         bail_parse_error!(
             "sequence name \"{}\" is reserved for internal AUTOINCREMENT use",
             normalized_name
@@ -918,12 +918,16 @@ pub(crate) fn emit_drop_sequence_cleanup(
     database_id: usize,
     seq_name: &str,
 ) -> Result<bool> {
-    let backing_table_name = sequence_backing_table_name(seq_name);
-    let root_page = resolver.with_schema(database_id, |s| {
-        s.get_sequence(seq_name)?;
-        Some(s.get_btree_table(&backing_table_name)?.root_page)
+    // Derive the backing-table row name from the sequence's stored spelling:
+    // the sqlite_schema row is matched byte-wise below, and sequence names
+    // compare case-insensitively.
+    let resolved = resolver.with_schema(database_id, |s| {
+        let seq = s.get_sequence(seq_name)?;
+        let backing_table_name = sequence_backing_table_name(seq.name.as_str());
+        let root_page = s.get_btree_table(&backing_table_name)?.root_page;
+        Some((backing_table_name, root_page))
     });
-    let Some(root_page) = root_page else {
+    let Some((backing_table_name, root_page)) = resolved else {
         return Ok(false);
     };
 

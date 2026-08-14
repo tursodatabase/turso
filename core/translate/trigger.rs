@@ -496,15 +496,18 @@ pub fn translate_drop_trigger(
     program.begin_write_operation()?;
     let normalized_trigger_name = trigger_name.name.identifier().clone();
 
-    // Check if trigger exists
-    if resolver.with_schema(database_id, |s| {
-        s.get_trigger(&normalized_trigger_name).is_none()
-    }) {
+    // Check if trigger exists. Keep the canonical stored spelling: the
+    // sqlite_schema row is matched byte-wise below, and trigger names compare
+    // case-insensitively.
+    let Some(trigger) =
+        resolver.with_schema(database_id, |s| s.get_trigger(&normalized_trigger_name))
+    else {
         if if_exists {
             return Ok(());
         }
         bail_parse_error!("no such trigger: {}", normalized_trigger_name);
-    }
+    };
+    let canonical_trigger_name = trigger.name.clone();
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
@@ -561,7 +564,7 @@ pub fn translate_drop_trigger(
     });
 
     // Check if name matches
-    let trigger_name_str_reg = program.emit_string8_new_reg(normalized_trigger_name.to_string());
+    let trigger_name_str_reg = program.emit_string8_new_reg(canonical_trigger_name.to_string());
     program.emit_insn(Insn::Ne {
         lhs: name_reg,
         rhs: trigger_name_str_reg,
@@ -602,7 +605,7 @@ pub fn translate_drop_trigger(
 
     program.emit_insn(Insn::DropTrigger {
         db: database_id,
-        trigger_name: normalized_trigger_name.to_string(),
+        trigger_name: canonical_trigger_name.to_string(),
     });
 
     Ok(())
