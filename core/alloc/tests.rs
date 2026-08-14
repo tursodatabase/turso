@@ -126,7 +126,8 @@ fn database_open_with_allocator_uses_allocator_for_mvcc_commit() {
     // logical-log commit buffers (and, under cfg(nightly), the version
     // chains), so exercise a commit.
     allocations.store(0, Ordering::Relaxed);
-    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
     assert!(allocations.load(Ordering::Relaxed) > 0);
 }
