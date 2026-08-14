@@ -1139,11 +1139,13 @@ mod tests {
     };
 
     fn get_seed() -> u64 {
-        std::env::var("SEED").map_or(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
+        std::env::var("SEED").map_or_else(
+            |_| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            },
             |v| {
                 v.parse()
                     .expect("Failed to parse SEED environment variable as u64")

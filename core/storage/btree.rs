@@ -11039,11 +11039,13 @@ mod tests {
     }
 
     fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
-        let seed = std::env::var("SEED").map_or(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
+        let seed = std::env::var("SEED").map_or_else(
+            |_| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            },
             |v| {
                 v.parse()
                     .expect("Failed to parse SEED environment variable as u64")

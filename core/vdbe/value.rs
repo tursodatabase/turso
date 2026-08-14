@@ -103,7 +103,7 @@ mod cmath {
     }
 
     // SQLite's M_PI constant (same value as SQLite's func.c)
-    #[allow(clippy::excessive_precision)]
+    #[allow(clippy::excessive_precision, clippy::approx_constant)]
     const M_PI: f64 = 3.141592653589793238462643383279502884;
 
     pub fn degrees(x: f64) -> f64 {

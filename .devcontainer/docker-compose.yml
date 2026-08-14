@@ -27,7 +27,7 @@ services:
         GIT_DELTA_VERSION: "0.18.2"
         ZSH_IN_DOCKER_VERSION: "1.2.0"
         GO_VERSION: "1.24.10"
-        RUST_VERSION: "1.88.0"
+        RUST_VERSION: "1.92.0"
         PYTHON_VERSION: "3.11"
         NVM_VERSION: "0.40.1"
         NODE_VERSION: "22.13.0"
