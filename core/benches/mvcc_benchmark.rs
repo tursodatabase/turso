@@ -411,6 +411,56 @@ fn run_huge_multi_write(c: &mut Criterion, group_name: &str, placement: GhostPla
     group.finish();
 }
 
+/// Full-scan benchmark over an uncheckpointed MVCC table: every row is served
+/// from the in-memory version store, so this measures the per-row cost of the
+/// stateful MVCC row iterator in both directions.
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_scan(c: &mut Criterion) {
+    const SCAN_ROWS: usize = 10_000;
+    const INSERT_BATCH: usize = 500;
+
+    let mut group = c.benchmark_group("mvcc-scan");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(SCAN_ROWS as u64));
+
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    // Keep every row in MvStore so the scan exercises the in-memory row map
+    // rather than checkpointed B-tree pages.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("CREATE TABLE scan_t(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    for batch_start in (0..SCAN_ROWS).step_by(INSERT_BATCH) {
+        let values = (batch_start..batch_start + INSERT_BATCH)
+            .map(|i| format!("({i}, 'value-{i}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute(format!("INSERT INTO scan_t VALUES {values}"))
+            .unwrap();
+    }
+
+    let mut fwd = conn.prepare("SELECT count(b) FROM scan_t").unwrap();
+    group.bench_function(format!("full-scan-fwd/rows={SCAN_ROWS}"), |b| {
+        b.iter(|| {
+            run_to_completion(&db, &mut fwd);
+            fwd.reset().unwrap();
+        })
+    });
+
+    let mut rev = conn.prepare("SELECT b FROM scan_t ORDER BY a DESC").unwrap();
+    group.bench_function(format!("full-scan-rev/rows={SCAN_ROWS}"), |b| {
+        b.iter(|| {
+            run_to_completion(&db, &mut rev);
+            rev.reset().unwrap();
+        })
+    });
+    group.finish();
+}
+
 /// Guards the eq-only bound on the UNIQUE-index probe (`seek_index`): the ghost
 /// rows' `seq` values sit above the measured batch, so each per-row `NoConflict`
 /// probe would scan O(pending) invisible entries without the bound.
@@ -432,14 +482,14 @@ fn bench_huge_multi_write_rowid(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid
+    targets = bench, bench_scan, bench_huge_multi_write, bench_huge_multi_write_rowid
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid
+    targets = bench, bench_scan, bench_huge_multi_write, bench_huge_multi_write_rowid
 }
 
 criterion_main!(benches);
