@@ -5938,16 +5938,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
             create_seek_range(start, direction)
         };
-        *index_iterator = Some(Box::new(OwnedIndexIter::new(index_rows, move |map| {
-            match direction {
-                IterationDirection::Forwards => {
-                    Box::new(map.range(range).map(owned_index_entry))
-                }
+        *index_iterator = Some(Box::new(OwnedIndexIter::new(
+            index_rows,
+            move |map| match direction {
+                IterationDirection::Forwards => Box::new(map.range(range).map(owned_index_entry)),
                 IterationDirection::Backwards => {
                     Box::new(map.range(range).rev().map(owned_index_entry))
                 }
-            }
-        })));
+            },
+        )));
         let mv_store_iterator = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above if it was None");
@@ -6033,7 +6032,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .expect("global_header initialized above");
                 self.txs.insert(
                     tx_id,
-                    Arc::new(Transaction::new(tx_id, ts, header, read_mark, schema_generation)),
+                    Arc::new(Transaction::new(
+                        tx_id,
+                        ts,
+                        header,
+                        read_mark,
+                        schema_generation,
+                    )),
                 );
             });
             if schema_stale {
@@ -6232,7 +6237,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .expect("global_header initialized above");
             self.txs.insert(
                 tx_id,
-                Arc::new(Transaction::new(tx_id, ts, header, read_mark, schema_generation)),
+                Arc::new(Transaction::new(
+                    tx_id,
+                    ts,
+                    header,
+                    read_mark,
+                    schema_generation,
+                )),
             );
         });
         if schema_stale {

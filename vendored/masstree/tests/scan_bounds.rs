@@ -82,7 +82,8 @@ fn reverse_scan_survives_emptied_rightmost_leaf_single_layer() {
     for i in 0..16u64 {
         tree.insert_with_guard(&i.to_be_bytes(), i, &guard);
     }
-    tree.remove_with_guard(&15u64.to_be_bytes(), &guard).unwrap();
+    tree.remove_with_guard(&15u64.to_be_bytes(), &guard)
+        .unwrap();
 
     let mut seen = Vec::new();
     tree.scan_rev_batch(

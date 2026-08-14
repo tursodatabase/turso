@@ -168,4 +168,3 @@ impl StdFmt::Debug for ShardedCounter {
             .finish()
     }
 }
-

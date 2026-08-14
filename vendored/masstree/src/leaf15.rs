@@ -36,7 +36,6 @@ use seize::Guard;
 
 mod layout;
 
-
 /// Special keylenx value indicating key has a suffix.
 pub const KSUF_KEYLENX: u8 = 64;
 

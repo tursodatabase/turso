@@ -451,7 +451,9 @@ fn bench_scan(c: &mut Criterion) {
         })
     });
 
-    let mut rev = conn.prepare("SELECT b FROM scan_t ORDER BY a DESC").unwrap();
+    let mut rev = conn
+        .prepare("SELECT b FROM scan_t ORDER BY a DESC")
+        .unwrap();
     group.bench_function(format!("full-scan-rev/rows={SCAN_ROWS}"), |b| {
         b.iter(|| {
             run_to_completion(&db, &mut rev);

@@ -671,4 +671,3 @@ impl<const WIDTH: usize> TreePermutation for Permuter<WIDTH> {
         Self::remove(self, i);
     }
 }
-

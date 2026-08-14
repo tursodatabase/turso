@@ -647,7 +647,8 @@ impl<P: LeafPolicy> ForwardScanCtx<P> {
 
         let perm: <LeafNode15<P> as TreeLeafNode<P>>::Perm = next_leaf.permutation();
 
-        let pos: usize = lower_with_suffix(&self.cursor_key, next_leaf, &perm, self.flags.emit_equal());
+        let pos: usize =
+            lower_with_suffix(&self.cursor_key, next_leaf, &perm, self.flags.emit_equal());
 
         self.stack.update_state(next_version, perm, pos);
 
@@ -719,7 +720,8 @@ impl<P: LeafPolicy> ForwardScanCtx<P> {
 
         let perm: <LeafNode15<P> as TreeLeafNode<P>>::Perm = next_leaf.permutation();
 
-        let pos: usize = lower_with_suffix(&self.cursor_key, next_leaf, &perm, self.flags.emit_equal());
+        let pos: usize =
+            lower_with_suffix(&self.cursor_key, next_leaf, &perm, self.flags.emit_equal());
 
         self.stack.update_state(next_version, perm, pos);
 

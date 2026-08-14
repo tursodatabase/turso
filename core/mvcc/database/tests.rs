@@ -356,7 +356,11 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     .unwrap();
 
     let tx_id = 7;
-    let tx = Arc::new(new_tx_in::<FailOnDemandAlloc>(tx_id, 1, TransactionState::Active));
+    let tx = Arc::new(new_tx_in::<FailOnDemandAlloc>(
+        tx_id,
+        1,
+        TransactionState::Active,
+    ));
     tx.begin_savepoint();
     store.txs.try_insert(tx_id, tx).unwrap();
 

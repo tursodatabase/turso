@@ -281,4 +281,3 @@ impl<P: LeafPolicy + 'static> TreeAllocator<P> for SeizeAllocator<P> {
         ptr
     }
 }
-

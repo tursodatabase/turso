@@ -600,7 +600,10 @@ mod tests {
             .collect();
         assert_eq!(absent_start, vec![], "absent Included start past the end");
         let empty: Vec<WideKey> = map
-            .range((Bound::Included(WideKey(7, 20)), Bound::Excluded(WideKey(7, 20))))
+            .range((
+                Bound::Included(WideKey(7, 20)),
+                Bound::Excluded(WideKey(7, 20)),
+            ))
             .map(|entry| *entry.key())
             .collect();
         assert_eq!(empty, vec![], "inverted-edge range is empty");
