@@ -3,7 +3,9 @@ use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
-use crate::io::{PlatformIO, IO};
+use crate::io::PlatformIO;
+#[cfg(nightly)]
+use crate::io::IO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
@@ -164,11 +166,13 @@ impl FailureInjector for FixedFailureInjector {
     }
 }
 
+#[cfg(nightly)]
 #[derive(Clone, Default)]
 struct FailOnDemandAlloc {
     fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[cfg(nightly)]
 impl FailOnDemandAlloc {
     fn fail_allocations(&self, fail: bool) {
         self.fail.store(fail, std::sync::atomic::Ordering::Relaxed);
@@ -207,6 +211,7 @@ fn aborted_transaction_rejects_write_set_insert() {
     tx.insert_to_write_set(row_id, row_versions);
 }
 
+#[cfg(nightly)]
 unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
     fn allocate(
         &self,
@@ -232,6 +237,7 @@ unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
     }
 }
 
+#[cfg(nightly)]
 fn test_mvcc_storage(name: &str) -> Arc<dyn crate::mvcc::persistent_storage::DurableStorage> {
     let io = Arc::new(MemoryIO::new());
     let file = io.open_file(name, OpenFlags::Create, false).unwrap();

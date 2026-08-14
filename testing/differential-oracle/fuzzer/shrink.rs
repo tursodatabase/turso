@@ -481,12 +481,12 @@ fn apply_clause_action(site: &mut Site<'_>, action: ClauseDrop) {
             }
         }
         (Site::Outer(select), ClauseDrop::Cte(i)) => {
-            if let Some(with) = &mut select.with {
-                if i < with.ctes.len() {
-                    with.ctes.remove(i);
-                    if with.ctes.is_empty() {
-                        select.with = None;
-                    }
+            if let Some(with) = &mut select.with
+                && i < with.ctes.len()
+            {
+                with.ctes.remove(i);
+                if with.ctes.is_empty() {
+                    select.with = None;
                 }
             }
         }
@@ -494,10 +494,9 @@ fn apply_clause_action(site: &mut Site<'_>, action: ClauseDrop) {
             if let OneSelect::Select {
                 from: Some(from), ..
             } = &mut select.body.select
+                && i < from.joins.len()
             {
-                if i < from.joins.len() {
-                    from.joins.remove(i);
-                }
+                from.joins.remove(i);
             }
         }
         (Site::Update(update), ClauseDrop::Where) => update.where_clause = None,
@@ -531,10 +530,10 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
         Stmt::Insert {
             body, returning, ..
         } => {
-            if let InsertBody::Select(select, _) = body {
-                if walk_select(select, f) {
-                    return true;
-                }
+            if let InsertBody::Select(select, _) = body
+                && walk_select(select, f)
+            {
+                return true;
             }
             walk_result_columns(returning, f)
         }
@@ -551,15 +550,15 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
                     return true;
                 }
             }
-            if let Some(from) = &mut update.from {
-                if walk_from(from, f) {
-                    return true;
-                }
+            if let Some(from) = &mut update.from
+                && walk_from(from, f)
+            {
+                return true;
             }
-            if let Some(w) = &mut update.where_clause {
-                if walk_expr(w, f) {
-                    return true;
-                }
+            if let Some(w) = &mut update.where_clause
+                && walk_expr(w, f)
+            {
+                return true;
             }
             walk_result_columns(&mut update.returning, f)
         }
@@ -576,10 +575,10 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
                     }
                 }
             }
-            if let Some(w) = where_clause {
-                if walk_expr(w, f) {
-                    return true;
-                }
+            if let Some(w) = where_clause
+                && walk_expr(w, f)
+            {
+                return true;
             }
             walk_result_columns(returning, f)
         }
@@ -595,10 +594,10 @@ fn walk_limit(
         if walk_expr(&mut limit.expr, f) {
             return true;
         }
-        if let Some(offset) = &mut limit.offset {
-            if walk_expr(offset, f) {
-                return true;
-            }
+        if let Some(offset) = &mut limit.offset
+            && walk_expr(offset, f)
+        {
+            return true;
         }
     }
     false
@@ -606,10 +605,10 @@ fn walk_limit(
 
 fn walk_result_columns(columns: &mut [ResultColumn], f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
     for rc in columns {
-        if let ResultColumn::Expr(expr, _) = rc {
-            if walk_expr(expr, f) {
-                return true;
-            }
+        if let ResultColumn::Expr(expr, _) = rc
+            && walk_expr(expr, f)
+        {
+            return true;
         }
     }
     false
@@ -651,15 +650,15 @@ fn walk_one_select(one: &mut OneSelect, f: &mut dyn FnMut(&mut Expr) -> bool) ->
             if walk_result_columns(columns, f) {
                 return true;
             }
-            if let Some(from) = from {
-                if walk_from(from, f) {
-                    return true;
-                }
+            if let Some(from) = from
+                && walk_from(from, f)
+            {
+                return true;
             }
-            if let Some(w) = where_clause {
-                if walk_expr(w, f) {
-                    return true;
-                }
+            if let Some(w) = where_clause
+                && walk_expr(w, f)
+            {
+                return true;
             }
             if let Some(gb) = group_by {
                 for e in &mut gb.exprs {
@@ -667,10 +666,10 @@ fn walk_one_select(one: &mut OneSelect, f: &mut dyn FnMut(&mut Expr) -> bool) ->
                         return true;
                     }
                 }
-                if let Some(h) = &mut gb.having {
-                    if walk_expr(h, f) {
-                        return true;
-                    }
+                if let Some(h) = &mut gb.having
+                    && walk_expr(h, f)
+                {
+                    return true;
                 }
             }
             false
@@ -699,10 +698,10 @@ fn walk_from(
         if walk_select_table(&mut join.table, f) {
             return true;
         }
-        if let Some(turso_parser::ast::JoinConstraint::On(e)) = &mut join.constraint {
-            if walk_expr(e, f) {
-                return true;
-            }
+        if let Some(turso_parser::ast::JoinConstraint::On(e)) = &mut join.constraint
+            && walk_expr(e, f)
+        {
+            return true;
         }
     }
     false
@@ -755,10 +754,10 @@ fn walk_sites(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Site<'_>) -> bool) -> bool
         Stmt::Insert {
             body, returning, ..
         } => {
-            if let InsertBody::Select(select, _) = body {
-                if walk_select_sites(select, f) {
-                    return true;
-                }
+            if let InsertBody::Select(select, _) = body
+                && walk_select_sites(select, f)
+            {
+                return true;
             }
             f(&mut Site::InsertReturning(returning))
         }
@@ -770,10 +769,10 @@ fn walk_sites(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Site<'_>) -> bool) -> bool
                     }
                 }
             }
-            if let Some(from) = &mut update.from {
-                if walk_from_sites(from, f) {
-                    return true;
-                }
+            if let Some(from) = &mut update.from
+                && walk_from_sites(from, f)
+            {
+                return true;
             }
             f(&mut Site::Update(update))
         }
@@ -822,10 +821,9 @@ fn walk_select_sites(select: &mut Select, f: &mut dyn FnMut(&mut Site<'_>) -> bo
     if let OneSelect::Select {
         from: Some(from), ..
     } = &mut select.body.select
+        && walk_from_sites(from, f)
     {
-        if walk_from_sites(from, f) {
-            return true;
-        }
+        return true;
     }
     false
 }
@@ -834,16 +832,16 @@ fn walk_from_sites(
     from: &mut turso_parser::ast::FromClause,
     f: &mut dyn FnMut(&mut Site<'_>) -> bool,
 ) -> bool {
-    if let SelectTable::Select(select, _) = &mut *from.select {
-        if walk_select_sites(select, f) {
-            return true;
-        }
+    if let SelectTable::Select(select, _) = &mut *from.select
+        && walk_select_sites(select, f)
+    {
+        return true;
     }
     for join in &mut from.joins {
-        if let SelectTable::Select(select, _) = &mut *join.table {
-            if walk_select_sites(select, f) {
-                return true;
-            }
+        if let SelectTable::Select(select, _) = &mut *join.table
+            && walk_select_sites(select, f)
+        {
+            return true;
         }
     }
     false

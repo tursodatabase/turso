@@ -293,8 +293,9 @@ impl<A: ConcurrentAllocator> DualCursorPeek<A> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
+    #[default]
     Uninitialized,
     Row {
         key: RowKey,
@@ -303,12 +304,6 @@ enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
         versions: Option<RowVersions<A>>,
     },
     Exhausted,
-}
-
-impl<A: ConcurrentAllocator> Default for CursorPeek<A> {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
 }
 
 impl<A: ConcurrentAllocator> CursorPeek<A> {

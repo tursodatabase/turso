@@ -1630,7 +1630,7 @@ fn optimize_subqueries(
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
             if let Some(cached) = cache.from_clause.remove(&table.internal_id) {
-                from_clause_subquery.plan = Box::new(cached);
+                *from_clause_subquery.plan = cached;
                 continue;
             }
             // Use match to handle both SelectPlan and CompoundSelect variants

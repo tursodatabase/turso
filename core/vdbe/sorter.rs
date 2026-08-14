@@ -1177,7 +1177,11 @@ mod tests {
                     let denominator = (rng.next_u64() as f64).abs().max(1.0);
                     Value::from_f64(numerator / denominator)
                 }
-                5 => Value::from_f64(if rng.next_u64() % 2 == 0 { 0.0 } else { -0.0 }),
+                5 => Value::from_f64(if rng.next_u64().is_multiple_of(2) {
+                    0.0
+                } else {
+                    -0.0
+                }),
                 6..=8 => {
                     let alphabet = [b'a', b'b', b'\0'];
                     let len = (rng.next_u64() % 10) as usize;
@@ -1196,7 +1200,7 @@ mod tests {
         };
 
         let gen_key = |rng: &mut ChaCha8Rng| KeyInfo {
-            sort_order: if rng.next_u64() % 2 == 0 {
+            sort_order: if rng.next_u64().is_multiple_of(2) {
                 SortOrder::Asc
             } else {
                 SortOrder::Desc

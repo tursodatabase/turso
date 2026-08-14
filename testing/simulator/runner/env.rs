@@ -1832,11 +1832,10 @@ impl Paths {
     }
 
     pub fn delete_all_files(&self) {
-        if self.base.exists() {
-            let res = std::fs::remove_dir_all(&self.base);
-            if res.is_err() {
-                tracing::error!(error = %res.unwrap_err(),"failed to remove directory");
-            }
+        if self.base.exists()
+            && let Err(err) = std::fs::remove_dir_all(&self.base)
+        {
+            tracing::error!(error = %err, "failed to remove directory");
         }
     }
 }

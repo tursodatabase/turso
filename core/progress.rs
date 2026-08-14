@@ -59,7 +59,7 @@ impl ProgressHandler {
     /// configured multiple of `ops`.
     pub(crate) fn should_interrupt(&self, vm_steps: u64) -> bool {
         let ops = self.ops();
-        if ops == 0 || vm_steps % ops != 0 {
+        if ops == 0 || !vm_steps.is_multiple_of(ops) {
             return false;
         }
         let callback = self.callback.read();

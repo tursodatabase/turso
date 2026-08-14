@@ -22,9 +22,10 @@ use crate::{
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord, Default)]
 pub enum CollationSeq {
     Unset,
+    #[default]
     Binary,
     NoCase,
     Rtrim,
@@ -209,12 +210,6 @@ fn resolve_collation_name(
         return Ok(collation);
     }
     CollationSeq::new(collation)
-}
-
-impl Default for CollationSeq {
-    fn default() -> Self {
-        Self::Binary
-    }
 }
 
 impl std::fmt::Display for CollationSeq {

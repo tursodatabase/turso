@@ -1258,9 +1258,11 @@ struct VacuumInPlaceCleanupState {
 }
 
 /// Phases for the in-place VACUUM state machine.
+#[derive(Default)]
 enum VacuumInPlacePhase {
     /// Validate preconditions (auto_commit, active statements, readonly, memory,
     /// MVCC, WAL-backed pager). Then acquire check_point lock
+    #[default]
     Preflight,
     /// Acquire exclusive source access on the source WAL via
     /// `begin_vacuum_blocking_tx`: checkpoint_lock is already held from Preflight;
@@ -1333,12 +1335,6 @@ enum VacuumInPlacePhase {
     InstallCommittedImage,
     /// Clean up after successful commit.
     Done,
-}
-
-impl Default for VacuumInPlacePhase {
-    fn default() -> Self {
-        Self::Preflight
-    }
 }
 
 /// Holds the context for the in-place VACUUM operation across async yields.

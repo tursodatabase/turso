@@ -528,17 +528,15 @@ async fn run_single<B: SqlBackend, R: Runnable>(
             && !options.db_config.readonly
             && !test.expects_error()
             && !options.mvcc
+            && let Some(ref binary) = options.cross_check_binary
+            && let Some(ref db_path) = file_handle.path
         {
-            if let Some(ref binary) = options.cross_check_binary {
-                if let Some(ref db_path) = file_handle.path {
-                    match run_cross_check_integrity(binary, db_path).await {
-                        Ok(()) => {} // integrity check passed
-                        Err(msg) => {
-                            outcome = TestOutcome::Failed {
-                                reason: format!("cross-check integrity_check failed: {msg}"),
-                            };
-                        }
-                    }
+            match run_cross_check_integrity(binary, db_path).await {
+                Ok(()) => {} // integrity check passed
+                Err(msg) => {
+                    outcome = TestOutcome::Failed {
+                        reason: format!("cross-check integrity_check failed: {msg}"),
+                    };
                 }
             }
         }
@@ -914,17 +912,17 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
             // For each test
             for test in &test_file.tests {
                 // Apply filter if present
-                if let Some(ref filter) = self.config.filter {
-                    if !matches_filter(&test.name, filter) {
-                        continue;
-                    }
+                if let Some(ref filter) = self.config.filter
+                    && !matches_filter(&test.name, filter)
+                {
+                    continue;
                 }
 
                 // Skip tests that don't match the current backend
-                if let Some(required_backend) = test.modifiers.backend {
-                    if required_backend != backend_type {
-                        continue;
-                    }
+                if let Some(required_backend) = test.modifiers.backend
+                    && required_backend != backend_type
+                {
+                    continue;
                 }
 
                 let backend = Arc::clone(&self.backend);
@@ -985,24 +983,24 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
             // For each snapshot
             for snapshot in &test_file.snapshots {
                 // Apply snapshot filter if present
-                if let Some(ref filter) = self.config.snapshot_filter {
-                    if !matches_filter(&snapshot.name, filter) {
-                        continue;
-                    }
+                if let Some(ref filter) = self.config.snapshot_filter
+                    && !matches_filter(&snapshot.name, filter)
+                {
+                    continue;
                 }
 
                 // Also check the regular filter (it applies to both tests and snapshots)
-                if let Some(ref filter) = self.config.filter {
-                    if !matches_filter(&snapshot.name, filter) {
-                        continue;
-                    }
+                if let Some(ref filter) = self.config.filter
+                    && !matches_filter(&snapshot.name, filter)
+                {
+                    continue;
                 }
 
                 // Skip snapshots that don't match the current backend
-                if let Some(required_backend) = snapshot.modifiers.backend {
-                    if required_backend != backend_type {
-                        continue;
-                    }
+                if let Some(required_backend) = snapshot.modifiers.backend
+                    && required_backend != backend_type
+                {
+                    continue;
                 }
 
                 let backend = Arc::clone(&self.backend);
@@ -1052,10 +1050,10 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         if let Some(db_config) = test_file.databases.first() {
             for matrix in &test_file.matrices {
                 for expansion in matrix.expand() {
-                    if let Some(ref filter) = self.config.filter {
-                        if !matches_filter(&expansion.name, filter) {
-                            continue;
-                        }
+                    if let Some(ref filter) = self.config.filter
+                        && !matches_filter(&expansion.name, filter)
+                    {
+                        continue;
                     }
 
                     let backend = Arc::clone(&self.backend);

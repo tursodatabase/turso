@@ -522,7 +522,9 @@ pub struct OpHashProbeState {
     pub probe_buffered: bool,
 }
 
+#[derive(Default)]
 enum ActiveOpState {
+    #[default]
     None,
     ClearBtree(OpClearBtreeState),
     Delete(OpDeleteState),
@@ -596,12 +598,6 @@ macro_rules! active_state_accessor {
             }
         }
     };
-}
-
-impl Default for ActiveOpState {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl ActiveOpStateSlot {
@@ -744,16 +740,12 @@ pub(crate) struct DeferredSeekState {
     pub table_cursor_id: CursorID,
 }
 
+#[derive(Default)]
 pub(crate) enum VacuumOpState {
+    #[default]
     None,
     IntoFile(Box<VacuumIntoOpContext>),
     InPlace(Box<VacuumInPlaceOpContext>),
-}
-
-impl Default for VacuumOpState {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// The program state describes the environment in which the program executes.

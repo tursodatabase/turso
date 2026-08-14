@@ -1,3 +1,9 @@
+// rustc 1.92 attributes phantom `unused_assignments` diagnostics to struct
+// fields constructed through macros (same as sqlite/parser); earlier and
+// later compilers don't fire it. Remove when the pinned toolchain moves past
+// 1.92.
+#![allow(unused_assignments)]
+
 pub mod backends;
 pub mod comparison;
 pub mod generator;

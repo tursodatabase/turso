@@ -129,7 +129,7 @@ pub fn execute_on_both(
 /// Print progress at evenly spaced intervals through a loop.
 pub fn log_progress(name: &str, iter: usize, total: usize, num_prints: usize) {
     let interval = (total / num_prints).max(1);
-    if iter % interval == 0 {
+    if iter.is_multiple_of(interval) {
         println!("{name} iteration {}/{}", iter + 1, total);
     }
 }

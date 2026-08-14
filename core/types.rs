@@ -659,6 +659,11 @@ impl Value {
     }
 }
 
+// Function pointers take part in the derived equality: unique addresses are
+// not guaranteed, so equal functions can compare unequal. Equality here only
+// distinguishes aggregate instances, which `state` already does, so the
+// imprecision is harmless.
+#[allow(unpredictable_function_pointer_comparisons)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalAggState {
     pub context: usize,

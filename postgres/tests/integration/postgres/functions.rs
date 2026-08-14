@@ -73,16 +73,16 @@ fn test_pg_current_database_matches_pg_database(db: TempDatabase) {
     let expected = db.path.file_stem().unwrap().to_str().unwrap().to_string();
     assert_eq!(
         query_text(&conn, "SELECT current_database()"),
-        [expected.clone()]
+        std::slice::from_ref(&expected)
     );
     assert_eq!(
         query_text(&conn, "SELECT * FROM current_database()"),
-        [expected.clone()]
+        std::slice::from_ref(&expected)
     );
     // The bare current_catalog keyword is the same function per PG docs.
     assert_eq!(
         query_text(&conn, "SELECT current_catalog"),
-        [expected.clone()]
+        std::slice::from_ref(&expected)
     );
     // Must agree with what the pg_database catalog reports as datname.
     assert_eq!(

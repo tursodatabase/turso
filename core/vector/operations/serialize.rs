@@ -26,7 +26,7 @@ pub fn vector_serialize(x: Vector) -> Result<Value, TryReserveError> {
             // Format: [data bytes][optional padding][trailing_bits][0x03]
             let dims = x.dims;
             let data_size = dims.div_ceil(8);
-            let needs_padding = data_size % 2 == 0;
+            let needs_padding = data_size.is_multiple_of(2);
             let mut blob = x.bin_eject()?;
             blob.truncate(data_size);
             blob.try_reserve(usize::from(needs_padding) + 2)?;

@@ -36,7 +36,7 @@ impl<'a> Vector<'a> {
     /// computed later in from_data).
     pub fn vector_type(blob: &[u8]) -> Result<(VectorType, usize, usize)> {
         // Even-sized blobs are always float32.
-        if blob.len() % 2 == 0 {
+        if blob.len().is_multiple_of(2) {
             return Ok((VectorType::Float32Dense, blob.len(), 0));
         }
         // Odd-sized blobs have type byte at the end
@@ -57,7 +57,7 @@ impl<'a> Vector<'a> {
             3 => {
                 // Float1Bit: [data bytes][optional padding][trailing_bits][0x03]
                 let n_blob_size = blob.len() - 1; // without type byte
-                if n_blob_size == 0 || n_blob_size % 2 != 0 {
+                if n_blob_size == 0 || !n_blob_size.is_multiple_of(2) {
                     return Err(LimboError::ConversionError(
                         "float1bit vector blob length must be even and non-empty".to_string(),
                     ));
@@ -86,7 +86,7 @@ impl<'a> Vector<'a> {
             4 => {
                 // Float8: [quantized bytes][alignment padding][alpha f32][shift f32][padding 0x00][trailing_bytes][0x04]
                 let n_blob_size = blob.len() - 1; // without type byte
-                if n_blob_size < 2 || n_blob_size % 2 != 0 {
+                if n_blob_size < 2 || !n_blob_size.is_multiple_of(2) {
                     return Err(LimboError::ConversionError(
                         "float8 vector blob must have even length >= 2 (excluding type byte)"
                             .to_string(),
@@ -641,7 +641,7 @@ pub(crate) mod tests {
                         *b = u8::arbitrary(g);
                     }
                     // Mask off unused bits in the last byte
-                    if DIMS % 8 != 0 {
+                    if !DIMS.is_multiple_of(8) {
                         let mask = (1u8 << (DIMS % 8)) - 1;
                         if let Some(last) = bits.last_mut() {
                             *last &= mask;

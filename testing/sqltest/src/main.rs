@@ -426,7 +426,7 @@ async fn run_tests(
         "pg" => {
             // --binary defaults to tursodb for the cli backend; for pg the
             // server binary is tursopg, so rewrite an untouched default.
-            let binary = if binary == PathBuf::from("tursodb") {
+            let binary = if binary == std::path::Path::new("tursodb") {
                 PathBuf::from("tursopg")
             } else {
                 binary
@@ -746,30 +746,30 @@ fn convert_single_file(
         // If multiple files, create a subdirectory
         let (output_base, use_subdir) = if num_files > 1 {
             let subdir = base_dir.join(file_stem.as_ref());
-            if !subdir.exists() {
-                if let Err(e) = std::fs::create_dir_all(&subdir) {
-                    eprintln!(
-                        "  {} Failed to create directory {}: {}",
-                        "ERROR".red().bold(),
-                        subdir.display(),
-                        e
-                    );
-                    return (0, warning_count);
-                }
+            if !subdir.exists()
+                && let Err(e) = std::fs::create_dir_all(&subdir)
+            {
+                eprintln!(
+                    "  {} Failed to create directory {}: {}",
+                    "ERROR".red().bold(),
+                    subdir.display(),
+                    e
+                );
+                return (0, warning_count);
             }
             (subdir, true)
         } else {
             // Ensure base dir exists
-            if !base_dir.exists() {
-                if let Err(e) = std::fs::create_dir_all(&base_dir) {
-                    eprintln!(
-                        "  {} Failed to create directory {}: {}",
-                        "ERROR".red().bold(),
-                        base_dir.display(),
-                        e
-                    );
-                    return (0, warning_count);
-                }
+            if !base_dir.exists()
+                && let Err(e) = std::fs::create_dir_all(&base_dir)
+            {
+                eprintln!(
+                    "  {} Failed to create directory {}: {}",
+                    "ERROR".red().bold(),
+                    base_dir.display(),
+                    e
+                );
+                return (0, warning_count);
             }
             (base_dir, false)
         };
@@ -830,16 +830,16 @@ async fn generate_debug_databases(
     eprintln!();
 
     // Create output directory if it doesn't exist
-    if !output_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&output_dir) {
-            eprintln!(
-                "{}: Failed to create output directory {}: {}",
-                "Error".red().bold(),
-                output_dir.display(),
-                e
-            );
-            return ExitCode::from(1);
-        }
+    if !output_dir.exists()
+        && let Err(e) = std::fs::create_dir_all(&output_dir)
+    {
+        eprintln!(
+            "{}: Failed to create output directory {}: {}",
+            "Error".red().bold(),
+            output_dir.display(),
+            e
+        );
+        return ExitCode::from(1);
     }
 
     // Generate default database (INTEGER PRIMARY KEY - has rowid alias)

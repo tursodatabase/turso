@@ -461,12 +461,12 @@ fn generate_function_arg<C: Capabilities>(
 ) -> Result<Expr, GenError> {
     // Check if this function has integer argument constraints (e.g., zeroblob)
     if let Some(max_val) = func.int_arg_max {
-        if let Some(expected_type) = func.arg_type_at(arg_index) {
-            if expected_type == DataType::Integer {
-                // Generate a constrained integer literal
-                let val = ctx.gen_range_inclusive(0, max_val as usize) as i64;
-                return Ok(Expr::literal(ctx, Literal::Integer(val)));
-            }
+        if let Some(expected_type) = func.arg_type_at(arg_index)
+            && expected_type == DataType::Integer
+        {
+            // Generate a constrained integer literal
+            let val = ctx.gen_range_inclusive(0, max_val as usize) as i64;
+            return Ok(Expr::literal(ctx, Literal::Integer(val)));
         }
         // If no specific type, still apply the constraint for safety
         if func.arg_types.is_empty() {

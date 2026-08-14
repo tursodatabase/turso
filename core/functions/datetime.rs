@@ -1535,7 +1535,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_date(&[input.clone()]);
+            let result = exec_date(std::slice::from_ref(&input));
             assert_eq!(
                 result,
                 Value::build_text(expected.to_string()),
@@ -1709,7 +1709,7 @@ mod tests {
         ];
 
         for case in invalid_cases {
-            let result = exec_time(&[case.clone()]);
+            let result = exec_time(std::slice::from_ref(&case));
             assert_eq!(result, Value::Null);
         }
     }

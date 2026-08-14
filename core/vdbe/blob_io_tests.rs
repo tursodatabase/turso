@@ -827,7 +827,7 @@ fn blob_boundary_read_write_sweep() {
     // back through SQL substr (independent of the blob write path).
     let mut blob = conn.blob_open("t", "data", 1, true).unwrap();
     for &(off, len) in &[(4090usize, 6usize), (4092, 8184), (0, 4093), (19990, 10)] {
-        let repl: Vec<u8> = (0..len).map(|i| (255 - (i as u8))).collect();
+        let repl: Vec<u8> = (0..len).map(|i| 255 - (i as u8)).collect();
         blob.write(off, &repl).unwrap();
         let mut sq = conn
             .query(format!(

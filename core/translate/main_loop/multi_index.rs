@@ -456,7 +456,7 @@ pub(super) fn emit_multi_index_scan_loop(
 
     let final_rowset = if is_intersection && multi_idx_op.branches.len() > 1 {
         let num_swaps = multi_idx_op.branches.len().saturating_sub(2);
-        if num_swaps % 2 == 0 {
+        if num_swaps.is_multiple_of(2) {
             rowset2_reg
         } else {
             rowset1_reg

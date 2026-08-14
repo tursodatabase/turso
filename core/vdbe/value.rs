@@ -261,10 +261,12 @@ impl Value {
             }
 
             let code = get_code(b);
-            if code.is_some() && code != prev_code {
-                result.push(code.unwrap());
-                prev_code = code;
-            } else if code.is_none() {
+            if let Some(c) = code {
+                if code != prev_code {
+                    result.push(c);
+                    prev_code = code;
+                }
+            } else {
                 // Reset previous code for vowels/separators (a,e,i,o,u,y)
                 prev_code = None;
             }
@@ -2120,7 +2122,7 @@ mod tests {
 
     #[test]
     fn test_exec_and() {
-        let inputs = vec![
+        let inputs = [
             (Value::from_i64(0), Value::Null),
             (Value::Null, Value::from_i64(1)),
             (Value::Null, Value::Null),

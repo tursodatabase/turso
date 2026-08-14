@@ -39,6 +39,7 @@ struct JsonRpcError {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 struct InitializeRequest {
     #[serde(rename = "protocolVersion")]
     protocol_version: String,

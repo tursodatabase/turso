@@ -4158,11 +4158,10 @@ pub fn op_transaction_inner(
                                     return Err(err);
                                 }
                             }
-                        } else if write {
+                        } else if let (Some((tx_id, current_mode)), true) = (current_mv_tx, write) {
                             // Upgrade: attached DB has a Read/Concurrent tx but the
                             // statement needs write access. Mirror the main DB's
                             // upgrade logic so that exclusive locks are acquired.
-                            let (tx_id, current_mode) = current_mv_tx.unwrap();
                             if matches!(current_mode, TransactionMode::None | TransactionMode::Read)
                                 && matches!(tx_mode, TransactionMode::Write)
                             {
@@ -5085,7 +5084,9 @@ pub fn op_integer(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Default)]
 pub enum OpProgramState {
+    #[default]
     Start,
     /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
     Step {
@@ -5099,12 +5100,6 @@ pub enum OpProgramState {
         /// value becomes visible again once the trigger returns.
         saved_changes_value: Option<i64>,
     },
-}
-
-impl Default for OpProgramState {
-    fn default() -> Self {
-        Self::Start
-    }
 }
 
 fn finish_subprogram(

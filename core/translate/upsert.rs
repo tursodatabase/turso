@@ -450,7 +450,6 @@ pub fn resolve_upsert_target(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Emit the bytecode to implement the `DO UPDATE` arm of an UPSERT.
 ///
 /// This routine is entered after the caller has determined that an INSERT
