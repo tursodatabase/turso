@@ -245,6 +245,13 @@ impl<K: MassKey, V: Clone + Send + Sync + 'static> MassMap<K, V> {
             .tree
             .remove_with_guard(bytes.as_ref(), &guard)
             .expect("masstree remove hit its internal retry limit");
+        // Push the removed value's retirement to the reclamation queue right
+        // away instead of letting it sit in seize's local batch (256 entries
+        // per thread). Removed values are `Arc`s to whole version chains —
+        // and removed transactions pin every chain their write set touched —
+        // so a lazily flushed batch holds megabytes of superseded chains
+        // long after GC unlinked them.
+        self.tree.flush(&guard);
         removed.map(|value| MassEntry {
             key: key.clone(),
             value: V::clone(&value),
