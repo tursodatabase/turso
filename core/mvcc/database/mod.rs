@@ -5429,46 +5429,50 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<Option<Row>> {
         tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
 
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
-        turso_assert_eq!(tx.state, TransactionState::Active);
-        match maybe_index_id {
-            Some(index_id) => {
-                let rows = self.get_or_create_index_rows(index_id)?;
-                let rows = rows.value();
-                let RowKey::Record(sortable_key) = &id.row_id else {
-                    panic!("Index reads must have a record row_id");
-                };
-                let row_versions_opt = rows.get(sortable_key);
-                if let Some(ref row_versions) = row_versions_opt {
-                    let row_versions = row_versions.value().read();
-                    if let Some(rv) = row_versions
-                        .iter()
-                        .rev()
-                        .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-                    {
-                        return Ok(Some(rv.row.clone()));
+        // Probe-and-inspect: borrow the reading tx and the version chain in
+        // place, and clone only the visible row out. The `get` this replaces
+        // cloned the tx Arc (and, before visibility ran, the chain Arc) just
+        // to drop them again on return.
+        self.txs
+            .with_value(&tx_id, |tx| {
+                turso_assert_eq!(tx.state, TransactionState::Active);
+                match maybe_index_id {
+                    Some(index_id) => {
+                        let rows = self.get_or_create_index_rows(index_id)?;
+                        let rows = rows.value();
+                        let RowKey::Record(sortable_key) = &id.row_id else {
+                            panic!("Index reads must have a record row_id");
+                        };
+                        let row_versions_opt = rows.get(sortable_key);
+                        if let Some(ref row_versions) = row_versions_opt {
+                            let row_versions = row_versions.value().read();
+                            if let Some(rv) = row_versions.iter().rev().find(|rv| {
+                                rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states)
+                            }) {
+                                return Ok(Some(rv.row.clone()));
+                            }
+                        }
+                        Ok(None)
+                    }
+                    None => {
+                        let row = self
+                            .rows
+                            .with_value(id, |versions| {
+                                let versions = versions.read();
+                                versions
+                                    .iter()
+                                    .rev()
+                                    .find(|rv| {
+                                        rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states)
+                                    })
+                                    .map(|rv| rv.row.clone())
+                            })
+                            .flatten();
+                        Ok(row)
                     }
                 }
-                Ok(None)
-            }
-            None => {
-                if let Some(row_versions) = self.rows.get(id) {
-                    let row_versions = row_versions.value().read();
-                    if let Some(rv) = row_versions
-                        .iter()
-                        .rev()
-                        .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-                    {
-                        return Ok(Some(rv.row.clone()));
-                    }
-                }
-                Ok(None)
-            }
-        }
+            })
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?
     }
 
     /// Like the table branch of [`read_from_table_or_index`], but reads from an
@@ -10161,17 +10165,16 @@ fn lookup_tx_state<A: ConcurrentAllocator>(
     finalized_tx_states: &MassMap<TxID, TransactionState>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
-    txs.get(&tx_id)
-        .map(|entry| entry.value().state.load())
-        .or_else(|| finalized_tx_states.get(&tx_id).map(|entry| *entry.value()))
+    txs.with_value(&tx_id, |tx| tx.state.load())
+        .or_else(|| finalized_tx_states.with_value(&tx_id, |state| *state))
 }
 
 fn lookup_finalized_tx_state(
     finalized_tx_states: &MassMap<TxID, TransactionState>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
-    finalized_tx_states.get(&tx_id).map(|entry| {
-        let state = *entry.value();
+    finalized_tx_states.with_value(&tx_id, |state| {
+        let state = *state;
         turso_assert!(
             !matches!(
                 state,
@@ -10198,53 +10201,54 @@ fn is_begin_visible<A: ConcurrentAllocator>(
             tx.begin_ts > rv_begin_ts
         }
         Some(TxTimestampOrID::TxID(rv_begin)) => {
-            let visible = match txs.get(&rv_begin) {
-                Some(tb_entry) => {
-                    let tb = tb_entry.value();
-                    let visible = match tb.state.load() {
-                        TransactionState::Active => tx.tx_id == tb.tx_id && rv.end().is_none(),
-                        TransactionState::Preparing(end_ts) => {
-                            // Hekaton Table 1 / Section 2.5: speculative read of TB.
-                            // If begin_ts > end_ts, the version would be visible once TB
-                            // commits. Speculatively return true and register a dependency.
-                            // Fixes partial commit visibility (Bug #8).
-                            turso_assert!(
-                                tx.tx_id != tb.tx_id,
-                                "a txn cannot read its own row versions during prepare"
-                            );
-                            turso_assert!(
-                                tx.begin_ts != end_ts,
-                                "begin_ts and preparing end_ts cannot be equal: txn timestamps are strictly monotonic"
-                            );
-                            if tx.begin_ts > end_ts {
-                                register_commit_dependency(txs, tx, rv_begin);
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        TransactionState::Committed(committed_ts) => {
-                            turso_assert!(
-                                tx.begin_ts != committed_ts,
-                                "begin_ts and committed_ts cannot be equal: txn timestamps are strictly monotonic"
-                            );
-                            tx.begin_ts > committed_ts
-                        }
-                        TransactionState::Aborted => false,
-                        TransactionState::Terminated => {
-                            tracing::debug!(
-                                "TODO: should reread rv's end field - it should have updated the timestamp in the row version by now"
-                            );
+            // Probe-and-inspect: borrow the owning tx in place instead of
+            // cloning its Arc out of the map for a state check.
+            let visible = match txs.with_value(&rv_begin, |tb| {
+                let visible = match tb.state.load() {
+                    TransactionState::Active => tx.tx_id == tb.tx_id && rv.end().is_none(),
+                    TransactionState::Preparing(end_ts) => {
+                        // Hekaton Table 1 / Section 2.5: speculative read of TB.
+                        // If begin_ts > end_ts, the version would be visible once TB
+                        // commits. Speculatively return true and register a dependency.
+                        // Fixes partial commit visibility (Bug #8).
+                        turso_assert!(
+                            tx.tx_id != tb.tx_id,
+                            "a txn cannot read its own row versions during prepare"
+                        );
+                        turso_assert!(
+                            tx.begin_ts != end_ts,
+                            "begin_ts and preparing end_ts cannot be equal: txn timestamps are strictly monotonic"
+                        );
+                        if tx.begin_ts > end_ts {
+                            register_commit_dependency(txs, tx, rv_begin);
+                            true
+                        } else {
                             false
                         }
-                    };
-                    tracing::trace!(
-                        "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
-                        rv.begin(),
-                        rv.end()
-                    );
-                    visible
-                }
+                    }
+                    TransactionState::Committed(committed_ts) => {
+                        turso_assert!(
+                            tx.begin_ts != committed_ts,
+                            "begin_ts and committed_ts cannot be equal: txn timestamps are strictly monotonic"
+                        );
+                        tx.begin_ts > committed_ts
+                    }
+                    TransactionState::Aborted => false,
+                    TransactionState::Terminated => {
+                        tracing::debug!(
+                            "TODO: should reread rv's end field - it should have updated the timestamp in the row version by now"
+                        );
+                        false
+                    }
+                };
+                tracing::trace!(
+                    "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
+                    rv.begin(),
+                    rv.end()
+                );
+                visible
+            }) {
+                Some(visible) => visible,
                 None => match lookup_finalized_tx_state(finalized_tx_states, rv_begin) {
                     Some(TransactionState::Committed(committed_ts)) => {
                         turso_assert!(
@@ -10283,43 +10287,42 @@ fn is_end_visible<A: ConcurrentAllocator>(
     match row_version.end() {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let visible = match txs.get(&rv_end) {
-                Some(other_tx_entry) => {
-                    let other_tx = other_tx_entry.value();
-                    let visible = match other_tx.state.load() {
-                        // V's sharp mind discovered an issue with the hekaton paper which basically states that a
-                        // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
-                        // Source: https://avi.im/blag/2023/hekaton-paper-typo/
-                        TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                        // Hekaton Table 2: speculative ignore of TE. If end_ts < begin_ts,
-                        // we speculatively ignore V (treat deletion as committed). Register a
-                        // dependency in case TE aborts (then V should have been visible).
-                        TransactionState::Preparing(end_ts) => {
-                            turso_assert!(
-                                current_tx.tx_id != other_tx.tx_id,
-                                "a txn is reading itself while preparing"
-                            );
-                            let visible = current_tx.begin_ts < end_ts;
-                            if !visible {
-                                register_commit_dependency(txs, current_tx, rv_end);
-                            }
-                            visible
+            // Probe-and-inspect: borrow the ending tx in place instead of
+            // cloning its Arc out of the map for a state check.
+            let visible = match txs.with_value(&rv_end, |other_tx| {
+                let visible = match other_tx.state.load() {
+                    // V's sharp mind discovered an issue with the hekaton paper which basically states that a
+                    // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
+                    // Source: https://avi.im/blag/2023/hekaton-paper-typo/
+                    TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
+                    // Hekaton Table 2: speculative ignore of TE. If end_ts < begin_ts,
+                    // we speculatively ignore V (treat deletion as committed). Register a
+                    // dependency in case TE aborts (then V should have been visible).
+                    TransactionState::Preparing(end_ts) => {
+                        turso_assert!(
+                            current_tx.tx_id != other_tx.tx_id,
+                            "a txn is reading itself while preparing"
+                        );
+                        let visible = current_tx.begin_ts < end_ts;
+                        if !visible {
+                            register_commit_dependency(txs, current_tx, rv_end);
                         }
-                        TransactionState::Committed(committed_ts) => {
-                            current_tx.begin_ts < committed_ts
-                        }
-                        TransactionState::Aborted => true,
-                        // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
-                        // reachable from Aborted, and abort rollback resets end to None → visible.
-                        TransactionState::Terminated => true,
-                    };
-                    tracing::trace!(
-                        "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
-                        row_version.begin(),
-                        row_version.end()
-                    );
-                    visible
-                }
+                        visible
+                    }
+                    TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
+                    TransactionState::Aborted => true,
+                    // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
+                    // reachable from Aborted, and abort rollback resets end to None → visible.
+                    TransactionState::Terminated => true,
+                };
+                tracing::trace!(
+                    "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
+                    row_version.begin(),
+                    row_version.end()
+                );
+                visible
+            }) {
+                Some(visible) => visible,
                 None => match lookup_finalized_tx_state(finalized_tx_states, rv_end) {
                     Some(TransactionState::Committed(committed_ts)) => {
                         current_tx.begin_ts < committed_ts

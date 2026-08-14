@@ -178,6 +178,25 @@ impl<K: MassKey, V: Clone + Send + Sync + 'static> MassMap<K, V> {
             })
     }
 
+    /// Run `f` against the value mapped to `key` without cloning it out.
+    /// Lock-free.
+    ///
+    /// This is the hot-path variant of [`Self::get`] for probe-and-inspect
+    /// call sites: `get` clones the value (an `Arc` bump plus the later drop)
+    /// only for the caller to look at a field and throw the clone away.
+    ///
+    /// `f` runs under the tree's epoch guard, which keeps the borrowed value
+    /// alive even if a concurrent remove unlinks it mid-call. Map operations
+    /// inside `f` are safe (guards nest, and no lock is held here), but keep
+    /// `f` short: every guard alive delays reclamation of retired values.
+    pub fn with_value<F: FnOnce(&V) -> R, R>(&self, key: &K, f: F) -> Option<R> {
+        let bytes = key.encode();
+        let guard = self.tree.guard();
+        self.tree
+            .get_with_guard(bytes.as_ref(), &guard)
+            .map(|value| f(&value))
+    }
+
     /// Insert `value` under `key`, replacing any existing value (upsert),
     /// like the skip list's `insert`.
     pub fn insert(&self, key: K, value: V) -> MassEntry<K, V> {
