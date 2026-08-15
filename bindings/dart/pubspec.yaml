@@ -1,0 +1,16 @@
+name: turso
+description: Dart FFI bindings for Turso, an in-process SQL database written in Rust.
+version: 0.8.0-pre.4
+repository: https://github.com/tursodatabase/turso
+
+environment:
+  sdk: ^3.3.0
+
+dependencies:
+  code_assets: ^1.2.1
+  ffi: ^2.1.0
+  hooks: ^2.1.0
+
+dev_dependencies:
+  ffigen: ^21.0.0
+  test: ^1.25.0

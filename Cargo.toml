@@ -53,7 +53,9 @@ members = [
     "testing/differential-oracle/fuzzer",
     "testing/sqltest"
 ]
-exclude = ["perf/latency/limbo"]
+# bindings/wasm only builds for wasm32-unknown-unknown, so it stays out of the
+# workspace rather than breaking host builds.
+exclude = ["perf/latency/limbo", "bindings/wasm"]
 
 default-members = [
     "bindings/java",

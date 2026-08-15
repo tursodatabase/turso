@@ -1,0 +1,23 @@
+{
+  "name": "turso-wasm-todo-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "cd .. && wasm-pack build --target web",
+    "dev": "vite",
+    "start": "vite",
+    "prebuild": "cd .. && wasm-pack build --target web",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "solid-js": "^1.9.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.4",
+    "tailwindcss": "^4.1.4",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.3",
+    "vite-plugin-solid": "^2.11.6"
+  }
+}

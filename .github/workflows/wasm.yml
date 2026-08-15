@@ -1,0 +1,43 @@
+name: Wasm
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bindings/wasm/**'
+      - 'core/**'
+      - '.github/workflows/wasm.yml'
+  pull_request:
+    paths:
+      - 'bindings/wasm/**'
+      - 'core/**'
+      - '.github/workflows/wasm.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bindings/wasm
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the version; only the target is missing.
+      - run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/wasm
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown --all-targets -- --deny=warnings
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - run: wasm-pack build --target web
+      # These cover the SQL surface against the in-memory backend and need no
+      # browser API, so they run under Node. OPFS needs a real Web Worker, so
+      # example/ is what exercises that path.
+      - run: wasm-pack test --node

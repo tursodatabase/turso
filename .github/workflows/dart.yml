@@ -1,0 +1,99 @@
+name: Dart
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bindings/dart/**'
+      - 'bindings/c/**'
+      - '.github/workflows/dart.yml'
+  pull_request:
+    paths:
+      - 'bindings/dart/**'
+      - 'bindings/c/**'
+      - '.github/workflows/dart.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: bindings/dart
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: dart pub get
+      - run: dart analyze
+      - run: dart format --output=none --set-exit-if-changed lib test hook
+      # The build hook compiles the crate, so this covers the FFI surface too.
+      - run: dart test
+
+  example:
+    name: Example app
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: bindings/dart/example
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+      - run: flutter build macos --debug
+
+  xcframework:
+    name: XCFramework
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: bindings/dart
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ./tool/build_native.sh xcframework
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Turso.xcframework
+          path: bindings/dart/build/Turso.xcframework
+
+  aar:
+    name: AAR
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bindings/dart
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27
+      - run: cargo install cargo-ndk
+      - run: ./tool/build_native.sh aar
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turso-aar
+          path: bindings/dart/build/turso.aar
