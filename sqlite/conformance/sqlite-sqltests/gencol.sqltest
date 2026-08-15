@@ -5064,3 +5064,17 @@ test update-or-virtual-deferred-seek-no-panic-explicit-index {
 expect error {
     UNIQUE constraint failed
 }
+
+setup gencol_explain_physical_columns {
+    CREATE TABLE t(a INT, b INT, v INT AS (a + b) VIRTUAL, c INT);
+}
+
+@setup gencol_explain_physical_columns
+snapshot gencol_explain_column_after_virtual {
+    SELECT c FROM t;
+}
+
+@setup gencol_explain_physical_columns
+snapshot gencol_explain_column_range_across_virtual {
+    SELECT b, c FROM t;
+}

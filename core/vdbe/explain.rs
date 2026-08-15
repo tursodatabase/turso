@@ -583,8 +583,12 @@ pub fn insn_to_row(
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name: Option<&String> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
-                        name
+                        table
+                            .logical_to_physical_map
+                            .iter()
+                            .position(|physical| physical == column)
+                            .and_then(|logical| table.columns().get(logical))
+                            .and_then(|column| column.name.as_ref())
                     }
                     CursorType::BTreeIndex(index) => {
                         let name = index.columns.get(*column).map(|c| &c.name);
@@ -628,7 +632,11 @@ pub fn insn_to_row(
                 let column_name = |column: usize| -> String {
                     let name: Option<&String> = match cursor_type {
                         CursorType::BTreeTable(table) => {
-                            table.columns().get(column).and_then(|v| v.name.as_ref())
+                            table.logical_to_physical_map
+                                .iter()
+                                .position(|&physical| physical == column)
+                                .and_then(|logical| table.columns().get(logical))
+                                .and_then(|column| column.name.as_ref())
                         }
                         CursorType::BTreeIndex(index) => index.columns.get(column).map(|c| &c.name),
                         _ => {
