@@ -5067,6 +5067,7 @@ expect error {
 
 setup gencol_explain_physical_columns {
     CREATE TABLE t(a INT, b INT, v INT AS (a + b) VIRTUAL, c INT);
+    PRAGMA wal_checkpoint(TRUNCATE);
 }
 
 @setup gencol_explain_physical_columns
