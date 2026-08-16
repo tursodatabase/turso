@@ -182,6 +182,7 @@ pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
+pub use vdbe::value::ValueExecOps;
 pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 
 /// Database index for the main database (always 0 in SQLite).

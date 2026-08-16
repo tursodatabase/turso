@@ -1,5 +1,6 @@
 #![no_main]
 
+use turso_core::ValueExecOps;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use turso_core::functions::datetime::{

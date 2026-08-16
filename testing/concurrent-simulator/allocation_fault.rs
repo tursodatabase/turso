@@ -266,6 +266,9 @@ fn splitmix64(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the cfg(nightly) allocation-fault test calls Value's exec_* methods.
+    #[cfg(nightly)]
+    use turso_core::ValueExecOps;
 
     #[test]
     fn probability_threshold_handles_edges() {

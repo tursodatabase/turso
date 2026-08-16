@@ -2,9 +2,11 @@
 //! the main crate rather than in `turso_core_io`.
 
 use crate::io::*;
+use crate::io::clock::{MonotonicInstant, WallClockInstant};
+use crate::sync::Arc;
 use crate::vdbe::StepResult;
 use crate::SqliteDialect;
-use crate::{Database, IOResult, OpenFlags};
+use crate::{Database, IOResult, OpenFlags, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 struct StepGuardedIO {
@@ -44,7 +46,7 @@ impl IO for StepGuardedIO {
         self.inner.remove_file(path)
     }
 
-    fn file_id(&self, path: &str) -> Result<super::super::FileId> {
+    fn file_id(&self, path: &str) -> Result<crate::io::FileId> {
         self.inner.file_id(path)
     }
 
