@@ -5123,12 +5123,14 @@ mod tests {
             Value::Blob(vec![0]),
             Value::Blob(vec![1, 2]),
             Value::Blob(vec![1, 3]),
-            Value::Blob(b"a".to_vec()),
+            Value::Blob(vec![b'a']),
         ]
     }
 
     fn all_key_infos() -> Vec<KeyInfo> {
-        let mut key_infos = Vec::new();
+        // The alloc `vec!` macro so the element type matches the module's
+        // allocator-aware `Vec` alias under `--cfg nightly`.
+        let mut key_infos = vec![];
         for sort_order in [SortOrder::Asc, SortOrder::Desc] {
             for collation in [
                 CollationSeq::Unset,
