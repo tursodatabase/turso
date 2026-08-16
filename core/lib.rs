@@ -31,7 +31,7 @@ pub mod json;
 mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod numeric;
+pub use turso_core_types::numeric;
 pub mod schema;
 pub use turso_core_common::skiplist;
 pub use turso_core_io::state_machine;
@@ -62,7 +62,7 @@ mod info;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod numeric;
+pub(crate) use turso_core_types::numeric;
 mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;

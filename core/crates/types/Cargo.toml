@@ -18,6 +18,8 @@ path = "lib.rs"
 
 [features]
 default = []
+allocation_metric = ["turso_core_common/allocation_metric"]
+json = []
 serde = ["dep:serde", "turso_core_common/serde"]
 
 [dependencies]
@@ -25,7 +27,11 @@ turso_core_common = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 turso_macros = { workspace = true }
 turso_parser = { workspace = true }
+bigdecimal = "0.4"
 branches = { version = "0.4.3", default-features = false }
+either = { workspace = true }
+num-bigint = "0.4"
+num-traits = "0.2"
 hex = { workspace = true }
 libm = "0.2"
 ryu = "1.0.19"

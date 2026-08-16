@@ -163,19 +163,108 @@ fn sqlite_text_prefix(s: &str) -> &str {
     }
 }
 
-enum TrimType {
+pub enum TrimType {
     All,
     Left,
     Right,
 }
 
-impl Value {
-    pub fn exec_lower(&self) -> Option<Self> {
+/// SQL operator and scalar-function semantics on [`Value`].
+///
+/// `Value` lives in `turso_core_types`, but these operations depend on
+/// collation resolution, affinity and math-function plumbing from this
+/// crate, so they hang off an extension trait instead of inherent methods.
+pub trait ValueExecOps: Sized {
+    /// 1 GiB, matching SQLITE_MAX_LENGTH's default.
+    const MAX_BLOB_LENGTH: i64 = 1_000_000_000;
+
+    fn exec_lower(&self) -> Option<Self>;
+    fn exec_length(&self) -> Self;
+    fn exec_octet_length(&self) -> Self;
+    fn exec_upper(&self) -> Option<Self>;
+    fn exec_sign(&self) -> Option<Value>;
+    fn exec_soundex(&self) -> Value;
+    fn exec_abs(&self) -> Result<Self>;
+    // Only exercised from tests and benches in-crate; real callers go through
+    // the RANDOM() opcode which inlines the generator.
+    #[allow(dead_code)]
+    fn exec_random<F>(generate_random_number: F) -> Self
+    where
+        F: Fn() -> i64;
+    fn exec_randomblob<F>(&self, fill_bytes: F) -> Result<Value>
+    where
+        F: Fn(&mut [u8]);
+    fn exec_quote(&self) -> Self;
+    fn exec_unistr_quote(&self) -> Self;
+    fn exec_nullif(&self, second_value: &Self) -> Self;
+    fn exec_substring(
+        value: &Value,
+        start_value: &Value,
+        length_value: Option<&Value>,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError>;
+    fn exec_instr(&self, pattern: &Value) -> Value;
+    fn exec_typeof(&self) -> Value;
+    fn exec_hex(&self) -> Value;
+    fn exec_unhex(&self, ignored_chars: Option<&Value>) -> Value;
+    fn byte_view(&self) -> Option<std::borrow::Cow<'_, [u8]>>;
+    fn exec_get_byte(&self, offset: &Value) -> Result<Value>;
+    fn exec_set_byte(&self, offset: &Value, new_value: &Value) -> Result<Value>;
+    fn exec_unicode(&self) -> Value;
+    fn exec_unistr(&self) -> Result<Value>;
+    fn exec_round(&self, precision: Option<&Value>) -> Value;
+    fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value;
+    fn exec_trim(&self, pattern: Option<&Value>) -> Value;
+    fn exec_rtrim(&self, pattern: Option<&Value>) -> Value;
+    fn exec_ltrim(&self, pattern: Option<&Value>) -> Value;
+    fn exec_zeroblob(&self) -> Result<Value>;
+    fn exec_if(&self, jump_if_null: bool, not: bool) -> bool;
+    fn exec_cast(
+        &self,
+        datatype: &str,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError>;
+    fn exec_replace(
+        source: &Value,
+        pattern: &Value,
+        replacement: &Value,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError>;
+    fn exec_math_unary(&self, function: &MathFunc) -> Value;
+    fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value;
+    fn exec_math_log(&self, base: Option<&Value>) -> Value;
+    fn exec_add(&self, rhs: &Value) -> Value;
+    fn exec_subtract(&self, rhs: &Value) -> Value;
+    fn exec_multiply(&self, rhs: &Value) -> Value;
+    fn exec_divide(&self, rhs: &Value) -> Value;
+    fn exec_bit_and(&self, rhs: &Value) -> Value;
+    fn exec_bit_or(&self, rhs: &Value) -> Value;
+    fn exec_remainder(&self, rhs: &Value) -> Value;
+    fn exec_bit_not(&self) -> Value;
+    fn exec_shift_left(&self, rhs: &Value) -> Value;
+    fn exec_shift_right(&self, rhs: &Value) -> Value;
+    fn exec_boolean_not(&self) -> Value;
+    fn exec_concat(&self, rhs: &Value)
+        -> std::result::Result<Value, crate::alloc::TryReserveError>;
+    fn exec_and(&self, rhs: &Value) -> Value;
+    fn exec_or(&self, rhs: &Value) -> Value;
+    fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError>;
+    fn exec_glob(pattern: &str, text: &str) -> Result<bool, LimboError>;
+    fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value;
+    fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value;
+    fn exec_group_concat(
+        &mut self,
+        other: &Value,
+    ) -> std::result::Result<(), crate::alloc::TryReserveError>;
+    fn exec_concat_strings<'a, T: Iterator<Item = &'a Value>>(registers: T) -> Self;
+    fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Value>>(registers: T) -> Self;
+    fn exec_char<'a, T: Iterator<Item = &'a Value>>(values: T) -> Self;
+}
+
+impl ValueExecOps for Value {
+    fn exec_lower(&self) -> Option<Self> {
         self.cast_text()
             .map(|s| Value::build_text(s.to_ascii_lowercase()))
     }
 
-    pub fn exec_length(&self) -> Self {
+    fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
                 Value::from_i64(sqlite_text_prefix(t.as_str()).chars().count() as i64)
@@ -189,7 +278,7 @@ impl Value {
         }
     }
 
-    pub fn exec_octet_length(&self) -> Self {
+    fn exec_octet_length(&self) -> Self {
         match self {
             Value::Text(s) => Value::from_i64(s.as_str().len() as i64),
             Value::Blob(blob) => Value::from_i64(blob.len() as i64),
@@ -198,12 +287,12 @@ impl Value {
         }
     }
 
-    pub fn exec_upper(&self) -> Option<Self> {
+    fn exec_upper(&self) -> Option<Self> {
         self.cast_text()
             .map(|s| Value::build_text(s.to_ascii_uppercase()))
     }
 
-    pub fn exec_sign(&self) -> Option<Value> {
+    fn exec_sign(&self) -> Option<Value> {
         let v = Numeric::from_value_strict(self).map(|value| value.to_f64())?;
 
         Some(Value::from_i64(if v > 0.0 {
@@ -216,7 +305,7 @@ impl Value {
     }
 
     /// Generates the Soundex code for a given word
-    pub fn exec_soundex(&self) -> Value {
+    fn exec_soundex(&self) -> Value {
         let s = match self {
             Value::Text(s) => s.as_str(),
             Value::Null => return Value::build_text("?000"),
@@ -277,7 +366,7 @@ impl Value {
         Value::build_text(result)
     }
 
-    pub fn exec_abs(&self) -> Result<Self> {
+    fn exec_abs(&self) -> Result<Self> {
         Ok(match self {
             Value::Null => Value::Null,
             Value::Numeric(Numeric::Integer(v)) => {
@@ -298,7 +387,7 @@ impl Value {
         })
     }
 
-    pub fn exec_random<F>(generate_random_number: F) -> Self
+    fn exec_random<F>(generate_random_number: F) -> Self
     where
         F: Fn() -> i64,
     {
@@ -306,9 +395,8 @@ impl Value {
     }
 
     /// SQLite default max blob/string size (1GB)
-    pub const MAX_BLOB_LENGTH: i64 = 1_000_000_000;
 
-    pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Result<Value>
+    fn exec_randomblob<F>(&self, fill_bytes: F) -> Result<Value>
     where
         F: Fn(&mut [u8]),
     {
@@ -329,7 +417,7 @@ impl Value {
         Ok(Value::Blob(blob))
     }
 
-    pub fn exec_quote(&self) -> Self {
+    fn exec_quote(&self) -> Self {
         use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
@@ -366,7 +454,7 @@ impl Value {
         }
     }
 
-    pub fn exec_unistr_quote(&self) -> Self {
+    fn exec_unistr_quote(&self) -> Self {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
         match self {
@@ -425,7 +513,7 @@ impl Value {
         }
     }
 
-    pub fn exec_nullif(&self, second_value: &Self) -> Self {
+    fn exec_nullif(&self, second_value: &Self) -> Self {
         if self != second_value {
             self.clone()
         } else {
@@ -433,7 +521,7 @@ impl Value {
         }
     }
 
-    pub fn exec_substring(
+    fn exec_substring(
         value: &Value,
         start_value: &Value,
         length_value: Option<&Value>,
@@ -562,7 +650,7 @@ impl Value {
         })
     }
 
-    pub fn exec_instr(&self, pattern: &Value) -> Value {
+    fn exec_instr(&self, pattern: &Value) -> Value {
         if self == &Value::Null || pattern == &Value::Null {
             return Value::Null;
         }
@@ -607,7 +695,7 @@ impl Value {
         }
     }
 
-    pub fn exec_typeof(&self) -> Value {
+    fn exec_typeof(&self) -> Value {
         match self {
             Value::Null => Value::build_text("null"),
             Value::Numeric(Numeric::Integer(_)) => Value::build_text("integer"),
@@ -617,7 +705,7 @@ impl Value {
         }
     }
 
-    pub fn exec_hex(&self) -> Value {
+    fn exec_hex(&self) -> Value {
         match self {
             Value::Text(_) | Value::Numeric(_) => {
                 let text = self.to_string();
@@ -628,7 +716,7 @@ impl Value {
         }
     }
 
-    pub fn exec_unhex(&self, ignored_chars: Option<&Value>) -> Value {
+    fn exec_unhex(&self, ignored_chars: Option<&Value>) -> Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
@@ -704,7 +792,7 @@ impl Value {
     /// `offset` as an integer in the range 0..=255. Raises an error when the
     /// offset falls outside `0..length-1`, matching PostgreSQL exactly. A `NULL`
     /// input or offset yields `NULL`.
-    pub fn exec_get_byte(&self, offset: &Value) -> Result<Value> {
+    fn exec_get_byte(&self, offset: &Value) -> Result<Value> {
         let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
             return Ok(Value::Null);
         };
@@ -725,7 +813,7 @@ impl Value {
     /// byte at the 0-based `offset` replaced by the low 8 bits of `newvalue`.
     /// Raises an error when the offset falls outside `0..length-1`, matching
     /// PostgreSQL exactly. A `NULL` input, offset, or value yields `NULL`.
-    pub fn exec_set_byte(&self, offset: &Value, new_value: &Value) -> Result<Value> {
+    fn exec_set_byte(&self, offset: &Value, new_value: &Value) -> Result<Value> {
         let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
             return Ok(Value::Null);
         };
@@ -752,7 +840,7 @@ impl Value {
         Ok(result)
     }
 
-    pub fn exec_unicode(&self) -> Value {
+    fn exec_unicode(&self) -> Value {
         match self {
             Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
                 let text = self.to_string();
@@ -769,7 +857,7 @@ impl Value {
         }
     }
 
-    pub fn exec_unistr(&self) -> Result<Value> {
+    fn exec_unistr(&self) -> Result<Value> {
         let text = match self {
             Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
             Value::Numeric(_) | Value::Blob(_) => std::borrow::Cow::Owned(self.to_string()),
@@ -829,7 +917,7 @@ impl Value {
         Ok(Value::build_text(out))
     }
 
-    pub fn exec_round(&self, precision: Option<&Value>) -> Value {
+    fn exec_round(&self, precision: Option<&Value>) -> Value {
         let Some(f) = Numeric::from_value(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
@@ -893,20 +981,20 @@ impl Value {
     }
 
     // Implements TRIM pattern matching.
-    pub fn exec_trim(&self, pattern: Option<&Value>) -> Value {
+    fn exec_trim(&self, pattern: Option<&Value>) -> Value {
         self._exec_trim(pattern, TrimType::All)
     }
     // Implements RTRIM pattern matching.
-    pub fn exec_rtrim(&self, pattern: Option<&Value>) -> Value {
+    fn exec_rtrim(&self, pattern: Option<&Value>) -> Value {
         self._exec_trim(pattern, TrimType::Right)
     }
 
     // Implements LTRIM pattern matching.
-    pub fn exec_ltrim(&self, pattern: Option<&Value>) -> Value {
+    fn exec_ltrim(&self, pattern: Option<&Value>) -> Value {
         self._exec_trim(pattern, TrimType::Left)
     }
 
-    pub fn exec_zeroblob(&self) -> Result<Value> {
+    fn exec_zeroblob(&self) -> Result<Value> {
         let length: i64 = match self {
             Value::Numeric(Numeric::Integer(i)) => *i,
             Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
@@ -923,14 +1011,14 @@ impl Value {
     }
 
     // exec_if returns whether you should jump
-    pub fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
+    fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
         Numeric::from_value(self)
             .map(|v| v.to_bool())
             .map(|jump| if not { !jump } else { jump })
             .unwrap_or(jump_if_null)
     }
 
-    pub fn exec_cast(
+    fn exec_cast(
         &self,
         datatype: &str,
     ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
@@ -1003,7 +1091,7 @@ impl Value {
         })
     }
 
-    pub fn exec_replace(
+    fn exec_replace(
         source: &Value,
         pattern: &Value,
         replacement: &Value,
@@ -1040,7 +1128,7 @@ impl Value {
         }
     }
 
-    pub fn exec_math_unary(&self, function: &MathFunc) -> Value {
+    fn exec_math_unary(&self, function: &MathFunc) -> Value {
         let v = Numeric::from_value_strict(self);
 
         // In case of some functions and integer input, return the input as is
@@ -1093,7 +1181,7 @@ impl Value {
         }
     }
 
-    pub fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
+    fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
         let Some(lhs) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
@@ -1122,7 +1210,7 @@ impl Value {
     /// their dedicated logarithm functions looks more accurate but shifts
     /// the result by 1 ulp relative to SQLite's ratio.
     #[allow(unused_unsafe)]
-    pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
+    fn exec_math_log(&self, base: Option<&Value>) -> Value {
         let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
@@ -1149,31 +1237,31 @@ impl Value {
         Value::from_f64(unsafe { cmath::log(f) } / log_base)
     }
 
-    pub fn exec_add(&self, rhs: &Value) -> Value {
+    fn exec_add(&self, rhs: &Value) -> Value {
         (|| Numeric::from_value(self)?.checked_add(Numeric::from_value(rhs)?))().into()
     }
 
-    pub fn exec_subtract(&self, rhs: &Value) -> Value {
+    fn exec_subtract(&self, rhs: &Value) -> Value {
         (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
     }
 
-    pub fn exec_multiply(&self, rhs: &Value) -> Value {
+    fn exec_multiply(&self, rhs: &Value) -> Value {
         (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
     }
 
-    pub fn exec_divide(&self, rhs: &Value) -> Value {
+    fn exec_divide(&self, rhs: &Value) -> Value {
         (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
     }
 
-    pub fn exec_bit_and(&self, rhs: &Value) -> Value {
+    fn exec_bit_and(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) & NullableInteger::from(rhs)).into()
     }
 
-    pub fn exec_bit_or(&self, rhs: &Value) -> Value {
+    fn exec_bit_or(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) | NullableInteger::from(rhs)).into()
     }
 
-    pub fn exec_remainder(&self, rhs: &Value) -> Value {
+    fn exec_remainder(&self, rhs: &Value) -> Value {
         let convert_to_float = matches!(Numeric::from_value(self), Some(Numeric::Float(_)))
             || matches!(Numeric::from_value(rhs), Some(Numeric::Float(_)));
 
@@ -1189,19 +1277,19 @@ impl Value {
         }
     }
 
-    pub fn exec_bit_not(&self) -> Value {
+    fn exec_bit_not(&self) -> Value {
         (!NullableInteger::from(self)).into()
     }
 
-    pub fn exec_shift_left(&self, rhs: &Value) -> Value {
+    fn exec_shift_left(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) << NullableInteger::from(rhs)).into()
     }
 
-    pub fn exec_shift_right(&self, rhs: &Value) -> Value {
+    fn exec_shift_right(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) >> NullableInteger::from(rhs)).into()
     }
 
-    pub fn exec_boolean_not(&self) -> Value {
+    fn exec_boolean_not(&self) -> Value {
         match Numeric::from_value(self).map(|v| v.to_bool()) {
             None => Value::Null,
             Some(v) => Value::from_i64(!v as i64),
@@ -1209,7 +1297,7 @@ impl Value {
     }
 
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Concat)]
-    pub fn exec_concat(
+    fn exec_concat(
         &self,
         rhs: &Value,
     ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
@@ -1234,7 +1322,7 @@ impl Value {
         Ok(Value::build_text(lhs + &rhs))
     }
 
-    pub fn exec_and(&self, rhs: &Value) -> Value {
+    fn exec_and(&self, rhs: &Value) -> Value {
         match (
             Numeric::from_value(self).map(|v| v.to_bool()),
             Numeric::from_value(rhs).map(|v| v.to_bool()),
@@ -1245,7 +1333,7 @@ impl Value {
         }
     }
 
-    pub fn exec_or(&self, rhs: &Value) -> Value {
+    fn exec_or(&self, rhs: &Value) -> Value {
         match (
             Numeric::from_value(self).map(|v| v.to_bool()),
             Numeric::from_value(rhs).map(|v| v.to_bool()),
@@ -1256,7 +1344,7 @@ impl Value {
         }
     }
 
-    pub fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError> {
+    fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError> {
         const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
         if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
             return Err(LimboError::Constraint(
@@ -1298,7 +1386,7 @@ impl Value {
         Ok(pattern_compare(pattern, text, &LIKE_INFO, escape) == CompareResult::Match)
     }
 
-    pub fn exec_glob(pattern: &str, text: &str) -> Result<bool, LimboError> {
+    fn exec_glob(pattern: &str, text: &str) -> Result<bool, LimboError> {
         const MAX_GLOB_PATTERN_LENGTH: usize = 50000;
         const GLOB_CHARS: [char; 3] = ['*', '?', '['];
 
@@ -1337,7 +1425,7 @@ impl Value {
         Ok(pattern_compare(pattern, text, &GLOB_INFO, None) == CompareResult::Match)
     }
 
-    pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
+    fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
         // SQLite: multi-arg min() returns NULL if ANY argument is NULL
         let mut result: Option<&Value> = None;
         for v in regs {
@@ -1353,7 +1441,7 @@ impl Value {
         result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
+    fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
         // SQLite: multi-arg max() returns NULL if ANY argument is NULL
         let mut result: Option<&Value> = None;
         for v in regs {
@@ -1371,7 +1459,7 @@ impl Value {
 
     /// Fallibly concatenate another value onto this Text value, converting it to a string.
     /// Panics if self is not a Text value.
-    pub fn exec_group_concat(
+    fn exec_group_concat(
         &mut self,
         other: &Value,
     ) -> std::result::Result<(), crate::alloc::TryReserveError> {
@@ -1405,7 +1493,7 @@ impl Value {
         Ok(())
     }
 
-    pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
+    fn exec_concat_strings<'a, T: Iterator<Item = &'a Value>>(registers: T) -> Self {
         let mut result = String::new();
         for val in registers {
             match val {
@@ -1419,7 +1507,7 @@ impl Value {
         Value::build_text(result)
     }
 
-    pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
+    fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Value>>(mut registers: T) -> Self {
         if registers.len() == 0 {
             return Value::Null;
         }
@@ -1441,7 +1529,7 @@ impl Value {
         Value::build_text(result)
     }
 
-    pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
+    fn exec_char<'a, T: Iterator<Item = &'a Value>>(values: T) -> Self {
         let result: String = values
             .map(|x| {
                 // char() coerces every argument to an integer codepoint, the
@@ -1730,6 +1818,7 @@ fn compare_chars(p: char, t: char, no_case: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::ValueExecOps;
     use crate::numeric::Numeric;
     use crate::types::Value;
     use crate::vdbe::Register;

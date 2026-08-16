@@ -30,7 +30,7 @@ use turso_ext::{
     ContextDestructor, ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind,
     VTabModuleImpl, ValueDestructor,
 };
-pub use turso_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
+pub use turso_ext::{FinalizeFunction, StepFunction};
 pub use vtab_xconnect::{execute, prepare_stmt};
 
 /// The context passed to extensions to register with Core
