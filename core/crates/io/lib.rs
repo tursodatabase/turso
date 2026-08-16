@@ -44,15 +44,19 @@ pub enum TempStore {
 }
 
 /// Handle to a VFS implementation registered by a loaded extension. Defined
-/// outside the `fs`-gated `vfs` module because the extension registry tracks
-/// these even in builds without the file-system backends.
+/// outside the `vfs` module so the type (not just the IO impl) is visible to
+/// the extension registry in the main crate.
+#[cfg(feature = "fs")]
 #[derive(Clone, Debug)]
 pub struct VfsMod {
     pub ctx: *const turso_ext::VfsImpl,
 }
 
+#[cfg(feature = "fs")]
 unsafe impl Send for VfsMod {}
+#[cfg(feature = "fs")]
 unsafe impl Sync for VfsMod {}
+#[cfg(feature = "fs")]
 turso_core_common::assert_send_sync!(VfsMod);
 
 use crate::alloc::DynBoxedSlice;

@@ -7386,6 +7386,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core_common",
  "turso_core_io",
+ "turso_core_json",
  "turso_core_types",
  "turso_ext",
  "turso_macros",
@@ -7456,6 +7457,7 @@ name = "turso_core_json"
 version = "0.8.0-pre.4"
 dependencies = [
  "antithesis_sdk",
+ "ryu",
  "serde_json",
  "tracing",
  "turso_core_common",
@@ -7475,6 +7477,8 @@ dependencies = [
  "libm",
  "num-bigint",
  "num-traits",
+ "quickcheck",
+ "quickcheck_macros",
  "ryu",
  "serde",
  "serde_json",

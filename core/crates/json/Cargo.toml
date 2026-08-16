@@ -18,11 +18,13 @@ path = "lib.rs"
 
 [features]
 default = []
+allocation_metric = ["turso_core_common/allocation_metric", "turso_core_types/allocation_metric"]
 
 [dependencies]
 turso_core_common = { workspace = true }
-turso_core_types = { workspace = true }
+turso_core_types = { workspace = true, features = ["json"] }
 turso_macros = { workspace = true }
+ryu = "1.0.19"
 tracing = { workspace = true }
 
 [target.'cfg(antithesis)'.dependencies]

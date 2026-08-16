@@ -2,9 +2,9 @@ use crate::alloc::{
     TryClone, TryReserveError, TursoAllocExt, TursoFromIterator, TursoTryWithCapacityExt,
     TursoVecExt,
 };
-use crate::json::error::{Error as PError, Result as PResult};
-use crate::json::Conv;
+use crate::error::{Error as PError, Result as PResult};
 use crate::types::{value_blob_from_slice, ValueBlob};
+use crate::Conv;
 use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
@@ -752,7 +752,7 @@ impl PathOperationMode {
 #[derive(Debug, Clone, Copy)]
 pub struct JsonbHeader(ElementType, PayloadSize);
 
-pub(crate) enum HeaderFormat {
+pub enum HeaderFormat {
     Inline([u8; 1]),    // Small payloads embedded directly in the header
     OneByte([u8; 2]),   // Medium payloads with 1-byte size field
     TwoBytes([u8; 3]),  // Large payloads with 2-byte size field
@@ -4297,7 +4297,7 @@ world""#,
 #[cfg(test)]
 mod path_operations_tests {
     use super::*;
-    use crate::json::path::{JsonPath, PathElement};
+    use crate::path::{JsonPath, PathElement};
     use std::borrow::Cow;
 
     // Helper function to create a simple JsonPath

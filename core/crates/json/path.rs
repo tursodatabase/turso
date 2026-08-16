@@ -462,7 +462,7 @@ mod tests {
             let path = json_path(value);
 
             match path {
-                Err(crate::error::LimboError::ParseError(_)) => {
+                Err(turso_core_common::LimboError::ParseError(_)) => {
                     // happy path
                 }
                 _ => panic!("Expected error for: {value:?}, got: {path:?}"),

@@ -585,7 +585,7 @@ impl Drop for UnixFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
     use std::io::Write;

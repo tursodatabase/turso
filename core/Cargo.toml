@@ -26,7 +26,7 @@ conn_raw_api = []
 # production builds carry zero instrumentation.
 aristo-instr = ["aristo/aristo_instrument"]
 fs = ["turso_ext/vfs", "turso_core_io/fs"]
-json = ["turso_core_types/json"]
+json = ["turso_core_types/json", "dep:turso_core_json"]
 uuid = ["dep:uuid"]
 io_uring = ["dep:io-uring", "rustix/io_uring", "turso_core_common/io_uring", "turso_core_io/io_uring"]
 experimental_win_iocp = ["turso_core_io/experimental_win_iocp"]
@@ -34,7 +34,7 @@ time = []
 fuzz = []
 omit_autovacuum = []
 simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric", "turso_core_io/simulator"]
-allocation_metric = ["turso_core_common/allocation_metric", "turso_core_types/allocation_metric"]
+allocation_metric = ["turso_core_common/allocation_metric", "turso_core_types/allocation_metric", "turso_core_json?/allocation_metric"]
 # Test only: exposed to testing/stress and the simulator, never to regular library users.
 io_memory_yield = ["turso_core_io/io_memory_yield"]
 serde = ["dep:serde", "turso_core_types/serde"]
@@ -86,6 +86,7 @@ aristo = "0.4"
 turso_core_common = { workspace = true }
 turso_core_io = { workspace = true }
 turso_core_types = { workspace = true }
+turso_core_json = { workspace = true, optional = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
