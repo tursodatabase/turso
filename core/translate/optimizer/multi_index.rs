@@ -107,6 +107,77 @@ impl MultiIndexAndTermsMemo {
     }
 }
 
+/// One slot per joined table, filled on first use.
+///
+/// Before the planner can cost an OR-by-union path it has to know what each
+/// disjunct of an `OR` term constrains on the table being planned: build
+/// branch-local `WhereTerm`s out of the disjunct's conjuncts and run the normal
+/// constraint analysis over them. That answer depends on the table, the `WHERE`
+/// clause, the available indexes and the schema — and on nothing that changes
+/// while the join order search runs. The search asked it again for every (join
+/// order prefix, table) pair it tried, so a join-heavy query rebuilt the same
+/// answer thousands of times. Ask once per (table, term) instead.
+///
+/// The prepass also settles, once and for all, which `OR` terms are even
+/// shaped like something that could drive a union scan of the table, so the
+/// rest are never looked at again. In a join-heavy query the answer for nearly
+/// every (table, term) pair is "this term constrains nothing here": an `OR`
+/// term is about one table, and the rest of the query's tables were paying the
+/// full analysis only to find they had nothing to seek by.
+///
+/// Both halves stay as lazy as the search was: the term list is built the first
+/// time the table is planned, and a term's disjuncts are analyzed the first
+/// time the search actually reaches that term. A term the search always decides
+/// before is never analyzed at all.
+///
+/// Like [`MultiIndexAndTermsMemo`], the memo is only sound while the `WHERE`
+/// clause it was built against holds still, so it lives in the join planner's
+/// context and dies with the search that created it.
+#[derive(Debug)]
+pub(crate) struct MultiIndexOrTermsMemo {
+    per_table: Vec<OnceCell<Vec<OrTermSlot>>>,
+}
+
+impl MultiIndexOrTermsMemo {
+    /// One slot per entry of [`TableReferences::joined_tables`].
+    pub(crate) fn new(joined_table_count: usize) -> Self {
+        Self {
+            per_table: (0..joined_table_count).map(|_| OnceCell::new()).collect(),
+        }
+    }
+
+    /// The `OR` terms worth trying on the table at `table_idx`, finding them if
+    /// this is the first time they have been asked for.
+    fn get_or_find_terms(
+        &self,
+        table_idx: usize,
+        find_terms: impl FnOnce() -> Vec<OrTermSlot>,
+    ) -> &[OrTermSlot] {
+        self.per_table[table_idx].get_or_init(find_terms)
+    }
+}
+
+/// One `OR` term worth trying on one table, with room for the analysis of its
+/// disjuncts.
+#[derive(Debug)]
+struct OrTermSlot {
+    /// Where the term sits in the `WHERE` clause.
+    where_term_idx: usize,
+    /// The join whose `ON` clause the term came from, if any.
+    from_outer_join: Option<TableInternalId>,
+    /// One entry per disjunct once analyzed, or `None` once the disjuncts have
+    /// been found unusable. Empty until the search first reaches this term.
+    disjuncts: OnceCell<Option<Vec<BranchConstraints>>>,
+}
+
+/// One disjunct's conjuncts as planner terms, plus what they constrain on the
+/// table being planned.
+#[derive(Debug)]
+struct BranchConstraints {
+    terms: Vec<WhereTerm>,
+    constraints: TableConstraints,
+}
+
 /// One term that can participate in an AND-by-intersection plan.
 #[derive(Debug)]
 struct AndBranch {
@@ -994,6 +1065,114 @@ fn analyze_and_terms_for_multi_index(
     })
 }
 
+/// The `OR` terms of the `WHERE` clause that a union scan of `table_reference`
+/// could be built from, by shape alone.
+///
+/// These are the cheap checks. What each disjunct actually constrains on the
+/// table is worked out later, per term, by
+/// [`branch_constraints_for_or_term`].
+fn or_terms_worth_trying(
+    table_reference: &JoinedTable,
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+) -> Vec<OrTermSlot> {
+    where_clause
+        .iter()
+        .enumerate()
+        .filter(|(_, term)| {
+            !term.consumed
+                && multi_index_can_consume_term(table_reference, term, table_references)
+                && matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _))
+                && flatten_or_expr(&term.expr).len() >= 2
+        })
+        .map(|(where_term_idx, term)| OrTermSlot {
+            where_term_idx,
+            from_outer_join: term.from_outer_join,
+            disjuncts: OnceCell::new(),
+        })
+        .collect()
+}
+
+/// What each disjunct of an `OR` term constrains on `table_reference`, or
+/// `None` when no join order can turn the term into a union scan of it.
+#[expect(clippy::too_many_arguments)]
+fn branch_constraints_for_or_term(
+    term_expr: &ast::Expr,
+    from_outer_join: Option<TableInternalId>,
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    available_indexes: &AvailableIndexes,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Option<Vec<BranchConstraints>> {
+    // Every disjunct has to become a branch, so one unusable disjunct rules out
+    // the whole term.
+    flatten_or_expr(term_expr)
+        .into_iter()
+        .map(|disjunct_expr| {
+            branch_constraints_for_disjunct(
+                disjunct_expr,
+                from_outer_join,
+                table_reference,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            )
+        })
+        .collect()
+}
+
+/// What one disjunct constrains on `table_reference`, or `None` when no join
+/// order can turn it into a union branch.
+#[expect(clippy::too_many_arguments)]
+fn branch_constraints_for_disjunct(
+    disjunct_expr: &ast::Expr,
+    from_outer_join: Option<TableInternalId>,
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    available_indexes: &AvailableIndexes,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Option<BranchConstraints> {
+    let Ok(disjunct_expr) = crate::translate::expr::unwrap_parens(disjunct_expr) else {
+        return None;
+    };
+    // Each disjunct is replanned with branch-local `TableConstraints`, so
+    // compound conjuncts can reuse the same compound-seek analysis as ordinary
+    // btree access.
+    let conjuncts = flatten_and_expr(disjunct_expr)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let (terms, constraints) = get_table_local_constraints_for_branch(
+        &conjuncts,
+        from_outer_join,
+        table_reference,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
+        params,
+    )
+    .ok()?;
+
+    // A branch is a seek on this table, so a disjunct that constrains nothing
+    // on it has nothing to seek by. Both branch access paths agree on that:
+    // `choose_best_btree_candidate` can only pick constraint refs drawn from
+    // these constraints, and `choose_best_in_seek_candidate` scans them for an
+    // `IN`. A join order prefix only ever narrows which of them may be used, so
+    // no prefix can conjure a branch out of none.
+    if constraints.constraints.is_empty() {
+        return None;
+    }
+
+    Some(BranchConstraints { terms, constraints })
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Analyze OR clauses for OR-by-union optimization.
 ///
@@ -1002,6 +1181,8 @@ fn analyze_and_terms_for_multi_index(
 /// non-multi-index alternative.
 pub fn consider_multi_index_union(
     rhs_table: &JoinedTable,
+    rhs_table_idx: usize,
+    or_terms_memo: &MultiIndexOrTermsMemo,
     where_clause: &[WhereTerm],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
@@ -1014,67 +1195,41 @@ pub fn consider_multi_index_union(
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
 ) -> Result<Option<AccessMethod>> {
-    for (where_term_idx, term) in where_clause.iter().enumerate() {
-        if term.consumed {
-            continue;
-        }
-        if !multi_index_can_consume_term(rhs_table, term, table_references) {
-            continue;
-        }
+    let or_terms = or_terms_memo.get_or_find_terms(rhs_table_idx, || {
+        or_terms_worth_trying(rhs_table, where_clause, table_references)
+    });
+    if or_terms.is_empty() {
+        return Ok(None);
+    }
 
-        let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
+    let mut allowed_mask = lhs_mask.try_clone()?;
+    allowed_mask.set(rhs_table_idx)?;
+
+    for or_term in or_terms {
+        let Some(disjuncts) = or_term.disjuncts.get_or_init(|| {
+            branch_constraints_for_or_term(
+                &where_clause[or_term.where_term_idx].expr,
+                or_term.from_outer_join,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+            )
+        }) else {
             continue;
         };
 
-        let disjuncts = flatten_or_expr(&term.expr);
-        if disjuncts.len() < 2 {
-            continue;
-        }
-
-        let mut allowed_mask = lhs_mask.try_clone()?;
-        let Some(rhs_idx) = table_references
-            .joined_tables()
-            .iter()
-            .position(|t| t.internal_id == rhs_table.internal_id)
-        else {
-            continue;
-        };
-        allowed_mask.set(rhs_idx)?;
-
-        // Each disjunct is replanned with branch-local `TableConstraints`, so
-        // compound conjuncts can reuse the same compound-seek analysis as
-        // ordinary btree access.
         let branches = disjuncts
-            .into_iter()
-            .map(|disjunct_expr| {
-                let Ok(disjunct_expr) = crate::translate::expr::unwrap_parens(disjunct_expr) else {
-                    return Ok(None);
-                };
-                let conjuncts = flatten_and_expr(disjunct_expr)
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let Some((synthetic_where_terms, table_constraints)) =
-                    get_table_local_constraints_for_branch(
-                        &conjuncts,
-                        term.from_outer_join,
-                        rhs_table,
-                        table_references,
-                        available_indexes,
-                        subqueries,
-                        schema,
-                        params,
-                    )
-                    .ok()
-                else {
-                    return Ok(None);
-                };
+            .iter()
+            .map(|disjunct| {
                 let Some(mut chosen) = choose_multi_index_branch_access(
                     rhs_table,
-                    &table_constraints,
-                    &synthetic_where_terms,
+                    &disjunct.constraints,
+                    &disjunct.terms,
                     lhs_mask,
-                    rhs_idx,
+                    rhs_table_idx,
                     schema,
                     available_indexes,
                     base_row_count,
@@ -1089,7 +1244,7 @@ pub fn consider_multi_index_union(
                 // before the index seek; post-filters reference the target
                 // table and are evaluated after the seek.
                 let Some(partitioned_pre_post) = partition_residual_multi_or_exprs(
-                    &synthetic_where_terms,
+                    &disjunct.terms,
                     &chosen.access,
                     chosen.index.as_deref(),
                     rhs_table,
@@ -1104,7 +1259,7 @@ pub fn consider_multi_index_union(
                     return Ok(None);
                 }
                 chosen.union_prepost_filters = Some(UnionBranchPrePostFilters {
-                    requires_table_cursor: partitioned_pre_post.post_mask.get(rhs_idx),
+                    requires_table_cursor: partitioned_pre_post.post_mask.get(rhs_table_idx),
                     pre_filter_exprs: partitioned_pre_post.pre_filter_exprs,
                     post_filter_exprs: partitioned_pre_post.post_filter_exprs,
                 });
@@ -1119,7 +1274,7 @@ pub fn consider_multi_index_union(
         if let Some(access_method) = evaluate_multi_index_branches(
             branches,
             SetOperation::Union,
-            where_term_idx,
+            or_term.where_term_idx,
             rhs_table,
             table_references,
             available_indexes,
@@ -1261,6 +1416,7 @@ mod tests {
     use super::{
         consider_multi_index_intersection, consider_multi_index_union, AnalyzeStats,
         AndClauseDecomposition, MultiIndexAndTermsMemo, MultiIndexBranchParams,
+        MultiIndexOrTermsMemo, OrTermSlot,
     };
     use crate::alloc::TursoIteratorExt;
     use crate::alloc::TursoSliceExt;
@@ -1285,7 +1441,7 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
-    use std::cell::Cell;
+    use std::cell::{Cell, OnceCell};
     use std::{collections::VecDeque, sync::Arc};
     use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
@@ -1541,6 +1697,8 @@ mod tests {
 
         let access_method = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
+            ITEM,
+            &MultiIndexOrTermsMemo::new(table_references.joined_tables().len()),
             &where_clause,
             &available_indexes,
             &table_references,
@@ -1727,6 +1885,149 @@ mod tests {
     }
 
     #[test]
+    fn or_terms_memo_finds_each_table_s_terms_once() {
+        let memo = MultiIndexOrTermsMemo::new(2);
+        let searches = Cell::new(0);
+        // Both closures only capture `&searches`, so they are `Copy` and can be
+        // handed to the memo more than once.
+        let find_for_table_0 = || {
+            searches.set(searches.get() + 1);
+            vec![OrTermSlot {
+                where_term_idx: 7,
+                from_outer_join: None,
+                disjuncts: OnceCell::new(),
+            }]
+        };
+        let find_for_table_1 = || {
+            searches.set(searches.get() + 1);
+            vec![]
+        };
+
+        let term_indices =
+            |slots: &[OrTermSlot]| slots.iter().map(|s| s.where_term_idx).collect::<Vec<_>>();
+
+        assert_eq!(
+            term_indices(memo.get_or_find_terms(0, find_for_table_0)),
+            [7]
+        );
+        assert_eq!(searches.get(), 1);
+
+        // Asking about the same table again answers from the memo. This is the
+        // whole point: the join order search asks once per join order it tries.
+        assert_eq!(
+            term_indices(memo.get_or_find_terms(0, find_for_table_0)),
+            [7]
+        );
+        assert_eq!(searches.get(), 1);
+
+        // Another table is a separate question, so it gets its own search.
+        assert!(memo.get_or_find_terms(1, find_for_table_1).is_empty());
+        assert_eq!(searches.get(), 1 + 1);
+
+        // "No OR term is worth trying on this table" is an answer worth
+        // remembering too - it is the answer for most tables in a join-heavy
+        // query.
+        assert!(memo.get_or_find_terms(1, find_for_table_1).is_empty());
+        assert_eq!(searches.get(), 2);
+    }
+
+    /// An `OR` term only offers union branches to the table its disjuncts
+    /// constrain. Every other table in the query has nothing to seek by, so the
+    /// term is rejected once instead of being re-analyzed for every join order
+    /// the search tries.
+    #[test]
+    fn or_term_is_usable_only_by_the_table_its_disjuncts_constrain() {
+        let link = create_btree_table(
+            "link",
+            vec![
+                create_column_of_type("src", Type::Integer),
+                create_column_of_type("dst", Type::Integer),
+            ],
+        );
+        let item = create_btree_table(
+            "item",
+            vec![
+                create_column_of_type("id", Type::Integer),
+                create_column_of_type("kind", Type::Integer),
+            ],
+        );
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            create_table_reference(link, None, table_id_counter.next()),
+            create_table_reference(
+                item,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                    no_reorder: false,
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const LINK: usize = 0;
+        const ITEM: usize = 1;
+        let item_id = joined_tables[ITEM].internal_id;
+
+        // `item.id = 1 OR item.id = 2` - about `item`, and about nothing else.
+        let where_clause = vec![WhereTerm {
+            expr: Expr::Binary(
+                Box::new(Expr::Binary(
+                    Box::new(create_column_expr(item_id, 0, false)),
+                    Operator::Equals,
+                    Box::new(create_numeric_literal("1")),
+                )),
+                Operator::Or,
+                Box::new(Expr::Binary(
+                    Box::new(create_column_expr(item_id, 0, false)),
+                    Operator::Equals,
+                    Box::new(create_numeric_literal("2")),
+                )),
+            ),
+            from_outer_join: None,
+            consumed: false,
+        }];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+
+        // By shape alone the term is worth trying on either table.
+        for table_idx in [LINK, ITEM] {
+            let slots = super::or_terms_worth_trying(
+                &table_references.joined_tables()[table_idx],
+                &where_clause,
+                &table_references,
+            );
+            assert_eq!(slots.len(), 1);
+            assert_eq!(slots[0].where_term_idx, 0);
+        }
+
+        let branches = |table_idx: usize| {
+            super::branch_constraints_for_or_term(
+                &where_clause[0].expr,
+                None,
+                &table_references.joined_tables()[table_idx],
+                &table_references,
+                &available_indexes,
+                &[],
+                &empty_schema(),
+                &DEFAULT_PARAMS,
+            )
+        };
+
+        assert_eq!(
+            branches(ITEM).map(|b| b.len()),
+            Some(2),
+            "both disjuncts constrain `item`, so both become branches"
+        );
+        assert!(
+            branches(LINK).is_none(),
+            "an OR term that constrains nothing on `link` cannot drive a union scan of it"
+        );
+    }
+
+    #[test]
     fn test_multi_index_union_branch_reuses_compound_seek_analysis() {
         let link = create_btree_table(
             "link",
@@ -1869,6 +2170,8 @@ mod tests {
 
         let access_method = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
+            ITEM,
+            &MultiIndexOrTermsMemo::new(table_references.joined_tables().len()),
             &where_clause,
             &available_indexes,
             &table_references,
@@ -2004,8 +2307,12 @@ mod tests {
         let lhs_mask = [LINK].into_iter().try_collect().unwrap();
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
 
+        // Each call plans a different `WHERE` clause, so each gets its own
+        // memo: a memo only answers for the clause it was built against.
         let without_residual = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
+            ITEM,
+            &MultiIndexOrTermsMemo::new(table_references.joined_tables().len()),
             &make_join_expr(None),
             &available_indexes,
             &table_references,
@@ -2023,6 +2330,8 @@ mod tests {
 
         let with_residual = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
+            ITEM,
+            &MultiIndexOrTermsMemo::new(table_references.joined_tables().len()),
             &make_join_expr(Some("7")),
             &available_indexes,
             &table_references,

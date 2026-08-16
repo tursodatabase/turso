@@ -1003,6 +1003,8 @@ fn find_best_access_method_for_btree(
 
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table,
+            rhs_table_idx,
+            planning_context.or_terms_memo,
             where_clause,
             available_indexes,
             table_references,

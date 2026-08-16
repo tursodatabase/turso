@@ -9,7 +9,7 @@ use super::{
     access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
-    multi_index::MultiIndexAndTermsMemo,
+    multi_index::{MultiIndexAndTermsMemo, MultiIndexOrTermsMemo},
     order::OrderTarget,
     AvailableIndexes, IndexMethodCandidate,
 };
@@ -52,6 +52,9 @@ pub(crate) struct JoinPlanningContext<'a> {
     /// order this search tries. Only valid for the `WHERE` clause the search
     /// was started with.
     pub and_terms_memo: &'a MultiIndexAndTermsMemo,
+    /// Per-table OR-by-union prepass results, with the same validity rules as
+    /// `and_terms_memo`.
+    pub or_terms_memo: &'a MultiIndexOrTermsMemo,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -60,11 +63,13 @@ impl<'a> JoinPlanningContext<'a> {
     fn default_with_order_target(
         maybe_order_target: Option<&'a OrderTarget>,
         and_terms_memo: &'a MultiIndexAndTermsMemo,
+        or_terms_memo: &'a MultiIndexOrTermsMemo,
     ) -> Self {
         Self {
             maybe_order_target,
             cost_limit: None,
             and_terms_memo,
+            or_terms_memo,
         }
     }
 }
@@ -1074,10 +1079,15 @@ pub fn compute_best_join_order<'a>(
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
     let and_terms_memo = MultiIndexAndTermsMemo::new(joined_tables.len());
+    let or_terms_memo = MultiIndexOrTermsMemo::new(joined_tables.len());
     compute_best_join_order_with_context(
         joined_tables,
         initial_input_cardinality,
-        JoinPlanningContext::default_with_order_target(maybe_order_target, &and_terms_memo),
+        JoinPlanningContext::default_with_order_target(
+            maybe_order_target,
+            &and_terms_memo,
+            &or_terms_memo,
+        ),
         constraints,
         base_table_rows,
         access_methods_arena,
