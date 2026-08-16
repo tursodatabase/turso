@@ -116,21 +116,7 @@ unsafe impl Send for PageCache {}
 unsafe impl Sync for PageCache {}
 crate::assert::assert_send_sync!(PageCache);
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub enum CacheError {
-    #[error("{0}")]
-    InternalError(String),
-    #[error("page {pgno} is locked")]
-    Locked { pgno: usize },
-    #[error("page {pgno} is dirty")]
-    Dirty { pgno: usize },
-    #[error("page {pgno} is pinned")]
-    Pinned { pgno: usize },
-    #[error("Page cache is full")]
-    Full,
-    #[error("key already exists")]
-    KeyExists,
-}
+pub use crate::error::CacheError;
 
 #[derive(Debug, PartialEq)]
 pub enum CacheResizeResult {

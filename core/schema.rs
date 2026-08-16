@@ -2661,10 +2661,9 @@ impl TryClone for UniqueSet {
 }
 
 // Copy enums stored as `Vec` elements: their clone cannot allocate.
-crate::alloc::impl_try_clone_via_clone!(
-    turso_parser::ast::SortOrder,
-    crate::translate::collate::CollationSeq,
-);
+// (`turso_parser::ast::SortOrder` gets its impl next to `TryClone` itself,
+// in turso_core_common, because both are foreign to this crate.)
+crate::alloc::impl_try_clone_via_clone!(crate::translate::collate::CollationSeq);
 
 // Std-pinned schema element types: every owned field allocates through the
 // std global allocator (Strings, `std::vec::Vec`, boxed parser AST), so

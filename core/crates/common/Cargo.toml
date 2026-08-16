@@ -1,0 +1,55 @@
+# Copyright 2023-2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_core_common"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared infrastructure for the Turso database library: errors, sync primitives, allocation"
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_core_common"
+path = "lib.rs"
+
+[features]
+default = []
+allocation_metric = []
+stacker = ["dep:stacker"]
+# Matches turso_core's io_uring feature: adds the uring variant to CompletionError.
+io_uring = []
+serde = ["dep:serde"]
+
+[dependencies]
+allocator-api2 = { workspace = true }
+branches = { version = "0.4.3", default-features = false }
+bumpalo = { version = "3", features = ["collections"] }
+crossbeam-epoch = "0.9.18"
+crossbeam-utils = "0.8.21"
+miette = { workspace = true }
+parking_lot = { workspace = true, features = ["arc_lock"] }
+rustc-hash = "2.0"
+serde = { workspace = true, optional = true, features = ["derive"] }
+stacker = { version = "0.1", optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+turso_ext = { workspace = true, features = ["core_only"] }
+turso_macros = { workspace = true }
+turso_parser = { workspace = true }
+
+[target.'cfg(target_family = "unix")'.dependencies]
+rustix = { version = "1.0.5", features = ["fs"] }
+
+[target.'cfg(antithesis)'.dependencies]
+antithesis_sdk = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }

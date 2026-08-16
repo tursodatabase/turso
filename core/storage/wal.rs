@@ -2423,7 +2423,7 @@ pub enum CheckpointState {
 }
 
 /// IOV_MAX is 1024 on most systems, lets use 512 to be safe
-pub const CKPT_BATCH_PAGES: usize = 512;
+pub use crate::io::CKPT_BATCH_PAGES;
 
 /// TODO: *ALL* of these need to be tuned for perf. It is tricky
 /// trying to figure out the ideal numbers here to work together concurrently
