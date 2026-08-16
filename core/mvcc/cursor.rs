@@ -13,8 +13,8 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult, Value,
+    compare_serialized_records, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey,
+    SeekOp, SeekResult, Value,
 };
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
@@ -241,13 +241,14 @@ fn current_pos_matches_seek_key(
             let MvccCursorType::Index(index_info) = mv_cursor_type else {
                 return Ok(false);
             };
-            let key_info: Vec<_> = index_info
-                .key_info
-                .iter()
-                .take(target.column_count())
-                .cloned()
-                .collect();
-            compare_immutable(target.get_values()?, current.key.get_values()?, &key_info).is_eq()
+            let num_cols = target.column_count().min(index_info.key_info.len());
+            compare_serialized_records(
+                target.get_payload(),
+                current.key.get_payload(),
+                &index_info.key_info,
+                num_cols,
+            )?
+            .is_eq()
         }
         _ => false,
     })
@@ -610,6 +611,13 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// (`invalidate_record`); a store epoch bump covers writes made through
     /// other cursors of the same transaction (e.g. triggers).
     record_serialized_at: Option<u64>,
+    /// Metadata for the most recent seek probe key with fewer columns than
+    /// the index (a prefix seek). Probe metadata only differs from the
+    /// cursor's own [`MvccCursorType::Index`] metadata in `num_cols`, and a
+    /// scan loop seeks with the same probe width every iteration, so caching
+    /// one truncated `IndexInfo` avoids rebuilding it (and re-copying its
+    /// key_info) on every seek.
+    probe_index_info: Option<Arc<IndexInfo>>,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
@@ -690,6 +698,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             reusable_immutable_record: None,
             eq_seek_memo: None,
             record_serialized_at: None,
+            probe_index_info: None,
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
@@ -913,6 +922,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let res = if allocator.is_uninitialized() {
             NextRowidResult::Uninitialized
         } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
+            self.remember_fresh_rowid(next_rowid);
             NextRowidResult::Next {
                 new_rowid: next_rowid,
                 prev_rowid: prev_max_rowid,
@@ -921,6 +931,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             NextRowidResult::FindRandom
         };
         Ok(IOResult::Done(res))
+    }
+
+    /// Record that `rowid` was just handed out by the allocator. The allocator
+    /// counter is bumped by every version insert and seeded from the B-tree
+    /// max, so an allocated rowid is strictly greater than every rowid this
+    /// transaction can see (rows committed by others after our snapshot are
+    /// invisible). An eq probe on it would find nothing; remember that so
+    /// `insert` skips the probe.
+    fn remember_fresh_rowid(&mut self, rowid: i64) {
+        self.eq_seek_memo = Some(EqSeekMemo {
+            key: RowID::new(self.table_id, RowKey::Int(rowid)),
+            mvcc_found: false,
+            epoch: self.db.version_mutation_epoch(),
+        });
     }
 
     pub fn initialize_max_rowid(&mut self, max_rowid: Option<i64>) -> Result<()> {
@@ -935,9 +959,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Allocate the next rowid from the (already initialized) allocator.
     /// Must be called while holding the allocator lock.
-    pub fn allocate_next_rowid(&self) -> Option<(i64, Option<i64>)> {
+    pub fn allocate_next_rowid(&mut self) -> Option<(i64, Option<i64>)> {
         let allocator = self.db.get_rowid_allocator(&self.table_id);
-        allocator.get_next_rowid()
+        let allocated = allocator.get_next_rowid();
+        if let Some((next_rowid, _)) = allocated {
+            self.remember_fresh_rowid(next_rowid);
+        }
+        allocated
     }
 
     pub fn end_new_rowid(&mut self) {
@@ -1846,13 +1874,28 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
                                     panic!("SeekKey::IndexKey requires Index cursor type");
                                 };
-                                Arc::new(IndexInfo::new_in(
-                                    index_info.key_info.iter().cloned(),
-                                    index_info.has_rowid,
-                                    index_key.column_count(),
-                                    index_info.is_unique,
-                                    self.db.allocator(),
-                                )?)
+                                let probe_cols = index_key.column_count();
+                                if probe_cols == index_info.num_cols {
+                                    // Full-width probe: the cursor's own metadata
+                                    // describes it exactly.
+                                    index_info.clone()
+                                } else if let Some(cached) = self
+                                    .probe_index_info
+                                    .as_ref()
+                                    .filter(|cached| cached.num_cols == probe_cols)
+                                {
+                                    cached.clone()
+                                } else {
+                                    let built = Arc::new(IndexInfo::new_in(
+                                        index_info.key_info.iter().cloned(),
+                                        index_info.has_rowid,
+                                        probe_cols,
+                                        index_info.is_unique,
+                                        self.db.allocator(),
+                                    )?);
+                                    self.probe_index_info = Some(built.clone());
+                                    built
+                                }
                             };
                             let sortable_key = SortableIndexKey::new_from_payload_in(
                                 index_key,
@@ -1943,18 +1986,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     else {
                                         panic!("Index cursor expected");
                                     };
-                                    let key_info: Vec<_> = index_info
-                                        .key_info
-                                        .iter()
-                                        .take(index_key.column_count())
-                                        .cloned()
-                                        .collect();
-                                    let cmp = compare_immutable(
-                                        index_key.get_values()?,
-                                        found_key.key.get_values()?,
-                                        &key_info,
-                                    );
-                                    cmp.is_eq()
+                                    let num_cols =
+                                        index_key.column_count().min(index_info.key_info.len());
+                                    compare_serialized_records(
+                                        index_key.get_payload(),
+                                        found_key.key.get_payload(),
+                                        &index_info.key_info,
+                                        num_cols,
+                                    )?
+                                    .is_eq()
                                 }
                             };
                             if found {

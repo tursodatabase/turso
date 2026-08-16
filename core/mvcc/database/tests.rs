@@ -20630,3 +20630,20 @@ fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
     // Now that the reader is gone, Truncate can proceed.
     writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
+
+#[test]
+fn commit_state_machine_stays_small() {
+    use crate::alloc::DynAllocator;
+    use crate::mvcc::clock::MvccClock;
+    use crate::mvcc::database::CommitStateMachine;
+    // One CommitStateMachine is built and moved into its Box on every commit,
+    // so its size is per-commit memcpy cost. The checkpoint state machine is
+    // boxed inside the Checkpoint variant precisely to keep this small; this
+    // guards against a large variant creeping back in.
+    let size = std::mem::size_of::<CommitStateMachine<MvccClock, DynAllocator>>();
+    eprintln!("CommitStateMachine size: {size} bytes");
+    assert!(
+        size <= 512,
+        "CommitStateMachine grew to {size} bytes; commit_tx copies this struct on every commit"
+    );
+}

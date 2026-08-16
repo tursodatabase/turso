@@ -2507,6 +2507,242 @@ where
     Ok(std::cmp::Ordering::Equal)
 }
 
+/// A cursor over the columns of a serialized record, yielding each column's
+/// serial type and raw payload bytes without decoding values.
+struct RawColumnCursor<'a> {
+    header: &'a [u8],
+    data: &'a [u8],
+}
+
+impl<'a> RawColumnCursor<'a> {
+    #[inline(always)]
+    fn new(payload: &'a [u8]) -> Result<Self> {
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+        if header_size > payload.len()
+            || header_varint_len > payload.len()
+            || header_varint_len > header_size
+        {
+            mark_unlikely();
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
+        }
+        Ok(Self {
+            header: &payload[header_varint_len..header_size],
+            data: &payload[header_size..],
+        })
+    }
+
+    /// Next column as (serial type, raw bytes), or `None` when the record ends.
+    #[inline(always)]
+    #[allow(clippy::type_complexity)]
+    fn next(&mut self) -> Option<Result<(u64, &'a [u8])>> {
+        if self.header.is_empty() {
+            return None;
+        }
+        let (serial_type, bytes_read) = match read_varint(self.header) {
+            Ok(v) => v,
+            Err(e) => {
+                mark_unlikely();
+                return Some(Err(e));
+            }
+        };
+        self.header = &self.header[bytes_read..];
+        let size = match get_serial_type_size(serial_type) {
+            Ok(size) => size,
+            Err(e) => {
+                mark_unlikely();
+                return Some(Err(e));
+            }
+        };
+        let Some(bytes) = self.data.get(..size) else {
+            mark_unlikely();
+            return Some(Err(LimboError::Corrupt(
+                "Data section too small for indicated serial type size".into(),
+            )));
+        };
+        self.data = &self.data[size..];
+        Some(Ok((serial_type, bytes)))
+    }
+}
+
+/// What a serialized column stores, decoded just enough to compare it.
+enum RawColumn {
+    Null,
+    Number(Numeric),
+    Text,
+    Blob,
+}
+
+#[inline(always)]
+fn classify_raw_column(serial_type: u64, bytes: &[u8]) -> Result<RawColumn> {
+    Ok(match serial_type {
+        0 => RawColumn::Null,
+        1..=6 | 8 | 9 => {
+            RawColumn::Number(Numeric::Integer(read_integer(bytes, serial_type as u8)?))
+        }
+        7 => {
+            let Some(bytes) = bytes.first_chunk::<8>() else {
+                mark_unlikely();
+                return Err(LimboError::Corrupt("Invalid 8-byte float".into()));
+            };
+            // NaN sorts as NULL, mirroring `ValueRef::from_f64`.
+            match NonNan::new(f64::from_be_bytes(*bytes)) {
+                Some(float) => RawColumn::Number(Numeric::Float(float)),
+                None => RawColumn::Null,
+            }
+        }
+        n if n >= 12 => {
+            if n.is_multiple_of(2) {
+                RawColumn::Blob
+            } else {
+                RawColumn::Text
+            }
+        }
+        _ => {
+            mark_unlikely();
+            return Err(LimboError::Corrupt(format!(
+                "Invalid serial type: {serial_type}"
+            )));
+        }
+    })
+}
+
+/// Compare one column of two serialized records the way [`cmp_in_column`]
+/// compares the decoded values, but reading the raw bytes directly. Text is
+/// compared without UTF-8 validation whenever the collation is byte-based
+/// (everything except locale collations).
+#[inline(always)]
+fn compare_raw_column(
+    l_serial_type: u64,
+    l_bytes: &[u8],
+    r_serial_type: u64,
+    r_bytes: &[u8],
+    key: &KeyInfo,
+) -> Result<Ordering> {
+    let l = classify_raw_column(l_serial_type, l_bytes)?;
+    let r = classify_raw_column(r_serial_type, r_bytes)?;
+    // Value classes sort as NULL < numeric < text < blob, like `ValueRef::cmp`.
+    let cmp = match (&l, &r) {
+        (RawColumn::Null, RawColumn::Null) => Ordering::Equal,
+        (RawColumn::Null, _) => Ordering::Less,
+        (_, RawColumn::Null) => Ordering::Greater,
+        (RawColumn::Number(a), RawColumn::Number(b)) => a.cmp(b),
+        (RawColumn::Number(_), _) => Ordering::Less,
+        (_, RawColumn::Number(_)) => Ordering::Greater,
+        (RawColumn::Text, RawColumn::Text) => {
+            match key.collation.compare_text_bytes(l_bytes, r_bytes) {
+                Some(cmp) => cmp,
+                None => {
+                    // Locale collations compare real strings; validate first.
+                    let invalid_utf8 = |_| {
+                        mark_unlikely();
+                        LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+                    };
+                    let l_text = simdutf8::basic::from_utf8(l_bytes).map_err(invalid_utf8)?;
+                    let r_text = simdutf8::basic::from_utf8(r_bytes).map_err(invalid_utf8)?;
+                    key.collation.compare_strings(l_text, r_text)
+                }
+            }
+        }
+        (RawColumn::Text, RawColumn::Blob) => Ordering::Less,
+        (RawColumn::Blob, RawColumn::Text) => Ordering::Greater,
+        (RawColumn::Blob, RawColumn::Blob) => l_bytes.cmp(r_bytes),
+    };
+    if cmp != Ordering::Equal {
+        // Mirror `cmp_with_sort`: NULLS FIRST/LAST overrides ASC/DESC when a
+        // null is involved; otherwise DESC reverses the natural order.
+        if matches!(l, RawColumn::Null) || matches!(r, RawColumn::Null) {
+            if let Some(nulls_order) = key.nulls_order {
+                return Ok(match nulls_order {
+                    turso_parser::ast::NullsOrder::First => cmp,
+                    turso_parser::ast::NullsOrder::Last => cmp.reverse(),
+                });
+            }
+        }
+        return Ok(match key.sort_order {
+            SortOrder::Asc => cmp,
+            SortOrder::Desc => cmp.reverse(),
+        });
+    }
+    Ok(Ordering::Equal)
+}
+
+/// Compare the first `num_cols` columns of two serialized records, producing
+/// the same ordering as [`compare_immutable`] over their decoded values.
+/// Reads the raw bytes directly, so text columns skip UTF-8 validation
+/// whenever the collation is byte-based (everything except locale
+/// collations). This is the hot path for index-key ordering.
+///
+/// Panics if either record has fewer than `num_cols` columns, mirroring the
+/// length assertions in [`compare_immutable`].
+pub fn compare_serialized_records(
+    l_payload: &[u8],
+    r_payload: &[u8],
+    key_info: &[KeyInfo],
+    num_cols: usize,
+) -> Result<Ordering> {
+    let mut l_cursor = RawColumnCursor::new(l_payload)?;
+    let mut r_cursor = RawColumnCursor::new(r_payload)?;
+    for key in &key_info[..num_cols] {
+        let (l_serial_type, l_bytes) = l_cursor
+            .next()
+            .expect("record has fewer columns than the index key")?;
+        let (r_serial_type, r_bytes) = r_cursor
+            .next()
+            .expect("record has fewer columns than the index key")?;
+        let cmp = compare_raw_column(l_serial_type, l_bytes, r_serial_type, r_bytes, key)?;
+        if cmp != Ordering::Equal {
+            return Ok(cmp);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// Whether the first `num_cols` columns of two serialized records compare
+/// equal. Returns `Ok(false)` when either record has fewer than `num_cols`
+/// columns. Same raw-bytes fast path as [`compare_serialized_records`].
+pub fn serialized_record_prefixes_equal(
+    l_payload: &[u8],
+    r_payload: &[u8],
+    key_info: &[KeyInfo],
+    num_cols: usize,
+) -> Result<bool> {
+    let mut l_cursor = RawColumnCursor::new(l_payload)?;
+    let mut r_cursor = RawColumnCursor::new(r_payload)?;
+    for key in &key_info[..num_cols] {
+        let (Some(l), Some(r)) = (l_cursor.next(), r_cursor.next()) else {
+            return Ok(false);
+        };
+        let (l_serial_type, l_bytes) = l?;
+        let (r_serial_type, r_bytes) = r?;
+        if compare_raw_column(l_serial_type, l_bytes, r_serial_type, r_bytes, key)?
+            != Ordering::Equal
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether any of the first `num_cols` columns of a serialized record is
+/// NULL. A NaN float counts as NULL, mirroring `ValueRef::from_f64`. Columns
+/// past the end of the record are not counted.
+pub fn serialized_record_has_null_in_first_cols(payload: &[u8], num_cols: usize) -> Result<bool> {
+    let mut cursor = RawColumnCursor::new(payload)?;
+    for _ in 0..num_cols {
+        let Some(column) = cursor.next() else {
+            return Ok(false);
+        };
+        let (serial_type, bytes) = column?;
+        if matches!(classify_raw_column(serial_type, bytes)?, RawColumn::Null) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Treats `NULL` as equal to itself and smaller than other values.
 pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
 where
@@ -4849,5 +5085,209 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+
+    /// Every value the record serializer can produce, covering all serial
+    /// types: NULL (0), all integer widths (1-6), the 0/1 constants (8/9),
+    /// floats (7), and text/blob including empty ones.
+    fn all_serial_type_values() -> Vec<Value> {
+        vec![
+            Value::Null,
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(-1),
+            Value::from_i64(120),
+            Value::from_i64(-30_000),
+            Value::from_i64(5_000_000),
+            Value::from_i64(-2_000_000_000),
+            Value::from_i64(200_000_000_000),
+            Value::from_i64(i64::MAX),
+            Value::from_i64(i64::MIN),
+            Value::from_f64(0.0),
+            Value::from_f64(-0.5),
+            Value::from_f64(1.0),
+            Value::from_f64(2.5),
+            Value::from_f64(f64::INFINITY),
+            Value::from_f64(f64::NEG_INFINITY),
+            Value::build_text(""),
+            Value::build_text("a"),
+            Value::build_text("A"),
+            Value::build_text("a "),
+            Value::build_text("a  "),
+            Value::build_text("ab"),
+            Value::build_text("b"),
+            Value::build_text("B\0c"),
+            Value::build_text("b\0C"),
+            Value::build_text("grüß"),
+            Value::Blob(vec![]),
+            Value::Blob(vec![0]),
+            Value::Blob(vec![1, 2]),
+            Value::Blob(vec![1, 3]),
+            Value::Blob(b"a".to_vec()),
+        ]
+    }
+
+    fn all_key_infos() -> Vec<KeyInfo> {
+        let mut key_infos = Vec::new();
+        for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+            for collation in [
+                CollationSeq::Unset,
+                CollationSeq::Binary,
+                CollationSeq::NoCase,
+                CollationSeq::Rtrim,
+            ] {
+                for nulls_order in [
+                    None,
+                    Some(turso_parser::ast::NullsOrder::First),
+                    Some(turso_parser::ast::NullsOrder::Last),
+                ] {
+                    key_infos.push(KeyInfo {
+                        sort_order,
+                        collation,
+                        nulls_order,
+                    });
+                }
+            }
+        }
+        key_infos
+    }
+
+    #[test]
+    fn serialized_record_compare_matches_decoded_compare() {
+        let values = all_serial_type_values();
+        for key in all_key_infos() {
+            let key_info = [key];
+            for l_value in &values {
+                let l_record = ImmutableRecord::from_values(&[l_value.clone()], 1).unwrap();
+                for r_value in &values {
+                    let r_record = ImmutableRecord::from_values(&[r_value.clone()], 1).unwrap();
+                    let fast = compare_serialized_records(
+                        l_record.get_payload(),
+                        r_record.get_payload(),
+                        &key_info,
+                        1,
+                    )
+                    .unwrap();
+                    let slow = compare_immutable(
+                        l_record.get_values().unwrap().iter(),
+                        r_record.get_values().unwrap().iter(),
+                        &key_info,
+                    );
+                    assert_eq!(
+                        fast, slow,
+                        "raw-bytes compare diverged from decoded compare for {l_value:?} vs {r_value:?} with {key:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serialized_record_compare_walks_multiple_columns() {
+        let key_info = [
+            KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            },
+            KeyInfo {
+                sort_order: SortOrder::Desc,
+                collation: CollationSeq::NoCase,
+                nulls_order: None,
+            },
+            KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            },
+        ];
+        let rows = [
+            vec![Value::from_i64(1), Value::build_text("a"), Value::Null],
+            vec![Value::from_i64(1), Value::build_text("A"), Value::Null],
+            vec![
+                Value::from_i64(1),
+                Value::build_text("b"),
+                Value::from_i64(2),
+            ],
+            vec![
+                Value::from_i64(2),
+                Value::build_text("a"),
+                Value::Blob(vec![1]),
+            ],
+            vec![Value::Null, Value::build_text("a"), Value::from_f64(0.5)],
+        ];
+        for l_values in &rows {
+            let l_record = ImmutableRecord::from_values(l_values, l_values.len()).unwrap();
+            for r_values in &rows {
+                let r_record = ImmutableRecord::from_values(r_values, r_values.len()).unwrap();
+                let fast = compare_serialized_records(
+                    l_record.get_payload(),
+                    r_record.get_payload(),
+                    &key_info,
+                    key_info.len(),
+                )
+                .unwrap();
+                let slow = compare_immutable(
+                    l_record.get_values().unwrap().iter(),
+                    r_record.get_values().unwrap().iter(),
+                    &key_info,
+                );
+                assert_eq!(
+                    fast, slow,
+                    "raw-bytes compare diverged for {l_values:?} vs {r_values:?}"
+                );
+                let prefix_equal = serialized_record_prefixes_equal(
+                    l_record.get_payload(),
+                    r_record.get_payload(),
+                    &key_info,
+                    2,
+                )
+                .unwrap();
+                let decoded_prefix_equal = compare_immutable(
+                    l_record.get_values().unwrap()[..2].iter(),
+                    r_record.get_values().unwrap()[..2].iter(),
+                    &key_info[..2],
+                )
+                .is_eq();
+                assert_eq!(prefix_equal, decoded_prefix_equal);
+            }
+        }
+    }
+
+    #[test]
+    fn serialized_record_nan_float_sorts_as_null() {
+        // The serializer cannot produce a NaN float (`Value::from_f64` maps
+        // NaN to NULL), but a record read from disk can carry one. Patch the
+        // float payload of a serialized record to the NaN bit pattern and
+        // check both the comparator and the null scan treat it as NULL, the
+        // way decoding through `read_value_serial_type` does.
+        let float_record = ImmutableRecord::from_values(&[Value::from_f64(1.5)], 1).unwrap();
+        let payload = float_record.get_payload();
+        // One-column record: 2-byte header (size varint, serial type 7), then
+        // the 8 float bytes.
+        assert_eq!(payload.len(), 10);
+        assert_eq!(payload[1], 7);
+        let mut nan_payload = payload.to_vec();
+        nan_payload[2..].copy_from_slice(&f64::NAN.to_be_bytes());
+
+        let key_info = [KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation: CollationSeq::Binary,
+            nulls_order: None,
+        }];
+        let null_record = ImmutableRecord::from_values(&[Value::Null], 1).unwrap();
+        let int_record = ImmutableRecord::from_values(&[Value::from_i64(0)], 1).unwrap();
+        assert_eq!(
+            compare_serialized_records(&nan_payload, null_record.get_payload(), &key_info, 1)
+                .unwrap(),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_serialized_records(&nan_payload, int_record.get_payload(), &key_info, 1)
+                .unwrap(),
+            Ordering::Less
+        );
+        assert!(serialized_record_has_null_in_first_cols(&nan_payload, 1).unwrap());
+        assert!(!serialized_record_has_null_in_first_cols(int_record.get_payload(), 1).unwrap());
     }
 }

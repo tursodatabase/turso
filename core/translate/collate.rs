@@ -152,25 +152,40 @@ impl CollationSeq {
     #[inline(always)]
     pub fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
         match *self {
-            Self::Unset | Self::Binary => Self::binary_cmp(lhs, rhs),
-            Self::NoCase => Self::nocase_cmp(lhs, rhs),
-            Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
+            Self::Unset | Self::Binary => Self::binary_cmp(lhs.as_bytes(), rhs.as_bytes()),
+            Self::NoCase => Self::nocase_cmp(lhs.as_bytes(), rhs.as_bytes()),
+            Self::Rtrim => Self::rtrim_cmp(lhs.as_bytes(), rhs.as_bytes()),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
             // Immutable comparison paths have no connection to fetch the external
             // callback from. Runtime VDBE paths dispatch custom collations via
             // `Connection`; schema/index paths reject them before storage.
-            Self::Custom(_) => Self::binary_cmp(lhs, rhs),
+            Self::Custom(_) => Self::binary_cmp(lhs.as_bytes(), rhs.as_bytes()),
+        }
+    }
+
+    /// Compare two text values by their raw bytes, without checking that they
+    /// are valid UTF-8. Returns `None` for locale collations, which need real
+    /// strings. For every other collation this returns exactly what
+    /// [`Self::compare_strings`] would return for the same bytes: those
+    /// collations only ever look at individual bytes.
+    #[inline(always)]
+    pub fn compare_text_bytes(&self, lhs: &[u8], rhs: &[u8]) -> Option<Ordering> {
+        match *self {
+            Self::Unset | Self::Binary | Self::Custom(_) => Some(Self::binary_cmp(lhs, rhs)),
+            Self::NoCase => Some(Self::nocase_cmp(lhs, rhs)),
+            Self::Rtrim => Some(Self::rtrim_cmp(lhs, rhs)),
+            Self::Locale(_) => None,
         }
     }
 
     #[inline(always)]
-    fn binary_cmp(lhs: &str, rhs: &str) -> Ordering {
+    fn binary_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
         lhs.cmp(rhs)
     }
 
     #[inline(always)]
-    fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+    fn nocase_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        for (left, right) in lhs.iter().zip(rhs.iter()) {
             let left = left.to_ascii_lowercase();
             let right = right.to_ascii_lowercase();
             if left != right {
@@ -184,8 +199,15 @@ impl CollationSeq {
     }
 
     #[inline(always)]
-    fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+    fn rtrim_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        fn trim_trailing_spaces(bytes: &[u8]) -> &[u8] {
+            let end = bytes
+                .iter()
+                .rposition(|&b| b != b' ')
+                .map_or(0, |pos| pos + 1);
+            &bytes[..end]
+        }
+        trim_trailing_spaces(lhs).cmp(trim_trailing_spaces(rhs))
     }
 
     pub fn hash_key(&self, text: &str) -> Vec<u8> {

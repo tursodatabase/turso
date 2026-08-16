@@ -1171,9 +1171,27 @@ impl BTreeCursor {
         index: &Index,
         num_columns: usize,
     ) -> Result<Self> {
+        Ok(Self::new_index_with_info(
+            pager,
+            root_page,
+            num_columns,
+            Arc::new(IndexInfo::new_from_index(index)?),
+        ))
+    }
+
+    /// Like [`Self::new_index`], but reuses an already-built `IndexInfo`
+    /// instead of deriving a fresh one from the schema. Callers that also
+    /// hand the same metadata to an MVCC cursor share one allocation this
+    /// way.
+    pub fn new_index_with_info(
+        pager: Arc<Pager>,
+        root_page: i64,
+        num_columns: usize,
+        index_info: Arc<IndexInfo>,
+    ) -> Self {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)?));
-        Ok(cursor)
+        cursor.index_info = Some(index_info);
+        cursor
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the

@@ -26,7 +26,9 @@ use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
-use crate::types::compare_immutable;
+use crate::types::compare_serialized_records;
+use crate::types::serialized_record_has_null_in_first_cols;
+use crate::types::serialized_record_prefixes_equal;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
@@ -201,72 +203,31 @@ impl SortableIndexKey {
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
-
-        let mut lhs = self.key.iter()?;
-        let mut rhs = other.key.iter()?;
-
-        for i in 0..num_cols {
-            let lhs_value = lhs.next().expect("we already checked length")?;
-            let rhs_value = rhs.next().expect("we already checked length")?;
-
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
-
-            if cmp != std::cmp::Ordering::Equal {
-                return Ok(cmp);
-            }
-        }
-
-        Ok(std::cmp::Ordering::Equal)
+        compare_serialized_records(
+            self.key.get_payload(),
+            other.key.get_payload(),
+            &self.metadata.key_info,
+            num_cols,
+        )
     }
 
     /// Check if the index key contains any NULL values (excluding the rowid column).
     /// In SQLite, NULLs don't violate UNIQUE constraints, so we skip conflict checks for NULL keys.
     pub fn contains_null(&self, num_indexed_cols: usize) -> Result<bool> {
-        let mut iter = self.key.iter()?;
         // Only check the indexed columns, not the rowid at the end
-        for _ in 0..num_indexed_cols {
-            if let Some(value) = iter.next() {
-                if matches!(value?, crate::types::ValueRef::Null) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        serialized_record_has_null_in_first_cols(self.key.get_payload(), num_indexed_cols)
     }
 
     /// Check if the first `num_cols` columns of this key match another key.
     /// Used for UNIQUE index conflict detection where we need to compare only
     /// the indexed columns, not the rowid suffix.
     pub fn matches_prefix(&self, other: &Self, num_cols: usize) -> Result<bool> {
-        let mut lhs = self.key.iter()?;
-        let mut rhs = other.key.iter()?;
-
-        for i in 0..num_cols {
-            let lhs_value = match lhs.next() {
-                Some(v) => v?,
-                None => return Ok(false),
-            };
-            let rhs_value = match rhs.next() {
-                Some(v) => v?,
-                None => return Ok(false),
-            };
-
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
-
-            if cmp != std::cmp::Ordering::Equal {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        serialized_record_prefixes_equal(
+            self.key.get_payload(),
+            other.key.get_payload(),
+            &self.metadata.key_info,
+            num_cols,
+        )
     }
 }
 
@@ -1463,7 +1424,10 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     Checkpoint {
         // TODO: if and when we transform this code to async we won't be needing this explicit state machine nor
         // the mutex
-        state_machine: Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>,
+        // Boxed so this rarely-entered variant doesn't inflate every
+        // `CommitStateMachine` (one is built per commit) to the checkpoint
+        // machine's size.
+        state_machine: Box<Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>>,
     },
     CommitEnd {
         end_ts: u64,
@@ -2157,18 +2121,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
         // (e.g. -58). On recovery, bootstrap reconstructs the map using
         // -(root_page), so log records must use that canonical form to be found.
+        //
+        // A commit logs many versions but usually touches one table plus a few
+        // indexes, so memoize the rootpage lookup per table id: a hash probe
+        // per version instead of a skiplist search. The memo lives for one
+        // chunk of this step; the rootpage binding cannot change mid-commit
+        // (checkpoints serialize behind the commit lock this tx holds).
+        let canonical_table_ids: std::cell::RefCell<HashMap<MVTableId, MVTableId>> =
+            std::cell::RefCell::new(HashMap::default());
         let canonicalize_table_id = |version: &mut RowVersion| {
             let table_id = version.row.id.table_id;
             if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                 return;
             }
-            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
-                if let Some(root_page) = entry.value().root_page {
-                    let canonical = MVTableId::from(-(root_page as i64));
-                    if canonical != table_id {
-                        version.row.id.table_id = canonical;
-                    }
-                }
+            let canonical = *canonical_table_ids
+                .borrow_mut()
+                .entry(table_id)
+                .or_insert_with(|| {
+                    mvcc_store
+                        .table_id_to_rootpage
+                        .get(&table_id)
+                        .and_then(|entry| entry.value().root_page)
+                        .map(|root_page| MVTableId::from(-(root_page as i64)))
+                        .unwrap_or(table_id)
+                });
+            if canonical != table_id {
+                version.row.id.table_id = canonical;
             }
         };
 
@@ -3353,7 +3331,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         self.db_id,
                         auto_checkpoint_mode,
                     ));
-                    let state_machine = Mutex::new(state_machine);
+                    let state_machine = Box::new(Mutex::new(state_machine));
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
                 }
@@ -5245,6 +5223,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<bool> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
         self.bump_version_mutation_epoch();
+        // One transaction lookup for the whole call. The entry stays valid
+        // across the version loop: only this connection can finish the
+        // transaction, and it is busy running this delete.
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        turso_assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.get_or_create_index_rows(index_id)?;
@@ -5257,12 +5244,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let arc_key = row_versions_entry.key().clone();
                     let row_versions = row_versions_entry.value().clone();
                     for rv in row_versions.write().iter_mut().rev() {
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
@@ -5275,11 +5256,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
                         let version_id = rv.id;
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
                         tx.insert_to_write_set(id, row_versions.clone());
                         tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
@@ -5293,12 +5269,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let row_versions = row_versions_entry.value().clone();
                     let mut locked_row_versions = row_versions.write();
                     for rv in locked_row_versions.iter_mut().rev() {
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
@@ -5313,11 +5283,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
                         drop(locked_row_versions);
                         drop(row_versions_opt);
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
                         tx.insert_to_write_set(id.clone(), row_versions.clone());
                         tx.record_deleted_table_version(id.clone(), version_id);
                         return Ok(true);
@@ -8033,9 +7998,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // which performs a binary search for the insertion point.
         versions.try_reserve(1)?;
         let mut position = 0_usize;
+        let new_begin = self.resolve_begin_timestamp(&row_version.begin());
         for (i, v) in versions.iter().enumerate().rev() {
             let existing_begin = self.resolve_begin_timestamp(&v.begin());
-            let new_begin = self.resolve_begin_timestamp(&row_version.begin());
             if existing_begin <= new_begin {
                 // Recovery can replay multiple operations for the same row from one transaction
                 // (e.g. insert then delete), which share the same begin timestamp.
@@ -10178,6 +10143,13 @@ fn is_begin_visible<A: ConcurrentAllocator>(
             tx.begin_ts > rv_begin_ts
         }
         Some(TxTimestampOrID::TxID(rv_begin)) => {
+            // Our own uncommitted version: we are Active (we are executing
+            // this very read), so the Active arm below would evaluate to
+            // `rv.end().is_none()`. Answer without the map lookup — reading
+            // your own writes is the common TxID-reference case.
+            if rv_begin == tx.tx_id {
+                return rv.end().is_none();
+            }
             let visible = match txs.get(&rv_begin) {
                 Some(tb_entry) => {
                     let tb = tb_entry.value();
@@ -10263,6 +10235,13 @@ fn is_end_visible<A: ConcurrentAllocator>(
     match row_version.end() {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
+            // We deleted this version ourselves: we are Active, so the Active
+            // arm below would evaluate to false. Answer without the map
+            // lookup — seeing your own deletes is the common TxID-reference
+            // case.
+            if rv_end == current_tx.tx_id {
+                return false;
+            }
             let visible = match txs.get(&rv_end) {
                 Some(other_tx_entry) => {
                     let other_tx = other_tx_entry.value();
