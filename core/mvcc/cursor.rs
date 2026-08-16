@@ -618,6 +618,14 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// one truncated `IndexInfo` avoids rebuilding it (and re-copying its
     /// key_info) on every seek.
     probe_index_info: Option<Arc<IndexInfo>>,
+    /// The transaction's `begin_ts`, captured at cursor construction. A
+    /// transaction's snapshot timestamp never changes, and a cursor is bound
+    /// to one transaction for its whole life, so this replaces a
+    /// transactions-map lookup on every B-tree-readability check.
+    snapshot_ts: u64,
+    /// The transaction's frozen WAL read mark; immutable per transaction,
+    /// cached for the same reason as `snapshot_ts`.
+    read_mark: crate::mvcc::database::WalPos,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
@@ -683,6 +691,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         } else {
             db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
         };
+        let read_mark = db.read_tx_mark(tx_id);
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
@@ -699,6 +708,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             eq_seek_memo: None,
             record_serialized_at: None,
             probe_index_info: None,
+            snapshot_ts,
+            read_mark,
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
@@ -1001,10 +1012,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // (`visible_from <= observed_boundary`). A cursor that opened before checkpoint publish
         // materialization therefore stays version-store-only for its whole life and never seeks
         // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
-        let begin_ts = self.db.read_snapshot_ts(self.tx_id);
-        let read_mark = self.db.read_tx_mark(self.tx_id);
+        // `snapshot_ts` and `read_mark` are immutable per transaction and
+        // cached at cursor construction.
         self.db
-            .is_btree_readable_at(&self.table_id, begin_ts, read_mark)
+            .is_btree_readable_at(&self.table_id, self.snapshot_ts, self.read_mark)
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
