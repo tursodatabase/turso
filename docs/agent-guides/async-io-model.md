@@ -191,8 +191,8 @@ ProcessingItem { idx, items } => {
 ## Turso Implementation
 
 Key files:
-- `core/types.rs` - `IOResult`, `IOCompletions`, `return_if_io!`, `return_and_restore_if_io!`
-- `core/io/completions.rs` - `Completion`, `CompletionGroup`
+- `core/crates/io/io_result.rs` - `IOResult`, `IOCompletions`, `return_if_io!`, `return_and_restore_if_io!`
+- `core/crates/io/completions.rs` - `Completion`, `CompletionGroup`
 - `core/util.rs` - `io_yield_one!` macro
 - `core/state_machine.rs` - Generic `StateMachine` wrapper
 - `core/storage/btree.rs` - Many state machine examples
