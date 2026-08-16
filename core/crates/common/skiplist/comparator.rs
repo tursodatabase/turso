@@ -22,7 +22,7 @@ use super::equivalent::{Comparable, Equivalent};
 ///
 /// ## Example
 /// ```
-/// use turso_core::skiplist::comparator::Equivalator;
+/// use turso_core_common::skiplist::comparator::Equivalator;
 ///
 /// struct MyEquivalator {
 ///     case_sensitive: bool,

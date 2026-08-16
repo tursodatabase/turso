@@ -33,7 +33,7 @@ impl<T> SkipSet<T> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set: SkipSet<i32> = SkipSet::new();
     /// ```
@@ -51,8 +51,8 @@ impl<T, A: SkiplistAllocator> SkipSet<T, BasicComparator, A> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::alloc::TursoAllocator;
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::alloc::TursoAllocator;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set: SkipSet<i32, _, TursoAllocator> = SkipSet::new_in(TursoAllocator);
     /// ```
@@ -69,7 +69,7 @@ impl<T, C> SkipSet<T, C> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::{SkipSet, comparator::BasicComparator};
+    /// use turso_core_common::skiplist::{SkipSet, comparator::BasicComparator};
     ///
     /// let set: SkipSet<i32> = SkipSet::with_comparator(BasicComparator);
     /// ```
@@ -87,8 +87,8 @@ impl<T, C, A: SkiplistAllocator> SkipSet<T, C, A> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::alloc::TursoAllocator;
-    /// use turso_core::skiplist::{SkipSet, comparator::BasicComparator};
+    /// use turso_core_common::alloc::TursoAllocator;
+    /// use turso_core_common::skiplist::{SkipSet, comparator::BasicComparator};
     ///
     /// let set: SkipSet<i32, _, TursoAllocator> =
     ///     SkipSet::with_comparator_in(BasicComparator, TursoAllocator);
@@ -104,7 +104,7 @@ impl<T, C, A: SkiplistAllocator> SkipSet<T, C, A> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// assert!(set.is_empty());
@@ -124,7 +124,7 @@ impl<T, C, A: SkiplistAllocator> SkipSet<T, C, A> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// assert_eq!(set.len(), 0);
@@ -146,7 +146,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(1);
@@ -163,7 +163,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(1);
@@ -180,7 +180,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set: SkipSet<_> = (1..=3).collect();
     /// assert!(set.contains(&1));
@@ -199,7 +199,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set: SkipSet<_> = (1..=3).collect();
     /// assert_eq!(*set.get(&3).unwrap(), 3);
@@ -220,7 +220,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     /// use std::ops::Bound::*;
     ///
     /// let set = SkipSet::new();
@@ -252,7 +252,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     /// use std::ops::Bound::*;
     ///
     /// let set = SkipSet::new();
@@ -279,7 +279,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// let entry = set.get_or_insert(2);
@@ -297,7 +297,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// let entry = set.try_get_or_insert(2).unwrap();
@@ -312,7 +312,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(6);
@@ -336,7 +336,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(6);
@@ -373,7 +373,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(2);
@@ -391,7 +391,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.try_insert(2).unwrap();
@@ -409,7 +409,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(2);
@@ -433,7 +433,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(1);
@@ -458,7 +458,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(1);
@@ -479,7 +479,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipSet;
+    /// use turso_core_common::skiplist::SkipSet;
     ///
     /// let set = SkipSet::new();
     /// set.insert(1);

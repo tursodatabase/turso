@@ -14,7 +14,7 @@
 //! them to be invoked concurrently.
 //!
 //! ```
-//! use turso_core::skiplist::SkipMap;
+//! use turso_core_common::skiplist::SkipMap;
 //! use crossbeam_utils::thread::scope;
 //!
 //! let person_ages = SkipMap::new();
@@ -47,7 +47,7 @@
 //! Be warned that, because of this lock-freedom, it's easy to introduce
 //! race conditions into your code. For example:
 //! ```no_run
-//! use turso_core::skiplist::SkipSet;
+//! use turso_core_common::skiplist::SkipSet;
 //! use crossbeam_utils::thread::scope;
 //!
 //! let numbers = SkipSet::new();
@@ -165,7 +165,7 @@
 //! # Examples
 //! [`SkipMap`] basic usage:
 //! ```
-//! use turso_core::skiplist::SkipMap;
+//! use turso_core_common::skiplist::SkipMap;
 //!
 //! // Note that the variable doesn't have to be mutable:
 //! // SkipMap methods take &self to support concurrent access.
@@ -200,7 +200,7 @@
 //!
 //! [`SkipSet`] basic usage:
 //! ```
-//! use turso_core::skiplist::SkipSet;
+//! use turso_core_common::skiplist::SkipSet;
 //!
 //! let books = SkipSet::new();
 //!

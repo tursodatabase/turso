@@ -412,6 +412,12 @@ impl DeleteOperation {
     }
 }
 
+impl Default for DeleteOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PathOperation for DeleteOperation {
     fn operation_mode(&self) -> PathOperationMode {
         self.mode
@@ -933,6 +939,10 @@ impl Jsonb {
 
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 
     pub fn make_empty_array(size: usize) -> Result<Self> {

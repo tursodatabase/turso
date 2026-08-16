@@ -394,8 +394,6 @@ impl ValueExecOps for Value {
         Value::from_i64(generate_random_number())
     }
 
-    /// SQLite default max blob/string size (1GB)
-
     fn exec_randomblob<F>(&self, fill_bytes: F) -> Result<Value>
     where
         F: Fn(&mut [u8]),

@@ -36,7 +36,7 @@ impl<K, V> SkipMap<K, V> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map: SkipMap<i32, &str> = SkipMap::new();
     /// ```
@@ -54,8 +54,8 @@ impl<K, V, A: SkiplistAllocator> SkipMap<K, V, BasicComparator, A> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::alloc::TursoAllocator;
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::alloc::TursoAllocator;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map: SkipMap<i32, &str, _, TursoAllocator> = SkipMap::new_in(TursoAllocator);
     /// ```
@@ -72,7 +72,7 @@ impl<K, V, C> SkipMap<K, V, C> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::skiplist::{SkipMap, comparator::BasicComparator};
+    /// use turso_core_common::skiplist::{SkipMap, comparator::BasicComparator};
     ///
     /// let map: SkipMap<i32, &str> = SkipMap::with_comparator(BasicComparator);
     /// ```
@@ -90,8 +90,8 @@ impl<K, V, C, A: SkiplistAllocator> SkipMap<K, V, C, A> {
     /// # Example
     ///
     /// ```
-    /// use turso_core::alloc::TursoAllocator;
-    /// use turso_core::skiplist::{SkipMap, comparator::BasicComparator};
+    /// use turso_core_common::alloc::TursoAllocator;
+    /// use turso_core_common::skiplist::{SkipMap, comparator::BasicComparator};
     ///
     /// let map: SkipMap<i32, &str, _, TursoAllocator> =
     ///     SkipMap::with_comparator_in(BasicComparator, TursoAllocator);
@@ -110,7 +110,7 @@ impl<K, V, C, A: SkiplistAllocator> SkipMap<K, V, C, A> {
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map: SkipMap<&str, &str> = SkipMap::new();
     /// assert!(map.is_empty());
@@ -129,7 +129,7 @@ impl<K, V, C, A: SkiplistAllocator> SkipMap<K, V, C, A> {
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map = SkipMap::new();
     /// map.insert(0, 1);
@@ -157,7 +157,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let numbers = SkipMap::new();
     /// numbers.insert(5, "five");
@@ -177,7 +177,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let numbers = SkipMap::new();
     /// numbers.insert(5, "five");
@@ -197,7 +197,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let ages = SkipMap::new();
     /// let gates_age = ages.get_or_insert("Bill Gates", 64);
@@ -219,7 +219,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let ages = SkipMap::new();
     /// let gates_age = ages.try_get_or_insert("Bill Gates", 64).unwrap();
@@ -249,7 +249,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let ages = SkipMap::new();
     /// let gates_age = ages.get_or_insert_with("Bill Gates", || 64);
@@ -275,7 +275,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let ages = SkipMap::new();
     /// let gates_age = ages.try_get_or_insert_with("Bill Gates", || 64).unwrap();
@@ -303,7 +303,7 @@ where
     ///
     /// # Examples
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let numbers = SkipMap::new();
     /// numbers.insert(6, "six");
@@ -332,7 +332,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let ages = SkipMap::new();
     /// ages.insert("Bill Gates", 64);
@@ -356,7 +356,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let numbers: SkipMap<&str, i32> = SkipMap::new();
     /// assert!(numbers.get("six").is_none());
@@ -382,7 +382,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     /// use std::ops::Bound::*;
     ///
     /// let numbers = SkipMap::new();
@@ -417,7 +417,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     /// use std::ops::Bound::*;
     ///
     /// let numbers = SkipMap::new();
@@ -447,7 +447,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let numbers = SkipMap::new();
     /// numbers.insert(6, "six");
@@ -489,7 +489,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map = SkipMap::new();
     /// map.insert("key", "value");
@@ -508,7 +508,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map = SkipMap::new();
     /// map.try_insert("key", "value").unwrap();
@@ -531,7 +531,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map = SkipMap::new();
     /// map.insert("key", 1);
@@ -557,7 +557,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map = SkipMap::new();
     /// map.try_insert("key", 1).unwrap();
@@ -589,7 +589,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let map: SkipMap<&str, &str> = SkipMap::new();
     /// assert!(map.remove("invalid key").is_none());
@@ -614,7 +614,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let numbers = SkipMap::new();
     /// numbers.insert(6, "six");
@@ -641,7 +641,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let numbers = SkipMap::new();
     /// numbers.insert(6, "six");
@@ -664,7 +664,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use turso_core::skiplist::SkipMap;
+    /// use turso_core_common::skiplist::SkipMap;
     ///
     /// let people = SkipMap::new();
     /// people.insert("Bill", "Gates");
