@@ -15,7 +15,7 @@ use crate::translate::optimizer::access_method::{
     BranchReadMode, ChosenInSeekCandidate,
 };
 use crate::translate::optimizer::constraints::{
-    analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
+    analyze_binary_term_for_index, can_use_partial_index, constraints_for_table,
     partial_index_predicate_terms, summarize_binary_term_for_index, Constraint, RangeConstraintRef,
     TableConstraints,
 };
@@ -133,7 +133,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 /// Build temporary `WhereTerm`s from branch-local expressions and extract the
 /// constraints for exactly one target table.
 ///
-/// This is narrower than `constraints_from_where_clause()`:
+/// This is narrower than `constraints_for_table()`:
 /// - `exprs` are synthetic planner inputs, not the query's real top-level
 ///   `WHERE` terms.
 /// - The returned `WhereTerm`s are only suitable for branch-local planning
@@ -141,9 +141,8 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 ///   for global predicate consumption or join rewrites.
 ///
 /// FIXME: stop synthesizing `WhereTerm`s here just to reuse
-/// `constraints_from_where_clause()`. Branch-local planning should have a
-/// direct constraint-extraction path that does not fabricate top-level planner
-/// terms.
+/// `constraints_for_table()`. Branch-local planning should have a direct
+/// constraint-extraction path that does not fabricate top-level planner terms.
 #[expect(clippy::too_many_arguments)]
 fn get_table_local_constraints_for_branch(
     exprs: &[ast::Expr],
@@ -164,18 +163,15 @@ fn get_table_local_constraints_for_branch(
             consumed: false,
         })
         .collect::<Vec<_>>();
-    let table_constraints = constraints_from_where_clause(
+    let mut table_constraints = constraints_for_table(
+        table_reference,
         &synthetic_where_terms,
         table_references,
         available_indexes,
         subqueries,
         schema,
         params,
-    )?
-    .into_iter()
-    .find(|constraints| constraints.table_id == table_reference.internal_id)
-    .expect("constraints_from_where_clause must return constraints for every joined table");
-    let mut table_constraints = table_constraints;
+    )?;
     // Branch-local constraints originate from synthetic `WhereTerm`s, so copy
     // out their constraining expressions while those temporary terms still
     // exist.
