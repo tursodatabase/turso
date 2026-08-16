@@ -333,10 +333,11 @@ fn seqcompact_tombstone_payload_uses_store_allocator() {
     )
     .unwrap();
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
-    let versions = store
+    let entry = store
         .get_or_create_table_row_versions(row_id.clone())
         .unwrap();
-    versions.write().try_reserve(1).unwrap();
+    entry.value().write().try_reserve(1).unwrap();
+    drop(entry);
 
     alloc.fail_allocations(true);
     store.seqcompact_commit_delete(row_id, 1, 10);
