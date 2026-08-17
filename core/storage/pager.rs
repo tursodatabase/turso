@@ -62,15 +62,24 @@ use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 
-/// Readahead window ceiling, in pages, out of the box.
+/// Readahead window ceiling, in pages, out of the box. Zero means off.
 ///
-/// 32 pages is 128 KiB at the usual 4 KiB page size, which is also Linux's
-/// default `read_ahead_kb`. Measured over the TPC-H table scans (see
-/// `storage::readahead`), 32 pages already removes ~185x of the blocking
-/// reads; going wider does not remove meaningfully more of them, and every
-/// extra page is memory held and bandwidth spent. Set `PRAGMA prefetch_pages`
-/// to trade the other way.
-pub const DEFAULT_READAHEAD_WINDOW: u32 = 32;
+/// Off by default because on an ordinary file it has not been shown to make
+/// queries faster. Measured over the whole TPC-H suite against the 1.2 GB
+/// database, with the page cache dropped before every run, readahead was
+/// within noise of no readahead (-0.5% total). The reason is that the kernel
+/// is already doing this: Linux read-ahead on that device is 8 MiB, sixty-four
+/// times the window here, so by the time the database asks for the next page
+/// the kernel has long since fetched it. Readahead removes syscalls -- 195,206
+/// to 8,827 on a full LINEITEM scan -- but on that path the syscalls were not
+/// what the query was waiting for.
+///
+/// It is worth turning on when nothing underneath is reading ahead for you and
+/// a request costs much more than the bytes it moves: O_DIRECT, network block
+/// storage, a remote page server, an object store. `PRAGMA prefetch_pages = 32`
+/// is a reasonable starting point there (128 KiB at a 4 KiB page size, which is
+/// also Linux's own default read-ahead size).
+pub const DEFAULT_READAHEAD_WINDOW: u32 = 0;
 
 /// Hard ceiling on `PRAGMA prefetch_pages`, so one connection cannot pin an
 /// unbounded amount of memory in prefetched pages.
