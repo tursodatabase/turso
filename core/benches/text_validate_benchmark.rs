@@ -1,233 +1,141 @@
-//! Head-to-head microbenchmark of two UTF-8 text validation strategies,
-//! at the function level (no database engine involved).
-//!
-//! Baseline: `simdutf8::basic::from_utf8`, exactly what the TEXT serial-type
-//! arm of `nth_into_register` in `core/vdbe/mod.rs` calls on main today.
-//! Candidates: an ASCII OR-reduction fast path that falls back to the baseline
-//! for non-ASCII input, byte by byte or a word at a time.
-//!
-//! Real TEXT values are decoded from b-tree page cells at arbitrary byte
-//! offsets, and short-input `from_utf8` is alignment-sensitive. Each measured
-//! iteration therefore validates slices at a fixed schedule of varying
-//! offsets whose low three bits cycle through 0..=7.
-//!
-//! Run:  cargo bench -p turso_core --bench text_validate_benchmark
-
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{
+    black_box, criterion_group, criterion_main, Criterion, Throughput,
+};
 #[cfg(not(feature = "codspeed"))]
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
 use std::time::Duration;
 
-/// Baseline: verbatim the validation call from the TEXT decode arm in
-/// `core/vdbe/mod.rs` (`nth_into_register`).
-fn validate_simdutf8(data: &[u8]) -> Option<&str> {
-    simdutf8::basic::from_utf8(data).ok()
+const CALLS_PER_ITERATION: usize = 10_000;
+const CALLGRIND_SIZES: &[usize] = &[
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+    511, 512, 513, 1024,
+];
+
+struct Fixture {
+    bytes: Vec<u8>,
+    offset: usize,
 }
 
-/// The OR-reduction fast path without a size cutoff: it always OR-reduces
-/// every byte, takes the unchecked-ASCII path if none has the high bit set,
-/// and falls back to the baseline (`simdutf8::basic::from_utf8`) otherwise.
-/// Kept as a benchmark variant to document why `validate_utf8` in
-/// `core/vdbe/mod.rs` has a cutoff at all.
-#[inline]
-fn validate_ascii_or(data: &[u8]) -> Option<&str> {
-    let mut acc = 0u8;
-    for &byte in data {
-        acc |= byte;
-    }
-    if acc.is_ascii() {
-        // SAFETY: all bytes are ASCII, which is valid UTF-8.
-        return Some(unsafe { core::str::from_utf8_unchecked(data) });
-    }
-    simdutf8::basic::from_utf8(data).ok()
+struct Case {
+    name: String,
+    fixtures: Vec<Fixture>,
 }
 
-/// The byte-at-a-time OR-reduction with a cutoff: the OR-reduction only
-/// runs where it wins (short strings, where simdutf8's std fallback is
-/// alignment-sensitive); longer inputs go straight to real SIMD validation.
-#[inline]
-fn validate_ascii_or_cutoff(data: &[u8]) -> Option<&str> {
-    const ASCII_SCAN_CUTOFF: usize = 512;
-    if data.len() <= ASCII_SCAN_CUTOFF {
-        let mut acc = 0u8;
-        for &byte in data {
-            acc |= byte;
-        }
-        if acc.is_ascii() {
-            // SAFETY: all bytes are ASCII, which is valid UTF-8.
-            return Some(unsafe { core::str::from_utf8_unchecked(data) });
-        }
-    }
-    simdutf8::basic::from_utf8(data).ok()
-}
-
-/// Verbatim copy of `validate_utf8` in `core/vdbe/mod.rs`: the OR-reduction
-/// of the cutoff variant done eight bytes at a time, then four, two and one
-/// for the rest, so a value takes at most `len / 8 + 3` unaligned loads.
-#[inline]
-fn validate_ascii_words(data: &[u8]) -> Option<&str> {
-    const ASCII_SCAN_CUTOFF: usize = 512;
-    if data.len() <= ASCII_SCAN_CUTOFF && is_ascii(data) {
-        // SAFETY: all bytes are ASCII, which is valid UTF-8.
-        return Some(unsafe { core::str::from_utf8_unchecked(data) });
-    }
-    simdutf8::basic::from_utf8(data).ok()
-}
-
-#[inline]
-fn is_ascii(data: &[u8]) -> bool {
-    let mut acc = 0u64;
-    let mut rest = data;
-    while let Some((word, tail)) = rest.split_first_chunk::<8>() {
-        acc |= u64::from_ne_bytes(*word);
-        rest = tail;
-    }
-    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
-        acc |= u64::from(u32::from_ne_bytes(*word));
-        rest = tail;
-    }
-    if let Some((word, tail)) = rest.split_first_chunk::<2>() {
-        acc |= u64::from(u16::from_ne_bytes(*word));
-        rest = tail;
-    }
-    if let Some(&byte) = rest.first() {
-        acc |= u64::from(byte);
-    }
-    acc & 0x8080_8080_8080_8080 == 0
-}
-
-const BUF_LEN: usize = 8192;
-const SLICES_PER_ROUND: usize = 64;
-const SIZES: [usize; 13] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
-
-/// Offsets at pseudo-random positions whose low three bits cycle 0..=7, so
-/// consecutive calls see differently-aligned slices like record decoding does.
-fn ascii_schedule(size: usize) -> Vec<usize> {
-    let bases = (BUF_LEN - size) / 8;
-    (0..SLICES_PER_ROUND)
-        .map(|i| {
-            let pr = (i as u32).wrapping_mul(0x9E37_79B1) as usize;
-            (pr % bases) * 8 + (i % 8)
-        })
-        .collect()
-}
-
-/// A buffer holding a valid 64-byte multibyte string at each scheduled
-/// offset, so odd-offset slices never split a codepoint. Spacing is 72 bytes
-/// (a multiple of 8), so alignment still cycles 0..=7.
-fn multibyte_fixture() -> (Vec<u8>, Vec<usize>) {
-    let mut buf = vec![b'a'; BUF_LEN];
-    let pattern = "é".repeat(32).into_bytes();
-    assert_eq!(pattern.len(), 64);
-    let offsets: Vec<usize> = (0..SLICES_PER_ROUND).map(|i| i * 72 + (i % 8)).collect();
-    for &off in &offsets {
-        buf[off..off + 64].copy_from_slice(&pattern);
-    }
-    (buf, offsets)
-}
-
-fn run_schedule(
-    buf: &[u8],
-    schedule: &[usize],
-    size: usize,
-    rounds: usize,
-    validate: impl Fn(&[u8]) -> Option<&str>,
-) {
-    for _ in 0..rounds {
-        for &off in schedule {
-            let slice = &buf[off..off + size];
-            black_box(validate(black_box(slice)).is_some());
-        }
-    }
-}
-
-/// Batch enough calls per iteration that the smallest sizes are well above
-/// timer noise.
-fn rounds_for(size: usize) -> usize {
-    (32_768 / (SLICES_PER_ROUND * size)).max(1)
-}
-
-fn assert_functions_agree() {
-    let long_multibyte = "é".repeat(32);
-    let cases: [&[u8]; 6] = [
-        b"",
-        b"hello world",
-        "héllo wörld".as_bytes(),
-        b"\xff\xfe invalid",
-        b"ascii then bad \xc3",
-        long_multibyte.as_bytes(),
-    ];
-    for case in cases {
-        assert_eq!(
-            validate_simdutf8(case),
-            validate_ascii_or(case),
-            "functions disagree on {case:?}"
-        );
-        assert_eq!(
-            validate_simdutf8(case),
-            validate_ascii_or_cutoff(case),
-            "cutoff variant disagrees on {case:?}"
-        );
-        assert_eq!(
-            validate_simdutf8(case),
-            validate_ascii_words(case),
-            "word variant disagrees on {case:?}"
-        );
-    }
+#[derive(Clone, Copy)]
+enum Content {
+    Ascii,
+    UnicodeFirst,
+    UnicodeLast,
+    UnicodeDense,
+    InvalidFirst,
+    InvalidLast,
+    Truncated,
 }
 
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_text_validate(criterion: &mut Criterion) {
-    assert_functions_agree();
-
     let mut group = criterion.benchmark_group("text_validate");
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(2));
+    group.throughput(Throughput::Elements(CALLS_PER_ITERATION as u64));
 
-    let ascii_buf = vec![b'a'; BUF_LEN];
-    for size in SIZES {
-        let schedule = ascii_schedule(size);
-        let rounds = rounds_for(size);
-        group.bench_function(format!("simdutf8_{size}"), |b| {
-            b.iter(|| run_schedule(&ascii_buf, &schedule, size, rounds, validate_simdutf8));
-        });
-        group.bench_function(format!("ascii_or_{size}"), |b| {
-            b.iter(|| run_schedule(&ascii_buf, &schedule, size, rounds, validate_ascii_or));
-        });
-        group.bench_function(format!("ascii_or_cutoff_{size}"), |b| {
-            b.iter(|| {
-                run_schedule(
-                    &ascii_buf,
-                    &schedule,
-                    size,
-                    rounds,
-                    validate_ascii_or_cutoff,
-                )
-            });
-        });
-        group.bench_function(format!("ascii_words_{size}"), |b| {
-            b.iter(|| run_schedule(&ascii_buf, &schedule, size, rounds, validate_ascii_words));
+    for case in cases() {
+        assert!(case.fixtures.len().is_power_of_two());
+        for fixture in &case.fixtures {
+            let data = &fixture.bytes[fixture.offset..];
+            let expected = std::str::from_utf8(data).is_ok();
+            assert_eq!(read_production(data), expected, "{}", case.name);
+        }
+        group.bench_function(format!("{}/production", case.name), |b| {
+            b.iter(|| text_validate_batch(&case.fixtures));
         });
     }
-
-    let (mb_buf, mb_schedule) = multibyte_fixture();
-    let rounds = rounds_for(64);
-    group.bench_function("simdutf8_multibyte_64", |b| {
-        b.iter(|| run_schedule(&mb_buf, &mb_schedule, 64, rounds, validate_simdutf8));
-    });
-    group.bench_function("ascii_or_multibyte_64", |b| {
-        b.iter(|| run_schedule(&mb_buf, &mb_schedule, 64, rounds, validate_ascii_or));
-    });
-    group.bench_function("ascii_or_cutoff_multibyte_64", |b| {
-        b.iter(|| run_schedule(&mb_buf, &mb_schedule, 64, rounds, validate_ascii_or_cutoff));
-    });
-    group.bench_function("ascii_words_multibyte_64", |b| {
-        b.iter(|| run_schedule(&mb_buf, &mb_schedule, 64, rounds, validate_ascii_words));
-    });
-
     group.finish();
+}
+
+fn cases() -> Vec<Case> {
+    let mut cases = Vec::new();
+    for len in CALLGRIND_SIZES.iter().copied().chain([2048, 4096]) {
+        cases.push(fixed_case("ascii", Content::Ascii, len));
+    }
+    for len in [8, 15, 16, 17, 32, 64, 128, 256, 512, 513, 1024] {
+        cases.push(fixed_case("unicode_first", Content::UnicodeFirst, len));
+        cases.push(fixed_case("unicode_last", Content::UnicodeLast, len));
+    }
+    for len in [16, 64, 512] {
+        cases.push(fixed_case("unicode_dense", Content::UnicodeDense, len));
+    }
+    for len in [7, 8, 16, 32, 64, 128, 256, 512, 513, 1024] {
+        cases.push(fixed_case("invalid_first", Content::InvalidFirst, len));
+        cases.push(fixed_case("invalid_last", Content::InvalidLast, len));
+        cases.push(fixed_case("truncated", Content::Truncated, len));
+    }
+    cases.push(mixed_case("ascii", 0));
+    cases.push(mixed_case("unicode", 1));
+    cases.push(mixed_case("ascii_unicode", 5));
+    cases
+}
+
+fn fixed_case(name: &str, content: Content, len: usize) -> Case {
+    Case {
+        name: format!("fixed/{name}/{len}"),
+        fixtures: (0..8).map(|offset| fixture(content, len, offset)).collect(),
+    }
+}
+
+fn mixed_case(name: &str, unicode_every: usize) -> Case {
+    let fixtures = (0..256)
+        .map(|i| {
+            let hash = (i as u64).wrapping_mul(2_654_435_761) ^ ((i as u64) >> 2);
+            let len = CALLGRIND_SIZES[(hash % CALLGRIND_SIZES.len() as u64) as usize];
+            let content = if len >= 2 && unicode_every != 0 && i % unicode_every == 0 {
+                Content::UnicodeFirst
+            } else {
+                Content::Ascii
+            };
+            fixture(content, len, i % 8)
+        })
+        .collect();
+    Case {
+        name: format!("mixed/{name}"),
+        fixtures,
+    }
+}
+
+fn fixture(content: Content, len: usize, offset: usize) -> Fixture {
+    let mut bytes = vec![b'a'; len + offset];
+    let data = &mut bytes[offset..];
+    match content {
+        Content::Ascii => {}
+        Content::UnicodeFirst => data[..2].copy_from_slice("é".as_bytes()),
+        Content::UnicodeLast => data[len - 2..].copy_from_slice("é".as_bytes()),
+        Content::UnicodeDense => {
+            for pair in data.chunks_exact_mut(2) {
+                pair.copy_from_slice("é".as_bytes());
+            }
+        }
+        Content::InvalidFirst => data[0] = 0xff,
+        Content::InvalidLast => data[len - 1] = 0xff,
+        Content::Truncated => data[len - 1] = 0xc3,
+    }
+    Fixture { bytes, offset }
+}
+
+#[inline(never)]
+#[no_mangle]
+fn text_validate_batch(fixtures: &[Fixture]) {
+    let mask = fixtures.len() - 1;
+    for i in 0..CALLS_PER_ITERATION {
+        let fixture = &fixtures[i & mask];
+        black_box(read_production(black_box(&fixture.bytes[fixture.offset..])));
+    }
+}
+
+#[inline(never)]
+fn read_production(data: &[u8]) -> bool {
+    turso_core::storage::sqlite3_ondisk::read_text(data).is_ok()
 }
 
 criterion_group!(benches, bench_text_validate);
