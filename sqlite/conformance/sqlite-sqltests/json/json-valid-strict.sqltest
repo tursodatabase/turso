@@ -605,3 +605,39 @@ test json5_plus_only_numbers_stay_canonical {
 expect {
     {"x":4e1}|{"x":5.5}|{"x":4.0E2}
 }
+
+# JSON5 Infinity: -> renders the JSON text 9e999, while ->> and
+# json_extract return the infinite REAL.
+
+test json5_infinity_arrow_renders_9e999 {
+    SELECT '{x:Infinity}'->'x', typeof('{x:Infinity}'->'x');
+}
+expect {
+    9e999|text
+}
+
+test json5_infinity_double_arrow_returns_real {
+    SELECT '{x:Infinity}'->>'x', typeof('{x:Infinity}'->>'x'),
+           '{x:-Infinity}'->>'x', json_extract('{x:Infinity}','$.x');
+}
+expect {
+    Inf|real|-Inf|Inf
+}
+
+test json5_infinity_document_renderings {
+    SELECT json('Infinity'), json('{x:-Infinity}'), json('{"x":9e999}'), json_quote(9e999);
+}
+expect {
+    9e999|{"x":-9e999}|{"x":9e999}|9.0e+999
+}
+
+# A leading-plus overflow number is an ordinary JSON5 number, not the
+# Infinity literal: its text must survive rendering unchanged even
+# though its value is infinite.
+test json5_plus_overflow_number_keeps_its_text {
+    SELECT '+9.0e+999'->'$', '{x: +9.0e+999}'->'$.x', typeof('+9.0e+999'->>'$');
+}
+expect {
+    9.0e+999|9.0e+999|real
+}
+

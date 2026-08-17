@@ -52,7 +52,9 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
                 None => json_val.to_string()?,
             };
 
-            // Simplify infinity format to match SQLite (#4196)
+            // An infinite REAL argument converts to the payload
+            // 9.0e+999, but SQLite's json() renders it as 9e999 (while
+            // json_array and json_quote keep the long form) (#4196).
             json = json.replace("9.0e+999", "9e999");
 
             Ok(Value::Text(Text::json(json)))
@@ -672,18 +674,9 @@ pub fn json_string_to_db_type(
             }
         }
         ElementType::FLOAT5 | ElementType::FLOAT => {
+            // Infinity parses from its 9e999 rendering to an infinite
+            // f64, which is exactly what ->> and json_extract return.
             match json_string.parse::<f64>() {
-                Ok(float_val)
-                    if float_val.is_infinite() && matches!(flag, OutputVariant::ElementType) =>
-                {
-                    // For json() function, SQLite returns bare infinity as "9e999" not "9.0e+999"
-                    let simplified = if float_val.is_sign_negative() {
-                        "-9e999"
-                    } else {
-                        "9e999"
-                    };
-                    Ok(Value::Text(Text::json(simplified.to_string())))
-                }
                 Ok(float_val) => Ok(Value::from_f64(float_val)),
                 Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
             }

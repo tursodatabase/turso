@@ -19,7 +19,7 @@ const SIZE_MARKER_8BIT: u8 = 12;
 const SIZE_MARKER_16BIT: u8 = 13;
 const SIZE_MARKER_32BIT: u8 = 14;
 const MAX_JSON_DEPTH: usize = 1000;
-const INFINITY_CHAR_COUNT: u8 = 8;
+const INFINITY_CHAR_COUNT: u8 = 5;
 
 const fn make_whitespace_table() -> [u8; 256] {
     let mut table = [0u8; 256];
@@ -1474,9 +1474,6 @@ impl Jsonb {
             bail_parse_error!("Integer is less then 2 chars: {}", float_str);
         }
         match float_str {
-            "9.0e+999" | "-9.0e+999" => {
-                string.push_str(float_str);
-            }
             val if val.starts_with("-.") => {
                 string.push_str("-0.");
                 string.push_str(&val[2..]);
@@ -2210,8 +2207,11 @@ impl Jsonb {
 
             info.has_json5 = true;
 
-            // Write Infinity as 9.0e+999
-            self.data.extend_from_slice(b"9.0e+999");
+            // Store Infinity as the payload text 9e999, like SQLite. A
+            // leading-plus number such as +9e999 stores the same
+            // payload; both meanings render as 9e999 and extract as an
+            // infinite REAL, so they never need to be told apart.
+            self.data.extend_from_slice(b"9e999");
             self.write_element_header(
                 num_start,
                 ElementType::FLOAT5,
@@ -4669,13 +4669,13 @@ mod tests {
         let parsed = Jsonb::from_str("1.5e+10").unwrap();
         assert_eq!(parsed.to_string().unwrap(), "1.5e+10");
 
-        // Infinity
+        // Infinity renders as SQLite's short form
         let parsed = Jsonb::from_str("Infinity").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "9.0e+999");
+        assert_eq!(parsed.to_string().unwrap(), "9e999");
 
         // Negative Infinity
         let parsed = Jsonb::from_str("-Infinity").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "-9.0e+999");
+        assert_eq!(parsed.to_string().unwrap(), "-9e999");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
