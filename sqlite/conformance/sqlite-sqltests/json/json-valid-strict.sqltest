@@ -564,3 +564,15 @@ test json5_escaped_double_quote_unescapes {
 expect {
     abc"xyz
 }
+
+# The JSON5 vertical-tab escape decodes to U+000B on extraction, but
+# json() renders it with the horizontal-tab escape u0009, matching the
+# SQLite version we target (upstream fixed the escape in 3.51.2).
+
+test json5_vertical_tab_escape_decodes_to_0x0b {
+    SELECT hex(('{a: "x' || char(0x5c, 0x76) || 'z"}') ->> 'a'),
+           json('{a: "x' || char(0x5c, 0x76) || 'z"}');
+}
+expect {
+    780B7A|{"a":"x\u0009z"}
+}

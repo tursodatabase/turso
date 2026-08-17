@@ -1011,6 +1011,27 @@ impl Jsonb {
         Ok(result)
     }
 
+    /// Returns the decoded text of the single string element this
+    /// document holds, unescaping straight from the stored payload.
+    /// This cannot go through [Jsonb::to_string], because JSON text
+    /// rendering translates the JSON5 \v escape to \u0009 for SQLite
+    /// bug-compatibility, while extraction must yield the real 0x0B.
+    pub fn scalar_string_value(&self) -> Result<String> {
+        let (JsonbHeader(_, len), header_size) = self.read_header(0)?;
+        // The 8-byte size format lets a crafted header declare a length
+        // near usize::MAX, so the end must be computed without overflow.
+        let payload_end = header_size
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        let payload = self
+            .data
+            .get(header_size..payload_end)
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        let text = from_utf8(payload)
+            .map_err(|_| LimboError::ParseError("Failed to serialize string!".to_string()))?;
+        Ok(unescape_string(text))
+    }
+
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
         let mut result = String::with_capacity(self.data.len() * 2);
         let ind = if let Some(ind) = indentation {
@@ -1275,7 +1296,12 @@ impl Jsonb {
                                     i += 2;
                                 }
 
-                                // Vertical tab
+                                // Vertical tab. SQLite (through 3.51.1)
+                                // renders it with the escape for
+                                // horizontal tab, and we are
+                                // bug-compatible with that; extraction
+                                // decodes the stored \v directly and
+                                // still yields the real 0x0B byte.
                                 b'v' => {
                                     string.push_str("\\u0009");
                                     i += 2;
@@ -3990,6 +4016,18 @@ pub fn unescape_string(input: &str) -> String {
                 Some('"') => result.push('"'),
                 Some('b') => result.push('\u{0008}'),
                 Some('f') => result.push('\u{000C}'),
+                // JSON5 escapes, stored raw in TEXT5 payloads.
+                Some('v') => result.push('\u{000B}'),
+                Some('\'') => result.push('\''),
+                Some('0') => result.push('\u{0000}'),
+                // A backslash before a line terminator is a JSON5 line
+                // continuation: both characters disappear.
+                Some('\n') | Some('\u{2028}') | Some('\u{2029}') => {}
+                Some('\r') => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
                 Some('x') => {
                     code_point.clear();
                     for _ in 0..2 {
@@ -4425,6 +4463,17 @@ mod tests {
         ] {
             assert!(parse_has_json5(input), "{input:?}");
         }
+    }
+
+    #[test]
+    fn scalar_string_value_rejects_overflowing_payload_length() {
+        // TEXT5 header in the 8-byte size format declaring a payload
+        // length near usize::MAX: the payload end computation must not
+        // overflow (SQL paths validate blobs first, but this decoder is
+        // public API).
+        let blob = [0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7];
+        let jsonb = Jsonb::from_raw_data(&blob).unwrap();
+        assert!(jsonb.scalar_string_value().is_err());
     }
 
     #[test]

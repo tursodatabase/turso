@@ -660,9 +660,13 @@ pub fn json_string_to_db_type(
         ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),
         ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {
             if matches!(flag, OutputVariant::ElementType) {
-                json_string.remove(json_string.len() - 1);
-                json_string.remove(0);
-                Ok(Value::Text(Text::new(unescape_string(&json_string))))
+                if element_type == ElementType::TEXT5 {
+                    Ok(Value::Text(Text::new(json.scalar_string_value()?)))
+                } else {
+                    json_string.remove(json_string.len() - 1);
+                    json_string.remove(0);
+                    Ok(Value::Text(Text::new(unescape_string(&json_string))))
+                }
             } else {
                 Ok(Value::Text(Text::new(json_string)))
             }
