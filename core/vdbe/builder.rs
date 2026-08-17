@@ -2028,6 +2028,7 @@ impl ProgramBuilder {
         self.emit_insn(Insn::Next {
             cursor_id,
             pc_if_next: loop_start,
+            fullscan: false,
         });
         self.preassign_label_to_next_insn(loop_end);
     }

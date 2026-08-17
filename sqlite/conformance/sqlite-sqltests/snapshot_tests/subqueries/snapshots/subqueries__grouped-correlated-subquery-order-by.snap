@@ -48,7 +48,7 @@ addr  opcode                          p1   p2  p3  p4              p5  comment
   20                    If             4   22   0                   0  if r[4] goto 22; don't emit group columns if continuing existing group
   21                    Column         2    0   7                   0  r[7]=idx_grouped_values_grp.grp
   22                    Integer        1    4   0                   0  r[4]=1; indicate data in accumulator
-  23                  Next             2   10   0                   0
+  23                  Next             2   10   0                   1
   24                  Gosub            3   28   0                   0  ; emit row for final group
   25                  Goto             0   42   0                   0  ; group by finished
   26                  Integer          1    5   0                   0  r[5]=1
@@ -100,7 +100,7 @@ addr  opcode                          p1   p2  p3  p4              p5  comment
   72            IfPos                 32   75   0                   0  r[32]>0 -> r[32]-=0, goto 75
   73            NullRow                0    0   0                   0  Set cursor 0 to a (pseudo) NULL row
   74            Goto                   0   56   0                   0
-  75          Next                     5   50   0                   0
+  75          Next                     5   50   0                   1
   76          Gosub                   20   80   0                   0  ; emit row for final group
   77          Goto                     0   93   0                   0  ; group by finished
   78          Integer                  1   22   0                   0  r[22]=1

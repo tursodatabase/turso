@@ -64,7 +64,7 @@ addr  opcode                    p1  p2  p3  p4                                  
   23              Goto           0  26   0                                          0  ; semi-join: early out after first match
   24            Next             4  16   0                                          0
   25            Goto             0  26   0                                          0  ; semi-join: no match, skip outer row
-  26          Next               2  10   0                                          0
+  26          Next               2  10   0                                          1
   27          OpenPseudo         1  10   1                                          0  1 columns in r[10]
   28          SorterSort         0  42   0                                          0
   29            SorterData       0  10   1                                          0  r[10]=data

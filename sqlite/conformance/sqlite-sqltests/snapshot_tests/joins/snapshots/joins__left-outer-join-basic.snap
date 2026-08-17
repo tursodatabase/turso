@@ -46,7 +46,7 @@ addr  opcode            p1  p2  p3  p4              p5  comment
   18    NullRow          1   0   0                   0  Set cursor 1 to a (pseudo) NULL row
   19    NullRow          2   0   0                   0  Set cursor 2 to a (pseudo) NULL row
   20    Goto             0  10   0                   0
-  21  Next               0   5   0                   0
+  21  Next               0   5   0                   1
   22  Halt               0   0   0                   0
   23  Transaction        0   1  10                   0  iDb=0 tx_mode=Read
   24  Goto               0   1   0                   0

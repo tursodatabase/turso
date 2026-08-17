@@ -58,7 +58,7 @@ addr  opcode                             p1   p2   p3  p4              p5  comme
   23                      If              7   25    0                   0  if r[7] goto 25; don't emit group columns if continuing existing group
   24                      Column          1    0   10                   0  r[10]=idx_products_category.category_id
   25                      Integer         1    7    0                   0  r[7]=1; indicate data in accumulator
-  26                    Next              1   12    0                   0
+  26                    Next              1   12    0                   1
   27                    Gosub             6   31    0                   0  ; emit row for final group
   28                    Goto              0   41    0                   0  ; group by finished
   29                    Integer           1    8    0                   0  r[8]=1
@@ -108,7 +108,7 @@ addr  opcode                             p1   p2   p3  p4              p5  comme
   73            If                       25   75    0                   0  if r[25] goto 75; don't emit group columns if continuing existing group
   74            Column                    4    0   28                   0  r[28]=idx_products_category.category_id
   75            Integer                   1   25    0                   0  r[25]=1; indicate data in accumulator
-  76          Next                        4   62    0                   0
+  76          Next                        4   62    0                   1
   77          Gosub                      24   81    0                   0  ; emit row for final group
   78          Goto                        0   93    0                   0  ; group by finished
   79          Integer                     1   26    0                   0  r[26]=1
@@ -155,7 +155,7 @@ addr  opcode                             p1   p2   p3  p4              p5  comme
  120      Column                          6    1   38                   0  r[38]=ephemeral(ephemeral_subquery_t5).avg_price
  121      ResultRow                      36    3    0                   0  output=r[36..38]
  122    Next                              6  114    0                   0
- 123  Next                                5   95    0                   0
+ 123  Next                                5   95    0                   1
  124  Halt                                0    0    0                   0
  125  Transaction                         0    1   11                   0  iDb=0 tx_mode=Read
  126  Real                                0   43    0  0.8              0  r[43]=0.8

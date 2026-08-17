@@ -32,7 +32,7 @@ addr  opcode          p1  p2  p3  p4                p5  comment
   11    Column         1   4  11                     0  r[11]=products.stock
   12    MakeRecord     7   5   6                     0  r[6]=mkrec(r[7..11])
   13    SorterInsert   0   6   0  0                  0  key=r[6]
-  14  Next             1   4   0                     0
+  14  Next             1   4   0                     1
   15  OpenPseudo       2   6   5                     0  5 columns in r[6]
   16  SorterSort       0  22   0                     0
   17    SorterData     0   6   2                     0  r[6]=data

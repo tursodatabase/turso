@@ -54,7 +54,7 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   29              MakeRecord    13   3  12                 0  r[12]=mkrec(r[13..15])
   30              SorterInsert   0  12   0  0              0  key=r[12]
   31            Next             3  23   0                 0
-  32          Next               4   9   0                 0
+  32          Next               4   9   0                 1
   33          OpenPseudo         1  12   3                 0  3 columns in r[12]
   34          SorterSort         0  50   0                 0
   35            SorterData       0  12   1                 0  r[12]=data
