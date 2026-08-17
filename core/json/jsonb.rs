@@ -1943,6 +1943,29 @@ impl Jsonb {
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
+                    b'\r' => {
+                        // Line continuation; swallows a following LF so
+                        // \<CR><LF> counts as one line terminator.
+                        self.data.extend_from_slice(b"\\\r");
+                        len += 2;
+                        if pos < input.len() && input[pos] == b'\n' {
+                            self.data.push(b'\n');
+                            len += 1;
+                            pos += 1;
+                        }
+                        element_type = ElementType::TEXT5;
+                    }
+                    0xe2 if pos + 1 < input.len()
+                        && input[pos] == 0x80
+                        && (input[pos + 1] == 0xa8 || input[pos + 1] == 0xa9) =>
+                    {
+                        // Line continuation with U+2028 or U+2029
+                        self.data.push(b'\\');
+                        self.data.extend_from_slice(&input[pos - 1..pos + 2]);
+                        len += 4;
+                        pos += 2;
+                        element_type = ElementType::TEXT5;
+                    }
                     b'\'' => {
                         self.data.extend_from_slice(b"\\\'");
                         len += 2;

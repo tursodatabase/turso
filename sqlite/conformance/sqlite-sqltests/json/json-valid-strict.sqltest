@@ -517,3 +517,50 @@ test json_quote_output_is_always_strict_json {
 expect {
     31
 }
+
+# JSON5 strings may span lines by escaping any of the four line
+# terminators: LF, CR, CRLF, U+2028 and U+2029. The continuation is
+# dropped from the string value.
+
+test json5_line_continuation_lf {
+    SELECT ('{a: "abc' || char(0x5c, 0x0a) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_cr {
+    SELECT ('{a: "abc' || char(0x5c, 0x0d) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_crlf_is_one_terminator {
+    SELECT ('{a: "abc' || char(0x5c, 0x0d, 0x0a) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_u2028_u2029 {
+    SELECT ('{a: "abc' || char(0x5c, 0x2028) || 'xyz"}') ->> 'a',
+           ('{a: "abc' || char(0x5c, 0x2029) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz|abcxyz
+}
+
+test json5_line_continuation_json_rendering {
+    SELECT json('{a: "abc' || char(0x5c, 0x0d) || 'xyz"}');
+}
+expect {
+    {"a":"abcxyz"}
+}
+
+test json5_escaped_double_quote_unescapes {
+    SELECT ('{a: "abc' || char(0x5c, 0x22) || 'xyz"}') ->> 'a';
+}
+expect {
+    abc"xyz
+}
