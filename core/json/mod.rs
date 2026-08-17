@@ -20,6 +20,7 @@ use jsonb::{
     PathOperationMode, SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy)]
@@ -992,9 +993,17 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
 
             for c in t.as_str().chars() {
                 match c {
-                    '"' | '\\' | '\n' | '\r' | '\t' | '\u{0008}' | '\u{000c}' => {
+                    '"' | '\\' => {
                         escaped_value.push('\\');
                         escaped_value.push(c);
+                    }
+                    '\u{0008}' => escaped_value.push_str("\\b"),
+                    '\u{000c}' => escaped_value.push_str("\\f"),
+                    '\n' => escaped_value.push_str("\\n"),
+                    '\r' => escaped_value.push_str("\\r"),
+                    '\t' => escaped_value.push_str("\\t"),
+                    c if (c as u32) < 0x20 => {
+                        let _ = write!(escaped_value, "\\u{:04x}", c as u32);
                     }
                     c => escaped_value.push(c),
                 }
