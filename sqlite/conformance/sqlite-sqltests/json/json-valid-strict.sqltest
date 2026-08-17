@@ -698,3 +698,22 @@ expect {
     {"x":1}|{"x":1}|0
 }
 
+# Array locators counting from the end: leading zeros in [#-n] keep the
+# sign, and [#-0] addresses the same one-past-the-end position as [#].
+
+test json_path_from_end_leading_zeros_keep_sign {
+    SELECT json_extract('{"b":[1,[2,3],4]}','$.b[#-02]'),
+           json_extract('{"b":[1,[2,3],4]}','$.b[#-000001]'),
+           json_extract('{"b":[1,2]}','$.b[#-00002]');
+}
+expect {
+    [2,3]|4|1
+}
+
+test json_path_minus_zero_is_one_past_the_end {
+    SELECT json_remove('{"b":[1,2]}','$.b[#-0]'),
+           json_extract('{"b":[1,2]}','$.b[#-0]') IS NULL;
+}
+expect {
+    {"b":[1,2]}|1
+}

@@ -15,6 +15,11 @@ enum ArrayIndexState {
     Start,
     AfterHash,
     CollectingNumbers,
+    /// Collecting digits after "#-". The sign has to live in the state,
+    /// not in the sign of the accumulated number: while the digits seen
+    /// so far are all zeros the accumulator is plain 0 and cannot
+    /// remember that "#-02" means two from the end.
+    CollectingNegativeNumbers,
     IsMax,
 }
 
@@ -270,13 +275,18 @@ fn handle_array_index<'a>(
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(None));
         }
-        (ArrayIndexState::CollectingNumbers, '0'..='9') => {
+        (
+            state @ (ArrayIndexState::CollectingNumbers
+            | ArrayIndexState::CollectingNegativeNumbers),
+            '0'..='9',
+        ) => {
+            let negative = matches!(state, ArrayIndexState::CollectingNegativeNumbers);
             let (new_num, is_max) = collect_num(
                 *index_buffer,
                 ch.1.to_digit(10).ok_or_else(|| {
                     crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
                 })? as i128,
-                *index_buffer < 0,
+                negative,
             );
             if is_max {
                 *index_state = ArrayIndexState::IsMax;
@@ -284,7 +294,18 @@ fn handle_array_index<'a>(
             *index_buffer = new_num;
         }
         (ArrayIndexState::IsMax, '0'..='9') => (),
-        (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
+        (ArrayIndexState::CollectingNegativeNumbers, ']') if *index_buffer == 0 => {
+            // "#-0" (any number of zeros) addresses the same one-past-the-end
+            // position as a bare "#".
+            *parser_state = PPState::ExpectDotOrBracket;
+            path_components.push(PathElement::ArrayLocator(None));
+        }
+        (
+            ArrayIndexState::CollectingNumbers
+            | ArrayIndexState::CollectingNegativeNumbers
+            | ArrayIndexState::IsMax,
+            ']',
+        ) => {
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
         }
@@ -354,7 +375,7 @@ fn handle_negative_index(
             *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
                 crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
             })? as i128);
-            *index_state = ArrayIndexState::CollectingNumbers;
+            *index_state = ArrayIndexState::CollectingNegativeNumbers;
             Ok(())
         } else {
             bail_parse_error!("Bad json path: {}", path)
