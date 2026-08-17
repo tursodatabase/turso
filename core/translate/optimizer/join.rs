@@ -1,4 +1,5 @@
 use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
+use core::cell::RefCell;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -6,7 +7,9 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Operator, TableInternalId};
 
 use super::{
-    access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
+    access_method::{
+        add_where_cost, find_best_access_method_for_join_order, AccessMethod, BtreeAccessShapeMemo,
+    },
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     multi_index::{MultiIndexAndTermsMemo, MultiIndexOrTermsMemo},
@@ -55,6 +58,12 @@ pub(crate) struct JoinPlanningContext<'a> {
     /// Per-table OR-by-union prepass results, with the same validity rules as
     /// `and_terms_memo`.
     pub or_terms_memo: &'a MultiIndexOrTermsMemo,
+    /// The btree access paths available for one table from one join prefix,
+    /// with the same validity rules as `and_terms_memo`.
+    pub btree_access_memo: &'a BtreeAccessShapeMemo,
+    /// What the `WHERE` clause says about one table from one join prefix, with
+    /// the same validity rules as `and_terms_memo`.
+    pub prefix_where_memo: &'a PrefixWhereMemo,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -64,12 +73,16 @@ impl<'a> JoinPlanningContext<'a> {
         maybe_order_target: Option<&'a OrderTarget>,
         and_terms_memo: &'a MultiIndexAndTermsMemo,
         or_terms_memo: &'a MultiIndexOrTermsMemo,
+        btree_access_memo: &'a BtreeAccessShapeMemo,
+        prefix_where_memo: &'a PrefixWhereMemo,
     ) -> Self {
         Self {
             maybe_order_target,
             cost_limit: None,
             and_terms_memo,
             or_terms_memo,
+            btree_access_memo,
+            prefix_where_memo,
         }
     }
 }
@@ -360,15 +373,27 @@ fn join_lhs_and_rhs<'a>(
         Some(lhs) => lhs.table_numbers().try_collect()?,
         None => TableMask::default(),
     };
-    let mut joined_mask = lhs_mask.try_clone()?;
-    joined_mask.set(rhs_table_number)?;
-    let ready_where = ready_where_work(
-        where_clause,
-        where_terms,
-        &joined_mask,
-        rhs_table_number,
-        rhs_table_reference.internal_id,
-    );
+    let where_work =
+        planning_context
+            .prefix_where_memo
+            .get_or_compute(rhs_table_number, &lhs_mask, || {
+                let mut joined_mask = lhs_mask.try_clone()?;
+                joined_mask.set(rhs_table_number)?;
+                Ok(PrefixWhereWork {
+                    ready: ready_where_work(
+                        where_clause,
+                        where_terms,
+                        &joined_mask,
+                        rhs_table_number,
+                        rhs_table_reference.internal_id,
+                    ),
+                    ties_table_to_prefix: where_terms.iter().any(|term| {
+                        term.table_mask.get(rhs_table_number)
+                            && term.table_mask.intersects(&lhs_mask)
+                    }),
+                })
+            })?;
+    let ready_where = &where_work.ready;
 
     let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
@@ -377,7 +402,7 @@ fn join_lhs_and_rhs<'a>(
         join_order,
         planning_context,
         where_clause,
-        &ready_where,
+        ready_where,
         available_indexes,
         table_references,
         subqueries,
@@ -396,7 +421,7 @@ fn join_lhs_and_rhs<'a>(
     let mut best_access_method = method;
     add_where_cost(
         &mut best_access_method,
-        &ready_where,
+        ready_where,
         input_cardinality,
         params,
     );
@@ -410,10 +435,7 @@ fn join_lhs_and_rhs<'a>(
         m
     };
 
-    let has_join_constraint = lhs.is_some()
-        && where_terms.iter().any(|term| {
-            term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
-        });
+    let has_join_constraint = lhs.is_some() && where_work.ties_table_to_prefix;
     if lhs.is_some() && !has_join_constraint {
         let rhs_self_constraint_selectivity =
             build_self_constraint_selectivity(rhs_constraints, rhs_table_number);
@@ -831,7 +853,7 @@ fn join_lhs_and_rhs<'a>(
                     }
                     add_where_cost(
                         &mut hash_join_method,
-                        &ready_where,
+                        ready_where,
                         input_cardinality,
                         params,
                     );
@@ -878,7 +900,7 @@ fn join_lhs_and_rhs<'a>(
                     where_covered: candidate.where_covered,
                 },
             };
-            add_where_cost(&mut index_method, &ready_where, input_cardinality, params);
+            add_where_cost(&mut index_method, ready_where, input_cardinality, params);
             if index_method.cost < best_access_method.cost {
                 best_access_method = index_method;
             }
@@ -1080,6 +1102,8 @@ pub fn compute_best_join_order<'a>(
 ) -> Result<Option<BestJoinOrderResult>> {
     let and_terms_memo = MultiIndexAndTermsMemo::new(joined_tables.len());
     let or_terms_memo = MultiIndexOrTermsMemo::new(joined_tables.len());
+    let btree_access_memo = BtreeAccessShapeMemo::new(joined_tables.len());
+    let prefix_where_memo = PrefixWhereMemo::new(joined_tables.len());
     compute_best_join_order_with_context(
         joined_tables,
         initial_input_cardinality,
@@ -1087,6 +1111,8 @@ pub fn compute_best_join_order<'a>(
             maybe_order_target,
             &and_terms_memo,
             &or_terms_memo,
+            &btree_access_memo,
+            &prefix_where_memo,
         ),
         constraints,
         base_table_rows,
@@ -2160,6 +2186,68 @@ fn build_where_term_info(
         .collect()
 }
 
+/// What the `WHERE` clause says about one table reached from one join prefix.
+#[derive(Debug, Clone)]
+pub(crate) struct PrefixWhereWork {
+    /// The extra `WHERE` work that can run after this table, as
+    /// `(term index, extra steps)`.
+    ready: SmallVec<[(usize, usize); 4]>,
+    /// Whether any term ties this table to a table already in the prefix. A
+    /// table with none can only be joined as a cross product.
+    ties_table_to_prefix: bool,
+}
+
+/// One slot per joined table, holding the last join prefix asked about.
+///
+/// Both answers come from walking the whole `WHERE` clause, and both depend on
+/// the table and the *set* of tables already joined — not on how many rows that
+/// set produces. The join order search keeps several plans per table subset and
+/// tries each of them in front of the same next table, so it used to walk the
+/// clause again for every one of them.
+///
+/// The search finishes with one (table, prefix) pair before moving to the next,
+/// so one slot per table catches every repeat. Like the other join planner
+/// memos, this is only sound while the `WHERE` clause it was built against
+/// holds still, so it lives with the search that created it.
+#[derive(Debug)]
+pub(crate) struct PrefixWhereMemo {
+    per_table: Vec<RefCell<Option<(TableMask, PrefixWhereWork)>>>,
+}
+
+impl PrefixWhereMemo {
+    /// One slot per entry of [`TableReferences::joined_tables`].
+    pub(crate) fn new(joined_table_count: usize) -> Self {
+        Self {
+            per_table: (0..joined_table_count)
+                .map(|_| RefCell::new(None))
+                .collect(),
+        }
+    }
+
+    /// What the clause says about `table_idx` from `lhs_mask`, walking it if the
+    /// slot holds a different prefix (or nothing yet).
+    ///
+    /// Hands back an owned copy rather than a borrow of the slot: the caller
+    /// keeps the answer for the rest of its work, and a live borrow would turn
+    /// any later question about the same table into a panic.
+    fn get_or_compute(
+        &self,
+        table_idx: usize,
+        lhs_mask: &TableMask,
+        compute: impl FnOnce() -> Result<PrefixWhereWork>,
+    ) -> Result<PrefixWhereWork> {
+        let slot = &self.per_table[table_idx];
+        if let Some((prefix, work)) = slot.borrow().as_ref() {
+            if prefix == lhs_mask {
+                return Ok(work.clone());
+            }
+        }
+        let work = compute()?;
+        *slot.borrow_mut() = Some((lhs_mask.try_clone()?, work.clone()));
+        Ok(work)
+    }
+}
+
 /// Return the extra `WHERE` work that can run after this table.
 fn ready_where_work(
     where_clause: &[WhereTerm],
@@ -2319,6 +2407,53 @@ mod tests {
         .unwrap()
         .best_plan
         .cost
+    }
+
+    /// Both of a join prefix's `WHERE` answers come from walking the whole
+    /// clause, and both depend on the set of tables already joined rather than
+    /// on how many rows that set produces. The search tries several plans for
+    /// the same set in front of the same table, so the memo has to walk the
+    /// clause for the first of them and answer the rest.
+    #[test]
+    fn where_clause_is_walked_once_per_join_prefix() -> Result<()> {
+        let memo = PrefixWhereMemo::new(2);
+        let walks = std::cell::Cell::new(0);
+        // The closure only captures `&walks`, so it is `Copy` and can be handed
+        // to the memo more than once.
+        let walk = || {
+            walks.set(walks.get() + 1);
+            Ok(PrefixWhereWork {
+                ready: SmallVec::from_slice(&[(3, 1)]),
+                ties_table_to_prefix: true,
+            })
+        };
+
+        let mut prefix = TableMask::default();
+        prefix.set(1)?;
+        let mut longer_prefix = prefix.try_clone()?;
+        longer_prefix.set(2)?;
+
+        let work = memo.get_or_compute(0, &prefix, walk)?;
+        assert_eq!(work.ready.as_slice(), [(3, 1)]);
+        assert!(work.ties_table_to_prefix);
+        assert_eq!(walks.get(), 1);
+
+        // The repeat the search makes, once per plan it kept for this prefix.
+        memo.get_or_compute(0, &prefix, walk)?;
+        assert_eq!(walks.get(), 1);
+
+        // Another table is a separate question, even from the same prefix.
+        memo.get_or_compute(1, &prefix, walk)?;
+        assert_eq!(walks.get(), 2);
+        memo.get_or_compute(0, &prefix, walk)?;
+        assert_eq!(walks.get(), 2);
+
+        // So is the same table from a different prefix: whether a term can run
+        // yet is exactly what the prefix decides.
+        memo.get_or_compute(0, &longer_prefix, walk)?;
+        assert_eq!(walks.get(), 3);
+
+        Ok(())
     }
 
     #[test]
