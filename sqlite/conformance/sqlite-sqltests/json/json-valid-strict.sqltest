@@ -641,3 +641,60 @@ expect {
     9.0e+999|9.0e+999|real
 }
 
+# Unquoted JSON5 object keys follow SQLite's identifier rules: ASCII
+# letters, '_' and '$' may start one, digits may only continue one,
+# non-ASCII characters are accepted, everything else is malformed.
+
+test json5_unquoted_key_charset {
+    SELECT json_valid('{x1:5}',2), json_valid('{_x:5}',2), json_valid('{$x:5}',2),
+           json_valid('{éx:5}',2);
+}
+expect {
+    1|1|1|1
+}
+
+test json5_unquoted_key_rejects_illegal_characters {
+    SELECT json_valid('{1x:5}',2), json_valid('{x-y:5}',2), json_valid('{x.y:5}',2),
+           json_valid('{x/y:5}',2), json_valid('{:5}',2), json_valid('{a'||char(1)||':1}',2);
+}
+expect {
+    0|0|0|0|0|0
+}
+
+test json5_unquoted_key_slash_is_malformed {
+    SELECT json('{ MNO_123/xyz : 789 }');
+}
+expect error {
+    ^(Parse error: )?malformed JSON$
+}
+
+# \uXXXX escapes may appear anywhere in an unquoted key, whatever they
+# decode to; rendering keeps the escape and path matching decodes it.
+# No other escape is allowed in a key.
+test json5_unquoted_key_accepts_unicode_escapes {
+    SELECT json('{' || char(0x5c) || 'u0061:1}'),
+           ('{' || char(0x5c) || 'u0061:1}')->>'a',
+           ('{a' || char(0x5c) || 'u0062:1}')->>'ab',
+           json('{' || char(0x5c) || 'u0031:1}');
+}
+expect {
+    {"\u0061":1}|1|1|{"\u0031":1}
+}
+
+test json5_unquoted_key_rejects_other_escapes {
+    SELECT json_valid('{a' || char(0x5c) || 'tb:1}', 2),
+           json_valid('{a' || char(0x5c) || 'x62:1}', 2),
+           json_valid('{' || char(0x5c) || 'u061:1}', 2);
+}
+expect {
+    0|0|0
+}
+
+# A comment directly after an unquoted key acts as whitespace.
+test json5_unquoted_key_ends_at_comment {
+    SELECT json('{x/*c*/:1}'), json('{x//c' || char(10) || ':1}'), json_valid('{x/y:1}', 2);
+}
+expect {
+    {"x":1}|{"x":1}|0
+}
+

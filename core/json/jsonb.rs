@@ -1862,10 +1862,22 @@ impl Jsonb {
 
         // Special case for unquoted JSON5 keys (identifiers)
         if !quoted {
-            self.data.push(quote);
-            len += 1;
+            if quote == b'\\' && input.get(pos) == Some(&b'u') {
+                // The key starts with a \uXXXX escape, which SQLite
+                // accepts no matter what it decodes to. Rewind one byte
+                // so the escape handling below consumes it.
+                pos -= 1;
+            } else if !is_json5_id_char(quote, true) {
+                return Err(PError::Message {
+                    msg: "Invalid character in unquoted object key".to_string(),
+                    location: Some(pos),
+                });
+            } else {
+                self.data.push(quote);
+                len += 1;
+            }
 
-            if pos < input.len() && input[pos] == b':' {
+            if len > 0 && pos < input.len() && input[pos] == b':' {
                 self.write_element_header(string_start, element_type, len, false)
                     .map_err(|_| PError::Message {
                         msg: "Failed to write header".to_string(),
@@ -1901,6 +1913,14 @@ impl Jsonb {
 
                 let esc = input[pos];
                 pos += 1;
+
+                // SQLite allows only \uXXXX escapes in unquoted keys.
+                if !quoted && esc != b'u' {
+                    return Err(PError::Message {
+                        msg: "Invalid character in unquoted object key".to_string(),
+                        location: Some(pos),
+                    });
+                }
 
                 // A standard escape upgrades plain TEXT to TEXTJ but
                 // never demotes TEXT5: earlier JSON5 syntax keeps the
@@ -2059,10 +2079,21 @@ impl Jsonb {
                         });
                     }
                 }
-            } else if !quoted && (c == b':' || c.is_ascii_whitespace()) {
-                // End of unquoted identifier
+            } else if !quoted
+                && (c == b':'
+                    || c.is_ascii_whitespace()
+                    || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*'))))
+            {
+                // End of unquoted identifier. A comment right after the
+                // key acts as whitespace, so its opening '/' ends the
+                // key and the whitespace skipping before ':' eats it.
                 pos -= 1; // Put back the terminating character
                 break;
+            } else if !quoted && !is_json5_id_char(c, false) {
+                return Err(PError::Message {
+                    msg: "Invalid character in unquoted object key".to_string(),
+                    location: Some(pos),
+                });
             } else if c <= 0x1F {
                 // Control character
                 element_type = ElementType::TEXT5;
@@ -4147,6 +4178,14 @@ pub fn unescape_string(input: &str) -> String {
 #[derive(Debug, Default)]
 pub struct ParseInfo {
     pub has_json5: bool,
+}
+
+/// Whether `b` may appear in an unquoted JSON5 object key. Like
+/// SQLite, ASCII letters, '_' and '$' may start one, digits may only
+/// continue one, and every non-ASCII byte is accepted without decoding
+/// the character.
+fn is_json5_id_char(b: u8, first: bool) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x7f || (!first && b.is_ascii_digit())
 }
 
 /// Length of the JSON5-only whitespace sequence at the start of
