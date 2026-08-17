@@ -244,9 +244,9 @@ proc do_test {name cmd expected} {
   }
 }
 
-# Execute SQL test with expected results
+# Execute SQL test with expected results.
 proc do_execsql_test {name sql {expected {}}} {
-  do_test $name [list execsql $sql] $expected
+  do_test $name [list execsql $sql] [list {*}$expected]
 }
 
 # Execute SQL test expecting an error
