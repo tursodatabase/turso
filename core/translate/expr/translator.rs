@@ -1220,6 +1220,7 @@ pub fn translate_expr(
                         | ScalarFunc::Upper
                         | ScalarFunc::Length
                         | ScalarFunc::OctetLength
+                        | ScalarFunc::Subtype
                         | ScalarFunc::Typeof
                         | ScalarFunc::Unicode
                         | ScalarFunc::Unistr

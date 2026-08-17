@@ -13,11 +13,11 @@ pub use crate::json::ops::{
 use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
-use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
+use crate::{bail_constraint_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
-    jsonb_error_position, unescape_string, ElementType, Jsonb, JsonbHeader, ParseInfo,
-    PathOperationMode, SearchOperation, SetOperation,
+    jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb, JsonbHeader,
+    ParseInfo, PathOperationMode, SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -33,6 +33,7 @@ pub enum Conv {
 #[cfg(feature = "json")]
 pub enum OutputVariant {
     ElementType,
+    ElementTypePlain,
     Binary,
     String,
 }
@@ -57,7 +58,12 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
             // json_array and json_quote keep the long form) (#4196).
             json = json.replace("9.0e+999", "9e999");
 
-            Ok(Value::Text(Text::json(json)))
+            if indent.is_some() {
+                // json_pretty() output carries no subtype in SQLite.
+                Ok(Value::Text(Text::new(json)))
+            } else {
+                Ok(Value::Text(Text::json(json)))
+            }
         }
     }
 }
@@ -141,6 +147,15 @@ fn malformed_json_error(error: JsonError) -> LimboError {
         JsonError::OutOfMemory => LimboError::OutOfMemory,
         JsonError::Message { .. } => LimboError::ParseError("malformed JSON".to_string()),
     }
+}
+
+/// Whether a blob is a complete, fully valid JSONB document. Unlike
+/// [`looks_like_jsonb_blob`] this examines the whole payload, because
+/// later readers trust its interior offsets and decode its text
+/// payloads as `&str`: any blob's first byte parses as a plausible
+/// header, so the header alone cannot identify JSONB.
+fn is_jsonb_blob(slice: &[u8]) -> bool {
+    validate_jsonb(slice)
 }
 
 /// SQLite's shallow "superficially looks like JSONB" test
@@ -289,6 +304,15 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
     }
 }
 
+fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
+    if let ValueRef::Blob(blob) = value {
+        if !is_jsonb_blob(blob) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
+    }
+    Ok(())
+}
+
 pub fn curry_convert_dbtype_to_jsonb(
     strict: Conv,
 ) -> impl FnOnce(ValueRef) -> crate::Result<Jsonb> {
@@ -306,9 +330,7 @@ where
 
     for value in values {
         let value = value.as_value_ref();
-        if matches!(value, ValueRef::Blob(_)) {
-            crate::bail_constraint_error!("JSON cannot hold BLOB values")
-        }
+        ensure_blob_arg_is_jsonb(value)?;
         let value = convert_dbtype_to_jsonb(value, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
@@ -328,9 +350,7 @@ where
 
     for value in values {
         let value = value.as_value_ref();
-        if matches!(value, ValueRef::Blob(_)) {
-            crate::bail_constraint_error!("JSON cannot hold BLOB values")
-        }
+        ensure_blob_arg_is_jsonb(value)?;
         let value = convert_dbtype_to_jsonb(value, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
@@ -396,11 +416,7 @@ where
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
 
-        if second.as_value_ref().value_type() == ValueType::Blob {
-            return Err(crate::LimboError::Constraint(
-                "JSON cannot hold BLOB values".to_string(),
-            ));
-        }
+        ensure_blob_arg_is_jsonb(second.as_value_ref())?;
 
         let path = json_path_from_db_value(&first, true)?;
 
@@ -511,7 +527,7 @@ pub fn json_arrow_shift_extract(
             Ok(json_string_to_db_type(
                 extracted,
                 element_type,
-                OutputVariant::ElementType,
+                OutputVariant::ElementTypePlain,
             )?)
         } else {
             Ok(Value::Null)
@@ -659,9 +675,18 @@ pub fn json_string_to_db_type(
         return Ok(Value::Text(Text::json(json_string)));
     }
     match element_type {
-        ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),
+        ElementType::ARRAY | ElementType::OBJECT => {
+            if matches!(flag, OutputVariant::ElementTypePlain) {
+                Ok(Value::Text(Text::new(json_string)))
+            } else {
+                Ok(Value::Text(Text::json(json_string)))
+            }
+        }
         ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {
-            if matches!(flag, OutputVariant::ElementType) {
+            if matches!(
+                flag,
+                OutputVariant::ElementType | OutputVariant::ElementTypePlain
+            ) {
                 if element_type == ElementType::TEXT5 {
                     Ok(Value::Text(Text::new(json.scalar_string_value()?)))
                 } else {
@@ -708,7 +733,9 @@ pub fn json_type(value: impl AsValueRef, path: Option<impl AsValueRef>) -> crate
         let json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
         let element_type = json.element_type()?;
 
-        return Ok(Value::Text(Text::json(element_type.into())));
+        // The type name is plain metadata text, not JSON: SQLite gives
+        // it no subtype.
+        return Ok(Value::Text(Text::new(String::from(element_type))));
     }
     let path_value = path.ok_or_else(|| {
         crate::LimboError::InternalError("path should be Some after is_none check".to_string())
@@ -723,7 +750,7 @@ pub fn json_type(value: impl AsValueRef, path: Option<impl AsValueRef>) -> crate
             } else {
                 json.element_type_at(target.field_value_index)
             }?;
-            Ok(Value::Text(Text::json(element_type.into())))
+            Ok(Value::Text(Text::new(String::from(element_type))))
         } else {
             Ok(Value::Null)
         }
@@ -801,8 +828,25 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             }
             Err(JsonError::OutOfMemory) => Err(LimboError::OutOfMemory),
         },
-        ValueRef::Blob(_) => {
-            bail_parse_error!("Unsupported")
+        ValueRef::Blob(blob) => {
+            // SQLite classifies the raw blob: one that looks like
+            // JSONB reports the byte offset of its first malformed
+            // element (0 when fully valid). Anything else is read as
+            // text, which for a blob stops at the first NUL. The lossy
+            // UTF-8 conversion stands in for SQLite's byte-wise
+            // parser: each bad byte becomes one replacement character,
+            // so error positions still line up.
+            if looks_like_jsonb_blob(blob) {
+                return Ok(Value::from_i64(jsonb_error_position(blob) as i64));
+            }
+            let zero_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+            match Jsonb::from_str(&String::from_utf8_lossy(&blob[..zero_pos])) {
+                Ok(_) => Ok(Value::from_i64(0)),
+                Err(JsonError::Message { location, .. }) => {
+                    Ok(Value::from_i64(location.map_or(1, |loc| loc as i64 + 1)))
+                }
+                Err(JsonError::OutOfMemory) => Err(LimboError::OutOfMemory),
+            }
         }
         ValueRef::Null => Ok(Value::Null),
         _ => Ok(Value::from_i64(0)),
@@ -843,6 +887,7 @@ where
                 "values should have second element in loop".to_string(),
             )
         })?;
+        ensure_blob_arg_is_jsonb(second.as_value_ref())?;
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
@@ -883,6 +928,7 @@ where
                 "values should have second element in loop".to_string(),
             )
         })?;
+        ensure_blob_arg_is_jsonb(second.as_value_ref())?;
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
@@ -1007,18 +1053,25 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
             }
             escaped_value.push('"');
 
-            Ok(Value::build_text(escaped_value))
+            Ok(Value::Text(Text::json(escaped_value)))
         }
         // Numbers are unquoted in json, but must be returned as TEXT
         ValueRef::Numeric(n) => match n {
-            crate::numeric::Numeric::Integer(i) => Ok(Value::build_text(i.to_string())),
+            crate::numeric::Numeric::Integer(i) => Ok(Value::Text(Text::json(i.to_string()))),
             crate::numeric::Numeric::Float(_) => {
                 let json = convert_ref_dbtype_to_jsonb(ValueRef::Numeric(n), Conv::Strict)?;
-                Ok(Value::build_text(json.to_string()?))
+                Ok(Value::Text(Text::json(json.to_string()?)))
             }
         },
-        ValueRef::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
-        ValueRef::Null => Ok(Value::build_text("null")),
+        ValueRef::Blob(blob) => {
+            if is_jsonb_blob(blob) {
+                let json = Jsonb::from_raw_data(blob)?;
+                Ok(Value::Text(Text::json(json.to_string()?)))
+            } else {
+                crate::bail_constraint_error!("JSON cannot hold BLOB values")
+            }
+        }
+        ValueRef::Null => Ok(Value::Text(Text::json("null".to_string()))),
     }
 }
 
@@ -2017,5 +2070,24 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(result.unwrap().to_text().unwrap(), r#"{"field":"value"}"#,);
+    }
+
+    #[test]
+    fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
+        // `|` is 0x7C: OBJECT with a 7-byte inline payload, so this is exactly at
+        // the length where a scalar blob and a JSONB object are indistinguishable
+        // by header alone.
+        let overlapping_scalar = b"|1234567";
+        assert_eq!(overlapping_scalar.len(), 8);
+        assert!(!is_jsonb_blob(overlapping_scalar));
+    }
+
+    /// Object with a payload larger than a scalar blob, so header inspection
+    /// alone accepts it, but the TEXT5 key holds bytes that are not UTF-8.
+    /// Reading such a key used to reach `str::from_utf8_unchecked`.
+    #[test]
+    fn test_is_jsonb_blob_rejects_invalid_utf8_key() {
+        let invalid_utf8_key = b"\x9C\x79aaaaaa\xF0\x00";
+        assert!(!is_jsonb_blob(invalid_utf8_key));
     }
 }

@@ -813,3 +813,128 @@ expect error {
     ^(Parse error: )?bad JSON path: 'x'$
 }
 
+# subtype() reports 74 ('J') for TEXT a JSON function produced, and 0
+# for everything else — including JSONB blobs, whose acceptance as
+# arguments is purely structural.
+
+test subtype_reports_json_text_only {
+    SELECT subtype(json('{}')), subtype(jsonb('{}')), subtype('{}'),
+           subtype(1), subtype(NULL), subtype(json_extract('{"a":[1]}','$.a')),
+           subtype(json_extract('{"a":1}','$.a'));
+}
+expect {
+    74|0|0|0|0|74|0
+}
+
+test double_arrow_result_never_carries_subtype {
+    SELECT subtype('{"a":[7,8]}'->'a'), subtype('{"a":[7,8]}'->>'a'),
+           typeof('{"a":[7,8]}'->>'a');
+}
+expect {
+    74|0|text
+}
+
+test jsonb_blob_arguments_accepted_structurally {
+    SELECT json_array(jsonb_array(1,2)), json(jsonb_array(json_array(1,2))),
+           json_object('ex', jsonb('[52,3.14159]')),
+           json_set('{"a":2,"c":4}', '$.c', jsonb('[97,96]')),
+           json_array(x'0B'), json_quote(x'0B');
+}
+expect {
+    [[1,2]]|[[1,2]]|{"ex":[52,3.14159]}|{"a":2,"c":[97,96]}|[[]]|[]
+}
+
+test non_jsonb_blob_arguments_error {
+    SELECT json_array(x'313233');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?JSON cannot hold BLOB values$
+}
+
+# Document arguments accept blobs everywhere: JSONB blobs directly,
+# and other blobs as JSON text (x'313233' is the text "123").
+test patch_and_error_position_accept_blobs {
+    SELECT json_patch(jsonb('{"a":1}'), jsonb('{"b":2}')),
+           json(jsonb_patch(jsonb('{"a":1}'), jsonb('{"b":2}'))),
+           json_patch(x'313233', '{}'),
+           json_error_position(jsonb('{"a":1}')),
+           json_error_position(x'313233'), json_error_position(x'ABCD');
+}
+expect {
+    {"a":1,"b":2}|{"a":1,"b":2}|{}|0|0|1
+}
+
+# Only text a JSON function produced as a JSON value carries the 'J'
+# subtype: json_quote and json_patch results do, while metadata text
+# from json_type and display text from json_pretty do not.
+test subtype_marks_json_values_not_metadata {
+    SELECT subtype(json_quote('x')), subtype(json_quote(5)), subtype(json_quote(NULL)),
+           subtype(json_patch('{}','null')), subtype(json_patch('{"a":1}','{"b":2}')),
+           subtype(json_type('{}')), subtype(json_type('[3]','$[0]')),
+           subtype(json_pretty('{}'));
+}
+expect {
+    74|74|74|74|74|0|0|0
+}
+
+# Unmarked json_type output nests as a plain string.
+test json_type_output_nests_as_text {
+    SELECT json_array(json_type('{}'));
+}
+expect {
+    ["object"]
+}
+
+# A JSON null patch result stays a JSON value: json_patch returns the
+# text 'null' with the 'J' subtype and jsonb_patch the JSONB null blob,
+# not SQL NULL.
+test patch_json_null_result_stays_json {
+    SELECT json_patch('{}', jsonb('null')), subtype(json_patch('{}', jsonb('null'))),
+           json_patch('{}', x'00'), json_patch('{}', 'null'),
+           json_patch('{"a":1}', 'null'),
+           hex(jsonb_patch('{}', jsonb('null'))), hex(jsonb_patch('{}', 'null'));
+}
+expect {
+    null|74|null|null|null|00|00
+}
+
+# A malformed blob target errors even when the patch is the text
+# 'null'.
+test patch_validates_target_before_null_patch {
+    SELECT json_patch(x'ABCD', 'null');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+test jsonb_patch_validates_target_before_null_patch {
+    SELECT jsonb_patch(x'ABCD', 'null');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+# json_error_position reads a non-JSONB blob as text that stops at the
+# first NUL: x'3132330078' is "123" followed by NUL and garbage.
+test json_error_position_blob_stops_at_nul {
+    SELECT json_error_position(x'3132330078');
+}
+expect {
+    0
+}
+
+# A blob that looks like JSONB reports the byte offset of its first
+# malformed element instead of being re-read as text: x'3B133132' is an
+# array whose second element claims to be FALSE with a payload, and
+# x'1301' and x'2B31FF' carry non-digit bytes in numeric payloads.
+# x'5B6E756C6C5D' is the text "[null]" whose first byte only looks like
+# an array header, and x'22FF22' reads as text because FALSE cannot
+# carry a payload.
+test json_error_position_reports_jsonb_offsets {
+    SELECT json_error_position(x'3B133132'), json_error_position(x'1301'),
+           json_error_position(x'2B31FF'), json_error_position(x'5B6E756C6C5D'),
+           json_error_position(x'22FF22'), json_error_position(x'CB01');
+}
+expect {
+    4|2|2|0|0|1
+}

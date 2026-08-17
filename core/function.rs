@@ -820,6 +820,7 @@ pub enum ScalarFunc {
     Time,
     TotalChanges,
     DateTime,
+    Subtype,
     Typeof,
     Unicode,
     Unistr,
@@ -955,6 +956,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Time => false,
             ScalarFunc::TotalChanges => false,
             ScalarFunc::DateTime => false,
+            ScalarFunc::Subtype => true,
             ScalarFunc::Typeof => true,
             ScalarFunc::Unicode => true,
             ScalarFunc::Unistr => true,
@@ -1101,6 +1103,7 @@ impl Display for ScalarFunc {
             Self::Date => "date",
             Self::Time => "time",
             Self::TotalChanges => "total_changes",
+            Self::Subtype => "subtype",
             Self::Typeof => "typeof",
             Self::Unicode => "unicode",
             Self::Unistr => "unistr",
@@ -1240,6 +1243,7 @@ impl ScalarFunc {
             | Self::RandomBlob
             | Self::Sign
             | Self::Soundex
+            | Self::Subtype
             | Self::Typeof
             | Self::Unicode
             | Self::Unistr

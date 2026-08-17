@@ -1,3 +1,5 @@
+#[cfg(feature = "json")]
+use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
@@ -604,6 +606,14 @@ impl Value {
                 Value::from_i64(char_pos as i64)
             }
             None => Value::from_i64(0),
+        }
+    }
+
+    pub fn exec_subtype(&self) -> Value {
+        match self {
+            #[cfg(feature = "json")]
+            Value::Text(t) if t.subtype == TextSubtype::Json => Value::from_i64(74),
+            _ => Value::from_i64(0),
         }
     }
 
