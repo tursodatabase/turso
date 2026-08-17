@@ -112,6 +112,57 @@ pub trait DatabaseStorage: Send + Sync {
     fn read_header(&self, c: Completion) -> Result<Completion>;
 
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
+
+    /// Read `dest.len()` consecutive pages starting at `first_page_idx` as one
+    /// request, filling `dest[i]` with page `first_page_idx + i`.
+    ///
+    /// This exists for readahead. Reading a 32-page run one page at a time is
+    /// 32 requests to the storage layer; as one request it is a single
+    /// round trip that moves the same bytes, which on any medium with a
+    /// per-request cost -- a syscall, a disk seek, an HTTP GET -- is where
+    /// nearly all of the saving is.
+    ///
+    /// `on_done` fires exactly once when every page has been read and
+    /// transformed, or with the first error. The returned completion is what
+    /// the caller waits on.
+    ///
+    /// Returns an error without issuing any I/O if `dest` is empty or its
+    /// buffers are not all one valid page size.
+    ///
+    /// The default fans out to [`DatabaseStorage::read_page`] and joins the
+    /// results, so every backend supports readahead; backends that can move a
+    /// contiguous run in one request should override it.
+    fn read_pages(
+        &self,
+        first_page_idx: usize,
+        dest: Vec<Arc<Buffer>>,
+        io_ctx: &IOContext,
+        on_done: Box<dyn Fn(Result<(), CompletionError>) + Send + Sync>,
+    ) -> Result<Completion> {
+        if dest.is_empty() {
+            return Err(LimboError::InternalError(
+                "read_pages called with no destination buffers".into(),
+            ));
+        }
+        let mut group = crate::io::CompletionGroup::new(move |res| {
+            on_done(res.map(|_| ()));
+        });
+        for (i, buf) in dest.iter().enumerate() {
+            let c = Completion::new_read(buf.clone(), |_| None);
+            match self.read_page(first_page_idx + i, io_ctx, c) {
+                Ok(c) => group.add(&c),
+                Err(e) => {
+                    // Reads already submitted keep their buffers alive until
+                    // they resolve; cancel them so they do not outlive this
+                    // call, then report the failure to the caller.
+                    group.cancel();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(group.build())
+    }
+
     fn write_page(
         &self,
         page_idx: usize,
@@ -270,6 +321,97 @@ impl DatabaseStorage for DatabaseFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    fn read_pages(
+        &self,
+        first_page_idx: usize,
+        dest: Vec<Arc<Buffer>>,
+        io_ctx: &IOContext,
+        on_done: Box<dyn Fn(Result<(), CompletionError>) + Send + Sync>,
+    ) -> Result<Completion> {
+        turso_assert_greater_than!(first_page_idx, 0);
+        let Some(page_size) = dest.first().map(|b| b.len()) else {
+            return Err(LimboError::InternalError(
+                "read_pages called with no destination buffers".into(),
+            ));
+        };
+        if !(512..=65536).contains(&page_size) || page_size & (page_size - 1) != 0 {
+            return Err(LimboError::NotADB);
+        }
+        if dest.iter().any(|b| b.len() != page_size) {
+            return Err(LimboError::InternalError(
+                "read_pages requires every destination buffer to be one page".into(),
+            ));
+        }
+        let Some(pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
+            return Err(LimboError::IntegerOverflow);
+        };
+        let total = page_size * dest.len();
+
+        match io_ctx.page_transform() {
+            // Nothing has to look at the encoded bytes separately from the
+            // decoded ones, so read straight into the page buffers. One
+            // request, no copy.
+            PageTransform::None => {
+                let c = Completion::new_write(move |res| {
+                    on_done(check_run_length(res, first_page_idx, total));
+                });
+                self.file.preadv(pos, dest, c)
+            }
+            // Checksums are verified in place, so this can also read straight
+            // into the page buffers.
+            PageTransform::Checksum(ctx) => {
+                let ctx = ctx.clone();
+                let pages = dest.clone();
+                let c = Completion::new_write(move |res| {
+                    let outcome = check_run_length(res, first_page_idx, total).and_then(|()| {
+                        for (i, page_buf) in pages.iter().enumerate() {
+                            ctx.verify_checksum(page_buf.as_mut_slice(), first_page_idx + i)?;
+                        }
+                        Ok(())
+                    });
+                    on_done(outcome);
+                });
+                self.file.preadv(pos, dest, c)
+            }
+            // A codec decodes from one buffer into another, so the encoded
+            // run needs somewhere to land first.
+            PageTransform::Codec(codec) => {
+                // Codec contexts depend only on the page number, so build them
+                // here: the completion callback cannot return a `LimboError`.
+                let codec_contexts = (0..dest.len())
+                    .map(|i| {
+                        PageCodecContext::from_page_idx(first_page_idx + i, PageLocation::Database)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let codec = codec.clone();
+                let staging = Arc::new(Buffer::new_temporary(total));
+                let decode = move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let (buf, bytes_read) = res?;
+                    check_run_length(Ok(bytes_read), first_page_idx, total)?;
+                    for (i, page_buf) in dest.iter().enumerate() {
+                        let page_idx = first_page_idx + i;
+                        let src = &buf.as_slice()[i * page_size..(i + 1) * page_size];
+                        codec
+                            .decode_page(codec_contexts[i], src, page_buf.as_mut_slice())
+                            .map_err(|e| {
+                                tracing::error!("failed to decode prefetched page {page_idx}: {e}");
+                                page_codec_completion_error(codec.as_ref(), page_idx)
+                            })?;
+                    }
+                    Ok(())
+                };
+                let c = Completion::new_read(staging, move |res| {
+                    let outcome = decode(res);
+                    let err = outcome.as_ref().err().copied();
+                    on_done(outcome);
+                    err
+                });
+                self.file.pread(pos, c)
+            }
+        }
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn write_page(
         &self,
         page_idx: usize,
@@ -357,6 +499,25 @@ impl DatabaseFile {
     pub fn new(file: Arc<dyn crate::io::File>) -> Self {
         Self { file }
     }
+}
+
+/// A readahead run has to arrive whole. A short read means the run ran past
+/// the end of the file, which readahead should have clamped, so the pages are
+/// unusable and the caller must fall back to reading them one at a time.
+fn check_run_length(
+    res: Result<i32, CompletionError>,
+    first_page_idx: usize,
+    expected: usize,
+) -> Result<(), CompletionError> {
+    let bytes_read = res?;
+    if bytes_read as usize != expected {
+        return Err(CompletionError::ShortRead {
+            page_idx: first_page_idx,
+            expected,
+            actual: bytes_read.max(0) as usize,
+        });
+    }
+    Ok(())
 }
 
 fn encode_buffer(

@@ -1956,6 +1956,10 @@ pub enum PragmaName {
     EmptyResultCallbacks,
     /// VDBE opcode trace output
     VdbeTrace,
+    /// Largest number of pages to read ahead of a scan. 0 disables readahead.
+    PrefetchPages,
+    /// Readahead counters for this connection's pager.
+    PrefetchStats,
 }
 
 /// `CREATE TRIGGER` time

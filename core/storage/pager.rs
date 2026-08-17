@@ -17,7 +17,8 @@ use crate::storage::{
     wal::{CheckpointResult, RollbackTo, Wal, IOV_MAX},
 };
 use crate::sync::atomic::{
-    AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicI64, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
+    Ordering,
 };
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
@@ -37,6 +38,7 @@ use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use tracing::{instrument, trace, Level};
 
 use super::btree::offset::{
@@ -47,6 +49,7 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
+use super::readahead::{PrefetchBuffer, PrefetchHit, Readahead, ReadaheadAction};
 use super::sqlite3_ondisk::read_varint;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
@@ -58,6 +61,72 @@ use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
+
+/// Readahead window ceiling, in pages, out of the box.
+///
+/// 32 pages is 128 KiB at the usual 4 KiB page size, which is also Linux's
+/// default `read_ahead_kb`. Measured over the TPC-H table scans (see
+/// `storage::readahead`), 32 pages already removes ~185x of the blocking
+/// reads; going wider does not remove meaningfully more of them, and every
+/// extra page is memory held and bandwidth spent. Set `PRAGMA prefetch_pages`
+/// to trade the other way.
+pub const DEFAULT_READAHEAD_WINDOW: u32 = 32;
+
+/// Hard ceiling on `PRAGMA prefetch_pages`, so one connection cannot pin an
+/// unbounded amount of memory in prefetched pages.
+pub const MAX_READAHEAD_WINDOW: u32 = 512;
+
+/// How many prefetched pages we are willing to hold, given a window size.
+///
+/// Two windows can be outstanding while the ramp is catching up, and pages the
+/// reader never gets to have to sit somewhere until they age out, so a few
+/// windows of slack keeps the buffer from evicting pages that are about to be
+/// used. Beyond that it is just memory.
+fn prefetch_buffer_capacity(window: u32) -> usize {
+    if window == 0 {
+        return 0;
+    }
+    (window as usize * 4).max(16)
+}
+
+/// Readahead counters. Reported by `PRAGMA prefetch_stats`, and the thing
+/// tests assert on: whether readahead helped is a question about how many
+/// times a query had to go to storage, which is exactly what these count.
+#[derive(Default, Debug)]
+pub struct ReadaheadStats {
+    /// Reads served by a page readahead had already fetched and finished.
+    hits: AtomicU64,
+    /// Reads that found a prefetched page whose read was still in flight.
+    hits_in_flight: AtomicU64,
+    /// Reads that had to go to storage themselves.
+    misses: AtomicU64,
+    /// Pages fetched by readahead.
+    pages_fetched: AtomicU64,
+    /// Requests readahead made to storage. `pages_fetched / reads` is how many
+    /// pages we move per round trip.
+    reads: AtomicU64,
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadaheadStatsSnapshot {
+    pub hits: u64,
+    pub hits_in_flight: u64,
+    pub misses: u64,
+    pub pages_fetched: u64,
+    pub reads: u64,
+}
+
+impl ReadaheadStats {
+    fn snapshot(&self) -> ReadaheadStatsSnapshot {
+        ReadaheadStatsSnapshot {
+            hits: self.hits.load(Ordering::Relaxed),
+            hits_in_flight: self.hits_in_flight.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            pages_fetched: self.pages_fetched.load(Ordering::Relaxed),
+            reads: self.reads.load(Ordering::Relaxed),
+        }
+    }
+}
 const RESERVED_SPACE_NOT_SET: u16 = u16::MAX;
 
 #[cfg(feature = "test_helper")]
@@ -1361,6 +1430,18 @@ pub struct Pager {
     /// `read_page_nonblock(idx)` reuses the stored `(page, disk_read)` pair
     /// instead of issuing a duplicate disk read.
     pending_reads: RwLock<HashMap<i64, PendingRead>>,
+    /// Follows readers walking forward through the file and decides when to
+    /// fetch pages ahead of them. See `storage::readahead`.
+    readahead: Mutex<Readahead>,
+    /// Pages readahead has fetched but nothing has asked for yet.
+    prefetched: Mutex<PrefetchBuffer>,
+    /// Ceiling on the readahead window, in pages. 0 turns readahead off.
+    readahead_window: AtomicU32,
+    /// Database file size in pages, as readahead last saw it. -1 means
+    /// "ask the file". Cleared by `forget_readahead`.
+    readahead_file_pages: AtomicI64,
+    /// Readahead counters, for tests and `PRAGMA` introspection.
+    readahead_stats: ReadaheadStats,
     #[cfg(test)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
@@ -1656,6 +1737,13 @@ impl Pager {
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             pending_reads: RwLock::new(HashMap::new()),
+            readahead: Mutex::new(Readahead::new()),
+            prefetched: Mutex::new(PrefetchBuffer::new(prefetch_buffer_capacity(
+                DEFAULT_READAHEAD_WINDOW,
+            ))),
+            readahead_window: AtomicU32::new(DEFAULT_READAHEAD_WINDOW),
+            readahead_file_pages: AtomicI64::new(-1),
+            readahead_stats: ReadaheadStats::default(),
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
@@ -3206,6 +3294,9 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn end_read_tx(&self) {
+        // Prefetched pages are only known-correct for the snapshot they were
+        // read under. That snapshot ends here.
+        self.forget_readahead();
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3328,48 +3419,74 @@ impl Pager {
         let (page, c_disk) = if let Some(pending) = pending {
             // Re-entry: previous call yielded on spill before completing
             // `cache_insert`. Reuse the same PageRef and in-flight disk read
-            // rather than issuing duplicate IO.
+            // rather than issuing duplicate IO. Readahead already counted this
+            // page on the first pass; counting it again would let a retry loop
+            // look like forward progress.
             (pending.page, pending.disk_read)
         } else {
             // Fast path: cache hit.
-            {
+            let cached = {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx as usize);
-                if let Some(page) = page_cache.get(&page_key)? {
-                    turso_assert!(
-                        page_idx as usize == page.get().id,
-                        "attempted to read page but got different page",
-                        { "expected_page": page_idx, "actual_page": page.get().id }
-                    );
-                    if !page.is_loaded() {
-                        // The page is cache-resident but its read is still in
-                        // flight: `read_page` publishes a page into the shared
-                        // cache (via `cache_insert` below) *before* its disk
-                        // read completes, and `PageCache::get` deliberately
-                        // hands out locked-but-unloaded in-flight pages. We have
-                        // no completion to surface on this path (the disk-read
-                        // completion was consumed by the original caller and the
-                        // `pending_reads` entry has already been removed), so
-                        // returning `Done((page, None))` would hand the caller a
-                        // locked, unloaded page with nothing to wait on: a torn
-                        // / uninitialized read, or a concurrent writer filling
-                        // the buffer underneath the reader.
-                        io_yield_one!(crate::Completion::new_yield());
-                    }
-                    return Ok(IOResult::Done((page, None)));
+                page_cache.get(&page_key)?
+            };
+            if let Some(page) = cached {
+                turso_assert!(
+                    page_idx as usize == page.get().id,
+                    "attempted to read page but got different page",
+                    { "expected_page": page_idx, "actual_page": page.get().id }
+                );
+                if !page.is_loaded() {
+                    // The page is cache-resident but its read is still in
+                    // flight: `read_page` publishes a page into the shared
+                    // cache (via `cache_insert` below) *before* its disk
+                    // read completes, and `PageCache::get` deliberately
+                    // hands out locked-but-unloaded in-flight pages. We have
+                    // no completion to surface on this path (the disk-read
+                    // completion was consumed by the original caller and the
+                    // `pending_reads` entry has already been removed), so
+                    // returning `Done((page, None))` would hand the caller a
+                    // locked, unloaded page with nothing to wait on: a torn
+                    // / uninitialized read, or a concurrent writer filling
+                    // the buffer underneath the reader.
+                    io_yield_one!(crate::Completion::new_yield());
                 }
+                // Served from memory. This is where readahead queues the next
+                // window, so the reader keeps a lead and stops stalling.
+                self.note_page_read(page_idx, true);
+                return Ok(IOResult::Done((page, None)));
             }
 
-            tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
-            let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+            // Not cached. Readahead may already have this page in hand, in
+            // which case its read went out earlier than a demand read could
+            // have -- often early enough to have already landed.
+            let (page, c) = match self.prefetched.lock().take(page_idx) {
+                Some(PrefetchHit::Ready(page)) => {
+                    self.readahead_stats.hits.fetch_add(1, Ordering::Relaxed);
+                    (page, None)
+                }
+                Some(PrefetchHit::InFlight(page, c)) => {
+                    self.readahead_stats
+                        .hits_in_flight
+                        .fetch_add(1, Ordering::Relaxed);
+                    (page, Some(c))
+                }
+                None => {
+                    tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+                    self.readahead_stats.misses.fetch_add(1, Ordering::Relaxed);
+                    let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+                    (page, Some(c))
+                }
+            };
             self.pending_reads.write().insert(
                 page_idx,
                 PendingRead {
                     page: page.clone(),
-                    disk_read: Some(c.clone()),
+                    disk_read: c.clone(),
                 },
             );
-            (page, Some(c))
+            self.note_page_read(page_idx, false);
+            (page, c)
         };
 
         match self.cache_insert(page_idx as usize, page.clone())? {
@@ -3384,6 +3501,225 @@ impl Pager {
                 io_yield_one!(spill_c);
             }
         }
+    }
+
+    /// Ceiling on the readahead window in pages. 0 means readahead is off.
+    pub fn readahead_window(&self) -> u32 {
+        self.readahead_window.load(Ordering::Relaxed)
+    }
+
+    /// Set the readahead ceiling in pages. 0 turns readahead off.
+    ///
+    /// Any pages already fetched are dropped, so turning readahead off stops
+    /// it costing memory immediately rather than at the end of the statement.
+    pub fn set_readahead_window(&self, pages: u32) {
+        let pages = pages.min(MAX_READAHEAD_WINDOW);
+        self.readahead_window.store(pages, Ordering::Relaxed);
+        self.readahead.lock().reset();
+        let mut prefetched = self.prefetched.lock();
+        prefetched.set_capacity(prefetch_buffer_capacity(pages));
+        if pages == 0 {
+            prefetched.clear();
+        }
+    }
+
+    pub fn readahead_stats(&self) -> ReadaheadStatsSnapshot {
+        self.readahead_stats.snapshot()
+    }
+
+    /// Forget every prefetched page and every stream.
+    ///
+    /// Prefetched pages are copies of the database file taken under one read
+    /// snapshot. Once that snapshot can no longer be assumed -- the read
+    /// transaction ended, someone dirtied a page, the cache was cleared, a
+    /// checkpoint moved WAL frames into the file -- they are no longer known
+    /// to be what a reader should see, so they go.
+    pub(crate) fn forget_readahead(&self) {
+        self.readahead_file_pages.store(-1, Ordering::Relaxed);
+        let mut prefetched = self.prefetched.lock();
+        if prefetched.len() > 0 {
+            prefetched.clear();
+        }
+        self.readahead.lock().reset();
+    }
+
+    /// A cursor is starting a walk of a whole b-tree. See
+    /// [`Readahead::hint_scan_start`].
+    pub(crate) fn hint_scan_start(&self, root_page: i64) {
+        if self.readahead_window.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        self.readahead.lock().hint_scan_start(root_page);
+    }
+
+    /// Drop one page from the prefetch buffer. Called when that page stops
+    /// being a faithful copy of what a reader should see.
+    pub(crate) fn forget_prefetched_page(&self, page_idx: i64) {
+        if self.readahead_window.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        self.prefetched.lock().remove(page_idx);
+    }
+
+    /// Record a page read and act on whatever readahead decides.
+    ///
+    /// Must not be called while holding the page cache lock: issuing a window
+    /// takes it.
+    fn note_page_read(&self, page_idx: i64, cache_hit: bool) {
+        let window = NonZeroU32::new(self.effective_readahead_window());
+        let action = self.readahead.lock().on_read(page_idx, cache_hit, window);
+        let ReadaheadAction::Fetch { start, count } = action else {
+            return;
+        };
+        // Readahead is an optimization and nothing more: a failure here must
+        // never surface to the query, which will read the page itself.
+        if let Err(e) = self.issue_readahead(start, count) {
+            tracing::debug!("readahead of {count} pages from {start} did not happen: {e}");
+        }
+    }
+
+    /// The window we will actually use, which is the configured ceiling
+    /// bounded by what the page cache can absorb.
+    ///
+    /// A window that is a large fraction of the cache would evict the pages
+    /// the query is still working on to make room for guesses, so readahead
+    /// would slow the query down. An eighth leaves the cache overwhelmingly
+    /// for real work.
+    fn effective_readahead_window(&self) -> u32 {
+        let configured = self.readahead_window.load(Ordering::Relaxed);
+        if configured == 0 {
+            return 0;
+        }
+        let cache_capacity = self.page_cache.read().capacity() as u32;
+        configured.min((cache_capacity / 8).max(1))
+    }
+
+    /// Fetch up to `count` pages from `start`, best effort.
+    ///
+    /// Only the run of pages we can safely read from the database file gets
+    /// fetched, as a single request:
+    ///
+    /// * pages already in the cache or already fetched are skipped -- reading
+    ///   them again would be pure waste, and overwriting a cached page could
+    ///   clobber a dirty one;
+    /// * pages with a WAL frame in this reader's snapshot are skipped, because
+    ///   the file copy is not what this reader should see;
+    /// * pages past the end of the file are skipped, because a short read
+    ///   would leave an unusable page behind.
+    ///
+    /// The run stops at the first page that fails any of those, so the whole
+    /// thing is one contiguous read. Whatever is left gets picked up by the
+    /// next window.
+    fn issue_readahead(&self, start: i64, count: u32) -> Result<()> {
+        turso_assert_greater_than!(start, 0);
+        if count == 0 {
+            return Ok(());
+        }
+        // Read the raw field rather than `get_page_size_unchecked`: readahead
+        // can run before the page size is known, and it must never assert.
+        let page_size = self.page_size.load(Ordering::Relaxed) as u64;
+        if page_size == 0 {
+            return Ok(());
+        }
+        // Never read past the end of the file: a short read leaves a page
+        // locked and unloaded, which a later reader would wait on forever.
+        //
+        // Asking the file its size is a syscall, and this runs once per
+        // window, so remember it. The file only grows on commit, and
+        // `forget_readahead` clears this whenever the snapshot changes.
+        let mut file_pages = self.readahead_file_pages.load(Ordering::Relaxed);
+        if file_pages < 0 {
+            file_pages = (self.db_file.size()? / page_size) as i64;
+            self.readahead_file_pages
+                .store(file_pages, Ordering::Relaxed);
+        }
+        let last = (start + count as i64 - 1).min(file_pages);
+        if last < start {
+            return Ok(());
+        }
+
+        let run = self.readahead_run(start, last)?;
+        if run.is_empty() {
+            return Ok(());
+        }
+
+        let pages: Vec<PageRef> = run
+            .iter()
+            .map(|idx| {
+                let page = Arc::new(Page::new(*idx));
+                page.set_locked();
+                page
+            })
+            .collect();
+        let buffers: Vec<Arc<Buffer>> = (0..pages.len())
+            .map(|_| Arc::new(self.buffer_pool.get_page()))
+            .collect();
+
+        let finish_pages = pages.clone();
+        let finish_buffers = buffers.clone();
+        let first = run[0];
+        let on_done = Box::new(move |res: Result<(), CompletionError>| {
+            match res {
+                Ok(()) => {
+                    for (i, page) in finish_pages.iter().enumerate() {
+                        sqlite3_ondisk::finish_read_page(
+                            first as usize + i,
+                            finish_buffers[i].clone(),
+                            page.clone(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    // Leave the pages unloaded. `PrefetchBuffer::take` sees
+                    // the failed completion, drops the entry and lets the
+                    // demand read go to storage as if readahead never ran.
+                    tracing::debug!("readahead read starting at page {first} failed: {err}");
+                    for page in finish_pages.iter() {
+                        page.clear_locked();
+                    }
+                }
+            }
+        });
+
+        let io_ctx = self.io_ctx.read().clone();
+        let c = self
+            .db_file
+            .read_pages(first as usize, buffers, &io_ctx, on_done)?;
+
+        let mut prefetched = self.prefetched.lock();
+        for (i, page) in pages.into_iter().enumerate() {
+            prefetched.insert(first + i as i64, page, c.clone());
+        }
+        self.readahead_stats
+            .pages_fetched
+            .fetch_add(run.len() as u64, Ordering::Relaxed);
+        self.readahead_stats.reads.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("readahead fetched {} pages from {first}", run.len());
+        Ok(())
+    }
+
+    /// The leading run of pages in `[start, last]` that is worth and safe to
+    /// read from the database file. See [`Pager::issue_readahead`].
+    fn readahead_run(&self, start: i64, last: i64) -> Result<Vec<i64>> {
+        let prefetched = self.prefetched.lock();
+        let page_cache = self.page_cache.read();
+        let mut run = Vec::new();
+        for idx in start..=last {
+            if page_cache.contains_key(&PageCacheKey::new(idx as usize)) || prefetched.contains(idx)
+            {
+                break;
+            }
+            if let Some(wal) = self.wal.as_ref() {
+                // `find_frame` answers against this reader's snapshot, which
+                // is fixed for the life of the read transaction -- so a page
+                // with no frame now still has none when the reader gets to it.
+                if wal.find_frame(idx as u64, None)?.is_some() {
+                    break;
+                }
+            }
+            run.push(idx);
+        }
+        Ok(run)
     }
 
     fn begin_read_disk_page(
@@ -3496,6 +3832,11 @@ impl Pager {
             { "page_id": page.get().id }
         );
         self.subjournal_page_if_required(page)?;
+        // Anything readahead fetched for this page is a pre-write copy of it.
+        // Once the page is dirty that copy must never be handed to a reader:
+        // a dirty page can be spilled to the WAL and evicted, and the next
+        // read of it would otherwise find our stale copy instead of the frame.
+        self.forget_prefetched_page(page.get().id as i64);
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
@@ -5064,6 +5405,7 @@ impl Pager {
 
     pub fn clear_page_cache(&self, clear_dirty: bool) {
         self.invalidate_all_cursors();
+        self.forget_readahead();
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
@@ -5742,6 +6084,7 @@ impl Pager {
 
     fn reset_internal_states(&self) {
         self.pending_reads.write().clear();
+        self.forget_readahead();
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
