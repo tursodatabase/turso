@@ -30,6 +30,17 @@ const fn make_whitespace_table() -> [u8; 256] {
     table[0x0D] = 1; // Carriage return
     table[0x20] = 1; // Space
 
+    // Bit 2 marks bytes that can start a JSON5-only whitespace
+    // sequence, so the hot path only calls json5_whitespace_len for
+    // them.
+    table[0x0B] |= 2; // Vertical tab
+    table[0x0C] |= 2; // Form feed
+    table[0xC2] |= 2; // First byte of NBSP
+    table[0xE1] |= 2; // First byte of U+1680
+    table[0xE2] |= 2; // First byte of U+2000..U+200A, U+2028/29/2F, U+205F
+    table[0xE3] |= 2; // First byte of U+3000
+    table[0xEF] |= 2; // First byte of U+FEFF
+
     table
 }
 
@@ -4138,6 +4149,26 @@ pub struct ParseInfo {
     pub has_json5: bool,
 }
 
+/// Length of the JSON5-only whitespace sequence at the start of
+/// `input`, or 0 if it does not start with one. Covers VT, FF and the
+/// UTF-8 encodings of the Unicode space characters SQLite's JSON5
+/// parser skips: U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029,
+/// U+202F, U+205F, U+3000 and the U+FEFF byte order mark.
+#[inline]
+fn json5_whitespace_len(input: &[u8]) -> usize {
+    match input {
+        [0x0b | 0x0c, ..] => 1,
+        [0xc2, 0xa0, ..] => 2,
+        [0xe1, 0x9a, 0x80, ..] => 3,
+        [0xe2, 0x80, 0x80..=0x8a, ..] => 3,
+        [0xe2, 0x80, 0xa8 | 0xa9 | 0xaf, ..] => 3,
+        [0xe2, 0x81, 0x9f, ..] => 3,
+        [0xe3, 0x80, 0x80, ..] => 3,
+        [0xef, 0xbb, 0xbf, ..] => 3,
+        _ => 0,
+    }
+}
+
 /// The common case is no whitespace at all, so the check for it must
 /// inline into the deserializers the way the pre-tracking
 /// implementation did: an outlined call here costs more than the
@@ -4145,7 +4176,7 @@ pub struct ParseInfo {
 #[inline(always)]
 pub fn skip_whitespace_tracking(input: &[u8], pos: usize, info: &mut ParseInfo) -> usize {
     // Fast path for non-whitespace, non-comment
-    if pos >= input.len() || ((WS_TABLE[input[pos] as usize] & 1) == 0 && input[pos] != b'/') {
+    if pos >= input.len() || ((WS_TABLE[input[pos] as usize] & 3) == 0 && input[pos] != b'/') {
         return pos;
     }
     skip_whitespace_and_comments(input, pos, info)
@@ -4160,6 +4191,15 @@ fn skip_whitespace_and_comments(input: &[u8], mut pos: usize, info: &mut ParseIn
         if (WS_TABLE[ch as usize] & 1) != 0 {
             // Skip whitespace
             pos += 1;
+        } else if (WS_TABLE[ch as usize] & 2) != 0 {
+            let n = json5_whitespace_len(&input[pos..]);
+            if n == 0 {
+                // A JSON5 lead byte without the rest of the sequence
+                // is not whitespace.
+                break;
+            }
+            info.has_json5 = true;
+            pos += n;
         } else if ch == b'/' && pos + 1 < len {
             // Handle JSON5 comments
             match input[pos + 1] {
