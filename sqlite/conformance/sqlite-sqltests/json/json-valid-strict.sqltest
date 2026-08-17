@@ -576,3 +576,32 @@ test json5_vertical_tab_escape_decodes_to_0x0b {
 expect {
     780B7A|{"a":"x\u0009z"}
 }
+
+# JSON5 numbers with a trailing decimal point: the canonical rendering
+# inserts the missing zero after the dot, before any exponent. Numbers
+# whose only JSON5 feature is a leading '+' stay untouched.
+
+test json5_trailing_dot_gets_zero_inserted {
+    SELECT json('{x: 4.}'), json('{x: 4.e0}'), json('{x: +4.e1}'), json('{x: -4.e2}');
+}
+expect {
+    {"x":4.0}|{"x":4.0e0}|{"x":4.0e1}|{"x":-4.0e2}
+}
+
+# CAST to TEXT so the engine formats the REAL results; the JS driver
+# would otherwise render 4.0 as the bare number 4.
+test json5_trailing_dot_extracted_value {
+    SELECT CAST(('{x: 4.e0}')->>'x' AS TEXT),
+           CAST(('{x: +4.e1}')->>'x' AS TEXT),
+           CAST(('{x: -4.e2}')->>'x' AS TEXT);
+}
+expect {
+    4.0|40.0|-400.0
+}
+
+test json5_plus_only_numbers_stay_canonical {
+    SELECT json('{x: +4e1}'), json('{x: +5.5}'), json('{x: 4.E2}');
+}
+expect {
+    {"x":4e1}|{"x":5.5}|{"x":4.0E2}
+}

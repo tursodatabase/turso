@@ -1494,8 +1494,16 @@ impl Jsonb {
                 .next()
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-') =>
             {
-                string.push_str(val);
-                string.push('0');
+                match val.find('.') {
+                    Some(dot)
+                        if matches!(val[dot + 1..].chars().next(), None | Some('e' | 'E')) =>
+                    {
+                        string.push_str(&val[..=dot]);
+                        string.push('0');
+                        string.push_str(&val[dot + 1..]);
+                    }
+                    _ => string.push_str(val),
+                }
             }
             _ => bail_parse_error!("Unable to serialize float5: {}", float_str),
         }
