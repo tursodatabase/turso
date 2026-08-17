@@ -19,6 +19,7 @@ use crate::{
     schema::{BTreeTable, Index},
     storage::{
         pager::{BtreePageAllocMode, Pager},
+        readahead::{PrefetchPlan, ScanReadahead},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, CELL_PTR_SIZE_BYTES,
@@ -840,6 +841,9 @@ pub struct BTreeCursor {
     /// Reusable buffer for cell payloads during insert/update operations.
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: crate::alloc::Vec<u8>,
+    /// Decides when a forward scan should read upcoming leaf pages before
+    /// the cursor gets to them. See `PRAGMA prefetch_pages`.
+    readahead: ScanReadahead,
     /// Per-cell access cache for incremental blob I/O. Caches the leaf cell's payload
     /// layout, the overflow-page-number array (Turso's runtime reconstruction of
     /// SQLite's `aOverflow`), and the byte range of the most recently accessed column,
@@ -1118,6 +1122,7 @@ impl BTreeCursor {
             skip_advance: false,
             reusable_cell_payload: crate::alloc::vec![],
             blob_cache: BlobCellCache::default(),
+            readahead: ScanReadahead::new(),
             blob_pinned_rowid: None,
             blob_expired: false,
             iteration_pending_descent: None,
@@ -1544,6 +1549,7 @@ impl BTreeCursor {
                 let cell_count = contents.cell_count();
                 let is_leaf = contents.is_leaf();
                 if cell_idx != -1 && is_leaf && cell_idx as usize + 1 < cell_count {
+                    self.readahead.note_leaf_level(self.stack.current());
                     self.stack.advance();
                     return Ok(IOResult::Done(true));
                 }
@@ -1585,6 +1591,7 @@ impl BTreeCursor {
                         (Some(right_most_pointer), false) => {
                             // do rightmost
                             self.stack.advance();
+                            self.maybe_readahead(&mem_page, cell_count);
                             // Spill yield from here would re-enter the loop
                             // top with cell_idx already advanced twice; we
                             // record the descent target in
@@ -1627,6 +1634,7 @@ impl BTreeCursor {
                 );
 
                 if is_leaf {
+                    self.readahead.note_leaf_level(self.stack.current());
                     return Ok(IOResult::Done(true));
                 }
                 if is_index && self.going_upwards {
@@ -1637,6 +1645,7 @@ impl BTreeCursor {
                 }
 
                 let left_child_page = contents.cell_interior_read_left_child_page(cell_idx)?;
+                self.maybe_readahead(&mem_page, cell_idx);
                 // Same re-entry handling as the rightmost branch above —
                 // the loop-top `stack.advance()` has already fired for this
                 // step, so we route a spill yield through
@@ -1708,6 +1717,110 @@ impl BTreeCursor {
         self.stack.push_backwards(page);
     }
 
+    /// Ask the readahead policy whether the scan should read pages ahead of
+    /// the cursor, and submit those reads. Called right before descending
+    /// from the interior page on top of the stack into its child at
+    /// `child_idx` (`cell_count` means the rightmost pointer). Never yields.
+    #[aristo::intent(
+        "A readahead failure turns readahead off for the rest of the scan \
+         instead of failing the statement. Prefetch targets include pages an \
+         early-stopping scan never visits, so propagating a speculative \
+         error would fail queries whose own read set is perfectly healthy; \
+         the foreground read surfaces real corruption on the pages the query \
+         actually touches.",
+        verify = "neural",
+        id = "readahead_failure_never_fails_the_scan"
+    )]
+    fn maybe_readahead(&mut self, interior: &PageRef, child_idx: usize) {
+        let level = self.stack.current();
+        let contents = interior.get_contents();
+        let cell_count = contents.cell_count();
+        let Some(plan) = self
+            .readahead
+            .on_descend(level, interior.get().id, child_idx, cell_count)
+        else {
+            return;
+        };
+        if let Err(e) = self.submit_readahead(plan, interior, level, cell_count) {
+            tracing::debug!("readahead disabled for the rest of this scan: {e}");
+            self.readahead.disable_for_scan();
+        }
+    }
+
+    /// Submit the reads for one readahead plan: upcoming children of the
+    /// current interior page, and optionally the interior page that follows
+    /// it, so the scan does not stall when it switches parents.
+    fn submit_readahead(
+        &self,
+        plan: PrefetchPlan,
+        interior: &PageRef,
+        interior_level: usize,
+        cell_count: usize,
+    ) -> Result<()> {
+        let interior_contents = interior.get_contents();
+        for idx in plan.start_child_idx..plan.start_child_idx + plan.count {
+            let page_no = if idx < cell_count {
+                interior_contents.cell_interior_read_left_child_page(idx)?
+            } else {
+                match interior_contents.rightmost_pointer()? {
+                    Some(rightmost) => rightmost,
+                    None => break,
+                }
+            };
+            // A corrupt child pointer must be reported by the foreground
+            // read that actually visits it, not by a speculative one.
+            if page_no < 1 {
+                return_corrupt!(
+                    "readahead found invalid child pointer {page_no} on page {}",
+                    interior.get().id
+                );
+            }
+            self.pager.prefetch_page(page_no as i64)?;
+        }
+        if plan.prefetch_next_interior {
+            self.prefetch_next_interior_sibling(interior_level)?;
+        }
+        Ok(())
+    }
+
+    /// Prefetch the interior page that follows the one at `level`, found
+    /// through the grandparent's next child pointer. Does nothing when the
+    /// interior page is the root or the grandparent is exhausted too.
+    fn prefetch_next_interior_sibling(&self, level: usize) -> Result<()> {
+        if level == 0 {
+            return Ok(());
+        }
+        let parent_level = level - 1;
+        let Some(parent) = self.stack.get_page_at_level(parent_level) else {
+            return Ok(());
+        };
+        let parent_contents = parent.get_contents();
+        let parent_cell_count = parent_contents.cell_count();
+        let parent_idx = self.stack.node_states[parent_level].cell_idx;
+        if parent_idx < 0 {
+            return Ok(());
+        }
+        let next_idx = parent_idx as usize + 1;
+        let page_no = if next_idx < parent_cell_count {
+            parent_contents.cell_interior_read_left_child_page(next_idx)?
+        } else if next_idx == parent_cell_count {
+            match parent_contents.rightmost_pointer()? {
+                Some(rightmost) => rightmost,
+                None => return Ok(()),
+            }
+        } else {
+            return Ok(());
+        };
+        if page_no < 1 {
+            return_corrupt!(
+                "readahead found invalid child pointer {page_no} on page {}",
+                parent.get().id
+            );
+        }
+        self.pager.prefetch_page(page_no as i64)?;
+        Ok(())
+    }
+
     /// Move the cursor to the root page of the btree.
     ///
     /// Blocking shim retained for tests and any caller that doesn't have an
@@ -1736,6 +1849,9 @@ impl BTreeCursor {
         let (mem_page, c) = return_if_io!(self.read_page(self.root_page));
         self.stack.clear();
         self.stack.push(mem_page);
+        // Every repositioning starts here, so this is where readahead
+        // forgets the old access pattern and re-reads the pragma.
+        self.readahead.on_jump(self.pager.get_prefetch_pages());
         Ok(IOResult::Done(c))
     }
 
@@ -6992,6 +7108,10 @@ impl CursorTrait for BTreeCursor {
                     self.clear_saved_seek();
                     let c = return_if_io!(self.move_to_root_nonblock());
                     self.count_state = CountState::Loop;
+                    // A count is a declared full sweep of the btree; like a
+                    // rewind, readahead may start at the first leaf. This
+                    // state transition runs exactly once per count.
+                    self.readahead.on_scan_start();
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -7007,6 +7127,9 @@ impl CursorTrait for BTreeCursor {
                      */
                     if !matches!(contents.page_type()?, PageType::TableInterior) {
                         self.count += contents.cell_count();
+                    }
+                    if contents.is_leaf() {
+                        self.readahead.note_leaf_level(self.stack.current());
                     }
 
                     let cell_idx = self.stack.current_cell_index() as usize;
@@ -7070,7 +7193,7 @@ impl CursorTrait for BTreeCursor {
                         // Move to child left page
                         let cell = contents.cell_get(cell_idx, self.usable_space())?;
 
-                        match cell {
+                        let left_child_page = match cell {
                             BTreeCell::TableInteriorCell(TableInteriorCell {
                                 left_child_page,
                                 ..
@@ -7078,26 +7201,29 @@ impl CursorTrait for BTreeCursor {
                             | BTreeCell::IndexInteriorCell(IndexInteriorCell {
                                 left_child_page,
                                 ..
-                            }) => {
-                                // Same re-entry handling as the rightmost
-                                // branch above.
-                                match self.pager.read_page(left_child_page as i64)? {
-                                    IOResult::Done((child, c)) => {
-                                        self.stack.advance();
-                                        self.stack.push(child);
-                                        if let Some(c) = c {
-                                            io_yield_one!(c);
-                                        }
-                                    }
-                                    IOResult::IO(IOCompletions(spill_c)) => {
-                                        self.count_state = CountState::Descend {
-                                            target: left_child_page as i64,
-                                        };
-                                        io_yield_one!(spill_c);
-                                    }
+                            }) => left_child_page,
+                            _ => unreachable!(),
+                        };
+                        // A count visits every leaf in order, so it benefits
+                        // from the same readahead as a next()-driven scan.
+                        let interior = mem_page.clone();
+                        self.maybe_readahead(&interior, cell_idx);
+                        // Same re-entry handling as the rightmost branch
+                        // above.
+                        match self.pager.read_page(left_child_page as i64)? {
+                            IOResult::Done((child, c)) => {
+                                self.stack.advance();
+                                self.stack.push(child);
+                                if let Some(c) = c {
+                                    io_yield_one!(c);
                                 }
                             }
-                            _ => unreachable!(),
+                            IOResult::IO(IOCompletions(spill_c)) => {
+                                self.count_state = CountState::Descend {
+                                    target: left_child_page as i64,
+                                };
+                                io_yield_one!(spill_c);
+                            }
                         }
                     }
                 }
@@ -7148,6 +7274,12 @@ impl CursorTrait for BTreeCursor {
                 RewindState::Start => {
                     let c = return_if_io!(self.move_to_root_nonblock());
                     self.rewind_state = RewindState::NextRecord;
+                    // A rewind declares a sequential scan, so readahead may
+                    // start at the first leaf instead of waiting for a
+                    // sequential streak. This state transition runs exactly
+                    // once per logical rewind, unlike the surrounding code
+                    // which re-runs when IO makes the caller re-enter.
+                    self.readahead.on_scan_start();
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }

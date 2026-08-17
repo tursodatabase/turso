@@ -20,6 +20,7 @@ pub(crate) mod page_cache;
 pub(crate) mod page_transform;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
+pub(crate) mod readahead;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
 pub(crate) mod shared_wal_coordination;
