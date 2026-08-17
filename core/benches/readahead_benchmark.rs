@@ -239,10 +239,12 @@ fn drop_cache(conn: &Arc<turso_core::Connection>) {
 
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_readahead(criterion: &mut Criterion) {
-    report_request_counts();
+    // Seeding is by far the most expensive thing here, so do it once and let
+    // both the request count and the timings use the same database.
     let dir = seed_db();
     let path = dir.path().join("readahead.db");
     let path = path.to_str().unwrap();
+    report_request_counts(path);
 
     let mut group = criterion.benchmark_group("readahead");
     group.measurement_time(Duration::from_secs(10));
@@ -295,7 +297,7 @@ fn label(prefetch_pages: u32) -> &'static str {
 
 /// Counts requests rather than timing them, so a run reports the thing
 /// readahead actually changes. Printed alongside the timings.
-fn report_request_counts() {
+fn report_request_counts(path: &str) {
     struct CountingIo {
         inner: Arc<dyn IO>,
         reads: Arc<AtomicU64>,
@@ -380,9 +382,6 @@ fn report_request_counts() {
         }
     }
 
-    let dir = seed_db();
-    let path = dir.path().join("readahead.db");
-    let path = path.to_str().unwrap();
     println!("\nrequests made by `{SCAN}`:");
     for prefetch in [0u32, 32] {
         let reads = Arc::new(AtomicU64::new(0));
