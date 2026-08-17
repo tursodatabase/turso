@@ -717,3 +717,74 @@ test json_path_minus_zero_is_one_past_the_end {
 expect {
     {"b":[1,2]}|1
 }
+
+# Appending with [#] or the exact one-past-the-end index works for both
+# json_set and json_insert; larger indexes and from-end locators are
+# no-ops for insert-only mode.
+
+test json_array_append_with_hash_and_end_index {
+    SELECT json_insert('{"b":[1,2]}','$.b[#]','X'),
+           json_insert('{"b":[1,2]}','$.b[2]','X'),
+           json_set('{"b":[1,2]}','$.b[#]','X','$.b[#]','Y'),
+           json_insert('[1,2]','$[#]','X'),
+           json_insert('{"b":[[2,3]]}','$.b[0][2]','X');
+}
+expect {
+    {"b":[1,2,"X"]}|{"b":[1,2,"X"]}|{"b":[1,2,"X","Y"]}|[1,2,"X"]|{"b":[[2,3,"X"]]}
+}
+
+test json_array_append_out_of_range_is_noop {
+    SELECT json_insert('{"b":[1,2]}','$.b[5]','X'),
+           json_insert('{"b":[1,2]}','$.b[#-1]','X'),
+           json_insert('{"b":[[2,3]]}','$.b[0][5]','X');
+}
+expect {
+    {"b":[1,2]}|{"b":[1,2]}|{"b":[[2,3]]}
+}
+
+test json_appended_document_stays_well_formed {
+    SELECT json_extract(json_set('{"b":[1,2]}','$.b[#]','X'),'$.b[2]'),
+           json(jsonb_set('{"b":[1,2]}','$.b[#]','X'));
+}
+expect {
+    X|{"b":[1,2,"X"]}
+}
+
+# An 11-byte array payload sits exactly on a JSONB header size-format
+# boundary: appending grows the array's own header, which shifts the
+# contents. The appended value and the document must survive that.
+test json_append_across_array_header_size_boundary {
+    SELECT json_extract(json_set(json('{"b":' || json_array(
+               null,null,null,null,null,null,null,null,null,null,null) || '}'),
+               '$.b[#]', 'X'), '$.b[10]', '$.b[11]'),
+           json_valid(jsonb_set(json('{"b":' || json_array(
+               null,null,null,null,null,null,null,null,null,null,null) || '}'),
+               '$.b[11]', 'X'), 8);
+}
+expect {
+    [null,"X"]|1
+}
+
+# x'8C1762CB0413311332' encodes {"b":[1,2]} with a non-minimal
+# two-byte header on the array. Appending rewrites the header
+# minimally, which shrinks it and shifts the contents left.
+test json_append_shrinks_non_minimal_array_header {
+    SELECT json_insert(x'8C1762CB0413311332','$.b[2]','X'),
+           json_insert(x'8C1762CB0413311332','$.b[#]','X');
+}
+expect {
+    {"b":[1,2,"X"]}|{"b":[1,2,"X"]}
+}
+
+# When a later path segment fails, the placeholder container an
+# earlier append segment created must not survive: the document stays
+# unchanged.
+test json_append_failed_traversal_leaves_document_unchanged {
+    SELECT json_insert('{"b":[1,2]}','$.b[#][5]','X'),
+           json_insert('{"b":[1,2]}','$.b[2][5]','X'),
+           json_insert('{"b":[1,2]}','$.b[#][0]','X');
+}
+expect {
+    {"b":[1,2]}|{"b":[1,2]}|{"b":[1,2,["X"]]}
+}
+
