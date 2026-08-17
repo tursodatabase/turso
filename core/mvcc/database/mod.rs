@@ -57,6 +57,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
+use turso_parser::identifier::Identifier;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{
@@ -4178,10 +4179,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
     ) {
         for vtab in table_valued_functions {
-            let normalized_name = crate::util::normalize_ident(&vtab.name);
             schema
                 .tables
-                .entry(normalized_name)
+                .entry(Identifier::new(vtab.name.as_str()))
                 .or_insert_with(|| Arc::new(Table::Virtual(vtab.clone())));
         }
     }
@@ -8519,9 +8519,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         fresh.schema_version = cookie;
         let mut from_sql_indexes = crate::alloc::vec![];
         let mut automatic_indices = HashMap::default();
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let mut dbsp_state_roots: HashMap<Identifier, i64> = HashMap::default();
+        let mut dbsp_state_index_roots: HashMap<Identifier, i64> = HashMap::default();
+        let mut materialized_view_info: HashMap<Identifier, (String, i64)> = HashMap::default();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
@@ -9469,11 +9469,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         fresh.schema_version = cookie;
         let mut from_sql_indexes =
             crate::alloc::Vec::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG);
-        let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =
+        let mut automatic_indices: HashMap<Identifier, crate::alloc::Vec<(Identifier, i64)>> =
             HashMap::default();
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let mut dbsp_state_roots: HashMap<Identifier, i64> = HashMap::default();
+        let mut dbsp_state_index_roots: HashMap<Identifier, i64> = HashMap::default();
+        let mut materialized_view_info: HashMap<Identifier, (String, i64)> = HashMap::default();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 

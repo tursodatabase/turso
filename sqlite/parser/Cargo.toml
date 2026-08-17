@@ -21,6 +21,7 @@ codspeed = []
 
 [dependencies]
 bitflags = { workspace = true }
+identstr = { workspace = true }
 miette = { workspace = true }
 strum = { workspace = true }
 strum_macros = {workspace = true }

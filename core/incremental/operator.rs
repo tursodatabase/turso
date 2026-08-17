@@ -43,8 +43,8 @@ impl DbspStateCursors {
 /// This defines the primary key index on (operator_id, zset_id, element_id)
 pub fn create_dbsp_state_index(root_page: i64) -> Index {
     Index {
-        name: "dbsp_state_pk".to_string(),
-        table_name: "dbsp_state".to_string(),
+        name: "dbsp_state_pk".into(),
+        table_name: "dbsp_state".into(),
         root_page,
         columns: IndexColumn::new_many(vec!["operator_id", "zset_id", "element_id"]),
         unique: true,

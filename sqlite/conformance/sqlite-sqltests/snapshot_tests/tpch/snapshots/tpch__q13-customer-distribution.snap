@@ -48,33 +48,33 @@ addr  opcode                                p1   p2   p3  p4                    
    4                    Integer              0    6    0                                               0  r[6]=0; clear group by abort flag
    5                    Null                 0    7    0                                               0  r[7]=NULL; initialize group by comparison registers to NULL
    6                    Gosub               13   92    0                                               0  ; go to clear accumulator subroutine
-   7                    OpenRead             2    8    0  k(8,B,B,B,B,B,B,B,B)                         0  table=customer, root=8, iDb=0
-   8                    OpenRead             3    9    0  k(9,B,B,B,B,B,B,B,B,B)                       0  table=orders, root=9, iDb=0
+   7                    OpenRead             2    8    0  k(8,B,B,B,B,B,B,B,B)                         0  table=CUSTOMER, root=8, iDb=0
+   8                    OpenRead             3    9    0  k(9,B,B,B,B,B,B,B,B,B)                       0  table=ORDERS, root=9, iDb=0
    9                    Integer              0   14    0                                               0  r[14]=0
   10                    Once                19    0    0                                               0  goto 19
-  11                    OpenRead             4    8    0  k(8,B,B,B,B,B,B,B,B)                         0  table=customer, root=8, iDb=0
-  12                    Rewind               4   18    0                                               0  Rewind table customer
-  13                      RowId              4   15    0                                               0  r[15]=customer.rowid
+  11                    OpenRead             4    8    0  k(8,B,B,B,B,B,B,B,B)                         0  table=CUSTOMER, root=8, iDb=0
+  12                    Rewind               4   18    0                                               0  Rewind table CUSTOMER
+  13                      RowId              4   15    0                                               0  r[15]=CUSTOMER.rowid
   14                      Affinity          15    1    0                                               0  r[15..16] = C
-  15                      RowId              4   16    0                                               0  r[16]=customer.rowid
+  15                      RowId              4   16    0                                               0  r[16]=CUSTOMER.rowid
   16                      HashBuild          4   15    1  r=[1] budget=67108864 payload=r[16]..r[16]   0
   17                    Next                 4   13    0                                               0
   18                    HashBuildFinalize    1    0    0                                               0
   19                    HashResetMatched     1    0    0                                               0
-  20                    Rewind               3   41    0                                               0  Rewind table orders
-  21                      Column             3    1   17                                               0  r[17]=orders.O_CUSTKEY
+  20                    Rewind               3   41    0                                               0  Rewind table ORDERS
+  21                      Column             3    1   17                                               0  r[17]=ORDERS.O_CUSTKEY
   22                      Affinity          17    1    0                                               0  r[17..18] = C
-  23                      RowId              3   19    0                                               0  r[19]=orders.rowid
+  23                      RowId              3   19    0                                               0  r[19]=ORDERS.rowid
   24                      Integer            0   20    0                                               0  r[20]=0
   25                      HashProbe          1   17    1  r[21]=40 payload=r[18]..r[18]                0
-  26                      Column             3    8   24                                               0  r[24]=orders.O_COMMENT
+  26                      Column             3    8   24                                               0  r[24]=ORDERS.O_COMMENT
   27                      Function           1   23   22  like(2)                                      0  r[22]=func(r[23..24])
   28                      If                22   37    1                                               0  if r[22] goto 37
   29                      HashMarkMatched    1    0    0                                               0
   30                      Gosub             25   32    0                                               0
   31                      Goto               0   37    0                                               0
   32                      Copy              18   11    0                                               0  r[11]=r[18]
-  33                      RowId              3   12    0                                               0  r[12]=orders.rowid
+  33                      RowId              3   12    0                                               0  r[12]=ORDERS.rowid
   34                      MakeRecord        11    2   10                                               0  r[10]=mkrec(r[11..12])
   35                      SorterInsert       0   10    0  0                                            0  key=r[10]
   36                    Return              25    0    0                                               0
@@ -84,7 +84,7 @@ addr  opcode                                p1   p2   p3  p4                    
   40                  Next                   3   21    0                                               0
   41                  NullRow                3    0    0                                               0  Set cursor 3 to a (pseudo) NULL row
   42                  HashScanUnmatched      1   21   47                                               0  hash_table_id=1 payload=r[18]..r[18]
-  43                  SeekRowid              2   21   47                                               0  if (r[21]!=cursor 2 for table customer.rowid) goto 47
+  43                  SeekRowid              2   21   47                                               0  if (r[21]!=cursor 2 for table CUSTOMER.rowid) goto 47
   44                  Gosub                 25   32    0                                               0
   45                  HashNextUnmatched      1   21   47                                               0  hash_table_id=1 payload=r[18]..r[18]
   46                  Goto                   0   43    0                                               0
@@ -92,14 +92,14 @@ addr  opcode                                p1   p2   p3  p4                    
   48                  Integer                1   20    0                                               0  r[20]=1
   49                  HashGraceLoadPart      1    0   64                                               0  hash_table_id=1
   50                  HashGraceNextProbe     1   17   56                                               0  hash_table_id=1 keys=r[17]..r[17] probe_rowid_dest=r[19]
-  51                  SeekRowid              3   19   50                                               0  if (r[19]!=cursor 3 for table orders.rowid) goto 50
+  51                  SeekRowid              3   19   50                                               0  if (r[19]!=cursor 3 for table ORDERS.rowid) goto 50
   52                  HashProbe              1   17    1  r[21]=50 payload=r[18]..r[18]                0
   53                  Goto                   0   26    0                                               0
   54                  HashNext               1   21   50   payload=r[18]..r[18]                        0
   55                  Goto                   0   26    0                                               0
   56                  NullRow                3    0    0                                               0  Set cursor 3 to a (pseudo) NULL row
   57                  HashScanUnmatched      1   21   62                                               0  hash_table_id=1 payload=r[18]..r[18]
-  58                  SeekRowid              2   21   62                                               0  if (r[21]!=cursor 2 for table customer.rowid) goto 62
+  58                  SeekRowid              2   21   62                                               0  if (r[21]!=cursor 2 for table CUSTOMER.rowid) goto 62
   59                  Gosub                 25   32    0                                               0
   60                  HashNextUnmatched      1   21   62                                               0  hash_table_id=1 payload=r[18]..r[18]
   61                  Goto                   0   58    0                                               0

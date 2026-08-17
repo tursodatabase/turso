@@ -24,6 +24,7 @@ use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::identifier::Identifier;
 
 /// The program run by an `Insn::Program` instruction.
 ///
@@ -913,7 +914,7 @@ pub enum Insn {
         start_reg: u32, // P1
         count: u32,     // P2
         dest_reg: u32,  // P3
-        index_name: Option<String>,
+        index_name: Option<Identifier>,
         affinity_str: Option<String>,
     },
 

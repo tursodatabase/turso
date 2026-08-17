@@ -43,8 +43,8 @@ fn fts_test_stats(
 ) -> turso_core::index_method::IndexMethodTestStats {
     let attachment = FtsIndexMethod
         .attach(&IndexMethodConfiguration {
-            table_name: table_name.to_string(),
-            index_name: index_name.to_string(),
+            table_name: table_name.into(),
+            index_name: index_name.into(),
             columns: columns
                 .iter()
                 .map(|&(name, index)| IndexColumn::new(name, index))
@@ -122,8 +122,8 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
+            table_name: "t".into(),
+            index_name: "t_idx".into(),
             columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
@@ -158,8 +158,8 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
+            table_name: "t".into(),
+            index_name: "t_idx".into(),
             columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
@@ -241,8 +241,8 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
+            table_name: "t".into(),
+            index_name: "t_idx".into(),
             columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
@@ -454,8 +454,8 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
     let index = FtsIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "fts_docs".to_string(),
+            table_name: "docs".into(),
+            index_name: "fts_docs".into(),
             columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
             parameters: HashMap::default(),
         })
@@ -496,8 +496,8 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
     let index = FtsIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "fts_docs".to_string(),
+            table_name: "docs".into(),
+            index_name: "fts_docs".into(),
             columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
             parameters: HashMap::default(),
         })
@@ -2786,8 +2786,8 @@ fn fts_read_cache_is_connection_local_and_bounded() {
 
     let attachment = FtsIndexMethod
         .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "docs_fts".to_string(),
+            table_name: "docs".into(),
+            index_name: "docs_fts".into(),
             columns: vec![IndexColumn::new("content", 1)],
             parameters: HashMap::default(),
         })

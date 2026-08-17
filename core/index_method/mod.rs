@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 
 use crate::{
     schema::IndexColumn,
@@ -32,9 +33,9 @@ pub trait IndexMethod: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct IndexMethodConfiguration {
     /// table name for which index_method is defined
-    pub table_name: String,
+    pub table_name: Identifier,
     /// index name
-    pub index_name: String,
+    pub index_name: Identifier,
     /// columns c1, c2, c3, ... provided to the index method (e.g. create index t_idx on t using method (c1, c2, c3, ...))
     pub columns: crate::alloc::Vec<IndexColumn>,
     /// optional parameters provided to the index method through WITH clause

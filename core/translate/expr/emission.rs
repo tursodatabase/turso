@@ -199,7 +199,7 @@ pub fn process_returning_clause(
 
                     result_columns.push(ResultSetColumn {
                         expr: column_expr,
-                        alias: column.name.clone(),
+                        alias: column.name.as_ref().map(ToString::to_string),
                         implicit_column_name: None,
                         contains_aggregates: false,
                     });

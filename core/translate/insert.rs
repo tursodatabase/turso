@@ -44,7 +44,6 @@ use crate::{
             ResolvedUpsertTarget,
         },
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
@@ -60,6 +59,7 @@ use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo, With,
 };
+use turso_parser::identifier::Identifier;
 
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(
@@ -128,7 +128,7 @@ pub struct InsertEmitCtx<'a> {
 
     /// Index cursors we need to populate for this table
     /// (idx name, root_page, idx cursor id)
-    pub idx_cursors: Vec<(String, i64, usize)>,
+    pub idx_cursors: Vec<(Identifier, i64, usize)>,
 
     /// Context for if the insert values are materialized first
     /// into a temporary table
@@ -336,7 +336,7 @@ pub fn translate_insert(
                     .btree()
                     .expect("we shouldn't have got here without a BTree table"),
             ),
-            identifier: normalize_ident(table_name.as_str()),
+            identifier: table_name.identifier().clone(),
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
             join_info: None,
@@ -1680,7 +1680,7 @@ fn open_autoincrement_state(
         db: ctx.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.to_string());
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -1938,10 +1938,9 @@ fn resolve_defaults_in_row(
             table.columns().iter().filter(|c| !c.hidden()).nth(i)
         } else {
             // Column list — map by name
-            columns.get(i).and_then(|name| {
-                let name = crate::util::normalize_ident(name.as_str());
-                table.get_column_by_name(&name).map(|(_, col)| col)
-            })
+            columns
+                .get(i)
+                .and_then(|name| table.get_column_by_name(name.as_str()).map(|(_, col)| col))
         };
         *expr = match col {
             Some(col) => col.default.clone().unwrap_or_else(|| {
@@ -2263,15 +2262,11 @@ fn init_source_emission<'a>(
                         columns
                             .iter()
                             .map(|col_name| {
-                                let column_name = normalize_ident(col_name.as_str());
-                                if ROWID_STRS
-                                    .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
-                                {
+                                if ROWID_STRS.iter().any(|s| *col_name == *s) {
                                     return Ok(Affinity::Integer.aff_mask());
                                 }
                                 table
-                                    .get_column_by_name(&column_name)
+                                    .get_column_by_name(col_name.as_str())
                                     .map(|(_, col)| {
                                         col.affinity_with_strict(ctx.table.is_strict).aff_mask()
                                     })
@@ -2279,7 +2274,7 @@ fn init_source_emission<'a>(
                                         crate::error::LimboError::ParseError(format!(
                                             "table {} has no column named {}",
                                             table.get_name(),
-                                            column_name
+                                            col_name
                                         ))
                                     })
                             })
@@ -2592,10 +2587,10 @@ fn build_insertion<'a>(
         // Case 2: Columns specified - map named columns to their values
         // Map each named column to its value index
         for (value_index, column_name) in columns.iter().enumerate() {
-            let column_name = normalize_ident(column_name.as_str());
-            if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
+            let column_name = column_name.as_str();
+            if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(column_name) {
                 // Generated columns cannot be written to directly
-                col_in_table.ensure_not_generated("INSERT into", &column_name)?;
+                col_in_table.ensure_not_generated("INSERT into", column_name)?;
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -2608,7 +2603,7 @@ fn build_insertion<'a>(
                 }
             } else if ROWID_STRS
                 .iter()
-                .any(|s| s.eq_ignore_ascii_case(&column_name))
+                .any(|s| s.eq_ignore_ascii_case(column_name))
             {
                 // Explicit use of the 'rowid' keyword
                 if let Some(col_in_table) = table.columns().iter().find(|c| c.is_rowid_alias()) {
@@ -3390,7 +3385,7 @@ fn ensure_sequence_initialized(
         db: database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(table.name.clone());
+    let table_name_reg = program.emit_string8_new_reg(table.name.to_string());
 
     let loop_start_label = program.allocate_label();
     let entry_exists_label = program.allocate_label();
@@ -4143,9 +4138,9 @@ fn build_parent_key_image_for_insert(
     // Decide column list. When the parent is the rowid we force the literal name
     // "rowid" so the loop below routes through `insertion.key_register()`; otherwise
     // we reuse the already-resolved columns that `ResolvedFkRef` carries.
-    let rowid_slot: [String; 1];
-    let parent_cols: &[String] = if pref.parent_uses_rowid {
-        rowid_slot = ["rowid".to_string()];
+    let rowid_slot: [Identifier; 1];
+    let parent_cols: &[Identifier] = if pref.parent_uses_rowid {
+        rowid_slot = [Identifier::new("rowid")];
         &rowid_slot
     } else {
         &pref.parent_cols

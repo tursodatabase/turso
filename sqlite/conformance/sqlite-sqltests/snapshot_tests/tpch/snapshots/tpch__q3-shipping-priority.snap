@@ -35,6 +35,6 @@ info:
 QUERY PLAN
 |--SCAN orders
 |--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+|--SEARCH lineitem USING INDEX sqlite_autoindex_LINEITEM_1 (L_ORDERKEY=?)
 |--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY

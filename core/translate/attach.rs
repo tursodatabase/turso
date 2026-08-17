@@ -4,7 +4,6 @@ use crate::translate::{
     expr::{sanitize_string, translate_expr},
     ProgramBuilder, ProgramBuilderOpts,
 };
-use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
 use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{Expr, Literal};
@@ -49,9 +48,11 @@ pub fn translate_attach(
             });
         }
         Expr::Id(id) => {
-            // For ATTACH, identifiers should be treated as filename strings
+            // For ATTACH, identifiers should be treated as filename strings.
+            // `as_str` is the dequoted text with its original case: filenames
+            // must not be case-folded.
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: id.as_str().to_string(),
                 dest: arg_reg,
             });
         }
@@ -79,10 +80,11 @@ pub fn translate_attach(
             });
         }
         Expr::Id(id) => {
-            // For ATTACH, identifiers should be treated as name strings
-            // Use normalize_ident to strip quotes from double-quoted identifiers
+            // For ATTACH, identifiers should be treated as name strings.
+            // Quotes were already stripped when the parser built the Name;
+            // attached-db name lookups fold case, so keep the original case.
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: id.as_str().to_string(),
                 dest: arg_reg + 1,
             });
         }
@@ -151,10 +153,11 @@ pub fn translate_detach(
             });
         }
         Expr::Id(id) => {
-            // For DETACH, identifiers should be treated as name strings
-            // Use normalize_ident to strip quotes from double-quoted identifiers
+            // For DETACH, identifiers should be treated as name strings.
+            // Quotes were already stripped when the parser built the Name;
+            // attached-db name lookups fold case, so keep the original case.
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: id.as_str().to_string(),
                 dest: arg_reg,
             });
         }

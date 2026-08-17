@@ -13,7 +13,6 @@ use crate::translate::subquery::{
     plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_triggers_including_temp;
-use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use smallvec::SmallVec;
@@ -85,10 +84,10 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
-    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+    let normalized_table_name = tbl_name.name.as_str();
     let table = validate_delete(
         resolver,
-        &normalized_table_name,
+        normalized_table_name,
         tbl_name,
         database_id,
         program,

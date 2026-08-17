@@ -1481,7 +1481,7 @@ impl Whopper {
                     raw_value - increment
                 };
                 let seq = turso_core::schema::Sequence::new(
-                    seq_name.clone(),
+                    turso_parser::identifier::Identifier::new(seq_name.clone()),
                     Some(start),
                     Some(increment),
                     Some(min_value),

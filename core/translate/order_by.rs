@@ -2,6 +2,7 @@ use crate::{alloc::TursoVecExt, sync::Arc};
 
 use crate::alloc::*;
 use turso_parser::ast::{self, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use crate::{
     emit_explain,
@@ -200,7 +201,8 @@ impl EmitOrderBy {
         let remappings =
             order_by_deduplicate_result_columns(order_by, result_columns, has_sequence)?;
         let sort_cursor = if use_heap_sort {
-            let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
+            let index_name =
+                Identifier::new(format!("heap_sort_{}", program.offset().as_offset_int())); // we don't really care about the name that much, just enough that we don't get name collisions
             let mut index_columns =
                 Vec::try_with_capacity_ext(order_by.len() + result_columns.len())?;
             for (column, order, nulls) in order_by {
@@ -217,7 +219,7 @@ impl EmitOrderBy {
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
-                    name: pos_in_table.to_string(),
+                    name: Identifier::new(pos_in_table.to_string()),
                     order: *order,
                     nulls_order: None,
                     pos_in_table,
@@ -229,7 +231,7 @@ impl EmitOrderBy {
             let pos_in_table = index_columns.len();
             // add sequence number between ORDER BY columns and result column
             index_columns.try_push(IndexColumn {
-                name: pos_in_table.to_string(),
+                name: Identifier::new(pos_in_table.to_string()),
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table,
@@ -243,7 +245,7 @@ impl EmitOrderBy {
             }
             let index = Arc::new(Index {
                 name: index_name,
-                table_name: String::new(),
+                table_name: Identifier::empty(),
                 ephemeral: true,
                 root_page: 0,
                 columns: index_columns,

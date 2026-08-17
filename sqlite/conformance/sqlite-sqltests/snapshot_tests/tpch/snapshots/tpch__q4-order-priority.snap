@@ -33,7 +33,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN orders
-|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+|--SEARCH lineitem USING INDEX sqlite_autoindex_LINEITEM_1 (L_ORDERKEY=?)
 `--USE SORTER FOR GROUP BY
 
 BYTECODE
@@ -44,21 +44,21 @@ addr  opcode                    p1  p2  p3  p4                                  
    3          Integer            0   6   0                                          0  r[6]=0; clear group by abort flag
    4          Null               0   7   0                                          0  r[7]=NULL; initialize group by comparison registers to NULL
    5          Gosub             12  53   0                                          0  ; go to clear accumulator subroutine
-   6          OpenRead           2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
-   7          OpenRead           3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   8          OpenRead           4  11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
-   9          Rewind             2  27   0                                          0  Rewind table orders
-  10            Column           2   4  14                                          0  r[14]=orders.O_ORDERDATE
+   6          OpenRead           2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=ORDERS, root=9, iDb=0
+   7          OpenRead           3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=LINEITEM, root=10, iDb=0
+   8          OpenRead           4  11   0  k(3,B,B)                                0  index=sqlite_autoindex_LINEITEM_1, root=11, iDb=0
+   9          Rewind             2  27   0                                          0  Rewind table ORDERS
+  10            Column           2   4  14                                          0  r[14]=ORDERS.O_ORDERDATE
   11            Lt              14  15  26  Binary                                  0  if r[14]<r[15] goto 26
-  12            Column           2   4  17                                          0  r[17]=orders.O_ORDERDATE
+  12            Column           2   4  17                                          0  r[17]=ORDERS.O_ORDERDATE
   13            Ge              17  18  26  Binary                                  0  if r[17]>=r[18] goto 26
-  14            RowId            2  19   0                                          0  r[19]=orders.rowid
+  14            RowId            2  19   0                                          0  r[19]=ORDERS.rowid
   15            SeekGE           4  25  19                                          0  key=[19..19]
   16              IdxGT          4  25  19                                          0  key=[19..19]
   17              DeferredSeek   4   3   0                                          0
-  18              ColumnRange    3  11  21  2                                       0  r[21..22]=lineitem.L_COMMITDATE..L_RECEIPTDATE
+  18              ColumnRange    3  11  21  2                                       0  r[21..22]=LINEITEM.L_COMMITDATE..L_RECEIPTDATE
   19              Ge            21  22  24  Binary                                  0  if r[21]>=r[22] goto 24
-  20              Column         2   5  11                                          0  r[11]=orders.O_ORDERPRIORITY
+  20              Column         2   5  11                                          0  r[11]=ORDERS.O_ORDERPRIORITY
   21              MakeRecord    11   1  10                                          0  r[10]=mkrec(r[11..11])
   22              SorterInsert   0  10   0  0                                       0  key=r[10]
   23              Goto           0  26   0                                          0  ; semi-join: early out after first match

@@ -2,7 +2,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
-use crate::util::{escape_sql_string_literal, normalize_ident};
+use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Result, MAIN_DB_ID};
@@ -97,8 +97,8 @@ pub fn translate_create_trigger(
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
-    let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
-    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+    let normalized_trigger_name = trigger_name.name.identifier().clone();
+    let normalized_table_name = tbl_name.name.identifier().clone();
     let database_id =
         resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
     let target_table_database_id = if temporary {
@@ -494,17 +494,20 @@ pub fn translate_drop_trigger(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
-    let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    let normalized_trigger_name = trigger_name.name.identifier().clone();
 
-    // Check if trigger exists
-    if resolver.with_schema(database_id, |s| {
-        s.get_trigger(&normalized_trigger_name).is_none()
-    }) {
+    // Check if trigger exists. Keep the canonical stored spelling: the
+    // sqlite_schema row is matched byte-wise below, and trigger names compare
+    // case-insensitively.
+    let Some(trigger) =
+        resolver.with_schema(database_id, |s| s.get_trigger(&normalized_trigger_name))
+    else {
         if if_exists {
             return Ok(());
         }
         bail_parse_error!("no such trigger: {}", normalized_trigger_name);
-    }
+    };
+    let canonical_trigger_name = trigger.name.clone();
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
@@ -561,7 +564,7 @@ pub fn translate_drop_trigger(
     });
 
     // Check if name matches
-    let trigger_name_str_reg = program.emit_string8_new_reg(normalized_trigger_name.clone());
+    let trigger_name_str_reg = program.emit_string8_new_reg(canonical_trigger_name.to_string());
     program.emit_insn(Insn::Ne {
         lhs: name_reg,
         rhs: trigger_name_str_reg,
@@ -603,7 +606,7 @@ pub fn translate_drop_trigger(
 
     program.emit_insn(Insn::DropTrigger {
         db: database_id,
-        trigger_name: normalized_trigger_name,
+        trigger_name: canonical_trigger_name.to_string(),
     });
 
     Ok(())

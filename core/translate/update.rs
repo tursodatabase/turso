@@ -10,11 +10,11 @@ use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
-    util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
 use turso_parser::ast::{self, Expr};
+use turso_parser::identifier::Identifier;
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -311,17 +311,14 @@ fn prepare_update_plan(
         check_update_from_column_ambiguity(from_tables.joined_tables(), connection.as_ref())?;
     }
 
-    let target_identifier = body.tbl_name.alias.as_ref().map_or_else(
-        || normalize_ident(body.tbl_name.name.as_str()),
-        |alias| normalize_ident(alias.as_str()),
-    );
-    let target_table_name = normalize_ident(body.tbl_name.name.as_str());
+    let target_identifier = body.tbl_name.identifier();
+    let target_table_name = body.tbl_name.name.identifier();
     let mut non_from_clause_subqueries = vec![];
     // Reject fairly specific cases like UPDATE t SET x=5 FROM t.
     let illegal_target_reference = from_tables.joined_tables().iter().any(|joined| {
         joined.database_id == database_id
-            && normalize_ident(joined.identifier.as_str()) == target_identifier
-            && normalize_ident(joined.table.get_name()) == target_table_name
+            && joined.identifier == target_identifier
+            && *target_table_name == joined.table.get_name()
     });
     if illegal_target_reference {
         bail_parse_error!(
@@ -380,7 +377,7 @@ fn prepare_update_plan(
         // base table name, not the UPDATE alias. Keep the target table in scope, but
         // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
         // still fails.
-        returning_target.identifier = table_name.to_string();
+        returning_target.identifier = Identifier::new(table_name);
         let mut returning_table_references = TableReferences::new(
             vec![returning_target],
             read_scope_tables.outer_query_refs().to_vec(),
@@ -455,11 +452,11 @@ fn collect_update_set_clauses(
     table: &Table,
     table_name: &str,
 ) -> crate::Result<Vec<UpdateSetClause>> {
-    let column_lookup: HashMap<String, usize> = table
+    let column_lookup: HashMap<Identifier, usize> = table
         .columns()
         .iter()
         .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.clone(), i)))
         .collect();
     let mut set_clauses: Vec<UpdateSetClause> = Vec::with_capacity(sets.len());
 
@@ -469,14 +466,14 @@ fn collect_update_set_clauses(
 
         for (col_name, expr) in set.col_names.iter().zip(values.into_iter()) {
             let expr = Box::new(expr);
-            let ident = normalize_ident(col_name.as_str());
+            let ident = col_name.identifier();
 
-            let col_index = match column_lookup.get(&ident) {
+            let col_index = match column_lookup.get(ident) {
                 Some(idx) => {
                     table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
                     *idx
                 }
-                None if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) => table
+                None if ROWID_STRS.iter().any(|s| *ident == *s) => table
                     .columns()
                     .iter()
                     .enumerate()
@@ -658,7 +655,7 @@ fn check_update_from_column_ambiguity(
             _ => continue,
         };
         for using_col in using {
-            let col_name = normalize_ident(using_col.as_str());
+            let col_name = using_col.identifier();
 
             // Count how many *other* tables expose this column without it
             // being covered by their own USING clause.
@@ -667,21 +664,19 @@ fn check_update_from_column_ambiguity(
                 if j == i {
                     continue;
                 }
-                let has_col = other.columns().iter().any(|c| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
-                });
+                let has_col = other
+                    .columns()
+                    .iter()
+                    .any(|c| c.name.as_ref().is_some_and(|n| n == col_name));
                 if !has_col {
                     continue;
                 }
                 // If this table's own USING already covers the column,
                 // it was deduplicated by its own NATURAL/USING JOIN — skip.
-                let already_deduped = other.join_info.as_ref().is_some_and(|info| {
-                    info.using
-                        .iter()
-                        .any(|u| u.as_str().eq_ignore_ascii_case(&col_name))
-                });
+                let already_deduped = other
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|info| info.using.iter().any(|u| u == col_name));
                 if !already_deduped {
                     found_count += 1;
                 }

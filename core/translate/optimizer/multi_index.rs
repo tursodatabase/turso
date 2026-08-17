@@ -1247,6 +1247,7 @@ mod tests {
     };
     use std::{collections::VecDeque, sync::Arc};
     use turso_parser::ast::{self, Expr, Operator, TableInternalId};
+    use turso_parser::identifier::Identifier;
 
     struct TestColumn {
         name: String,
@@ -1260,7 +1261,7 @@ mod tests {
 
     fn create_column(c: &TestColumn) -> Column {
         Column::new(
-            Some(c.name.clone()),
+            Some(Identifier::new(c.name.clone())),
             c.ty.to_string(),
             None,
             None,
@@ -1285,7 +1286,7 @@ mod tests {
     fn create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
         Arc::new(BTreeTable::new(
             1,
-            name.to_string(),
+            name.into(),
             crate::alloc::vec![],
             columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
             BTreeCharacteristics::HAS_ROWID,
@@ -1399,8 +1400,8 @@ mod tests {
             &joined_tables,
             "item",
             VecDeque::from([Arc::new(Index {
-                name: "idx_item_id".to_string(),
-                table_name: "item".to_string(),
+                name: "idx_item_id".into(),
+                table_name: "item".into(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["id"]),
                 unique: false,
@@ -1543,8 +1544,8 @@ mod tests {
             &joined_tables,
             "item",
             VecDeque::from([Arc::new(Index {
-                name: "idx_item_a".to_string(),
-                table_name: "item".to_string(),
+                name: "idx_item_a".into(),
+                table_name: "item".into(),
                 where_clause: None,
                 columns: crate::alloc::vec![IndexColumn::new("a", 1)],
                 unique: false,
@@ -1651,8 +1652,8 @@ mod tests {
             &joined_tables,
             "item",
             VecDeque::from([Arc::new(Index {
-                name: "idx_item_id_kind".to_string(),
-                table_name: "item".to_string(),
+                name: "idx_item_id_kind".into(),
+                table_name: "item".into(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["id", "kind"]),
                 unique: false,
@@ -1832,8 +1833,8 @@ mod tests {
             &joined_tables,
             "item",
             VecDeque::from([Arc::new(Index {
-                name: "idx_item_id".to_string(),
-                table_name: "item".to_string(),
+                name: "idx_item_id".into(),
+                table_name: "item".into(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["id"]),
                 unique: false,

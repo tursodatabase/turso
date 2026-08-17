@@ -16,6 +16,7 @@ use crate::{
     Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, MvStore, OpenFlags, SyncMode,
 };
 use turso_macros::{turso_assert, turso_assert_eq};
+use turso_parser::identifier::Identifier;
 
 /// A representation of a row from `sqlite_schema`.
 ///
@@ -401,7 +402,7 @@ pub(crate) fn mirror_symbols(source: &Connection, target: &Connection) {
 pub(crate) fn capture_custom_types(
     source: &Connection,
     db_id: usize,
-) -> Vec<(String, Arc<TypeDef>)> {
+) -> Vec<(Identifier, Arc<TypeDef>)> {
     source.with_schema(db_id, |schema| {
         schema
             .type_registry
@@ -424,7 +425,7 @@ pub(crate) struct VacuumTargetBuildConfig {
     /// Database header metadata to write before committing the target database.
     pub header_meta: VacuumDbHeaderMeta,
     /// Pre-captured source custom type definitions for STRICT table replay.
-    pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
+    pub source_custom_types: Vec<(Identifier, Arc<TypeDef>)>,
     /// Whether the target database should be placed in MVCC journal mode.
     pub target_mvcc_enabled: bool,
     /// Auto-vacuum mode to use while rebuilding the target image.
@@ -1611,7 +1612,7 @@ fn install_mvcc_state_after_vacuum_commit(
 /// state machine.
 fn capture_target_metadata(
     temp_db: &VacuumTempDb,
-    source_sequences: FxHashMap<String, Arc<crate::schema::Sequence>>,
+    source_sequences: FxHashMap<Identifier, Arc<crate::schema::Sequence>>,
 ) -> Result<VacuumCommittedImageMeta> {
     let temp_conn = &temp_db.conn;
     let temp_pager = temp_conn.get_pager();
@@ -2419,6 +2420,7 @@ mod tests {
         WallClockInstant, IO,
     };
     use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
+    use turso_parser::identifier::IdentifierStr;
 
     fn page_ref(id: i64) -> crate::storage::pager::PageRef {
         Arc::new(Page::new(id))
@@ -2884,10 +2886,19 @@ mod tests {
         assert_eq!(committed.header.write_version, mvcc_version);
         assert_eq!(committed.schema.schema_version, 42);
         assert!(
-            committed.schema.tables.contains_key("generate_series"),
+            committed
+                .schema
+                .tables
+                .contains_key(IdentifierStr::new("generate_series")),
             "captured schema must retain built-in table-valued functions"
         );
-        let table_root = match committed.schema.tables.get("t").expect("table t").as_ref() {
+        let table_root = match committed
+            .schema
+            .tables
+            .get(IdentifierStr::new("t"))
+            .expect("table t")
+            .as_ref()
+        {
             crate::schema::Table::BTree(btree) => btree.root_page,
             _ => panic!("expected btree table"),
         };
@@ -2895,7 +2906,7 @@ mod tests {
         let index_root = committed
             .schema
             .indexes
-            .get("t")
+            .get(IdentifierStr::new("t"))
             .and_then(|indexes| indexes.front())
             .map(|index| index.root_page)
             .expect("index idx_t_v");

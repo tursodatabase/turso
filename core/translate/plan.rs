@@ -31,6 +31,7 @@ use turso_parser::ast::{
 };
 
 use turso_parser::ast::TableInternalId;
+use turso_parser::identifier::Identifier;
 
 use super::emitter::OperationMode;
 
@@ -400,7 +401,7 @@ pub enum Plan {
 #[derive(Debug, Clone)]
 /// Everything needed to emit one self-referencing CTE.
 pub struct RecursiveCtePlan {
-    pub name: String,
+    pub name: Identifier,
     pub initial_query: Box<Plan>,
     pub recursive_query: Box<Plan>,
     pub input_table_id: TableInternalId,
@@ -1085,7 +1086,7 @@ pub fn select_star(
                         if long_names {
                             format!("{}.{}", table.identifier, col_name)
                         } else {
-                            col_name.clone()
+                            col_name.to_string()
                         }
                     });
                     ResultSetColumn {
@@ -1178,7 +1179,7 @@ pub struct JoinedTable {
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    pub identifier: Identifier,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
@@ -1232,7 +1233,7 @@ impl JoinedTable {
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    pub identifier: Identifier,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
@@ -1250,7 +1251,7 @@ pub struct OuterQueryReference {
     /// internal_ids to avoid cursor key collisions.
     pub cte_select: Option<ast::Select>,
     /// Explicit column names from WITH t(a, b) AS (...) syntax.
-    pub cte_explicit_columns: Vec<String>,
+    pub cte_explicit_columns: Vec<Identifier>,
     /// CTE ID if this is a CTE reference. Used to track CTE reference counts
     /// for materialization decisions.
     pub cte_id: Option<usize>,
@@ -2407,7 +2408,7 @@ impl Operation {
 
 fn query_output_columns(
     plan: &Plan,
-    explicit_columns: Option<&[String]>,
+    explicit_columns: Option<&[Identifier]>,
 ) -> Result<alloc::Vec<Column>> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
@@ -2446,7 +2447,7 @@ fn query_output_columns(
         .map(|(column_index, result_column)| {
             let name = explicit_columns
                 .and_then(|names| names.get(column_index).cloned())
-                .or_else(|| result_column.name(table_references).map(String::from));
+                .or_else(|| result_column.name(table_references).map(Identifier::new));
             let column_type = compound_arms
                 .as_ref()
                 .map(|arms| compound_column_affinity(arms, column_index).to_type())
@@ -2498,7 +2499,7 @@ impl JoinedTable {
 
     /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
-        identifier: String,
+        identifier: Identifier,
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -2510,7 +2511,7 @@ impl JoinedTable {
                 let col_type = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
                 let type_name = col_type.to_string();
                 Column::new(
-                    rc.name(&plan.table_references).map(String::from),
+                    rc.name(&plan.table_references).map(Identifier::new),
                     type_name,
                     None,
                     None,
@@ -2562,11 +2563,11 @@ impl JoinedTable {
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
     pub fn new_subquery_from_plan(
-        identifier: String,
+        identifier: Identifier,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
-        explicit_columns: Option<&[String]>,
+        explicit_columns: Option<&[Identifier]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
     ) -> Result<Self> {
@@ -2603,10 +2604,10 @@ impl JoinedTable {
     }
 
     pub fn new_recursive_cte_input(
-        identifier: String,
+        identifier: Identifier,
         query: &Plan,
         internal_id: TableInternalId,
-        explicit_columns: Option<&[String]>,
+        explicit_columns: Option<&[Identifier]>,
     ) -> Result<Self> {
         let mut columns = query_output_columns(query, explicit_columns)?;
         // The recursive self-reference reads SQLite's queue table, whose
@@ -3244,7 +3245,7 @@ pub struct Window {
     /// The window name, either provided in the original statement or synthetically generated by
     /// the planner. This is optional because it can be assigned at different stages of query
     /// processing, but it should eventually always be set.
-    pub name: Option<String>,
+    pub name: Option<Identifier>,
     /// Expressions from the PARTITION BY clause.
     pub partition_by: Vec<Expr>,
     /// The number of unique expressions in the PARTITION BY clause. This determines how many of
@@ -3289,7 +3290,7 @@ impl Window {
 
     /// Build a `Window` from a previously-bound named definition plus a
     /// resolved frame.
-    pub fn from_named_bound(name: String, bound: NamedWindowBound, frame: Frame) -> Self {
+    pub fn from_named_bound(name: Identifier, bound: NamedWindowBound, frame: Frame) -> Self {
         Window {
             name: Some(name),
             partition_by: bound.partition_by,
@@ -3450,7 +3451,7 @@ fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoun
 /// zero extra clones vs. the old "mutated stub" model.
 #[derive(Debug, Clone)]
 pub struct NamedWindowDef {
-    pub name: String,
+    pub name: Identifier,
     /// User-written FRAME clause preserved so a function attaching by
     /// `Over::Name` can compute its effective frame from it.
     pub user_frame_clause: Option<FrameClause>,

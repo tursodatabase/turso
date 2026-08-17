@@ -3161,6 +3161,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "identstr"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd28bbf1a15890cbdf597372d40b1d84992595a03e4b2fceb167f982b27eab63"
+
+[[package]]
 name = "idna"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7445,6 +7451,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "criterion",
  "fallible-iterator 0.3.0",
+ "identstr",
  "memchr",
  "miette",
  "pprof",

@@ -2293,7 +2293,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         for col in table.columns() {
             if let Some(ref name) = col.name {
                 columns.push(ColumnInfo {
-                    name: name.clone(),
+                    name: name.to_string(),
                     ty: col.ty(),
                     database: database.clone(),
                     table: Some(actual_table.clone()),
@@ -2416,7 +2416,7 @@ mod tests {
         // Create users table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2429,14 +2429,14 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            SchemaColumn::new_default_integer(Some("age".to_string()), "INTEGER".to_string(), None),
-            SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".into(), None),
+            SchemaColumn::new_default_integer(Some("age".into()), "INTEGER".into(), None),
+            SchemaColumn::new_default_text(Some("email".into()), "TEXT".into(), None),
         ];
         let users_table = BTreeTable::new(
             2,
-            "users".to_string(),
-            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            "users".into(),
+            vec![("id".into(), turso_parser::ast::SortOrder::Asc)],
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
@@ -2451,7 +2451,7 @@ mod tests {
         // Create orders table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2464,14 +2464,10 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_integer(
-                Some("user_id".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
-            SchemaColumn::new_default_text(Some("product".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_integer(Some("user_id".into()), "INTEGER".to_string(), None),
+            SchemaColumn::new_default_text(Some("product".into()), "TEXT".into(), None),
             SchemaColumn::new(
-                Some("amount".to_string()),
+                Some("amount".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -2482,8 +2478,8 @@ mod tests {
         ];
         let orders_table = BTreeTable::new(
             3,
-            "orders".to_string(),
-            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            "orders".into(),
+            vec![("id".into(), turso_parser::ast::SortOrder::Asc)],
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
@@ -2498,7 +2494,7 @@ mod tests {
         // Create products table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2511,9 +2507,9 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".into(), None),
             SchemaColumn::new(
-                Some("price".to_string()),
+                Some("price".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -2522,15 +2518,15 @@ mod tests {
                 ColDef::default(),
             ),
             SchemaColumn::new_default_integer(
-                Some("product_id".to_string()),
+                Some("product_id".into()),
                 "INTEGER".to_string(),
                 None,
             ),
         ];
         let products_table = BTreeTable::new(
             4,
-            "products".to_string(),
-            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            "products".into(),
+            vec![("id".into(), turso_parser::ast::SortOrder::Asc)],
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],

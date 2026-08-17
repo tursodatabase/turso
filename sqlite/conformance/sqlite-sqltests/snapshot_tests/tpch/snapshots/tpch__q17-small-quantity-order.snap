@@ -31,7 +31,7 @@ QUERY PLAN
 |--SEARCH scalar_subquery_t3 USING INDEX ephemeral_subquery_t3 (correlation_key_0=?)
 |  |--SCAN lineitem
 |  `--USE SORTER FOR GROUP BY
-`--SEARCH lineitem USING COVERING INDEX ephemeral_lineitem_t1 (L_PARTKEY=? AND L_QUANTITY<?)
+`--SEARCH lineitem USING COVERING INDEX ephemeral_LINEITEM_t1 (L_PARTKEY=? AND L_QUANTITY<?)
 
 BYTECODE
 addr  opcode                  p1  p2  p3  p4                                     p5  comment
@@ -43,10 +43,10 @@ addr  opcode                  p1  p2  p3  p4                                    
    5          Integer          0   5   0                                          0  r[5]=0; clear group by abort flag
    6          Null             0   6   0                                          0  r[6]=NULL; initialize group by comparison registers to NULL
    7          Gosub           12  48   0                                          0  ; go to clear accumulator subroutine
-   8          OpenRead         3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   9          Rewind           3  15   0                                          0  Rewind table lineitem
-  10            Column         3   1  10                                          0  r[10]=lineitem.L_PARTKEY
-  11            Column         3   4  11                                          0  r[11]=lineitem.L_QUANTITY
+   8          OpenRead         3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=LINEITEM, root=10, iDb=0
+   9          Rewind           3  15   0                                          0  Rewind table LINEITEM
+  10            Column         3   1  10                                          0  r[10]=LINEITEM.L_PARTKEY
+  11            Column         3   4  11                                          0  r[11]=LINEITEM.L_QUANTITY
   12            MakeRecord    10   2   9                                          0  r[9]=mkrec(r[10..11])
   13            SorterInsert   1   9   0  0                                       0  key=r[9]
   14          Next             3  10   0                                          1
@@ -87,26 +87,26 @@ addr  opcode                  p1  p2  p3  p4                                    
   49    Integer                0   4   0                                          0  r[4]=0
   50  Return                  12   0   0                                          0
   51  Null                     0  22   0                                          0  r[22]=NULL
-  52  OpenRead                 4  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-  53  OpenRead                 6   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
-  54  Rewind                   6  84   0                                          0  Rewind table part
-  55    Column                 6   3  24                                          0  r[24]=part.P_BRAND
+  52  OpenRead                 4  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=LINEITEM, root=10, iDb=0
+  53  OpenRead                 6   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=PART, root=4, iDb=0
+  54  Rewind                   6  84   0                                          0  Rewind table PART
+  55    Column                 6   3  24                                          0  r[24]=PART.P_BRAND
   56    Ne                    24  25  83  Binary                                  0  if r[24]!=r[25] goto 83
-  57    Column                 6   6  27                                          0  r[27]=part.P_CONTAINER
+  57    Column                 6   6  27                                          0  r[27]=PART.P_CONTAINER
   58    Ne                    27  28  83  Binary                                  0  if r[27]!=r[28] goto 83
-  59    RowId                  6  29   0                                          0  r[29]=part.rowid
+  59    RowId                  6  29   0                                          0  r[29]=PART.rowid
   60    SeekGE                 0  83  29                                          0  key=[29..29]
   61      IdxGT                0  83  29                                          0  key=[29..29]
   62      Once                71   0   0                                          0  goto 71
   63      OpenAutoindex        5   0   0                                          0  cursor=5
-  64      Rewind               4  65   0                                          0  Rewind table lineitem
-  65        Column             4   1  30                                          0  r[30]=lineitem.L_PARTKEY
-  66        ColumnRange        4   4  31  2                                       0  r[31..32]=lineitem.L_QUANTITY..L_EXTENDEDPRICE
-  67        RowId              4  33   0                                          0  r[33]=lineitem.rowid
-  68        MakeRecord        30   4  34                                          0  r[34]=mkrec(r[30..33]); for ephemeral_lineitem_t1
+  64      Rewind               4  65   0                                          0  Rewind table LINEITEM
+  65        Column             4   1  30                                          0  r[30]=LINEITEM.L_PARTKEY
+  66        ColumnRange        4   4  31  2                                       0  r[31..32]=LINEITEM.L_QUANTITY..L_EXTENDEDPRICE
+  67        RowId              4  33   0                                          0  r[33]=LINEITEM.rowid
+  68        MakeRecord        30   4  34                                          0  r[34]=mkrec(r[30..33]); for ephemeral_LINEITEM_t1
   69        IdxInsert          5  34  30                                          0  key=r[34]
   70      Next                 4  65   0                                          0
-  71      RowId                6  35   0                                          0  r[35]=part.rowid
+  71      RowId                6  35   0                                          0  r[35]=PART.rowid
   72      Null                 0  36   0                                          0  r[36]=NULL
   73      SeekGT               5  82  35                                          0  key=[35..36]
   74      Column               0   1  36                                          0  r[36]=ephemeral(ephemeral_subquery_t3).0.2 * avg(l_quantity)
@@ -114,7 +114,7 @@ addr  opcode                  p1  p2  p3  p4                                    
   76      IsNull              36  82   0                                          0  if (r[36]==NULL) goto 82
   77        IdxGE              5  82  35                                          0  key=[35..36]
   78        DeferredSeek       5   4   0                                          0
-  79        Column             5   2  37                                          0  r[37]=ephemeral(ephemeral_lineitem_t1).L_EXTENDEDPRICE
+  79        Column             5   2  37                                          0  r[37]=ephemeral(ephemeral_LINEITEM_t1).L_EXTENDEDPRICE
   80        AggStep            0  37  22  sum                                     0  accum=r[22] step(r[37])
   81      Next                 5  77   0                                          0
   82    Next                   0  61   0                                          0

@@ -1,4 +1,5 @@
 use super::*;
+use turso_parser::identifier::Identifier;
 
 /// Open or reuse the ephemeral cursor that supplies RHS values for an IN-seek.
 ///
@@ -24,11 +25,11 @@ pub(super) fn open_in_seek_source_cursor(
                 .and_then(|idx| idx.columns.first())
                 .and_then(|c| c.collation);
             let ephemeral_index = Arc::new(Index {
-                name: String::new(),
-                table_name: String::new(),
+                name: Identifier::empty(),
+                table_name: Identifier::empty(),
                 root_page: 0,
                 columns: crate::alloc::try_vec![IndexColumn {
-                    name: String::new(),
+                    name: Identifier::empty(),
                     order: SortOrder::Asc,
                     nulls_order: None,
                     pos_in_table: 0,

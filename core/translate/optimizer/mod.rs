@@ -75,6 +75,7 @@ use std::{
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
+use turso_parser::identifier::{Identifier, IdentifierStr};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -99,7 +100,10 @@ impl AvailableIndexes {
                 continue;
             }
             let indexes = resolver.with_schema(table_ref.database_id, |schema| {
-                schema.indexes.get(table_ref.table.get_name()).cloned()
+                schema
+                    .indexes
+                    .get(IdentifierStr::new(table_ref.table.get_name()))
+                    .cloned()
             });
             if let Some(indexes) = indexes {
                 available_indexes
@@ -1428,8 +1432,8 @@ fn collect_update_phase_subquery_ids(
     Ok(ids)
 }
 
-fn update_from_scratch_col_name(idx: usize) -> String {
-    format!("__update_from_{idx}")
+fn update_from_scratch_col_name(idx: usize) -> Identifier {
+    Identifier::new(format!("__update_from_{idx}"))
 }
 
 fn update_from_scratch_columns(set_clause_count: usize) -> Result<crate::alloc::Vec<Column>> {
@@ -1470,7 +1474,7 @@ fn build_update_write_set_plan(
     };
     let ephemeral_table = Arc::new(BTreeTable::new(
         0, // root_page, not relevant for ephemeral table definition
-        "ephemeral_scratch".to_string(),
+        Identifier::new("ephemeral_scratch"),
         crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
@@ -1613,7 +1617,7 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
         .enumerate()
         .map(|(idx, set_clause)| ResultSetColumn {
             expr: set_clause.expr.as_ref().clone(),
-            alias: Some(update_from_scratch_col_name(idx)),
+            alias: Some(update_from_scratch_col_name(idx).to_string()),
             implicit_column_name: None,
             contains_aggregates: false,
         })
@@ -3652,15 +3656,15 @@ fn ephemeral_index_build(
         }
     });
     let ephemeral_index = Index {
-        name: format!(
+        name: Identifier::new(format!(
             "ephemeral_{}_{}",
             table_reference.table.get_name(),
             table_reference.internal_id
-        ),
+        )),
         columns: ephemeral_columns,
         unique: false,
         ephemeral: true,
-        table_name: table_reference.table.get_name().to_string(),
+        table_name: Identifier::new(table_reference.table.get_name()),
         root_page: 0,
         where_clause: None,
         has_rowid: table_reference

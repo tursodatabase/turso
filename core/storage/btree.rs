@@ -11196,10 +11196,10 @@ mod tests {
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
                 .unwrap() as i64;
             let index_def = Index {
-                name: "testindex".to_string(),
+                name: "testindex".into(),
                 where_clause: None,
                 columns: IndexColumn::new_many((0..10).map(|i| format!("test{i}"))),
-                table_name: "test".to_string(),
+                table_name: "test".into(),
                 root_page: index_root_page,
                 unique: false,
                 ephemeral: false,
@@ -11369,10 +11369,10 @@ mod tests {
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
                 .unwrap() as i64;
             let index_def = Index {
-                name: "testindex".to_string(),
+                name: "testindex".into(),
                 where_clause: None,
                 columns: IndexColumn::new_many(vec!["testcol"]),
-                table_name: "test".to_string(),
+                table_name: "test".into(),
                 root_page: index_root_page,
                 unique: false,
                 ephemeral: false,

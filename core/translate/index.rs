@@ -27,7 +27,7 @@ use crate::{
         SchemaObjectType,
     },
     storage::pager::CreateBTreeFlags,
-    util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
+    util::{escape_sql_string_literal, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral, SorterOpenData},
@@ -35,6 +35,7 @@ use crate::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
+use turso_parser::identifier::Identifier;
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
@@ -110,8 +111,8 @@ pub fn translate_create_index(
     } else {
         resolver.resolve_existing_table_database_id(original_tbl_name.as_str())?
     };
-    let idx_name = normalize_ident(original_idx_name.name.as_str());
-    let tbl_name = normalize_ident(original_tbl_name.as_str());
+    let idx_name = original_idx_name.name.identifier().clone();
+    let tbl_name = original_tbl_name.identifier().clone();
 
     validate(
         &tbl_name,
@@ -343,7 +344,7 @@ fn emit_refill_index(
         column_count: tbl.columns().len(),
     }));
     let columns = &idx.columns;
-    let tbl_name = normalize_ident(tbl.name.as_str());
+    let tbl_name = tbl.name.clone();
 
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
@@ -702,27 +703,27 @@ fn resolve_reindex_targets(
         return Ok(collect_all_reindex_targets(resolver, connection));
     };
 
-    let normalized_name = normalize_ident(name.name.as_str());
+    let normalized_name = name.name.as_str();
     if name.db_name.is_none() {
-        if let Ok(collation) = CollationSeq::new(&normalized_name) {
+        if let Ok(collation) = CollationSeq::new(normalized_name) {
             return Ok(collect_reindex_targets_by_collation(
                 resolver, connection, collation,
             ));
         }
-        if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
+        if let Some(targets) = find_reindex_table(normalized_name, resolver, connection) {
             return Ok(targets);
         }
-        if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
+        if let Some(target) = find_reindex_index(normalized_name, resolver, connection) {
             return Ok(vec![target]);
         }
         bail_parse_error!("unable to identify the object to be reindexed");
     }
 
     let database_id = resolver.resolve_database_id(name)?;
-    if let Some(targets) = find_reindex_table_in_db(&normalized_name, database_id, resolver) {
+    if let Some(targets) = find_reindex_table_in_db(normalized_name, database_id, resolver) {
         return Ok(targets);
     }
-    if let Some(target) = find_reindex_index_in_db(&normalized_name, database_id, resolver) {
+    if let Some(target) = find_reindex_index_in_db(normalized_name, database_id, resolver) {
         return Ok(vec![target]);
     }
     bail_parse_error!("unable to identify the object to be reindexed");
@@ -820,7 +821,7 @@ fn find_reindex_table_in_db(
         };
         let targets = schema
             .indexes
-            .get(&normalize_ident(table.name.as_str()))
+            .get(&table.name)
             .map(|indexes| {
                 indexes
                     .iter()
@@ -947,7 +948,7 @@ fn resolve_sorted_columns_with_resolver(
         }
         resolved
             .push_within_capacity(IndexColumn {
-                name: sc.expr.to_string(),
+                name: Identifier::new(sc.expr.to_string()),
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
@@ -997,7 +998,7 @@ fn extract_collation<'a>(
 fn resolve_index_column<'a>(
     expr: &'a Expr,
     table: &'a BTreeTable,
-) -> Option<(usize, String, &'a Column)> {
+) -> Option<(usize, Identifier, &'a Column)> {
     let (pos, column) = match expr {
         Expr::Id(col_name) | Expr::Name(col_name) => table.get_column(col_name.as_str())?,
         // SQLite interprets single-quoted strings as column names in index expressions
@@ -1040,17 +1041,15 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         return false;
     }
 
-    let tbl_norm = normalize_ident(table.name.as_str());
     let has_col = |name: &str| {
-        let n = normalize_ident(name);
         table
             .columns()
             .iter()
-            .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+            .any(|c| c.name.as_ref().is_some_and(|cn| *cn == name))
     };
-    let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+    let is_tbl = |ns: &str| table.name == ns;
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
-        let n = normalize_ident(name);
+        let n = name.to_ascii_lowercase();
         Func::resolve_function(&n, args.len())
             .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
     };
@@ -1208,7 +1207,7 @@ pub fn translate_drop_index(
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
-    let idx_name = normalize_ident(qualified_name.name.as_str());
+    let idx_name = qualified_name.name.identifier().clone();
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
@@ -1263,7 +1262,14 @@ pub fn translate_drop_index(
     program.emit_null(null_reg, None);
 
     // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(idx_name);
+    // Match the schema row by the canonical stored spelling, not the spelling
+    // the user typed in DROP INDEX (index names compare case-insensitively).
+    let canonical_index_name = maybe_index
+        .as_ref()
+        .expect("index resolved above")
+        .name
+        .to_string();
+    let index_name_reg = program.emit_string8_new_reg(canonical_index_name);
     // String8; r[4] = 'index'
     let index_str_reg = program.emit_string8_new_reg("index".to_string());
 
@@ -1427,7 +1433,7 @@ pub fn translate_optimize(
 
     if let Some(name) = idx_name {
         // Optimize a specific index
-        let idx_name = normalize_ident(name.name.as_str());
+        let idx_name = name.name.identifier().clone();
         let database_id = resolver.resolve_existing_index_database_id(&name)?;
         let mut found = false;
 

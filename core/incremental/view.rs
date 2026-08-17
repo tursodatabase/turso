@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 use turso_parser::{
     ast::{Cmd, Stmt},
     parser::Parser,
@@ -209,13 +210,13 @@ pub struct IncrementalView {
     // All tables referenced by this view (from FROM clause and JOINs)
     referenced_tables: Vec<Arc<BTreeTable>>,
     // Mapping from table aliases to actual table names (e.g., "c" -> "customers")
-    table_aliases: HashMap<String, String>,
+    table_aliases: HashMap<Identifier, Identifier>,
     // Mapping from table name to fully qualified name (e.g., "customers" -> "main.customers")
     // This preserves database qualification from the original query
-    qualified_table_names: HashMap<String, String>,
+    qualified_table_names: HashMap<Identifier, String>,
     // WHERE conditions for each table (accumulated from all occurrences)
     // Multiple conditions from UNION branches or duplicate references are stored as a vector
-    table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
+    table_conditions: HashMap<Identifier, Vec<Option<ast::Expr>>>,
     // The view's column schema with table relationships
     pub column_schema: ViewColumnSchema,
     // State machine for population
@@ -269,7 +270,8 @@ impl IncrementalView {
             .map(|(i, vc)| {
                 vc.column
                     .name
-                    .clone()
+                    .as_ref()
+                    .map(|name| name.to_string())
                     .unwrap_or_else(|| format!("column{}", i + 1))
             })
     }
@@ -373,9 +375,9 @@ impl IncrementalView {
         name: String,
         select_stmt: ast::Select,
         referenced_tables: Vec<Arc<BTreeTable>>,
-        table_aliases: HashMap<String, String>,
-        qualified_table_names: HashMap<String, String>,
-        table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
+        table_aliases: HashMap<Identifier, Identifier>,
+        qualified_table_names: HashMap<Identifier, String>,
+        table_conditions: HashMap<Identifier, Vec<Option<ast::Expr>>>,
         column_schema: ViewColumnSchema,
         schema: &Schema,
         main_data_root: i64,
@@ -433,7 +435,7 @@ impl IncrementalView {
     }
 
     /// Get all table names referenced by this view
-    pub fn get_referenced_table_names(&self) -> Vec<String> {
+    pub fn get_referenced_table_names(&self) -> Vec<Identifier> {
         self.referenced_tables
             .iter()
             .map(|t| t.name.clone())
@@ -450,12 +452,12 @@ impl IncrementalView {
         name: &ast::QualifiedName,
         alias: &Option<ast::As>,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
-        aliases: &mut HashMap<String, String>,
-        qualified_names: &mut HashMap<String, String>,
-        cte_names: &HashSet<String>,
+        table_map: &mut HashMap<Identifier, Arc<BTreeTable>>,
+        aliases: &mut HashMap<Identifier, Identifier>,
+        qualified_names: &mut HashMap<Identifier, String>,
+        cte_names: &HashSet<Identifier>,
     ) -> Result<()> {
-        let table_name = name.name.as_str();
+        let table_name = name.name.identifier();
 
         // Build the fully qualified name
         let qualified_name = if let Some(ref db) = name.db_name {
@@ -467,15 +469,12 @@ impl IncrementalView {
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
             if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table);
-                qualified_names.insert(table_name.to_string(), qualified_name);
+                table_map.insert(table_name.clone(), table);
+                qualified_names.insert(table_name.clone(), qualified_name);
 
                 // Store the alias mapping if there is an alias
                 if let Some(alias_enum) = alias {
-                    aliases.insert(
-                        alias_enum.name().as_str().to_string(),
-                        table_name.to_string(),
-                    );
+                    aliases.insert(alias_enum.name().identifier().clone(), table_name.clone());
                 }
             } else {
                 return Err(LimboError::ParseError(format!(
@@ -489,11 +488,11 @@ impl IncrementalView {
     fn extract_one_statement(
         select: &ast::OneSelect,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
-        aliases: &mut HashMap<String, String>,
-        qualified_names: &mut HashMap<String, String>,
-        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
-        cte_names: &HashSet<String>,
+        table_map: &mut HashMap<Identifier, Arc<BTreeTable>>,
+        aliases: &mut HashMap<Identifier, Identifier>,
+        qualified_names: &mut HashMap<Identifier, String>,
+        table_conditions: &mut HashMap<Identifier, Vec<Option<ast::Expr>>>,
+        cte_names: &HashSet<Identifier>,
     ) -> Result<()> {
         if let ast::OneSelect::Select {
             from: Some(ref from),
@@ -547,7 +546,7 @@ impl IncrementalView {
         // Extract and store table-specific conditions from the WHERE clause
         if let Some(ref where_expr) = where_expr {
             for table_name in table_map.keys() {
-                let all_tables: Vec<String> = table_map.keys().cloned().collect();
+                let all_tables: Vec<Identifier> = table_map.keys().cloned().collect();
                 let table_specific_condition = Self::extract_conditions_for_table(
                     where_expr,
                     table_name,
@@ -589,9 +588,9 @@ impl IncrementalView {
         select: &ast::Select,
         schema: &Schema,
         tables: &mut Vec<Arc<BTreeTable>>,
-        aliases: &mut HashMap<String, String>,
-        qualified_names: &mut HashMap<String, String>,
-        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
+        aliases: &mut HashMap<Identifier, Identifier>,
+        qualified_names: &mut HashMap<Identifier, String>,
+        table_conditions: &mut HashMap<Identifier, Vec<Option<ast::Expr>>>,
     ) -> Result<()> {
         let mut table_map = HashMap::default();
         Self::extract_all_tables_inner(
@@ -615,11 +614,11 @@ impl IncrementalView {
     fn extract_all_tables_inner(
         select: &ast::Select,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
-        aliases: &mut HashMap<String, String>,
-        qualified_names: &mut HashMap<String, String>,
-        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
-        parent_cte_names: &HashSet<String>,
+        table_map: &mut HashMap<Identifier, Arc<BTreeTable>>,
+        aliases: &mut HashMap<Identifier, Identifier>,
+        qualified_names: &mut HashMap<Identifier, String>,
+        table_conditions: &mut HashMap<Identifier, Vec<Option<ast::Expr>>>,
+        parent_cte_names: &HashSet<Identifier>,
     ) -> Result<()> {
         let mut cte_names = parent_cte_names.clone();
 
@@ -627,7 +626,7 @@ impl IncrementalView {
         if let Some(ref with) = select.with {
             // First pass: collect all CTE names (needed for recursive CTEs)
             for cte in &with.ctes {
-                cte_names.insert(cte.tbl_name.as_str().to_string());
+                cte_names.insert(cte.tbl_name.identifier().clone());
             }
 
             // Second pass: extract tables from each CTE's SELECT statement
@@ -689,9 +688,9 @@ impl IncrementalView {
     pub fn generate_populate_queries(
         select_stmt: &ast::Select,
         referenced_tables: &[Arc<BTreeTable>],
-        table_aliases: &HashMap<String, String>,
-        qualified_table_names: &HashMap<String, String>,
-        table_conditions: &HashMap<String, Vec<Option<ast::Expr>>>,
+        table_aliases: &HashMap<Identifier, Identifier>,
+        qualified_table_names: &HashMap<Identifier, String>,
+        table_conditions: &HashMap<Identifier, Vec<Option<ast::Expr>>>,
     ) -> crate::Result<Vec<String>> {
         if referenced_tables.is_empty() {
             return Err(LimboError::ParseError(
@@ -731,7 +730,7 @@ impl IncrementalView {
             let table_name = qualified_table_names
                 .get(&table.name)
                 .cloned()
-                .unwrap_or_else(|| table.name.clone());
+                .unwrap_or_else(|| table.name.to_string());
 
             // Construct the query for this table
             let query = if where_clause.is_empty() {
@@ -749,9 +748,9 @@ impl IncrementalView {
     fn combine_conditions(
         _select_stmt: &ast::Select,
         conditions: &[Option<ast::Expr>],
-        table_name: &str,
+        table_name: &Identifier,
         _referenced_tables: &[Arc<BTreeTable>],
-        table_aliases: &HashMap<String, String>,
+        table_aliases: &HashMap<Identifier, Identifier>,
     ) -> crate::Result<String> {
         // Check if any conditions are None (SELECTs without WHERE)
         let has_none = conditions.iter().any(|c| c.is_none());
@@ -873,9 +872,9 @@ impl IncrementalView {
     /// Extract conditions from a WHERE clause that apply to a specific table
     fn extract_conditions_for_table(
         expr: &ast::Expr,
-        table_name: &str,
-        aliases: &HashMap<String, String>,
-        all_tables: &[String],
+        table_name: &Identifier,
+        aliases: &HashMap<Identifier, Identifier>,
+        all_tables: &[Identifier],
         schema: &Schema,
     ) -> Option<ast::Expr> {
         match expr {
@@ -909,9 +908,9 @@ impl IncrementalView {
                             Self::get_tables_in_expr(right, aliases, all_tables, schema);
 
                         if left_tables.len() == 1
-                            && left_tables.contains(&table_name.to_string())
+                            && left_tables.contains(table_name)
                             && right_tables.len() == 1
-                            && right_tables.contains(&table_name.to_string())
+                            && right_tables.contains(table_name)
                             && Self::is_simple_comparison(expr)
                         {
                             Some(expr.clone())
@@ -924,7 +923,7 @@ impl IncrementalView {
                         let referenced_tables =
                             Self::get_tables_in_expr(expr, aliases, all_tables, schema);
                         if referenced_tables.len() == 1
-                            && referenced_tables.contains(&table_name.to_string())
+                            && referenced_tables.contains(table_name)
                             && Self::is_simple_comparison(expr)
                         {
                             Some(expr.clone())
@@ -938,7 +937,7 @@ impl IncrementalView {
                 // For other expressions, check if they only reference our table
                 let referenced_tables = Self::get_tables_in_expr(expr, aliases, all_tables, schema);
                 if referenced_tables.len() == 1
-                    && referenced_tables.contains(&table_name.to_string())
+                    && referenced_tables.contains(table_name)
                     && Self::is_simple_comparison(expr)
                 {
                     Some(expr.clone())
@@ -953,8 +952,8 @@ impl IncrementalView {
     /// Removes table/alias prefixes from qualified column names
     fn unqualify_expression(
         expr: &ast::Expr,
-        table_name: &str,
-        aliases: &HashMap<String, String>,
+        table_name: &Identifier,
+        aliases: &HashMap<Identifier, Identifier>,
     ) -> ast::Expr {
         match expr {
             ast::Expr::Binary(left, op, right) => ast::Expr::Binary(
@@ -965,20 +964,16 @@ impl IncrementalView {
             ast::Expr::Qualified(table_or_alias, column) => {
                 // Check if this qualification refers to our table
                 let table_str = table_or_alias.as_str();
-                let actual_table = if let Some(actual) = aliases.get(table_str) {
+                let actual_table = if let Some(actual) = aliases.get(table_or_alias.identifier()) {
                     actual.clone()
                 } else if table_str.contains('.') {
                     // Handle database.table format
-                    table_str
-                        .split('.')
-                        .next_back()
-                        .unwrap_or(table_str)
-                        .to_string()
+                    Identifier::new(table_str.split('.').next_back().unwrap_or(table_str))
                 } else {
-                    table_str.to_string()
+                    table_or_alias.identifier().clone()
                 };
 
-                if actual_table == table_name {
+                if actual_table == *table_name {
                     // Remove the qualification
                     ast::Expr::Id(column.clone())
                 } else {
@@ -988,7 +983,7 @@ impl IncrementalView {
             }
             ast::Expr::DoublyQualified(_database, table, column) => {
                 // Check if this refers to our table
-                if table.as_str() == table_name {
+                if table.identifier() == table_name {
                     // Remove the qualification, keep just the column
                     ast::Expr::Id(column.clone())
                 } else {
@@ -1044,10 +1039,10 @@ impl IncrementalView {
     /// Get all tables referenced in an expression
     fn get_tables_in_expr(
         expr: &ast::Expr,
-        aliases: &HashMap<String, String>,
-        all_tables: &[String],
+        aliases: &HashMap<Identifier, Identifier>,
+        all_tables: &[Identifier],
         schema: &Schema,
-    ) -> Vec<String> {
+    ) -> Vec<Identifier> {
         let mut tables = Vec::new();
         Self::collect_tables_in_expr(expr, aliases, all_tables, schema, &mut tables);
         tables.sort();
@@ -1058,10 +1053,10 @@ impl IncrementalView {
     /// Recursively collect table references from an expression
     fn collect_tables_in_expr(
         expr: &ast::Expr,
-        aliases: &HashMap<String, String>,
-        all_tables: &[String],
+        aliases: &HashMap<Identifier, Identifier>,
+        all_tables: &[Identifier],
         schema: &Schema,
-        tables: &mut Vec<String>,
+        tables: &mut Vec<Identifier>,
     ) {
         match expr {
             ast::Expr::Binary(left, _, right) => {
@@ -1071,25 +1066,22 @@ impl IncrementalView {
             ast::Expr::Qualified(table_or_alias, _) => {
                 // Handle database.table or just table/alias
                 let table_str = table_or_alias.as_str();
-                let table_name = if let Some(actual_table) = aliases.get(table_str) {
-                    // It's an alias
-                    actual_table.clone()
-                } else if table_str.contains('.') {
-                    // It might be database.table format, extract just the table name
-                    table_str
-                        .split('.')
-                        .next_back()
-                        .unwrap_or(table_str)
-                        .to_string()
-                } else {
-                    // It's a direct table name
-                    table_str.to_string()
-                };
+                let table_name =
+                    if let Some(actual_table) = aliases.get(table_or_alias.identifier()) {
+                        // It's an alias
+                        actual_table.clone()
+                    } else if table_str.contains('.') {
+                        // It might be database.table format, extract just the table name
+                        Identifier::new(table_str.split('.').next_back().unwrap_or(table_str))
+                    } else {
+                        // It's a direct table name
+                        table_or_alias.identifier().clone()
+                    };
                 tables.push(table_name);
             }
             ast::Expr::DoublyQualified(_database, table, _column) => {
                 // For database.table.column, extract the table name
-                tables.push(table.to_string());
+                tables.push(table.identifier().clone());
             }
             ast::Expr::Id(column) => {
                 // Unqualified column - try to find which table has this column
@@ -1102,7 +1094,7 @@ impl IncrementalView {
                             if table
                                 .columns()
                                 .iter()
-                                .any(|col| col.name.as_deref() == Some(column.as_str()))
+                                .any(|col| col.name.as_ref() == Some(column.identifier()))
                             {
                                 tables.push(table_name.clone());
                                 break; // Found the table, stop looking
@@ -1367,7 +1359,7 @@ impl IncrementalView {
 
         // Create a DeltaSet with this delta for the current table
         let mut delta_set = DeltaSet::new();
-        let table_name = self.referenced_tables[table_idx].name.clone();
+        let table_name = self.referenced_tables[table_idx].name.to_string();
         delta_set.insert(table_name, single_row_delta);
 
         // Process through merge_delta
@@ -1429,6 +1421,7 @@ mod tests {
     };
     use crate::sync::Arc;
     use turso_parser::ast;
+    use turso_parser::identifier::IdentifierStr;
     use turso_parser::parser::Parser;
 
     // Helper function to create a test schema with multiple tables
@@ -1438,7 +1431,7 @@ mod tests {
         // Create customers table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1454,12 +1447,12 @@ mod tests {
                     notnull_conflict_clause: None,
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
         ];
         let customers_table = BTreeTable::new(
             2,
-            "customers".to_string(),
-            vec![("id".to_string(), ast::SortOrder::Asc)],
+            "customers".into(),
+            vec![("id".into(), ast::SortOrder::Asc)],
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
@@ -1471,7 +1464,7 @@ mod tests {
         // Create orders table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1488,7 +1481,7 @@ mod tests {
                 },
             ),
             SchemaColumn::new(
-                Some("customer_id".to_string()),
+                Some("customer_id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1496,16 +1489,12 @@ mod tests {
                 None,
                 ColDef::default(),
             ),
-            SchemaColumn::new_default_integer(
-                Some("total".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
+            SchemaColumn::new_default_integer(Some("total".into()), "INTEGER".to_string(), None),
         ];
         let orders_table = BTreeTable::new(
             3,
-            "orders".to_string(),
-            vec![("id".to_string(), ast::SortOrder::Asc)],
+            "orders".into(),
+            vec![("id".into(), ast::SortOrder::Asc)],
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
@@ -1517,7 +1506,7 @@ mod tests {
         // Create products table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1533,9 +1522,9 @@ mod tests {
                     notnull_conflict_clause: None,
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
             SchemaColumn::new(
-                Some("price".to_string()),
+                Some("price".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -1546,8 +1535,8 @@ mod tests {
         ];
         let products_table = BTreeTable::new(
             4,
-            "products".to_string(),
-            vec![("id".to_string(), ast::SortOrder::Asc)],
+            "products".into(),
+            vec![("id".into(), ast::SortOrder::Asc)],
             columns,
             BTreeCharacteristics::HAS_ROWID,
             vec![],
@@ -1559,7 +1548,7 @@ mod tests {
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
         let columns = vec![
             SchemaColumn::new(
-                Some("message".to_string()),
+                Some("message".into()),
                 "TEXT".to_string(),
                 None,
                 None,
@@ -1567,13 +1556,9 @@ mod tests {
                 None,
                 ColDef::default(),
             ),
+            SchemaColumn::new_default_integer(Some("level".into()), "INTEGER".to_string(), None),
             SchemaColumn::new_default_integer(
-                Some("level".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
-            SchemaColumn::new_default_integer(
-                Some("timestamp".to_string()),
+                Some("timestamp".into()),
                 "INTEGER".to_string(),
                 None,
             ),
@@ -1581,7 +1566,7 @@ mod tests {
         // logs has no primary key (no rowid alias) but does have an implicit rowid.
         let logs_table = BTreeTable::new(
             5,
-            "logs".to_string(),
+            "logs".into(),
             vec![],
             columns,
             BTreeCharacteristics::HAS_ROWID,
@@ -1623,9 +1608,9 @@ mod tests {
     // Type alias for the complex return type of extract_all_tables
     type ExtractedTableInfo = (
         Vec<Arc<BTreeTable>>,
-        HashMap<String, String>,
-        HashMap<String, String>,
-        HashMap<String, Vec<Option<ast::Expr>>>,
+        HashMap<Identifier, Identifier>,
+        HashMap<Identifier, String>,
+        HashMap<Identifier, Vec<Option<ast::Expr>>>,
     );
 
     fn extract_all_tables(select: &ast::Select, schema: &Schema) -> Result<ExtractedTableInfo> {
@@ -1668,8 +1653,8 @@ mod tests {
         let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 2);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("products"));
+        assert!(table_conditions.contains_key(IdentifierStr::new("customers")));
+        assert!(table_conditions.contains_key(IdentifierStr::new("products")));
     }
 
     #[test]
@@ -1682,8 +1667,8 @@ mod tests {
         let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 2);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("orders"));
+        assert!(table_conditions.contains_key(IdentifierStr::new("customers")));
+        assert!(table_conditions.contains_key(IdentifierStr::new("orders")));
     }
 
     #[test]
@@ -1698,9 +1683,9 @@ mod tests {
         let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 3);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("orders"));
-        assert!(table_conditions.contains_key("products"));
+        assert!(table_conditions.contains_key(IdentifierStr::new("customers")));
+        assert!(table_conditions.contains_key(IdentifierStr::new("orders")));
+        assert!(table_conditions.contains_key(IdentifierStr::new("products")));
     }
 
     #[test]
@@ -1713,8 +1698,8 @@ mod tests {
         let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 2);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("orders"));
+        assert!(table_conditions.contains_key(IdentifierStr::new("customers")));
+        assert!(table_conditions.contains_key(IdentifierStr::new("orders")));
     }
 
     #[test]
@@ -1725,8 +1710,8 @@ mod tests {
         let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 2);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("orders"));
+        assert!(table_conditions.contains_key(IdentifierStr::new("customers")));
+        assert!(table_conditions.contains_key(IdentifierStr::new("orders")));
     }
 
     #[test]
@@ -1744,8 +1729,14 @@ mod tests {
         assert!(table_names.contains(&"orders"));
 
         // Check that aliases are correctly mapped
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
+        assert_eq!(
+            aliases.get(IdentifierStr::new("c")),
+            Some(&Identifier::new("customers"))
+        );
+        assert_eq!(
+            aliases.get(IdentifierStr::new("o")),
+            Some(&Identifier::new("orders"))
+        );
     }
 
     #[test]
@@ -2083,9 +2074,18 @@ mod tests {
         assert!(table_names.contains(&"products"));
 
         // Verify aliases are correctly mapped
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
-        assert_eq!(aliases.get("p"), Some(&"products".to_string()));
+        assert_eq!(
+            aliases.get(IdentifierStr::new("c")),
+            Some(&Identifier::new("customers"))
+        );
+        assert_eq!(
+            aliases.get(IdentifierStr::new("o")),
+            Some(&Identifier::new("orders"))
+        );
+        assert_eq!(
+            aliases.get(IdentifierStr::new("p")),
+            Some(&Identifier::new("products"))
+        );
 
         // Generate populate queries to verify each table gets its own conditions
         let queries = IncrementalView::generate_populate_queries(
@@ -2197,10 +2197,18 @@ mod tests {
             extract_all_tables(&select, &schema).unwrap();
 
         // Check that qualified names are preserved
-        assert!(qualified_names.contains_key("customers"));
-        assert_eq!(qualified_names.get("customers").unwrap(), "main.customers");
-        assert!(qualified_names.contains_key("orders"));
-        assert_eq!(qualified_names.get("orders").unwrap(), "main.orders");
+        assert!(qualified_names.contains_key(IdentifierStr::new("customers")));
+        assert_eq!(
+            qualified_names
+                .get(IdentifierStr::new("customers"))
+                .unwrap(),
+            "main.customers"
+        );
+        assert!(qualified_names.contains_key(IdentifierStr::new("orders")));
+        assert_eq!(
+            qualified_names.get(IdentifierStr::new("orders")).unwrap(),
+            "main.orders"
+        );
 
         let view = IncrementalView::new(
             "test_view".to_string(),
@@ -2243,11 +2251,16 @@ mod tests {
             extract_all_tables(&select, &schema).unwrap();
 
         // Check that qualified names are preserved where specified
-        assert_eq!(qualified_names.get("customers").unwrap(), "main.customers");
+        assert_eq!(
+            qualified_names
+                .get(IdentifierStr::new("customers"))
+                .unwrap(),
+            "main.customers"
+        );
         // Unqualified tables should not have an entry (or have the bare name)
         assert!(
-            !qualified_names.contains_key("orders")
-                || qualified_names.get("orders").unwrap() == "orders"
+            !qualified_names.contains_key(IdentifierStr::new("orders"))
+                || qualified_names.get(IdentifierStr::new("orders")).unwrap() == "orders"
         );
 
         let view = IncrementalView::new(
@@ -2297,8 +2310,14 @@ mod tests {
         assert!(table_names.contains(&"orders"));
 
         // Check aliases from the CTE
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
+        assert_eq!(
+            aliases.get(IdentifierStr::new("c")),
+            Some(&Identifier::new("customers"))
+        );
+        assert_eq!(
+            aliases.get(IdentifierStr::new("o")),
+            Some(&Identifier::new("orders"))
+        );
     }
 
     #[test]
@@ -2430,8 +2449,14 @@ mod tests {
         assert!(table_names.contains(&"products"));
 
         // Check aliases from main query
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("p"), Some(&"products".to_string()));
+        assert_eq!(
+            aliases.get(IdentifierStr::new("c")),
+            Some(&Identifier::new("customers"))
+        );
+        assert_eq!(
+            aliases.get(IdentifierStr::new("p")),
+            Some(&Identifier::new("products"))
+        );
     }
 
     #[test]
@@ -2461,7 +2486,13 @@ mod tests {
         assert_eq!(tables[0].name, "orders"); // Single table, order doesn't matter
 
         // Should have collected two conditions
-        assert_eq!(table_conditions.get("orders").unwrap().len(), 2);
+        assert_eq!(
+            table_conditions
+                .get(IdentifierStr::new("orders"))
+                .unwrap()
+                .len(),
+            2
+        );
 
         // Should combine multiple conditions with OR
         assert_eq!(queries.len(), 1);
@@ -2630,8 +2661,14 @@ mod tests {
         assert!(table_names.contains(&"orders"));
 
         // Check aliases
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
+        assert_eq!(
+            aliases.get(IdentifierStr::new("c")),
+            Some(&Identifier::new("customers"))
+        );
+        assert_eq!(
+            aliases.get(IdentifierStr::new("o")),
+            Some(&Identifier::new("orders"))
+        );
     }
 
     #[test]

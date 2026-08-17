@@ -4,6 +4,7 @@ use crate::vdbe::{
 };
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
@@ -581,7 +582,7 @@ pub fn insn_to_row(
                 default,
             } => {
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
-                let column_name: Option<&String> = match cursor_type {
+                let column_name: Option<&Identifier> = match cursor_type {
                     CursorType::BTreeTable(table) => {
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
@@ -626,7 +627,7 @@ pub fn insn_to_row(
                 let count = defaults.len();
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name = |column: usize| -> String {
-                    let name: Option<&String> = match cursor_type {
+                    let name: Option<&Identifier> = match cursor_type {
                         CursorType::BTreeTable(table) => {
                             table.columns().get(column).and_then(|v| v.name.as_ref())
                         }
@@ -1955,7 +1956,7 @@ pub fn insn_to_row(
                 0,
                 0,
                 0,
-                Value::build_text(index.name.clone()),
+                Value::build_text(index.name.to_string()),
                 0,
                 format!("DROP INDEX {}", index.name),
             ),

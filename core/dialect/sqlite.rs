@@ -144,7 +144,7 @@ pub fn register_builtin_catalog(
 ) -> crate::Result<()> {
     for vtab in pragma_vtabs() {
         schema.tables.insert(
-            vtab.name.to_owned(),
+            turso_parser::identifier::Identifier::new(vtab.name.as_str()),
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
         );
     }

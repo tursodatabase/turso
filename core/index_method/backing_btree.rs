@@ -16,7 +16,7 @@ use crate::{
 pub struct BackingBtreeIndexMethod;
 
 #[derive(Debug)]
-pub struct BackingBTreeIndexMethodAttachment(String);
+pub struct BackingBTreeIndexMethodAttachment(turso_parser::identifier::Identifier);
 
 impl IndexMethod for BackingBtreeIndexMethod {
     fn attach(
@@ -33,7 +33,7 @@ impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: BACKING_BTREE_INDEX_METHOD_NAME,
-            index_name: &self.0,
+            index_name: self.0.as_str(),
             patterns: &[],
             backing_btree: true,
             results_materialized: false,

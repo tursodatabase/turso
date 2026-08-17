@@ -48,7 +48,7 @@ static CUSTOM_COLLATION_NAMES: LazyLock<Mutex<CustomCollationNames>> =
 
 impl CollationSeq {
     pub fn new(collation: &str) -> crate::Result<Self> {
-        match crate::util::normalize_ident(collation).as_str() {
+        match collation.to_ascii_lowercase().as_str() {
             "binary" => return Ok(Self::Binary),
             "nocase" => return Ok(Self::NoCase),
             "rtrim" => return Ok(Self::Rtrim),
@@ -107,7 +107,7 @@ impl CollationSeq {
     }
 
     pub fn custom(collation: &str) -> Self {
-        let normalized = crate::util::normalize_ident(collation);
+        let normalized = collation.to_ascii_lowercase();
         let mut registry = CUSTOM_COLLATION_NAMES.lock();
         if let Some(id) = registry.by_name.get(&normalized) {
             return Self::Custom(*id);
@@ -124,7 +124,7 @@ impl CollationSeq {
     }
 
     pub(crate) fn known_custom(collation: &str) -> Option<Self> {
-        let normalized = crate::util::normalize_ident(collation);
+        let normalized = collation.to_ascii_lowercase();
         CUSTOM_COLLATION_NAMES
             .lock()
             .by_name
@@ -841,7 +841,7 @@ mod tests {
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
         let columns = vec![Column::new(
-            Some("foo".to_string()),
+            Some("foo".into()),
             "text".to_string(),
             None,
             None,
@@ -851,7 +851,7 @@ mod tests {
         )];
         let table = Table::BTree(Arc::new(BTreeTable::new(
             0,
-            "foo".to_string(),
+            "foo".into(),
             vec![],
             columns,
             BTreeCharacteristics::empty(),
@@ -869,7 +869,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            identifier: "foo".to_string(),
+            identifier: "foo".into(),
             internal_id: TableInternalId::from(1),
             join_info: None,
             table,
@@ -886,7 +886,7 @@ mod tests {
         let mut table_references = TableReferences::new_empty();
         // Left table t1(id=1)
         let columns = vec![Column::new(
-            Some("a".to_string()),
+            Some("a".into()),
             "text".to_string(),
             None,
             None,
@@ -903,12 +903,12 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            identifier: "t1".to_string(),
+            identifier: "t1".into(),
             internal_id: TableInternalId::from(1),
             join_info: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
-                "t1".to_string(),
+                "t1".into(),
                 vec![],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
@@ -921,7 +921,7 @@ mod tests {
         });
         // Right table t2(id=2)
         let columns = vec![Column::new(
-            Some("b".to_string()),
+            Some("b".into()),
             "text".to_string(),
             None,
             None,
@@ -938,12 +938,12 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            identifier: "t2".to_string(),
+            identifier: "t2".into(),
             internal_id: TableInternalId::from(2),
             join_info: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
-                "t2".to_string(),
+                "t2".into(),
                 vec![],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
@@ -963,7 +963,7 @@ mod tests {
         use turso_parser::ast::SortOrder;
         let mut table_references = TableReferences::new_empty();
         let columns = vec![Column::new(
-            Some("id".to_string()),
+            Some("id".into()),
             "INTEGER".to_string(),
             None,
             None,
@@ -988,14 +988,14 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            identifier: "bar".to_string(),
+            identifier: "bar".into(),
             internal_id: TableInternalId::from(1),
             join_info: None,
             indexed: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
-                "bar".to_string(),
-                vec![("id".to_string(), SortOrder::Asc)],
+                "bar".into(),
+                vec![("id".into(), SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
                 vec![],

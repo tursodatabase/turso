@@ -18,6 +18,7 @@ use std::future::Future;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
+use turso_parser::identifier::{Identifier, IdentifierStr};
 use turso_parser::parser::Parser;
 
 #[macro_export]
@@ -222,10 +223,10 @@ pub struct ParseSchemaRowsState {
 struct ParseSchemaRowsInner {
     rows: Statement,
     from_sql_indexes: crate::alloc::Vec<UnparsedFromSqlIndex>,
-    automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
-    dbsp_state_roots: HashMap<String, i64>,
-    dbsp_state_index_roots: HashMap<String, i64>,
-    materialized_view_info: HashMap<String, (String, i64)>,
+    automatic_indices: HashMap<Identifier, crate::alloc::Vec<(Identifier, i64)>>,
+    dbsp_state_roots: HashMap<Identifier, i64>,
+    dbsp_state_index_roots: HashMap<Identifier, i64>,
+    materialized_view_info: HashMap<Identifier, (String, i64)>,
 }
 
 impl ParseSchemaRowsState {
@@ -1523,12 +1524,11 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
 }
 
 /// Extract column name from an expression (e.g., for SELECT clauses)
-pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<String> {
+pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<Identifier> {
     match expr.as_ref() {
-        ast::Expr::Id(name) => Some(name.as_str().to_string()),
-        ast::Expr::DoublyQualified(_, _, name) | ast::Expr::Qualified(_, name) => {
-            Some(normalize_ident(name.as_str()))
-        }
+        ast::Expr::Id(name)
+        | ast::Expr::DoublyQualified(_, _, name)
+        | ast::Expr::Qualified(_, name) => Some(name.identifier().clone()),
         _ => None,
     }
 }
@@ -1536,12 +1536,12 @@ pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<Stri
 /// Information about a table referenced in a view
 #[derive(Debug, Clone)]
 pub struct ViewTable {
-    /// Unqualified table name, normalized.
-    pub name: String,
-    /// Database qualifier if present, normalized.
-    pub db_name: Option<String>,
+    /// Unqualified table name.
+    pub name: Identifier,
+    /// Database qualifier if present.
+    pub db_name: Option<Identifier>,
     /// Optional alias (e.g., "c" in "FROM customers c")
-    pub alias: Option<String>,
+    pub alias: Option<Identifier>,
 }
 
 /// Information about a column in the view's output
@@ -1887,7 +1887,7 @@ pub fn validate_select_for_views(
 
 #[derive(Clone)]
 struct ViewSource {
-    qualifiers: Vec<String>,
+    qualifiers: Vec<Identifier>,
     columns: Vec<ViewColumn>,
 }
 
@@ -1912,13 +1912,13 @@ fn append_view_column_schema(
 fn view_source_from_select_table(
     select_table: &ast::SelectTable,
     schema: &Schema,
-    ctes: &HashMap<String, ViewColumnSchema>,
+    ctes: &HashMap<Identifier, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
 ) -> Result<ViewSource> {
     match select_table {
         ast::SelectTable::Table(name, alias, _) => {
-            let table_name = normalize_ident(name.name.as_str());
-            let table_alias = alias.as_ref().map(|a| normalize_ident(a.name().as_str()));
+            let table_name = name.name.identifier().clone();
+            let table_alias = alias.as_ref().map(|a| a.name().identifier().clone());
             let qualifiers = table_alias
                 .clone()
                 .map_or_else(|| vec![table_name.clone()], |alias| vec![alias]);
@@ -1935,7 +1935,7 @@ fn view_source_from_select_table(
             let table_index = tables.len();
             tables.push(ViewTable {
                 name: table_name.clone(),
-                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                db_name: name.db_name.as_ref().map(|db| db.identifier().clone()),
                 alias: table_alias,
             });
             let columns = schema
@@ -1962,7 +1962,7 @@ fn view_source_from_select_table(
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
-                    .map(|a| vec![normalize_ident(a.name().as_str())])
+                    .map(|a| vec![a.name().identifier().clone()])
                     .unwrap_or_default(),
                 columns: append_view_column_schema(derived, tables),
             })
@@ -1972,21 +1972,21 @@ fn view_source_from_select_table(
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
-                    .map(|a| vec![normalize_ident(a.name().as_str())])
+                    .map(|a| vec![a.name().identifier().clone()])
                     .unwrap_or_default(),
                 columns: expand_view_star(&sources),
             })
         }
         ast::SelectTable::TableCall(name, _, alias) => {
-            let table_name = normalize_ident(name.name.as_str());
-            let table_alias = alias.as_ref().map(|a| normalize_ident(a.name().as_str()));
+            let table_name = name.name.identifier().clone();
+            let table_alias = alias.as_ref().map(|a| a.name().identifier().clone());
             let qualifiers = table_alias
                 .clone()
                 .map_or_else(|| vec![table_name.clone()], |alias| vec![alias]);
             let table_index = tables.len();
             tables.push(ViewTable {
                 name: table_name.clone(),
-                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                db_name: name.db_name.as_ref().map(|db| db.identifier().clone()),
                 alias: table_alias,
             });
             let columns = schema
@@ -2033,7 +2033,7 @@ fn view_output_column(source: &ViewColumn) -> ViewColumn {
 fn view_sources_from_clause(
     from: &ast::FromClause,
     schema: &Schema,
-    ctes: &HashMap<String, ViewColumnSchema>,
+    ctes: &HashMap<Identifier, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
 ) -> Result<Vec<(ViewSource, Vec<String>)>> {
     let first = view_source_from_select_table(&from.select, schema, ctes, tables)?;
@@ -2131,15 +2131,15 @@ fn expand_view_star(sources: &[(ViewSource, Vec<String>)]) -> Vec<ViewColumn> {
         .collect()
 }
 
-fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<String, usize>) {
+fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<Identifier, usize>) {
     let name = column
         .column
         .name
         .clone()
-        .unwrap_or_else(|| "?".to_string());
-    let count = counts.entry(normalize_ident(&name)).or_insert(0);
+        .unwrap_or_else(|| Identifier::new("?"));
+    let count = counts.entry(name.clone()).or_insert(0);
     if *count > 0 {
-        column.column.name = Some(format!("{name}:{count}"));
+        column.column.name = Some(Identifier::new(format!("{name}:{count}")));
     } else {
         column.column.name = Some(name);
     }
@@ -2149,16 +2149,16 @@ fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<St
 fn extract_view_columns_inner(
     select_stmt: &ast::Select,
     schema: &Schema,
-    outer_ctes: &HashMap<String, ViewColumnSchema>,
+    outer_ctes: &HashMap<Identifier, ViewColumnSchema>,
 ) -> Result<ViewColumnSchema> {
     let mut ctes = outer_ctes.clone();
     if let Some(with) = &select_stmt.with {
         for cte in &with.ctes {
             let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
             for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
-                column.column.name = Some(explicit_name.col_name.as_str().to_string());
+                column.column.name = Some(explicit_name.col_name.identifier().clone());
             }
-            ctes.insert(normalize_ident(cte.tbl_name.as_str()), derived);
+            ctes.insert(cte.tbl_name.identifier().clone(), derived);
         }
     }
 
@@ -2191,7 +2191,7 @@ fn extract_view_columns_inner(
                             source
                                 .qualifiers
                                 .iter()
-                                .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
+                                .any(|candidate| *candidate == *qualifier)
                         })
                         .and_then(|(source, _)| {
                             source.columns.iter().find(|column| {
@@ -2212,9 +2212,9 @@ fn extract_view_columns_inner(
                 let name = alias
                     .as_ref()
                     .filter(|alias| !matches!(alias, ast::As::ImplicitColumnName(_)))
-                    .map(|alias| alias.name().as_str().to_string())
+                    .map(|alias| alias.name().identifier().clone())
                     .or_else(|| extract_column_name_from_expr(expr))
-                    .unwrap_or_else(|| expr.to_string());
+                    .unwrap_or_else(|| Identifier::new(expr.to_string()));
                 let mut column =
                     source_column
                         .map(view_output_column)
@@ -2232,7 +2232,7 @@ fn extract_view_columns_inner(
                     expanded.push(ViewColumn {
                         table_index: usize::MAX,
                         column: Column::new_default_text(
-                            Some("*".to_string()),
+                            Some(Identifier::new("*")),
                             "TEXT".to_string(),
                             None,
                         ),
@@ -2244,12 +2244,11 @@ fn extract_view_columns_inner(
                 }
             }
             ast::ResultColumn::TableStar(table_ref) => {
-                let qualifier = normalize_ident(table_ref.as_str());
                 if let Some((source, _)) = sources.iter().find(|(source, _)| {
                     source
                         .qualifiers
                         .iter()
-                        .any(|candidate| candidate.eq_ignore_ascii_case(&qualifier))
+                        .any(|candidate| *candidate == *table_ref)
                 }) {
                     for mut column in source.columns.iter().map(view_output_column) {
                         deduplicate_view_column_name(&mut column, &mut column_name_counts);
@@ -2518,7 +2517,7 @@ mod rename_column_view {
 
             for (i, indexed_col) in view_columns.iter().enumerate() {
                 if let Some(col) = final_columns.get_mut(i) {
-                    col.name = Some(indexed_col.col_name.as_str().to_string());
+                    col.name = Some(indexed_col.col_name.identifier().clone());
                 }
             }
 
@@ -2570,8 +2569,8 @@ mod rename_column_view {
                 &ctx.target_db_norm,
             ) {
                 if let Some(ref mut name) = view_column.column.name {
-                    if name.as_str().eq_ignore_ascii_case(ctx.old_column) {
-                        *name = ctx.new_column.to_string();
+                    if *name == ctx.old_column {
+                        *name = Identifier::new(ctx.new_column);
                     }
                 }
             }
@@ -2593,7 +2592,7 @@ mod rename_column_view {
         let mut columns = view_column_schema.flat_columns();
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
-                col.name = Some(indexed_col.col_name.as_str().to_string());
+                col.name = Some(indexed_col.col_name.identifier().clone());
             }
         }
         Ok(columns)
@@ -2980,7 +2979,7 @@ mod rename_column_view {
                     .is_none_or(|db| db == ctx.target_db_norm);
 
                 if is_local {
-                    if let Some(view) = ctx.schema.views.get(&table_name_norm) {
+                    if let Some(view) = ctx.schema.views.get(IdentifierStr::new(&table_name_norm)) {
                         let columns_before = view
                             .columns
                             .iter()
@@ -3361,8 +3360,8 @@ mod rename_column_view {
                     &ctx.target_db_norm,
                 ) {
                     if let Some(ref mut name) = view_column.column.name {
-                        if name.as_str().eq_ignore_ascii_case(ctx.old_column) {
-                            *name = ctx.new_column.to_string();
+                        if *name == ctx.old_column {
+                            *name = Identifier::new(ctx.new_column);
                         }
                     }
                 }
@@ -3371,7 +3370,12 @@ mod rename_column_view {
 
         Ok(columns
             .into_iter()
-            .map(|vc| vc.column.name.unwrap_or_else(|| "?".to_string()))
+            .map(|vc| {
+                vc.column
+                    .name
+                    .map(|name| name.as_str().to_owned())
+                    .unwrap_or_else(|| "?".to_string())
+            })
             .collect())
     }
 
@@ -3466,23 +3470,17 @@ mod rename_column_view {
     }
 
     fn table_source_columns(schema: &Schema, table_name: &str) -> Option<Vec<String>> {
+        let column_names = |columns: &[Column]| {
+            columns
+                .iter()
+                .filter_map(|col| col.name.as_ref().map(|name| name.as_str().to_owned()))
+                .collect()
+        };
         if let Some(table) = schema.get_table(table_name) {
-            return Some(
-                table
-                    .columns()
-                    .iter()
-                    .filter_map(|col| col.name.clone())
-                    .collect(),
-            );
+            return Some(column_names(table.columns()));
         }
-        let table_norm = normalize_ident(table_name);
-        if let Some(view) = schema.views.get(&table_norm) {
-            return Some(
-                view.columns
-                    .iter()
-                    .filter_map(|col| col.name.clone())
-                    .collect(),
-            );
+        if let Some(view) = schema.views.get(IdentifierStr::new(table_name)) {
+            return Some(column_names(&view.columns));
         }
         None
     }

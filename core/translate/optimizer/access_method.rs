@@ -4,6 +4,7 @@ use smallvec::SmallVec;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
@@ -1897,7 +1898,7 @@ fn materialized_subquery_ephemeral_index(
     Ok(Arc::new(Index {
         // Match the runtime autoindex naming so EQP and bytecode make it clear
         // that this is a synthetic probe/index-on-temp-table path.
-        name: format!("ephemeral_subquery_{}", rhs_table.internal_id),
+        name: Identifier::new(format!("ephemeral_subquery_{}", rhs_table.internal_id)),
         columns: index_columns,
         unique: false,
         ephemeral: true,

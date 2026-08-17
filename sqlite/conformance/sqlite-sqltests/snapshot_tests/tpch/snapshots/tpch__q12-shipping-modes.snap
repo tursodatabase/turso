@@ -50,24 +50,24 @@ addr  opcode                  p1  p2  p3  p4                                    
    3          Integer          0   6   0                                          0  r[6]=0; clear group by abort flag
    4          Null             0   7   0                                          0  r[7]=NULL; initialize group by comparison registers to NULL
    5          Gosub           14  87   0                                          0  ; go to clear accumulator subroutine
-   6          OpenRead         2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
-   7          OpenRead         3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   8          Rewind           3  27   0                                          0  Rewind table lineitem
-   9            Column         3  14  15                                          0  r[15]=lineitem.L_SHIPMODE
+   6          OpenRead         2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=ORDERS, root=9, iDb=0
+   7          OpenRead         3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=LINEITEM, root=10, iDb=0
+   8          Rewind           3  27   0                                          0  Rewind table LINEITEM
+   9            Column         3  14  15                                          0  r[15]=LINEITEM.L_SHIPMODE
   10            Eq            15  16  12  Binary                                  0  if r[15]==r[16] goto 12
   11            Ne            15  17  26  Binary                                  0  if r[15]!=r[17] goto 26
-  12            ColumnRange    3  11  19  2                                       0  r[19..20]=lineitem.L_COMMITDATE..L_RECEIPTDATE
+  12            ColumnRange    3  11  19  2                                       0  r[19..20]=LINEITEM.L_COMMITDATE..L_RECEIPTDATE
   13            Ge            19  20  26  Binary                                  0  if r[19]>=r[20] goto 26
-  14            ColumnRange    3  10  22  2                                       0  r[22..23]=lineitem.L_SHIPDATE..L_COMMITDATE
+  14            ColumnRange    3  10  22  2                                       0  r[22..23]=LINEITEM.L_SHIPDATE..L_COMMITDATE
   15            Ge            22  23  26  Binary                                  0  if r[22]>=r[23] goto 26
-  16            Column         3  12  25                                          0  r[25]=lineitem.L_RECEIPTDATE
+  16            Column         3  12  25                                          0  r[25]=LINEITEM.L_RECEIPTDATE
   17            Lt            25  26  26  Binary                                  0  if r[25]<r[26] goto 26
-  18            Column         3  12  28                                          0  r[28]=lineitem.L_RECEIPTDATE
+  18            Column         3  12  28                                          0  r[28]=LINEITEM.L_RECEIPTDATE
   19            Ge            28  29  26  Binary                                  0  if r[28]>=r[29] goto 26
-  20            Column         3   0  30                                          0  r[30]=lineitem.L_ORDERKEY
-  21            SeekRowid      2  30  26                                          0  if (r[30]!=cursor 2 for table orders.rowid) goto 26
-  22            Column         3  14  12                                          0  r[12]=lineitem.L_SHIPMODE
-  23            Column         2   5  13                                          0  r[13]=orders.O_ORDERPRIORITY
+  20            Column         3   0  30                                          0  r[30]=LINEITEM.L_ORDERKEY
+  21            SeekRowid      2  30  26                                          0  if (r[30]!=cursor 2 for table ORDERS.rowid) goto 26
+  22            Column         3  14  12                                          0  r[12]=LINEITEM.L_SHIPMODE
+  23            Column         2   5  13                                          0  r[13]=ORDERS.O_ORDERPRIORITY
   24            MakeRecord    12   2  11                                          0  r[11]=mkrec(r[12..13])
   25            SorterInsert   0  11   0  0                                       0  key=r[11]
   26          Next             3   9   0                                          1

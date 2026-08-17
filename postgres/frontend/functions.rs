@@ -2,6 +2,7 @@ use std::sync::Arc;
 use turso_core::schema::{Schema, Table};
 use turso_core::{Connection, LimboError, Result, Value};
 use turso_parser::ast::RefAct;
+use turso_parser::identifier::Identifier;
 
 const USER_TABLE_OID_START: i64 = 16384;
 
@@ -234,7 +235,7 @@ fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Value {
     Value::from_i64(if valid { 1 } else { 0 })
 }
 
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+fn user_tables_sorted(schema: &Schema) -> Vec<(&Identifier, &Arc<Table>)> {
     let mut tables: Vec<_> = schema
         .tables
         .iter()
@@ -298,10 +299,10 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
         let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
         if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
             if constraint_oid == target_oid {
-                let cols: Vec<String> = btree
+                let cols: Vec<&str> = btree
                     .primary_key_columns
                     .iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, _)| name.as_str())
                     .collect();
                 return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
             }
@@ -323,8 +324,18 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
         for fk in &btree.foreign_keys {
             if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
+                let child_cols = fk
+                    .child_columns
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let parent_cols = fk
+                    .parent_columns
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let mut def = format!(
                     "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
                     fk.parent_table
@@ -373,7 +384,7 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
                         if let Some(expr) = &col.expr {
                             expr.to_string()
                         } else {
-                            col.name.clone()
+                            col.name.to_string()
                         }
                     })
                     .collect();

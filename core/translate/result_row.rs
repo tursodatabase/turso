@@ -291,7 +291,7 @@ pub fn emit_columns_to_destination(
                         flag: InsertFlags::new()
                             .require_seek()
                             .is_ephemeral_table_insert(),
-                        table_name: table.name.clone(),
+                        table_name: table.name.to_string(),
                     });
                 }
                 super::plan::EphemeralRowidMode::Auto => {
@@ -315,7 +315,7 @@ pub fn emit_columns_to_destination(
                         key_reg: rowid_reg,
                         record_reg,
                         flag: InsertFlags::new().is_ephemeral_table_insert(),
-                        table_name: table.name.clone(),
+                        table_name: table.name.to_string(),
                     });
                 }
             }

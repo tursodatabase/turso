@@ -21,7 +21,7 @@ use crate::translate::planner::{
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
@@ -401,7 +401,7 @@ fn prepare_one_select_plan(
             {
                 trace_stack!("bind_windows");
                 for window_def in window_clause.iter() {
-                    let name = normalize_ident(window_def.name.as_str());
+                    let name = window_def.name.identifier().clone();
                     let mut partition_by: Vec<_> = window_def
                         .window
                         .partition_by
@@ -447,16 +447,14 @@ fn prepare_one_select_plan(
                     //   not an error.
                     if let Some(base) = &window_def.window.base {
                         if !named_windows.is_empty() {
-                            let base_name = normalize_ident(base.as_str());
-                            let Some(base_def) =
-                                named_windows.iter().rfind(|d| d.name == base_name)
+                            let Some(base_def) = named_windows.iter().rfind(|d| d.name == *base)
                             else {
-                                crate::bail_parse_error!("no such window: {}", base_name);
+                                crate::bail_parse_error!("no such window: {}", base);
                             };
                             if !window_def.window.partition_by.is_empty() {
                                 crate::bail_parse_error!(
                                     "cannot override PARTITION clause of window: {}",
-                                    base_name
+                                    base
                                 );
                             }
                             let base_bound = base_def
@@ -466,13 +464,13 @@ fn prepare_one_select_plan(
                             if !base_bound.order_by.is_empty() && !order_by.is_empty() {
                                 crate::bail_parse_error!(
                                     "cannot override ORDER BY clause of window: {}",
-                                    base_name
+                                    base
                                 );
                             }
                             if base_def.user_frame_clause.is_some() {
                                 crate::bail_parse_error!(
                                     "cannot override frame specification of window: {}",
-                                    base_name
+                                    base
                                 );
                             }
                             partition_by.clone_from(&base_bound.partition_by);
@@ -517,21 +515,20 @@ fn prepare_one_select_plan(
                             }
                         }
                         ResultColumn::TableStar(name) => {
-                            let name_normalized = normalize_ident(name.as_str());
                             // If this table identifier appears more than once in the FROM
                             // clause, `A.*` is ambiguous (matches SQLite behavior).
                             let dup_count = plan
                                 .table_references
                                 .joined_tables()
                                 .iter()
-                                .filter(|t| t.identifier == name_normalized)
+                                .filter(|t| t.identifier == name)
                                 .count();
                             if dup_count > 1 {
                                 let first_tbl = plan
                                     .table_references
                                     .joined_tables()
                                     .iter()
-                                    .find(|t| t.identifier == name_normalized)
+                                    .find(|t| t.identifier == name)
                                     .unwrap(); // safe: dup_count > 1 guarantees a match
                                 let col_name = first_tbl
                                     .columns()
@@ -550,7 +547,7 @@ fn prepare_one_select_plan(
                                 .table_references
                                 .joined_tables_mut()
                                 .iter_mut()
-                                .find(|t| t.identifier == name_normalized);
+                                .find(|t| t.identifier == name);
 
                             if referenced_table.is_none() {
                                 crate::bail_parse_error!("no such table: {}", name.as_str());
@@ -566,7 +563,7 @@ fn prepare_one_select_plan(
                                     if long_names {
                                         format!("{}.{}", table.identifier, col_name)
                                     } else {
-                                        col_name.clone()
+                                        col_name.to_string()
                                     }
                                 });
                                 plan.result_columns.push(ResultSetColumn {
@@ -1048,10 +1045,14 @@ fn reject_outer_query_refs_in_group_by_expr(
                         .expect(
                             "bound outer-scope Expr::Column must point to a named column in schema",
                         );
+                    // Binding already replaced the user's token with a column
+                    // index, so the original spelling is gone. Report the
+                    // lowercased schema name, which matches SQLite's message
+                    // for the common lowercase query text.
                     crate::bail_parse_error!(
                         "no such column: {}.{}",
                         outer_ref.identifier,
-                        normalize_ident(column_name)
+                        column_name.to_ascii_lowercase()
                     );
                 }
             }
@@ -1134,10 +1135,13 @@ fn reject_outer_scope_refs_inside_select_plan(
                 .get(col_idx)
                 .and_then(|col| col.name.as_deref())
                 .expect("bound outer-scope Expr::Column must point to a named column in schema");
+            // See the note above: the original token is gone after binding,
+            // so report the lowercased schema name like SQLite's message for
+            // lowercase query text.
             crate::bail_parse_error!(
                 "no such column: {}.{}",
                 outer_ref.identifier,
-                normalize_ident(column_name)
+                column_name.to_ascii_lowercase()
             );
         }
         if outer_ref.rowid_referenced {
@@ -1292,17 +1296,16 @@ fn resolve_compound_order_by_expr(
 
     for plan in all_plans {
         if let ast::Expr::Id(name) = expr {
-            let normalized_name = normalize_ident(name.as_str());
             for (index, result_column) in plan.result_columns.iter().enumerate() {
                 if let Some(alias) = &result_column.alias {
-                    if normalize_ident(alias) == normalized_name {
+                    if *name == alias.as_str() {
                         return Ok((index, None));
                     }
                 }
             }
             for (index, result_column) in plan.result_columns.iter().enumerate() {
                 if let Some(column_name) = result_column.name(&plan.table_references) {
-                    if normalize_ident(column_name) == normalized_name {
+                    if *name == column_name {
                         return Ok((index, None));
                     }
                 }
@@ -1936,11 +1939,10 @@ fn find_aliased_aggregate_ref(expr: &ast::Expr, result_columns: &[ResultSetColum
 
     walk_expr(expr, &mut |e| {
         if let Expr::Id(id) = e {
-            let normalized = normalize_ident(id.as_str());
             for rc in result_columns.iter() {
                 if let Some(alias) = &rc.alias {
-                    if alias.eq_ignore_ascii_case(&normalized) && rc.contains_aggregates {
-                        crate::bail_parse_error!("misuse of aliased aggregate {}", normalized);
+                    if *id == alias.as_str() && rc.contains_aggregates {
+                        crate::bail_parse_error!("misuse of aliased aggregate {}", id.as_str());
                     }
                 }
             }

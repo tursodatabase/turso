@@ -53,8 +53,8 @@ QUERY PLAN
 |--LIST SUBQUERY 1
 |  |--LIST SUBQUERY 2
 |  |  `--SCAN part
-|  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
-|  |--SEARCH lineitem USING COVERING INDEX ephemeral_lineitem_t8 (L_PARTKEY=? AND L_SUPPKEY=? AND L_SHIPDATE>=? AND L_SHIPDATE<?) LEFT-JOIN
+|  |--SEARCH partsupp USING INDEX sqlite_autoindex_PARTSUPP_1 (PS_PARTKEY=?)
+|  |--SEARCH lineitem USING COVERING INDEX ephemeral_LINEITEM_t8 (L_PARTKEY=? AND L_SUPPKEY=? AND L_SHIPDATE>=? AND L_SHIPDATE<?) LEFT-JOIN
 |  `--USE SORTER FOR GROUP BY
 |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)

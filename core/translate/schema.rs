@@ -21,8 +21,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, quote_identifier,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    escape_sql_string_literal, quote_identifier, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -34,6 +33,7 @@ use crate::{Connection, MAIN_DB_ID};
 use turso_ext::VTabKind;
 use turso_parser::ast;
 use turso_parser::ast::ColumnDefinition;
+use turso_parser::identifier::Identifier;
 
 /// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
 /// Rejects non-existent columns, non-existent functions, aggregates, window functions,
@@ -44,24 +44,21 @@ pub(crate) fn validate_check_expr(
     column_names: &[&str],
     resolver: &Resolver,
 ) -> Result<()> {
-    let normalized_table = normalize_ident(table_name);
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                let n = normalize_ident(name.as_str());
-                if !column_names.iter().any(|c| normalize_ident(c) == n)
-                    && !ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&n))
+                if !column_names.iter().any(|c| *name == **c)
+                    && !ROWID_STRS.iter().any(|r| *name == *r)
                 {
                     bail_parse_error!("no such column: {}", name.as_str());
                 }
             }
             ast::Expr::Qualified(tbl, col) => {
-                if normalize_ident(tbl.as_str()) != normalized_table {
+                if *tbl != table_name {
                     bail_parse_error!("no such column: {}.{}", tbl.as_str(), col.as_str());
                 }
-                let cn = normalize_ident(col.as_str());
-                if !column_names.iter().any(|c| normalize_ident(c) == cn)
-                    && !ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&cn))
+                if !column_names.iter().any(|c| *col == **c)
+                    && !ROWID_STRS.iter().any(|r| *col == *r)
                 {
                     bail_parse_error!("no such column: {}", col.as_str());
                 }
@@ -201,25 +198,23 @@ fn resolve_check_expr_type(
     use ast::{Literal, Operator, UnaryOperator};
     match expr {
         ast::Expr::Id(name) | ast::Expr::Name(name) => {
-            let n = normalize_ident(name.as_str());
             // rowid/oid/_rowid_ are INTEGER
-            if ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&n)) {
+            if ROWID_STRS.iter().any(|r| *name == *r) {
                 return Ok(CheckExprType::Integer);
             }
             for col in columns {
-                if normalize_ident(col.col_name.as_str()) == n {
+                if col.col_name == *name {
                     return resolve_column_type(col, resolver);
                 }
             }
             bail_parse_error!("no such column: {}", name.as_str());
         }
         ast::Expr::Qualified(_tbl, col) => {
-            let cn = normalize_ident(col.as_str());
-            if ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&cn)) {
+            if ROWID_STRS.iter().any(|r| *col == *r) {
                 return Ok(CheckExprType::Integer);
             }
             for c in columns {
-                if normalize_ident(c.col_name.as_str()) == cn {
+                if c.col_name == *col {
                     return resolve_column_type(c, resolver);
                 }
             }
@@ -1135,8 +1130,8 @@ pub fn translate_create_table(
     };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
-    validate(&body, &normalized_tbl_name, resolver, connection)?;
+    let tbl_name_str = tbl_name.name.as_str();
+    validate(&body, tbl_name_str, resolver, connection)?;
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
@@ -1165,9 +1160,12 @@ pub fn translate_create_table(
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
-        && RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_tbl_name.starts_with(prefix))
+        && RESERVED_TABLE_PREFIXES.iter().any(|prefix| {
+            tbl_name
+                .name
+                .identifier()
+                .starts_with_ignore_ascii_case(prefix)
+        })
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(
@@ -1178,7 +1176,7 @@ pub fn translate_create_table(
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
-        resolver.with_schema(database_id, |s| s.get_object_type(&normalized_tbl_name))
+        resolver.with_schema(database_id, |s| s.get_object_type(tbl_name_str))
     {
         match object_type {
             // IF NOT EXISTS suppresses errors for table/view conflicts
@@ -1359,7 +1357,7 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, program, &normalized_tbl_name)?;
+    let index_regs = collect_autoindexes(&body, program, tbl_name_str)?;
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
@@ -1386,8 +1384,8 @@ pub fn translate_create_table(
         sqlite_schema_cursor_id,
         cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Table,
-        &normalized_tbl_name,
-        &normalized_tbl_name,
+        tbl_name_str,
+        tbl_name_str,
         table_root_reg,
         Some(sql),
     )?;
@@ -1396,7 +1394,7 @@ pub fn translate_create_table(
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                normalized_tbl_name,
+                tbl_name_str,
                 idx + 1
             );
             emit_schema_entry(
@@ -1406,7 +1404,7 @@ pub fn translate_create_table(
                 None,
                 SchemaEntryType::Index,
                 &index_name,
-                &normalized_tbl_name,
+                tbl_name_str,
                 index_reg,
                 None,
             )?;
@@ -1419,7 +1417,7 @@ pub fn translate_create_table(
     // `__turso_internal_seq_<sequence-name>` table.
     // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
     if has_autoincrement {
-        let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&normalized_tbl_name);
+        let autoinc_seq_name = crate::schema::autoincrement_sequence_name(tbl_name_str);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
         let already_exists = resolver.with_schema(database_id, |s| {
@@ -1451,7 +1449,7 @@ pub fn translate_create_table(
     });
 
     // TODO: remove format, it sucks for performance but is convenient
-    let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
+    let escaped_tbl_name = escape_sql_string_literal(tbl_name_str);
     let mut parse_schema_where_clause =
         format!("tbl_name = '{escaped_tbl_name}' AND type != 'trigger'");
     if created_sequence_table {
@@ -1478,7 +1476,7 @@ pub fn translate_create_table(
             table_root_reg,
             col_count,
             database_id,
-            &normalized_tbl_name,
+            tbl_name_str,
             connection,
         )?;
     }
@@ -1850,7 +1848,7 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str())); //  r3
+    let table_reg = program.emit_string8_new_reg(table.get_name().to_string()); //  r3
     program.mark_last_insn_constant();
     let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
@@ -1970,7 +1968,7 @@ pub fn translate_drop_table(
         let temp_has_shadow = resolver.with_schema(crate::TEMP_DB_ID, |s| {
             s.get_table(tbl_name.name.as_str()).is_some()
         });
-        let trigger_names_to_drop: Vec<String> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+        let trigger_names_to_drop: Vec<Identifier> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
             s.get_triggers_for_table(tbl_name.name.as_str())
                 .filter(|trigger| match trigger.target_database_id {
                     Some(db_id) => db_id == database_id,
@@ -2000,7 +1998,7 @@ pub fn translate_drop_table(
                 let name_regs: Vec<usize> = trigger_names_to_drop
                     .iter()
                     .map(|name| {
-                        let reg = program.emit_string8_new_reg(name.clone());
+                        let reg = program.emit_string8_new_reg(name.to_string());
                         program.mark_last_insn_constant();
                         reg
                     })
@@ -2127,7 +2125,7 @@ pub fn translate_drop_table(
         let sqlite_schema_cursor_id_1 =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
         let columns = crate::alloc::try_vec![Column::new(
-            Some("rowid".to_string()),
+            Some(Identifier::new("rowid")),
             "INTEGER".to_string(),
             None,
             None,
@@ -2137,7 +2135,7 @@ pub fn translate_drop_table(
         )]?;
         let simple_table_rc = Arc::new(BTreeTable::new(
             0, // root_page, not relevant for ephemeral table definition
-            "ephemeral_scratch".to_string(),
+            Identifier::new("ephemeral_scratch"),
             crate::alloc::vec![],
             columns,
             BTreeCharacteristics::HAS_ROWID,
@@ -2296,8 +2294,7 @@ pub fn translate_drop_table(
     }) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
-        let dropped_table_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+        let dropped_table_name_reg = program.emit_string8_new_reg(table.get_name().to_string());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2366,8 +2363,7 @@ pub fn translate_drop_table(
             .map(|index| program.alloc_cursor_index(None, index))
             .transpose()?;
         let ver_table_name_reg = program.alloc_register();
-        let dropped_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+        let dropped_name_reg = program.emit_string8_new_reg(table.get_name().to_string());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2464,8 +2460,7 @@ pub fn translate_drop_table(
     // sequence/backing-table is somehow already missing — same idempotency
     // contract as DROP SEQUENCE IF EXISTS.
     if table.btree().is_some_and(|bt| bt.has_autoincrement) {
-        let seq_name =
-            crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
+        let seq_name = crate::schema::autoincrement_sequence_name(table.get_name());
         crate::translate::sequence::emit_drop_sequence_cleanup(
             program,
             resolver,
@@ -2648,7 +2643,7 @@ pub fn translate_create_type(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let normalized_name = normalize_ident(type_name);
+    let normalized_name = type_name;
 
     // Reject names that shadow SQLite base types
     let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
@@ -2662,7 +2657,7 @@ pub fn translate_create_type(
     // Check if type already exists
     if resolver
         .schema()
-        .get_type_def_unchecked(&normalized_name)
+        .get_type_def_unchecked(normalized_name)
         .is_some()
     {
         if if_not_exists {
@@ -2687,9 +2682,9 @@ pub fn translate_create_type(
     }
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence
-    let sql = build_create_type_sql(&normalized_name, body);
+    let sql = build_create_type_sql(normalized_name, body);
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    persist_type_definition(normalized_name.to_string(), sql, resolver, program)
 }
 
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
@@ -2798,7 +2793,7 @@ pub fn translate_create_domain(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let normalized_name = normalize_ident(domain_name);
+    let normalized_name = domain_name;
 
     // Reject names that shadow SQLite base types
     let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
@@ -2812,7 +2807,7 @@ pub fn translate_create_domain(
     // Check if type/domain already exists
     if resolver
         .schema()
-        .get_type_def_unchecked(&normalized_name)
+        .get_type_def_unchecked(normalized_name)
         .is_some()
     {
         if if_not_exists {
@@ -2822,7 +2817,7 @@ pub fn translate_create_domain(
     }
 
     // Validate base type exists — must be a primitive or a registered type
-    let base_normalized = normalize_ident(base_type);
+    let base_normalized = base_type;
     let is_primitive = turso_macros::match_ignore_ascii_case!(match base_normalized.as_bytes() {
         b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" => true,
         _ => false,
@@ -2830,7 +2825,7 @@ pub fn translate_create_domain(
     if !is_primitive
         && resolver
             .schema()
-            .get_type_def_unchecked(&base_normalized)
+            .get_type_def_unchecked(base_normalized)
             .is_none()
     {
         bail_parse_error!("base type \"{base_type}\" does not exist");
@@ -2838,9 +2833,7 @@ pub fn translate_create_domain(
 
     // Validate no cycles — check if base type chain is acyclic
     if !is_primitive {
-        resolver
-            .schema()
-            .resolve_base_type_chain(&base_normalized)?;
+        resolver.schema().resolve_base_type_chain(base_normalized)?;
     }
 
     // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)
@@ -2869,7 +2862,7 @@ pub fn translate_create_domain(
         s
     };
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    persist_type_definition(normalized_name.to_string(), sql, resolver, program)
 }
 
 pub fn translate_drop_type(
@@ -2879,11 +2872,11 @@ pub fn translate_drop_type(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let normalized_name = normalize_ident(type_name);
+    let normalized_name = type_name;
     let kind = if is_domain_drop { "domain" } else { "type" };
 
     // Check if type exists
-    let type_def = resolver.schema().get_type_def_unchecked(&normalized_name);
+    let type_def = resolver.schema().get_type_def_unchecked(normalized_name);
     if type_def.is_none() {
         if if_exists {
             return Ok(());
@@ -2910,7 +2903,7 @@ pub fn translate_drop_type(
     // Check if any table uses this type
     for (_, table) in resolver.schema().tables.iter() {
         for col in table.columns() {
-            if normalize_ident(&col.ty_str) == normalized_name {
+            if col.ty_str.eq_ignore_ascii_case(normalized_name) {
                 bail_parse_error!(
                     "cannot drop type {normalized_name}: used by column {} in table {}",
                     col.name.as_deref().unwrap_or("?"),
@@ -2922,7 +2915,7 @@ pub fn translate_drop_type(
 
     // Check if any other type/domain depends on this type
     for (name, td) in resolver.schema().type_registry.iter() {
-        if normalize_ident(td.base()) == normalized_name {
+        if td.base().eq_ignore_ascii_case(normalized_name) {
             bail_parse_error!(
                 "cannot drop type {}: type {} depends on it",
                 normalized_name,
@@ -2947,7 +2940,7 @@ pub fn translate_drop_type(
     let name_reg = program.alloc_register();
     program.emit_insn(Insn::String8 {
         dest: name_reg,
-        value: normalized_name.clone(),
+        value: normalized_name.to_string(),
     });
 
     let end_loop_label = program.allocate_label();
@@ -2994,7 +2987,7 @@ pub fn translate_drop_type(
     // Remove from in-memory schema
     program.emit_insn(Insn::DropType {
         db: MAIN_DB_ID,
-        type_name: normalized_name,
+        type_name: normalized_name.to_string(),
     });
 
     program.emit_insn(Insn::SetCookie {

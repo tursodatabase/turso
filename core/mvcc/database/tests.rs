@@ -502,13 +502,18 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     db.conn.reparse_schema().unwrap();
     let schema = db.conn.schema.read().clone();
     db.conn.promote_to_regular_connection();
-    let table_root = match schema.tables.get("t").expect("table t").as_ref() {
+    let table_root = match schema
+        .tables
+        .get(turso_parser::identifier::IdentifierStr::new("t"))
+        .expect("table t")
+        .as_ref()
+    {
         Table::BTree(btree) => btree.root_page,
         _ => panic!("expected btree table"),
     };
     let index_root = schema
         .indexes
-        .get("t")
+        .get(turso_parser::identifier::IdentifierStr::new("t"))
         .and_then(|indexes| indexes.front())
         .map(|index| index.root_page)
         .expect("index idx_t_v");
@@ -9025,8 +9030,8 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     let db = MvccTestDb::new();
     let pager = db.conn.pager.load().clone();
     let index = crate::schema::Index {
-        name: "testindex".to_string(),
-        table_name: "test".to_string(),
+        name: "testindex".into(),
+        table_name: "test".into(),
         root_page: 0,
         columns: IndexColumn::new_many(vec!["id"]),
         unique: true,
