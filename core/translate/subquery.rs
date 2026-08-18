@@ -18,7 +18,7 @@ use crate::{
         },
         eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
+            comparison_affinity_expr, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
             WalkControl,
         },
         optimizer::optimize_select_plan,
@@ -843,11 +843,8 @@ fn get_subquery_parser<'a>(
 
                 if reg_count == 1 {
                     if let Some(result_col) = plan.result_columns.first() {
-                        let affinity = get_expr_affinity_info(
-                            &result_col.expr,
-                            Some(&plan.table_references),
-                            None,
-                        );
+                        let affinity =
+                            get_expr_affinity(&result_col.expr, Some(&plan.table_references), None);
                         resolver
                             .subquery_affinities
                             .borrow_mut()
@@ -981,10 +978,9 @@ fn get_subquery_parser<'a>(
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
                 let mut lhs_collations = Vec::with_capacity(lhs_column_count);
                 for (i, lhs_expr) in lhs_columns.enumerate() {
-                    let lhs_affinity =
-                        get_expr_affinity_info(lhs_expr, Some(referenced_tables), None);
+                    let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables), None);
                     affinity_chars.push(
-                        compare_affinity(
+                        comparison_affinity_expr(
                             &result_columns[i].expr,
                             lhs_affinity,
                             Some(table_references),

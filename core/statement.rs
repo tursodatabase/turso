@@ -268,7 +268,7 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
         crate::vdbe::affinity::Affinity::Real => Some("REAL"),
         crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
         crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
-        crate::vdbe::affinity::Affinity::Blob => None,
+        crate::vdbe::affinity::Affinity::Blob | crate::vdbe::affinity::Affinity::None => None,
     }
 }
 
@@ -1278,13 +1278,7 @@ impl Statement {
             Some(&self.program.table_references),
             None,
         );
-        match affinity {
-            crate::vdbe::affinity::Affinity::Integer => Some("INTEGER".to_string()),
-            crate::vdbe::affinity::Affinity::Real => Some("REAL".to_string()),
-            crate::vdbe::affinity::Affinity::Text => Some("TEXT".to_string()),
-            crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC".to_string()),
-            crate::vdbe::affinity::Affinity::Blob => None, // Blob means "no affinity"
-        }
+        affinity_to_primitive(affinity).map(str::to_string)
     }
 
     pub fn parameters(&self) -> &parameters::Parameters {

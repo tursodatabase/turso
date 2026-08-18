@@ -116,8 +116,12 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
         for join_key in &self.hash_join_op.join_keys {
             let build_expr = join_key.get_build_expr(self.predicates);
             let probe_expr = join_key.get_probe_expr(self.predicates);
-            let affinity =
-                comparison_affinity(build_expr, probe_expr, Some(self.table_references), None);
+            let affinity = comparison_affinity_exprs(
+                build_expr,
+                probe_expr,
+                Some(self.table_references),
+                None,
+            );
             key_affinities.push(affinity.aff_mask());
         }
 

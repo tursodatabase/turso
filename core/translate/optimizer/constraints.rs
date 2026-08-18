@@ -4,7 +4,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         expr::{
-            as_binary_components, comparison_affinity, get_expr_affinity, truth_test_rhs,
+            as_binary_components, comparison_affinity_exprs, get_expr_affinity, truth_test_rhs,
             unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
@@ -155,7 +155,7 @@ impl Constraint {
             // known through it. Without it, `text_col < (SELECT int_col ...)`
             // would take the TEXT side's affinity and the seek would compare
             // the integer as text.
-            affinity = comparison_affinity(lhs, rhs, referenced_tables, resolver);
+            affinity = comparison_affinity_exprs(lhs, rhs, referenced_tables, resolver);
         }
 
         if side == BinaryExprSide::Lhs {
@@ -596,7 +596,7 @@ pub fn constraints_from_where_clause(
                 let cmp_aff = operator
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
-                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                    .map(|_| comparison_affinity_exprs(lhs, rhs, Some(table_references), None));
                 // A WHERE term must not constrain the loop of a table that an
                 // outer join can null-extend, with two exceptions below.
                 // Consuming the term into the access path filters that table's
@@ -2052,7 +2052,7 @@ pub(crate) fn analyze_binary_term_for_index(
     // Compute the affinity for the constraining expression
     let affinity = if let Some(ast_op) = operator.as_ast_operator() {
         if ast_op.is_comparison() && table_col_pos.is_some() {
-            comparison_affinity(lhs, rhs, Some(table_references), None)
+            comparison_affinity_exprs(lhs, rhs, Some(table_references), None)
         } else {
             Affinity::Blob
         }
