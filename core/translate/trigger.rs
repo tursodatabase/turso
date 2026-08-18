@@ -157,35 +157,53 @@ pub fn translate_create_trigger(
         );
     }
 
-    // Verify the table exists (use the table's database, not the trigger's).
+    // Verify the table or view exists (use the target object's database, not the trigger's).
     let table = resolver.with_schema(target_table_database_id, |s| {
         s.get_table(&normalized_table_name)
     });
-    let Some(table) = table else {
-        // SQLite qualifies a non-temp trigger's missing target table with its
-        // database ("no such table: main.t1"); temp triggers report the name
-        // as the user wrote it.
-        if temporary {
-            bail_parse_error!(
-                "no such table: {}",
-                crate::util::table_name_for_error(&tbl_name)
-            );
-        }
-        let db_name = resolver
-            .get_database_name_by_index(target_table_database_id)
-            .unwrap_or_else(|| "main".to_string());
-        bail_parse_error!("no such table: {}.{}", db_name, tbl_name.name.as_str());
-    };
-    if table.virtual_table().is_some() {
-        bail_parse_error!("cannot create triggers on virtual tables");
-    }
+    let view = resolver.with_schema(target_table_database_id, |s| {
+        s.get_view(&normalized_table_name)
+    });
 
-    if time
-        .as_ref()
-        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
-    {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
-    }
+    let target_name = crate::util::table_name_for_error(&tbl_name);
+    let _table = match (table, view) {
+        (None, None) => {
+            // SQLite qualifies a non-temp trigger's missing target table with its
+            // database ("no such table: main.t1"); temp triggers report the name
+            // as the user wrote it.
+            if temporary {
+                bail_parse_error!("no such table: {target_name}");
+            }
+            let db_name = resolver
+                .get_database_name_by_index(target_table_database_id)
+                .unwrap_or_else(|| "main".to_string());
+            bail_parse_error!("no such table: {db_name}.{}", tbl_name.name.as_str());
+        }
+        (Some(_), _)
+            if time
+                .as_ref()
+                .is_some_and(|t| *t == ast::TriggerTime::InsteadOf) =>
+        {
+            bail_parse_error!("cannot create INSTEAD OF trigger on table: {target_name}");
+        }
+        (Some(table), _) => {
+            if table.virtual_table().is_some() {
+                bail_parse_error!("cannot create triggers on virtual tables");
+            }
+            table
+        }
+        (None, Some(_)) => match time {
+            Some(ast::TriggerTime::Before) | None => {
+                bail_parse_error!("cannot create BEFORE trigger on view: {target_name}");
+            }
+            Some(ast::TriggerTime::After) => {
+                bail_parse_error!("cannot create AFTER trigger on view: {target_name}");
+            }
+            Some(ast::TriggerTime::InsteadOf) => {
+                bail_parse_error!("INSTEAD OF triggers on views are not supported yet");
+            }
+        },
+    };
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);

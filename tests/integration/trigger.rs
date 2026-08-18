@@ -2097,6 +2097,64 @@ fn test_changes_after_trigger_ignore_preserves_outer_and_trigger_counts(db: Temp
 }
 
 #[turso_macros::test()]
+fn test_trigger_view_and_instead_of_validation(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1 (a, b)").unwrap();
+    conn.execute("CREATE VIEW v1 AS SELECT * FROM t1").unwrap();
+
+    // 1. INSTEAD OF on a physical table is illegal in SQLite
+    let err = conn
+        .execute("CREATE TRIGGER tr_table_instead INSTEAD OF INSERT ON t1 BEGIN SELECT 1; END")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot create INSTEAD OF trigger on table: t1"),
+        "Unexpected error: {err}"
+    );
+
+    // 2. BEFORE trigger on a view is illegal in SQLite
+    let err = conn
+        .execute("CREATE TRIGGER tr_view_before BEFORE INSERT ON v1 BEGIN SELECT 1; END")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot create BEFORE trigger on view: v1"),
+        "Unexpected error: {err}"
+    );
+
+    // 3. AFTER trigger on a view is illegal in SQLite
+    let err = conn
+        .execute("CREATE TRIGGER tr_view_after AFTER INSERT ON v1 BEGIN SELECT 1; END")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot create AFTER trigger on view: v1"),
+        "Unexpected error: {err}"
+    );
+
+    // 4. Default timing (no BEFORE/AFTER specified) on a view defaults to BEFORE in SQLite
+    let err = conn
+        .execute("CREATE TRIGGER tr_view_default INSERT ON v1 BEGIN SELECT 1; END")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot create BEFORE trigger on view: v1"),
+        "Unexpected error: {err}"
+    );
+
+    // 5. INSTEAD OF on a view gives a clear message
+    let err = conn
+        .execute("CREATE TRIGGER tr_view_instead INSTEAD OF INSERT ON v1 BEGIN SELECT 1; END")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("INSTEAD OF triggers on views are not supported yet"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[turso_macros::test()]
 fn test_changes_after_foreign_key_failure_reset_to_zero(db: TempDatabase) {
     let conn = db.connect_limbo();
 
