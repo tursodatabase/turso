@@ -5242,9 +5242,10 @@ const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
 const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
 // Bits 20-22: base type affinity override.
-// 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1,
-// 6 = no declared affinity at all (e.g. a FROM-subquery/CTE/view column
-// backed by a literal or computed expression, not a real declared type)
+// 0 = not set (use ty_str-based affinity), anything else is `Affinity as u32`,
+// read back with `Affinity::from_repr`. `Affinity::None` lives in there too, for
+// a column with no declared type at all (e.g. a FROM-subquery/CTE/view column
+// backed by a literal or computed expression).
 const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
 const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
@@ -5254,25 +5255,19 @@ const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
 impl Column {
     pub fn affinity(&self) -> Affinity {
-        let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
-        if v > 0 {
-            match v {
-                1 => Affinity::Integer,
-                2 => Affinity::Text,
-                3 => Affinity::Blob,
-                4 => Affinity::Real,
-                5 => Affinity::Numeric,
-                6 => Affinity::None,
-                _ => Affinity::None,
-            }
-        } else {
-            Affinity::affinity(&self.ty_str)
+        let v = (self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT;
+        if v == 0 {
+            return Affinity::affinity(&self.ty_str);
         }
+        Affinity::from_repr(v)
+            .expect("only set_base_affinity writes these bits, so they always name an affinity")
     }
 
     /// Set the base type affinity override for a custom type column.
     /// This ensures affinity rules use the custom type's BASE type
     /// rather than applying SQLite name-based rules to the type name.
+    /// Read back with [`Column::affinity`], which goes through
+    /// [`Affinity::from_repr`].
     pub fn set_base_affinity(&mut self, affinity: Affinity) {
         let v: u32 = affinity as u32;
         self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
@@ -7390,5 +7385,34 @@ mod tests {
             !schema.sequences.contains_key("broken_seq"),
             "rejected descriptor must not land in the sequences map",
         );
+    }
+
+    #[test]
+    fn set_base_affinity_reads_back_the_same_affinity() {
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            let mut col = Column::new(
+                Some("x".to_string()),
+                "BLOB".to_string(),
+                None,
+                None,
+                Type::Blob,
+                None,
+                ColDef::default(),
+            );
+            col.set_base_affinity(affinity);
+            assert_eq!(
+                col.affinity(),
+                affinity,
+                "stored {affinity:?} but read back {:?}",
+                col.affinity(),
+            );
+        }
     }
 }

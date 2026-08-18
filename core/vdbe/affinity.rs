@@ -92,6 +92,24 @@ pub const SQLITE_AFF_INTEGER: char = 'D';
 pub const SQLITE_AFF_REAL: char = 'E';
 
 impl Affinity {
+    /// Turns the number produced by `self as u32` back into an `Affinity`.
+    ///
+    /// `Column` packs an affinity into a few bits of its `raw` field, and
+    /// needs to read it back out. Keep this in step with the discriminants
+    /// on the enum above; `affinity_round_trips_through_its_number` checks
+    /// that it is.
+    pub fn from_repr(repr: u32) -> Option<Self> {
+        match repr {
+            1 => Some(Affinity::Blob),
+            2 => Some(Affinity::Text),
+            3 => Some(Affinity::Numeric),
+            4 => Some(Affinity::Integer),
+            5 => Some(Affinity::Real),
+            6 => Some(Affinity::None),
+            _ => None,
+        }
+    }
+
     /// This is meant to be used in opcodes like Eq, which state:
     ///
     /// "The SQLITE_AFF_MASK portion of P5 must be an affinity character - SQLITE_AFF_TEXT, SQLITE_AFF_INTEGER, and so forth.
@@ -794,5 +812,25 @@ mod tests {
         assert_eq!(parsed.as_integer(), None);
         let (_, parsed) = try_for_float(b"-9.223372036854775808e18");
         assert_eq!(parsed.as_integer(), None);
+    }
+
+    #[test]
+    fn affinity_round_trips_through_its_number() {
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            assert_eq!(
+                Affinity::from_repr(affinity as u32),
+                Some(affinity),
+                "{affinity:?} does not survive the trip through `as u32`",
+            );
+        }
+        // Zero means "no affinity stored", so it must not name one.
+        assert_eq!(Affinity::from_repr(0), None);
     }
 }
