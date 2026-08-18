@@ -1352,6 +1352,8 @@ impl ProgramBuilder {
         self.mode.query_mode()
     }
 
+    /// Returns the index of the emitted Explain opcode.
+    /// 
     /// Prefer calling the emit_explain! macro instead.
     pub fn emit_explain_should_not_be_called_directly(
         &mut self,
