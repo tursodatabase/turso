@@ -20568,3 +20568,41 @@ fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
     // Now that the reader is gone, Truncate can proceed.
     writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
+
+#[test]
+fn correlated_subquery_outer_rowid_from_covering_index_scan() {
+    // Regression for #8395: a correlated subquery reading the OUTER query's
+    // rowid panicked ("Cursor not found") when the outer query used a covering
+    // index scan (no table cursor open). Fix: fall back to reading the rowid
+    // from the outer query's index cursor via IdxRowId. Must match SQLite:
+    //   SELECT a, (SELECT t.rowid) FROM t INDEXED BY i WHERE a >= 1 ORDER BY a
+    //   -> [(1, 2), (2, 1)]  (a, rowid)
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(a, b)").unwrap();
+    conn.execute("CREATE INDEX i ON t(a)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'x'), (1, 'y')").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT a, (SELECT t.rowid) FROM t INDEXED BY i WHERE a >= 1 ORDER BY a",
+    );
+    let vals: Vec<(i64, i64)> = rows
+        .iter()
+        .map(|r| (r[0].as_int().unwrap(), r[1].as_int().unwrap()))
+        .collect();
+    assert_eq!(vals, vec![(1, 2), (2, 1)]);
+
+    // Also: outer rowid when the table cursor IS open (plain scan) — must not
+    // regress to using the index cursor when the table cursor is available.
+    let rows = get_rows(
+        &conn,
+        "SELECT a, (SELECT t.rowid) FROM t WHERE a >= 1 ORDER BY a",
+    );
+    let vals: Vec<(i64, i64)> = rows
+        .iter()
+        .map(|r| (r[0].as_int().unwrap(), r[1].as_int().unwrap()))
+        .collect();
+    assert_eq!(vals, vec![(1, 2), (2, 1)]);
+}

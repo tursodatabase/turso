@@ -2702,6 +2702,10 @@ pub fn translate_expr(
                 (None, false)
             };
 
+            let (is_from_outer_query_scope, _) = referenced_tables
+                .find_table_by_internal_id(*table_ref_id)
+                .expect("table reference should be found");
+
             if use_covering_index {
                 let index =
                     index.expect("index cursor should be opened when use_covering_index=true");
@@ -2711,6 +2715,27 @@ pub fn translate_expr(
                     cursor_id,
                     dest: target_register,
                 });
+            } else if is_from_outer_query_scope {
+                // A correlated subquery reading the OUTER query's rowid: the outer
+                // query may use a covering index scan (no table cursor open). Mirror
+                // the column path (Expr::Column): use the table cursor when one is
+                // open; otherwise read the rowid from the outer query's index cursor
+                // via IdxRowId. Fixes #8395 (panic "Cursor not found").
+                if let Some(table_cursor_id) =
+                    program.resolve_cursor_id_safe(&CursorKey::table(*table_ref_id))
+                {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: table_cursor_id,
+                        dest: target_register,
+                    });
+                } else {
+                    let index_cursor_id =
+                        program.resolve_any_index_cursor_id_for_table(*table_ref_id);
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: index_cursor_id,
+                        dest: target_register,
+                    });
+                }
             } else {
                 let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
                 program.emit_insn(Insn::RowId {
