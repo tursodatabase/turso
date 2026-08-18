@@ -1,3 +1,4 @@
+use crate::translate::plan::Operation::HashJoin;
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
     aggregation::agg_arg_collation,
@@ -527,13 +528,8 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
                 .expect("probe table must be in join order");
             for join in &plan.join_order[..probe_pos] {
                 m.set(join.original_idx)?;
-                // An earlier hash join's probe loop is still open here, so its
-                // build table's columns are readable too: every referenced
-                // build column travels in payload registers that the probe
-                // refills for each row.
-                if let crate::translate::plan::Operation::HashJoin(hj) =
-                    &plan.table_references.joined_tables()[join.original_idx].op
-                {
+                // An earlier hash join's build table is also accessible.
+                if let HashJoin(hj) = &plan.table_references.joined_tables()[join.original_idx].op {
                     m.set(hj.build_table_idx)?;
                 }
             }
