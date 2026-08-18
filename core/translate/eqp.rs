@@ -674,7 +674,7 @@ impl EqpDetail {
     }
 
     /// Output the plan in json format for `EXPLAIN QUERY PLAN format=json`.
-    fn write_json(&self, out: &mut String) {
+    fn write_json(&self, out: &mut String, hash_join_build_node: Option<usize>) {
         let mut obj = JsonBuilder::new(out);
         match self {
             Self::ConstantRow => obj.str("type", "constant_row"),
@@ -736,6 +736,9 @@ impl EqpDetail {
             } => {
                 obj.str("type", "hash_join");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
+                if let Some(build_node) = hash_join_build_node {
+                    obj.num("build_node", build_node);
+                }
             }
             Self::HashBuild { table } => {
                 obj.str("type", "hash_build");
@@ -836,7 +839,13 @@ pub fn program_plan_json(program: &Program) -> String {
             None => node.key("parent").push_str("null"),
         }
         node.str("detail", &detail.to_string());
-        detail.write_json(node.key("op"));
+        let build_node = program
+            .explain
+            .hash_join_build_nodes
+            .iter()
+            .find(|(probe_node, _)| probe_node == p1)
+            .map(|(_, build_node)| *build_node);
+        detail.write_json(node.key("op"), build_node);
         node.finish();
     }
     nodes.push(']');

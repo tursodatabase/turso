@@ -620,7 +620,9 @@ impl ProgramBuilderOpts {
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
         if let $crate::QueryMode::ExplainQueryPlan { .. } = $builder.get_query_mode() {
-            $builder.emit_explain_should_not_be_called_directly($push, $detail);
+            $builder.emit_explain_should_not_be_called_directly($push, $detail)
+        } else {
+            None
         }
     };
 }
@@ -1351,22 +1353,33 @@ impl ProgramBuilder {
     }
 
     /// Prefer calling the emit_explain! macro instead.
-    pub fn emit_explain_should_not_be_called_directly(&mut self, push: bool, detail: EqpDetail) {
+    pub fn emit_explain_should_not_be_called_directly(
+        &mut self,
+        push: bool,
+        detail: EqpDetail,
+    ) -> Option<usize> {
         let BuilderQueryMode::ExplainQueryPlan {
             current_parent_idx, ..
         } = self.mode
         else {
-            return;
+            return None;
         };
         self.emit_insn(Insn::Explain {
             p1: self.insns.len(),
             p2: current_parent_idx,
             detail: Box::new(detail),
         });
+        let emitted = self.insns.len() - 1;
         if push {
-            let emitted = self.insns.len() - 1;
             *self.current_parent_idx_mut() = Some(emitted);
         }
+        Some(emitted)
+    }
+
+    pub fn record_hash_join_build_node(&mut self, probe_node: usize, build_node: usize) {
+        self.explain
+            .hash_join_build_nodes
+            .push((probe_node, build_node));
     }
 
     pub fn with_cte_materialization_eqp<T>(
