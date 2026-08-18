@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+pub use crate::io::IOExt;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
@@ -6,7 +7,6 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
-use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
     types::{Value, ValueType},
@@ -14,18 +14,10 @@ use crate::{
 };
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::future::Future;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
 use turso_parser::parser::Parser;
-
-#[macro_export]
-macro_rules! io_yield_one {
-    ($c:expr) => {
-        return Ok(IOResult::IO(IOCompletions($c)));
-    };
-}
 
 #[macro_export]
 macro_rules! eq_ignore_ascii_case {
@@ -77,38 +69,6 @@ macro_rules! ends_with_ignore_ascii_case {
             eq_ignore_ascii_case!(&$var[$var.len() - $value.len()..], $value)
         }
     }};
-}
-
-pub trait IOExt {
-    fn block<T>(&self, f: impl FnMut() -> Result<IOResult<T>>) -> Result<T>;
-    fn wait<T, F>(&self, f: F) -> impl Future<Output = Result<T>> + Send
-    where
-        F: FnMut() -> Result<IOResult<T>> + Send,
-        T: Send;
-}
-
-impl<I: ?Sized + IO> IOExt for I {
-    fn block<T>(&self, mut f: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
-        Ok(loop {
-            match f()? {
-                IOResult::Done(v) => break v,
-                IOResult::IO(io) => io.wait(self)?,
-            }
-        })
-    }
-
-    async fn wait<T, F>(&self, mut f: F) -> Result<T>
-    where
-        F: FnMut() -> Result<IOResult<T>> + Send,
-        T: Send,
-    {
-        Ok(loop {
-            match f()? {
-                IOResult::Done(v) => break v,
-                IOResult::IO(io) => io.wait_async(self).await?,
-            }
-        })
-    }
 }
 
 // https://sqlite.org/lang_keywords.html

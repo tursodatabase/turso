@@ -46,7 +46,8 @@ Default: add coverage to the narrowest existing test harness that can express th
 
 ```
 limbo/
-├── core/           # Database engine (translate/, storage/, vdbe/, io/, mvcc/)
+├── core/           # Database engine (translate/, storage/, vdbe/, mvcc/)
+│   └── crates/     # Split-out engine crates: common (errors/sync/alloc), io, types, json
 ├── sqlite/
 │   └── parser/     # SQL parser (lexer, AST, grammar)
 ├── cli/            # tursodb CLI (REPL, MCP server, sync server)

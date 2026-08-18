@@ -27,14 +27,7 @@ pub fn get_extension_libraries() -> Arc<Mutex<ExtensionStore>> {
 type Vfs = (String, Arc<VfsMod>);
 static VFS_MODULES: OnceLock<Mutex<Vec<Vfs>>> = OnceLock::new();
 
-#[derive(Clone, Debug)]
-pub struct VfsMod {
-    pub ctx: *const VfsImpl,
-}
-
-unsafe impl Send for VfsMod {}
-unsafe impl Sync for VfsMod {}
-crate::assert::assert_send_sync!(VfsMod);
+use crate::io::VfsMod;
 
 impl Connection {
     #[cfg(not(target_family = "wasm"))]

@@ -1,0 +1,75 @@
+# Copyright 2023-2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_core_io"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "I/O layer for the Turso database library: completions, buffers, platform backends"
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_core_io"
+path = "lib.rs"
+
+[features]
+default = []
+fs = ["turso_ext/vfs"]
+io_uring = ["dep:io-uring", "rustix/io_uring", "turso_core_common/io_uring"]
+experimental_win_iocp = []
+# Test only: exposed to testing/stress and the simulator, never to regular library users.
+io_memory_yield = []
+simulator = ["io_memory_yield"]
+test_helper = []
+
+[dependencies]
+turso_core_common = { workspace = true }
+turso_ext = { workspace = true, features = ["core_only"] }
+turso_macros = { workspace = true }
+bitflags = { workspace = true }
+cfg_block = "0.1.1"
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+crossbeam-utils = "0.8.21"
+parking_lot = { workspace = true, features = ["arc_lock"] }
+rand = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+branches = { version = "0.4.3", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7.5", optional = true }
+libc = { version = "0.2.172" }
+
+[target.'cfg(target_family = "unix")'.dependencies]
+polling = "3.7.4"
+rustix = { version = "1.0.5", features = ["fs"] }
+libc = { version = "0.2.172" }
+
+[target.'cfg(antithesis)'.dependencies]
+antithesis_sdk = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
+[build-dependencies]
+cfg_aliases = "0.2.1"

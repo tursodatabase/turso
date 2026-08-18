@@ -1,5 +1,6 @@
 use divan::{black_box, Bencher};
 use turso_core::types::Value;
+use turso_core::vdbe::value::ValueExecOps;
 
 // =============================================================================
 // LIKE Pattern Matching Benchmarks

@@ -12,14 +12,14 @@
 )]
 #![recursion_limit = "256"]
 
-pub mod alloc;
+pub use turso_core_common::alloc;
 pub mod busy;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod functions;
 pub mod index_method;
-pub mod io;
+pub use turso_core_io as io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
 #[cfg(all(
@@ -31,10 +31,10 @@ pub mod json;
 mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod numeric;
+pub use turso_core_types::numeric;
 pub mod schema;
-pub mod skiplist;
-pub mod state_machine;
+pub use turso_core_common::skiplist;
+pub use turso_core_io::state_machine;
 pub mod storage;
 pub mod types;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
@@ -43,16 +43,15 @@ pub mod vector;
 
 #[cfg(feature = "cli_only")]
 pub(crate) mod btree_dump;
-pub(crate) mod sync;
-pub(crate) mod thread;
+pub(crate) use turso_core_common::{sync, thread};
 
-mod assert;
+pub(crate) use turso_core_common::assert;
 mod connection;
 mod database;
 pub mod dialect;
-mod error;
+pub(crate) use turso_core_common::error;
 mod ext;
-mod fast_lock;
+pub(crate) use turso_core_common::fast_lock;
 mod function;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod functions;
@@ -63,7 +62,7 @@ mod info;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod numeric;
+pub(crate) use turso_core_types::numeric;
 mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
@@ -73,7 +72,7 @@ mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
-mod stack;
+pub(crate) use turso_core_common::stack;
 mod statement;
 mod stats;
 #[allow(dead_code)]
@@ -158,6 +157,17 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use turso_core_common::{
+    __turso_alloc_try_vec, __turso_alloc_vec, __turso_alloc_vec_count, assert_or_bail_corrupt,
+    bail_constraint_error, bail_corrupt_error, bail_parse_error, slice_in_bounds_or_corrupt,
+    trace_stack, with_btree_allocation_site, with_mv_store_allocation_site,
+    with_value_blob_allocation_site, without_allocation_faults,
+};
+pub use turso_core_io::IOExt;
+pub use turso_core_io::{
+    inject_io_yield, inject_transition_failure, inject_transition_yield, io_yield_one,
+    return_and_restore_if_io, return_if_io,
+};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
@@ -168,17 +178,22 @@ pub use turso_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
-pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
+pub use vdbe::value::ValueExecOps;
 pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
 
 mod turso_types_vtab;
+
+#[cfg(test)]
+mod alloc_tests;
+#[cfg(all(test, feature = "io_memory_yield"))]
+mod io_memory_yield_tests;
 
 /// Database index for the temp database (always 1 in SQLite).
 pub const TEMP_DB_ID: usize = 1;
@@ -218,18 +233,7 @@ pub enum SyncMode {
     Full = 2,
 }
 
-/// Control where temporary tables and indices are stored.
-/// Matches SQLite's PRAGMA temp_store values:
-/// - 0 = DEFAULT (use compile-time default, which is FILE)
-/// - 1 = FILE (always use temp files on disk)
-/// - 2 = MEMORY (always use in-memory storage)
-#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TempStore {
-    #[default]
-    Default = 0,
-    File = 1,
-    Memory = 2,
-}
+pub use turso_core_io::{AtomicTempStore, TempStore};
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock, alloc::DynAllocator>;
 

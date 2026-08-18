@@ -1,3 +1,4 @@
+use turso_core::ValueExecOps;
 use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use serde::{Deserialize, Serialize};

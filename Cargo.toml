@@ -10,6 +10,10 @@ members = [
     "bindings/rust",
     "cli",
     "core",
+    "core/crates/common",
+    "core/crates/io",
+    "core/crates/types",
+    "core/crates/json",
     "extensions/completion",
     "extensions/core",
     "extensions/crypto",
@@ -63,6 +67,10 @@ default-members = [
     "bindings/rust",
     "cli",
     "core",
+    "core/crates/common",
+    "core/crates/io",
+    "core/crates/types",
+    "core/crates/json",
     "extensions/completion",
     "extensions/core",
     "extensions/crypto",
@@ -113,6 +121,10 @@ turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.8.0-pre.4" }
 turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.8.0-pre.4" }
 limbo_completion = { path = "extensions/completion", version = "0.8.0-pre.4" }
 turso_core = { path = "core", version = "0.8.0-pre.4" }
+turso_core_common = { path = "core/crates/common", version = "0.8.0-pre.4" }
+turso_core_io = { path = "core/crates/io", version = "0.8.0-pre.4" }
+turso_core_types = { path = "core/crates/types", version = "0.8.0-pre.4" }
+turso_core_json = { path = "core/crates/json", version = "0.8.0-pre.4" }
 turso_sync_engine = { path = "sync/engine", version = "0.8.0-pre.4" }
 turso_ext = { path = "extensions/core", version = "0.8.0-pre.4" }
 turso_macros = { path = "macros", version = "0.8.0-pre.4" }

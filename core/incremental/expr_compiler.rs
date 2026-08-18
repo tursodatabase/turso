@@ -11,6 +11,7 @@ use crate::translate::expr::translate_expr;
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
+use crate::vdbe::value::ValueExecOps;
 use crate::vdbe::{Program, ProgramState, Register};
 use crate::{Connection, QueryMode, Result, Value};
 use crate::{DatabaseCatalog, RwLock, SymbolTable};

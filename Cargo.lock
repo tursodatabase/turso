@@ -7376,7 +7376,6 @@ dependencies = [
  "simsimd",
  "smallvec",
  "sorted-vec",
- "stacker",
  "strum",
  "strum_macros",
  "tantivy",
@@ -7385,6 +7384,10 @@ dependencies = [
  "thiserror 2.0.16",
  "tracing",
  "tracing-subscriber",
+ "turso_core_common",
+ "turso_core_io",
+ "turso_core_json",
+ "turso_core_types",
  "turso_ext",
  "turso_macros",
  "turso_parser",
@@ -7392,6 +7395,98 @@ dependencies = [
  "uncased",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "turso_core_common"
+version = "0.8.0-pre.4"
+dependencies = [
+ "allocator-api2 0.4.0",
+ "antithesis_sdk",
+ "branches",
+ "bumpalo",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "loom",
+ "miette",
+ "parking_lot",
+ "rustc-hash 2.1.1",
+ "rustix 1.0.7",
+ "serde",
+ "serde_json",
+ "shuttle",
+ "stacker",
+ "thiserror 2.0.16",
+ "tracing",
+ "turso_ext",
+ "turso_macros",
+ "turso_parser",
+]
+
+[[package]]
+name = "turso_core_io"
+version = "0.8.0-pre.4"
+dependencies = [
+ "antithesis_sdk",
+ "bitflags 2.9.4",
+ "branches",
+ "cfg_aliases",
+ "cfg_block",
+ "chrono",
+ "crossbeam-utils",
+ "io-uring",
+ "libc",
+ "loom",
+ "parking_lot",
+ "polling",
+ "rand 0.9.4",
+ "rustix 1.0.7",
+ "serde_json",
+ "shuttle",
+ "tempfile",
+ "thiserror 2.0.16",
+ "tracing",
+ "turso_core_common",
+ "turso_ext",
+ "turso_macros",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "turso_core_json"
+version = "0.8.0-pre.4"
+dependencies = [
+ "antithesis_sdk",
+ "ryu",
+ "serde_json",
+ "tracing",
+ "turso_core_common",
+ "turso_core_types",
+ "turso_macros",
+]
+
+[[package]]
+name = "turso_core_types"
+version = "0.8.0-pre.4"
+dependencies = [
+ "antithesis_sdk",
+ "bigdecimal",
+ "branches",
+ "either",
+ "hex",
+ "libm",
+ "num-bigint",
+ "num-traits",
+ "quickcheck",
+ "quickcheck_macros",
+ "ryu",
+ "serde",
+ "serde_json",
+ "tracing",
+ "turso_core_common",
+ "turso_ext",
+ "turso_macros",
+ "turso_parser",
 ]
 
 [[package]]

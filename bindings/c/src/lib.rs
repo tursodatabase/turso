@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
+use turso_core::ValueExecOps;
 use std::ffi::{self, CStr, CString};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,0 +1,32 @@
+# Copyright 2023-2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_core_json"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JSON and JSONB functions for the Turso database library"
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_core_json"
+path = "lib.rs"
+
+[features]
+default = []
+allocation_metric = ["turso_core_common/allocation_metric", "turso_core_types/allocation_metric"]
+
+[dependencies]
+turso_core_common = { workspace = true }
+turso_core_types = { workspace = true, features = ["json"] }
+turso_macros = { workspace = true }
+ryu = "1.0.19"
+tracing = { workspace = true }
+
+[target.'cfg(antithesis)'.dependencies]
+antithesis_sdk = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }

@@ -11,7 +11,7 @@
 //! remote. The `Wal` struct is responsible for managing the write-ahead log
 //! for the database, also either local or remote.
 pub(crate) mod btree;
-pub(crate) mod buffer_pool;
+pub(crate) use turso_core_io::buffer_pool;
 pub(crate) mod checksum;
 pub mod database;
 pub(crate) mod encryption;
@@ -24,7 +24,6 @@ pub(crate) mod pager;
 #[allow(dead_code)]
 pub(crate) mod shared_wal_coordination;
 #[allow(dead_code)]
-pub(super) mod slot_bitmap;
 pub mod sqlite3_ondisk;
 mod state_machines;
 pub(crate) mod subjournal;

@@ -1,0 +1,47 @@
+# Copyright 2023-2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_core_types"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQL value types and numeric conversions for the Turso database library"
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_core_types"
+path = "lib.rs"
+
+[features]
+default = []
+allocation_metric = ["turso_core_common/allocation_metric"]
+json = []
+serde = ["dep:serde", "turso_core_common/serde"]
+
+[dependencies]
+turso_core_common = { workspace = true }
+turso_ext = { workspace = true, features = ["core_only"] }
+turso_macros = { workspace = true }
+turso_parser = { workspace = true }
+bigdecimal = "0.4"
+branches = { version = "0.4.3", default-features = false }
+either = { workspace = true }
+num-bigint = "0.4"
+num-traits = "0.2"
+hex = { workspace = true }
+libm = "0.2"
+ryu = "1.0.19"
+serde = { workspace = true, optional = true, features = ["derive"] }
+tracing = { workspace = true }
+
+[target.'cfg(antithesis)'.dependencies]
+antithesis_sdk = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+quickcheck = { version = "1.0", default-features = false }
+quickcheck_macros = { version = "1.0", default-features = false }
