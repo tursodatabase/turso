@@ -40,8 +40,11 @@ impl WalSession {
     }
     pub fn end(&mut self, force_commit: bool) -> Result<()> {
         assert!(self.in_txn);
-        self.conn.wal_insert_end(force_commit)?;
+        let result = self.conn.wal_insert_end(force_commit);
+        // Do not use `?` before clearing this flag: an error here can still
+        // mean the WAL transaction was ended, so Drop must not retry cleanup.
         self.in_txn = false;
+        result?;
         Ok(())
     }
     pub fn in_txn(&self) -> bool {
