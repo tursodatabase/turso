@@ -67,23 +67,30 @@ const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 /// 32 pages is 128 KiB at the usual 4 KiB page size, which is also Linux's
 /// default `read_ahead_kb`.
 ///
-/// Whether this is worth anything depends entirely on whether something
-/// underneath is already reading ahead for us, and the two backends differ:
+/// What this buys depends on whether anything underneath is already reading
+/// ahead. Measured on the 1.2 GB TPC-H database, cold every run, best of
+/// three, same binary throughout (TPC-H Q1 / Q6, both LINEITEM scans):
 ///
-/// * `UringIO` sets `O_DIRECT` on the database file, so reads bypass the page
-///   cache and nothing prefetches. Measured on the 1.2 GB TPC-H database, a
-///   full LINEITEM scan goes 20.7s -> 10.5s and a scan with a filter goes
-///   12.1s -> 2.9s. This is what readahead is for.
-/// * `UnixIO` ignores the `direct` flag, so reads are buffered and Linux is
-///   already reading ahead -- 8 MiB on the machine this was measured on,
-///   sixty-four times this window. There the whole TPC-H suite came out
-///   within noise (-0.5%), because by the time we ask for the next page the
-///   kernel has long since fetched it.
+/// | backend                  | readahead | Q1       | Q6       |
+/// |--------------------------|-----------|----------|----------|
+/// | `UnixIO` (buffered)      | off       | 18.4 s   |  4.4 s   |
+/// | `UnixIO` (buffered)      | 32        | 16.6 s   |  3.7 s   |
+/// | `UringIO` (`O_DIRECT`)   | off       | 28.6 s   | 17.5 s   |
+/// | `UringIO` (`O_DIRECT`)   | 32        | 15.0 s   |  4.1 s   |
 ///
-/// So: a large win where it matters, and nothing measurable where it does
-/// not. On by default for that reason. Readahead removes syscalls either way
-/// -- 195,206 to 8,827 on a full LINEITEM scan -- but only in the first case
-/// were the syscalls what the query was waiting for.
+/// Buffered reads go through the page cache, where Linux is already reading
+/// ahead -- 8 MiB on the machine measured, sixty-four times this window -- so
+/// this adds a modest 10-15% on a scan and nothing on the rest of the suite.
+///
+/// The third row is the interesting one. `O_DIRECT` skips the page cache, so
+/// the kernel's readahead goes away and nothing replaces it: every page
+/// becomes its own round trip and the scan lands *four times slower than
+/// buffered*. Readahead is what puts that back, and only with it does the
+/// direct path reach parity with buffered.
+///
+/// So this is worth having on both paths, but for different reasons: a small
+/// gain on the buffered one, and on the direct one the difference between
+/// usable and not.
 ///
 /// Set `PRAGMA prefetch_pages = 0` to turn it off.
 pub const DEFAULT_READAHEAD_WINDOW: u32 = 32;
