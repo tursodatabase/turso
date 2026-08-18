@@ -62,13 +62,15 @@ pub(super) fn translate_in_list(
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let mut check_null_reg = 0;
     let label_ok = program.allocate_label();
+    let false_null_jump_targets_differ =
+        condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null;
 
     // Compute the affinity for the IN comparison based on the LHS expression
     // This follows SQLite's exprINAffinity() approach
     let affinity = in_expr_affinity(lhs, referenced_tables, Some(resolver));
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
 
-    if condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null {
+    if false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();
         program.emit_insn(Insn::BitAnd {
             lhs: lhs_reg,
@@ -92,10 +94,7 @@ pub(super) fn translate_in_list(
 
         if lhs_arity == 1 {
             // Scalar comparison path
-            if !last_condition
-                || condition_metadata.jump_target_when_false
-                    != condition_metadata.jump_target_when_null
-            {
+            if !last_condition || false_null_jump_targets_differ {
                 if lhs_reg != rhs_reg {
                     program.emit_insn(Insn::Eq {
                         lhs: lhs_reg,
@@ -126,10 +125,7 @@ pub(super) fn translate_in_list(
             }
         } else {
             // Row-valued comparison path: compare each component
-            if !last_condition
-                || condition_metadata.jump_target_when_false
-                    != condition_metadata.jump_target_when_null
-            {
+            if !last_condition || false_null_jump_targets_differ {
                 // If all components match, jump to label_ok; otherwise skip to next RHS item
                 let skip_label = program.allocate_label();
                 for j in 0..lhs_arity {
@@ -140,7 +136,7 @@ pub(super) fn translate_in_list(
                         referenced_tables,
                         Some(resolver),
                     )?;
-                    let flags = CmpInsFlags::default().with_affinity(aff);
+                    let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
                     if j < lhs_arity - 1 {
                         program.emit_insn(Insn::Ne {
                             lhs: lhs_reg + j,

@@ -161,3 +161,24 @@ expect {
     m5|-1
     m6|-1
 }
+
+setup row_values_with_null_schema {
+    CREATE TABLE w(a, b);
+    INSERT INTO w VALUES (NULL,1),(1,1),(2,NULL),(2,2);
+}
+
+@setup row_values_with_null_schema
+test row-value-nulls-literal-list-in {
+    SELECT a, b FROM w WHERE (a,b) IN ((1,1),(2,2)) ORDER BY 1,2;
+}
+expect {
+    1|1
+    2|2
+}
+
+@setup row_values_with_null_schema
+test row-value-nulls-literal-list-not-in {
+    SELECT a, b FROM w WHERE (a,b) NOT IN ((1,1),(2,2)) ORDER BY 1,2;
+}
+expect {
+}
