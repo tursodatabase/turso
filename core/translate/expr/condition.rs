@@ -72,10 +72,21 @@ pub(super) fn translate_in_list(
 
     if false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();
-        program.emit_insn(Insn::BitAnd {
-            lhs: lhs_reg,
-            rhs: lhs_reg,
-            dest: check_null_reg,
+	program.emit_insn(Insn::BitAnd {
+	    lhs: lhs_reg,
+	    rhs: lhs_reg,
+	    dest: check_null_reg,
+        });
+	for i in 1..lhs_arity {
+	    program.emit_insn(Insn::BitAnd {
+		lhs: lhs_reg + i,
+		rhs: check_null_reg,
+		dest: check_null_reg,
+            });
+	}
+	program.emit_insn(Insn::IsNull {
+	    reg: check_null_reg,
+	    target_pc: condition_metadata.jump_target_when_null,
         });
     }
 

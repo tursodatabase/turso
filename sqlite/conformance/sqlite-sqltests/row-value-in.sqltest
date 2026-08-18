@@ -182,3 +182,38 @@ test row-value-nulls-literal-list-not-in {
 }
 expect {
 }
+
+test row-value-null-in-first-position-in {
+    SELECT ((NULL,1) IN ((1,1))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-null-in-second-position-in {
+    SELECT ((2,NULL) IN ((2,2))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-null-in-second-position-not-in {
+    SELECT ((2,NULL) NOT IN ((2,2))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-null-in-middle-position-in {
+    SELECT ((1,NULL,3) IN ((1,2,3))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-null-against-multiple-literal-tuples-in {
+    SELECT ((NULL,1) IN ((9,9),(1,1))) IS NULL;
+}
+expect {
+    1
+}
