@@ -202,7 +202,16 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
     match val {
         ValueRef::Text(text) => {
             let res = if text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
-                Jsonb::from_str_with_mode(&text, strict)
+                // Like SQLite, text parsed as a JSON document stops at
+                // the first NUL; a text value converted to a string
+                // literal keeps it (Conv::ToString stringifies below).
+                let str = text.as_str();
+                let str = if matches!(strict, Conv::ToString) {
+                    str
+                } else {
+                    &str[..str.find('\0').unwrap_or(str.len())]
+                };
+                Jsonb::from_str_with_mode(str, strict)
             } else {
                 // Handle as a string literal otherwise
                 // Escape backslashes first, then double quotes
@@ -806,28 +815,34 @@ fn json_path_from_db_value<'a>(
 
 pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
     match json.as_value_ref() {
-        ValueRef::Text(t) => match Jsonb::from_str(t.as_str()) {
-            Ok(_) => Ok(Value::from_i64(0)),
-            Err(JsonError::Message { location, .. }) => {
-                if let Some(loc) = location {
-                    // The parser reports a byte offset, but SQLite
-                    // reports the position in characters (jsonErrorFunc
-                    // counts the non-continuation bytes before the
-                    // error), which differs for multibyte UTF-8 input.
-                    let byte_offset = loc.min(t.as_str().len());
-                    let char_offset = t.as_str().as_bytes()[..byte_offset]
-                        .iter()
-                        .filter(|&&b| !(0x80..0xC0).contains(&b))
-                        .count();
-                    Ok(Value::from_i64(char_offset as i64 + 1))
-                } else {
-                    Err(crate::error::LimboError::InternalError(
-                        "failed to determine json error position".into(),
-                    ))
+        ValueRef::Text(t) => {
+            // Like SQLite, text parsed as a JSON document stops at the
+            // first NUL.
+            let text = t.as_str();
+            let text = &text[..text.find('\0').unwrap_or(text.len())];
+            match Jsonb::from_str(text) {
+                Ok(_) => Ok(Value::from_i64(0)),
+                Err(JsonError::Message { location, .. }) => {
+                    if let Some(loc) = location {
+                        // The parser reports a byte offset, but SQLite
+                        // reports the position in characters (jsonErrorFunc
+                        // counts the non-continuation bytes before the
+                        // error), which differs for multibyte UTF-8 input.
+                        let byte_offset = loc.min(text.len());
+                        let char_offset = text.as_bytes()[..byte_offset]
+                            .iter()
+                            .filter(|&&b| !(0x80..0xC0).contains(&b))
+                            .count();
+                        Ok(Value::from_i64(char_offset as i64 + 1))
+                    } else {
+                        Err(crate::error::LimboError::InternalError(
+                            "failed to determine json error position".into(),
+                        ))
+                    }
                 }
+                Err(JsonError::OutOfMemory) => Err(LimboError::OutOfMemory),
             }
-            Err(JsonError::OutOfMemory) => Err(LimboError::OutOfMemory),
-        },
+        }
         ValueRef::Blob(blob) => {
             // SQLite classifies the raw blob: one that looks like
             // JSONB reports the byte offset of its first malformed

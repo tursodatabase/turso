@@ -938,3 +938,17 @@ test json_error_position_reports_jsonb_offsets {
 expect {
     4|2|2|0|0|1
 }
+
+# Text parsed as a JSON document stops at the first NUL, like SQLite,
+# so trailing bytes after one are invisible to the parser. A text
+# value converted to a JSON string keeps the NUL as an escape.
+test json_text_stops_at_first_nul {
+    SELECT json('123' || char(0) || 'x'),
+           json_extract('{"a":7}' || char(0) || 'junk', '$.a'),
+           json_array_length('[1,2]' || char(0) || 'zzz'),
+           json_error_position('"a' || char(0) || '"x'),
+           json_insert('{}', '$.a', 'x' || char(0) || 'y');
+}
+expect {
+    123|7|2|3|{"a":"x\u0000y"}
+}
