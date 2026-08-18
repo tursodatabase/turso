@@ -30,7 +30,7 @@ use crate::{
             CollationSeq,
         },
         emitter::{prepare_cdc_if_necessary, HashCtx},
-        expr::comparison_affinity,
+        expr::comparison_affinity_exprs,
         planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
     },

@@ -5246,7 +5246,6 @@ const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 // backed by a literal or computed expression, not a real declared type)
 const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
 const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
-const BASE_AFF_NO_DECLARED: u32 = 6;
 
 // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
 const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
@@ -5262,7 +5261,8 @@ impl Column {
                 3 => Affinity::Blob,
                 4 => Affinity::Real,
                 5 => Affinity::Numeric,
-                _ => Affinity::Blob,
+                6 => Affinity::None,
+                _ => Affinity::None,
             }
         } else {
             Affinity::affinity(&self.ty_str)
@@ -5273,27 +5273,10 @@ impl Column {
     /// This ensures affinity rules use the custom type's BASE type
     /// rather than applying SQLite name-based rules to the type name.
     pub fn set_base_affinity(&mut self, affinity: Affinity) {
-        let v: u32 = match affinity {
-            Affinity::Integer => 1,
-            Affinity::Text => 2,
-            Affinity::Blob => 3,
-            Affinity::Real => 4,
-            Affinity::Numeric => 5,
-        };
+        let v: u32 = affinity as u32;
         self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
     }
 
-    /// Mark this column as backed by an expression with no real declared type
-    /// (e.g. a literal column in a FROM-subquery, CTE, or view).
-    pub fn set_no_declared_affinity(&mut self) {
-        self.raw = (self.raw & !BASE_AFF_MASK)
-            | ((BASE_AFF_NO_DECLARED << BASE_AFF_SHIFT) & BASE_AFF_MASK);
-    }
-
-    /// Whether this column has a real declared type. Always `true` for table columns.
-    pub fn has_declared_affinity(&self) -> bool {
-        ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) != BASE_AFF_NO_DECLARED
-    }
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob
@@ -7406,50 +7389,5 @@ mod tests {
             !schema.sequences.contains_key("broken_seq"),
             "rejected descriptor must not land in the sequences map",
         );
-    }
-
-    fn new_blob_column() -> Column {
-        Column::new(
-            Some("x".to_string()),
-            "BLOB".to_string(),
-            None,
-            None,
-            Type::Blob,
-            None,
-            ColDef::default(),
-        )
-    }
-
-    #[test]
-    fn column_has_declared_affinity_by_default() {
-        let col = new_blob_column();
-        assert!(col.has_declared_affinity());
-        assert_eq!(col.affinity(), Affinity::Blob);
-    }
-
-    #[test]
-    fn column_set_no_declared_affinity_reports_no_affinity() {
-        let mut col = new_blob_column();
-        col.set_no_declared_affinity();
-        assert!(!col.has_declared_affinity());
-        // Still resolves to BLOB at the runtime-conversion level.
-        assert_eq!(col.affinity(), Affinity::Blob);
-    }
-
-    #[test]
-    fn column_set_base_affinity_still_has_declared_affinity() {
-        let mut col = new_blob_column();
-        col.set_base_affinity(Affinity::Real);
-        assert!(col.has_declared_affinity());
-        assert_eq!(col.affinity(), Affinity::Real);
-    }
-
-    #[test]
-    fn column_no_declared_affinity_can_be_overwritten_by_base_affinity() {
-        let mut col = new_blob_column();
-        col.set_no_declared_affinity();
-        col.set_base_affinity(Affinity::Integer);
-        assert!(col.has_declared_affinity());
-        assert_eq!(col.affinity(), Affinity::Integer);
     }
 }

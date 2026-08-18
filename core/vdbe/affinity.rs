@@ -75,14 +75,17 @@ use crate::{
 ///   ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Affinity {
-    Blob = 0,
-    Text = 1,
-    Numeric = 2,
-    Integer = 3,
-    Real = 4,
+    // Affinity = 0 is kept as a special value for custom types
+    Blob = 1,
+    Text = 2,
+    Numeric = 3,
+    Integer = 4,
+    Real = 5,
+    None = 6,
 }
 
-pub const SQLITE_AFF_NONE: char = 'A'; // Historically called NONE, but it's the same as BLOB
+pub const SQLITE_AFF_NONE: char = '@';
+pub const SQLITE_AFF_BLOB: char = 'A';
 pub const SQLITE_AFF_TEXT: char = 'B';
 pub const SQLITE_AFF_NUMERIC: char = 'C';
 pub const SQLITE_AFF_INTEGER: char = 'D';
@@ -100,9 +103,10 @@ impl Affinity {
         match self {
             Affinity::Integer => SQLITE_AFF_INTEGER,
             Affinity::Text => SQLITE_AFF_TEXT,
-            Affinity::Blob => SQLITE_AFF_NONE,
+            Affinity::Blob => SQLITE_AFF_BLOB,
             Affinity::Real => SQLITE_AFF_REAL,
             Affinity::Numeric => SQLITE_AFF_NUMERIC,
+            Affinity::None => SQLITE_AFF_NONE,
         }
     }
 
@@ -110,7 +114,7 @@ impl Affinity {
         match char {
             SQLITE_AFF_INTEGER => Affinity::Integer,
             SQLITE_AFF_TEXT => Affinity::Text,
-            SQLITE_AFF_NONE => Affinity::Blob,
+            SQLITE_AFF_BLOB => Affinity::Blob,
             SQLITE_AFF_REAL => Affinity::Real,
             SQLITE_AFF_NUMERIC => Affinity::Numeric,
             _ => Affinity::Blob,
@@ -129,7 +133,7 @@ impl Affinity {
     pub fn to_type(self) -> crate::schema::Type {
         use crate::schema::Type;
         match self {
-            Affinity::Blob => Type::Blob,
+            Affinity::Blob | Affinity::None => Type::Blob,
             Affinity::Text => Type::Text,
             Affinity::Numeric => Type::Numeric,
             Affinity::Integer => Type::Integer,
@@ -145,14 +149,11 @@ impl Affinity {
         !matches!(self, Affinity::Blob)
     }
 
-    /// Returns the canonical short type name for this affinity, matching
-    /// SQLite's `azType[]` in `createTableStmt()` (`build.c`).
-    ///
-    /// Used when generating schema SQL (e.g. for `sqlite_schema.sql`).
-    /// Returns an empty string for BLOB affinity (no declared type).
+    /// Loosely matches SQLite's `azType[]` in `createTableStmt()` (`build.c`).
+    /// Returns an empty string for BLOB and NONE affinity (no declared type).
     pub fn short_type_name(&self) -> &'static str {
         match self {
-            Affinity::Blob => "",
+            Affinity::Blob | Affinity::None => "",
             Affinity::Text => "TEXT",
             Affinity::Numeric => "NUM",
             Affinity::Integer => "INT",
@@ -245,7 +246,7 @@ impl Affinity {
                 left.map(Either::Left)
             }
 
-            Affinity::Blob => None, // Do nothing for blob affinity.
+            Affinity::Blob | Affinity::None => None, // Do nothing for blob affinity.
         }
     }
 
@@ -276,7 +277,7 @@ impl Affinity {
                 .flatten()
                 .map(Either::Left),
             Affinity::Text => self.convert(val),
-            Affinity::Blob => None,
+            Affinity::Blob | Affinity::None => None,
         }
     }
 
@@ -299,7 +300,7 @@ impl Affinity {
     ///   answer from the scan. Only a numeric-affinity index is safe.
     pub fn index_affinity_ok(self, comparison_aff: Affinity) -> bool {
         match comparison_aff {
-            Affinity::Blob => true,
+            Affinity::Blob | Affinity::None => true,
             Affinity::Text => matches!(self, Affinity::Text),
             Affinity::Numeric | Affinity::Integer | Affinity::Real => self.is_numeric(),
         }
