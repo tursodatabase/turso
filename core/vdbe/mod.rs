@@ -39,7 +39,7 @@ pub mod sorter;
 mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
-// for benchmarks
+#[allow(unused_imports)] // for benchmarks
 pub use crate::translate::collate::CollationSeq;
 use crate::{
     alloc::{DynAllocator, TryClone},

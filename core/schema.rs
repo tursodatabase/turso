@@ -4874,6 +4874,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
+                // ok
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
