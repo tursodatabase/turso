@@ -1451,7 +1451,9 @@ pub fn emit_from_clause_subqueries(
         .map(|m| m.original_idx)
         .try_collect()?;
 
-    for table_index in visit_order {
+    let mut plan_nodes: Vec<(usize, usize)> = Vec::new();
+
+    for &table_index in &visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
@@ -1463,7 +1465,7 @@ pub fn emit_from_clause_subqueries(
             _ => None,
         };
         let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode.as_ref());
-        emit_explain!(
+        let node = emit_explain!(
             program,
             true,
             eqp_detail_for_table_op(
@@ -1475,6 +1477,9 @@ pub fn emit_from_clause_subqueries(
                 eqp_subquery,
             )
         );
+        if let Some(node) = node {
+            plan_nodes.push((table_index, node));
+        }
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             let execution_mode =
@@ -1579,6 +1584,18 @@ pub fn emit_from_clause_subqueries(
         }
 
         program.pop_current_parent_explain();
+    }
+
+    for &(table_index, probe_node) in plan_nodes.iter() {
+        let Operation::HashJoin(hash_join_op) = &tables.joined_tables()[table_index].op else {
+            continue;
+        };
+        if let Some(&(_, build_node)) = plan_nodes
+            .iter()
+            .find(|(table_index, _)| *table_index == hash_join_op.build_table_idx)
+        {
+            program.record_hash_join_build_node(probe_node, build_node);
+        }
     }
     Ok(())
 }

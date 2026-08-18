@@ -72,7 +72,7 @@ the exact display string. `op` adds the structured fields, discriminated by
 | `search`                             | seek by key                             | `table`, `alias?`, `search_kind` (`rowid_eq`/`seek`/`in_seek`), `index?` or `integer_primary_key`, `constraints`, `backwards?`, `join?`, `subquery?` |
 | `multi_index`                        | combine rowid sets from several indexes | `set_op` (`or`/`and`), `indexes`                                                                                                                     |
 | `index_method`                       | pluggable index method access           | `method`                                                                                                                                             |
-| `hash_join`                          | hash side of a hash join                | `table`, `alias?`, `join?`, `subquery?`                                                                                                              |
+| `hash_join`                          | probe a hash table built from another node's rows | `table`, `alias?`, `join?`, `subquery?`, `build_node?`                                                                                     |
 | `hash_build`                         | materialize a hash join's build input   | `table`, `alias?`                                                                                                                                    |
 | `distinct` / `distinct_aggregate`    | hash-table de-duplication               | `function` (aggregate only)                                                                                                                          |
 | `order_by` / `group_by`              | sorting stage                           | `method` (`sorter`/`temp_btree`)                                                                                                                     |
@@ -83,3 +83,8 @@ the exact display string. `op` adds the structured fields, discriminated by
 
 Fields that are absent are simply omitted (e.g. `join` on the first table,
 `index` on a rowid search).
+
+A `hash_join` node names the table it probes, not the one the hash table was
+built from. Its `build_node` is the `id` of the node that reads the build input,
+so `{"type":"hash_join","table":"t4","build_node":4}` means "read t4 and probe a
+hash table built from whatever node 4 produces".
