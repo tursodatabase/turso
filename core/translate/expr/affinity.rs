@@ -212,7 +212,9 @@ pub fn comparison_affinity(
     do_comparison_affinity(lhs, rhs)
 }
 
-trait HasComparableAffinity {
+/// `pub(crate)` because `comparison_affinity` is reachable that far, and a
+/// bound may not be more private than the item that uses it.
+pub(crate) trait HasComparableAffinity {
     fn comparison_affinity(
         &self,
         referenced_tables: Option<&TableReferences>,
