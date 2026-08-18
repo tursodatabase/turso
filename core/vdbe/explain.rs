@@ -7,13 +7,47 @@ use turso_parser::ast::{ResolveType, SortOrder};
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
+use crate::translate::eqp::EqpCteMaterialization;
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
 pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
     "INTEGER", "TEXT", "INTEGER", "INTEGER", "INTEGER", "TEXT", "INTEGER", "TEXT",
 ];
+
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
+
+pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS: [&str; 1] = ["plan_json"];
+pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE: [&str; 1] = ["TEXT"];
+
+#[derive(Debug, Clone, Default)]
+pub struct ExplainInfo {
+    /// map of instruction index to manual comment
+    pub comments: Vec<(InsnReference, &'static str)>,
+    /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
+    /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
+    pub cte_materializations: Vec<EqpCteMaterialization>,
+}
+
+impl ExplainInfo {
+    pub fn comment_at(&self, insn_index: InsnReference) -> Option<&'static str> {
+        self.comments
+            .iter()
+            .find(|(offset, _)| *offset == insn_index)
+            .map(|(_, comment)| *comment)
+    }
+
+    pub(crate) fn remap_insn_indices(&mut self, old_to_new: &[usize]) {
+        for (offset, _) in self.comments.iter_mut() {
+            *offset = old_to_new[*offset as usize] as InsnReference;
+        }
+        for cte in self.cte_materializations.iter_mut() {
+            for node_id in cte.node_ids.iter_mut() {
+                *node_id = old_to_new[*node_id];
+            }
+        }
+    }
+}
 
 pub fn insn_to_row(
     program: &PreparedProgram,
@@ -2439,7 +2473,7 @@ pub fn insn_to_row(
                 *p1 as i64,
                 p2.as_ref().map(|p| *p).unwrap_or(0) as i64,
                 0,
-                Value::build_text(detail.clone()),
+                Value::build_text(detail.to_string()),
                 0,
                 String::new(),
             ),

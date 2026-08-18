@@ -196,7 +196,13 @@ impl EmitGroupBy {
                     comparators,
                 }),
             });
-            emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                crate::translate::eqp::EqpDetail::GroupBy {
+                    method: crate::translate::eqp::EqpSortMethod::Sorter,
+                }
+            );
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
             GroupByRowSource::Sorter {
                 pseudo_cursor,

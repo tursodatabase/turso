@@ -224,10 +224,15 @@ impl ToTokens for Cmd {
                 s.append(TK_EXPLAIN, None)?;
                 stmt.to_tokens(s, context)?;
             }
-            Self::ExplainQueryPlan(stmt) => {
+            Self::ExplainQueryPlan { stmt, format } => {
                 s.append(TK_EXPLAIN, None)?;
                 s.append(TK_QUERY, None)?;
                 s.append(TK_PLAN, None)?;
+                if *format == EqpFormat::Json {
+                    s.append(TK_ID, Some("FORMAT"))?;
+                    s.append(TK_EQ, None)?;
+                    s.append(TK_ID, Some("JSON"))?;
+                }
                 stmt.to_tokens(s, context)?;
             }
             Self::Stmt(stmt) => {

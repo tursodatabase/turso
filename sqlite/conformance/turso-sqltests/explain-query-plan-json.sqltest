@@ -1,0 +1,199 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, city_id INTEGER);
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);
+    CREATE INDEX idx_users_age ON users(age);
+    CREATE INDEX idx_orders_user ON orders(user_id);
+}
+
+@setup schema
+test search-nodes-name-the-index-the-constraints-and-the-join {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT u.name, o.amount
+    FROM users u
+    LEFT JOIN orders o ON o.user_id = u.id
+    WHERE u.age > 21
+    ORDER BY o.amount;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name, o.amount\n    FROM users u\n    LEFT JOIN orders o ON o.user_id = u.id\n    WHERE u.age > 21\n    ORDER BY o.amount;","result_columns":["name","amount"],"nodes":[{"id":1,"parent":null,"detail":"SEARCH u USING INDEX idx_users_age (age>?)","op":{"type":"search","table":"users","alias":"u","search_kind":"seek","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"constraints":["age>?"]}},{"id":2,"parent":null,"detail":"SEARCH o USING INDEX idx_orders_user (user_id=?) LEFT-JOIN","op":{"type":"search","table":"orders","alias":"o","join":"left","search_kind":"seek","index":{"name":"idx_orders_user","covering":false,"ephemeral":false},"constraints":["user_id=?"]}},{"id":28,"parent":null,"detail":"USE SORTER FOR ORDER BY","op":{"type":"order_by","method":"sorter"}}]}
+}
+
+@setup schema
+test exists-is-reported-as-a-semi-join {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT *
+    FROM users u
+    WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT *\n    FROM users u\n    WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);","result_columns":["id","name","age","city_id"],"nodes":[{"id":1,"parent":null,"detail":"SCAN users AS u","op":{"type":"scan","table":"users","alias":"u","source":"table"}},{"id":2,"parent":null,"detail":"SEARCH o USING COVERING INDEX idx_orders_user (user_id=?)","op":{"type":"search","table":"orders","alias":"o","join":"semi","search_kind":"seek","index":{"name":"idx_orders_user","covering":true,"ephemeral":false},"constraints":["user_id=?"]}}]}
+}
+
+@setup schema
+test not-exists-is-reported-as-an-anti-join {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT *
+    FROM users u
+    WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT *\n    FROM users u\n    WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);","result_columns":["id","name","age","city_id"],"nodes":[{"id":1,"parent":null,"detail":"SCAN users AS u","op":{"type":"scan","table":"users","alias":"u","source":"table"}},{"id":2,"parent":null,"detail":"SEARCH o USING COVERING INDEX idx_orders_user (user_id=?)","op":{"type":"search","table":"orders","alias":"o","join":"anti","search_kind":"seek","index":{"name":"idx_orders_user","covering":true,"ephemeral":false},"constraints":["user_id=?"]}}]}
+}
+
+@setup schema
+test both-readers-of-a-shared-cte-point-at-one-materialization {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    WITH spenders AS (
+        SELECT user_id, sum(amount) AS total FROM orders GROUP BY user_id
+    )
+    SELECT u.name, s1.total
+    FROM users u
+    JOIN spenders s1 ON s1.user_id = u.id
+    JOIN spenders s2 ON s2.user_id = u.city_id;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    WITH spenders AS (\n        SELECT user_id, sum(amount) AS total FROM orders GROUP BY user_id\n    )\n    SELECT u.name, s1.total\n    FROM users u\n    JOIN spenders s1 ON s1.user_id = u.id\n    JOIN spenders s2 ON s2.user_id = u.city_id;","result_columns":["name","total"],"nodes":[{"id":2,"parent":null,"detail":"SCAN orders USING INDEX idx_orders_user","op":{"type":"scan","table":"orders","source":"table","index":{"name":"idx_orders_user","covering":false,"ephemeral":false}}},{"id":41,"parent":null,"detail":"SCAN users AS u","op":{"type":"scan","table":"users","alias":"u","source":"table"}},{"id":42,"parent":null,"detail":"SEARCH s1 USING INDEX ephemeral_subquery_t3 (user_id=?)","op":{"type":"search","table":"spenders","alias":"s1","join":"inner","subquery":{"execution":"materialized_reuse","cte_id":0},"search_kind":"seek","index":{"name":"ephemeral_subquery_t3","covering":false,"ephemeral":true},"constraints":["user_id=?"]}},{"id":43,"parent":null,"detail":"SEARCH s2 USING INDEX ephemeral_subquery_t5 (user_id=?)","op":{"type":"search","table":"spenders","alias":"s2","join":"inner","subquery":{"execution":"materialized_reuse","cte_id":0},"search_kind":"seek","index":{"name":"ephemeral_subquery_t5","covering":false,"ephemeral":true},"constraints":["user_id=?"]}}],"cte_materializations":[{"cte_id":0,"name":"spenders","nodes":[2]}]}
+}
+
+@setup schema
+test a-from-clause-subquery-nests-its-body-under-its-own-scan {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT city_id, avg(age)
+    FROM (SELECT * FROM users WHERE age > 18)
+    GROUP BY city_id
+    ORDER BY avg(age);
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT city_id, avg(age)\n    FROM (SELECT * FROM users WHERE age > 18)\n    GROUP BY city_id\n    ORDER BY avg(age);","result_columns":["city_id","avg(age)"],"nodes":[{"id":1,"parent":null,"detail":"SCAN (subquery-0)","op":{"type":"scan","table":"(subquery-0)","subquery":{"execution":"coroutine"},"source":"subquery"}},{"id":3,"parent":1,"detail":"SEARCH users USING INDEX idx_users_age (age>?)","op":{"type":"search","table":"users","search_kind":"seek","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"constraints":["age>?"]}},{"id":19,"parent":null,"detail":"USE SORTER FOR GROUP BY","op":{"type":"group_by","method":"sorter"}},{"id":61,"parent":null,"detail":"USE SORTER FOR ORDER BY","op":{"type":"order_by","method":"sorter"}}]}
+}
+
+@setup schema
+test a-compound-select-lists-its-arms {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT name FROM users WHERE age > 30
+    UNION
+    SELECT name FROM users
+    ORDER BY name;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT name FROM users WHERE age > 30\n    UNION\n    SELECT name FROM users\n    ORDER BY name;","result_columns":["name"],"nodes":[{"id":2,"parent":null,"detail":"COMPOUND QUERY","op":{"type":"compound"}},{"id":4,"parent":2,"detail":"LEFT-MOST SUBQUERY","op":{"type":"compound_arm","op":"left_most","temp_btree":false}},{"id":5,"parent":4,"detail":"SEARCH users USING INDEX idx_users_age (age>?)","op":{"type":"search","table":"users","search_kind":"seek","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"constraints":["age>?"]}},{"id":15,"parent":2,"detail":"UNION USING TEMP B-TREE","op":{"type":"compound_arm","op":"union","temp_btree":true}},{"id":16,"parent":15,"detail":"SCAN users","op":{"type":"scan","table":"users","source":"table"}},{"id":40,"parent":null,"detail":"USE SORTER FOR ORDER BY","op":{"type":"order_by","method":"sorter"}}]}
+}
+
+@setup schema
+test list-and-scalar-subqueries-report-whether-they-are-correlated {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT u.name, (SELECT count(*) FROM orders o WHERE o.user_id = u.id)
+    FROM users u
+    WHERE u.age IN (SELECT age FROM users WHERE city_id = 3);
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name, (SELECT count(*) FROM orders o WHERE o.user_id = u.id)\n    FROM users u\n    WHERE u.age IN (SELECT age FROM users WHERE city_id = 3);","result_columns":["name","(SELECT count(*) FROM orders o WHERE o.user_id = u.id)"],"nodes":[{"id":1,"parent":null,"detail":"LIST SUBQUERY 1","op":{"type":"list_subquery","subquery_id":1,"correlated":false}},{"id":4,"parent":1,"detail":"SCAN users","op":{"type":"scan","table":"users","source":"table"}},{"id":13,"parent":null,"detail":"SEARCH u USING INDEX idx_users_age (age=?)","op":{"type":"search","table":"users","alias":"u","search_kind":"in_seek","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"constraints":["age=?"]}},{"id":23,"parent":null,"detail":"CORRELATED SCALAR SUBQUERY 2","op":{"type":"scalar_subquery","subquery_id":2,"correlated":true}},{"id":26,"parent":23,"detail":"SEARCH o USING COVERING INDEX idx_orders_user (user_id=?)","op":{"type":"search","table":"orders","alias":"o","search_kind":"seek","index":{"name":"idx_orders_user","covering":true,"ephemeral":false},"constraints":["user_id=?"]}}]}
+}
+
+@setup schema
+test an-or-over-two-indexes-lists-both-branches {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT *
+    FROM users
+    WHERE id = 5 OR age = 30;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT *\n    FROM users\n    WHERE id = 5 OR age = 30;","result_columns":["id","name","age","city_id"],"nodes":[{"id":1,"parent":null,"detail":"MULTI-INDEX OR users (PRIMARY KEY, idx_users_age)","op":{"type":"multi_index","table":"users","set_op":"or","indexes":["PRIMARY KEY","idx_users_age"]}}]}
+}
+
+@setup schema
+test a-recursive-cte-reports-its-setup-and-step-phases {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    WITH RECURSIVE cnt(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT x+1 FROM cnt WHERE x < 10
+    )
+    SELECT x FROM cnt;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    WITH RECURSIVE cnt(x) AS (\n        SELECT 1\n        UNION ALL\n        SELECT x+1 FROM cnt WHERE x < 10\n    )\n    SELECT x FROM cnt;","result_columns":["x"],"nodes":[{"id":1,"parent":null,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","subquery":{"execution":"coroutine","cte_id":0,"recursive":true},"source":"subquery"}},{"id":5,"parent":1,"detail":"SETUP","op":{"type":"recursive_setup"}},{"id":6,"parent":5,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row"}},{"id":17,"parent":1,"detail":"RECURSIVE STEP","op":{"type":"recursive_step"}},{"id":18,"parent":17,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","source":"recursive_cte_input"}}]}
+}
+
+@setup schema
+test the-json-tree-matches-the-text-rows {
+    EXPLAIN QUERY PLAN
+    SELECT u.name
+    FROM users u
+    WHERE u.age IN (SELECT age FROM users WHERE city_id = 3)
+    ORDER BY u.name;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT u.name
+    FROM users u
+    WHERE u.age IN (SELECT age FROM users WHERE city_id = 3)
+    ORDER BY u.name;
+}
+expect {
+    1|0|0|LIST SUBQUERY 1
+    4|1|0|SCAN users
+    13|0|0|SEARCH u USING INDEX idx_users_age (age=?)
+    29|0|0|USE SORTER FOR ORDER BY
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name\n    FROM users u\n    WHERE u.age IN (SELECT age FROM users WHERE city_id = 3)\n    ORDER BY u.name;","result_columns":["name"],"nodes":[{"id":1,"parent":null,"detail":"LIST SUBQUERY 1","op":{"type":"list_subquery","subquery_id":1,"correlated":false}},{"id":4,"parent":1,"detail":"SCAN users","op":{"type":"scan","table":"users","source":"table"}},{"id":13,"parent":null,"detail":"SEARCH u USING INDEX idx_users_age (age=?)","op":{"type":"search","table":"users","alias":"u","search_kind":"in_seek","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"constraints":["age=?"]}},{"id":29,"parent":null,"detail":"USE SORTER FOR ORDER BY","op":{"type":"order_by","method":"sorter"}}]}
+}
+
+@setup schema
+test leaving-out-the-format-clause-means-text {
+    EXPLAIN QUERY PLAN
+    SELECT u.name, o.amount
+    FROM users u
+    LEFT JOIN orders o ON o.user_id = u.id
+    WHERE u.age > 21;
+
+    EXPLAIN QUERY PLAN FORMAT=TEXT
+    SELECT u.name, o.amount
+    FROM users u
+    LEFT JOIN orders o ON o.user_id = u.id
+    WHERE u.age > 21;
+}
+expect {
+    1|0|0|SEARCH u USING INDEX idx_users_age (age>?)
+    2|0|0|SEARCH o USING INDEX idx_orders_user (user_id=?) LEFT-JOIN
+    1|0|0|SEARCH u USING INDEX idx_users_age (age>?)
+    2|0|0|SEARCH o USING INDEX idx_orders_user (user_id=?) LEFT-JOIN
+}
+
+@setup schema
+test quotes-in-the-statement-are-escaped-in-the-echo {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT u.name
+    FROM users u
+    WHERE u.name = 'a "quoted" name'
+    ORDER BY u.age;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name\n    FROM users u\n    WHERE u.name = 'a \"quoted\" name'\n    ORDER BY u.age;","result_columns":["name"],"nodes":[{"id":1,"parent":null,"detail":"SCAN users AS u USING INDEX idx_users_age","op":{"type":"scan","table":"users","alias":"u","source":"table","index":{"name":"idx_users_age","covering":false,"ephemeral":false}}}]}
+}
+
+test the-format-clause-is-case-insensitive {
+    EXPLAIN QUERY PLAN FORMAT=json SELECT 1;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=json SELECT 1;","result_columns":["1"],"nodes":[{"id":1,"parent":null,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row"}}]}
+}
+
+test an-unknown-format-is-a-parse-error {
+    EXPLAIN QUERY PLAN FORMAT=YAML SELECT 1;
+}
+expect error {
+    unknown EXPLAIN QUERY PLAN format: YAML \(supported formats: TEXT, JSON\)
+}
+
+@setup schema
+test planning-a-write-does-not-run-it {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    INSERT INTO users(name) VALUES ('x');
+
+    SELECT count(*) FROM users;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    INSERT INTO users(name) VALUES ('x');","result_columns":[],"nodes":[]}
+    0
+}

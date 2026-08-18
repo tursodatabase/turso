@@ -26,6 +26,7 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
+use crate::translate::eqp::{EqpDetail, EqpSortMethod};
 use crate::vdbe::insn::SortComparatorType;
 
 /// Maps a custom type `<` operator function name to a SortComparatorType.
@@ -349,9 +350,21 @@ impl EmitOrderBy {
             + remappings.iter().filter(|r| !r.deduplicated).count();
 
         if use_heap_sort {
-            emit_explain!(program, false, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                EqpDetail::OrderBy {
+                    method: EqpSortMethod::TempBTree,
+                }
+            );
         } else {
-            emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                EqpDetail::OrderBy {
+                    method: EqpSortMethod::Sorter,
+                }
+            );
         }
 
         let cursor_id = if !use_heap_sort {

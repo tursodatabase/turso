@@ -6,6 +6,7 @@ use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
 };
+use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
@@ -167,7 +168,7 @@ pub fn emit_program_for_compound_select(
         }
     };
 
-    emit_explain!(program, true, "COMPOUND QUERY".to_owned());
+    emit_explain!(program, true, EqpDetail::Compound);
 
     // The compound query's result columns are the leftmost subselect's result columns
     // (per SQLite semantics). Save them so we can install them on `program` after
@@ -325,7 +326,14 @@ fn emit_compound_select(
                     right_most_ctx.reg_offset = offset_reg;
                 }
 
-                emit_explain!(program, true, "UNION ALL".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::UnionAll,
+                        temp_btree: false,
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -373,7 +381,14 @@ fn emit_compound_select(
                     is_delete: false,
                 };
 
-                emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::Union,
+                        temp_btree: true,
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -426,7 +441,14 @@ fn emit_compound_select(
                     query_destination,
                 )?;
 
-                emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::Intersect,
+                        temp_btree: true,
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -477,7 +499,14 @@ fn emit_compound_select(
                     affinity_str: None,
                     is_delete: true,
                 };
-                emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::Except,
+                        temp_btree: true,
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -504,7 +533,14 @@ fn emit_compound_select(
                 right_most.offset.clone_from(offset);
                 right_most_ctx.reg_offset = offset_reg;
             }
-            emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
+            emit_explain!(
+                program,
+                true,
+                EqpDetail::CompoundArm {
+                    op: EqpCompoundOp::LeftMost,
+                    temp_btree: false,
+                }
+            );
             right_most_ctx.materialized_build_inputs =
                 emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
             emit_query(program, right_most, &mut right_most_ctx)?;
@@ -1041,7 +1077,13 @@ fn emit_compound_order_by(
         .transpose()?;
 
     // Sort and emit results
-    emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+    emit_explain!(
+        program,
+        false,
+        EqpDetail::OrderBy {
+            method: EqpSortMethod::Sorter,
+        }
+    );
 
     let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
         column_count: sorter_column_count,
