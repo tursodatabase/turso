@@ -9,7 +9,7 @@ This implementation provides SQLite3 API compatibility for Turso, allowing exist
 1. Implements the SQLite3 C API functions in Rust
 2. Translates between C and Rust data structures
 3. Maps SQLite operations to equivalent Turso operations
-4. Maintains API compatibility with SQLite version 3.42.0
+4. Maintains API compatibility with SQLite
 
 ## Testing Strategy
 
