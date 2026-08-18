@@ -252,6 +252,7 @@ pub enum EqpDetail {
         table: EqpTable,
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
+        build_node: Option<usize>,
     },
     /// Materialize the build side of a hash join into an in-memory table.
     HashBuild {
@@ -539,6 +540,7 @@ pub(crate) fn eqp_detail_for_table_op(
             table: eqp_table,
             join,
             subquery,
+            build_node: None,
         },
     }
 }
@@ -641,6 +643,39 @@ impl<'a> JsonBuilder<'a> {
 }
 
 impl EqpDetail {
+    pub(crate) fn set_hash_join_build_node(&mut self, node: usize) {
+        let Self::HashJoin { build_node, .. } = self else {
+            unreachable!("only a hash join step has a build input");
+        };
+        *build_node = Some(node);
+    }
+
+    pub(crate) fn remap_node_ids(&mut self, old_to_new: &[usize]) {
+        match self {
+            Self::HashJoin {
+                build_node: Some(node),
+                ..
+            } => *node = old_to_new[*node],
+            Self::HashJoin { .. }
+            | Self::ConstantRow
+            | Self::Scan { .. }
+            | Self::Search { .. }
+            | Self::MultiIndex { .. }
+            | Self::IndexMethod { .. }
+            | Self::HashBuild { .. }
+            | Self::Distinct
+            | Self::DistinctAggregate { .. }
+            | Self::OrderBy { .. }
+            | Self::GroupBy { .. }
+            | Self::Compound
+            | Self::CompoundArm { .. }
+            | Self::ListSubquery { .. }
+            | Self::ScalarSubquery { .. }
+            | Self::RecursiveSetup
+            | Self::RecursiveStep => {}
+        }
+    }
+
     fn write_table_fields(
         obj: &mut JsonBuilder,
         table: &EqpTable,
@@ -733,9 +768,13 @@ impl EqpDetail {
                 table,
                 join,
                 subquery,
+                build_node,
             } => {
                 obj.str("type", "hash_join");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
+                if let Some(build_node) = build_node {
+                    obj.num("build_node", *build_node);
+                }
             }
             Self::HashBuild { table } => {
                 obj.str("type", "hash_build");
