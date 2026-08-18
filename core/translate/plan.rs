@@ -79,15 +79,15 @@ fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
     let mut data_types = StorageClassMask::from_null();
     let mut idx = 0;
     // Skip leading arms with no affinity, adopting the next arm's affinity.
-    while !affinity.has_affinity() && idx + 1 < arms.len() {
+    while affinity == Affinity::None && idx + 1 < arms.len() {
         data_types |= col_data_type(arms[idx]);
         idx += 1;
         affinity = col_affinities(arms[idx]);
     }
-    if !affinity.has_affinity() {
+    if affinity == Affinity::None {
         return Affinity::None;
     }
-    // `info` has TEXT or numeric affinity here; accumulate the remaining arms' classes.
+    // This arm has a real affinity; accumulate the remaining arms' classes.
     for &arm in &arms[idx + 1..] {
         data_types |= col_data_type(arm);
     }
@@ -2454,7 +2454,7 @@ fn query_output_columns(
                     infer_type_from_expr(&result_column.expr, Some(table_references))
                 });
             let column_type = affinity.to_type();
-            Column::new(
+            let mut column = Column::new(
                 name,
                 column_type.to_string(),
                 None,
@@ -2462,7 +2462,9 @@ fn query_output_columns(
                 column_type,
                 None,
                 ColDef::default(),
-            )
+            );
+            column.set_base_affinity(affinity);
+            column
         })
         .try_collect::<alloc::Vec<_>>()?;
 
@@ -2510,7 +2512,7 @@ impl JoinedTable {
             .map(|rc| {
                 let affinity = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
                 let col_type = affinity.to_type();
-                Column::new(
+                let mut column = Column::new(
                     rc.name(&plan.table_references).map(String::from),
                     col_type.to_string(),
                     None,
@@ -2518,7 +2520,9 @@ impl JoinedTable {
                     col_type,
                     None,
                     ColDef::default(),
-                )
+                );
+                column.set_base_affinity(affinity);
+                column
             })
             .try_collect::<alloc::Vec<_>>()?;
 
