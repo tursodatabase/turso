@@ -1164,7 +1164,10 @@ impl<'document> HirValidator<'document> {
             SourceKind::SchemaExpression => {}
             SourceKind::Table(table) => self.visit_source_table(source, table, true)?,
             SourceKind::Pseudo { table, .. } => self.visit_source_table(source, table, false)?,
-            SourceKind::TableFunction { table, arguments } => {
+            SourceKind::TableFunction {
+                table,
+                argument_predicates,
+            } => {
                 self.visit_source_table(source, table, false)?;
                 self.require(
                     table.value().virtual_table().is_some(),
@@ -1177,13 +1180,13 @@ impl<'document> HirValidator<'document> {
                     .filter(|column| column.hidden())
                     .count();
                 self.require(
-                    arguments.len() <= maximum,
+                    argument_predicates.len() <= maximum,
                     format!(
                         "table-function source {id} has {} arguments but accepts at most {maximum}",
-                        arguments.len()
+                        argument_predicates.len()
                     ),
                 )?;
-                self.visit_exprs(arguments)?;
+                self.visit_exprs(argument_predicates)?;
             }
             SourceKind::Cte(cte) | SourceKind::RecursiveInput(cte) => {
                 self.visit_cte(*cte)?;

@@ -13,10 +13,12 @@ use crate::translate::expr::{
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
+use crate::translate::plan::{
+    GroupBy, Plan, PredicateExpr, ResultSetColumn, SelectPlan, SubqueryState,
+};
 use crate::translate::planner::{
-    append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
-    parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    append_vtab_predicates_to_where_clause, parse_from, parse_limit, parse_where,
+    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -1861,7 +1863,7 @@ fn process_having_clause(
     aggregate_expressions: &mut Vec<super::plan::Aggregate>,
 ) -> Result<Vec<ast::Expr>> {
     let mut predicates = vec![];
-    break_predicate_at_and_boundaries(&having, &mut predicates);
+    having.append_conjuncts(&mut predicates);
 
     // Before alias resolution replaces identifiers with their underlying expressions,
     // check for aliased aggregate misuse. SQLite does this during name resolution by

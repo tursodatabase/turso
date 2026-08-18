@@ -8,7 +8,7 @@ use super::{
     expr::{build_using_column, ExprPolicies, ExprPolicy},
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
     schema_program::TypeTransform,
-    scope::{resolve_source_column, Scope},
+    scope::{resolve_source_column, ResolvedScopeExpr, Scope},
 };
 use crate::{schema::Table, sync::Arc, LimboError, Result};
 
@@ -488,7 +488,37 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let policy = policies.table_function();
         let mut arguments = Vec::with_capacity(syntax.len());
         for argument in syntax {
-            arguments.push(self.analyze_source_scalar_expr(argument, scope, policy, parent)?);
+            arguments
+                .push(self.analyze_source_scalar_expr_with_facts(argument, scope, policy, parent)?);
+        }
+        let hidden_columns = self
+            .source(source)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "missing semantic table-function source {source}"
+                ))
+            })?
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(column, definition)| definition.hidden.then_some(column))
+            .take(arguments.len())
+            .collect::<Vec<_>>();
+        if hidden_columns.len() != arguments.len() {
+            return Err(crate::LimboError::InternalError(format!(
+                "table-function source {source} argument count exceeds hidden columns"
+            )));
+        }
+        let mut argument_predicates = Vec::with_capacity(arguments.len());
+        for (argument, column) in arguments.into_iter().zip(hidden_columns) {
+            let hidden = self.resolve_atomic_expr(hir::Expr::column(source, column), scope)?;
+            let predicate = if matches!(&argument.expr, hir::Expr::Literal(ast::Literal::Null)) {
+                hir::Expr::IsNull(Box::new(hidden.expr))
+            } else {
+                self.build_scalar_binary_expr(hidden, ast::Operator::Equals, argument)?
+                    .expr
+            };
+            argument_predicates.push(predicate);
         }
         let source = self.source_mut(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!(
@@ -496,7 +526,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ))
         })?;
         let hir::SourceKind::TableFunction {
-            arguments: bound, ..
+            argument_predicates: bound,
+            ..
         } = &mut source.kind
         else {
             return Err(crate::LimboError::InternalError(format!(
@@ -510,7 +541,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 source.id
             )));
         }
-        *bound = arguments;
+        *bound = argument_predicates;
         Ok(())
     }
 
@@ -521,13 +552,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policy: ExprPolicy,
         parent: Option<hir::QueryId>,
     ) -> Result<hir::Expr> {
+        self.analyze_source_scalar_expr_with_facts(syntax, scope, policy, parent)
+            .map(|resolved| resolved.expr)
+    }
+
+    fn analyze_source_scalar_expr_with_facts(
+        &mut self,
+        syntax: &'ast ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        parent: Option<hir::QueryId>,
+    ) -> Result<ResolvedScopeExpr> {
         match parent {
-            Some(parent) => self
-                .analyze_query_scalar_expr(syntax, scope, policy, parent)
-                .map(|resolved| resolved.expr),
-            None => self
-                .analyze_root_expr(syntax, scope, policy)
-                .map(|resolved| resolved.expr),
+            Some(parent) => self.analyze_query_scalar_expr(syntax, scope, policy, parent),
+            None => self.analyze_root_expr(syntax, scope, policy),
         }
     }
 
@@ -790,7 +828,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     CatalogSourceKind::Table => hir::SourceKind::Table(table.clone()),
                     CatalogSourceKind::TableFunction => hir::SourceKind::TableFunction {
                         table: table.clone(),
-                        arguments: Vec::new(),
+                        argument_predicates: Vec::new(),
                     },
                 },
                 columns,

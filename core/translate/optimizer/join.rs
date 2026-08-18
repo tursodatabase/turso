@@ -6,16 +6,19 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Operator, TableInternalId};
 
 use super::{
-    access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
-    constraints::{usable_constraints_for_lhs_mask, TableConstraints},
+    access_method::{
+        add_where_cost, choose_single_btree_access_method, find_best_access_method_for_join_order,
+        find_best_hir_access_method_for_vtab, AccessMethod, AccessSource, HirAccessSource,
+    },
+    constraints::{usable_constraints_for_lhs_mask, HirTableConstraints, TableConstraints},
     cost_params::CostModelParams,
-    order::OrderTarget,
+    order::{HirOrderTarget, OrderTarget},
     AvailableIndexes, IndexMethodCandidate,
 };
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::translate::plan::BitSet;
 use crate::{
-    schema::Schema,
+    schema::{Schema, Table},
     stats::AnalyzeStats,
     translate::{
         expr::expr_references_subquery_id,
@@ -25,16 +28,19 @@ use crate::{
                 AccessMethodParams,
             },
             cost::{
-                estimate_rows_per_seek, rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx,
-                Cost, IndexInfo, RowCountEstimate,
+                estimate_cost_for_scan_or_seek, estimate_rows_per_seek, hir_where_expr_steps,
+                rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx, Cost, IndexInfo,
+                RowCountEstimate,
             },
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
+            HashJoinKey, HashJoinType, HirFromGroupBoundary, HirFromLayout, HirPlanSource,
+            HirWhereTerm, JoinOrderMember, JoinedTable, NonFromClauseSubquery, PredicateTerm,
             SubqueryState, TableReferences, WhereTerm,
         },
-        planner::{table_mask_from_expr, TableMask},
+        planner::{table_mask_from_expr, table_mask_from_hir_scope, HirFromScope, TableMask},
+        semantic::hir::{self, HirDocument},
     },
     LimboError, Result,
 };
@@ -68,8 +74,8 @@ const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
 /// Estimate how much the remaining `WHERE` terms cut the row count.
 ///
 /// Some callers skip a term because they need the count before that term runs.
-fn constraint_output_multipliers(
-    rhs_constraints: &TableConstraints,
+fn constraint_output_multipliers<E, S>(
+    rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
     consumed_where_terms: &BitSet<usize>,
@@ -125,20 +131,16 @@ fn constraint_output_multipliers(
 }
 
 /// Return the row count after one table and its ready filters.
-fn rows_after_join(
+fn rows_after_join<E, S>(
     input_cardinality: f64,
     method: &AccessMethod,
-    rhs_constraints: &TableConstraints,
+    rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     rhs_mask: TableMask,
-    rhs_table: &JoinedTable,
+    is_semi_or_anti: bool,
     params: &CostModelParams,
 ) -> f64 {
-    if rhs_table
-        .join_info
-        .as_ref()
-        .is_some_and(|join_info| join_info.is_semi_or_anti())
-    {
+    if is_semi_or_anti {
         return input_cardinality;
     }
     let remaining_filter_selectivity = constraint_output_multipliers(
@@ -263,7 +265,10 @@ pub(super) fn count_subquery_calls_for_plan(
             &constraints[*table_number],
             &prior_tables,
             table_mask,
-            &joined_tables[*table_number],
+            joined_tables[*table_number]
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_semi_or_anti()),
             params,
         );
         prior_tables.set(*table_number)?;
@@ -282,9 +287,13 @@ pub struct JoinN {
     pub cost: Cost,
 }
 
-struct WhereTermInfo {
+struct PredicateWorkInfo {
     table_mask: TableMask,
     extra_steps: usize,
+}
+
+struct WhereTermInfo {
+    work: PredicateWorkInfo,
     equal_tables: Option<(TableInternalId, TableInternalId, Option<TableInternalId>)>,
 }
 
@@ -349,9 +358,9 @@ fn join_lhs_and_rhs<'a>(
     };
     let mut joined_mask = lhs_mask.try_clone()?;
     joined_mask.set(rhs_table_number)?;
-    let ready_where = ready_where_work(
+    let ready_where = ready_predicate_work(
         where_clause,
-        where_terms,
+        where_terms.iter().map(|term| &term.work),
         &joined_mask,
         rhs_table_number,
         rhs_table_reference.internal_id,
@@ -399,7 +408,7 @@ fn join_lhs_and_rhs<'a>(
 
     let has_join_constraint = lhs.is_some()
         && where_terms.iter().any(|term| {
-            term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
+            term.work.table_mask.get(rhs_table_number) && term.work.table_mask.intersects(&lhs_mask)
         });
     if lhs.is_some() && !has_join_constraint {
         let rhs_self_constraint_selectivity =
@@ -919,7 +928,10 @@ fn join_lhs_and_rhs<'a>(
         rhs_constraints,
         &lhs_mask,
         rhs_self_mask,
-        &joined_tables[rhs_table_number],
+        joined_tables[rhs_table_number]
+            .join_info
+            .as_ref()
+            .is_some_and(|join_info| join_info.is_semi_or_anti()),
         params,
     );
 
@@ -1000,8 +1012,8 @@ fn build_prior_constraint_selectivity(
 }
 
 /// Estimates selectivity from build-side constraints that reference only the build table.
-fn build_self_constraint_selectivity(
-    build_constraints: &TableConstraints,
+fn build_self_constraint_selectivity<E, S>(
+    build_constraints: &TableConstraints<E, S>,
     build_table_idx: usize,
 ) -> f64 {
     let build_only_mask: TableMask = [build_table_idx]
@@ -1043,6 +1055,141 @@ pub struct BestJoinOrderResult {
     pub best_plan: JoinN,
     /// The best plan for the given order target, if it isn't the overall best.
     pub best_ordered_plan: Option<JoinN>,
+}
+
+#[derive(Clone, Copy)]
+struct JoinOrderingFacts {
+    constrained: bool,
+    full_outer: bool,
+}
+
+/// Join-order dependencies shared by parser-expression and HIR planning.
+pub(crate) struct JoinOrderingRestrictions {
+    illegal_lhs_by_rhs: Option<HashMap<usize, TableMask>>,
+    required_lhs_by_table: Option<Vec<TableMask>>,
+}
+
+impl JoinOrderingRestrictions {
+    fn required_lhs(&self, table: usize) -> Option<&TableMask> {
+        self.required_lhs_by_table
+            .as_ref()
+            .map(|required| &required[table])
+            .filter(|required| !required.is_empty())
+    }
+
+    pub(crate) fn allows_subset(&self, subset: &TableMask) -> bool {
+        self.required_lhs_by_table.as_ref().is_none_or(|required| {
+            !required.iter().enumerate().any(|(table, required)| {
+                subset.get(table) && !subset.contains_all_set_bits_of(required)
+            })
+        })
+    }
+
+    pub(crate) fn allows_rhs(&self, rhs: usize, lhs: &TableMask) -> bool {
+        self.illegal_lhs_by_rhs
+            .as_ref()
+            .and_then(|dependencies| dependencies.get(&rhs))
+            .is_none_or(|illegal_lhs| !lhs.intersects(illegal_lhs))
+    }
+
+    #[cfg(test)]
+    fn allows_order(&self, order: &[usize]) -> Result<bool> {
+        let mut prefix = TableMask::default();
+        for &rhs in order {
+            let mut subset = prefix.try_clone()?;
+            subset.set(rhs)?;
+            if !self.allows_subset(&subset) || !self.allows_rhs(rhs, &prefix) {
+                return Ok(false);
+            }
+            prefix = subset;
+        }
+        Ok(true)
+    }
+}
+
+fn join_ordering_restrictions<T>(
+    sources: &[T],
+    facts: impl Fn(&T) -> JoinOrderingFacts,
+) -> Result<JoinOrderingRestrictions> {
+    let source_count = sources.len();
+    let ordering_constrained_count = sources
+        .iter()
+        .filter(|source| facts(source).constrained)
+        .count();
+    let has_full_outer = sources.iter().any(|source| facts(source).full_outer);
+    if ordering_constrained_count == 0 && !has_full_outer {
+        return Ok(JoinOrderingRestrictions {
+            illegal_lhs_by_rhs: None,
+            required_lhs_by_table: None,
+        });
+    }
+
+    let mut illegal_lhs_by_rhs: HashMap<usize, TableMask> =
+        HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
+    let mut required_lhs_by_table = vec![TableMask::default(); source_count];
+    // Every ordering-constrained join requires its RHS source to remain after
+    // every source originally on its left. The reverse map lets the dynamic
+    // program reject a source that would place one of those RHS sources first.
+    for (left, _) in sources.iter().enumerate() {
+        for (right, source) in sources.iter().enumerate().skip(left + 1) {
+            if facts(source).constrained {
+                required_lhs_by_table[right].set(left)?;
+                illegal_lhs_by_rhs.entry(left).or_default().set(right)?;
+            }
+        }
+    }
+
+    // FULL OUTER is a barrier in both directions. Later sources cannot move
+    // before it: `(t1 INNER t3) FULL OUTER t2` is not equivalent to the
+    // requested `(t1 FULL OUTER t2) INNER t3`, because NULL-extended probe rows
+    // can survive differently.
+    for (full, source) in sources.iter().enumerate() {
+        if !facts(source).full_outer {
+            continue;
+        }
+        for (later, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(full + 1) {
+            required_lhs.set(full)?;
+            illegal_lhs_by_rhs.entry(full).or_default().set(later)?;
+        }
+    }
+
+    Ok(JoinOrderingRestrictions {
+        illegal_lhs_by_rhs: Some(illegal_lhs_by_rhs),
+        required_lhs_by_table: Some(required_lhs_by_table),
+    })
+}
+
+fn legacy_join_ordering_restrictions(
+    joined_tables: &[JoinedTable],
+) -> Result<JoinOrderingRestrictions> {
+    join_ordering_restrictions(joined_tables, |table| {
+        let join = table.join_info.as_ref();
+        JoinOrderingFacts {
+            constrained: join.is_some_and(|join| join.is_ordering_constrained()),
+            full_outer: join.is_some_and(|join| join.is_full_outer()),
+        }
+    })
+}
+
+/// Build HIR restrictions with the same code used by the legacy join planner.
+pub(crate) fn hir_join_ordering_restrictions(
+    sources: &[HirPlanSource],
+) -> Result<JoinOrderingRestrictions> {
+    join_ordering_restrictions(sources, |source| {
+        let kind = source.join_info().map(|join| join.kind);
+        JoinOrderingFacts {
+            constrained: matches!(
+                kind,
+                Some(
+                    crate::translate::semantic::hir::JoinKind::Cross
+                        | crate::translate::semantic::hir::JoinKind::Left
+                        | crate::translate::semantic::hir::JoinKind::Right
+                        | crate::translate::semantic::hir::JoinKind::Full
+                )
+            ),
+            full_outer: kind == Some(crate::translate::semantic::hir::JoinKind::Full),
+        }
+    })
 }
 
 /// Compute the best way to join a given set of tables.
@@ -1259,80 +1406,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Example:
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
-    let (left_join_illegal_map, required_lhs_by_table) = {
-        let ordering_constrained_count = joined_tables
-            .iter()
-            .filter(|t| {
-                t.join_info
-                    .as_ref()
-                    .is_some_and(|j| j.is_ordering_constrained())
-            })
-            .count();
-        let has_full_outer = joined_tables
-            .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
-        if ordering_constrained_count == 0 && !has_full_outer {
-            (None, None)
-        } else {
-            // map from rhs table index to lhs table index
-            let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
-            let mut required_lhs_by_table = vec![TableMask::default(); num_tables];
-            for (i, _) in joined_tables.iter().enumerate() {
-                for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
-                    // to appear after the LHS table in the join order.
-                    if joined_table
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|j| j.is_ordering_constrained())
-                    {
-                        required_lhs_by_table[j].set(i)?;
-                        // bitwise OR the masks
-                        if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.set(j)?;
-                        } else {
-                            let mut mask = TableMask::default();
-                            mask.set(j)?;
-                            left_join_illegal_map.insert(i, mask);
-                        }
-                    }
-                }
-            }
-            // FULL OUTER acts as a reordering barrier in both directions: tables
-            // originally after a FULL OUTER table cannot be moved before it, or
-            // the planner produces e.g. `(t1 INNER t3) FULL OUTER t2` instead of
-            // the requested `(t1 FULL OUTER t2) INNER t3`, which can leak
-            // NULL-filled probe rows past the inner join.
-            for (k, t) in joined_tables.iter().enumerate() {
-                if !t.join_info.as_ref().is_some_and(|j| j.is_full_outer()) {
-                    continue;
-                }
-                for (j, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(k + 1) {
-                    required_lhs.set(k)?;
-                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
-                        illegal_lhs.set(j)?;
-                    } else {
-                        let mut mask = TableMask::default();
-                        mask.set(j)?;
-                        left_join_illegal_map.insert(k, mask);
-                    }
-                }
-            }
-            (Some(left_join_illegal_map), Some(required_lhs_by_table))
-        }
-    };
+    let ordering_restrictions = legacy_join_ordering_restrictions(joined_tables)?;
 
     // Now that we have our single-table base cases, we can start considering join subsets of 2 tables and more.
     // Try to join each single table to each other table.
     for subset_size in 2..=num_tables {
         for mask in generate_join_bitmasks(num_tables, subset_size) {
             let mask = mask?;
-            if required_lhs_by_table.as_ref().is_some_and(|required| {
-                required.iter().enumerate().any(|(table, required)| {
-                    mask.get(table) && !mask.contains_all_set_bits_of(required)
-                })
-            }) {
+            if !ordering_restrictions.allows_subset(&mask) {
                 continue;
             }
             // Keep track of the best way to join this subset of tables per possible last table.
@@ -1362,14 +1443,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 }
 
                 // If this join ordering would violate LEFT JOIN ordering restrictions, skip.
-                if let Some(illegal_lhs) = left_join_illegal_map
-                    .as_ref()
-                    .and_then(|deps| deps.get(&rhs_idx))
-                {
-                    let legal = !lhs_mask.intersects(illegal_lhs);
-                    if !legal {
-                        continue; // Don't allow RHS before its LEFT in LEFT JOIN
-                    }
+                if !ordering_restrictions.allows_rhs(rhs_idx, &lhs_mask) {
+                    continue;
                 }
 
                 let Some(lhs_variants) = best_plan_memo.get(&lhs_mask) else {
@@ -1598,34 +1673,17 @@ fn compute_greedy_join_order<'a>(
         return Ok(None);
     }
 
-    // Outer join RHS tables require all preceding tables to be joined first.
-    let left_join_deps: HashMap<usize, TableMask> = joined_tables
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_ordering_constrained())
-        })
-        .map(|(j, _)| {
-            let mut required = TableMask::default();
-            for k in 0..j {
-                required.set(k)?;
-            }
-            Ok((j, required))
-        })
-        .collect::<Result<_>>()?;
+    let ordering_restrictions = legacy_join_ordering_restrictions(joined_tables)?;
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick the starting table using local filters and directed indexed-seek benefits.
-    let first_idx = find_best_starting_table(
-        num_tables,
-        joined_tables,
+    let first_idx = find_best_starting_source(
+        joined_tables.iter(),
         constraints,
         base_table_rows,
-        &left_join_deps,
+        &ordering_restrictions,
         analyze_stats,
         params,
     )?;
@@ -1678,14 +1736,14 @@ fn compute_greedy_join_order<'a>(
         let mut has_connected_candidate = false;
         for idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
+            if let Some(required) = ordering_restrictions.required_lhs(idx) {
                 if !current_mask.contains_all_set_bits_of(required) {
                     continue;
                 }
             }
-            let connected = where_terms
-                .iter()
-                .any(|term| term.table_mask.get(idx) && term.table_mask.intersects(&current_mask));
+            let connected = where_terms.iter().any(|term| {
+                term.work.table_mask.get(idx) && term.work.table_mask.intersects(&current_mask)
+            });
             if connected {
                 has_connected_candidate = true;
                 break;
@@ -1694,14 +1752,14 @@ fn compute_greedy_join_order<'a>(
 
         for idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
+            if let Some(required) = ordering_restrictions.required_lhs(idx) {
                 if !current_mask.contains_all_set_bits_of(required) {
                     continue;
                 }
             }
             if has_connected_candidate {
                 let connected = where_terms.iter().any(|term| {
-                    term.table_mask.get(idx) && term.table_mask.intersects(&current_mask)
+                    term.work.table_mask.get(idx) && term.work.table_mask.intersects(&current_mask)
                 });
                 if !connected {
                     continue;
@@ -1767,6 +1825,389 @@ fn compute_greedy_join_order<'a>(
     }))
 }
 
+/// One candidate source and access method during greedy HIR join planning.
+#[derive(Debug)]
+struct HirJoinStep {
+    source_position: usize,
+    access_method: AccessMethod,
+}
+
+/// Keeps flattened FROM-group leaves together while the greedy planner chooses
+/// their access order. This preserves syntactic join barriers without making a
+/// group into a runtime source.
+struct HirJoinBoundaries<'a> {
+    groups: &'a [HirFromGroupBoundary],
+    ordering_restrictions: &'a JoinOrderingRestrictions,
+}
+
+impl HirJoinBoundaries<'_> {
+    fn allows_candidate(&self, source_position: usize, joined: &TableMask) -> bool {
+        for group in self.groups {
+            let started = group
+                .source_range
+                .clone()
+                .any(|position| joined.get(position));
+            let complete = group
+                .source_range
+                .clone()
+                .all(|position| joined.get(position));
+
+            if started && !complete && !group.source_range.contains(&source_position) {
+                return false;
+            }
+
+            if !started && group.source_range.contains(&source_position) {
+                let group_requires_outer_prefix = group
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|join| hir_join_kind_is_ordering_constrained(join.kind));
+                let nested_group_requires_outer_prefix = self.groups.iter().any(|nested| {
+                    group.source_range.start <= nested.source_range.start
+                        && nested.source_range.end <= group.source_range.end
+                        && nested
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|join| hir_join_kind_is_ordering_constrained(join.kind))
+                });
+                let leaf_requires_outer_source = group.source_range.clone().any(|position| {
+                    self.ordering_restrictions
+                        .required_lhs(position)
+                        .is_some_and(|required| {
+                            required.iter().any(|required_position| {
+                                !group.source_range.contains(&required_position)
+                                    && !joined.get(required_position)
+                            })
+                        })
+                });
+                if ((group_requires_outer_prefix || nested_group_requires_outer_prefix)
+                    && (0..group.source_range.start).any(|position| !joined.get(position)))
+                    || leaf_requires_outer_source
+                {
+                    return false;
+                }
+            }
+
+            if !complete
+                && source_position >= group.source_range.end
+                && group
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|join| join.kind == hir::JoinKind::Full)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn hir_join_kind_is_ordering_constrained(kind: hir::JoinKind) -> bool {
+    matches!(
+        kind,
+        hir::JoinKind::Cross | hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+    )
+}
+
+/// Build a left-deep HIR join plan using the existing greedy rules.
+///
+/// HIR supports B-tree, virtual-table, derived, and CTE scans. Hash joins and
+/// multi-index scans remain optional legacy optimizations.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn compute_hir_greedy_join_order(
+    document: &HirDocument,
+    sources: &[HirPlanSource],
+    groups: &[HirFromGroupBoundary],
+    constraints: &[HirTableConstraints],
+    where_clause: &[HirWhereTerm],
+    base_table_rows: &[RowCountEstimate],
+    source_costs: &[Cost],
+    order_target: Option<&HirOrderTarget<'_>>,
+    initial_input_cardinality: f64,
+    access_methods_arena: &mut Vec<AccessMethod>,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<Option<BestJoinOrderResult>> {
+    if sources.is_empty() {
+        return Ok(None);
+    }
+
+    let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
+    let boundaries = HirJoinBoundaries {
+        groups,
+        ordering_restrictions: &ordering_restrictions,
+    };
+    let layout = HirFromLayout::new(sources, groups);
+    let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
+    let first_position = find_best_hir_starting_source(
+        document,
+        sources,
+        constraints,
+        base_table_rows,
+        source_costs,
+        &ordering_restrictions,
+        &boundaries,
+        analyze_stats,
+        params,
+    )?;
+
+    let mut remaining: TableMask = (0..sources.len()).try_collect()?;
+    let mut joined_mask = TableMask::default();
+    let first = hir_join_step(
+        document,
+        sources,
+        &layout,
+        constraints,
+        where_clause,
+        &predicate_work,
+        base_table_rows,
+        source_costs,
+        order_target,
+        first_position,
+        &joined_mask,
+        initial_input_cardinality,
+        schema,
+        analyze_stats,
+        params,
+    )?;
+    let first_position = first.source_position;
+    let mut first_mask = TableMask::default();
+    first_mask.set(first_position)?;
+    let mut output_cardinality = rows_after_join(
+        initial_input_cardinality,
+        &first.access_method,
+        &constraints[first_position],
+        &joined_mask,
+        first_mask,
+        false,
+        params,
+    );
+    let mut cost = first.access_method.cost;
+    access_methods_arena.push(first.access_method);
+    let mut data = vec![(first_position, access_methods_arena.len() - 1)];
+    joined_mask.set(first_position)?;
+    remaining.clear(first_position);
+
+    while !remaining.is_empty() {
+        let mut has_connected_candidate = false;
+        for position in &remaining {
+            if !boundaries.allows_candidate(position, &joined_mask) {
+                continue;
+            }
+            if let Some(required) = ordering_restrictions.required_lhs(position) {
+                if !joined_mask.contains_all_set_bits_of(required) {
+                    continue;
+                }
+            }
+            let connected = predicate_work.iter().any(|work| {
+                work.table_mask.get(position) && work.table_mask.intersects(&joined_mask)
+            });
+            if connected {
+                has_connected_candidate = true;
+                break;
+            }
+        }
+
+        let mut best: Option<(usize, AccessMethod, f64, Cost)> = None;
+        for position in &remaining {
+            if !boundaries.allows_candidate(position, &joined_mask) {
+                continue;
+            }
+            if let Some(required) = ordering_restrictions.required_lhs(position) {
+                if !joined_mask.contains_all_set_bits_of(required) {
+                    continue;
+                }
+            }
+            let connected = predicate_work.iter().any(|work| {
+                work.table_mask.get(position) && work.table_mask.intersects(&joined_mask)
+            });
+            if has_connected_candidate && !connected {
+                continue;
+            }
+
+            let step = hir_join_step(
+                document,
+                sources,
+                &layout,
+                constraints,
+                where_clause,
+                &predicate_work,
+                base_table_rows,
+                source_costs,
+                order_target,
+                position,
+                &joined_mask,
+                output_cardinality,
+                schema,
+                analyze_stats,
+                params,
+            )?;
+            let position = step.source_position;
+            let mut method = step.access_method;
+            if !connected {
+                let base_rows = base_table_rows
+                    .get(position)
+                    .copied()
+                    .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+                let self_selectivity =
+                    build_self_constraint_selectivity(&constraints[position], position);
+                method.cost =
+                    method.cost + Cost(output_cardinality * *base_rows * self_selectivity);
+            }
+
+            let candidate_cost = cost + method.cost;
+            let mut rhs_mask = TableMask::default();
+            rhs_mask.set(position)?;
+            let candidate_cardinality = rows_after_join(
+                output_cardinality,
+                &method,
+                &constraints[position],
+                &joined_mask,
+                rhs_mask,
+                false,
+                params,
+            );
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, _, best_cost)| candidate_cost < *best_cost)
+            {
+                best = Some((position, method, candidate_cardinality, candidate_cost));
+            }
+        }
+
+        let (position, method, cardinality, next_cost) = best.ok_or_else(|| {
+            LimboError::PlanningError("Greedy HIR join ordering: no valid next source".to_string())
+        })?;
+        access_methods_arena.push(method);
+        data.push((position, access_methods_arena.len() - 1));
+        joined_mask.set(position)?;
+        remaining.clear(position);
+        output_cardinality = cardinality;
+        cost = next_cost;
+    }
+
+    Ok(Some(BestJoinOrderResult {
+        best_plan: JoinN {
+            data,
+            output_cardinality,
+            cost,
+        },
+        best_ordered_plan: None,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hir_join_step(
+    document: &HirDocument,
+    sources: &[HirPlanSource],
+    layout: &HirFromLayout<'_>,
+    constraints: &[HirTableConstraints],
+    where_clause: &[HirWhereTerm],
+    predicate_work: &[PredicateWorkInfo],
+    base_table_rows: &[RowCountEstimate],
+    source_costs: &[Cost],
+    order_target: Option<&HirOrderTarget<'_>>,
+    source_position: usize,
+    lhs_mask: &TableMask,
+    input_cardinality: f64,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<HirJoinStep> {
+    let source = &sources[source_position];
+    let mut joined_mask = lhs_mask.try_clone()?;
+    joined_mask.set(source_position)?;
+    let ready_where = ready_predicate_work_by_owner(
+        where_clause,
+        predicate_work,
+        &joined_mask,
+        source_position,
+        |owner| layout.predicate_owner_ready(owner, &joined_mask, source_position),
+    );
+    let base_row_count = base_table_rows
+        .get(source_position)
+        .copied()
+        .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+    let mut access_method = match source {
+        HirPlanSource::BTree(source) => match &source.table {
+            Table::BTree(_) => choose_single_btree_access_method(
+                &HirAccessSource::new(
+                    source,
+                    document
+                        .source(source.internal_id)
+                        .expect("validated HIR contains referenced source"),
+                ),
+                &constraints[source_position],
+                lhs_mask,
+                source_position,
+                order_target,
+                &ready_where,
+                schema,
+                analyze_stats,
+                input_cardinality,
+                base_row_count,
+                params,
+            )?,
+            Table::Virtual(vtab) => find_best_hir_access_method_for_vtab(
+                vtab,
+                &constraints[source_position].constraints,
+                source_position,
+                lhs_mask,
+                input_cardinality,
+                base_row_count,
+                params,
+            )?
+            .ok_or_else(|| {
+                LimboError::PlanningError(format!(
+                    "virtual table {} rejected the available constraints",
+                    source.table.get_name()
+                ))
+            })?,
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR catalog source {} is not a table",
+                    source.internal_id
+                )))
+            }
+        },
+        HirPlanSource::Derived { .. }
+        | HirPlanSource::Cte { .. }
+        | HirPlanSource::RecursiveCte { .. }
+        | HirPlanSource::RecursiveInput { .. } => {
+            let rows = *base_row_count;
+            let scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+                None,
+            );
+            let reexecution_cost =
+                Cost((input_cardinality - 1.0).max(0.0) * rows * params.cpu_cost_per_seek);
+            AccessMethod {
+                cost: scan_cost
+                    + reexecution_cost
+                    + Cost(input_cardinality * source_costs[source_position].0),
+                estimated_rows_per_outer_row: rows,
+                consumed_where_terms: Default::default(),
+                params: AccessMethodParams::Subquery {
+                    iter_dir: crate::translate::plan::IterationDirection::Forwards,
+                },
+            }
+        }
+    };
+    add_where_cost(&mut access_method, &ready_where, input_cardinality, params);
+
+    Ok(HirJoinStep {
+        source_position,
+        access_method,
+    })
+}
+
 /// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
 ///
 /// Score = base_rows * filter_selectivity * table's indexed-seek multiplier
@@ -1776,57 +2217,96 @@ fn compute_greedy_join_order<'a>(
 /// better reached via an index only after a predecessor has been joined.
 ///
 /// Lower score wins. Outer join RHS tables are excluded.
-fn find_best_starting_table(
-    num_tables: usize,
-    joined_tables: &[JoinedTable],
-    constraints: &[TableConstraints],
+fn find_best_starting_source<E, S, I>(
+    sources: I,
+    constraints: &[TableConstraints<E, S>],
     base_table_rows: &[RowCountEstimate],
-    left_join_deps: &HashMap<usize, TableMask>,
+    ordering_restrictions: &JoinOrderingRestrictions,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Result<usize> {
+) -> Result<usize>
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: AccessSource,
+{
+    let num_sources = constraints.len();
     let multipliers = compute_indexed_seek_benefits(
-        num_tables,
-        joined_tables,
+        sources,
         constraints,
         base_table_rows,
-        left_join_deps,
+        ordering_restrictions,
         analyze_stats,
         params,
     )?;
 
     let mut best: Option<(usize, f64)> = None;
-    for t in 0..num_tables {
-        if left_join_deps.contains_key(&t) {
+    for source in 0..num_sources {
+        if ordering_restrictions.required_lhs(source).is_some() {
             continue; // Outer join RHS - cannot be first
         }
 
-        let base_rows = *base_table_rows[t];
-
-        // Self-constraints compare columns within the same table (e.g., t.col1 < t.col2).
-        let self_mask = {
-            let mut m = TableMask::default();
-            m.set(t)?;
-            m
-        };
-
-        // Include literal constraints (lhs_mask empty) and self-constraints in selectivity
-        let selectivity: f64 = constraints[t]
-            .constraints
-            .iter()
-            .filter(|c| c.lhs_mask.is_empty() || c.lhs_mask == self_mask)
-            .map(|c| c.selectivity)
-            .product();
-
-        let score = base_rows * selectivity * multipliers[t];
+        let score = *base_table_rows[source]
+            * build_self_constraint_selectivity(&constraints[source], source)
+            * multipliers[source];
 
         if best.is_none_or(|(_, s)| score < s) {
-            best = Some((t, score));
+            best = Some((source, score));
         }
     }
 
     // Table 0 can never be outer join RHS, so best is always Some.
     Ok(best.expect("no valid starting table").0)
+}
+
+fn find_best_hir_starting_source(
+    document: &HirDocument,
+    sources: &[HirPlanSource],
+    constraints: &[HirTableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    source_costs: &[Cost],
+    ordering_restrictions: &JoinOrderingRestrictions,
+    boundaries: &HirJoinBoundaries<'_>,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<usize> {
+    let multipliers = compute_indexed_seek_benefits_optional(
+        sources.len(),
+        constraints,
+        base_table_rows,
+        ordering_restrictions,
+        analyze_stats,
+        params,
+        |position| {
+            let source = sources[position].btree()?;
+            Some(HirAccessSource::new(
+                source,
+                document
+                    .source(source.internal_id)
+                    .expect("validated HIR contains referenced source"),
+            ))
+        },
+    )?;
+
+    let empty = TableMask::default();
+    let mut best: Option<(usize, f64)> = None;
+    for position in 0..sources.len() {
+        if !boundaries.allows_candidate(position, &empty) {
+            continue;
+        }
+        if ordering_restrictions.required_lhs(position).is_some() {
+            continue;
+        }
+        let source_work = source_costs[position].0 + *base_table_rows[position];
+        let score = source_work
+            * build_self_constraint_selectivity(&constraints[position], position)
+            * multipliers[position];
+        if best.is_none_or(|(_, best_score)| score < best_score) {
+            best = Some((position, score));
+        }
+    }
+
+    Ok(best.expect("no valid starting HIR source").0)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1851,27 +2331,60 @@ impl IndexedSeekBenefit {
 /// A table enables a seek on another when its presence in the join prefix allows
 /// the second table to use an indexed seek instead of a scan. The returned
 /// multiplier is lower for better starting choices.
-fn compute_indexed_seek_benefits(
-    num_tables: usize,
-    joined_tables: &[JoinedTable],
-    constraints: &[TableConstraints],
+fn compute_indexed_seek_benefits<E, S, I>(
+    sources: I,
+    constraints: &[TableConstraints<E, S>],
     base_table_rows: &[RowCountEstimate],
-    left_join_deps: &HashMap<usize, TableMask>,
+    ordering_restrictions: &JoinOrderingRestrictions,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Result<Vec<f64>> {
-    let mut benefits = vec![IndexedSeekBenefit::default(); num_tables];
+) -> Result<Vec<f64>>
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: AccessSource,
+{
+    let sources: Vec<_> = sources.into_iter().collect();
+    let num_sources = constraints.len();
+    turso_assert_eq!(sources.len(), num_sources);
+    compute_indexed_seek_benefits_optional(
+        num_sources,
+        constraints,
+        base_table_rows,
+        ordering_restrictions,
+        analyze_stats,
+        params,
+        |position| Some(&sources[position]),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_indexed_seek_benefits_optional<E, S, A>(
+    num_sources: usize,
+    constraints: &[TableConstraints<E, S>],
+    base_table_rows: &[RowCountEstimate],
+    ordering_restrictions: &JoinOrderingRestrictions,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+    mut access_source: impl FnMut(usize) -> Option<A>,
+) -> Result<Vec<f64>>
+where
+    A: AccessSource,
+{
+    let mut benefits = vec![IndexedSeekBenefit::default(); num_sources];
 
     let mut total_constant_score = 0.0;
-    let mut constant_scores = vec![0.0; num_tables];
+    let mut constant_scores = vec![0.0; num_sources];
     let empty_lhs_mask = TableMask::default();
 
-    for rhs in 0..num_tables {
+    for rhs in 0..num_sources {
+        let Some(rhs_source) = access_source(rhs) else {
+            continue;
+        };
         let rhs_constraints = &constraints[rhs];
-        let rhs_table = &joined_tables[rhs];
         let rhs_base_rows = base_table_rows[rhs];
 
-        if let Some(deps) = left_join_deps.get(&rhs) {
+        if let Some(deps) = ordering_restrictions.required_lhs(rhs) {
             if deps.count() > 1 {
                 continue;
             }
@@ -1882,7 +2395,7 @@ fn compute_indexed_seek_benefits(
                     rhs_constraints,
                     &lhs_mask,
                     rhs,
-                    rhs_table,
+                    &rhs_source,
                     rhs_base_rows,
                     analyze_stats,
                     params,
@@ -1918,7 +2431,7 @@ fn compute_indexed_seek_benefits(
             rhs_constraints,
             &empty_lhs_mask,
             rhs,
-            rhs_table,
+            &rhs_source,
             rhs_base_rows,
             analyze_stats,
             params,
@@ -1926,7 +2439,7 @@ fn compute_indexed_seek_benefits(
         if constant_score > 0.0 {
             total_constant_score += constant_score;
             constant_scores[rhs] = constant_score;
-            benefits[rhs].penalty += constant_score * (num_tables.saturating_sub(1)) as f64;
+            benefits[rhs].penalty += constant_score * (num_sources.saturating_sub(1)) as f64;
         }
 
         for t in potential_predecessors.iter() {
@@ -1939,7 +2452,7 @@ fn compute_indexed_seek_benefits(
                 rhs_constraints,
                 &lhs_mask,
                 rhs,
-                rhs_table,
+                &rhs_source,
                 rhs_base_rows,
                 analyze_stats,
                 params,
@@ -1952,7 +2465,7 @@ fn compute_indexed_seek_benefits(
         }
     }
 
-    for start in 0..num_tables {
+    for start in 0..num_sources {
         benefits[start].reward += total_constant_score - constant_scores[start];
     }
 
@@ -1964,15 +2477,16 @@ fn compute_indexed_seek_benefits(
 /// Higher is better, based on estimated row reduction:
 ///
 /// `ln(base_rows / estimated_rows_per_seek)`
-fn get_best_seek_score(
-    rhs_constraints: &TableConstraints,
+fn get_best_seek_score<E, S>(
+    rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     rhs: usize,
-    rhs_table: &JoinedTable,
+    rhs_source: &impl AccessSource,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> f64 {
+    let rhs_table = rhs_source.table();
     let mut best_score = 0.0;
     for candidate in &rhs_constraints.candidates {
         let usable_constraint_refs = usable_constraints_for_lhs_mask(
@@ -1988,7 +2502,7 @@ fn get_best_seek_score(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
+                covering: rhs_source.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
@@ -2004,7 +2518,7 @@ fn get_best_seek_score(
             },
         };
         let analyze_ctx = AnalyzeCtx {
-            rhs_table,
+            table_name: rhs_table.get_name(),
             index: candidate.index.as_ref(),
             stats: analyze_stats,
         };
@@ -2128,10 +2642,12 @@ fn build_where_term_info(
         .iter()
         .map(|term| {
             Ok(WhereTermInfo {
-                table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
-                // FIXME: The row cost also includes one simple condition. Give row work
-                // and condition work separate costs so this does not need to subtract one.
-                extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
+                work: PredicateWorkInfo {
+                    table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
+                    // FIXME: The row cost also includes one simple condition. Give row work
+                    // and condition work separate costs so this does not need to subtract one.
+                    extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
+                },
                 equal_tables: (!term.consumed)
                     .then(|| tables_in_equal_test(&term.expr))
                     .flatten()
@@ -2141,26 +2657,54 @@ fn build_where_term_info(
         .collect()
 }
 
-/// Return the extra `WHERE` work that can run after this table.
-fn ready_where_work(
-    where_clause: &[WhereTerm],
-    where_terms: &[WhereTermInfo],
-    joined_mask: &TableMask,
-    rhs_table_number: usize,
-    rhs_table_id: TableInternalId,
-) -> SmallVec<[(usize, usize); 4]> {
-    where_clause
+fn build_hir_predicate_work(
+    document: &HirDocument,
+    from: &impl HirFromScope,
+    terms: &[HirWhereTerm],
+) -> Result<Vec<PredicateWorkInfo>> {
+    terms
         .iter()
-        .zip(where_terms)
+        .map(|term| {
+            Ok(PredicateWorkInfo {
+                table_mask: table_mask_from_hir_scope(document, from, &term.expr)?,
+                extra_steps: hir_where_expr_steps(&term.expr).saturating_sub(1),
+            })
+        })
+        .collect()
+}
+
+/// Return the extra `WHERE` work that can run after this table.
+fn ready_predicate_work<'work, E, S: Copy + PartialEq>(
+    terms: &[PredicateTerm<E, S>],
+    work: impl IntoIterator<Item = &'work PredicateWorkInfo>,
+    joined_mask: &TableMask,
+    rhs_position: usize,
+    rhs_source: S,
+) -> SmallVec<[(usize, usize); 4]> {
+    ready_predicate_work_by_owner(terms, work, joined_mask, rhs_position, |owner| {
+        owner == rhs_source
+    })
+}
+
+fn ready_predicate_work_by_owner<'work, E, S: Copy>(
+    terms: &[PredicateTerm<E, S>],
+    work: impl IntoIterator<Item = &'work PredicateWorkInfo>,
+    joined_mask: &TableMask,
+    rhs_position: usize,
+    owner_is_ready: impl Fn(S) -> bool,
+) -> SmallVec<[(usize, usize); 4]> {
+    terms
+        .iter()
+        .zip(work)
         .enumerate()
         .filter_map(|(term_idx, (term, info))| {
             if term.consumed || info.extra_steps == 0 {
                 return None;
             }
             let ready = match term.from_outer_join {
-                Some(table_id) => table_id == rhs_table_id,
+                Some(owner) => owner_is_ready(owner),
                 None => {
-                    info.table_mask.get(rhs_table_number)
+                    info.table_mask.get(rhs_position)
                         && joined_mask.contains_all_set_bits_of(&info.table_mask)
                 }
             };
@@ -2235,14 +2779,18 @@ mod tests {
         stats::AnalyzeStats,
         translate::{
             optimizer::{
-                access_method::AccessMethodParams,
-                constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
+                access_method::{AccessMethodParams, HirAccessSource},
+                constraints::{
+                    constraints_from_where_clause, BinaryExprSide, Constraint, ConstraintOperator,
+                    ConstraintRef, ConstraintUseCandidate, RangeConstraintRef, TableConstraints,
+                },
                 cost_params::DEFAULT_PARAMS,
             },
             plan::{
-                ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, TableReferences,
-                WhereTerm,
+                ColumnUsedMask, HirFromGroupBoundary, HirJoinInfo, HirPlannedSource,
+                IterationDirection, JoinInfo, JoinType, Operation, TableReferences, WhereTerm,
             },
+            semantic::hir::{self, IndexHint, JoinKind, SourceId},
         },
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
@@ -2397,13 +2945,24 @@ mod tests {
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
-        assert!(
-            ready_where_work(&two_table_where, &where_terms, &joined_mask, 0, first_id).is_empty()
-        );
+        assert!(ready_predicate_work(
+            &two_table_where,
+            where_terms.iter().map(|term| &term.work),
+            &joined_mask,
+            0,
+            first_id,
+        )
+        .is_empty());
 
         joined_mask.set(1)?;
-        let ready = ready_where_work(&two_table_where, &where_terms, &joined_mask, 1, second_id);
-        assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
+        let ready = ready_predicate_work(
+            &two_table_where,
+            where_terms.iter().map(|term| &term.work),
+            &joined_mask,
+            1,
+            second_id,
+        );
+        assert_eq!(ready.as_slice(), &[(0, where_terms[0].work.extra_steps)]);
         let mut term = WhereTerm::from(Expr::Binary(
             Box::new(check(first_id)),
             Operator::Or,
@@ -2415,13 +2974,468 @@ mod tests {
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
+        assert!(ready_predicate_work(
+            &outer_join_where,
+            where_terms.iter().map(|term| &term.work),
+            &joined_mask,
+            0,
+            first_id,
+        )
+        .is_empty());
+
+        joined_mask.set(1)?;
+        let ready = ready_predicate_work(
+            &outer_join_where,
+            where_terms.iter().map(|term| &term.work),
+            &joined_mask,
+            1,
+            second_id,
+        );
+        assert_eq!(ready.as_slice(), &[(0, where_terms[0].work.extra_steps)]);
+        Ok(())
+    }
+
+    #[test]
+    fn hir_where_work_uses_resolved_source_dependencies() -> Result<()> {
+        let first = SourceId::new(0);
+        let second = SourceId::new(1);
+        let from = hir::From {
+            first,
+            joins: vec![hir::Join {
+                right: second,
+                kind: JoinKind::Inner,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let document = HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: first,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![
+                _create_hir_definition("first", first),
+                _create_hir_definition("second", second),
+            ],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let check = |source| hir::Expr::Binary {
+            lhs: Box::new(hir::Expr::column(source, 0)),
+            operator: Operator::Equals,
+            rhs: Box::new(hir::Expr::Literal(ast::Literal::Numeric("1".into()))),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        let terms = vec![HirWhereTerm::from(hir::Expr::Binary {
+            lhs: Box::new(check(first)),
+            operator: Operator::Or,
+            rhs: Box::new(check(second)),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        })];
+        let work = build_hir_predicate_work(&document, &from, &terms)?;
+        assert_eq!(work[0].extra_steps, 2);
+
+        let mut joined_mask = TableMask::default();
+        joined_mask.set(0)?;
         assert!(
-            ready_where_work(&outer_join_where, &where_terms, &joined_mask, 0, first_id).is_empty()
+            ready_predicate_work(&terms, &work, &joined_mask, 0, first).is_empty(),
+            "predicate still needs the second source"
         );
 
         joined_mask.set(1)?;
-        let ready = ready_where_work(&outer_join_where, &where_terms, &joined_mask, 1, second_id);
-        assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
+        assert_eq!(
+            ready_predicate_work(&terms, &work, &joined_mask, 1, second).as_slice(),
+            [(0, 2)]
+        );
+
+        let mut outer_join_term = HirWhereTerm::from(hir::Expr::Binary {
+            lhs: Box::new(check(first)),
+            operator: Operator::Or,
+            rhs: Box::new(check(first)),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        });
+        outer_join_term.from_outer_join = Some(second);
+        let terms = vec![outer_join_term];
+        let work = build_hir_predicate_work(&document, &from, &terms)?;
+        assert!(ready_predicate_work(&terms, &work, &joined_mask, 0, first).is_empty());
+        assert_eq!(
+            ready_predicate_work(&terms, &work, &joined_mask, 1, second).as_slice(),
+            [(0, work[0].extra_steps)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hir_group_predicate_owner_is_ready_only_when_current_leaf_completes_group() -> Result<()> {
+        let sources = (0..3)
+            .map(|id| {
+                HirPlanSource::BTree(_create_hir_source(
+                    _create_btree_table(
+                        &format!("source_{id}"),
+                        _create_column_list(&["value"], Type::Integer),
+                    ),
+                    None,
+                    SourceId::new(id),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let outer_group = SourceId::new(10);
+        let first_leaf_group = SourceId::new(11);
+        let last_leaf_group = SourceId::new(12);
+        let groups = vec![
+            HirFromGroupBoundary {
+                source: first_leaf_group,
+                parent: Some(outer_group),
+                source_range: 1..2,
+                join_info: None,
+            },
+            HirFromGroupBoundary {
+                source: last_leaf_group,
+                parent: Some(outer_group),
+                source_range: 2..3,
+                join_info: None,
+            },
+            HirFromGroupBoundary {
+                source: outer_group,
+                parent: None,
+                source_range: 1..3,
+                join_info: None,
+            },
+        ];
+        let layout = HirFromLayout::new(&sources, &groups);
+        let terms = [HirWhereTerm {
+            expr: hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+            from_outer_join: Some(outer_group),
+            consumed: false,
+        }];
+        let work = [PredicateWorkInfo {
+            table_mask: TableMask::default(),
+            extra_steps: 1,
+        }];
+
+        let mut joined = TableMask::default();
+        joined.set(1)?;
+        assert!(layout.predicate_owner_ready(first_leaf_group, &joined, 1));
+        assert!(!layout.predicate_owner_ready(outer_group, &joined, 1));
+        assert!(
+            ready_predicate_work_by_owner(&terms, &work, &joined, 1, |owner| {
+                layout.predicate_owner_ready(owner, &joined, 1)
+            })
+            .is_empty()
+        );
+
+        joined.set(2)?;
+        assert!(layout.predicate_owner_ready(last_leaf_group, &joined, 2));
+        assert!(layout.predicate_owner_ready(outer_group, &joined, 2));
+        assert_eq!(
+            ready_predicate_work_by_owner(&terms, &work, &joined, 2, |owner| {
+                layout.predicate_owner_ready(owner, &joined, 2)
+            })
+            .as_slice(),
+            [(0, 1)]
+        );
+        assert!(!layout.predicate_owner_ready(outer_group, &joined, 0));
+        assert!(layout.predicate_owner_ready(SourceId::new(0), &joined, 0));
+        assert!(!layout.predicate_owner_ready(SourceId::new(99), &joined, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn later_hir_join_step_uses_constraints_from_joined_sources() -> Result<()> {
+        let first = SourceId::new(0);
+        let second = SourceId::new(1);
+        let first_table =
+            _create_btree_table("first", _create_column_list(&["value"], Type::Integer));
+        let second_table =
+            _create_btree_table("second", _create_column_list(&["value"], Type::Integer));
+        let first_source = _create_hir_source(first_table, None, first);
+        let mut second_source = _create_hir_source(second_table, Some(JoinKind::Inner), second);
+        second_source.col_used_mask.set(0)?;
+        let sources = vec![first_source, second_source]
+            .into_iter()
+            .map(HirPlanSource::BTree)
+            .collect::<Vec<_>>();
+        let document = HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: first,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![
+                _create_hir_definition("first", first),
+                _create_hir_definition("second", second),
+            ],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let from = hir::From {
+            first,
+            joins: vec![hir::Join {
+                right: second,
+                kind: JoinKind::Inner,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let where_clause = vec![HirWhereTerm {
+            expr: hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::column(second, 0)),
+                operator: Operator::Equals,
+                rhs: Box::new(hir::Expr::column(first, 0)),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            },
+            from_outer_join: None,
+            consumed: false,
+        }];
+        let constraints = vec![
+            _hir_empty_constraints(first),
+            _hir_auto_index_constraints(second, 0, 0)?,
+        ];
+        let mut lhs_mask = TableMask::default();
+        lhs_mask.set(0)?;
+        let predicate_work = build_hir_predicate_work(&document, &from, &where_clause)?;
+        let layout = HirFromLayout::new(&sources, &[]);
+        let step = hir_join_step(
+            &document,
+            &sources,
+            &layout,
+            &constraints,
+            &where_clause,
+            &predicate_work,
+            &[
+                RowCountEstimate::AnalyzeStats(1_000.0),
+                RowCountEstimate::AnalyzeStats(10_000.0),
+            ],
+            &[Cost(0.0); 2],
+            None,
+            1,
+            &lhs_mask,
+            1_000.0,
+            &Schema::new(),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )?;
+
+        assert_eq!(step.source_position, 1);
+        assert_eq!(
+            (&step.access_method.consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert!(matches!(
+            step.access_method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn greedy_hir_join_order_respects_ordering_and_uses_join_constraints() -> Result<()> {
+        let first = SourceId::new(0);
+        let second = SourceId::new(1);
+        let third = SourceId::new(2);
+        let mut second_source = _create_hir_source(
+            _create_btree_table("second", _create_column_list(&["value"], Type::Integer)),
+            Some(JoinKind::Left),
+            second,
+        );
+        second_source.col_used_mask.set(0)?;
+        let mut third_source = _create_hir_source(
+            _create_btree_table("third", _create_column_list(&["value"], Type::Integer)),
+            Some(JoinKind::Inner),
+            third,
+        );
+        third_source.col_used_mask.set(0)?;
+        let sources = vec![
+            _create_hir_source(
+                _create_btree_table("first", _create_column_list(&["value"], Type::Integer)),
+                None,
+                first,
+            ),
+            second_source,
+            third_source,
+        ]
+        .into_iter()
+        .map(HirPlanSource::BTree)
+        .collect::<Vec<_>>();
+        let document = HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: first,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![
+                _create_hir_definition("first", first),
+                _create_hir_definition("second", second),
+                _create_hir_definition("third", third),
+            ],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let equality = |lhs, rhs| {
+            HirWhereTerm::from(hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::column(lhs, 0)),
+                operator: Operator::Equals,
+                rhs: Box::new(hir::Expr::column(rhs, 0)),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            })
+        };
+        let where_clause = vec![equality(second, first), equality(third, second)];
+        let constraints = vec![
+            _hir_empty_constraints(first),
+            _hir_auto_index_constraints(second, 0, 0)?,
+            _hir_auto_index_constraints(third, 1, 1)?,
+        ];
+        let mut access_methods = Vec::new();
+        let result = compute_hir_greedy_join_order(
+            &document,
+            &sources,
+            &[],
+            &constraints,
+            &where_clause,
+            &[
+                RowCountEstimate::AnalyzeStats(1_000.0),
+                RowCountEstimate::AnalyzeStats(1.0),
+                RowCountEstimate::AnalyzeStats(10_000.0),
+            ],
+            &[Cost(0.0); 3],
+            None,
+            1.0,
+            &mut access_methods,
+            &Schema::new(),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )?
+        .expect("three HIR sources produce a join plan");
+
+        assert_eq!(
+            result.best_plan.table_numbers().collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let chosen = result
+            .best_plan
+            .best_access_methods()
+            .map(|index| &access_methods[index])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (&chosen[1].consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            (&chosen[2].consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(chosen[1..].iter().all(|method| matches!(
+            method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_group_boundary_requires_left_side_then_finishes_group() -> Result<()> {
+        let groups = [HirFromGroupBoundary {
+            source: SourceId::new(10),
+            parent: None,
+            source_range: 1..3,
+            join_info: Some(HirJoinInfo {
+                kind: JoinKind::Left,
+            }),
+        }];
+        let restrictions = JoinOrderingRestrictions {
+            illegal_lhs_by_rhs: None,
+            required_lhs_by_table: None,
+        };
+        let boundaries = HirJoinBoundaries {
+            groups: &groups,
+            ordering_restrictions: &restrictions,
+        };
+
+        let empty = TableMask::default();
+        assert!(boundaries.allows_candidate(0, &empty));
+        assert!(!boundaries.allows_candidate(1, &empty));
+        assert!(!boundaries.allows_candidate(2, &empty));
+
+        let left: TableMask = [0].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(1, &left));
+        assert!(boundaries.allows_candidate(2, &left));
+
+        let started: TableMask = [0, 2].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(1, &started));
+        assert!(!boundaries.allows_candidate(3, &started));
+
+        let complete: TableMask = [0, 1, 2].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(3, &complete));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_group_nested_boundary_waits_for_outer_prerequisites() -> Result<()> {
+        let outer = SourceId::new(10);
+        let groups = [
+            HirFromGroupBoundary {
+                source: SourceId::new(11),
+                parent: Some(outer),
+                source_range: 2..4,
+                join_info: Some(HirJoinInfo {
+                    kind: JoinKind::Left,
+                }),
+            },
+            HirFromGroupBoundary {
+                source: outer,
+                parent: None,
+                source_range: 1..4,
+                join_info: None,
+            },
+        ];
+        let restrictions = JoinOrderingRestrictions {
+            illegal_lhs_by_rhs: None,
+            required_lhs_by_table: None,
+        };
+        let boundaries = HirJoinBoundaries {
+            groups: &groups,
+            ordering_restrictions: &restrictions,
+        };
+
+        let empty = TableMask::default();
+        assert!(!boundaries.allows_candidate(1, &empty));
+
+        let outer_left: TableMask = [0].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(1, &outer_left));
+
+        let outer_started: TableMask = [0, 1].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(2, &outer_started));
+        assert!(boundaries.allows_candidate(3, &outer_started));
+        assert!(!boundaries.allows_candidate(4, &outer_started));
         Ok(())
     }
 
@@ -3879,6 +4893,375 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
         }
+    }
+
+    fn _create_hir_source(
+        table: Arc<BTreeTable>,
+        join_kind: Option<JoinKind>,
+        internal_id: SourceId,
+    ) -> HirPlannedSource {
+        let table = Table::BTree(table);
+        HirPlannedSource {
+            op: (),
+            table,
+            identifier: (),
+            internal_id,
+            join_info: join_kind.map(|kind| HirJoinInfo { kind }),
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: MAIN_DB_ID,
+            indexed: IndexHint::None,
+        }
+    }
+
+    fn _create_hir_definition(name: &str, internal_id: SourceId) -> hir::Source {
+        hir::Source {
+            id: internal_id,
+            owner: hir::SourceOwner::Root,
+            database: None,
+            name: name.to_string(),
+            alias: None,
+            kind: hir::SourceKind::SchemaExpression,
+            columns: Vec::new(),
+            generated_expressions: Vec::new(),
+            default_expressions: Vec::new(),
+            column_type_programs: Vec::new(),
+            check_constraints: None,
+            rowid_available: true,
+            index_hint: IndexHint::None,
+            index_expressions: Vec::new(),
+            index_coverage: hir::IndexCoverage::Selective,
+            index_method_patterns: Vec::new(),
+        }
+    }
+
+    fn _hir_empty_constraints(source: SourceId) -> HirTableConstraints {
+        HirTableConstraints {
+            table_id: source,
+            constraints: Vec::new(),
+            candidates: Vec::new(),
+            temporary_index_terms: SmallVec::new(),
+        }
+    }
+
+    fn _hir_auto_index_constraints(
+        source: SourceId,
+        where_clause_position: usize,
+        lhs_position: usize,
+    ) -> Result<HirTableConstraints> {
+        let mut lhs_mask = TableMask::default();
+        lhs_mask.set(lhs_position)?;
+        Ok(HirTableConstraints {
+            table_id: source,
+            constraints: vec![Constraint {
+                where_clause_pos: (where_clause_position, BinaryExprSide::Rhs),
+                operator: ConstraintOperator::from(Operator::Equals),
+                table_col_pos: Some(0),
+                expr: None,
+                constraining_expr: None,
+                lhs_mask,
+                selectivity: DEFAULT_PARAMS.sel_eq_unindexed,
+                usable: true,
+                is_rowid: false,
+                comparison_affinity: Some(crate::vdbe::affinity::Affinity::Integer),
+                comparison_collation: None,
+                null_matching: false,
+            }],
+            candidates: vec![ConstraintUseCandidate {
+                index: None,
+                refs: Vec::new(),
+                partial_index: None,
+            }],
+            temporary_index_terms: smallvec::smallvec![ConstraintRef {
+                constraint_vec_pos: 0,
+                index_col_pos: 0,
+                sort_order: ast::SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+            }],
+        })
+    }
+
+    fn costing_constraints<E, S>(table_id: S) -> TableConstraints<E, S> {
+        let constraint = |position, operator, selectivity| Constraint {
+            where_clause_pos: (position, BinaryExprSide::Rhs),
+            operator: ConstraintOperator::from(operator),
+            table_col_pos: Some(0),
+            expr: None,
+            constraining_expr: None,
+            lhs_mask: TableMask::default(),
+            selectivity,
+            usable: true,
+            is_rowid: false,
+            comparison_affinity: None,
+            comparison_collation: None,
+            null_matching: false,
+        };
+        TableConstraints {
+            table_id,
+            constraints: vec![
+                constraint(0, Operator::Equals, 0.1),
+                constraint(1, Operator::Greater, 0.2),
+                constraint(2, Operator::Less, 0.3),
+            ],
+            candidates: vec![ConstraintUseCandidate {
+                index: None,
+                refs: vec![
+                    ConstraintRef {
+                        constraint_vec_pos: 1,
+                        index_col_pos: 0,
+                        sort_order: ast::SortOrder::Asc,
+                        nulls_order: ast::NullsOrder::First,
+                    },
+                    ConstraintRef {
+                        constraint_vec_pos: 2,
+                        index_col_pos: 0,
+                        sort_order: ast::SortOrder::Asc,
+                        nulls_order: ast::NullsOrder::First,
+                    },
+                ],
+                partial_index: None,
+            }],
+            temporary_index_terms: SmallVec::new(),
+        }
+    }
+
+    #[test]
+    fn ast_and_hir_constraints_share_cost_formulas() -> Result<()> {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let ast_constraints: TableConstraints<ast::Expr, TableInternalId> =
+            costing_constraints(table_id_counter.next());
+        let hir_constraints: TableConstraints<hir::Expr, SourceId> =
+            costing_constraints(SourceId::new(0));
+        let mut rhs_mask = TableMask::default();
+        rhs_mask.set(0)?;
+
+        let ast_multiplier = constraint_output_multipliers(
+            &ast_constraints,
+            &TableMask::default(),
+            rhs_mask.clone(),
+            &BitSet::default(),
+            &BitSet::default(),
+            &DEFAULT_PARAMS,
+        );
+        let hir_multiplier = constraint_output_multipliers(
+            &hir_constraints,
+            &TableMask::default(),
+            rhs_mask,
+            &BitSet::default(),
+            &BitSet::default(),
+            &DEFAULT_PARAMS,
+        );
+        assert_eq!(ast_multiplier, hir_multiplier);
+        assert_eq!(
+            ast_multiplier,
+            0.1 * 0.2 * 0.3 * DEFAULT_PARAMS.closed_range_selectivity_factor
+        );
+
+        let ast_self = build_self_constraint_selectivity(&ast_constraints, 0);
+        let hir_self = build_self_constraint_selectivity(&hir_constraints, 0);
+        assert_eq!(ast_self, hir_self);
+        assert_eq!(ast_self, 0.1 * 0.2 * 0.3);
+
+        let range = RangeConstraintRef {
+            table_col_pos: Some(0),
+            index_col_pos: 0,
+            sort_order: ast::SortOrder::Asc,
+            nulls_order: ast::NullsOrder::First,
+            eq: None,
+            lower_bound: Some(1),
+            upper_bound: Some(2),
+        };
+        let index = IndexInfo {
+            unique: false,
+            covering: false,
+            column_count: 1,
+            rows_per_leaf_page: DEFAULT_PARAMS.rows_per_table_page,
+        };
+        let rows = RowCountEstimate::HardcodedFallback(1_000.0);
+        let ast_rows = estimate_rows_per_seek(
+            index,
+            &ast_constraints.constraints,
+            std::slice::from_ref(&range),
+            rows,
+            None,
+        );
+        let hir_rows = estimate_rows_per_seek(
+            index,
+            &hir_constraints.constraints,
+            std::slice::from_ref(&range),
+            rows,
+            None,
+        );
+        assert_eq!(ast_rows, hir_rows);
+        assert_eq!(ast_rows, 0.2 * 0.3 * 1_000.0);
+
+        let table = _create_btree_table("items", _create_column_list(&["value"], Type::Integer));
+        let ast_source = _create_table_reference(table.clone(), None, table_id_counter.next());
+        let hir_id = SourceId::new(0);
+        let hir_planned = _create_hir_source(table, None, hir_id);
+        let hir_definition = _create_hir_definition("items", hir_id);
+        let hir_source = HirAccessSource::new(&hir_planned, &hir_definition);
+        let ast_score = get_best_seek_score(
+            &ast_constraints,
+            &TableMask::default(),
+            0,
+            &ast_source,
+            rows,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        );
+        let hir_score = get_best_seek_score(
+            &hir_constraints,
+            &TableMask::default(),
+            0,
+            &hir_source,
+            rows,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        );
+        assert_eq!(ast_score, hir_score);
+        assert!(ast_score > 0.0);
+
+        let ast_ordering = legacy_join_ordering_restrictions(std::slice::from_ref(&ast_source))?;
+        let hir_plan_source = HirPlanSource::BTree(hir_planned.clone());
+        let hir_ordering = hir_join_ordering_restrictions(std::slice::from_ref(&hir_plan_source))?;
+        let ast_start = find_best_starting_source(
+            std::iter::once(&ast_source),
+            std::slice::from_ref(&ast_constraints),
+            std::slice::from_ref(&rows),
+            &ast_ordering,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )?;
+        let hir_start = find_best_starting_source(
+            std::iter::once(&hir_source),
+            std::slice::from_ref(&hir_constraints),
+            std::slice::from_ref(&rows),
+            &hir_ordering,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )?;
+        assert_eq!(ast_start, hir_start);
+
+        Ok(())
+    }
+
+    #[test]
+    fn hir_and_legacy_joins_share_ordering_restrictions() -> Result<()> {
+        let join_cases = [
+            (
+                JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: Vec::new(),
+                    no_reorder: true,
+                },
+                JoinKind::Cross,
+            ),
+            (
+                JoinInfo {
+                    join_type: JoinType::LeftOuter,
+                    using: Vec::new(),
+                    no_reorder: false,
+                },
+                JoinKind::Left,
+            ),
+            (
+                JoinInfo {
+                    join_type: JoinType::FullOuter,
+                    using: Vec::new(),
+                    no_reorder: false,
+                },
+                JoinKind::Full,
+            ),
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+
+        for (legacy_join, hir_join) in join_cases {
+            let columns = _create_column_list(&["value"], Type::Integer);
+            let mut table_id_counter = TableRefIdCounter::new();
+            let legacy_sources = vec![
+                _create_table_reference(
+                    _create_btree_table("first", columns.clone()),
+                    None,
+                    table_id_counter.next(),
+                ),
+                _create_table_reference(
+                    _create_btree_table("joined", columns.clone()),
+                    Some(legacy_join),
+                    table_id_counter.next(),
+                ),
+                _create_table_reference(
+                    _create_btree_table("later", columns.clone()),
+                    Some(JoinInfo {
+                        join_type: JoinType::Inner,
+                        using: Vec::new(),
+                        no_reorder: false,
+                    }),
+                    table_id_counter.next(),
+                ),
+            ];
+            let hir_sources = vec![
+                _create_hir_source(
+                    _create_btree_table("first", columns.clone()),
+                    None,
+                    SourceId::new(0),
+                ),
+                _create_hir_source(
+                    _create_btree_table("joined", columns.clone()),
+                    Some(hir_join),
+                    SourceId::new(1),
+                ),
+                _create_hir_source(
+                    _create_btree_table("later", columns.clone()),
+                    Some(JoinKind::Inner),
+                    SourceId::new(2),
+                ),
+            ]
+            .into_iter()
+            .map(HirPlanSource::BTree)
+            .collect::<Vec<_>>();
+
+            let legacy = legacy_join_ordering_restrictions(&legacy_sources)?;
+            let hir = hir_join_ordering_restrictions(&hir_sources)?;
+            for order in orders {
+                assert_eq!(legacy.allows_order(&order)?, hir.allows_order(&order)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn preserved_hir_right_join_keeps_its_left_source_first() -> Result<()> {
+        let columns = _create_column_list(&["value"], Type::Integer);
+        let sources = vec![
+            _create_hir_source(
+                _create_btree_table("left", columns.clone()),
+                None,
+                SourceId::new(0),
+            ),
+            _create_hir_source(
+                _create_btree_table("right", columns),
+                Some(JoinKind::Right),
+                SourceId::new(1),
+            ),
+        ]
+        .into_iter()
+        .map(HirPlanSource::BTree)
+        .collect::<Vec<_>>();
+        let restrictions = hir_join_ordering_restrictions(&sources)?;
+
+        assert!(restrictions.allows_order(&[0, 1])?);
+        assert!(!restrictions.allows_order(&[1, 0])?);
+        Ok(())
     }
 
     /// Creates a column expression

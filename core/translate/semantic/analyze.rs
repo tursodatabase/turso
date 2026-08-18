@@ -1873,18 +1873,16 @@ mod tests {
         );
         analyze(
             &context,
-            AnalyzeInput::TriggerProgram(
-                crate::translate::semantic::TriggerProgramInput {
-                    context: TriggerAnalysis {
-                        database: DatabaseId::new(MAIN_DB_ID),
-                        table: schema.get_table("writable").expect("writable table exists"),
-                        event,
-                    },
-                    predicate: when_clause.as_deref(),
-                    commands: &commands,
-                    conflict_override,
+            AnalyzeInput::TriggerProgram(crate::translate::semantic::TriggerProgramInput {
+                context: TriggerAnalysis {
+                    database: DatabaseId::new(MAIN_DB_ID),
+                    table: schema.get_table("writable").expect("writable table exists"),
+                    event,
                 },
-            ),
+                predicate: when_clause.as_deref(),
+                commands: &commands,
+                conflict_override,
+            }),
         )
     }
 
@@ -4013,13 +4011,15 @@ mod tests {
             .as_ref()
             .expect("relation query has FROM")
             .first;
-        let SourceKind::TableFunction { table, arguments } =
-            &document.source(source).expect("source exists").kind
+        let SourceKind::TableFunction {
+            table,
+            argument_predicates,
+        } = &document.source(source).expect("source exists").kind
         else {
             panic!("relation source is table function");
         };
         assert_eq!(table.value().get_name(), "json_each");
-        assert_eq!(arguments.len(), 1);
+        assert_eq!(argument_predicates.len(), 1);
     }
 
     #[test]
@@ -4819,9 +4819,15 @@ mod tests {
         assert_eq!(group.from.joins.len(), 1);
         assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
         assert_eq!(block.outputs.len(), 7);
-        assert!(block.outputs.iter().all(|output| {
-            matches!(output.expr, Expr::Column(reference) if reference.source == group_source.id)
-        }));
+        assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
+        for output in &block.outputs {
+            output.expr.walk(&mut |expression| {
+                assert!(!matches!(
+                    expression,
+                    Expr::Column(reference) if reference.source == group_source.id
+                ));
+            });
+        }
 
         let error = analyze_sql_with_schema(
             &schema,
@@ -4863,10 +4869,7 @@ mod tests {
             block.outputs[1].expr,
             Expr::Column(reference) if reference.source == categories && reference.column == 1
         ));
-        assert!(matches!(
-            block.outputs[2].expr,
-            Expr::Column(reference) if reference.source == group_id && reference.column == 0
-        ));
+        assert!(matches!(block.outputs[2].expr, Expr::MergedColumn(_)));
         assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
     }
 
@@ -4958,17 +4961,123 @@ mod tests {
             let source = document
                 .source(function_id)
                 .expect("function source exists");
-            let SourceKind::TableFunction { table, arguments } = &source.kind else {
+            let SourceKind::TableFunction {
+                table,
+                argument_predicates,
+            } = &source.kind
+            else {
                 panic!("json_each is a table-function source");
             };
             assert_eq!(table.value().get_name(), "json_each");
-            assert_eq!(arguments.len(), 1);
+            assert_eq!(argument_predicates.len(), 1);
             assert!(matches!(
-                arguments[0],
-                Expr::Column(reference)
-                    if reference.source == items_id && reference.column == 1
+                &argument_predicates[0],
+                Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }
+                    if matches!(lhs.as_ref(), Expr::Column(reference) if reference.source == function_id)
+                        && matches!(rhs.as_ref(), Expr::Column(reference) if reference.source == items_id && reference.column == 1)
             ));
         }
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn null_table_function_arguments_become_hidden_column_is_null_predicates() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT value FROM json_each(NULL)")
+            .expect("NULL table-function argument binds");
+        document
+            .validate()
+            .expect("NULL table-function argument produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = block.from.as_ref().expect("query has FROM").first;
+        let SourceKind::TableFunction {
+            argument_predicates,
+            ..
+        } = &document.source(source).expect("source exists").kind
+        else {
+            panic!("json_each is a table-function source");
+        };
+        assert!(matches!(
+            argument_predicates.as_slice(),
+            [Expr::IsNull(expression)]
+                if matches!(expression.as_ref(), Expr::Column(reference) if reference.source == source)
+        ));
+
+        let query = root.query;
+        let plan = crate::translate::semantic_to_plan::HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("table function plans from resolved HIR");
+        let planned = plan
+            .queries
+            .iter()
+            .find(|planned| planned.query == query)
+            .expect("root query is planned");
+        let [block] = planned.blocks.as_slice() else {
+            panic!("SELECT has one planned block");
+        };
+        let [source] = block.loops.as_slice() else {
+            panic!("table function has one planned source");
+        };
+        let crate::translate::semantic_to_plan::HirSourceAccess::Virtual(operation) =
+            &source.access
+        else {
+            panic!("table function uses virtual-table access");
+        };
+        assert!(operation.arguments.is_empty());
+        assert!(matches!(
+            block.predicates.as_slice(),
+            [crate::translate::plan::HirWhereTerm {
+                expr: Expr::IsNull(_),
+                consumed: false,
+                ..
+            }]
+        ));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn table_function_hir_plan_freezes_selected_arguments() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT value FROM json_each('[1]')")
+            .expect("table-function argument binds");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = root.query;
+        let plan = crate::translate::semantic_to_plan::HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("table function plans from resolved HIR");
+        let planned = plan
+            .queries
+            .iter()
+            .find(|planned| planned.query == query)
+            .expect("root query is planned");
+        let [block] = planned.blocks.as_slice() else {
+            panic!("SELECT has one planned block");
+        };
+        let [source] = block.loops.as_slice() else {
+            panic!("table function has one planned source");
+        };
+        let crate::translate::semantic_to_plan::HirSourceAccess::Virtual(operation) =
+            &source.access
+        else {
+            panic!("table function uses virtual-table access");
+        };
+        assert!(matches!(
+            operation.arguments.as_slice(),
+            [Expr::Literal(ast::Literal::String(_))]
+        ));
+        assert!(block.predicates[0].consumed);
     }
 
     #[cfg(feature = "json")]
@@ -5004,7 +5113,10 @@ mod tests {
             .as_ref()
             .expect("inner query has FROM")
             .first;
-        let SourceKind::TableFunction { arguments, .. } = &document
+        let SourceKind::TableFunction {
+            argument_predicates,
+            ..
+        } = &document
             .source(function_source)
             .expect("source exists")
             .kind
@@ -5012,9 +5124,9 @@ mod tests {
             panic!("inner source is a table function");
         };
         assert!(matches!(
-            arguments.as_slice(),
-            [Expr::Column(reference)]
-                if reference.source == outer_source && reference.column == 1
+            argument_predicates.as_slice(),
+            [Expr::Binary { rhs, comparison: Some(_), .. }]
+                if matches!(rhs.as_ref(), Expr::Column(reference) if reference.source == outer_source && reference.column == 1)
         ));
     }
 
@@ -6264,6 +6376,10 @@ mod tests {
 
     #[test]
     fn trigger_program_binds_predicate_and_ordered_commands_once() {
+        use crate::translate::semantic_to_plan::{
+            HirPlan, HirRootPlan, HirTriggerCommandPlan, HirTriggerPlan,
+        };
+
         let schema = schema_with_writable_table();
         let document = analyze_trigger_program_with_schema(
             &schema,
@@ -6297,12 +6413,8 @@ mod tests {
         assert!(predicate_reads.contains(&new_source));
         assert!(predicate_reads.contains(&old_source));
 
-        let [
-            hir::TriggerCommand::Select(query_id),
-            hir::TriggerCommand::Insert(insert),
-            hir::TriggerCommand::Update(update),
-            hir::TriggerCommand::Delete(delete),
-        ] = program.commands.as_slice()
+        let [hir::TriggerCommand::Select(query_id), hir::TriggerCommand::Insert(insert), hir::TriggerCommand::Update(update), hir::TriggerCommand::Delete(delete)] =
+            program.commands.as_slice()
         else {
             panic!("trigger commands preserve source order and shape");
         };
@@ -6340,6 +6452,49 @@ mod tests {
             });
         assert!(delete_reads.contains(&delete.target));
         assert!(delete_reads.contains(&old_source));
+
+        let select_query = *query_id;
+        let update_target = update.target;
+        let delete_target = delete.target;
+        document
+            .validate()
+            .expect("whole trigger program produces closed HIR");
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("whole trigger program plans from resolved HIR");
+        let HirRootPlan::Trigger(HirTriggerPlan::Program(commands)) = &plan.root else {
+            panic!("trigger program produces ordered command plans");
+        };
+        assert_eq!(commands.len(), 4);
+        let HirTriggerCommandPlan::Select(planned_query) = &commands[0] else {
+            panic!("first trigger command plan is SELECT");
+        };
+        assert!(matches!(commands[1], HirTriggerCommandPlan::Insert));
+        let HirTriggerCommandPlan::Update(update_access) = &commands[2] else {
+            panic!("third trigger command plan is UPDATE");
+        };
+        let HirTriggerCommandPlan::Delete(delete_access) = &commands[3] else {
+            panic!("fourth trigger command plan is DELETE");
+        };
+        assert_eq!(*planned_query, select_query);
+        assert!(plan
+            .queries
+            .iter()
+            .any(|planned| planned.query == select_query));
+        for (access, target) in [
+            (update_access, update_target),
+            (delete_access, delete_target),
+        ] {
+            assert_eq!(access.loops.len(), 1);
+            assert_eq!(access.loops[0].source, target);
+            assert!(access
+                .loops
+                .iter()
+                .all(|planned| planned.source != new_source && planned.source != old_source));
+        }
     }
 
     #[test]
@@ -6870,6 +7025,171 @@ mod tests {
             document.query(*inner).expect("inner query exists").captures,
             [input]
         );
+
+        let inner = *inner;
+        let plan = crate::translate::semantic_to_plan::HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("INSERT-owned queries plan from resolved HIR");
+        assert_eq!(plan.queries.len(), 2);
+        assert!(plan.queries.iter().any(|planned| planned.query == query_id));
+        assert!(plan.queries.iter().any(|planned| planned.query == inner));
+    }
+
+    #[test]
+    fn query_free_insert_builds_an_empty_hir_query_plan() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "INSERT INTO items DEFAULT VALUES")
+            .expect("DEFAULT VALUES INSERT binds");
+        document
+            .validate()
+            .expect("DEFAULT VALUES INSERT produces closed HIR");
+
+        let plan = crate::translate::semantic_to_plan::HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("query-free INSERT plans from resolved HIR");
+        assert!(plan.queries.is_empty());
+        assert!(matches!(
+            plan.root,
+            crate::translate::semantic_to_plan::HirRootPlan::Insert
+        ));
+    }
+
+    #[test]
+    fn update_root_uses_hir_access_planning() {
+        use crate::translate::{
+            optimizer::SelectedBtreeOperation,
+            semantic_to_plan::{HirPlan, HirRootPlan, HirSourceAccess},
+        };
+
+        let schema = schema_with_items();
+        let document =
+            analyze_sql_with_schema(&schema, "UPDATE items SET value = 'new' WHERE rowid = 1")
+                .expect("UPDATE binds");
+        document.validate().expect("UPDATE produces closed HIR");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let target = update.target;
+        let new_source = update.new_source;
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("UPDATE plans from resolved HIR");
+        let HirRootPlan::Update(access) = &plan.root else {
+            panic!("UPDATE produces UPDATE access plan");
+        };
+        let [target_loop] = access.loops.as_slice() else {
+            panic!("UPDATE has one target loop");
+        };
+        assert_eq!(target_loop.source, target);
+        assert_ne!(target_loop.source, new_source);
+        assert!(matches!(
+            &target_loop.access,
+            HirSourceAccess::BTree(SelectedBtreeOperation::RowidEq {
+                cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
+            }) if value == "1"
+        ));
+
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE items SET value = categories.label \
+             FROM categories WHERE items.rowid = categories.id",
+        )
+        .expect("UPDATE FROM binds");
+        document
+            .validate()
+            .expect("UPDATE FROM produces closed HIR");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE FROM produces UPDATE root");
+        };
+        let target = update.target;
+        let new_source = update.new_source;
+        let from = update
+            .from
+            .as_ref()
+            .expect("UPDATE FROM is preserved")
+            .first;
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("UPDATE FROM plans from resolved HIR");
+        let HirRootPlan::Update(access) = &plan.root else {
+            panic!("UPDATE FROM produces UPDATE access plan");
+        };
+        assert_eq!(access.loops.len(), 2);
+        assert!(access.loops.iter().any(|planned| planned.source == target));
+        assert!(access.loops.iter().any(|planned| planned.source == from));
+        assert!(access
+            .loops
+            .iter()
+            .all(|planned| planned.source != new_source));
+    }
+
+    #[test]
+    fn delete_root_uses_hir_access_planning() {
+        use crate::translate::{
+            optimizer::SelectedBtreeOperation,
+            semantic_to_plan::{HirPlan, HirRootPlan, HirSourceAccess},
+        };
+
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "DELETE FROM items WHERE rowid = 1")
+            .expect("DELETE binds");
+        document.validate().expect("DELETE produces closed HIR");
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let target = delete.target;
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("DELETE plans from resolved HIR");
+        let HirRootPlan::Delete(access) = &plan.root else {
+            panic!("DELETE produces DELETE access plan");
+        };
+        let [target_loop] = access.loops.as_slice() else {
+            panic!("DELETE has one target loop");
+        };
+        assert_eq!(target_loop.source, target);
+        assert_eq!(target_loop.source_position, 0);
+        assert!(matches!(
+            &target_loop.access,
+            HirSourceAccess::BTree(SelectedBtreeOperation::RowidEq {
+                cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
+            }) if value == "1"
+        ));
+        assert_eq!(access.predicates.len(), 1);
+        assert!(access.predicates[0].consumed);
+
+        let document =
+            analyze_sql_with_schema(&schema, "DELETE FROM items").expect("unfiltered DELETE binds");
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("unfiltered DELETE plans from resolved HIR");
+        let HirRootPlan::Delete(access) = &plan.root else {
+            panic!("unfiltered DELETE produces DELETE access plan");
+        };
+        assert!(access.predicates.is_empty());
+        assert!(matches!(
+            &access.loops[0].access,
+            HirSourceAccess::BTree(SelectedBtreeOperation::Scan { index: None, .. })
+        ));
     }
 
     #[test]

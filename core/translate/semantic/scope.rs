@@ -75,44 +75,40 @@ pub(crate) struct GroupColumn {
 }
 
 #[derive(Clone, Debug)]
-struct ScopeColumn {
+struct ColumnBinding {
     source: SourceId,
     display_name: String,
     lookup_name: String,
-    expr: hir::Expr,
-    type_fact: TypeFact,
-    affinity: Affinity,
-    has_affinity: bool,
-    collation: Option<hir::ResolvedCollation>,
+    resolved: ResolvedScopeExpr,
     hidden: bool,
 }
 
-impl ScopeColumn {
-    fn from_source(source: SourceId, index: usize, column: &hir::SourceColumn) -> Self {
-        Self {
-            source,
-            display_name: column.name.clone(),
-            lookup_name: crate::util::normalize_ident(&column.name),
-            expr: hir::Expr::Column(ColumnRef {
-                source,
+impl ColumnBinding {
+    fn from_source(source: &hir::Source, index: usize, column: &hir::SourceColumn) -> Self {
+        let expr = match &source.kind {
+            hir::SourceKind::FromGroup(group) => group.columns[index].clone(),
+            _ => hir::Expr::Column(ColumnRef {
+                source: source.id,
                 column: index,
             }),
-            type_fact: column.type_fact.clone(),
-            affinity: column.affinity,
-            has_affinity: column.has_affinity,
-            collation: column.collation.clone(),
+        };
+        Self {
+            source: source.id,
+            display_name: column.name.clone(),
+            lookup_name: crate::util::normalize_ident(&column.name),
+            resolved: ResolvedScopeExpr {
+                expr,
+                type_fact: column.type_fact.clone(),
+                affinity: column.affinity,
+                has_affinity: column.has_affinity,
+                collation: ExprCollation::inherited(column.collation.clone()),
+            },
             hidden: column.hidden,
         }
     }
 
     fn resolved(&self) -> ResolvedScopeExpr {
-        ResolvedScopeExpr {
-            expr: self.expr.clone(),
-            type_fact: self.type_fact.clone(),
-            affinity: self.affinity,
-            has_affinity: self.has_affinity,
-            collation: ExprCollation::inherited(self.collation.clone()),
-        }
+        self.resolved.clone()
     }
 }
 
@@ -123,7 +119,7 @@ pub(crate) fn resolve_source_column(source: &hir::Source, name: &str) -> Result<
         .iter()
         .enumerate()
         .find(|(_, column)| crate::util::normalize_ident(&column.name) == normalized)
-        .map(|(index, column)| ScopeColumn::from_source(source.id, index, column).resolved())
+        .map(|(index, column)| ColumnBinding::from_source(source, index, column).resolved())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!(
                 "cannot join using column {name} - column not present in both tables"
@@ -138,7 +134,7 @@ struct ScopeSource {
     table_name: String,
     database: Option<hir::DatabaseId>,
     database_qualified: bool,
-    columns: Vec<ScopeColumn>,
+    columns: Vec<ColumnBinding>,
     rowid_available: bool,
     unqualified: bool,
 }
@@ -160,7 +156,7 @@ struct ScopeOutput {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Scope {
     sources: Vec<ScopeSource>,
-    visible_columns: Vec<ScopeColumn>,
+    visible_columns: Vec<ColumnBinding>,
     outputs: Vec<ScopeOutput>,
     outer: Option<Arc<Scope>>,
     outer_resolution_blocked: bool,
@@ -184,7 +180,7 @@ impl Scope {
             .columns
             .iter()
             .enumerate()
-            .map(|(index, column)| ScopeColumn::from_source(source.id, index, column))
+            .map(|(index, column)| ColumnBinding::from_source(source, index, column))
             .collect();
         if unqualified {
             self.visible_columns.extend(columns.iter().cloned());
@@ -385,7 +381,7 @@ impl Scope {
                 .columns
                 .iter()
                 .find(|candidate| candidate.lookup_name == normalized_column)
-                .map(ScopeColumn::resolved)
+                .map(ColumnBinding::resolved)
                 .or_else(|| {
                     (source.rowid_available && is_rowid_name(&normalized_column))
                         .then(|| resolved_rowid(source.id))
@@ -437,7 +433,7 @@ impl Scope {
                 .columns
                 .iter()
                 .find(|candidate| candidate.lookup_name == normalized_column)
-                .map(ScopeColumn::resolved)
+                .map(ColumnBinding::resolved)
                 .or_else(|| {
                     (source.rowid_available && is_rowid_name(&normalized_column))
                         .then(|| resolved_rowid(source.id))
@@ -524,7 +520,7 @@ impl Scope {
         self.visible_columns
             .iter()
             .find(|column| column.lookup_name == normalized)
-            .map(ScopeColumn::resolved)
+            .map(ColumnBinding::resolved)
             .ok_or_else(|| {
                 crate::LimboError::ParseError(format!(
                     "cannot join using column {name} - column not present in both tables"
@@ -568,7 +564,7 @@ impl Scope {
         for using in columns {
             let right_position = self.visible_columns.iter().position(|column| {
                 matches!(
-                    &column.expr,
+                    &column.resolved.expr,
                     hir::Expr::Column(reference) if *reference == using.right
                 )
             });
@@ -586,7 +582,7 @@ impl Scope {
                 .find(|(position, column)| {
                     *position != right_position
                         && column.lookup_name == lookup_name
-                        && same_join_column(&column.expr, &using.left)
+                        && same_join_column(&column.resolved.expr, &using.left)
                 })
                 .map(|(position, _)| position);
             let Some(left_position) = left_position else {
@@ -607,11 +603,13 @@ impl Scope {
             });
 
             let left = &mut self.visible_columns[left_position];
-            left.expr = merged;
-            left.type_fact = using.type_fact.clone();
-            left.affinity = using.affinity;
-            left.has_affinity = using.has_affinity;
-            left.collation = using.collation.clone();
+            left.resolved = ResolvedScopeExpr {
+                expr: merged,
+                type_fact: using.type_fact.clone(),
+                affinity: using.affinity,
+                has_affinity: using.has_affinity,
+                collation: ExprCollation::inherited(using.collation.clone()),
+            };
             self.visible_columns.remove(right_position);
         }
         Ok(())

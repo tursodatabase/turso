@@ -1,9 +1,9 @@
-use crate::schema::Index;
+use crate::schema::{Index, Table};
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
-use crate::translate::plan::JoinedTable;
+use crate::translate::semantic::hir;
 use turso_parser::ast;
 
 use super::constraints::Constraint;
@@ -45,6 +45,28 @@ pub fn where_node_steps(expr: &ast::Expr) -> usize {
         | ast::Expr::Qualified(..)
         | ast::Expr::Variable(_)
         | ast::Expr::Default => 0,
+        _ => 1,
+    }
+}
+
+/// Count the operations needed to check one resolved `WHERE` expression.
+pub(super) fn hir_where_expr_steps(expr: &hir::Expr) -> usize {
+    let mut steps = 0;
+    expr.walk(&mut |expr| steps += hir_where_node_steps(expr));
+    steps.max(1)
+}
+
+fn hir_where_node_steps(expr: &hir::Expr) -> usize {
+    match expr {
+        hir::Expr::Between { .. } => 2,
+        hir::Expr::InList { values, .. } => values.len().max(1),
+        hir::Expr::Case { when_then, .. } => when_then.len().max(1),
+        hir::Expr::Literal(_)
+        | hir::Expr::Parameter(_)
+        | hir::Expr::Column(_)
+        | hir::Expr::RowId(_)
+        | hir::Expr::Output(_)
+        | hir::Expr::Collate { .. } => 0,
         _ => 1,
     }
 }
@@ -96,7 +118,7 @@ pub fn index_leaf_rows_per_page(
 /// Compute `rows_per_leaf_page` for an index on the given table.
 pub fn rows_per_leaf_page_for_index(
     index_column_count: usize,
-    rhs_table: &JoinedTable,
+    rhs_table: &Table,
     rows_per_table_page: f64,
 ) -> f64 {
     let table_column_count = rhs_table.columns().len();
@@ -277,14 +299,14 @@ impl std::ops::Deref for RowCountEstimate {
 /// Uses sqlite_stat1 histogram data for row estimates when available,
 /// otherwise falls through to heuristic selectivity multipliers.
 pub struct AnalyzeCtx<'a> {
-    pub rhs_table: &'a JoinedTable,
+    pub table_name: &'a str,
     pub index: Option<&'a Arc<Index>>,
     pub stats: &'a AnalyzeStats,
 }
 
-pub(crate) fn estimate_rows_per_seek(
+pub(crate) fn estimate_rows_per_seek<E>(
     index_info: IndexInfo,
-    constraints: &[Constraint],
+    constraints: &[Constraint<E>],
     usable_constraint_refs: &[RangeConstraintRef],
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,
@@ -379,9 +401,7 @@ fn estimate_rows_from_analyze_stats(
         return None;
     }
 
-    let table_name = ctx.rhs_table.table.get_name();
-
-    let table_stats = ctx.stats.table_stats(table_name)?;
+    let table_stats = ctx.stats.table_stats(ctx.table_name)?;
     let idx_stats = table_stats.index_stats.get(&index.name)?;
 
     if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {
@@ -395,9 +415,9 @@ fn estimate_rows_from_analyze_stats(
 
 /// Estimate the cost of a scan or seek operation.
 #[expect(clippy::too_many_arguments)]
-pub fn estimate_cost_for_scan_or_seek(
+pub fn estimate_cost_for_scan_or_seek<E>(
     index_info: Option<IndexInfo>,
-    constraints: &[Constraint],
+    constraints: &[Constraint<E>],
     usable_constraint_refs: &[RangeConstraintRef],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,

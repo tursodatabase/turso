@@ -8,10 +8,16 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
+        expr::{
+            as_binary_components, expr_data_type, get_expr_affinity, unwrap_parens,
+            StorageClassMask,
+        },
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
-        planner::determine_where_to_eval_term,
+        planner::{
+            determine_where_to_eval_term, table_mask_from_hir_scope, HirFromScope, TableMask,
+        },
+        semantic::hir,
     },
     types::SeekOp,
     util::exprs_are_equivalent,
@@ -25,7 +31,7 @@ use crate::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
+use std::{cmp::Ordering, marker::PhantomData, ops::Range, sync::Arc};
 use turso_parser::ast::{
     self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
@@ -188,45 +194,161 @@ pub struct GroupBy {
     pub having: Option<Vec<ast::Expr>>,
 }
 
-/// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.
-/// This is done so that we can evaluate the conditions at the correct loop depth.
-/// We also need to keep track of whether the condition came from an OUTER JOIN. Take this example:
-/// SELECT * FROM users u LEFT JOIN products p ON u.id = 5.
-/// Even though the condition only refers to 'u', we CANNOT evaluate it at the users loop, because we need to emit NULL
-/// values for the columns of 'p', for EVERY row in 'u', instead of completely skipping any rows in 'u' where the condition is false.
+/// In a query plan, WHERE and JOIN conditions are split into predicate terms
+/// so each condition can run at the correct loop depth.
+///
+/// Outer joins require the originating join source to be retained. For:
+///
+/// `SELECT * FROM users u LEFT JOIN products p ON u.id = 5`
+///
+/// `u.id = 5` cannot run in the `users` loop and skip rows. Every `users` row
+/// must reach the join so `products` can be NULL-extended when the condition
+/// is false.
 #[derive(Debug, Clone)]
-pub struct WhereTerm {
+pub struct PredicateTerm<E, S> {
     /// The original condition expression.
-    pub expr: ast::Expr,
-    /// For normal JOIN conditions (ON or WHERE clauses), we break them up into individual [WhereTerm] conditions
-    /// and let the optimizer determine when each should be evaluated based on the tables they reference.
-    /// See e.g. [EvalAt].
-    /// For example, in "SELECT * FROM x JOIN y WHERE x.a = 2", we want to evaluate x.a = 2 right after opening x
-    /// since it only depends on x.
+    pub expr: E,
+
+    /// For ordinary conditions, the optimizer chooses the earliest loop
+    /// containing every referenced source.
     ///
-    /// However, OUTER JOIN conditions require special handling. Consider:
-    ///   SELECT * FROM t LEFT JOIN s ON t.a = 2
+    /// Outer-join conditions cannot always run at that earliest loop. For:
     ///
-    /// Even though t.a = 2 only references t, we cannot evaluate it during t's loop and skip rows where t.a != 2.
-    /// Instead, we must:
-    /// 1. Process ALL rows from t
-    /// 2. For each t row where t.a != 2, emit NULL values for s's columns
-    /// 3. For each t row where t.a = 2, emit the actual s values
+    /// `SELECT * FROM t LEFT JOIN s ON t.a = 2`
     ///
-    /// This means the condition must be evaluated during s's loop, regardless of which tables it references.
-    /// We track this requirement using [WhereTerm::from_outer_join], which contains the [TableInternalId] of the
-    /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
-    /// is set, we force evaluation to happen during that table's loop.
-    pub from_outer_join: Option<TableInternalId>,
-    /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
-    /// in the normal place where WHERE terms are evaluated.
-    /// A term may have been consumed e.g. if:
-    /// - it has been converted into a constraint in a seek key
-    /// - it has been removed due to being trivially true or false
+    /// the engine must:
+    ///
+    /// 1. Process every row from `t`.
+    /// 2. Emit NULL values for `s` when `t.a != 2`.
+    /// 3. Emit the matching `s` values when `t.a = 2`.
+    ///
+    /// This field forces evaluation at the outer join's source loop. `S` is
+    /// `TableInternalId` for the legacy path and `SourceId` for HIR.
+    pub from_outer_join: Option<S>,
+
+    /// Whether the optimizer already incorporated this condition elsewhere.
+    ///
+    /// A term may be consumed because:
+    ///
+    /// - it became a seek constraint;
+    /// - it was proven trivially true or false.
     pub consumed: bool,
 }
 
-impl WhereTerm {
+/// Predicate term used by the existing parser-expression planning path.
+pub type WhereTerm = PredicateTerm<ast::Expr, TableInternalId>;
+
+/// Predicate term used by HIR planning without parser expressions or planner IDs.
+pub(crate) type HirWhereTerm =
+    PredicateTerm<crate::translate::semantic::hir::Expr, crate::translate::semantic::hir::SourceId>;
+
+/// Expression behavior needed to split predicates for planning.
+pub(crate) trait PredicateExpr: Clone {
+    fn ungrouped(&self) -> &Self {
+        self
+    }
+
+    fn and_operands(&self) -> Option<(&Self, &Self)>;
+
+    fn conjuncts(&self) -> PredicateConjuncts<'_, Self>
+    where
+        Self: Sized,
+    {
+        PredicateConjuncts {
+            pending: vec![self],
+        }
+    }
+
+    fn append_conjuncts<T>(&self, output: &mut Vec<T>)
+    where
+        Self: Sized,
+        T: From<Self>,
+    {
+        let expression = self.ungrouped();
+        if let Some((lhs, rhs)) = expression.and_operands() {
+            lhs.append_conjuncts(output);
+            rhs.append_conjuncts(output);
+        } else {
+            output.push(expression.clone().into());
+        }
+    }
+}
+
+pub(crate) struct PredicateConjuncts<'expr, E: PredicateExpr> {
+    pending: Vec<&'expr E>,
+}
+
+impl<'expr, E: PredicateExpr> Iterator for PredicateConjuncts<'expr, E> {
+    type Item = &'expr E;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(expression) = self.pending.pop() {
+            let expression = expression.ungrouped();
+            if let Some((lhs, rhs)) = expression.and_operands() {
+                self.pending.push(rhs);
+                self.pending.push(lhs);
+            } else {
+                return Some(expression);
+            }
+        }
+        None
+    }
+}
+
+impl PredicateExpr for ast::Expr {
+    fn ungrouped(&self) -> &Self {
+        unwrap_parens(self).unwrap_or(self)
+    }
+
+    fn and_operands(&self) -> Option<(&Self, &Self)> {
+        let Self::Binary(lhs, ast::Operator::And, rhs) = self else {
+            return None;
+        };
+        Some((lhs, rhs))
+    }
+}
+
+impl PredicateExpr for crate::translate::semantic::hir::Expr {
+    fn and_operands(&self) -> Option<(&Self, &Self)> {
+        let Self::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some((lhs, rhs))
+    }
+}
+
+impl From<ast::Expr> for PredicateTerm<ast::Expr, TableInternalId> {
+    fn from(expr: ast::Expr) -> Self {
+        Self {
+            expr,
+            from_outer_join: None,
+            consumed: false,
+        }
+    }
+}
+
+impl From<crate::translate::semantic::hir::Expr>
+    for PredicateTerm<
+        crate::translate::semantic::hir::Expr,
+        crate::translate::semantic::hir::SourceId,
+    >
+{
+    fn from(expr: crate::translate::semantic::hir::Expr) -> Self {
+        Self {
+            expr,
+            from_outer_join: None,
+            consumed: false,
+        }
+    }
+}
+
+impl PredicateTerm<ast::Expr, TableInternalId> {
     pub fn should_eval_before_loop(
         &self,
         join_order: &[JoinOrderMember],
@@ -265,16 +387,6 @@ impl WhereTerm {
         table_references: Option<&TableReferences>,
     ) -> Result<EvalAt> {
         determine_where_to_eval_term(self, join_order, subqueries, table_references)
-    }
-}
-
-impl From<Expr> for WhereTerm {
-    fn from(value: Expr) -> Self {
-        Self {
-            expr: value,
-            from_outer_join: None,
-            consumed: false,
-        }
     }
 }
 
@@ -1117,19 +1229,19 @@ pub enum JoinType {
     Anti,
 }
 
-/// Join information for a table reference.
+/// Join information for a planned source.
 #[derive(Debug, Clone)]
-pub struct JoinInfo {
+pub struct JoinInfo<N = ast::Name> {
     /// The type of join.
     pub join_type: JoinType,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
-    pub using: Vec<ast::Name>,
+    pub using: Vec<N>,
     /// When true, the optimizer must not reorder this table relative to its
     /// neighbors. Set for CROSS JOIN to match SQLite semantics.
     pub no_reorder: bool,
 }
 
-impl JoinInfo {
+impl<N> JoinInfo<N> {
     /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
     pub fn is_outer(&self) -> bool {
         matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
@@ -1161,28 +1273,28 @@ impl JoinInfo {
     }
 }
 
-/// A joined table in the query plan.
+/// A source participating in a query plan.
 /// For example,
 /// ```sql
 /// SELECT * FROM users u JOIN products p JOIN (SELECT * FROM users) sub;
 /// ```
-/// has three table references where
+/// has three sources where
 /// - all have [Operation::Scan]
 /// - identifiers are `t`, `p`, `sub`
 /// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
 /// - join_info is None for the first table reference, and Some(JoinInfo { join_type: JoinType::Inner, using: vec![] }) for the second and third table references
 #[derive(Debug, Clone)]
-pub struct JoinedTable {
-    /// The operation that this table reference performs.
-    pub op: Operation,
+pub struct PlannedSource<I, H, E, J, O = Operation, N = String> {
+    /// The operation that this source performs.
+    pub op: O,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
-    /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
-    pub internal_id: TableInternalId,
-    /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
-    pub join_info: Option<JoinInfo>,
+    pub identifier: N,
+    /// Identity used by expressions and planner metadata.
+    pub internal_id: I,
+    /// Join info when this source is the right side of a join.
+    pub join_info: Option<J>,
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
@@ -1195,18 +1307,437 @@ pub struct JoinedTable {
     pub column_use_counts: Vec<usize>,
     /// Expressions referencing this table that may be satisfied by an expression index.
     ///
-    /// Each entry stores the normalized expression text and the columns it
-    /// needs. During covering checks we ask: does an index contain this
+    /// Each entry stores the expression shape used by this planning path and
+    /// the columns it needs. During covering checks we ask: does an index contain this
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
-    pub expression_index_usages: Vec<ExpressionIndexUsage>,
+    pub expression_index_usages: Vec<ExpressionIndexUsage<E>>,
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
-    /// INDEXED BY / NOT INDEXED hint from the SQL statement.
-    pub indexed: Option<ast::Indexed>,
+    /// Index-selection hint already represented for this planning path.
+    pub indexed: H,
 }
 
-impl JoinedTable {
+/// Source used by the parser-expression planning path.
+pub type JoinedTable =
+    PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<ast::Name>>;
+
+/// Resolved join metadata used by HIR planning without rewriting RIGHT JOIN.
+#[derive(Debug, Clone)]
+pub(crate) struct HirJoinInfo {
+    pub(crate) kind: crate::translate::semantic::hir::JoinKind,
+}
+
+/// Structural boundary for a parenthesized FROM group. Physical leaves remain
+/// in the flat source list; this records their nesting and join position.
+pub(crate) struct HirFromGroupBoundary {
+    pub(crate) source: crate::translate::semantic::hir::SourceId,
+    pub(crate) parent: Option<crate::translate::semantic::hir::SourceId>,
+    pub(crate) source_range: Range<usize>,
+    pub(crate) join_info: Option<HirJoinInfo>,
+}
+
+/// Flat physical source positions plus parenthesized join boundaries for one
+/// resolved FROM clause.
+pub(crate) struct HirFromLayout<'a> {
+    sources: &'a [HirPlanSource],
+    groups: &'a [HirFromGroupBoundary],
+}
+
+impl<'a> HirFromLayout<'a> {
+    pub(crate) fn new(sources: &'a [HirPlanSource], groups: &'a [HirFromGroupBoundary]) -> Self {
+        Self { sources, groups }
+    }
+
+    pub(crate) fn source_position(&self, source: hir::SourceId) -> Option<usize> {
+        self.sources
+            .iter()
+            .position(|candidate| candidate.source() == source)
+    }
+
+    pub(crate) fn table_mask(
+        &self,
+        document: &hir::HirDocument,
+        expression: &hir::Expr,
+    ) -> Result<TableMask> {
+        table_mask_from_hir_scope(document, self, expression)
+    }
+
+    pub(crate) fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        self.join_may_null_extend(source, false)
+    }
+
+    pub(crate) fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        self.join_may_null_extend(source, true)
+    }
+
+    /// An outer-join predicate owned by a group can run only when the current
+    /// source completes that group. Requiring the current source to be inside
+    /// the group prevents the predicate from becoming ready again later.
+    pub(crate) fn predicate_owner_ready(
+        &self,
+        owner: hir::SourceId,
+        joined: &TableMask,
+        current: usize,
+    ) -> bool {
+        if self.source_position(owner) == Some(current) {
+            return true;
+        }
+
+        self.groups
+            .iter()
+            .find(|group| group.source == owner)
+            .is_some_and(|group| {
+                group.source_range.contains(&current)
+                    && group
+                        .source_range
+                        .clone()
+                        .all(|position| joined.get(position))
+            })
+    }
+
+    fn join_may_null_extend(&self, source: hir::SourceId, full_only: bool) -> bool {
+        let Some(position) = self.source_position(source) else {
+            return false;
+        };
+        self.sources.iter().enumerate().any(|(right, candidate)| {
+            candidate.join_info().is_some_and(|join| {
+                (!full_only || join.kind == hir::JoinKind::Full)
+                    && join_kind_may_null_extend(
+                        join.kind,
+                        position,
+                        self.innermost_group_start(right),
+                        right..right + 1,
+                    )
+            })
+        }) || self.groups.iter().any(|group| {
+            group.join_info.as_ref().is_some_and(|join| {
+                (!full_only || join.kind == hir::JoinKind::Full)
+                    && join_kind_may_null_extend(
+                        join.kind,
+                        position,
+                        self.parent_group_start(group),
+                        group.source_range.clone(),
+                    )
+            })
+        })
+    }
+
+    fn innermost_group_start(&self, position: usize) -> usize {
+        self.groups
+            .iter()
+            .filter(|group| group.source_range.contains(&position))
+            .min_by_key(|group| group.source_range.len())
+            .map_or(0, |group| group.source_range.start)
+    }
+
+    fn parent_group_start(&self, group: &HirFromGroupBoundary) -> usize {
+        group
+            .parent
+            .and_then(|parent| self.groups.iter().find(|group| group.source == parent))
+            .map_or(0, |parent| parent.source_range.start)
+    }
+}
+
+impl HirFromScope for HirFromLayout<'_> {
+    fn source_position(&self, source: hir::SourceId) -> Option<usize> {
+        HirFromLayout::source_position(self, source)
+    }
+
+    fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        HirFromLayout::outer_join_may_null_extend(self, source)
+    }
+
+    fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        HirFromLayout::full_join_may_null_extend(self, source)
+    }
+}
+
+fn join_kind_may_null_extend(
+    kind: hir::JoinKind,
+    source_position: usize,
+    left_start: usize,
+    right: Range<usize>,
+) -> bool {
+    match kind {
+        hir::JoinKind::Left => right.contains(&source_position),
+        hir::JoinKind::Right => (left_start..right.start).contains(&source_position),
+        hir::JoinKind::Full => (left_start..right.end).contains(&source_position),
+        hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => false,
+    }
+}
+
+/// Source used by HIR planning without parser expressions or planner IDs.
+pub(crate) type HirPlannedSource = PlannedSource<
+    crate::translate::semantic::hir::SourceId,
+    crate::translate::semantic::hir::IndexHint,
+    crate::translate::semantic::hir::Expr,
+    HirJoinInfo,
+    (),
+    (),
+>;
+
+/// Resolved reuse policy for a non-recursive CTE scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HirCteMaterialization {
+    PerReference,
+    Shared,
+    Explicit,
+}
+
+/// One resolved HIR source as seen by join planning.
+///
+/// B-tree sources carry physical access metadata. Query-backed sources point
+/// at their planned query, so they do not need a synthetic table.
+pub(crate) enum HirPlanSource {
+    BTree(HirPlannedSource),
+    Derived {
+        source: crate::translate::semantic::hir::SourceId,
+        query: crate::translate::semantic::hir::QueryId,
+        join_info: Option<HirJoinInfo>,
+    },
+    Cte {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        query: crate::translate::semantic::hir::QueryId,
+        materialization: HirCteMaterialization,
+        join_info: Option<HirJoinInfo>,
+    },
+    RecursiveCte {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        join_info: Option<HirJoinInfo>,
+    },
+    RecursiveInput {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        join_info: Option<HirJoinInfo>,
+    },
+}
+
+impl HirPlanSource {
+    pub(crate) fn source(&self) -> crate::translate::semantic::hir::SourceId {
+        match self {
+            Self::BTree(source) => source.internal_id,
+            Self::Derived { source, .. }
+            | Self::Cte { source, .. }
+            | Self::RecursiveCte { source, .. }
+            | Self::RecursiveInput { source, .. } => *source,
+        }
+    }
+
+    pub(crate) fn join_info(&self) -> Option<&HirJoinInfo> {
+        match self {
+            Self::BTree(source) => source.join_info.as_ref(),
+            Self::Derived { join_info, .. }
+            | Self::Cte { join_info, .. }
+            | Self::RecursiveCte { join_info, .. }
+            | Self::RecursiveInput { join_info, .. } => join_info.as_ref(),
+        }
+    }
+
+    pub(crate) fn btree(&self) -> Option<&HirPlannedSource> {
+        match self {
+            Self::BTree(source) => Some(source),
+            Self::Derived { .. }
+            | Self::Cte { .. }
+            | Self::RecursiveCte { .. }
+            | Self::RecursiveInput { .. } => None,
+        }
+    }
+
+    pub(crate) fn btree_mut(&mut self) -> Option<&mut HirPlannedSource> {
+        match self {
+            Self::BTree(source) => Some(source),
+            Self::Derived { .. }
+            | Self::Cte { .. }
+            | Self::RecursiveCte { .. }
+            | Self::RecursiveInput { .. } => None,
+        }
+    }
+}
+
+impl<I, H, E, J, O, N> PlannedSource<I, H, E, J, O, N> {
+    /// Apply shared covering-index rules while letting each expression
+    /// representation decide whether an expression key matches.
+    fn index_is_covering_with(
+        &self,
+        index: &Index,
+        expression_in_index: impl Fn(&E, &Index) -> bool,
+    ) -> bool {
+        let Table::BTree(btree) = &self.table else {
+            return false;
+        };
+        if index.index_method.is_some() {
+            return false;
+        }
+        if self.col_used_mask.is_empty() {
+            // With no referenced columns, a complete index can provide the row-producing
+            // scan without opening the table. Partial-index completeness depends on the
+            // query predicate, so keep this path conservative.
+            return index.where_clause.is_none();
+        }
+
+        if self.expression_index_usages.is_empty() {
+            Self::index_covers_columns(index, btree, &self.col_used_mask)
+        } else {
+            let mut required_columns = self.col_used_mask.clone();
+            self.apply_expression_index_coverage(index, &mut required_columns, expression_in_index);
+            if required_columns.is_empty() {
+                return true;
+            }
+            Self::index_covers_columns(index, btree, &required_columns)
+        }
+    }
+
+    /// Remove columns fully supplied by expression keys in this index.
+    fn apply_expression_index_coverage(
+        &self,
+        index: &Index,
+        required_columns: &mut ColumnUsedMask,
+        expression_in_index: impl Fn(&E, &Index) -> bool,
+    ) {
+        let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
+        let mut any_covered = false;
+        for usage in &self.expression_index_usages {
+            // If the index stores the expression (e.g. idx on lower(name)), all
+            // columns needed *solely* for that expression can be treated as
+            // covered by the index key. Example:
+            //   CREATE INDEX idx ON t(lower(name));
+            //   SELECT lower(name) FROM t;
+            // Column `name` is not otherwise needed, so we can rely on the
+            // expression value from the index and drop the table cursor.
+            if expression_in_index(&usage.normalized_expr, index) {
+                any_covered = true;
+                for col_idx in usage.columns_mask.iter() {
+                    if col_idx >= coverage_counts.len() {
+                        coverage_counts.resize(col_idx + 1, 0);
+                    }
+                    coverage_counts[col_idx] += 1;
+                }
+            }
+        }
+        if !any_covered {
+            return;
+        }
+        for (col_idx, &covered) in coverage_counts.iter().enumerate() {
+            if covered == 0 {
+                continue;
+            }
+            // Only drop the requirement if *all* references to this column are
+            // satisfied by expression-index values. If the column is also
+            // selected or filtered directly, the table data is still needed.
+            if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
+                required_columns.clear(col_idx);
+            }
+        }
+    }
+
+    fn index_covers_columns(
+        index: &Index,
+        btree: &BTreeTable,
+        required_columns: &ColumnUsedMask,
+    ) -> bool {
+        // If a table has a rowid, the index is guaranteed to contain it as well.
+        let rowid_alias_pos = if btree.has_rowid {
+            btree.get_rowid_alias_column().map(|(pos, _)| pos)
+        } else {
+            None
+        };
+
+        if let Some(pos) = rowid_alias_pos {
+            if required_columns.is_only(pos) {
+                // If the index would be ONLY used for the rowid, don't bother.
+                // Example: SELECT id FROM t where id is a rowid alias - just scan the table.
+                return false;
+            }
+        }
+
+        // Check that every required column is covered by the index
+        for required_col in required_columns.iter() {
+            if rowid_alias_pos == Some(required_col) {
+                // rowid is always implicitly covered by the index
+                continue;
+            }
+            let covered_by_index = index
+                .columns
+                .iter()
+                .filter(|c| c.pos_in_table == required_col)
+                .any(|c| {
+                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
+                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
+                    // in the future, but for now we do this to ensure correctness.
+                    !btree
+                        .columns()
+                        .get(c.pos_in_table)
+                        .expect("column should be in table")
+                        .is_virtual_generated()
+                });
+            if !covered_by_index {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl
+    PlannedSource<
+        crate::translate::semantic::hir::SourceId,
+        crate::translate::semantic::hir::IndexHint,
+        crate::translate::semantic::hir::Expr,
+        HirJoinInfo,
+        (),
+        (),
+    >
+{
+    pub(crate) fn register_expression_index_usage(
+        &mut self,
+        expression: crate::translate::semantic::hir::Expr,
+        columns_mask: ColumnUsedMask,
+    ) {
+        if columns_mask.is_empty() {
+            return;
+        }
+        if self
+            .expression_index_usages
+            .iter()
+            .any(|usage| usage.normalized_expr.equivalent_for_index(&expression))
+        {
+            return;
+        }
+        self.expression_index_usages.push(ExpressionIndexUsage {
+            normalized_expr: Box::new(expression),
+            columns_mask,
+        });
+    }
+
+    pub(crate) fn index_is_covering(
+        &self,
+        source: &crate::translate::semantic::hir::Source,
+        index: &Index,
+    ) -> bool {
+        self.index_is_covering_with(index, |expression, index| {
+            source
+                .index_expressions
+                .iter()
+                .find(|expressions| std::ptr::eq(expressions.index.value(), index))
+                .is_some_and(|expressions| {
+                    expressions
+                        .columns
+                        .iter()
+                        .flatten()
+                        .any(|indexed| expression.equivalent_for_index(indexed))
+                        || expressions
+                            .predicate
+                            .as_ref()
+                            .is_some_and(|predicate| expression.equivalent_for_index(predicate))
+                })
+        })
+    }
+}
+
+impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<ast::Name>> {
     pub fn using_dedup_hidden_cols(&self) -> Result<ColumnMask> {
         let Some(join_info) = self.join_info.as_ref() else {
             return Ok(ColumnMask::default());
@@ -2157,10 +2688,10 @@ impl<T> TryFrom<u128> for BitSet<T> {
 }
 
 #[derive(Clone, Debug)]
-pub struct ExpressionIndexUsage {
-    /// Normalized (non-bound) ast of the expression as stored on an index column.
+pub struct ExpressionIndexUsage<E = ast::Expr> {
+    /// Normalized expression as stored on an index column.
     /// Example: `lower(name)` for INDEX ON t(lower(name)).
-    pub normalized_expr: Box<ast::Expr>,
+    pub normalized_expr: Box<E>,
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
@@ -2478,7 +3009,7 @@ fn query_output_columns(
     Ok(columns)
 }
 
-impl JoinedTable {
+impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<ast::Name>> {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match &self.table {
@@ -2684,59 +3215,6 @@ impl JoinedTable {
         });
     }
 
-    /// Provided an index that may contain expression keys, remove any
-    /// columns from `required_columns` that are fully covered by expression index values.
-    fn apply_expression_index_coverage(
-        &self,
-        index: &Index,
-        required_columns: &mut ColumnUsedMask,
-    ) {
-        let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
-        let mut any_covered = false;
-        for usage in &self.expression_index_usages {
-            // If the index stores the expression (e.g. idx on lower(name)), all
-            // columns needed *solely* for that expression can be treated as
-            // covered by the index key. Example:
-            //   CREATE INDEX idx ON t(lower(name));
-            //   SELECT lower(name) FROM t;
-            // Column `name` is not otherwise needed, so we can rely on the
-            // expression value from the index and drop the table cursor.
-            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
-            } else {
-                false
-            };
-
-            if index
-                .expression_to_index_pos(&usage.normalized_expr)
-                .is_some()
-                || matches_where_clause
-            {
-                any_covered = true;
-                for col_idx in usage.columns_mask.iter() {
-                    if col_idx >= coverage_counts.len() {
-                        coverage_counts.resize(col_idx + 1, 0);
-                    }
-                    coverage_counts[col_idx] += 1;
-                }
-            }
-        }
-        if !any_covered {
-            return;
-        }
-        for (col_idx, &covered) in coverage_counts.iter().enumerate() {
-            if covered == 0 {
-                continue;
-            }
-            // Only drop the requirement if *all* references to this column are
-            // satisfied by expression-index values. If the column is also
-            // selected or filtered directly, the table data is still needed.
-            if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
-                required_columns.clear(col_idx);
-            }
-        }
-    }
-
     /// Open the necessary cursors for this table reference.
     /// Generally a table cursor is always opened unless a SELECT query can use a covering index.
     /// An index cursor is opened if an index is used in any way for reading data from the table.
@@ -2852,76 +3330,13 @@ impl JoinedTable {
 
     /// Returns true if a given index is a covering index for this [TableReference].
     pub fn index_is_covering(&self, index: &Index) -> bool {
-        let Table::BTree(btree) = &self.table else {
-            return false;
-        };
-        if index.index_method.is_some() {
-            return false;
-        }
-        if self.col_used_mask.is_empty() {
-            // With no referenced columns, a complete index can provide the row-producing
-            // scan without opening the table. Partial-index completeness depends on the
-            // query predicate, so keep this path conservative.
-            return index.where_clause.is_none();
-        }
-
-        if self.expression_index_usages.is_empty() {
-            Self::index_covers_columns(index, btree, &self.col_used_mask)
-        } else {
-            let mut required_columns = self.col_used_mask.clone();
-            self.apply_expression_index_coverage(index, &mut required_columns);
-            if required_columns.is_empty() {
-                return true;
-            }
-            Self::index_covers_columns(index, btree, &required_columns)
-        }
-    }
-
-    fn index_covers_columns(
-        index: &Index,
-        btree: &BTreeTable,
-        required_columns: &ColumnUsedMask,
-    ) -> bool {
-        // If a table has a rowid, the index is guaranteed to contain it as well.
-        let rowid_alias_pos = if btree.has_rowid {
-            btree.get_rowid_alias_column().map(|(pos, _)| pos)
-        } else {
-            None
-        };
-
-        if let Some(pos) = rowid_alias_pos {
-            if required_columns.is_only(pos) {
-                // If the index would be ONLY used for the rowid, don't bother.
-                // Example: SELECT id FROM t where id is a rowid alias - just scan the table.
-                return false;
-            }
-        }
-
-        // Check that every required column is covered by the index
-        for required_col in required_columns.iter() {
-            if rowid_alias_pos == Some(required_col) {
-                // rowid is always implicitly covered by the index
-                continue;
-            }
-            let covered_by_index = index
-                .columns
-                .iter()
-                .filter(|c| c.pos_in_table == required_col)
-                .any(|c| {
-                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
-                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
-                    // in the future, but for now we do this to ensure correctness.
-                    !btree
-                        .columns()
-                        .get(c.pos_in_table)
-                        .expect("column should be in table")
-                        .is_virtual_generated()
-                });
-            if !covered_by_index {
-                return false;
-            }
-        }
-        true
+        self.index_is_covering_with(index, |expression, index| {
+            index.expression_to_index_pos(expression).is_some()
+                || index
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|predicate| exprs_are_equivalent(predicate, expression))
+        })
     }
 
     /// Returns true if the index selected for use with this [TableReference] is a covering index,
@@ -2943,31 +3358,33 @@ impl JoinedTable {
 /// [SeekKey] is the condition that is used to seek to a specific row in a table/index.
 /// [SeekKey] also used to represent range scan termination condition.
 #[derive(Debug, Clone)]
-pub struct SeekDef {
+pub struct SeekDef<E = ast::Expr> {
     /// Common prefix of the key which is shared between start/end fields
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
     ///
     /// Then, prefix=[(eq=1, ASC)], start=Some((ge, Expr(30))), end=Some((gt, Sentinel))
-    pub prefix: Vec<SeekRangeConstraint>,
+    pub prefix: Vec<SeekRangeConstraint<E>>,
     /// The condition to use when seeking. See [SeekKey] for more details.
-    pub start: SeekKey,
+    pub start: SeekKey<E>,
     /// The condition to use when terminating the scan that follows the seek. See [SeekKey] for more details.
-    pub end: SeekKey,
+    pub end: SeekKey<E>,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
 }
 
-pub struct SeekDefKeyIterator<'a, T> {
-    seek_def: &'a SeekDef,
-    seek_key: &'a SeekKey,
+pub(crate) type HirSeekDef = SeekDef<crate::translate::semantic::hir::Expr>;
+
+pub struct SeekDefKeyIterator<'a, E, T> {
+    seek_def: &'a SeekDef<E>,
+    seek_key: &'a SeekKey<E>,
     pos: usize,
     _t: PhantomData<T>,
 }
 
-impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
-    type Item = SeekKeyComponent<&'a ast::Expr>;
+impl<'a, E> Iterator for SeekDefKeyIterator<'a, E, SeekKeyComponent<&'a E>> {
+    type Item = SeekKeyComponent<&'a E>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = if self.pos < self.seek_def.prefix.len() {
@@ -2988,7 +3405,7 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
     }
 }
 
-impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
+impl<E> Iterator for SeekDefKeyIterator<'_, E, Affinity> {
     type Item = Affinity;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -3009,10 +3426,10 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
     }
 }
 
-impl SeekDef {
+impl<E> SeekDef<E> {
     /// returns amount of values in the given seek key
     /// - so, for SELECT * FROM t WHERE x = 10 AND y = 20 AND y >= 30 there will be 3 values (10, 20, 30)
-    pub fn size(&self, key: &SeekKey) -> usize {
+    pub fn size(&self, key: &SeekKey<E>) -> usize {
         self.prefix.len()
             + match key.last_component {
                 SeekKeyComponent::Expr(_) => 1,
@@ -3023,8 +3440,8 @@ impl SeekDef {
     /// iterate over value expressions in the given seek key
     pub fn iter<'a>(
         &'a self,
-        key: &'a SeekKey,
-    ) -> SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
+        key: &'a SeekKey<E>,
+    ) -> SeekDefKeyIterator<'a, E, SeekKeyComponent<&'a E>> {
         SeekDefKeyIterator {
             seek_def: self,
             seek_key: key,
@@ -3034,7 +3451,7 @@ impl SeekDef {
     }
 
     /// iterate over affinity in the given seek key
-    pub fn iter_affinity<'a>(&'a self, key: &'a SeekKey) -> SeekDefKeyIterator<'a, Affinity> {
+    pub fn iter_affinity<'a>(&'a self, key: &'a SeekKey<E>) -> SeekDefKeyIterator<'a, E, Affinity> {
         SeekDefKeyIterator {
             seek_def: self,
             seek_key: key,
@@ -3042,7 +3459,9 @@ impl SeekDef {
             _t: PhantomData,
         }
     }
+}
 
+impl SeekDef<ast::Expr> {
     /// Whether the key component at `pos` came from a NULL-matching equality
     /// (`x IS <expr>`) rather than `x = <expr>`.
     ///
@@ -3087,7 +3506,10 @@ pub fn is_non_null_literal(expr: &ast::Expr) -> bool {
 /// stored in the ephemeral index still includes the remaining payload columns
 /// (and possibly a synthetic rowid). Pad those trailing slots with NONE affinity
 /// so MakeRecord sees the same layout the index insert path produced.
-pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Option<Arc<String>> {
+pub fn synthesized_seek_affinity_str<E>(
+    index: &Index,
+    seek_def: &SeekDef<E>,
+) -> Option<Arc<String>> {
     let num_key_cols = seek_def.size(&seek_def.start);
     let total_cols = index.columns.len() + if index.has_rowid { 1 } else { 0 };
     let mut aff: String = seek_def
@@ -3116,9 +3538,9 @@ pub enum SeekKeyComponent<E> {
 
 /// A condition to use when seeking.
 #[derive(Debug, Clone)]
-pub struct SeekKey {
+pub struct SeekKey<E = ast::Expr> {
     /// Complete key must be constructed from common [SeekDef::prefix] and optional last_component
-    pub last_component: SeekKeyComponent<ast::Expr>,
+    pub last_component: SeekKeyComponent<E>,
 
     /// The comparison operator to use when seeking.
     pub op: SeekOp,
@@ -3923,6 +4345,7 @@ fn resolve_outer_ref_loop(
 #[cfg(test)]
 mod tests {
     use crate::alloc::TursoFromIterator;
+    use crate::translate::semantic::hir;
 
     use super::*;
     use rand_chacha::{
@@ -3931,6 +4354,224 @@ mod tests {
     };
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
+
+    fn hir_integer(value: i64) -> crate::translate::semantic::hir::Expr {
+        crate::translate::semantic::hir::Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    }
+
+    fn hir_and(
+        lhs: crate::translate::semantic::hir::Expr,
+        rhs: crate::translate::semantic::hir::Expr,
+    ) -> crate::translate::semantic::hir::Expr {
+        crate::translate::semantic::hir::Expr::Binary {
+            lhs: Box::new(lhs),
+            operator: ast::Operator::And,
+            rhs: Box::new(rhs),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        }
+    }
+
+    #[test]
+    fn hir_seek_definition_keeps_resolved_expressions() {
+        let seek: HirSeekDef = SeekDef {
+            prefix: vec![SeekRangeConstraint::new_eq(
+                SortOrder::Asc,
+                ast::NullsOrder::First,
+                (ast::Operator::Equals, hir_integer(7), Affinity::Integer),
+            )],
+            start: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: SeekOp::GE { eq_only: true },
+                affinity: Affinity::Blob,
+            },
+            end: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: SeekOp::LE { eq_only: true },
+                affinity: Affinity::Blob,
+            },
+            iter_dir: IterationDirection::Forwards,
+        };
+
+        let values = seek.iter(&seek.start).collect::<Vec<_>>();
+        assert!(matches!(
+            values.as_slice(),
+            [SeekKeyComponent::Expr(hir::Expr::Literal(
+                ast::Literal::Numeric(value)
+            ))] if value == "7"
+        ));
+        assert_eq!(
+            seek.iter_affinity(&seek.start).collect::<Vec<_>>(),
+            [Affinity::Integer]
+        );
+    }
+
+    fn hir_output(id: hir::OutputId, expr: hir::Expr) -> hir::Output {
+        hir::Output {
+            id,
+            name: "value".into(),
+            expr,
+            type_fact: hir::TypeFact::dynamic(),
+            affinity: Affinity::Blob,
+            schema_affinity: Affinity::Blob,
+            has_affinity: false,
+            collation: None,
+            collation_is_explicit: false,
+            name_kind: hir::OutputNameKind::Inferred,
+        }
+    }
+
+    fn hir_dependency_document(
+        output_expr: hir::Expr,
+        captures: Vec<hir::SourceId>,
+    ) -> hir::HirDocument {
+        let outer_query = hir::QueryId::new(0);
+        let outer_block = hir::QueryBlockId::new(outer_query, 0);
+        let output = hir::OutputId::query(outer_block, 0);
+        let mut block = hir::QueryBlock::new(
+            outer_block,
+            hir::QueryBlockBody::Values { rows: Vec::new() },
+        );
+        block.outputs.push(hir_output(output, output_expr));
+
+        let inner_query = hir::QueryId::new(1);
+        let inner_block = hir::QueryBlockId::new(inner_query, 0);
+        hir::HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::Query(hir::QueryRoot { query: outer_query }),
+            queries: vec![
+                hir::Query {
+                    id: outer_query,
+                    parent: None,
+                    captures: Vec::new(),
+                    reachable_ctes: Vec::new(),
+                    blocks: vec![block],
+                    first: outer_block,
+                    compounds: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    output: vec![output],
+                },
+                hir::Query {
+                    id: inner_query,
+                    parent: Some(outer_query),
+                    captures,
+                    reachable_ctes: Vec::new(),
+                    blocks: vec![hir::QueryBlock::new(
+                        inner_block,
+                        hir::QueryBlockBody::Values { rows: Vec::new() },
+                    )],
+                    first: inner_block,
+                    compounds: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    output: Vec::new(),
+                },
+            ],
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        }
+    }
+
+    #[test]
+    fn hir_predicates_split_without_ast_conversion() {
+        let expression = hir_and(hir_integer(1), hir_and(hir_integer(2), hir_integer(3)));
+        let mut terms: Vec<HirWhereTerm> = Vec::new();
+
+        expression.append_conjuncts(&mut terms);
+
+        let values = terms
+            .iter()
+            .map(|term| match &term.expr {
+                crate::translate::semantic::hir::Expr::Literal(ast::Literal::Numeric(value)) => {
+                    value.as_str()
+                }
+                _ => panic!("conjunct remains an HIR numeric literal"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["1", "2", "3"]);
+        assert!(terms.iter().all(|term| term.from_outer_join.is_none()));
+    }
+
+    #[test]
+    fn hir_expression_dependencies_map_to_local_from_positions() -> Result<()> {
+        let first = hir::SourceId::new(10);
+        let joined = hir::SourceId::new(20);
+        let outside = hir::SourceId::new(30);
+        let from = hir::From {
+            first,
+            joins: vec![hir::Join {
+                right: joined,
+                kind: hir::JoinKind::Inner,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let output = hir::OutputId::query(hir::QueryBlockId::new(hir::QueryId::new(0), 0), 0);
+        let document = hir_dependency_document(hir::Expr::column(joined, 0), vec![joined, outside]);
+
+        let direct = hir_and(hir::Expr::column(first, 0), hir::Expr::rowid(joined));
+        let direct_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &direct)?;
+        assert!(direct_mask.get(0));
+        assert!(direct_mask.get(1));
+
+        let merged = hir::Expr::MergedColumn(hir::MergedColumn {
+            left: Box::new(hir::Expr::column(first, 0)),
+            right: hir::ColumnRef {
+                source: joined,
+                column: 0,
+            },
+            value: hir::MergedColumnValue::Coalesce,
+            type_fact: hir::TypeFact::dynamic(),
+            affinity: Affinity::Blob,
+            has_affinity: false,
+            collation: None,
+        });
+        let merged_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &merged)?;
+        assert!(merged_mask.get(0));
+        assert!(merged_mask.get(1));
+
+        let output_mask = crate::translate::planner::table_mask_from_hir_expr(
+            &document,
+            Some(&from),
+            &hir::Expr::output(output),
+        )?;
+        assert!(!output_mask.get(0));
+        assert!(output_mask.get(1));
+
+        let subquery = hir::Expr::Subquery(hir::SubqueryExpr::In {
+            lhs: Box::new(hir::Expr::column(first, 0)),
+            query: hir::QueryId::new(1),
+            negated: false,
+            comparison: hir::ComparisonSemantics {
+                components: vec![hir::ComparisonComponent {
+                    affinity: Affinity::Blob,
+                    collation: None,
+                    array: false,
+                }],
+            },
+        });
+        let subquery_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &subquery)?;
+        assert!(subquery_mask.get(0));
+        assert!(subquery_mask.get(1));
+        assert_eq!(subquery_mask.iter().count(), 2);
+
+        let duplicate = hir_and(hir::Expr::column(first, 0), hir::Expr::column(first, 1));
+        let duplicate_mask = crate::translate::planner::table_mask_from_hir_expr(
+            &document,
+            Some(&from),
+            &duplicate,
+        )?;
+        assert_eq!(duplicate_mask.iter().collect::<Vec<_>>(), [0]);
+
+        Ok(())
+    }
 
     #[test]
     fn test_column_used_mask_empty() -> TestResult {

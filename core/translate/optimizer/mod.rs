@@ -2,10 +2,10 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
+        DeletePlan, GroupBy, HirPlannedSource, HirSeekDef, HirWhereTerm, InSeekSource,
+        IterationDirection, JoinInfo, JoinOrderMember, JoinType, JoinedTable, MinMaxDef,
+        MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan,
+        SetOperation, SimpleAggregate, TableReferences, UpdatePlan, WhereTerm,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -13,6 +13,7 @@ use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::TableMask;
+use crate::translate::semantic::hir;
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
@@ -26,7 +27,8 @@ use crate::{
         optimizer::{
             access_method::{AccessMethod, AccessMethodParams},
             constraints::{
-                ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
+                ConstraintUseCandidate, HirConstraint, RangeConstraintRef, SeekRangeConstraint,
+                TableConstraints,
             },
             cost::RowCountEstimate,
             multi_index::MultiIndexBranchAccessParams,
@@ -34,8 +36,9 @@ use crate::{
         },
         plan::{
             DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
-            NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
-            SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
+            NonFromClauseSubquery, PlannedSource, QueryDestination, ResultSetColumn, Scan,
+            SeekKeyComponent, SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause,
+            WriteSetPlan,
         },
         trigger_exec::has_triggers_including_temp,
     },
@@ -51,10 +54,7 @@ use crate::{
     LimboError, Result,
 };
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
-use constraints::{
-    can_use_partial_index, constraints_from_where_clause, partial_index,
-    partial_index_predicate_terms, Constraint,
-};
+use constraints::{can_use_partial_index, constraints_from_where_clause, Constraint};
 use cost::Cost;
 use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
@@ -70,6 +70,7 @@ use smallvec::SmallVec;
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, VecDeque},
+    fmt::Display,
     sync::Arc,
 };
 use turso_ext::{ConstraintInfo, ConstraintUsage};
@@ -80,6 +81,7 @@ pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
+pub(crate) use cost_params::CostModelParams;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
@@ -1921,12 +1923,12 @@ fn register_index_expression_usages_for_plan(
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
-fn base_row_estimate(
+pub(crate) fn base_row_estimate(
     schema: &Schema,
-    table: &JoinedTable,
+    table: &Table,
     params: &cost_params::CostModelParams,
 ) -> RowCountEstimate {
-    match &table.table {
+    match table {
         Table::BTree(btree) => {
             if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
                 if let Some(rows) = stats.row_count.or_else(|| {
@@ -2091,7 +2093,7 @@ fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Sche
             .joined_tables()
             .iter()
             .find(|table| table.internal_id == *table_id)?;
-        Some(rows * *base_row_estimate(schema, table, params))
+        Some(rows * *base_row_estimate(schema, &table.table, params))
     });
     rows_per_call.map_or(input_rows, |rows| input_rows.min(calls * rows))
 }
@@ -2217,9 +2219,14 @@ fn enforce_indexed_by_hints(
                 // If no candidate survived (no WHERE constraints matched), add an empty one
                 // so the optimizer can still scan the index.
                 if cs.candidates.is_empty() {
+                    assert!(
+                        forced_index.where_clause.is_none(),
+                        "a usable forced partial index candidate must survive constraint collection"
+                    );
                     cs.candidates.push(ConstraintUseCandidate {
                         index: Some(forced_index),
                         refs: Vec::new(),
+                        partial_index: None,
                     });
                 }
             }
@@ -2367,7 +2374,7 @@ fn find_table_access_plan(
     let base_table_rows_for_candidates = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t, params))
+        .map(|t| base_row_estimate(schema, &t.table, params))
         .collect::<Vec<_>>();
 
     let index_method_candidates = if !is_single_table {
@@ -2400,7 +2407,7 @@ fn find_table_access_plan(
     let base_table_rows = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t, params))
+        .map(|t| base_row_estimate(schema, &t.table, params))
         .collect::<Vec<_>>();
 
     // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
@@ -2698,128 +2705,47 @@ fn apply_table_access_plan(
             continue;
         }
         let access_method = &mut access_methods_arena[best_access_methods[i]];
-        match &mut access_method.params {
-            AccessMethodParams::BTreeTable {
-                iter_dir,
-                index,
-                build_index,
-                constraint_refs,
-            } => {
-                if *build_index {
-                    turso_assert!(index.is_none(), "a new temporary index must not exist yet");
-                    let prior_tables: TableMask =
-                        best_table_numbers.iter().take(i).copied().try_collect()?;
-                    *constraint_refs = constraints::usable_constraints_for_lhs_mask(
-                        &constraints_per_table[table_idx].constraints,
-                        &constraints_per_table[table_idx].temporary_index_terms,
-                        &prior_tables,
-                        table_idx,
+        if matches!(
+            access_method.params,
+            AccessMethodParams::BTreeTable { .. } | AccessMethodParams::InSeek { .. }
+        ) {
+            let source = &table_references.joined_tables()[table_idx];
+            let prior_tables: TableMask =
+                best_table_numbers.iter().take(i).copied().try_collect()?;
+            let outer_join_source = source
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer())
+                .then_some(source.internal_id);
+            let builder = LegacyBtreeOperationBuilder {
+                table_references,
+                resolver,
+            };
+            let selected = apply_selected_btree_access(
+                source,
+                &constraints_per_table[table_idx],
+                where_clause,
+                access_method,
+                &prior_tables,
+                table_idx,
+                outer_join_source,
+                hash_join_build_only_tables.get(table_idx),
+                &builder,
+                |index| {
+                    maybe_remove_index_candidate(
+                        index,
+                        source,
+                        maybe_order_target.as_ref(),
+                        sort_eliminated,
                     )
-                    .into_vec();
-                    turso_assert!(
-                        !constraint_refs.is_empty(),
-                        "a temporary index must have a search key"
-                    );
-                    *index = Some(Arc::new(ephemeral_index_build(
-                        &table_references.joined_tables()[table_idx],
-                        constraint_refs,
-                    )?));
-                    *build_index = false;
-                }
-                maybe_remove_index_candidate(
-                    index,
-                    &table_references.joined_tables()[table_idx],
-                    maybe_order_target.as_ref(),
-                    sort_eliminated,
-                );
-                if constraint_refs.is_empty() {
-                    if let Some(index) = partial_index(index.as_ref()) {
-                        let is_outer_join = table_references.joined_tables()[table_idx]
-                            .join_info
-                            .as_ref()
-                            .is_some_and(|join_info| join_info.is_outer());
-                        mark_partial_index_predicate_terms_consumed(
-                            index,
-                            &table_references.joined_tables()[table_idx],
-                            where_clause,
-                            is_outer_join,
-                        );
-                    }
-                    table_references.joined_tables_mut()[table_idx].op =
-                        Operation::Scan(Scan::BTreeTable {
-                            iter_dir: *iter_dir,
-                            index: index.clone(),
-                        });
-                    continue;
-                } else {
-                    let is_outer_join = table_references.joined_tables()[table_idx]
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|join_info| join_info.is_outer());
-                    let defer_cross_table_constraints = hash_join_build_only_tables.get(table_idx);
-                    if let Some(index) = partial_index(index.as_ref()) {
-                        mark_partial_index_predicate_terms_consumed(
-                            index,
-                            &table_references.joined_tables()[table_idx],
-                            where_clause,
-                            is_outer_join,
-                        );
-                    }
-                    mark_seek_constraints_consumed(
-                        &constraints_per_table[table_idx].constraints,
-                        constraint_refs,
-                        where_clause,
-                        is_outer_join,
-                        defer_cross_table_constraints,
-                    );
-                    if let Some(index) = &index {
-                        table_references.joined_tables_mut()[table_idx].op =
-                            Operation::Search(Search::Seek {
-                                index: Some(index.clone()),
-                                seek_def: build_seek_def_from_constraints(
-                                    &constraints_per_table[table_idx].constraints,
-                                    constraint_refs,
-                                    *iter_dir,
-                                    where_clause,
-                                    Some(table_references),
-                                    Some(resolver),
-                                )?,
-                            });
-                        continue;
-                    }
-                    turso_assert_eq!(
-                        constraint_refs.len(),
-                        1,
-                        "expected exactly one constraint for rowid seek",
-                        {"constraint_refs": format!("{constraint_refs:?}")}
-                    );
-                    table_references.joined_tables_mut()[table_idx].op =
-                        if let Some(ref eq) = constraint_refs[0].eq {
-                            Operation::Search(Search::RowidEq {
-                                cmp_expr: constraints_per_table[table_idx].constraints
-                                    [eq.constraint_pos]
-                                    .get_constraining_expr(
-                                        where_clause,
-                                        Some(table_references),
-                                        Some(resolver),
-                                    )
-                                    .1,
-                            })
-                        } else {
-                            Operation::Search(Search::Seek {
-                                index: None,
-                                seek_def: build_seek_def_from_constraints(
-                                    &constraints_per_table[table_idx].constraints,
-                                    constraint_refs,
-                                    *iter_dir,
-                                    where_clause,
-                                    Some(table_references),
-                                    Some(resolver),
-                                )?,
-                            })
-                        };
-                }
-            }
+                },
+            )?
+            .expect("B-tree and IN access methods produce a selected operation");
+            table_references.joined_tables_mut()[table_idx].op =
+                legacy_operation_from_selected(selected);
+            continue;
+        }
+        match &mut access_method.params {
             AccessMethodParams::VirtualTable {
                 idx_num,
                 idx_str,
@@ -2860,7 +2786,7 @@ fn apply_table_access_plan(
                     &table_constraints.constraints,
                     constraint_refs,
                     where_clause,
-                    false,
+                    None,
                     false,
                 );
 
@@ -2972,50 +2898,8 @@ fn apply_table_access_plan(
                         set_op: s_op,
                     });
             }
-            AccessMethodParams::InSeek {
-                index,
-                affinity,
-                where_term_idx,
-            } => {
-                let source = match &where_clause[*where_term_idx].expr {
-                    Expr::InList { rhs, .. } => {
-                        let in_values: Vec<ast::Expr> = rhs.iter().map(|e| *e.clone()).collect();
-                        InSeekSource::LiteralList {
-                            values: in_values,
-                            affinity: *affinity,
-                        }
-                    }
-                    Expr::SubqueryResult {
-                        query_type: SubqueryType::In { cursor_id, .. },
-                        ..
-                    } => InSeekSource::Subquery {
-                        cursor_id: *cursor_id,
-                    },
-                    _ => {
-                        return Err(crate::LimboError::InternalError(
-                            "InSeek where term is not an InList or SubqueryResult expression"
-                                .into(),
-                        ));
-                    }
-                };
-                let is_outer_join = table_references.joined_tables()[table_idx]
-                    .join_info
-                    .as_ref()
-                    .is_some_and(|join_info| join_info.is_outer());
-                if let Some(index) = partial_index(index.as_ref()) {
-                    mark_partial_index_predicate_terms_consumed(
-                        index,
-                        &table_references.joined_tables()[table_idx],
-                        where_clause,
-                        is_outer_join,
-                    );
-                }
-                where_clause[*where_term_idx].consumed = true;
-                table_references.joined_tables_mut()[table_idx].op =
-                    Operation::Search(Search::InSeek {
-                        index: index.clone(),
-                        source,
-                    });
+            AccessMethodParams::BTreeTable { .. } | AccessMethodParams::InSeek { .. } => {
+                unreachable!("B-tree access methods are applied before this match")
             }
         }
     }
@@ -3163,20 +3047,244 @@ fn build_vtab_scan_op(
     }))
 }
 
+trait AccessPredicate<S: Copy> {
+    fn outer_join_source(&self) -> Option<S>;
+    fn is_consumed(&self) -> bool;
+    fn consume(&mut self);
+}
+
+impl AccessPredicate<TableInternalId> for WhereTerm {
+    fn outer_join_source(&self) -> Option<TableInternalId> {
+        self.from_outer_join
+    }
+
+    fn is_consumed(&self) -> bool {
+        self.consumed
+    }
+
+    fn consume(&mut self) {
+        self.consumed = true;
+    }
+}
+
+impl AccessPredicate<hir::SourceId> for HirWhereTerm {
+    fn outer_join_source(&self) -> Option<hir::SourceId> {
+        self.from_outer_join
+    }
+
+    fn is_consumed(&self) -> bool {
+        self.consumed
+    }
+
+    fn consume(&mut self) {
+        self.consumed = true;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SelectedBtreeOperation<E, InSource> {
+    Scan {
+        iter_dir: IterationDirection,
+        index: Option<Arc<Index>>,
+    },
+    Seek {
+        index: Option<Arc<Index>>,
+        seek_def: SeekDef<E>,
+    },
+    RowidEq {
+        cmp_expr: E,
+    },
+    InSeek {
+        index: Option<Arc<Index>>,
+        source: InSource,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HirInSeekSource {
+    Values {
+        values: Vec<hir::Expr>,
+        affinity: Affinity,
+    },
+    Query {
+        query: hir::QueryId,
+    },
+}
+
+pub(crate) type HirBtreeOperation = SelectedBtreeOperation<hir::Expr, HirInSeekSource>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct HirVirtualTableOperation {
+    pub(crate) idx_num: i32,
+    pub(crate) idx_str: Option<String>,
+    pub(crate) arguments: Vec<hir::Expr>,
+}
+
+trait BtreeOperationBuilder<E, P> {
+    type InSource;
+
+    fn seek_def(
+        &self,
+        constraints: &[Constraint<E>],
+        constraint_refs: &[RangeConstraintRef],
+        iter_dir: IterationDirection,
+        predicates: &[P],
+    ) -> Result<SeekDef<E>>;
+
+    fn rowid_eq(&self, constraint: &Constraint<E>, predicates: &[P]) -> Result<E>;
+
+    fn in_seek_source(&self, predicate: &P, affinity: Affinity) -> Result<Self::InSource>;
+}
+
+struct LegacyBtreeOperationBuilder<'a> {
+    table_references: &'a TableReferences,
+    resolver: &'a Resolver<'a>,
+}
+
+impl BtreeOperationBuilder<ast::Expr, WhereTerm> for LegacyBtreeOperationBuilder<'_> {
+    type InSource = InSeekSource;
+
+    fn seek_def(
+        &self,
+        constraints: &[Constraint],
+        constraint_refs: &[RangeConstraintRef],
+        iter_dir: IterationDirection,
+        predicates: &[WhereTerm],
+    ) -> Result<SeekDef> {
+        build_seek_def_from_constraints(
+            constraints,
+            constraint_refs,
+            iter_dir,
+            predicates,
+            Some(self.table_references),
+            Some(self.resolver),
+        )
+    }
+
+    fn rowid_eq(&self, constraint: &Constraint, predicates: &[WhereTerm]) -> Result<ast::Expr> {
+        Ok(constraint
+            .get_constraining_expr(predicates, Some(self.table_references), Some(self.resolver))
+            .1)
+    }
+
+    fn in_seek_source(&self, predicate: &WhereTerm, affinity: Affinity) -> Result<InSeekSource> {
+        match &predicate.expr {
+            Expr::InList { rhs, .. } => Ok(InSeekSource::LiteralList {
+                values: rhs.iter().map(|expression| *expression.clone()).collect(),
+                affinity,
+            }),
+            Expr::SubqueryResult {
+                query_type: SubqueryType::In { cursor_id, .. },
+                ..
+            } => Ok(InSeekSource::Subquery {
+                cursor_id: *cursor_id,
+            }),
+            _ => Err(LimboError::InternalError(
+                "InSeek where term is not an InList or SubqueryResult expression".into(),
+            )),
+        }
+    }
+}
+
+struct HirBtreeOperationBuilder;
+
+impl BtreeOperationBuilder<hir::Expr, HirWhereTerm> for HirBtreeOperationBuilder {
+    type InSource = HirInSeekSource;
+
+    fn seek_def(
+        &self,
+        constraints: &[HirConstraint],
+        constraint_refs: &[RangeConstraintRef],
+        iter_dir: IterationDirection,
+        predicates: &[HirWhereTerm],
+    ) -> Result<HirSeekDef> {
+        build_hir_seek_def_from_constraints(constraints, constraint_refs, iter_dir, predicates)
+    }
+
+    fn rowid_eq(
+        &self,
+        constraint: &HirConstraint,
+        predicates: &[HirWhereTerm],
+    ) -> Result<hir::Expr> {
+        Ok(constraint.get_hir_constraining_expr(predicates).1)
+    }
+
+    fn in_seek_source(
+        &self,
+        predicate: &HirWhereTerm,
+        affinity: Affinity,
+    ) -> Result<HirInSeekSource> {
+        match &predicate.expr {
+            hir::Expr::InList { values, .. } => Ok(HirInSeekSource::Values {
+                values: values.clone(),
+                affinity,
+            }),
+            hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. }) => {
+                Ok(HirInSeekSource::Query { query: *query })
+            }
+            _ => Err(LimboError::InternalError(
+                "HIR IN-seek term is not an IN list or IN subquery".into(),
+            )),
+        }
+    }
+}
+
+fn selected_partial_index_terms<E, I>(
+    constraints: &TableConstraints<E, I>,
+    index: Option<&Arc<Index>>,
+) -> SmallVec<[usize; 4]> {
+    let Some(index) = index.filter(|index| index.where_clause.is_some()) else {
+        return SmallVec::new();
+    };
+    constraints
+        .candidates
+        .iter()
+        .find_map(|candidate| {
+            candidate
+                .index
+                .as_ref()
+                .is_some_and(|candidate_index| Arc::ptr_eq(candidate_index, index))
+                .then(|| {
+                    candidate
+                        .partial_index
+                        .as_ref()
+                        .expect("selected partial index keeps its proof terms")
+                        .predicate_terms
+                        .clone()
+                })
+        })
+        .expect("selected partial index remains in the source candidate set")
+}
+
+/// Mark predicates used only to prove that a partial index is usable.
+fn mark_partial_index_terms_consumed<S: Copy + PartialEq>(
+    terms: impl IntoIterator<Item = usize>,
+    predicates: &mut [impl AccessPredicate<S>],
+    outer_join_source: Option<S>,
+) {
+    for term in terms {
+        let predicate = &mut predicates[term];
+        if predicate.is_consumed() {
+            continue;
+        }
+        if outer_join_source.is_some() && predicate.outer_join_source() != outer_join_source {
+            continue;
+        }
+        predicate.consume();
+    }
+}
+
 /// Mark WHERE clause terms as consumed when they are covered by a seek
 /// (index seek, ephemeral auto-index seek, or rowid seek).
 ///
-/// `is_outer_join`: skip consuming non-ON WHERE terms for outer joins, because
-/// the cursor may land on a NULL-extended row that the WHERE filter must still
-/// reject (e.g. `SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5`).
-///
-/// `defer_cross_table`: skip cross-table constraints for hash-join build-only
-/// tables that lack a main-loop cursor — the probe side will evaluate them.
-fn mark_seek_constraints_consumed(
-    constraints: &[Constraint],
+/// For an outer join, non-ON terms remain available to reject a NULL-extended
+/// row. Cross-table constraints on a hash-build-only source are also deferred
+/// to the probe side.
+fn mark_seek_constraints_consumed<E, S: Copy>(
+    constraints: &[Constraint<E>],
     constraint_refs: &[RangeConstraintRef],
-    where_clause: &mut [WhereTerm],
-    is_outer_join: bool,
+    predicates: &mut [impl AccessPredicate<S>],
+    outer_join_source: Option<S>,
     defer_cross_table: bool,
 ) {
     for cref in constraint_refs.iter() {
@@ -3187,38 +3295,261 @@ fn mark_seek_constraints_consumed(
         ] {
             let Some(pos) = pos else { continue };
             let constraint = &constraints[pos];
-            let where_term = &mut where_clause[constraint.where_clause_pos.0];
-            if where_term.consumed {
+            let predicate = &mut predicates[constraint.where_clause_pos.0];
+            if predicate.is_consumed() {
                 continue;
             }
-            if is_outer_join && where_term.from_outer_join.is_none() {
+            if outer_join_source.is_some() && predicate.outer_join_source().is_none() {
                 continue;
             }
             if defer_cross_table && !constraint.lhs_mask.is_empty() {
                 continue;
             }
-            where_term.consumed = true;
+            predicate.consume();
         }
     }
 }
 
-fn mark_partial_index_predicate_terms_consumed(
-    index: &Index,
-    table_reference: &JoinedTable,
-    where_clause: &mut [WhereTerm],
-    is_outer_join: bool,
-) {
-    let predicate_terms = partial_index_predicate_terms(index, table_reference, where_clause)
-        .expect("selected partial index predicate must be implied by query");
-    for term_idx in predicate_terms {
-        let where_term = &mut where_clause[term_idx];
-        if where_term.consumed {
-            continue;
+#[allow(clippy::too_many_arguments)]
+fn apply_selected_btree_access<I, H, E, J, O, N, P, B>(
+    source: &PlannedSource<I, H, E, J, O, N>,
+    constraints: &TableConstraints<E, I>,
+    predicates: &mut [P],
+    access_method: &mut AccessMethod,
+    prior_sources: &TableMask,
+    source_position: usize,
+    outer_join_source: Option<I>,
+    defer_cross_table_constraints: bool,
+    builder: &B,
+    adjust_index: impl FnOnce(&mut Option<Arc<Index>>),
+) -> Result<Option<SelectedBtreeOperation<E, B::InSource>>>
+where
+    I: Copy + Display + PartialEq,
+    P: AccessPredicate<I>,
+    B: BtreeOperationBuilder<E, P>,
+{
+    let params = &mut access_method.params;
+    match params {
+        AccessMethodParams::BTreeTable {
+            iter_dir,
+            index,
+            build_index,
+            constraint_refs,
+        } => {
+            if *build_index {
+                turso_assert!(index.is_none(), "a new temporary index must not exist yet");
+                *constraint_refs = constraints::usable_constraints_for_lhs_mask(
+                    &constraints.constraints,
+                    &constraints.temporary_index_terms,
+                    prior_sources,
+                    source_position,
+                )
+                .into_vec();
+                turso_assert!(
+                    !constraint_refs.is_empty(),
+                    "a temporary index must have a search key"
+                );
+                *index = Some(Arc::new(ephemeral_index_build(source, constraint_refs)?));
+                *build_index = false;
+            }
+
+            adjust_index(index);
+            mark_partial_index_terms_consumed(
+                selected_partial_index_terms(constraints, index.as_ref()),
+                predicates,
+                outer_join_source,
+            );
+
+            if constraint_refs.is_empty() {
+                return Ok(Some(SelectedBtreeOperation::Scan {
+                    iter_dir: *iter_dir,
+                    index: index.clone(),
+                }));
+            }
+
+            mark_seek_constraints_consumed(
+                &constraints.constraints,
+                constraint_refs,
+                predicates,
+                outer_join_source,
+                defer_cross_table_constraints,
+            );
+            if let Some(index) = index {
+                return Ok(Some(SelectedBtreeOperation::Seek {
+                    index: Some(index.clone()),
+                    seek_def: builder.seek_def(
+                        &constraints.constraints,
+                        constraint_refs,
+                        *iter_dir,
+                        predicates,
+                    )?,
+                }));
+            }
+
+            turso_assert_eq!(
+                constraint_refs.len(),
+                1,
+                "expected exactly one constraint for rowid seek",
+                {"constraint_refs": format!("{constraint_refs:?}")}
+            );
+            if let Some(equality) = &constraint_refs[0].eq {
+                return Ok(Some(SelectedBtreeOperation::RowidEq {
+                    cmp_expr: builder.rowid_eq(
+                        &constraints.constraints[equality.constraint_pos],
+                        predicates,
+                    )?,
+                }));
+            }
+            Ok(Some(SelectedBtreeOperation::Seek {
+                index: None,
+                seek_def: builder.seek_def(
+                    &constraints.constraints,
+                    constraint_refs,
+                    *iter_dir,
+                    predicates,
+                )?,
+            }))
         }
-        if is_outer_join && where_term.from_outer_join != Some(table_reference.internal_id) {
-            continue;
+        AccessMethodParams::InSeek {
+            index,
+            affinity,
+            where_term_idx,
+        } => {
+            mark_partial_index_terms_consumed(
+                selected_partial_index_terms(constraints, index.as_ref()),
+                predicates,
+                outer_join_source,
+            );
+            let source = builder.in_seek_source(&predicates[*where_term_idx], *affinity)?;
+            predicates[*where_term_idx].consume();
+            Ok(Some(SelectedBtreeOperation::InSeek {
+                index: index.clone(),
+                source,
+            }))
         }
-        where_term.consumed = true;
+        _ => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_hir_selected_btree_access(
+    source: &HirPlannedSource,
+    constraints: &constraints::HirTableConstraints,
+    predicates: &mut [HirWhereTerm],
+    access_method: &mut AccessMethod,
+    prior_sources: &TableMask,
+    source_position: usize,
+) -> Result<HirBtreeOperation> {
+    let outer_join_source = source.join_info.as_ref().and_then(|join| {
+        matches!(
+            join.kind,
+            hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+        )
+        .then_some(source.internal_id)
+    });
+    apply_selected_btree_access(
+        source,
+        constraints,
+        predicates,
+        access_method,
+        prior_sources,
+        source_position,
+        outer_join_source,
+        false,
+        &HirBtreeOperationBuilder,
+        |_| {},
+    )?
+    .ok_or_else(|| {
+        LimboError::InternalError("HIR B-tree plan selected a non-B-tree access method".into())
+    })
+}
+
+pub(crate) fn apply_hir_selected_virtual_access(
+    constraints: &constraints::HirTableConstraints,
+    predicates: &mut [HirWhereTerm],
+    access_method: &AccessMethod,
+) -> Result<HirVirtualTableOperation> {
+    let AccessMethodParams::VirtualTable {
+        idx_num,
+        idx_str,
+        constraints: virtual_constraints,
+        constraint_usages,
+    } = &access_method.params
+    else {
+        return Err(LimboError::InternalError(
+            "HIR virtual table selected a non-virtual access method".into(),
+        ));
+    };
+    if constraint_usages.len() != virtual_constraints.len() {
+        return Err(LimboError::ExtensionError(format!(
+            "Constraint usage count mismatch (expected {}, got {})",
+            virtual_constraints.len(),
+            constraint_usages.len()
+        )));
+    }
+
+    let mut arguments = vec![None; constraint_usages.len()];
+    let mut argument_count = 0;
+    for (virtual_constraint, usage) in virtual_constraints.iter().zip(constraint_usages) {
+        let Some(index) = usage.argv_index else {
+            continue;
+        };
+        if index < 1 || index as usize > constraint_usages.len() {
+            return Err(LimboError::ExtensionError(format!(
+                "argv_index {index} is out of valid range [1..{}]",
+                constraint_usages.len()
+            )));
+        }
+        let argument = &mut arguments[index as usize - 1];
+        if argument.is_some() {
+            return Err(LimboError::ExtensionError(format!(
+                "duplicate argv_index {index}"
+            )));
+        }
+        let constraint = &constraints.constraints[virtual_constraint.index];
+        if usage.omit {
+            predicates[constraint.where_clause_pos.0].consumed = true;
+        }
+        *argument = Some(constraint.get_hir_constraining_expr(predicates).1);
+        argument_count += 1;
+    }
+    let arguments = arguments
+        .into_iter()
+        .take(argument_count)
+        .enumerate()
+        .map(|(index, argument)| {
+            argument.ok_or_else(|| {
+                LimboError::ExtensionError(format!(
+                    "argv_index values must form contiguous sequence starting from 1, missing index {}",
+                    index + 1
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(HirVirtualTableOperation {
+        idx_num: *idx_num,
+        idx_str: idx_str.clone(),
+        arguments,
+    })
+}
+
+fn legacy_operation_from_selected(
+    operation: SelectedBtreeOperation<ast::Expr, InSeekSource>,
+) -> Operation {
+    match operation {
+        SelectedBtreeOperation::Scan { iter_dir, index } => {
+            Operation::Scan(Scan::BTreeTable { iter_dir, index })
+        }
+        SelectedBtreeOperation::Seek { index, seek_def } => {
+            Operation::Search(Search::Seek { index, seek_def })
+        }
+        SelectedBtreeOperation::RowidEq { cmp_expr } => {
+            Operation::Search(Search::RowidEq { cmp_expr })
+        }
+        SelectedBtreeOperation::InSeek { index, source } => {
+            Operation::Search(Search::InSeek { index, source })
+        }
     }
 }
 
@@ -3274,7 +3605,7 @@ fn maybe_remove_index_candidate(
     if let Some((idx, order_target)) = index.as_mut().zip(order_target) {
         for col_order in &order_target.columns {
             // Only check columns from this table
-            if col_order.table_id != table_reference.internal_id {
+            if col_order.source != table_reference.internal_id {
                 continue;
             }
 
@@ -3620,16 +3951,20 @@ impl Optimizable for ast::Expr {
     }
 }
 
-fn ephemeral_index_build(
-    table_reference: &JoinedTable,
+pub(crate) fn ephemeral_index_build<I, H, E, J, O, N>(
+    source: &PlannedSource<I, H, E, J, O, N>,
     constraint_refs: &[RangeConstraintRef],
-) -> Result<Index> {
-    let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
+) -> Result<Index>
+where
+    I: Display,
+{
+    let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = source
+        .table
         .columns()
         .iter()
         .enumerate()
         // Only copy columns that the query reads.
-        .filter(|(index, _)| table_reference.column_is_used(*index))
+        .filter(|(index, _)| source.col_used_mask.get(*index))
         .map(|(i, c)| {
             let expr = match c.generated_type() {
                 GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
@@ -3666,19 +4001,16 @@ fn ephemeral_index_build(
     let ephemeral_index = Index {
         name: format!(
             "ephemeral_{}_{}",
-            table_reference.table.get_name(),
-            table_reference.internal_id
+            source.table.get_name(),
+            source.internal_id
         ),
         columns: ephemeral_columns,
         unique: false,
         ephemeral: true,
-        table_name: table_reference.table.get_name().to_string(),
+        table_name: source.table.get_name().to_string(),
         root_page: 0,
         where_clause: None,
-        has_rowid: table_reference
-            .table
-            .btree()
-            .is_some_and(|btree| btree.has_rowid),
+        has_rowid: source.table.btree().is_some_and(|btree| btree.has_rowid),
         index_method: None,
         on_conflict: None,
     };
@@ -3695,29 +4027,6 @@ pub fn build_seek_def_from_constraints(
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Result<SeekDef> {
-    if constraint_refs.is_empty() {
-        // Zero-prefix seeks are used for extremum scans over an already ordered
-        // source: start at one end of the cursor and stop after the first
-        // qualifying row.
-        let (start_op, end_op) = match iter_dir {
-            IterationDirection::Forwards => (SeekOp::GE { eq_only: true }, SeekOp::GT),
-            IterationDirection::Backwards => (SeekOp::LE { eq_only: true }, SeekOp::LT),
-        };
-        return Ok(SeekDef {
-            prefix: Vec::new(),
-            iter_dir,
-            start: SeekKey {
-                last_component: SeekKeyComponent::None,
-                op: start_op,
-                affinity: Affinity::Blob,
-            },
-            end: SeekKey {
-                last_component: SeekKeyComponent::None,
-                op: end_op,
-                affinity: Affinity::Blob,
-            },
-        });
-    }
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
@@ -3728,6 +4037,20 @@ pub fn build_seek_def_from_constraints(
 
     let seek_def = build_seek_def(iter_dir, key)?;
     Ok(seek_def)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_hir_seek_def_from_constraints(
+    constraints: &[HirConstraint],
+    constraint_refs: &[RangeConstraintRef],
+    iter_dir: IterationDirection,
+    where_clause: &[HirWhereTerm],
+) -> Result<HirSeekDef> {
+    let key = constraint_refs
+        .iter()
+        .map(|constraint| constraint.as_hir_seek_range_constraint(constraints, where_clause))
+        .collect();
+    build_seek_def(iter_dir, key)
 }
 
 /// Build a [SeekDef] for a given [SeekRangeConstraint] and [IterationDirection].
@@ -3755,11 +4078,33 @@ pub fn build_seek_def_from_constraints(
 /// since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
 /// So when you see e.g. a SeekOp::GT below for a descending index, it actually means that we are seeking the first row where the index key is LESS than the seek key.
 ///
-fn build_seek_def(
+fn build_seek_def<E>(
     iter_dir: IterationDirection,
-    mut key: Vec<SeekRangeConstraint>,
-) -> Result<SeekDef> {
-    turso_assert!(!key.is_empty());
+    mut key: Vec<SeekRangeConstraint<E>>,
+) -> Result<SeekDef<E>> {
+    if key.is_empty() {
+        // Zero-prefix seeks are used for extremum scans over an already ordered
+        // source: start at one end of the cursor and stop after the first
+        // qualifying row.
+        let (start_op, end_op) = match iter_dir {
+            IterationDirection::Forwards => (SeekOp::GE { eq_only: true }, SeekOp::GT),
+            IterationDirection::Backwards => (SeekOp::LE { eq_only: true }, SeekOp::LT),
+        };
+        return Ok(SeekDef {
+            prefix: Vec::new(),
+            iter_dir,
+            start: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: start_op,
+                affinity: Affinity::Blob,
+            },
+            end: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: end_op,
+                affinity: Affinity::Blob,
+            },
+        });
+    }
     let last = key.last().unwrap();
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
@@ -3792,7 +4137,7 @@ fn build_seek_def(
     turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
     let has_prefix = !key.is_empty();
-    let apply_null_boundaries = |start: &mut SeekKey, end: &mut SeekKey| {
+    let apply_null_boundaries = |start: &mut SeekKey<E>, end: &mut SeekKey<E>| {
         // Sometimes we must add an extra NULL to the key on purpose.
         // We do this so scans over composite indexes match SQLite exactly.
         //

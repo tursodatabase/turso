@@ -11,16 +11,17 @@ use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
-    partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
+    convert_to_vtab_constraint, convert_to_vtab_constraint_for_prefix, expr_uses_custom_collation,
+    ordered_ephemeral_key_columns, BinaryExprSide, Constraint, ConstraintOperator,
     RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, NonFromClauseSubquery,
-    Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
+    plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, HirPlannedSource,
+    NonFromClauseSubquery, Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
+use crate::translate::semantic::hir;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -44,12 +45,167 @@ use super::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
     order::{
-        btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
-        EqualityPrefixScope, OrderTarget,
+        btree_access_order_consumed, hir_btree_access_order_consumed,
+        subquery_intrinsic_order_consumed, ColumnTarget, EqualityPrefixScope, HirOrderSource,
+        OrderConsumption, OrderTarget,
     },
     AvailableIndexes,
 };
 use crate::translate::planner::TableMask;
+
+pub(super) trait AccessSource {
+    fn table(&self) -> &Table;
+    fn index_is_covering(&self, index: &Index) -> bool;
+}
+
+impl<T: AccessSource + ?Sized> AccessSource for &T {
+    fn table(&self) -> &Table {
+        (*self).table()
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        (*self).index_is_covering(index)
+    }
+}
+
+impl AccessSource for JoinedTable {
+    fn table(&self) -> &Table {
+        &self.table
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        JoinedTable::index_is_covering(self, index)
+    }
+}
+
+pub(crate) struct HirAccessSource<'a> {
+    planned: &'a HirPlannedSource,
+    definition: &'a hir::Source,
+}
+
+impl<'a> HirAccessSource<'a> {
+    pub(crate) fn new(planned: &'a HirPlannedSource, definition: &'a hir::Source) -> Self {
+        Self {
+            planned,
+            definition,
+        }
+    }
+}
+
+impl AccessSource for HirAccessSource<'_> {
+    fn table(&self) -> &Table {
+        &self.planned.table
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        self.planned.index_is_covering(self.definition, index)
+    }
+}
+
+pub(super) trait BtreeCandidateSource<I, O>: AccessSource {
+    fn order_consumed(
+        &self,
+        iter_dir: IterationDirection,
+        index: Option<&Index>,
+        constraint_refs: &[RangeConstraintRef],
+        order_target: &OrderTarget<I, O>,
+        schema: &Schema,
+    ) -> Result<OrderConsumption>;
+}
+
+pub(super) trait BtreeAccessSource<I, O>: BtreeCandidateSource<I, O> {
+    fn allows_alternative_access(&self) -> bool;
+    fn is_full_outer_join(&self) -> bool;
+    fn used_column_count(&self) -> usize;
+}
+
+impl BtreeCandidateSource<TableInternalId, *const ast::Expr> for JoinedTable {
+    fn order_consumed(
+        &self,
+        iter_dir: IterationDirection,
+        index: Option<&Index>,
+        constraint_refs: &[RangeConstraintRef],
+        order_target: &OrderTarget,
+        schema: &Schema,
+    ) -> Result<OrderConsumption> {
+        Ok(btree_access_order_consumed(
+            self,
+            iter_dir,
+            index,
+            constraint_refs,
+            order_target,
+            0,
+            schema,
+            EqualityPrefixScope::AnyEquality,
+        ))
+    }
+}
+
+impl BtreeAccessSource<TableInternalId, *const ast::Expr> for JoinedTable {
+    fn allows_alternative_access(&self) -> bool {
+        self.indexed.is_none()
+    }
+
+    fn is_full_outer_join(&self) -> bool {
+        self.join_info
+            .as_ref()
+            .is_some_and(|join_info| join_info.is_full_outer())
+    }
+
+    fn used_column_count(&self) -> usize {
+        self.table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(column_idx, _)| self.column_is_used(*column_idx))
+            .count()
+    }
+}
+
+impl<'a> BtreeCandidateSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a> {
+    fn order_consumed(
+        &self,
+        iter_dir: IterationDirection,
+        index: Option<&Index>,
+        constraint_refs: &[RangeConstraintRef],
+        order_target: &OrderTarget<hir::SourceId, &'a hir::Expr>,
+        schema: &Schema,
+    ) -> Result<OrderConsumption> {
+        hir_btree_access_order_consumed(
+            &HirOrderSource::new(self.planned, self.definition),
+            iter_dir,
+            index,
+            constraint_refs,
+            order_target,
+            0,
+            schema,
+            EqualityPrefixScope::AnyEquality,
+        )
+    }
+}
+
+impl<'a> BtreeAccessSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a> {
+    fn allows_alternative_access(&self) -> bool {
+        matches!(self.planned.indexed, hir::IndexHint::None)
+    }
+
+    fn is_full_outer_join(&self) -> bool {
+        self.planned
+            .join_info
+            .as_ref()
+            .is_some_and(|join_info| join_info.kind == hir::JoinKind::Full)
+    }
+
+    fn used_column_count(&self) -> usize {
+        self.planned
+            .table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(column_idx, _)| self.planned.col_used_mask.get(*column_idx))
+            .count()
+    }
+}
 
 #[derive(Debug, Clone)]
 /// Represents a way to access a table.
@@ -162,6 +318,7 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) index: Option<Arc<Index>>,
     pub(super) constraint_refs: SmallVec<[RangeConstraintRef; 2]>,
     pub(super) base_row_count: RowCountEstimate,
+    pub(super) partial_index_predicate_terms: SmallVec<[usize; 4]>,
     pub(super) cost: Cost,
 }
 
@@ -172,6 +329,7 @@ pub(super) struct ChosenInSeekCandidate {
     pub(super) constraint_idx: usize,
     pub(super) cost: Cost,
     pub(super) estimated_rows_per_outer_row: f64,
+    pub(super) partial_index_predicate_terms: SmallVec<[usize; 4]>,
 }
 
 /// Describes what a caller needs to read from a branch-local scan.
@@ -191,14 +349,13 @@ pub(super) enum BranchReadMode {
 #[allow(clippy::too_many_arguments)]
 /// Choose the best ordinary btree lookup candidate for one table under the
 /// current join-order prefix.
-pub(super) fn choose_best_btree_candidate(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+pub(super) fn choose_best_btree_candidate<C, I, O>(
+    rhs_source: &impl BtreeCandidateSource<I, O>,
+    rhs_constraints: &TableConstraints<C, I>,
     lhs_mask: &TableMask,
     rhs_table_idx: usize,
-    maybe_order_target: Option<&OrderTarget>,
+    maybe_order_target: Option<&OrderTarget<I, O>>,
     schema: &Schema,
-    available_indexes: &AvailableIndexes,
     analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
@@ -211,7 +368,7 @@ pub(super) fn choose_best_btree_candidate(
     let mut best_cost = if has_rowid_candidate {
         estimate_cost_for_scan_or_seek(
             None,
-            &[],
+            &rhs_constraints.constraints,
             &[],
             input_cardinality,
             base_row_count,
@@ -227,6 +384,7 @@ pub(super) fn choose_best_btree_candidate(
         index: None,
         constraint_refs: SmallVec::new(),
         base_row_count,
+        partial_index_predicate_terms: SmallVec::new(),
         cost: best_cost,
     };
     let mut best_adjusted_output = f64::MAX;
@@ -249,11 +407,11 @@ pub(super) fn choose_best_btree_candidate(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
+                covering: rhs_source.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
-                    rhs_table,
+                    rhs_source.table(),
                     params.rows_per_table_page,
                 ),
             },
@@ -273,29 +431,25 @@ pub(super) fn choose_best_btree_candidate(
                 // this specific access path can emit rows ordered after its seek
                 // key; final global ORDER BY validation is stricter and only
                 // skips globally constant prefixes.
-                let all_same_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Forwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                    EqualityPrefixScope::AnyEquality,
-                )
-                .consumed
+                let all_same_direction = rhs_source
+                    .order_consumed(
+                        IterationDirection::Forwards,
+                        candidate.index.as_deref(),
+                        &usable_constraint_refs,
+                        order_target,
+                        schema,
+                    )?
+                    .consumed
                     == order_target.columns.len();
-                let all_opposite_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Backwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                    EqualityPrefixScope::AnyEquality,
-                )
-                .consumed
+                let all_opposite_direction = rhs_source
+                    .order_consumed(
+                        IterationDirection::Backwards,
+                        candidate.index.as_deref(),
+                        &usable_constraint_refs,
+                        order_target,
+                        schema,
+                    )?
+                    .consumed
                     == order_target.columns.len();
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
@@ -320,7 +474,7 @@ pub(super) fn choose_best_btree_candidate(
             };
 
         let analyze_ctx = AnalyzeCtx {
-            rhs_table,
+            table_name: rhs_source.table().get_name(),
             index: candidate.index.as_ref(),
             stats: analyze_stats,
         };
@@ -328,24 +482,15 @@ pub(super) fn choose_best_btree_candidate(
         // values pass the index's WHERE clause. Discount the row count estimate
         // accordingly so the cost model recognizes the partial index as cheaper
         // than a full table scan.
-        let candidate_base_row_count = match candidate
-            .index
+        let candidate_base_row_count = candidate
+            .partial_index
             .as_ref()
-            .and_then(|idx| idx.where_clause.as_ref())
-        {
-            Some(where_expr) => {
-                let selectivity = super::constraints::estimate_partial_index_where_selectivity(
-                    where_expr.as_ref(),
-                    rhs_table,
-                    schema,
-                    available_indexes,
-                    params,
+            .map(|partial_index| {
+                RowCountEstimate::AnalyzeStats(
+                    (*base_row_count * partial_index.selectivity.clamp(1e-6, 1.0)).max(1.0),
                 )
-                .clamp(1e-6, 1.0);
-                RowCountEstimate::AnalyzeStats((*base_row_count * selectivity).max(1.0))
-            }
-            None => base_row_count,
-        };
+            })
+            .unwrap_or(base_row_count);
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
@@ -449,6 +594,12 @@ pub(super) fn choose_best_btree_candidate(
                 index: candidate.index.clone(),
                 constraint_refs: usable_constraint_refs,
                 base_row_count: candidate_base_row_count,
+                partial_index_predicate_terms: candidate
+                    .partial_index
+                    .as_ref()
+                    .map_or_else(SmallVec::new, |partial_index| {
+                        partial_index.predicate_terms.clone()
+                    }),
                 cost,
             };
         }
@@ -457,8 +608,8 @@ pub(super) fn choose_best_btree_candidate(
     Ok(Some(best_choice))
 }
 
-fn consumed_where_terms_from_constraint_refs(
-    constraints: &[Constraint],
+fn consumed_where_terms_from_constraint_refs<E>(
+    constraints: &[Constraint<E>],
     constraint_refs: &[RangeConstraintRef],
 ) -> Result<BitSet<usize>> {
     let mut consumed = BitSet::default();
@@ -478,18 +629,105 @@ fn consumed_where_terms_from_constraint_refs(
     Ok(consumed)
 }
 
-fn consume_partial_index_predicate_terms(
-    consumed: &mut BitSet<usize>,
-    index: &Index,
-    rhs_table: &JoinedTable,
-    where_clause: &[WhereTerm],
-) -> Result<()> {
-    let predicate_terms = partial_index_predicate_terms(index, rhs_table, where_clause)
-        .expect("selected partial index predicate must be implied by query");
-    for term_idx in predicate_terms {
-        consumed.set(term_idx)?;
+/// Turn a chosen B-tree candidate into the access method consumed by join
+/// planning. Candidate discovery is representation-specific; these physical
+/// row-count and consumed-predicate facts are not.
+pub(super) fn build_btree_access_method<E, S>(
+    source: &impl AccessSource,
+    constraints: &TableConstraints<E, S>,
+    chosen: ChosenBtreeCandidate,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<AccessMethod> {
+    let ChosenBtreeCandidate {
+        iter_dir,
+        index,
+        constraint_refs,
+        base_row_count,
+        partial_index_predicate_terms,
+        cost,
+    } = chosen;
+    let estimated_rows_per_outer_row = if constraint_refs.is_empty() {
+        *base_row_count
+    } else {
+        let index_info = match index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: source.index_is_covering(index),
+                column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    source.table(),
+                    params.rows_per_table_page,
+                ),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: true,
+                column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
+            },
+        };
+        let analyze_ctx = AnalyzeCtx {
+            table_name: source.table().get_name(),
+            index: index.as_ref(),
+            stats: analyze_stats,
+        };
+        estimate_rows_per_seek(
+            index_info,
+            &constraints.constraints,
+            &constraint_refs,
+            base_row_count,
+            Some(&analyze_ctx),
+        )
+    };
+    let mut consumed_where_terms =
+        consumed_where_terms_from_constraint_refs(&constraints.constraints, &constraint_refs)?;
+    for term_idx in partial_index_predicate_terms {
+        consumed_where_terms.set(term_idx)?;
     }
-    Ok(())
+    Ok(AccessMethod {
+        cost,
+        estimated_rows_per_outer_row,
+        consumed_where_terms,
+        params: AccessMethodParams::BTreeTable {
+            iter_dir,
+            index,
+            build_index: false,
+            constraint_refs: constraint_refs.into_vec(),
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Choose and build the best ordinary B-tree access method for one source.
+pub(super) fn choose_btree_access_method<C, I, O>(
+    source: &impl BtreeCandidateSource<I, O>,
+    constraints: &TableConstraints<C, I>,
+    lhs_mask: &TableMask,
+    source_position: usize,
+    order_target: Option<&OrderTarget<I, O>>,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<AccessMethod> {
+    let chosen = choose_best_btree_candidate(
+        source,
+        constraints,
+        lhs_mask,
+        source_position,
+        order_target,
+        schema,
+        analyze_stats,
+        input_cardinality,
+        base_row_count,
+        params,
+    )?
+    .expect("B-tree candidate selection always includes a scan candidate");
+
+    build_btree_access_method(source, constraints, chosen, analyze_stats, params)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -503,9 +741,9 @@ fn consume_partial_index_predicate_terms(
 /// Because of that execution shape, only rowid or the first column of an index
 /// can drive `InSeek`, and the comparison collation must match the chosen
 /// index's first-key collation.
-pub(super) fn choose_best_in_seek_candidate(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+pub(super) fn choose_best_in_seek_candidate<E, S>(
+    rhs_source: &impl AccessSource,
+    rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
@@ -513,9 +751,10 @@ pub(super) fn choose_best_in_seek_candidate(
     best_cost: Cost,
     read_mode: BranchReadMode,
 ) -> Result<Option<ChosenInSeekCandidate>> {
-    let Table::BTree(btree) = &rhs_table.table else {
+    let rhs_table = rhs_source.table();
+    let Table::BTree(btree) = rhs_table else {
         return Err(LimboError::InternalError(
-            "consider_in_seek_access_method called on non-BTree table".into(),
+            "IN-seek candidate selection called on non-BTree table".into(),
         ));
     };
 
@@ -534,7 +773,7 @@ pub(super) fn choose_best_in_seek_candidate(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: rowid_only || rhs_table.index_is_covering(index),
+                covering: rowid_only || rhs_source.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
@@ -577,13 +816,13 @@ pub(super) fn choose_best_in_seek_candidate(
             // IN cursor. Reject mismatches here so a BINARY `IN` comparison
             // cannot silently become `NOCASE`/`RTRIM` just because the index is.
             if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
-                let constrained_column = &rhs_table.table.columns()[col_pos];
+                let constrained_column = &rhs_table.columns()[col_pos];
                 let table_collation = constrained_column.collation();
                 let index_collation = index.columns[0].collation.unwrap_or_default();
                 if table_collation != index_collation {
                     continue;
                 }
-                let idx_aff = constrained_column.affinity_with_strict(rhs_table.table.is_strict());
+                let idx_aff = constrained_column.affinity_with_strict(rhs_table.is_strict());
                 if !constraint.satisfies_index_affinity(idx_aff) {
                     continue;
                 }
@@ -624,6 +863,12 @@ pub(super) fn choose_best_in_seek_candidate(
                 constraint_idx: constraint.where_clause_pos.0,
                 cost: in_cost,
                 estimated_rows_per_outer_row: (constraint.selectivity * base).max(1.0),
+                partial_index_predicate_terms: candidate
+                    .partial_index
+                    .as_ref()
+                    .map_or_else(SmallVec::new, |partial_index| {
+                        partial_index.predicate_terms.clone()
+                    }),
             });
         }
     }
@@ -631,38 +876,188 @@ pub(super) fn choose_best_in_seek_candidate(
     Ok(best_in_seek)
 }
 
-fn consider_in_seek_access_method(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+fn build_in_seek_access_method(chosen: ChosenInSeekCandidate) -> Result<AccessMethod> {
+    let mut consumed_where_terms: BitSet<usize> =
+        iter::once(chosen.constraint_idx).try_collect()?;
+    for term_idx in chosen.partial_index_predicate_terms {
+        consumed_where_terms.set(term_idx)?;
+    }
+    Ok(AccessMethod {
+        cost: chosen.cost,
+        estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
+        consumed_where_terms,
+        params: AccessMethodParams::InSeek {
+            index: chosen.index,
+            affinity: chosen.affinity,
+            where_term_idx: chosen.constraint_idx,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn choose_in_seek_access_method<E, S>(
+    source: &impl AccessSource,
+    constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     best_cost: Cost,
+    read_mode: BranchReadMode,
 ) -> Result<Option<AccessMethod>> {
     choose_best_in_seek_candidate(
-        rhs_table,
-        rhs_constraints,
+        source,
+        constraints,
         lhs_mask,
         input_cardinality,
         base_row_count,
         params,
         best_cost,
-        BranchReadMode::FullRow,
+        read_mode,
     )?
-    .map(|chosen| -> Result<AccessMethod> {
-        Ok(AccessMethod {
-            cost: chosen.cost,
-            estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
-            consumed_where_terms: iter::once(chosen.constraint_idx).try_collect()?,
-            params: AccessMethodParams::InSeek {
-                index: chosen.index,
-                affinity: chosen.affinity,
-                where_term_idx: chosen.constraint_idx,
-            },
-        })
-    })
+    .map(build_in_seek_access_method)
     .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn choose_single_btree_access_method<E, I, O>(
+    source: &impl BtreeAccessSource<I, O>,
+    constraints: &TableConstraints<E, I>,
+    lhs_mask: &TableMask,
+    source_position: usize,
+    order_target: Option<&OrderTarget<I, O>>,
+    ready_predicates: &[(usize, usize)],
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<AccessMethod> {
+    let mut best = choose_btree_access_method(
+        source,
+        constraints,
+        lhs_mask,
+        source_position,
+        order_target,
+        schema,
+        analyze_stats,
+        input_cardinality,
+        base_row_count,
+        params,
+    )?;
+    let AccessMethodParams::BTreeTable {
+        iter_dir: ordinary_iter_dir,
+        ..
+    } = &best.params
+    else {
+        unreachable!("ordinary B-tree selection returns BTreeTable access")
+    };
+    let ordinary_iter_dir = *ordinary_iter_dir;
+    let mut best_cost = cost_with_where_work(&best, ready_predicates, input_cardinality, params);
+
+    let uses_full_table_scan = matches!(
+        &best.params,
+        AccessMethodParams::BTreeTable {
+            index: None,
+            build_index: false,
+            constraint_refs,
+            ..
+        } if constraint_refs.is_empty()
+    );
+    if source.allows_alternative_access()
+        && uses_full_table_scan
+        && !lhs_mask.is_empty()
+        && !source.is_full_outer_join()
+    {
+        let constraint_refs = usable_constraints_for_lhs_mask(
+            &constraints.constraints,
+            &constraints.temporary_index_terms,
+            lhs_mask,
+            source_position,
+        );
+        if !constraint_refs.is_empty() {
+            let column_count = source.used_column_count();
+            let index_info = IndexInfo {
+                unique: false,
+                column_count,
+                covering: true,
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    column_count,
+                    source.table(),
+                    params.rows_per_table_page,
+                ),
+            };
+            let rows_per_seek = estimate_rows_per_seek(
+                index_info,
+                &constraints.constraints,
+                &constraint_refs,
+                base_row_count,
+                None,
+            );
+            let scan_cost = estimate_cost_for_scan_or_seek::<E>(
+                None,
+                &[],
+                &[],
+                1.0,
+                base_row_count,
+                false,
+                params,
+                None,
+            );
+            let build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
+            let seek_cost = Cost(
+                input_cardinality * params.cpu_cost_per_seek
+                    + input_cardinality * rows_per_seek * params.cpu_cost_per_row,
+            );
+            let temporary_index = AccessMethod {
+                cost: scan_cost + build_cost + seek_cost,
+                estimated_rows_per_outer_row: rows_per_seek,
+                consumed_where_terms: consumed_where_terms_from_constraint_refs(
+                    &constraints.constraints,
+                    &constraint_refs,
+                )?,
+                params: AccessMethodParams::BTreeTable {
+                    iter_dir: ordinary_iter_dir,
+                    index: None,
+                    build_index: true,
+                    constraint_refs: Vec::new(),
+                },
+            };
+            replace_if_cheaper(
+                &mut best,
+                &mut best_cost,
+                temporary_index,
+                ready_predicates,
+                input_cardinality,
+                params,
+            );
+        }
+    }
+
+    let has_rowid = source.table().btree().is_some_and(|btree| btree.has_rowid);
+    if source.allows_alternative_access() && has_rowid {
+        if let Some(in_seek) = choose_in_seek_access_method(
+            source,
+            constraints,
+            lhs_mask,
+            input_cardinality,
+            base_row_count,
+            params,
+            best_cost,
+            BranchReadMode::FullRow,
+        )? {
+            replace_if_cheaper(
+                &mut best,
+                &mut best_cost,
+                in_seek,
+                ready_predicates,
+                input_cardinality,
+                params,
+            );
+        }
+    }
+
+    Ok(best)
 }
 
 /// Add the cost of ready `WHERE` conditions.
@@ -770,7 +1165,7 @@ pub fn find_best_access_method_for_join_order(
             params,
         ),
         Table::RecursiveCteInput(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(
+            cost: estimate_cost_for_scan_or_seek::<ast::Expr>(
                 None,
                 &[],
                 &[],
@@ -806,201 +1201,25 @@ fn find_best_access_method_for_btree(
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
-    let best = choose_best_btree_candidate(
+    let mut best_access_method = choose_single_btree_access_method(
         rhs_table,
         rhs_constraints,
         lhs_mask,
         rhs_table_idx,
         maybe_order_target,
+        ready_where,
         schema,
-        available_indexes,
         analyze_stats,
         input_cardinality,
         base_row_count,
         params,
-    )?
-    .expect("btree candidate selection must always consider the rowid candidate");
-
-    let access_base_row_count = best.base_row_count;
-    let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
-        *access_base_row_count
-    } else {
-        let index_info = match best.index.as_ref() {
-            Some(index) => IndexInfo {
-                unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
-                column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
-            },
-            None => IndexInfo {
-                unique: true,
-                covering: true,
-                column_count: 1,
-                rows_per_leaf_page: params.rows_per_table_page,
-            },
-        };
-        let analyze_ctx = AnalyzeCtx {
-            rhs_table,
-            index: best.index.as_ref(),
-            stats: analyze_stats,
-        };
-        estimate_rows_per_seek(
-            index_info,
-            &rhs_constraints.constraints,
-            &best.constraint_refs,
-            access_base_row_count,
-            Some(&analyze_ctx),
-        )
-    };
-    let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
-        &rhs_constraints.constraints,
-        &best.constraint_refs,
     )?;
-    if let Some(index) = partial_index(best.index.as_ref()) {
-        consume_partial_index_predicate_terms(
-            &mut consumed_where_terms,
-            index,
-            rhs_table,
-            where_clause,
-        )?;
-    }
-    let mut best_access_method = AccessMethod {
-        cost: best.cost,
-        estimated_rows_per_outer_row,
-        consumed_where_terms,
-        params: AccessMethodParams::BTreeTable {
-            iter_dir: best.iter_dir,
-            index: best.index,
-            build_index: false,
-            constraint_refs: best.constraint_refs.into_vec(),
-        },
-    };
     let mut best_cost_with_filters =
         cost_with_where_work(&best_access_method, ready_where, input_cardinality, params);
 
-    let is_full_outer = rhs_table
-        .join_info
-        .as_ref()
-        .is_some_and(|join_info| join_info.is_full_outer());
-    let uses_full_table_scan = matches!(
-        &best_access_method.params,
-        AccessMethodParams::BTreeTable {
-            index: None,
-            build_index: false,
-            constraint_refs,
-            ..
-        } if constraint_refs.is_empty()
-    );
-    if rhs_table.indexed.is_none() && uses_full_table_scan && !lhs_mask.is_empty() && !is_full_outer
-    {
-        let constraint_refs = usable_constraints_for_lhs_mask(
-            &rhs_constraints.constraints,
-            &rhs_constraints.temporary_index_terms,
-            lhs_mask,
-            rhs_table_idx,
-        );
-        if !constraint_refs.is_empty() {
-            let column_count = rhs_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(column_idx, _)| rhs_table.column_is_used(*column_idx))
-                .count();
-            let index_info = IndexInfo {
-                unique: false,
-                column_count,
-                covering: true,
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    column_count,
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
-            };
-            let rows_per_seek = estimate_rows_per_seek(
-                index_info,
-                &rhs_constraints.constraints,
-                &constraint_refs,
-                base_row_count,
-                None,
-            );
-            let scan_cost = estimate_cost_for_scan_or_seek(
-                None,
-                &[],
-                &[],
-                1.0,
-                base_row_count,
-                false,
-                params,
-                None,
-            );
-            let build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
-            let seek_cost = Cost(
-                input_cardinality * params.cpu_cost_per_seek
-                    + input_cardinality * rows_per_seek * params.cpu_cost_per_row,
-            );
-            let cost = scan_cost + build_cost + seek_cost;
-            let temporary_index = AccessMethod {
-                cost,
-                estimated_rows_per_outer_row: rows_per_seek,
-                consumed_where_terms: consumed_where_terms_from_constraint_refs(
-                    &rhs_constraints.constraints,
-                    &constraint_refs,
-                )?,
-                params: AccessMethodParams::BTreeTable {
-                    iter_dir: best.iter_dir,
-                    index: None,
-                    build_index: true,
-                    constraint_refs: Vec::new(),
-                },
-            };
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                temporary_index,
-                ready_where,
-                input_cardinality,
-                params,
-            );
-        }
-    }
-
-    // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
-    // is specified — the user explicitly requested a specific index or no index.
+    // Multi-index scans still depend on parser expressions and TableReferences.
+    // Keep them outside the representation-neutral single-source selector.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
-        if let Some(in_seek_method) = consider_in_seek_access_method(
-            rhs_table,
-            rhs_constraints,
-            lhs_mask,
-            input_cardinality,
-            base_row_count,
-            params,
-            best_cost_with_filters,
-        )? {
-            let mut in_seek_method = in_seek_method;
-            if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
-                if let Some(index) = partial_index(index.as_ref()) {
-                    consume_partial_index_predicate_terms(
-                        &mut in_seek_method.consumed_where_terms,
-                        index,
-                        rhs_table,
-                        where_clause,
-                    )?;
-                }
-            }
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                in_seek_method,
-                ready_where,
-                input_cardinality,
-                params,
-            );
-        }
-
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table,
             where_clause,
@@ -1053,16 +1272,54 @@ fn find_best_access_method_for_btree(
     Ok(Some(best_access_method))
 }
 
-fn find_best_access_method_for_vtab(
+pub(super) fn find_best_access_method_for_vtab<E>(
     vtab: &VirtualTable,
-    constraints: &[Constraint],
+    constraints: &[Constraint<E>],
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order)?;
+    find_best_access_method_for_vtab_constraints(
+        vtab,
+        constraints,
+        vtab_constraints,
+        input_cardinality,
+        base_row_count,
+        params,
+    )
+}
 
+pub(super) fn find_best_hir_access_method_for_vtab<E>(
+    vtab: &VirtualTable,
+    constraints: &[Constraint<E>],
+    source_position: usize,
+    lhs_mask: &TableMask,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
+    let vtab_constraints =
+        convert_to_vtab_constraint_for_prefix(constraints, source_position, lhs_mask);
+    find_best_access_method_for_vtab_constraints(
+        vtab,
+        constraints,
+        vtab_constraints,
+        input_cardinality,
+        base_row_count,
+        params,
+    )
+}
+
+fn find_best_access_method_for_vtab_constraints<E>(
+    vtab: &VirtualTable,
+    constraints: &[Constraint<E>],
+    vtab_constraints: Vec<ConstraintInfo>,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
     // TODO: get proper order_by information to pass to the vtab.
     // maybe encode more info on t_ctx? we need: [col_idx , is_descending]
     let best_index_result = vtab.best_index(&vtab_constraints, &[]);
@@ -1098,7 +1355,7 @@ fn find_best_access_method_for_vtab(
             };
             Ok(Some(AccessMethod {
                 // TODO: Base cost on `IndexInfo::estimated_cost`.
-                cost: estimate_cost_for_scan_or_seek(
+                cost: estimate_cost_for_scan_or_seek::<E>(
                     None,
                     &[],
                     &[],
@@ -1559,7 +1816,7 @@ fn find_best_access_method_for_subquery(
     use super::constraints::ConstraintRef;
     let maybe_order_target = planning_context.maybe_order_target;
 
-    let coroutine_scan_cost = estimate_cost_for_scan_or_seek(
+    let coroutine_scan_cost = estimate_cost_for_scan_or_seek::<ast::Expr>(
         None,
         &[],
         &[],
@@ -1768,8 +2025,16 @@ fn find_best_access_method_for_subquery(
                 None,
             )
         };
-    let one_pass_scan_cost =
-        estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);
+    let one_pass_scan_cost = estimate_cost_for_scan_or_seek::<ast::Expr>(
+        None,
+        &[],
+        &[],
+        1.0,
+        base_row_count,
+        false,
+        params,
+        None,
+    );
     let append_build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
     let seek_setup_cost = if table_materialization_required || can_direct_materialize_index {
         // Both table-backed materialization and direct-index materialization avoid

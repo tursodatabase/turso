@@ -35,8 +35,30 @@ documents.
 4. Move INSERT, UPDATE, DELETE, and pseudo-sources.
 5. Move triggers and stored schema expressions.
 6. Validate every completed document.
-7. Switch the production entry point after coverage is complete.
-8. Delete `Bound*`, `TableReferences` conversion, and planner-era binding code.
+7. Feed resolved HIR into the existing plan, optimizer, and emitter pipeline.
+8. Switch the production entry point after coverage is complete.
+9. Delete `Bound*`, source-ID conversion, and planner-era binding code.
+
+## Planner handoff
+
+Keep the existing plan algorithms, optimizer, and emitter. Replace only work
+already completed by semantic analysis:
+
+- Build existing planning source records from resolved HIR sources.
+- Move SELECT plan expressions from parser AST to resolved HIR expressions.
+- Assemble existing SELECT plans from HIR without name lookup, star expansion,
+  alias or ordinal replacement, function lookup, or expression rewriting.
+- Switch SELECT preparation to HIR in one step; do not run both binders.
+- Remove the name-resolution half of `TableReferences`, keeping column usage,
+  join planning, index selection, and other physical planning data.
+
+Do not convert HIR expressions back into parser AST. That would discard
+resolved function, type, collation, and comparison choices, forcing later
+stages to repeat semantic work.
+
+HIR planned sources keep their document-local `SourceId` directly. They do not
+allocate a `TableInternalId` or maintain a compatibility map. IDs for
+planner-created runtime objects may remain separate.
 
 ## Current status
 
@@ -59,6 +81,21 @@ Deferred migration surfaces:
 |---|---|
 | Production entry point and lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Preparation can capture that catalog from the same schema inputs used to create the legacy resolver, but does not call the semantic entry point yet. Switching execution to HIR remains a later step; physical lowering is explicitly out of scope for now. |
 
+### Cutover deletion map
+
+SELECT has no remaining HIR planning guard. Its planner handoff does not use a
+resolver, `TableReferences`, parser-expression conversion, binding, or
+rewriting. Remaining parser types are frozen enums and literals already owned
+by HIR.
+
+| Legacy work | HIR replacement | Why still live |
+|---|---|---|
+| SELECT binding in `select.rs` | Semantic analyzer and HIR | Production preparation still builds the legacy plan. |
+| `expr/binding.rs` | `semantic/expr.rs` | The legacy emitter still consumes parser expressions. |
+| `TableReferences` name lookup | Semantic `Scope` and `SourceId` | Legacy SELECT and DML callers still use it. |
+| `TableReferences` physical facts | HIR planned sources and loops | The legacy emitter still uses its cursor and ordering metadata. |
+| Bind and rewrite passes | Closed, validated HIR | Production cutover has not happened. |
+
 Preserved binding restrictions, not HIR gaps:
 
 | Restriction | Matching old-path evidence |
@@ -79,8 +116,250 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 - `Func::AlterTable` is created by ALTER TABLE translation, not by a SELECT
   function call.
 
+### Non-lowering phase complete
+
+Validated HIR and HIR access planning now cover query roots, INSERT-owned
+queries, top-level UPDATE and DELETE, and ordered trigger commands.
+
+No legacy binding code is safely deletable before production cutover.
+`translate_inner` still enters the AST plan builders, and the current emitter
+still consumes parser expressions, `Plan`, and `TableReferences`.
+
+The next phase must replace that production handoff. Only then can we delete:
+
+- SELECT binding and rewriting in `select.rs`
+- DML binding and rewriting in `insert.rs`, `update.rs`, and `delete.rs`
+- `expr/binding.rs`
+- name-resolution state and methods from `TableReferences`
+- parser-expression fields retained solely by legacy plans
+
+This boundary must not be crossed by running HIR and legacy planning together,
+or by converting HIR expressions back into parser AST.
+
 Completed:
 
+- Trigger predicates and commands now have ordered HIR planner roots. SELECT
+  commands retain their `QueryId`; UPDATE and DELETE commands reuse resolved
+  target access planning without turning trigger OLD/NEW pseudo-sources into
+  physical scans.
+- Top-level DELETE now uses resolved HIR for target access selection. Its
+  predicate, index hint, column-use counts, and target `SourceId` flow directly
+  into the shared access planner without `TableReferences`, binding, rewriting,
+  or parser-expression conversion.
+- Top-level UPDATE now uses resolved HIR for target and `FROM` access selection.
+  The NEW-row pseudo-source remains semantic write state and never becomes a
+  physical scan source.
+- HIR planning now starts from the owned document rather than a caller-supplied
+  query ID. Query, DML, and trigger roots plan every reachable query once, while
+  documents without query work produce an empty query-plan list.
+- Parenthesized FROM groups now pass through complete HIR access planning.
+  Outer-join predicates owned by a group become ready only when the current
+  physical leaf completes that group, including nested and single-leaf groups;
+  they remain residual predicates rather than unsafe leaf access constraints.
+- HIR planner input now walks parenthesized FROM groups recursively. Physical
+  leaves stay flat for the existing join planner, while nested group ranges,
+  parent boundaries, join kinds, and outer-join predicate ownership remain
+  explicit without a fake group cursor or a copied join tree.
+- Greedy HIR join ordering now accepts those group boundaries. Constrained
+  groups wait for their left side, nested prerequisites cannot deadlock an
+  active parent group, and a started group finishes before planning continues
+  outside it. Access selection still operates on the same flat physical leaves.
+- HIR constraint and predicate masks now use one flat FROM layout instead of
+  searching only the top-level semantic FROM list. Group leaves map to their
+  physical positions, while nested RIGHT and FULL null extension stays local
+  to the parenthesized group that owns the join.
+- Temporary scope columns are now named and stored as expression bindings.
+  Parenthesized FROM-group names resolve directly to their inner HIR column or
+  merged-column expression, so the group source is only join structure and
+  never becomes a fake runtime column source.
+- Table-valued function calls now freeze hidden-column argument predicates in
+  HIR. NULL uses `IS NULL`; other arguments use ordinary resolved equality
+  semantics. HIR planning consumes those predicates with existing outer-join
+  ownership and virtual-table access selection, without parser-expression
+  rebinding.
+- Expression subqueries now participate in HIR query dependency planning.
+  Scalar, row, EXISTS, and IN subqueries are planned before their owning query
+  through the iterative HIR expression walker; their resolved expression shape
+  and comparison rules remain in the semantic document.
+- Recursive CTE seed and arm queries now plan before their owner. The outer
+  recursive source and each occurrence-local queue input retain `CteId`
+  directly; queue ordering, comparison collations, compound operators, and
+  LIMIT remain owned by HIR without a fake table identity or legacy recursive
+  plan.
+- HIR planning now resolves non-recursive CTE materialization into explicit
+  `PerReference`, `Shared`, or `Explicit` policy. Reference counting stops at
+  CTE-body boundaries, outer captures prevent sharing, and `NOT MATERIALIZED`
+  keeps the legacy behavior of allowing safe multi-reference sharing.
+- Non-recursive CTE sources now retain their `CteId`, body `QueryId`, and
+  materialization choice in HIR planning. The body is planned before each
+  referencing query block, and CTE scans reuse the resolved query-backed
+  constraint, cardinality, and cost path without synthetic legacy subquery
+  tables.
+- Derived-query scans now collect resolved binary and `IN` constraints through
+  the same HIR extractor as B-tree sources. They use child-query row estimates
+  for generic filter selectivity but cannot produce index or automatic-index
+  candidates.
+- One HIR join input now represents physical B-tree and derived-query sources
+  explicitly. Mixed joins use the same greedy ordering, connectivity,
+  cross-product, and predicate-work loop; derived scans compete using their
+  child row and cost estimates without a synthetic `FromClauseSubquery`.
+- Derived `FROM` sources now retain their child `QueryId` in the final source
+  loop. Query planning visits the child first, then uses its output cardinality
+  and cost with the existing coroutine-scan formula; no legacy
+  `FromClauseSubquery`, AST conversion, resolver, or `TableReferences` enters
+  this path.
+- Compound SELECT arms now receive HIR access plans while their final ORDER BY
+  remains query-level. Operators, arm IDs, ordering, and limits stay in the
+  owned semantic document instead of being copied into another query shape.
+- Ordinary SELECT and VALUES queries now have an owned HIR query-plan entry
+  point. The plan retains the semantic document and plans its blocks directly
+  from document-local query and source identities.
+- Query-block planning derives column-use counts from the owning resolved HIR
+  query. Callers no longer build or pass a separate usage summary.
+- Query-block planning now has one resolved-HIR entry point that owns planner
+  scratch construction. Source-less SELECT and VALUES blocks produce empty-loop
+  plans while retaining predicates, cardinality, and zero access cost.
+- Final HIR B-tree plans own their predicates after access selection, including
+  consumption state. Residual filters therefore survive planning instead of
+  remaining in mutable caller scratch state.
+- HIR planned sources no longer clone source names, aliases, or USING column
+  names into parser-era planner fields. The HIR document remains their owner;
+  physical join planning keeps only the resolved join kind.
+- Final HIR B-tree plans retain only selected loops, output cardinality, and
+  cost. Constraint arenas, candidate access methods, and dynamic-programming
+  join state stay local to planning and are dropped at the handoff boundary.
+- HIR planned sources no longer carry a placeholder legacy `Operation`.
+  Selected HIR access lives only on the final planned loop; parser-expression
+  sources retain their existing operation field through the shared source
+  type's default parameter.
+- Selected B-tree access methods now pass through one representation-generic
+  application path. Legacy AST and HIR planning share automatic-index
+  materialization, scan/seek/rowid/IN construction, and predicate-consumption
+  rules; only expression extraction differs.
+- Automatic-index construction now consumes a generic planned source. HIR
+  supplies its resolved source identity, physical table, and frozen column-use
+  mask directly; building the index no longer requires `JoinedTable`.
+- Seek construction now shares the existing direction, range, equality, and
+  NULL-boundary algorithm across parser and HIR expressions. HIR extracts seek
+  values and frozen comparison affinity directly from resolved predicates;
+  resolver and `TableReferences` are absent from that entry point.
+- Seek definitions, keys, and range constraints now accept either parser or
+  HIR expressions. The legacy plan keeps parser expressions through default
+  type parameters, while HIR planning can keep resolved expressions without
+  changing physical lowering.
+- HIR query-block B-tree planning now has one boundary that collects resolved
+  constraints, derives ANALYZE row estimates, owns the access-method arena, and
+  returns the complete `JoinN`. Callers no longer assemble those planning steps
+  themselves, and the boundary uses no AST, resolver, or `TableReferences`.
+- Greedy HIR B-tree planning now builds a complete left-deep `JoinN`. It uses
+  the existing ordering restrictions, connected-source preference,
+  cross-product penalty, cardinality formula, and access-method arena without
+  converting resolved expressions back to parser expressions.
+- HIR B-tree join-step selection now accepts the mask of sources already
+  joined. Later sources can therefore use resolved join constraints for index
+  seeks and automatic indexes; complete HIR join planning supplies an empty
+  left-hand side for its chosen starting source.
+- Greedy HIR planning selects the starting source and every ordinary B-tree
+  access method through one complete-plan entry point. The temporary public
+  first-step scaffold has been removed.
+- Ready-predicate masks, loop ownership, and residual expression work now flow
+  through one representation-neutral join helper. HIR derives the inputs from
+  resolved source dependencies and its iterative expression walker; only the
+  legacy hash-join metadata still depends on parser expressions.
+- Ordinary indexes, automatic temporary indexes, and `IN` seeks now compete in
+  one source-generic B-tree selector. The legacy wrapper retains only AST-based
+  multi-index scans; HIR uses the same single-source cost and replacement logic.
+- `IN`-seek selection now returns the final planner `AccessMethod` through one
+  expression-representation-neutral entry point. Legacy and HIR paths share
+  consumed predicates, affinity, index identity, row estimates, and cost.
+- Ordinary B-tree access selection now has one source-generic entry point that
+  both chooses the candidate and builds its planner `AccessMethod`. Legacy and
+  HIR callers no longer need representation-specific glue between those steps.
+- Chosen B-tree candidates now become planner access methods through one
+  expression-representation-neutral builder. Legacy and HIR constraints share
+  covering, rows-per-seek, consumed-predicate, direction, and index facts.
+- Partial-index candidates now retain the query predicate terms that proved
+  them usable. Ordinary B-tree and `IN` access selection consume those frozen
+  term positions instead of rebinding and rewriting the schema predicate after
+  choosing an index.
+- B-tree candidate scoring now runs one loop for legacy and HIR constraints.
+  Source-specific order matching sits behind a small source trait; HIR keeps
+  resolved source IDs and borrowed expressions through index choice.
+- HIR expressions now share one iterative frame traversal for preorder walks
+  and postorder folds. Partial-index selectivity uses the fold directly instead
+  of maintaining its own traversal tasks and result stack.
+- Partial-index candidates now carry their estimated stored-row fraction.
+  Legacy collection runs its existing bound-AST estimator once; HIR collection
+  applies the same formulas iteratively to the frozen resolved predicate.
+  Repeated candidate scoring no longer binds partial-index expressions or
+  needs `AvailableIndexes` for this estimate.
+- B-tree order matching now shares one source-generic algorithm across legacy
+  and HIR planning. HIR compares computed order terms against frozen resolved
+  index expressions, while preserving the existing equality-prefix,
+  collation, direction, NULL-order, custom-type, and rowid rules without AST
+  conversion or adapter allocation.
+- HIR ORDER BY terms now build planner order targets directly from resolved
+  source, output, collation, direction, and NULL-order facts. Output references
+  are followed inside the frozen document and computed expressions stay
+  borrowed; planning performs no name lookup, catalog lookup, AST conversion,
+  or expression clone.
+- Order-target storage is generic over source identity and expression
+  representation. The legacy planner keeps its existing table IDs and AST
+  pointers, while HIR can borrow resolved expressions keyed by `SourceId`
+  without cloning or converting them back to parser nodes.
+- Base row-count estimation now consumes a physical `Table` instead of a
+  parser-era `JoinedTable`. HIR query-block sources therefore receive the same
+  ANALYZE statistics and subquery fallbacks before join scoring, without a
+  compatibility source or separate estimate implementation.
+- Whole-block HIR sources and constraints now enter the shared greedy
+  starting-source selector directly. The selector reads frozen source
+  definitions lazily, allocates no compatibility source vector, and applies
+  HIR RIGHT/FULL ordering restrictions before scoring.
+- The HIR plan context now collects constraints for every query-block source
+  from the already assembled HIR sources and predicates. Whole-block planning
+  no longer needs callers to reconstruct the per-source constraint loop.
+- `IN`-seek access selection now consumes the shared borrowed access-source
+  view. HIR supplies its planned source plus frozen definition, so rowid/index
+  choice, collation, affinity, covering, and cost rules remain one algorithm.
+- Greedy starting-source scoring and directed indexed-seek benefits now consume
+  generic constraints and an exact-size iterator of borrowed source views.
+  HIR can run the same loop without building an adapter vector.
+- Greedy join ordering now consumes the same `JoinOrderingRestrictions` used
+  by exhaustive legacy and HIR planning. Starting-source eligibility,
+  indexed-seek benefits, and later-source eligibility no longer rebuild a
+  separate LEFT-only dependency map.
+- Indexed-seek scoring consumes one borrowed source view for its physical
+  table and covering-index decision. Legacy sources and HIR sources therefore
+  use the same scoring call without per-call callbacks; HIR covering reads its
+  frozen source definition.
+- Covering-index required-column rules are shared by legacy and HIR planned
+  sources. HIR expression-key matching reads frozen resolved index expressions;
+  output, grouping, HAVING, and ORDER BY usage is registered directly from
+  resolved source and column identities. Parser-expression matching remains
+  only as a temporary legacy wrapper.
+- Filter multipliers, self-filter selectivity, and rows-per-seek costing now
+  consume generic constraint records. AST and HIR constraints therefore use
+  the same formulas rather than parallel cost implementations.
+- Index seek-benefit costing now consumes a physical table, generic
+  constraints, and a covering-index decision. Index page-width and ANALYZE
+  lookups no longer require `JoinedTable`; the legacy path supplies only a
+  temporary covering-index adapter.
+- Legacy and HIR join planning now share one builder for CROSS and outer-join
+  ordering restrictions. Preserved HIR RIGHT JOIN is constrained directly;
+  the HIR path does not need the parser-era source swap.
+- Query-block planning input now comes directly from HIR. It preserves lexical
+  source order and exact join kinds, splits resolved ON and WHERE conjunctions,
+  and builds USING/NATURAL equality predicates from frozen column references
+  and comparison rules without resolver, `TableReferences`, or parser-expression
+  conversion.
+- HIR planned sources retain `SourceId`, resolved index hints, HIR expressions,
+  and string join names. Their construction no longer depends on
+  `ProgramBuilder`, planner table-ID allocation, or parser index-hint nodes.
+- HIR constraint collection consumes `HirPlannedSource` and the complete index
+  metadata frozen on its HIR source. It no longer accepts `JoinedTable`,
+  `AvailableIndexes`, or a separate source ID; existing candidate,
+  expression-index, partial-index, selectivity, and automatic-index rules are
+  shared with the legacy planner where they remain physical planning work.
 - SELECT B-tree sources freeze every resolved ordinary, expression, and
   partial index in catalog order. Expression keys and predicates close over
   the exact `SourceId`; complete coverage lets HIR planning avoid rebinding

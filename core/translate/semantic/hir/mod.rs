@@ -23,6 +23,7 @@ use crate::{
     translate::collate::CollationSeq,
 };
 
+pub(crate) use dependencies::ColumnUsage;
 pub use expr::*;
 pub use query::*;
 pub use root::*;

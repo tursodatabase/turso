@@ -1748,6 +1748,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         let lhs = take_scalar_operand(lhs)?;
         let rhs = take_scalar_operand(rhs)?;
+        self.build_scalar_binary_expr(lhs, operator, rhs)
+    }
+
+    pub(super) fn build_scalar_binary_expr(
+        &mut self,
+        lhs: ResolvedScopeExpr,
+        operator: ast::Operator,
+        rhs: ResolvedScopeExpr,
+    ) -> Result<ResolvedScopeExpr> {
         let custom = self.resolve_custom_binary_operator(operator, &lhs, &rhs)?;
         let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
         let array_concat = operator == ast::Operator::Concat

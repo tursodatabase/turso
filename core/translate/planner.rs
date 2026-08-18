@@ -7,7 +7,7 @@ use super::{
     plan::{
         Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        Plan, PredicateExpr, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -15,10 +15,11 @@ use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_vector_size, BindingBehavior,
+        WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
+    semantic::hir::{self, HirDocument},
 };
 use crate::{
     ast::Limit,
@@ -2205,7 +2206,7 @@ pub fn parse_where(
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
-        break_predicate_at_and_boundaries(where_expr, out_where_clause);
+        where_expr.append_conjuncts(out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
             bind_and_rewrite_expr(
                 &mut expr.expr,
@@ -2228,7 +2229,7 @@ pub fn parse_where(
             ) {
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                term.expr.append_conjuncts(&mut new_terms);
                 // Preserve from_outer_join from the original term
                 for new_term in new_terms.iter_mut() {
                     new_term.from_outer_join = term.from_outer_join;
@@ -2423,6 +2424,71 @@ pub fn table_mask_from_expr(
         Ok(WalkControl::Continue)
     })?;
 
+    Ok(mask)
+}
+
+/// Source positions and outer-join facts needed by HIR constraint planning.
+pub(crate) trait HirFromScope {
+    fn source_position(&self, source: hir::SourceId) -> Option<usize>;
+    fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool;
+    fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool;
+}
+
+impl HirFromScope for hir::From {
+    fn source_position(&self, source: hir::SourceId) -> Option<usize> {
+        hir::From::source_position(self, source)
+    }
+
+    fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        hir::From::outer_join_may_null_extend(self, source)
+    }
+
+    fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        hir::From::full_join_may_null_extend(self, source)
+    }
+}
+
+pub(crate) fn table_mask_from_hir_scope(
+    document: &HirDocument,
+    from: &impl HirFromScope,
+    expression: &hir::Expr,
+) -> Result<TableMask> {
+    table_mask_from_hir_positions(document, expression, |source| from.source_position(source))
+}
+
+/// Return direct FROM positions for tests and parser-shaped HIR callers.
+/// Sources captured from an outer query are absent from the local mask.
+#[cfg(test)]
+pub(crate) fn table_mask_from_hir_expr(
+    document: &HirDocument,
+    from: Option<&hir::From>,
+    expression: &hir::Expr,
+) -> Result<TableMask> {
+    table_mask_from_hir_positions(document, expression, |source| {
+        from.and_then(|from| from.source_position(source))
+    })
+}
+
+fn table_mask_from_hir_positions(
+    document: &HirDocument,
+    expression: &hir::Expr,
+    position: impl Fn(hir::SourceId) -> Option<usize>,
+) -> Result<TableMask> {
+    let mut mask = TableMask::default();
+    let mut allocation_error = None;
+
+    document.visit_expr_sources(expression, &mut |source| {
+        let Some(position) = position(source) else {
+            return;
+        };
+        if allocation_error.is_none() {
+            allocation_error = mask.set(position).err();
+        }
+    });
+
+    if let Some(error) = allocation_error {
+        return Err(error.into());
+    }
     Ok(mask)
 }
 
@@ -2628,7 +2694,7 @@ fn parse_join(
         match constraint {
             ast::JoinConstraint::On(ref expr) => {
                 let start_idx = out_where_clause.len();
-                break_predicate_at_and_boundaries(expr, out_where_clause);
+                expr.append_conjuncts(out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
                     predicate.from_outer_join = if outer {
                         Some(table_references.joined_tables().last().unwrap().internal_id)
@@ -2803,26 +2869,6 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
         _ => None,
     }
 }
-pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
-    predicate: &Expr,
-    out_predicates: &mut Vec<T>,
-) {
-    // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
-    // This is semantically equivalent since single-element Parenthesized is purely
-    // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
-    // left as-is by unwrap_parens.
-    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
-    match predicate {
-        Expr::Binary(left, ast::Operator::And, right) => {
-            break_predicate_at_and_boundaries(left, out_predicates);
-            break_predicate_at_and_boundaries(right, out_predicates);
-        }
-        _ => {
-            out_predicates.push(predicate.clone().into());
-        }
-    }
-}
-
 pub fn parse_row_id<F>(
     column_name: &str,
     table_id: TableInternalId,
