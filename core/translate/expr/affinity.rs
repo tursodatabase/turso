@@ -174,23 +174,7 @@ pub(crate) fn expr_data_type(
     }
 }
 
-/// Returns the [Affinity] to be used to compare two [Expr] between themselves.
-pub fn comparison_affinity_exprs(
-    lhs_expr: &ast::Expr,
-    rhs_expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> Affinity {
-    comparison_affinity_expr(
-        rhs_expr,
-        get_expr_affinity(lhs_expr, referenced_tables, resolver),
-        referenced_tables,
-        resolver,
-    )
-}
-
-/// Returns the [Affinity] to be used to compare two affinities.
-pub(super) fn comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
+fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
     if lhs != Affinity::None && rhs != Affinity::None {
         // Both sides have affinity - use numeric if either is numeric
         if lhs.is_numeric() || rhs.is_numeric() {
@@ -216,14 +200,44 @@ pub(super) fn comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
     }
 }
 
-/// Returns the [Affinity] to be used to compare an [Expr] with something else.
-pub(crate) fn comparison_affinity_expr(
-    expr: &ast::Expr,
-    other: Affinity,
+/// Returns the [Affinity] to be used to compare two terms.
+pub fn comparison_affinity(
+    lhs: impl HasComparableAffinity,
+    rhs: impl HasComparableAffinity,
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Affinity {
-    comparison_affinity(other, get_expr_affinity(expr, referenced_tables, resolver))
+    let lhs = lhs.comparison_affinity(referenced_tables, resolver);
+    let rhs = rhs.comparison_affinity(referenced_tables, resolver);
+    do_comparison_affinity(lhs, rhs)
+}
+
+trait HasComparableAffinity {
+    fn comparison_affinity(
+        &self,
+        referenced_tables: Option<&TableReferences>,
+        resolver: Option<&Resolver>,
+    ) -> Affinity;
+}
+
+impl HasComparableAffinity for &ast::Expr {
+    fn comparison_affinity(
+        &self,
+        referenced_tables: Option<&TableReferences>,
+        resolver: Option<&Resolver>,
+    ) -> Affinity {
+        get_expr_affinity(self, referenced_tables, resolver)
+    }
+}
+
+impl HasComparableAffinity for Affinity {
+    fn comparison_affinity(
+        &self,
+        _referenced_tables: Option<&TableReferences>,
+        _resolver: Option<&Resolver>,
+    ) -> Affinity {
+        *self
+    }
 }
 
 #[cfg(test)]
@@ -233,7 +247,7 @@ mod tests {
     #[test]
     fn both_sides_have_affinity_numeric_wins() {
         assert_eq!(
-            comparison_affinity(Affinity::Real, Affinity::Text,),
+            do_comparison_affinity(Affinity::Real, Affinity::Text,),
             Affinity::Numeric
         );
     }
@@ -241,7 +255,7 @@ mod tests {
     #[test]
     fn both_sides_have_affinity_neither_numeric_is_blob() {
         assert_eq!(
-            comparison_affinity(Affinity::Text, Affinity::Blob,),
+            do_comparison_affinity(Affinity::Text, Affinity::Blob,),
             Affinity::Blob
         );
     }
@@ -249,7 +263,7 @@ mod tests {
     #[test]
     fn only_lhs_has_real_affinity_collapses_to_numeric() {
         assert_eq!(
-            comparison_affinity(Affinity::Real, Affinity::None,),
+            do_comparison_affinity(Affinity::Real, Affinity::None,),
             Affinity::Numeric
         );
     }
@@ -257,7 +271,7 @@ mod tests {
     #[test]
     fn only_lhs_has_integer_affinity_collapses_to_numeric() {
         assert_eq!(
-            comparison_affinity(Affinity::Integer, Affinity::None,),
+            do_comparison_affinity(Affinity::Integer, Affinity::None,),
             Affinity::Numeric
         );
     }
@@ -265,7 +279,7 @@ mod tests {
     #[test]
     fn only_rhs_has_real_affinity_collapses_to_numeric() {
         assert_eq!(
-            comparison_affinity(Affinity::None, Affinity::Real,),
+            do_comparison_affinity(Affinity::None, Affinity::Real,),
             Affinity::Numeric
         );
     }
@@ -273,7 +287,7 @@ mod tests {
     #[test]
     fn only_lhs_has_text_affinity_is_preserved() {
         assert_eq!(
-            comparison_affinity(Affinity::Text, Affinity::None,),
+            do_comparison_affinity(Affinity::Text, Affinity::None,),
             Affinity::Text
         );
     }
@@ -281,7 +295,7 @@ mod tests {
     #[test]
     fn only_rhs_has_text_affinity_is_preserved() {
         assert_eq!(
-            comparison_affinity(Affinity::None, Affinity::Text,),
+            do_comparison_affinity(Affinity::None, Affinity::Text,),
             Affinity::Text
         );
     }
@@ -289,7 +303,7 @@ mod tests {
     #[test]
     fn neither_side_has_affinity_is_blob() {
         assert_eq!(
-            comparison_affinity(Affinity::None, Affinity::None,),
+            do_comparison_affinity(Affinity::None, Affinity::None,),
             Affinity::Blob
         );
     }

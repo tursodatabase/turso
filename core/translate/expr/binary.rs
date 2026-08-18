@@ -419,7 +419,7 @@ pub(super) fn row_component_affinity_collation(
     let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?.unwrap_or(lhs_expr);
     let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
     Ok((
-        comparison_affinity_exprs(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver),
+        comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver),
         comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver)?,
     ))
 }
@@ -482,7 +482,7 @@ pub(super) fn emit_binary_insn(
 ) -> Result<()> {
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity_exprs(lhs_expr, rhs_expr, referenced_tables, resolver);
+        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
     }
     let is_array_cmp =
         expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables);
@@ -897,7 +897,7 @@ pub(super) fn emit_binary_condition_insn(
 ) -> Result<()> {
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity_exprs(lhs_expr, rhs_expr, referenced_tables, resolver);
+        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
     }
 
     let opposite_op = match op {
