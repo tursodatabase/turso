@@ -949,8 +949,7 @@ impl Value {
         }
         Ok(match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
-            // Historically called NONE, but it's the same as BLOB
-            Affinity::Blob => {
+            Affinity::Blob | Affinity::None => {
                 if let Value::Blob(blob) = self {
                     return Value::from_slice(blob);
                 }
