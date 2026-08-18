@@ -198,6 +198,37 @@ fn prepare_window_subquery(
         )?;
     }
 
+    // Final sweep: every lag/lead window function must have its arguments
+    // rewritten to buffer-column references before the runtime reads
+    // `func.current_expr()`. The result-column/ORDER BY pass above only
+    // rewrites an entry when its SQL occurrence is walked; a repeated
+    // `LAG(SUM(x))` can leave a SECOND distinct entry unrewritten (its
+    // `rewritten` stays None and arg[0] remains the raw `SUM(x)`), which
+    // panics at emit time with "lag/lead arg[0] must be a buffer column
+    // reference" (#8336). Catch any stragglers here.
+    for func in current_window.functions.iter_mut() {
+        if func.rewritten.is_some() {
+            continue;
+        }
+        let is_lag_lead = matches!(
+            func.func,
+            AccumulatorFunc::Window(WindowFunc::Lag | WindowFunc::Lead)
+        );
+        if !is_lag_lead {
+            continue;
+        }
+        let mut expr = func.original_expr.clone();
+        if let Expr::FunctionCall { args, .. } = &mut expr {
+            for arg in args.iter_mut() {
+                rewrite_expr_as_subquery_column(arg, &mut ctx, true);
+            }
+        }
+        func.rewritten = Some(RewrittenWindowCall {
+            expr,
+            filter_expr: None,
+        });
+    }
+
     // When there is no ORDER BY or PARTITION BY clause, the window function takes zero arguments,
     // and no other columns are selected (e.g., "SELECT count() OVER () FROM products"),
     // `subquery_result_columns` may be empty. Add a constant expression to keep the query valid.
@@ -332,7 +363,27 @@ fn rewrite_terminal_expr(
                         // Window function tied to the current window: rewrite its
                         // children to reference the subquery, not the call itself.
                         if let Some(rewritten) = &window_function.rewritten {
+                            // A later SQL occurrence of the same window call
+                            // reuses the first occurrence's cached rewrite.
+                            // The runtime reads `func.current_expr()` from the
+                            // STORED WindowFunction, so the reused form must
+                            // also have its lag/lead args rewritten to the
+                            // subquery buffer columns the first occurrence
+                            // created. Without this, a repeated `LAG(SUM(x))`
+                            // leaves arg[0] as the raw `SUM(x)` FunctionCall
+                            // and the runtime hits `unreachable!` (#8336).
                             *expr = rewritten.expr.clone();
+                            let mut rewritten_args = rewritten.expr.clone();
+                            if let Expr::FunctionCall { args, .. } = &mut rewritten_args {
+                                for arg in args.iter_mut() {
+                                    rewrite_expr_as_subquery_column(arg, ctx, true);
+                                }
+                            }
+                            window_function.rewritten =
+                                Some(RewrittenWindowCall {
+                                    expr: rewritten_args,
+                                    filter_expr: rewritten.filter_expr.clone(),
+                                });
                         } else {
                             let window_name = current_window
                                 .name

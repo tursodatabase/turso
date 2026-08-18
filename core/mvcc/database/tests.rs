@@ -20606,3 +20606,37 @@ fn correlated_subquery_outer_rowid_from_covering_index_scan() {
         .collect();
     assert_eq!(vals, vec![(1, 2), (2, 1)]);
 }
+
+#[test]
+fn repeated_lag_sum_in_window_does_not_panic() {
+    // Regression for #8336: a query with an aggregate window expression and
+    // two identical `LAG(SUM(x))` expressions used to panic during window
+    // planner rewriting ("lag/lead arg[0] must be a buffer column reference").
+    // The second distinct LAG entry was never rewritten to a buffer-column
+    // reference. Must match SQLite's result.
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (d TEXT, x INT)").unwrap();
+    conn.execute("INSERT INTO t VALUES ('2026-01-01',1),('2026-02-02',2),('2026-03-03',3)")
+        .unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT strftime('%Y-%m', d) AS k, \
+                AVG(SUM(x)) OVER (ORDER BY strftime('%Y-%m', d)) AS running_avg, \
+                100.0 * (SUM(x) - LAG(SUM(x)) OVER (ORDER BY strftime('%Y-%m', d))) \
+                     / LAG(SUM(x)) OVER (ORDER BY strftime('%Y-%m', d)) AS pct_change \
+         FROM t GROUP BY 1",
+    );
+    // SQLite: ('2026-01', 1.0, None), ('2026-02', 1.5, 100.0), ('2026-03', 2.0, 50.0)
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].to_string(), "2026-01");
+    assert_eq!(rows[0][1].to_string(), "1.0");
+    assert_eq!(rows[1][0].to_string(), "2026-02");
+    assert_eq!(rows[1][1].to_string(), "1.5");
+    assert_eq!(rows[1][2].to_string(), "100.0");
+    assert_eq!(rows[2][0].to_string(), "2026-03");
+    assert_eq!(rows[2][1].to_string(), "2.0");
+    assert_eq!(rows[2][2].to_string(), "50.0");
+}
