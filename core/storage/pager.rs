@@ -62,24 +62,31 @@ use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 
-/// Readahead window ceiling, in pages, out of the box. Zero means off.
+/// Readahead window ceiling, in pages, out of the box.
 ///
-/// Off by default because on an ordinary file it has not been shown to make
-/// queries faster. Measured over the whole TPC-H suite against the 1.2 GB
-/// database, with the page cache dropped before every run, readahead was
-/// within noise of no readahead (-0.5% total). The reason is that the kernel
-/// is already doing this: Linux read-ahead on that device is 8 MiB, sixty-four
-/// times the window here, so by the time the database asks for the next page
-/// the kernel has long since fetched it. Readahead removes syscalls -- 195,206
-/// to 8,827 on a full LINEITEM scan -- but on that path the syscalls were not
-/// what the query was waiting for.
+/// 32 pages is 128 KiB at the usual 4 KiB page size, which is also Linux's
+/// default `read_ahead_kb`.
 ///
-/// It is worth turning on when nothing underneath is reading ahead for you and
-/// a request costs much more than the bytes it moves: O_DIRECT, network block
-/// storage, a remote page server, an object store. `PRAGMA prefetch_pages = 32`
-/// is a reasonable starting point there (128 KiB at a 4 KiB page size, which is
-/// also Linux's own default read-ahead size).
-pub const DEFAULT_READAHEAD_WINDOW: u32 = 0;
+/// Whether this is worth anything depends entirely on whether something
+/// underneath is already reading ahead for us, and the two backends differ:
+///
+/// * `UringIO` sets `O_DIRECT` on the database file, so reads bypass the page
+///   cache and nothing prefetches. Measured on the 1.2 GB TPC-H database, a
+///   full LINEITEM scan goes 20.7s -> 10.5s and a scan with a filter goes
+///   12.1s -> 2.9s. This is what readahead is for.
+/// * `UnixIO` ignores the `direct` flag, so reads are buffered and Linux is
+///   already reading ahead -- 8 MiB on the machine this was measured on,
+///   sixty-four times this window. There the whole TPC-H suite came out
+///   within noise (-0.5%), because by the time we ask for the next page the
+///   kernel has long since fetched it.
+///
+/// So: a large win where it matters, and nothing measurable where it does
+/// not. On by default for that reason. Readahead removes syscalls either way
+/// -- 195,206 to 8,827 on a full LINEITEM scan -- but only in the first case
+/// were the syscalls what the query was waiting for.
+///
+/// Set `PRAGMA prefetch_pages = 0` to turn it off.
+pub const DEFAULT_READAHEAD_WINDOW: u32 = 32;
 
 /// Hard ceiling on `PRAGMA prefetch_pages`, so one connection cannot pin an
 /// unbounded amount of memory in prefetched pages.

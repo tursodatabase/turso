@@ -498,10 +498,8 @@ fn prefetch_pages_round_trips() {
     let rows = limbo_exec_rows(&conn, "PRAGMA prefetch_pages");
     assert_eq!(
         rows[0][0],
-        rusqlite::types::Value::Integer(0),
-        "readahead is off out of the box: on an ordinary file the kernel is \
-         already reading ahead, and this has not been shown to make queries \
-         faster there"
+        rusqlite::types::Value::Integer(32),
+        "readahead is on out of the box"
     );
 
     for pages in [0u32, 1, 16, 512] {
