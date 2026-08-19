@@ -629,6 +629,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      # Required so nuget.org's trusted publishing policy can validate this
+      # workflow's OIDC token and mint a short-lived API key.
+      id-token: write
 
     steps:
       - name: Install dotnet SDK
@@ -642,9 +645,21 @@ jobs:
           name: nuget-packages
           path: nuget-packages
 
+      # Trusted publishing: swap the GitHub OIDC token for a NuGet API key that
+      # is only valid for an hour, so this must stay directly before the push.
+      # https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing
+      - name: NuGet login
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          # The individual nuget.org account the policy is registered under, not
+          # the package owner. Packages land under whichever owner the policy's
+          # "Package owner" field names (Turso), not under this account.
+          user: pjenberg
+
       # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
       - name: Publish to nuget
         run: |
           for package in nuget-packages/*.nupkg; do
-            dotnet nuget push "$package" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+            dotnet nuget push "$package" --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
           done
