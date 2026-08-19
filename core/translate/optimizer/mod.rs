@@ -24,12 +24,14 @@ use crate::{
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
-            access_method::{AccessMethod, AccessMethodParams},
+            access_method::{AccessMethod, AccessMethodParams, BtreeAccessShapeMemo},
             constraints::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
             },
             cost::RowCountEstimate,
-            multi_index::MultiIndexBranchAccessParams,
+            multi_index::{
+                MultiIndexAndTermsMemo, MultiIndexBranchAccessParams, MultiIndexOrTermsMemo,
+            },
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
@@ -58,7 +60,7 @@ use constraints::{
 use cost::Cost;
 use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
-    JoinN, JoinPlanningContext,
+    JoinN, JoinPlanningContext, PrefixWhereMemo,
 };
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
@@ -2457,9 +2459,17 @@ fn find_table_access_plan(
         &mut constraints_per_table,
     )?;
 
+    let and_terms_memo = MultiIndexAndTermsMemo::new(table_references.joined_tables().len());
+    let or_terms_memo = MultiIndexOrTermsMemo::new(table_references.joined_tables().len());
+    let btree_access_memo = BtreeAccessShapeMemo::new(table_references.joined_tables().len());
+    let prefix_where_memo = PrefixWhereMemo::new(table_references.joined_tables().len());
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
+        and_terms_memo: &and_terms_memo,
+        or_terms_memo: &or_terms_memo,
+        btree_access_memo: &btree_access_memo,
+        prefix_where_memo: &prefix_where_memo,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
