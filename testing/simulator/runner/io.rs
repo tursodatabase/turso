@@ -176,3 +176,95 @@ impl IO for SimulatorIO {
         self.rng.borrow_mut().fill_bytes(dest);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use turso_core::{Connection, Database, LimboError, OpenOptions, SqliteDialect};
+
+    use super::SimulatorIO;
+    use crate::runner::{FAULT_ERROR_MSG, SimIO, cli::IoBackend};
+
+    fn query_ids(conn: &Arc<Connection>) -> Result<Vec<i64>> {
+        let mut ids = Vec::new();
+        let mut stmt = conn.prepare("SELECT id FROM t ORDER BY id")?;
+        stmt.run_with_row_callback(|row| {
+            ids.push(row.get::<i64>(0).expect("id must be an integer"));
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    #[test]
+    fn explicit_commit_immediate_pwritev_error_does_not_resurrect_rows() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("commit-pwritev-error.db");
+        let db_path = db_path.to_str().expect("temporary path must be UTF-8");
+        let wal_path = format!("{db_path}-wal");
+        let io = Arc::new(SimulatorIO::new(1, 4096, 0, 1, 1, IoBackend::Default)?);
+        let db = Database::open(
+            io.clone(),
+            db_path,
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )?;
+        let writer = db.connect()?;
+        let observer = db.connect()?;
+
+        writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")?;
+        writer.execute("BEGIN")?;
+        writer.execute("INSERT INTO t VALUES(1)")?;
+
+        let wal_file = io
+            .files
+            .borrow()
+            .iter()
+            .find(|file| file.path == wal_path)
+            .cloned()
+            .expect("WAL file must be open");
+        let pwrite_faults_before = wal_file.nr_pwrite_faults.get();
+
+        io.inject_fault_selective(&[(&wal_path, true)]);
+        let commit_result = writer.execute("COMMIT");
+        io.inject_fault_selective(&[(&wal_path, false)]);
+
+        assert!(
+            matches!(
+                &commit_result,
+                Err(LimboError::InternalError(message)) if message == FAULT_ERROR_MSG
+            ),
+            "expected the injected fault, got {commit_result:?}"
+        );
+        assert_eq!(
+            wal_file.nr_pwrite_faults.get(),
+            pwrite_faults_before + 1,
+            "COMMIT must fail while submitting a WAL write"
+        );
+        assert!(
+            writer.get_auto_commit(),
+            "the failed COMMIT must end the explicit transaction"
+        );
+        assert_eq!(
+            query_ids(&writer)?,
+            Vec::<i64>::new(),
+            "the writer must not retain changes from the rolled-back transaction"
+        );
+        assert_eq!(
+            query_ids(&observer)?,
+            Vec::<i64>::new(),
+            "the rolled-back transaction must remain invisible to another connection"
+        );
+
+        writer.execute("BEGIN")?;
+        writer.execute("INSERT INTO t VALUES(2)")?;
+        writer.execute("COMMIT")?;
+
+        assert_eq!(
+            query_ids(&observer)?,
+            vec![2],
+            "a later transaction must not publish the failed row"
+        );
+        Ok(())
+    }
+}
