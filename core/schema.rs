@@ -5252,14 +5252,34 @@ const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
 impl Column {
     pub fn affinity(&self) -> Affinity {
+        self.stored_affinity()
+            .unwrap_or_else(|| Affinity::affinity(&self.ty_str))
+    }
+
+    /// The affinity written into the raw bits, or `None` when the column has
+    /// no override and its affinity comes from parsing `ty_str`.
+    fn stored_affinity(&self) -> Option<Affinity> {
         let v = (self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT;
         if v == 0 {
-            return Affinity::affinity(&self.ty_str);
+            return None;
         }
-        Affinity::from_repr(v).unwrap_or_else(|| {
+        Some(Affinity::from_repr(v).unwrap_or_else(|| {
             tracing::error!("column had invalid raw affinity {v}");
             Affinity::None
-        })
+        }))
+    }
+
+    /// Whether the column has no affinity at all, meaning it is backed by a
+    /// literal or computed expression instead of a declared type.
+    ///
+    /// Answers the same as `self.affinity() == Affinity::None` but only reads
+    /// the stored bits: parsing a type name never yields `Affinity::None`, so
+    /// only a stored affinity can be `None`. `affinity()` allocates an
+    /// uppercased copy of `ty_str` and scans it for six substrings, and query
+    /// planning asks this question for every column reference it looks at, so
+    /// the difference is worth keeping.
+    pub fn has_no_affinity(&self) -> bool {
+        self.stored_affinity() == Some(Affinity::None)
     }
 
     /// Set the base type affinity override for a custom type column.
@@ -7409,6 +7429,54 @@ mod tests {
                 affinity,
                 "stored {affinity:?} but read back {:?}",
                 col.affinity(),
+            );
+        }
+    }
+
+    /// `has_no_affinity` skips the `ty_str` parse that `affinity()` falls back
+    /// to, so it is only correct while the two always agree.
+    #[test]
+    fn has_no_affinity_agrees_with_affinity() {
+        for ty_str in ["", "BLOB", "TEXT", "VARCHAR(10)", "INTEGER", "REAL", "ANY"] {
+            let col = Column::new(
+                Some("x".to_string()),
+                ty_str.to_string(),
+                None,
+                None,
+                Type::Blob,
+                None,
+                ColDef::default(),
+            );
+            assert_eq!(
+                col.has_no_affinity(),
+                col.affinity() == Affinity::None,
+                "declared type {ty_str:?} read back as {:?}",
+                col.affinity(),
+            );
+        }
+
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            let mut col = Column::new(
+                Some("x".to_string()),
+                "BLOB".to_string(),
+                None,
+                None,
+                Type::Blob,
+                None,
+                ColDef::default(),
+            );
+            col.set_base_affinity(affinity);
+            assert_eq!(
+                col.has_no_affinity(),
+                col.affinity() == Affinity::None,
+                "stored {affinity:?}",
             );
         }
     }
