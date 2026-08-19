@@ -2712,9 +2712,16 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
+            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
+                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
+            } else {
+                false
+            };
+
             if index
                 .expression_to_index_pos(&usage.normalized_expr)
                 .is_some()
+                || matches_where_clause
             {
                 any_covered = true;
                 for col_idx in usage.columns_mask.iter() {

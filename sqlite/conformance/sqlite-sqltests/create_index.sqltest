@@ -302,4 +302,3 @@ test create-index-sqlite-source-id {
 }
 expect error {
 }
-
