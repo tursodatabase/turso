@@ -130,6 +130,27 @@ WITH (tokenizer = 'simple', weights = 'name=3.0,description=1.0');
 - Default weight is `1.0` for all fields
 - Weights affect the BM25 relevance score from `fts_score()`
 - Higher weights increase the score contribution from that field
+
+### Fuzzy Matching
+
+The `fuzzy_distance` parameter (0-2, default 0) makes plain word queries
+typo-tolerant:
+
+```sql
+CREATE INDEX idx_articles ON articles USING fts (title, body)
+WITH (fuzzy_distance = 1);
+
+-- 'databse' matches documents containing 'database' or 'databases'
+SELECT * FROM articles WHERE fts_match(title, body, 'databse migr');
+```
+
+Query words are expanded against the index's term dictionary: a term matches
+when some prefix of it is within `fuzzy_distance` edits of the query word
+(transposition counts as one edit), capped at 50 expansions per word. Words
+shorter than 3 characters always match exactly. `fuzzy_distance` requires a
+word tokenizer and cannot be combined with `tokenizer = 'ngram'`. Like prefix
+search, fuzzy matching applies only to plain word queries; queries using
+Tantivy grammar are parsed as-is.
 - Weights must be positive numbers
 
 #### Tokenizer Examples
@@ -256,6 +277,14 @@ The query string passed to `fts_match`/`fts_score` supports Tantivy's QueryParse
 | Prefix search | `data*` | Match terms starting with "data" |
 | Column filter | `title:database` | Match "database" only in title field |
 | Boosting | `title:database^2 body:database` | Boost title matches |
+
+Prefix search is handled by Turso, not by Tantivy's parser: a trailing `*`
+expands the word against the index's term dictionary and several words can be
+starred at once (`datab* migr*`). It applies only to plain word queries — in a
+query using any other syntax from this table, a bare `*` is dropped by the
+tokenizer and the word matches exactly. Expanded queries (prefix or fuzzy) also
+grade results by word proximity: the closer the query words appear to each
+other in a document, the higher it ranks.
 
 This syntax can be improved on in the future, and maybe eventually we can support some fancy elasticsearch/paradeDB syntax.
 

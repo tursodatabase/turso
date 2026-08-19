@@ -151,6 +151,10 @@ CREATE INDEX idx_articles_search ON articles USING fts (
     title WITH tokenizer=simple,
     body WITH tokenizer=ngram
 );
+
+-- FTS index with typo-tolerant matching (fuzzy_distance = 0-2)
+CREATE INDEX idx_articles_search ON articles USING fts (title, body)
+    WITH (fuzzy_distance = 1);
 ```
 
 Once an FTS index exists, use the `search()` function to query it:

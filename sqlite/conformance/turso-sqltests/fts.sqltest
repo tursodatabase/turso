@@ -981,3 +981,282 @@ test fts-create-index-batch-flush-returns-each-rowid-once {
 expect {
     20000|20000|20000
 }
+
+
+# -------------------------------------------------------------------
+# Fuzzy matching (WITH fuzzy_distance) and prefix stars in queries.
+# The ranked results (3, 4, 1) deliberately differ from insertion
+# order so a degenerate all-ties scoring cannot pass via rowid
+# tie-breaking.
+# -------------------------------------------------------------------
+
+@backend cli
+test fts-fuzzy-distance-typo-matches-via-match-pattern {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'The database is fast and reliable.');
+    INSERT INTO t VALUES (2, 'Lorem ipsum dolor sit amet.');
+    INSERT INTO t VALUES (3, 'Database migration guide for beginners');
+    INSERT INTO t VALUES (4, 'Migration of legacy data into modern databases');
+    SELECT id FROM t WHERE fts_match(x, 'databse') ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+@backend cli
+test fts-fuzzy-distance-typo-and-prefix-proximity-ranking {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'The database is fast and reliable.');
+    INSERT INTO t VALUES (2, 'Lorem ipsum dolor sit amet.');
+    INSERT INTO t VALUES (3, 'Database migration guide for beginners');
+    INSERT INTO t VALUES (4, 'Migration of legacy data into modern databases');
+    SELECT id FROM (
+        SELECT id, fts_score(x, 'databse migr') AS s
+        FROM t
+        WHERE fts_match(x, 'databse migr')
+        ORDER BY s DESC
+        LIMIT 10
+    );
+}
+expect {
+    3
+    4
+    1
+}
+
+@backend cli
+test fts-fuzzy-distance-exact-word-still-matches {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'The database is fast and reliable.');
+    INSERT INTO t VALUES (2, 'Lorem ipsum dolor sit amet.');
+    INSERT INTO t VALUES (3, 'Database migration guide for beginners');
+    INSERT INTO t VALUES (4, 'Migration of legacy data into modern databases');
+    SELECT id FROM t WHERE fts_match(x, 'migration') ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+@backend cli
+test fts-fuzzy-distance-no-match-stays-empty {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'The database is fast and reliable.');
+    SELECT count(*) FROM t WHERE fts_match(x, 'zzzzz');
+}
+expect {
+    0
+}
+
+@backend cli
+test fts-multi-star-prefix-proximity-ranking {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'The database is fast and reliable.');
+    INSERT INTO t VALUES (2, 'Lorem ipsum dolor sit amet.');
+    INSERT INTO t VALUES (3, 'Database migration guide for beginners');
+    INSERT INTO t VALUES (4, 'Migration of legacy data into modern databases');
+    SELECT id FROM (
+        SELECT id, fts_score(x, 'datab* migr*') AS s
+        FROM t
+        WHERE fts_match(x, 'datab* migr*')
+        ORDER BY s DESC
+        LIMIT 10
+    );
+}
+expect {
+    3
+    4
+    1
+}
+
+@backend cli
+test fts-single-star-prefix-matches {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'The database is fast and reliable.');
+    INSERT INTO t VALUES (2, 'Lorem ipsum dolor sit amet.');
+    INSERT INTO t VALUES (3, 'Database migration guide for beginners');
+    INSERT INTO t VALUES (4, 'Migration of legacy data into modern databases');
+    SELECT id FROM t WHERE fts_match(x, 'migr*') ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+@backend cli
+test fts-fuzzy-distance-multi-column-typos-match-across-columns {
+    CREATE TABLE articles (id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+    CREATE INDEX articles_idx ON articles USING fts (title, body) WITH (fuzzy_distance = 1);
+    INSERT INTO articles VALUES (1, 'Server maintenance', 'How to upgrade your database safely');
+    INSERT INTO articles VALUES (2, 'Migration checklist', 'Steps before switching providers');
+    INSERT INTO articles VALUES (3, 'Cooking pasta', 'Boil water and add salt');
+    SELECT id FROM articles WHERE fts_match(title, body, 'databse migrtion') ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@backend cli
+test fts-fuzzy-index-grammar-query-uses-passthrough {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'The database is fast and reliable.');
+    INSERT INTO t VALUES (3, 'Database migration guide for beginners');
+    INSERT INTO t VALUES (4, 'Migration of legacy data into modern databases');
+    SELECT id FROM t WHERE fts_match(x, '"database migration"') ORDER BY id;
+}
+expect {
+    3
+}
+
+@backend cli
+test fts-fuzzy-distance-invalid-value-rejected {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 5);
+}
+expect error {
+    Parse error: FTS WITH parameter 'fuzzy_distance' must be an integer between 0 and 2
+}
+
+@backend cli
+test fts-fuzzy-distance-rejected-with-ngram-tokenizer {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (tokenizer = 'ngram', fuzzy_distance = 1);
+}
+expect error {
+    Parse error: FTS WITH parameter 'fuzzy_distance' requires a word tokenizer, got tokenizer = 'ngram'
+}
+
+@backend cli
+test fts-fuzzy-distance-scores-distinct-and-positive {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'The database is fast and reliable.');
+    INSERT INTO t VALUES (2, 'Lorem ipsum dolor sit amet.');
+    INSERT INTO t VALUES (3, 'Database migration guide for beginners');
+    INSERT INTO t VALUES (4, 'Migration of legacy data into modern databases');
+    SELECT count(DISTINCT s), count(*), min(s) > 0 FROM (
+        SELECT id, fts_score(x, 'databse migr') AS s
+        FROM t
+        WHERE fts_match(x, 'databse migr')
+        ORDER BY s DESC
+        LIMIT 10
+    );
+}
+expect {
+    3|3|1
+}
+
+@backend cli
+test fts-proximity-closer-words-rank-higher {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'Create a database for testing');
+    INSERT INTO t VALUES (2, 'Lorem ipsum dolor sit amet.');
+    INSERT INTO t VALUES (3, 'Create database for testing now');
+    INSERT INTO t VALUES (4, 'Create new test and then add it to database');
+    SELECT id FROM (
+        SELECT id, fts_score(x, 'create database') AS s
+        FROM t
+        WHERE fts_match(x, 'create database')
+        ORDER BY s DESC
+        LIMIT 10
+    );
+}
+expect {
+    3
+    1
+    4
+}
+
+@backend cli
+test fts-fuzzy-three-word-query-proximity-tiers {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'A fresh database for everyone');
+    INSERT INTO t VALUES (2, 'Please create test database now');
+    INSERT INTO t VALUES (3, 'Nothing relevant lives in this row');
+    INSERT INTO t VALUES (4, 'You create test suites for every production database');
+    INSERT INTO t VALUES (5, 'To create alpha beta gamma one test two three four database');
+    SELECT id FROM (
+        SELECT id, fts_score(x, 'create test database') AS s
+        FROM t
+        WHERE fts_match(x, 'create test database')
+        ORDER BY s DESC
+        LIMIT 10
+    );
+}
+expect {
+    2
+    4
+    5
+    1
+}
+
+@backend cli
+test fts-fuzzy-four-words-all-typod-plus-star-ranked {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'The test of a great migration is to create it against a database');
+    INSERT INTO t VALUES (2, 'Unrelated content entirely');
+    INSERT INTO t VALUES (3, 'We create test database migration plans yearly');
+    SELECT id FROM (
+        SELECT id, fts_score(x, 'craete tset databse migr*') AS s
+        FROM t
+        WHERE fts_match(x, 'craete tset databse migr*')
+        ORDER BY s DESC
+        LIMIT 10
+    );
+}
+expect {
+    3
+    1
+}
+
+@backend cli
+test fts-fuzzy-expansion-cap-keeps-exact-term {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'zzzz exact target');
+    WITH RECURSIVE seq(i) AS (VALUES (10) UNION ALL SELECT i + 1 FROM seq WHERE i < 69)
+    INSERT INTO t SELECT i, 'zzza' || i || ' filler' FROM seq;
+    SELECT count(*) FROM t WHERE fts_match(x, 'zzzz') AND id = 1;
+}
+expect {
+    1
+}
+
+@backend cli
+test fts-fuzzy-hyphenated-word-matches-as-phrase {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x) WITH (fuzzy_distance = 1);
+    INSERT INTO t VALUES (1, 'a well-known author');
+    INSERT INTO t VALUES (2, 'the well respected mentor');
+    INSERT INTO t VALUES (3, 'known issues in the tracker');
+    SELECT id FROM t WHERE fts_match(x, 'well-known') ORDER BY id;
+}
+expect {
+    1
+}
+
+@backend cli
+test fts-standalone-star-matches-all-documents {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'foo bar');
+    INSERT INTO t VALUES (2, 'baz qux');
+    INSERT INTO t VALUES (3, 'hello world');
+    SELECT count(*) FROM t WHERE fts_match(x, 'foo *');
+}
+expect {
+    3
+}

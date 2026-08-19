@@ -46,7 +46,7 @@ cli_only = []
 test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
-fts = ["dep:tantivy"]
+fts = ["dep:tantivy", "dep:levenshtein_automata", "dep:tantivy-fst"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
@@ -75,6 +75,10 @@ libc = { version = "0.2.172" }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8.6"
 tantivy = { version = "0.26.0", optional = true }
+# Used by FTS fuzzy/prefix query expansion. Kept at the same versions tantivy
+# depends on so the Automaton trait is the one tantivy's term dictionary takes.
+levenshtein_automata = { version = "0.2.1", optional = true }
+tantivy-fst = { version = "0.5", optional = true }
 
 [dependencies]
 # aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument

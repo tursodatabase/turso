@@ -929,6 +929,21 @@ CREATE INDEX idx_docs ON docs USING fts (name, description)
 WITH (tokenizer = 'simple', weights = 'name=3.0,description=1.0');
 ```
 
+### Fuzzy Matching
+
+Set `fuzzy_distance` (0-2, default 0) to make plain word queries typo-tolerant:
+
+```sql
+CREATE INDEX idx_articles ON articles USING fts (title, body)
+WITH (fuzzy_distance = 1);
+
+-- 'databse' matches 'database' and 'databases'
+SELECT id FROM articles WHERE fts_match(title, body, 'databse');
+```
+
+Queries using Tantivy grammar (quotes, parentheses, boosts, `AND`/`OR`/`NOT`)
+are parsed as-is without expansion. See [docs/fts.md](fts.md) for details.
+
 ### Query Functions
 
 Turso provides three FTS functions:
@@ -980,6 +995,10 @@ The query string supports Tantivy's query syntax:
 | Prefix search | `data*` | Match terms starting with "data" |
 | Column filter | `title:database` | Match "database" only in title field |
 | Boosting | `title:database^2` | Boost matches in title field |
+
+Prefix search applies only to plain word queries (several words can be starred:
+`datab* migr*`); in a query using any other syntax from this table, a bare `*`
+is dropped by the tokenizer and the word matches exactly.
 
 ### Complex Queries
 

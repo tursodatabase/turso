@@ -32,14 +32,17 @@ use tantivy::{
     },
     fastfield::{AliveBitSet, Column},
     merge_policy::{LogMergePolicy, MergePolicy, NoMergePolicy},
-    query::{EnableScoring, Query, Scorer},
-    schema::{Field, Schema},
+    query::{
+        BooleanQuery, BoostQuery, EnableScoring, Occur, PhrasePrefixQuery, PhraseQuery, Query,
+        Scorer, TermQuery,
+    },
+    schema::{Field, IndexRecordOption, Schema},
     tokenizer::{
         NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenStream,
         WhitespaceTokenizer,
     },
     DocAddress, DocSet, HasLen, Index, IndexReader, IndexSettings, IndexWriter, Searcher,
-    SegmentMeta, TantivyDocument, TERMINATED,
+    SegmentMeta, TantivyDocument, Term, TERMINATED,
 };
 use turso_parser::ast::{Select, SortOrder};
 
@@ -1612,6 +1615,9 @@ pub struct FtsIndexAttachment {
     /// (min_gram, max_gram) for the ngram tokenizer, from the WITH clause
     /// `min_gram`/`max_gram` keys. [DEFAULT_NGRAM_WINDOW] unless configured.
     ngram_window: (usize, usize),
+    /// Maximum edit distance for fuzzy word matching, from the WITH clause
+    /// `fuzzy_distance` key. 0 disables fuzzy matching.
+    fuzzy_distance: u8,
     /// In-memory cached Tantivy read state.
     cached_state: Arc<RwLock<CachedFtsStates>>,
     /// Tantivy writer retained across sequential statements.
@@ -1631,7 +1637,32 @@ pub const SUPPORTED_TOKENIZERS: &[&str] = &[
 ];
 
 /// Supported keys in the WITH clause of an FTS index
-pub const SUPPORTED_WITH_KEYS: &[&str] = &["tokenizer", "weights", "min_gram", "max_gram"];
+pub const SUPPORTED_WITH_KEYS: &[&str] = &[
+    "tokenizer",
+    "weights",
+    "min_gram",
+    "max_gram",
+    "fuzzy_distance",
+];
+
+/// Cap on term-dictionary expansions per query word for fuzzy/prefix queries.
+/// Mirrors Tantivy's own `PhrasePrefixQuery` default.
+const MAX_TERM_EXPANSIONS: usize = 50;
+
+/// Cap on expanded terms per side of an adjacent-word proximity phrase, so a
+/// two-word query cannot compose more than this squared phrase clauses.
+const PHRASE_EXPANSION_CAP: usize = 8;
+
+/// Proximity ladder for expanded queries, as (slop, boost) rungs. Each
+/// adjacent query-word pair adds one slop phrase per rung, and Tantivy scores
+/// a sloppy phrase the same no matter how tight the match is — but a pair at
+/// distance 0 matches all three rungs while a pair at distance 7 matches only
+/// the widest, so stacking overlapping rungs grades scores by word distance.
+const PROXIMITY_LADDER: &[(u32, f32)] = &[(0, 2.0), (2, 1.0), (8, 0.5)];
+
+/// Query words shorter than this are matched exactly even when the index has
+/// `fuzzy_distance` configured: one edit in a 1-2 char word matches far too much.
+const MIN_FUZZY_WORD_LEN: usize = 3;
 
 /// Ngram window used when `min_gram`/`max_gram` are not given.
 pub const DEFAULT_NGRAM_WINDOW: (usize, usize) = (2, 3);
@@ -1721,6 +1752,27 @@ impl FtsIndexAttachment {
             return Err(LimboError::ParseError(format!(
                 "FTS ngram window is invalid: min_gram ({}) is greater than max_gram ({})",
                 ngram_window.0, ngram_window.1
+            )));
+        }
+
+        // Parse fuzzy matching distance: WITH (fuzzy_distance = 1)
+        let fuzzy_distance = match parameters.get("fuzzy_distance") {
+            None => 0u8,
+            Some(Value::Numeric(crate::numeric::Numeric::Integer(v))) if (0..=2).contains(v) => {
+                *v as u8
+            }
+            Some(_) => {
+                return Err(LimboError::ParseError(
+                    "FTS WITH parameter 'fuzzy_distance' must be an integer between 0 and 2"
+                        .to_string(),
+                ))
+            }
+        };
+        // N-grams are their own substring-matching strategy; combining them with
+        // per-word edit distance would fuzz individual grams, not words.
+        if fuzzy_distance > 0 && tokenizer_name == "ngram" {
+            return Err(LimboError::ParseError(format!(
+                "FTS WITH parameter 'fuzzy_distance' requires a word tokenizer, got tokenizer = '{tokenizer_name}'"
             )));
         }
 
@@ -1828,6 +1880,7 @@ impl FtsIndexAttachment {
             patterns,
             field_weights,
             ngram_window,
+            fuzzy_distance,
             cached_state: Arc::new(RwLock::new(CachedFtsStates::default())),
             cached_writer: Arc::new(Mutex::new(None)),
         })
@@ -2084,6 +2137,181 @@ impl FtsHitStream {
     }
 }
 
+/// One word of a simple (grammar-free) FTS query.
+struct SimpleQueryWord {
+    /// Analyzer-normalized tokens. Usually one; several when the analyzer
+    /// splits the raw word (e.g. "well-known" -> well, known). A split word
+    /// must match as a phrase, exactly like Tantivy's parser treats it.
+    tokens: Vec<String>,
+    /// The raw word ended with `*`, requesting prefix expansion.
+    prefix: bool,
+}
+
+/// Splits a query into analyzer-normalized words when it uses no Tantivy query
+/// grammar, so fuzzy/prefix expansion can rewrite it. Returns `None` when the
+/// query must go through the stock `QueryParser` instead: any grammar construct
+/// (quotes, grouping, boosts, boolean operators, field prefixes) keeps today's
+/// passthrough behavior, and a `*` anywhere but the end of a word is grammar
+/// too rather than a guess at what was meant.
+fn simple_query_words(query: &str, analyzer: &mut TextAnalyzer) -> Option<Vec<SimpleQueryWord>> {
+    if query.chars().any(|c| {
+        matches!(
+            c,
+            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ':' | '^' | '~'
+        )
+    }) {
+        return None;
+    }
+    let mut words = Vec::new();
+    for raw in query.split_whitespace() {
+        if matches!(raw, "AND" | "OR" | "NOT" | "IN") || raw.starts_with(['+', '-']) {
+            return None;
+        }
+        let stripped = raw.strip_suffix('*');
+        let prefix = stripped.is_some();
+        let word = stripped.unwrap_or(raw);
+        if word.contains('*') {
+            return None;
+        }
+        let mut tokens = Vec::new();
+        let mut stream = analyzer.token_stream(word);
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        // A word that analyzes to nothing has no expansion semantics here. A
+        // standalone `*` is the important case: Tantivy's parser reads it as
+        // match-all, so the whole query must go through the parser.
+        if tokens.is_empty() {
+            return None;
+        }
+        words.push(SimpleQueryWord { tokens, prefix });
+    }
+    if words.is_empty() {
+        return None;
+    }
+    Some(words)
+}
+
+/// Adapts a Levenshtein DFA to the automaton interface Tantivy's term
+/// dictionary searches with (the same shape as Tantivy's private wrapper
+/// behind `FuzzyTermQuery`).
+struct LevenshteinDfa(levenshtein_automata::DFA);
+
+impl tantivy_fst::Automaton for LevenshteinDfa {
+    type State = u32;
+
+    fn start(&self) -> u32 {
+        self.0.initial_state()
+    }
+
+    fn is_match(&self, state: &u32) -> bool {
+        matches!(
+            self.0.distance(*state),
+            levenshtein_automata::Distance::Exact(_)
+        )
+    }
+
+    fn can_match(&self, state: &u32) -> bool {
+        *state != levenshtein_automata::SINK_STATE
+    }
+
+    fn accept(&self, state: &u32, byte: u8) -> u32 {
+        self.0.transition(*state, byte)
+    }
+}
+
+/// Parametric Levenshtein automaton builders are expensive to construct, so
+/// the two supported distances are built once (transposition counts as one
+/// edit) and reused for every query.
+fn levenshtein_builder(distance: u8) -> &'static levenshtein_automata::LevenshteinAutomatonBuilder {
+    static BUILDERS: std::sync::OnceLock<[levenshtein_automata::LevenshteinAutomatonBuilder; 2]> =
+        std::sync::OnceLock::new();
+    let builders = BUILDERS.get_or_init(|| {
+        [
+            levenshtein_automata::LevenshteinAutomatonBuilder::new(1, true),
+            levenshtein_automata::LevenshteinAutomatonBuilder::new(2, true),
+        ]
+    });
+    &builders[usize::from(distance) - 1]
+}
+
+/// Expands one query word against a field's term dictionaries.
+///
+/// Prefix words expand to dictionary terms starting with the word. Fuzzy
+/// expansion uses prefix-DFA semantics: a dictionary term matches when some
+/// prefix of it is within `fuzzy_distance` edits of the word, so the typo
+/// `databse` reaches both `database` and `databases`. Results are capped at
+/// [MAX_TERM_EXPANSIONS] per word and deduplicated across segments. A word
+/// with no dictionary matches falls back to its exact term, so it matches
+/// nothing, exactly like an unknown word does today.
+fn expand_word(
+    searcher: &Searcher,
+    field: Field,
+    word: &str,
+    prefix: bool,
+    fuzzy_distance: u8,
+) -> Result<Vec<Term>> {
+    let fuzzy = fuzzy_distance > 0 && word.chars().count() >= MIN_FUZZY_WORD_LEN;
+    if !prefix && !fuzzy {
+        return Ok(vec![Term::from_field_text(field, word)]);
+    }
+    let mut expanded = std::collections::BTreeSet::new();
+    if fuzzy {
+        // The typed word always keeps its slot: expansions stream in
+        // dictionary order, so a crowd of lexicographically-earlier variants
+        // would otherwise evict the exact term at the cap.
+        expanded.insert(word.as_bytes().to_vec());
+    }
+    'segments: for segment_reader in searcher.segment_readers() {
+        let inverted = segment_reader
+            .inverted_index(field)
+            .map_err(|e| LimboError::InternalError(format!("FTS term dictionary error: {e}")))?;
+        let dict = inverted.terms();
+        if fuzzy {
+            // Covers the starred case too: every term starting with the word
+            // has a prefix at distance 0.
+            let dfa = levenshtein_builder(fuzzy_distance).build_prefix_dfa(word);
+            let mut stream = dict
+                .search(LevenshteinDfa(dfa))
+                .into_stream()
+                .map_err(|e| {
+                    LimboError::InternalError(format!("FTS term dictionary error: {e}"))
+                })?;
+            while stream.advance() {
+                if expanded.len() >= MAX_TERM_EXPANSIONS {
+                    break 'segments;
+                }
+                expanded.insert(stream.key().to_vec());
+            }
+        } else {
+            let mut stream = dict
+                .range()
+                .ge(word.as_bytes())
+                .into_stream()
+                .map_err(|e| {
+                    LimboError::InternalError(format!("FTS term dictionary error: {e}"))
+                })?;
+            while stream.advance() {
+                if !stream.key().starts_with(word.as_bytes()) {
+                    break;
+                }
+                if expanded.len() >= MAX_TERM_EXPANSIONS {
+                    break 'segments;
+                }
+                expanded.insert(stream.key().to_vec());
+            }
+        }
+    }
+    if expanded.is_empty() {
+        return Ok(vec![Term::from_field_text(field, word)]);
+    }
+    Ok(expanded
+        .into_iter()
+        .filter_map(|bytes| String::from_utf8(bytes).ok())
+        .map(|text| Term::from_field_text(field, &text))
+        .collect())
+}
+
 /// Cursor for executing FTS operations (queries, inserts, deletes).
 ///
 /// Implements `IndexMethodCursor` to integrate with turso's VDBE execution.
@@ -2103,6 +2331,8 @@ pub struct FtsCursor {
     field_boosts: Vec<(Field, f32)>,
     /// (min_gram, max_gram) window for the ngram tokenizer
     ngram_window: (usize, usize),
+    /// Maximum edit distance for fuzzy word matching. 0 disables it.
+    fuzzy_distance: u8,
     /// Query parser shared with other read cursors on the same snapshot.
     cached_parser: Option<Arc<tantivy::query::QueryParser>>,
     shared_cache: Arc<RwLock<CachedFtsStates>>,
@@ -2154,6 +2384,7 @@ impl FtsCursor {
             default_fields,
             field_boosts,
             ngram_window: attachment.ngram_window,
+            fuzzy_distance: attachment.fuzzy_distance,
             cached_parser: None,
             shared_cache: attachment.cached_state.clone(),
             shared_writer: attachment.cached_writer.clone(),
@@ -2247,6 +2478,139 @@ impl FtsCursor {
             parser.set_field_boost(field, boost);
         }
         Arc::new(parser)
+    }
+
+    /// Builds a term-expanded query for a simple word query, or `None` when
+    /// the stock `QueryParser` should handle it: nothing to expand (no
+    /// `fuzzy_distance` configured and no trailing `*` in the query), an
+    /// ngram tokenizer (its grams don't compose with word expansion), or a
+    /// query using Tantivy grammar.
+    ///
+    /// The result is one BM25 union per query word (a word matches when any
+    /// of its dictionary expansions does; a document matches when any word
+    /// does, like the parser's implicit OR) plus one boosted clause of slop
+    /// phrases over adjacent-word expansion pairs, so documents where the
+    /// query words sit closer together outrank scattered matches.
+    fn build_expanded_query(
+        &self,
+        index: &Index,
+        searcher: &Searcher,
+        query_str: &str,
+    ) -> Result<Option<Box<dyn Query>>> {
+        let has_star = query_str.split_whitespace().any(|w| w.ends_with('*'));
+        if self.fuzzy_distance == 0 && !has_star {
+            return Ok(None);
+        }
+        let Some(&first_field) = self.default_fields.first() else {
+            return Ok(None);
+        };
+        let tokenizer_name = match self.schema.get_field_entry(first_field).field_type() {
+            tantivy::schema::FieldType::Str(options) => options
+                .get_indexing_options()
+                .map(|indexing| indexing.tokenizer().to_string()),
+            _ => None,
+        };
+        let Some(tokenizer_name) = tokenizer_name else {
+            return Ok(None);
+        };
+        if tokenizer_name == "ngram" {
+            return Ok(None);
+        }
+        let Some(mut analyzer) = index.tokenizers().get(&tokenizer_name) else {
+            return Ok(None);
+        };
+        let Some(words) = simple_query_words(query_str, &mut analyzer) else {
+            return Ok(None);
+        };
+
+        let boost_of = |field: Field| {
+            self.field_boosts
+                .iter()
+                .find(|(boosted, _)| *boosted == field)
+                .map(|&(_, boost)| boost)
+                .unwrap_or(1.0)
+        };
+
+        // One SHOULD clause per query word, each a union of the word's
+        // expansions across every indexed column.
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(words.len() + 1);
+        // Expansions kept per word and per field for the proximity clause.
+        let mut expansions: Vec<Vec<Vec<Term>>> = Vec::with_capacity(words.len());
+        for word in &words {
+            let mut union: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            let mut field_terms = Vec::with_capacity(self.default_fields.len());
+            for &field in &self.default_fields {
+                let boost = boost_of(field);
+                if let [token] = word.tokens.as_slice() {
+                    let terms =
+                        expand_word(searcher, field, token, word.prefix, self.fuzzy_distance)?;
+                    for term in &terms {
+                        let term_query: Box<dyn Query> = Box::new(TermQuery::new(
+                            term.clone(),
+                            IndexRecordOption::WithFreqsAndPositions,
+                        ));
+                        let term_query = if boost == 1.0 {
+                            term_query
+                        } else {
+                            Box::new(BoostQuery::new(term_query, boost))
+                        };
+                        union.push((Occur::Should, term_query));
+                    }
+                    field_terms.push(terms);
+                } else {
+                    // A raw word the analyzer split (e.g. "well-known") must
+                    // match as a phrase, like Tantivy's parser treats it. It
+                    // is matched exactly (no expansion) and takes no part in
+                    // the proximity ladder, hence the empty expansion list.
+                    let terms: Vec<Term> = word
+                        .tokens
+                        .iter()
+                        .map(|token| Term::from_field_text(field, token))
+                        .collect();
+                    let phrase: Box<dyn Query> = if word.prefix {
+                        Box::new(PhrasePrefixQuery::new(terms))
+                    } else {
+                        Box::new(PhraseQuery::new(terms))
+                    };
+                    let phrase = if boost == 1.0 {
+                        phrase
+                    } else {
+                        Box::new(BoostQuery::new(phrase, boost))
+                    };
+                    union.push((Occur::Should, phrase));
+                    field_terms.push(Vec::new());
+                }
+            }
+            expansions.push(field_terms);
+            clauses.push((Occur::Should, Box::new(BooleanQuery::new(union))));
+        }
+
+        let mut phrase_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for pair in expansions.windows(2) {
+            for (field_idx, &field) in self.default_fields.iter().enumerate() {
+                let field_boost = boost_of(field);
+                for left in pair[0][field_idx].iter().take(PHRASE_EXPANSION_CAP) {
+                    for right in pair[1][field_idx].iter().take(PHRASE_EXPANSION_CAP) {
+                        for &(slop, rung_boost) in PROXIMITY_LADDER {
+                            let mut phrase = PhraseQuery::new(vec![left.clone(), right.clone()]);
+                            phrase.set_slop(slop);
+                            phrase_clauses.push((
+                                Occur::Should,
+                                Box::new(BoostQuery::new(
+                                    Box::new(phrase),
+                                    rung_boost * field_boost,
+                                )),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if !phrase_clauses.is_empty() {
+            clauses.push((Occur::Should, Box::new(BooleanQuery::new(phrase_clauses))));
+        }
+
+        Ok(Some(Box::new(BooleanQuery::new(clauses))))
     }
 
     /// Restore a writer retained by the previous statement when its committed
@@ -3668,19 +4032,27 @@ impl IndexMethodCursor for FtsCursor {
             }
         };
 
-        // Reuse cached QueryParser or build one on first query
-        if self.cached_parser.is_none() {
-            let index = self
-                .index
-                .as_ref()
-                .ok_or_else(|| LimboError::InternalError("FTS index not initialized".into()))?;
-            self.cached_parser = Some(self.build_query_parser(index));
-        }
-        let parser = self.cached_parser.as_deref().unwrap();
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("FTS index not initialized".into()))?;
 
-        let query = parser
-            .parse_query(&query_str)
-            .map_err(|e| LimboError::InternalError(format!("FTS parse error: {e}")))?;
+        // Simple word queries go through fuzzy/prefix term expansion when the
+        // index or query asks for it; everything else uses the stock parser.
+        let query = match self.build_expanded_query(index, searcher, &query_str)? {
+            Some(query) => query,
+            None => {
+                // Reuse cached QueryParser or build one on first query
+                if self.cached_parser.is_none() {
+                    self.cached_parser = Some(self.build_query_parser(index));
+                }
+                self.cached_parser
+                    .as_deref()
+                    .expect("FTS query parser cached immediately above")
+                    .parse_query(&query_str)
+                    .map_err(|e| LimboError::InternalError(format!("FTS parse error: {e}")))?
+            }
+        };
 
         // TopDocs keeps a heap proportional to its limit. Cap that heap at the
         // number of live documents: this preserves unlimited-query semantics,
