@@ -72,21 +72,10 @@ pub(super) fn translate_in_list(
 
     if false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();
-	program.emit_insn(Insn::BitAnd {
-	    lhs: lhs_reg,
-	    rhs: lhs_reg,
-	    dest: check_null_reg,
-        });
-	for i in 1..lhs_arity {
-	    program.emit_insn(Insn::BitAnd {
-		lhs: lhs_reg + i,
-		rhs: check_null_reg,
-		dest: check_null_reg,
-            });
-	}
-	program.emit_insn(Insn::IsNull {
-	    reg: check_null_reg,
-	    target_pc: condition_metadata.jump_target_when_null,
+        program.emit_insn(Insn::BitAnd {
+            lhs: lhs_reg,
+            rhs: lhs_reg,
+            dest: check_null_reg,
         });
     }
 
@@ -95,16 +84,16 @@ pub(super) fn translate_in_list(
         let rhs_reg = program.alloc_registers(lhs_arity);
         let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
 
-        if check_null_reg != 0 && expr.can_be_null() {
-            program.emit_insn(Insn::BitAnd {
-                lhs: check_null_reg,
-                rhs: rhs_reg,
-                dest: check_null_reg,
-            });
-        }
-
         if lhs_arity == 1 {
             // Scalar comparison path
+            if check_null_reg != 0 && expr.can_be_null() {
+                program.emit_insn(Insn::BitAnd {
+                    lhs: check_null_reg,
+                    rhs: rhs_reg,
+                    dest: check_null_reg,
+                });
+            }
+
             if !last_condition || false_null_jump_targets_differ {
                 if lhs_reg != rhs_reg {
                     program.emit_insn(Insn::Eq {
@@ -139,6 +128,8 @@ pub(super) fn translate_in_list(
             if !last_condition || false_null_jump_targets_differ {
                 // If all components match, jump to label_ok; otherwise skip to next RHS item
                 let skip_label = program.allocate_label();
+
+                // Check for unequal values and skip if one is found.
                 for j in 0..lhs_arity {
                     let (aff, collation) = row_component_affinity_collation(
                         lhs,
@@ -147,25 +138,33 @@ pub(super) fn translate_in_list(
                         referenced_tables,
                         Some(resolver),
                     )?;
-                    let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
-                    if j < lhs_arity - 1 {
-                        program.emit_insn(Insn::Ne {
-                            lhs: lhs_reg + j,
-                            rhs: rhs_reg + j,
-                            target_pc: skip_label,
-                            flags,
-                            collation,
-                        });
-                    } else {
-                        program.emit_insn(Insn::Eq {
-                            lhs: lhs_reg + j,
-                            rhs: rhs_reg + j,
-                            target_pc: label_ok,
-                            flags,
-                            collation,
-                        });
-                    }
+                    let flags = CmpInsFlags::default().with_affinity(aff);
+                    program.emit_insn(Insn::Ne {
+                        lhs: lhs_reg + j,
+                        rhs: rhs_reg + j,
+                        target_pc: skip_label,
+                        flags,
+                        collation,
+                    });
                 }
+
+                // Checking for NULL comes after confirming there are no inequalities in order to
+                // avoid prematurely resolving the result to NULL when inequalities exist.
+                // See https://sqlite.org/rowvalue.html#row_value_comparisons for details.
+                for j in 0..lhs_arity {
+                    program.emit_insn(Insn::IsNull {
+                        reg: lhs_reg + j,
+                        target_pc: condition_metadata.jump_target_when_null,
+                    });
+                    program.emit_insn(Insn::IsNull {
+                        reg: rhs_reg + j,
+                        target_pc: condition_metadata.jump_target_when_null,
+                    });
+                }
+
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_ok,
+                });
                 program.preassign_label_to_next_insn(skip_label);
             } else {
                 // Last condition, simple case: jump to false if any component doesn't match

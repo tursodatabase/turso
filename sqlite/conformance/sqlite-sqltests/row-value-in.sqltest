@@ -217,3 +217,17 @@ test row-value-null-against-multiple-literal-tuples-in {
 expect {
     1
 }
+
+test row-value-null-in-rhs-literal-list {
+   SELECT ((2,2) IN ((2,NULL))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-null-in-rhs-literal-list-overeager {
+   SELECT ((1,2,3) IN ((1,NULL,9))) IS FALSE;
+}
+expect {
+    1
+}
