@@ -159,13 +159,13 @@ pub(super) fn translate_in_list(
 
                 // Checking for null values after fully confirming there are no inequalities.
                 // The goal is to avoid prematurely resolving the result to NULL when inequalities are
-		// found when comparing row-values component-by-component. E.g. (NULL,1) IN ((2,2)) resolves
-		// to FALSE but (NULL,2) IN ((2,2)) resolves to NULL.
+                // found when comparing row-values component-by-component. E.g. (NULL,1) IN ((2,2)) resolves
+                // to FALSE but (NULL,2) IN ((2,2)) resolves to NULL.
                 let set_null_flag_label = program.allocate_label();
                 let null_target_label = if check_null_in_row_values_reg != 0 {
                     set_null_flag_label
                 } else {
-		    // skip setting the null flag when nulls are treated the same way as falses
+                    // skip setting the null flag when nulls are treated the same way as falses
                     skip_label
                 };
                 for j in 0..lhs_arity {
