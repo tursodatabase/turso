@@ -364,44 +364,27 @@ fn emit_loop_source<'a>(
                 )?;
             }
 
-            // For result columns that contain aggregates but also reference
-            // non-aggregate columns (e.g. CASE WHEN SUM(1) THEN a ELSE b END),
-            // pre-read those column references while the cursor is still valid.
-            // They are cached in expr_to_reg_cache so that when the full
-            // expression is evaluated after AggFinal, translate_expr finds
-            // the cached values instead of reading from the exhausted cursor.
-            for rc in plan
-                .result_columns
-                .iter()
-                .filter(|rc| rc.contains_aggregates)
-            {
-                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
-                    match expr {
-                        Expr::Column { .. } | Expr::RowId { .. } => {
-                            let reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                Some(&plan.table_references),
-                                expr,
-                                reg,
-                                &t_ctx.resolver,
-                            )?;
-                            t_ctx.resolver.cache_scalar_expr_reg(
-                                Cow::Owned(expr.clone()),
-                                reg,
-                                false,
-                                &plan.table_references,
-                            )?;
-                            Ok(WalkControl::SkipChildren)
-                        }
-                        _ => {
-                            if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                            Ok(WalkControl::Continue)
-                        }
-                    }
-                })?;
+            // Read the bare columns needed after the loop (in HAVING predicates,
+            // or in result columns that also contain an aggregate such as
+            // CASE WHEN sum(1) THEN a ELSE b END) into the registers allocated for
+            // them, while the cursor still points at a row. The whole table is one
+            // group here, so like SQLite we take the first row's values, which is
+            // what the once-flag guard above gives us.
+            // emit_ungrouped_aggregation then points post-loop translation at
+            // these registers.
+            turso_assert!(
+                t_ctx.bare_columns_read_in_loop.is_empty()
+                    || label_emit_nonagg_only_once.is_some(),
+                "bare columns must be read under the once flag, or they end up holding the last row's values instead of the first row's"
+            );
+            for (expr, reg) in t_ctx.bare_columns_read_in_loop.iter() {
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    expr,
+                    *reg,
+                    &t_ctx.resolver,
+                )?;
             }
 
             if let Some(label) = label_emit_nonagg_only_once {

@@ -1040,6 +1040,13 @@ pub struct TranslateCtx<'a> {
     /// evaluation: the sorter stores raw columns instead of pre-computed expressions,
     /// and full expressions are re-evaluated from the pseudo cursor during aggregation.
     pub agg_leaf_columns: Vec<Expr>,
+    /// Bare columns of an ungrouped aggregate query, paired with the register the
+    /// main loop reads them into on its first iteration. Needed because HAVING
+    /// predicates and result columns that also contain an aggregate are only
+    /// evaluated after the loop, when the cursor no longer points at a row. The
+    /// registers are nulled together with the aggregate accumulators before the
+    /// loop starts, like the column entries of SQLite's AggInfo.
+    pub bare_columns_read_in_loop: Vec<(Expr, usize)>,
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
@@ -1081,6 +1088,7 @@ impl<'a> TranslateCtx<'a> {
             resolver,
             non_aggregate_expressions: Vec::new(),
             agg_leaf_columns: Vec::new(),
+            bare_columns_read_in_loop: Vec::new(),
             cdc_cursor_id: None,
             meta_window: None,
             meta_in_seeks: (0..table_count).map(|_| None).collect(),
