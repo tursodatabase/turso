@@ -7301,6 +7301,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "turso_core",
+ "turso_parser",
  "turso_sync_engine",
  "validator",
  "windows-sys 0.61.2",
