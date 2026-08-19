@@ -5064,3 +5064,44 @@ test update-or-virtual-deferred-seek-no-panic-explicit-index {
 expect error {
     UNIQUE constraint failed
 }
+
+setup gencol_autoindex_source_row {
+    CREATE TABLE autoindex_gencol(
+        base TEXT,
+        direct TEXT AS (base),
+        chained TEXT AS (direct || '')
+    );
+    INSERT INTO autoindex_gencol(base) VALUES ('hit');
+}
+
+@setup gencol_autoindex_source_row
+test gencol-autoindex-virtual-column-uses-source-row {
+    SELECT base
+    FROM (SELECT 1) CROSS JOIN autoindex_gencol
+    WHERE direct = 'hit';
+}
+expect {
+    hit
+}
+
+@setup gencol_autoindex_source_row
+test gencol-autoindex-chained-virtual-column-uses-source-row {
+    SELECT base
+    FROM (SELECT 1) CROSS JOIN autoindex_gencol
+    WHERE chained = 'hit';
+}
+expect {
+    hit
+}
+
+@setup gencol_autoindex_source_row
+@skip-if sqlite "Turso names automatic indexes differently"
+test gencol-autoindex-virtual-column-plan {
+    EXPLAIN QUERY PLAN
+    SELECT base
+    FROM (SELECT 1) CROSS JOIN autoindex_gencol
+    WHERE direct = 'hit';
+}
+expect pattern {
+    SEARCH autoindex_gencol USING INDEX ephemeral_.* \(direct=\?\)
+}
