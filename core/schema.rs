@@ -5905,6 +5905,11 @@ impl Index {
             .is_some_and(|x| x.definition().backing_btree)
     }
 
+    /// Whether this schema index owns a B-tree root page.
+    pub fn is_btree_backed(&self) -> bool {
+        self.index_method.is_none() || self.is_backing_btree_index()
+    }
+
     pub fn automatic_from_primary_key(
         table: &BTreeTable,
         auto_index: (String, i64), // name, root_page

@@ -12973,10 +12973,6 @@ pub fn op_index_method_create(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
-    }
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
@@ -13003,10 +12999,6 @@ pub fn op_index_method_destroy(
     load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
-    }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
     }
     if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
         if state.cursors[*cursor_id].is_none() {
@@ -13035,10 +13027,6 @@ pub fn op_index_method_optimize(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
-    }
     if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
@@ -13057,7 +13045,7 @@ pub fn op_index_method_optimize(
 }
 
 pub fn op_index_method_query(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -13072,10 +13060,6 @@ pub fn op_index_method_query(
         },
         insn
     );
-    let mv_store = program.connection.mv_store();
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
-    }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
         .expect("cursor should exist");

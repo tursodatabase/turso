@@ -703,6 +703,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             .indexes
             .values()
             .flatten()
+            .filter(|index| index.is_btree_backed())
             .map(|index| {
                 turso_assert!(index.root_page != 0, "index root_page must be non-zero");
                 (
@@ -761,6 +762,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .indexes
                 .values()
                 .flatten()
+                .filter(|index| index.is_btree_backed())
                 .map(|index| {
                     turso_assert!(index.root_page != 0, "index root_page must be non-zero");
                     (
@@ -2058,7 +2060,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             .indexes
                             .values()
                             .flatten()
+                            .filter(|index| index.is_btree_backed())
                             .filter_map(|index| {
+                                turso_assert!(
+                                    index.root_page != 0,
+                                    "index root_page must be non-zero"
+                                );
                                 self.mvstore
                                     .try_get_table_id_from_root_page_at(
                                         index.root_page,
