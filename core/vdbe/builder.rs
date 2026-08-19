@@ -1795,6 +1795,25 @@ impl ProgramBuilder {
         self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
     }
 
+    /// The bytecode emitted by `emit` must run while `cursor_id` is open and
+    /// positioned on a row of `table_ref_id`.
+    pub fn with_cursor_override<T>(
+        &mut self,
+        table_ref_id: TableInternalId,
+        cursor_id: CursorID,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let table_id = table_ref_id.into();
+        let previous = self.cursor_overrides.insert(table_id, cursor_id);
+        let result = emit(self);
+        if let Some(previous) = previous {
+            self.cursor_overrides.insert(table_id, previous);
+        } else {
+            self.cursor_overrides.remove(&table_id);
+        }
+        result
+    }
+
     /// Clear the cursor override for a table.
     pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
         self.cursor_overrides.remove(&table_ref_id.into());
