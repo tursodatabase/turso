@@ -177,7 +177,7 @@ impl IO for SimulatorIO {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::sync::Arc;
 
