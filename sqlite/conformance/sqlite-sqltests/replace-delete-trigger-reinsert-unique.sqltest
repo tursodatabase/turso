@@ -1,0 +1,38 @@
+@database :memory:
+@requires-file trigger "trigger tests require trigger support"
+
+# Issue #7975: REPLACE with a delete trigger re-inserting the conflicting key
+# must re-check uniqueness. SQLite rejects the statement with
+# "UNIQUE constraint failed"; Turso used to let the duplicate through and
+# corrupt the unique index.
+
+# FK cascade delete fires a trigger that re-inserts the same UNIQUE key.
+@cross-check-integrity
+test replace-fk-cascade-trigger-reinsert-unique {
+    PRAGMA recursive_triggers = true;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p1 (a, b UNIQUE);
+    CREATE TABLE c1 (c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN INSERT INTO p1 VALUES(4, 1); END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO c1 VALUES(2, 1);
+    REPLACE INTO p1 VALUES(3, 1);
+}
+expect error {
+    UNIQUE constraint failed: p1.b
+}
+
+# Simpler recursive-trigger variant: delete trigger on the same table
+# re-inserts the conflicting key during REPLACE.
+@cross-check-integrity
+test replace-recursive-delete-trigger-reinsert-unique {
+    PRAGMA recursive_triggers = true;
+    CREATE TABLE t0 (c0, c1);
+    CREATE UNIQUE INDEX i0 ON t0(c0);
+    INSERT INTO t0(c0, c1) VALUES(123, 1);
+    CREATE TRIGGER tr0 AFTER DELETE ON t0 BEGIN INSERT INTO t0 VALUES(123, 2); END;
+    REPLACE INTO t0(c0, c1) VALUES(123, 3);
+}
+expect error {
+    UNIQUE constraint failed: t0.c0
+}
