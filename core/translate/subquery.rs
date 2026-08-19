@@ -1444,10 +1444,8 @@ pub fn emit_from_clause_subqueries(
         .map(|m| m.original_idx)
         .try_collect()?;
 
-    let mut plan_nodes: Vec<(usize, usize)> = Vec::new();
-
     for &table_index in &visit_order {
-        let table_reference = &mut tables.joined_tables_mut()[table_index];
+        let table_reference = &tables.joined_tables()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
                 Some(choose_from_clause_subquery_execution_mode(
@@ -1458,7 +1456,7 @@ pub fn emit_from_clause_subqueries(
             _ => None,
         };
         let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode.as_ref());
-        let node = emit_explain!(
+        emit_explain!(
             program,
             true,
             eqp_detail_for_table_op(
@@ -1468,12 +1466,11 @@ pub fn emit_from_clause_subqueries(
                     outer_table_set.get(table_index),
                 ),
                 eqp_subquery,
+                hash_join_build_table(tables, table_index),
             )
         );
-        if let Some(node) = node {
-            plan_nodes.push((table_index, node));
-        }
 
+        let table_reference = &mut tables.joined_tables_mut()[table_index];
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             let execution_mode =
                 execution_mode.expect("execution mode was computed above for subquery tables");
@@ -1578,19 +1575,14 @@ pub fn emit_from_clause_subqueries(
 
         program.pop_current_parent_explain();
     }
-
-    for &(table_index, probe_node) in plan_nodes.iter() {
-        let Operation::HashJoin(hash_join_op) = &tables.joined_tables()[table_index].op else {
-            continue;
-        };
-        if let Some(&(_, build_node)) = plan_nodes
-            .iter()
-            .find(|(table_index, _)| *table_index == hash_join_op.build_table_idx)
-        {
-            program.record_hash_join_build_node(probe_node, build_node);
-        }
-    }
     Ok(())
+}
+
+fn hash_join_build_table(tables: &TableReferences, table_index: usize) -> Option<&JoinedTable> {
+    let Operation::HashJoin(hash_join_op) = &tables.joined_tables()[table_index].op else {
+        return None;
+    };
+    Some(&tables.joined_tables()[hash_join_op.build_table_idx])
 }
 
 /// Emit a FROM clause subquery and return the start register of the result columns.
