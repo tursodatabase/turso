@@ -27,7 +27,6 @@ pub struct ExplainInfo {
     /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
     /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
     pub cte_materializations: Vec<EqpCteMaterialization>,
-    pub hash_join_build_nodes: Vec<(usize, usize)>,
 }
 
 impl ExplainInfo {
@@ -46,10 +45,6 @@ impl ExplainInfo {
             for node_id in cte.node_ids.iter_mut() {
                 *node_id = old_to_new[*node_id];
             }
-        }
-        for (probe_node, build_node) in self.hash_join_build_nodes.iter_mut() {
-            *probe_node = old_to_new[*probe_node];
-            *build_node = old_to_new[*build_node];
         }
     }
 }
