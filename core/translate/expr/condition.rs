@@ -61,6 +61,7 @@ pub(super) fn translate_in_list(
     let lhs_reg = program.alloc_registers(lhs_arity);
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let mut check_null_reg = 0;
+    let mut check_null_in_row_values_reg = 0;
     let label_ok = program.allocate_label();
     let false_null_jump_targets_differ =
         condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null;
@@ -71,12 +72,20 @@ pub(super) fn translate_in_list(
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
 
     if false_null_jump_targets_differ {
-        check_null_reg = program.alloc_register();
-        program.emit_insn(Insn::BitAnd {
-            lhs: lhs_reg,
-            rhs: lhs_reg,
-            dest: check_null_reg,
-        });
+        if lhs_arity == 1 {
+            check_null_reg = program.alloc_register();
+            program.emit_insn(Insn::BitAnd {
+                lhs: lhs_reg,
+                rhs: lhs_reg,
+                dest: check_null_reg,
+            });
+        } else if lhs_arity > 1 {
+            check_null_in_row_values_reg = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                dest: check_null_in_row_values_reg,
+                value: 0,
+            });
+        }
     }
 
     for (i, expr) in rhs.iter().enumerate() {
@@ -148,23 +157,39 @@ pub(super) fn translate_in_list(
                     });
                 }
 
-                // Checking for NULL comes after confirming there are no inequalities in order to
-                // avoid prematurely resolving the result to NULL when inequalities exist.
-                // See https://sqlite.org/rowvalue.html#row_value_comparisons for details.
+                // Checking for null values after fully confirming there are no inequalities.
+                // The goal is to avoid prematurely resolving the result to NULL when inequalities are
+		// found when comparing row-values component-by-component. E.g. (NULL,1) IN ((2,2)) resolves
+		// to FALSE but (NULL,2) IN ((2,2)) resolves to NULL.
+                let set_null_flag_label = program.allocate_label();
+                let null_target_label = if check_null_in_row_values_reg != 0 {
+                    set_null_flag_label
+                } else {
+		    // skip setting the null flag when nulls are treated the same way as falses
+                    skip_label
+                };
                 for j in 0..lhs_arity {
                     program.emit_insn(Insn::IsNull {
                         reg: lhs_reg + j,
-                        target_pc: condition_metadata.jump_target_when_null,
+                        target_pc: null_target_label,
                     });
                     program.emit_insn(Insn::IsNull {
                         reg: rhs_reg + j,
-                        target_pc: condition_metadata.jump_target_when_null,
+                        target_pc: null_target_label,
                     });
                 }
-
                 program.emit_insn(Insn::Goto {
                     target_pc: label_ok,
                 });
+
+                if check_null_in_row_values_reg != 0 {
+                    program.preassign_label_to_next_insn(set_null_flag_label);
+                    program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: check_null_in_row_values_reg,
+                    });
+                }
+
                 program.preassign_label_to_next_insn(skip_label);
             } else {
                 // Last condition, simple case: jump to false if any component doesn't match
@@ -193,6 +218,17 @@ pub(super) fn translate_in_list(
         program.emit_insn(Insn::IsNull {
             reg: check_null_reg,
             target_pc: condition_metadata.jump_target_when_null,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: condition_metadata.jump_target_when_false,
+        });
+    }
+
+    if check_null_in_row_values_reg != 0 {
+        program.emit_insn(Insn::If {
+            reg: check_null_in_row_values_reg,
+            target_pc: condition_metadata.jump_target_when_null,
+            jump_if_null: false,
         });
         program.emit_insn(Insn::Goto {
             target_pc: condition_metadata.jump_target_when_false,

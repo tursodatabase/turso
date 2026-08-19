@@ -168,7 +168,7 @@ setup row_values_with_null_schema {
 }
 
 @setup row_values_with_null_schema
-test row-value-nulls-literal-list-in {
+test row-value-filter-nulls-literal-list-in {
     SELECT a, b FROM w WHERE (a,b) IN ((1,1),(2,2)) ORDER BY 1,2;
 }
 expect {
@@ -177,56 +177,78 @@ expect {
 }
 
 @setup row_values_with_null_schema
-test row-value-nulls-literal-list-not-in {
+test row-value-filter-nulls-literal-list-not-in {
     SELECT a, b FROM w WHERE (a,b) NOT IN ((1,1),(2,2)) ORDER BY 1,2;
 }
 expect {
 }
 
-test row-value-null-in-first-position-in {
+@setup row_values_with_null_schema
+test row-value-filter-nulls-literal-list-containing-null-in {
+    SELECT a, b FROM w WHERE (a,b) IN ((2,NULL),(2,2)) ORDER BY 1,2;
+}
+expect {
+    2|2
+}
+
+test row-value-false-null-first-in {
     SELECT ((NULL,1) IN ((1,1))) IS NULL;
 }
 expect {
     1
 }
 
-test row-value-null-in-second-position-in {
+test row-value-false-null-second-in {
     SELECT ((2,NULL) IN ((2,2))) IS NULL;
 }
 expect {
     1
 }
 
-test row-value-null-in-second-position-not-in {
+test row-value-false-null-second-not-in {
     SELECT ((2,NULL) NOT IN ((2,2))) IS NULL;
 }
 expect {
     1
 }
 
-test row-value-null-in-middle-position-in {
+test row-value-false-null-three-values-in {
     SELECT ((1,NULL,3) IN ((1,2,3))) IS NULL;
 }
 expect {
     1
 }
 
-test row-value-null-against-multiple-literal-tuples-in {
-    SELECT ((NULL,1) IN ((9,9),(1,1))) IS NULL;
+test row-value-false-null-multiple-tuples-in {
+    SELECT ((NULL,1) IN ((1,1),(9,9))) IS NULL;
 }
 expect {
     1
 }
 
-test row-value-null-in-rhs-literal-list {
-   SELECT ((2,2) IN ((2,NULL))) IS NULL;
+test row-value-false-null-multiple-tuples-with-null-in {
+   SELECT ((2,2) IN ((2,NULL),(9,9))) IS NULL;
 }
 expect {
     1
 }
 
-test row-value-null-in-rhs-literal-list-overeager {
+test row-value-false-null-multiple-tuples-with-null-not-in {
+   SELECT ((2,2) NOT IN ((2,NULL),(9,9))) IS NULL;
+}
+expect {
+    1
+}
+
+test row-value-false-null-check-inequality-after-null-in {
    SELECT ((1,2,3) IN ((1,NULL,9))) IS FALSE;
+}
+expect {
+    1
+}
+
+test row-value-false-null-check-matches-after-null-in {
+   SELECT ((2,2) IN ((2,NULL),(2,2))) IS TRUE;
 }
 expect {
     1
