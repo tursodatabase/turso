@@ -233,6 +233,10 @@ pub struct ProgramBuilder {
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
     pub constant_spans: Vec<(usize, usize)>,
+    /// Current recursion depth of expression translation, bounded by
+    /// `MAX_EXPR_TRANSLATION_DEPTH` to prevent stack overflow on deeply
+    /// nested expression trees. Maintained by `translate_expr()`.
+    pub expr_translation_depth: usize,
     /// Cursors that are referenced by the program. Indexed by [CursorKey].
     /// Certain types of cursors do not need a [CursorKey] (e.g. temp tables, sorter),
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
@@ -704,6 +708,7 @@ impl ProgramBuilder {
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
+            expr_translation_depth: 0,
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
