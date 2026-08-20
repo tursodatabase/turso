@@ -2040,10 +2040,13 @@ impl Jsonb {
         info: &mut ParseInfo,
     ) -> PResult<usize> {
         let num_start = self.len();
+        let text_start = pos;
         let mut len = 0;
         let mut is_float = false;
         let mut is_json5 = false;
         let mut has_digit = false;
+        let mut seen_dot = false;
+        let mut in_exponent = false;
 
         // Write placeholder header
         self.write_element_header(num_start, ElementType::INT, 0, false)
@@ -2068,6 +2071,15 @@ impl Jsonb {
         if pos < input.len() && input[pos] == b'.' {
             is_json5 = true;
             is_float = true;
+            // Even JSON5 needs a digit right after a leading dot.
+            // SQLite reports a bare dot at the dot itself and a
+            // signed one just after the dot.
+            if pos + 1 >= input.len() || !input[pos + 1].is_ascii_digit() {
+                return Err(PError::Message {
+                    msg: "Not a digit".to_string(),
+                    location: Some(if text_start == pos { pos } else { pos + 1 }),
+                });
+            }
         }
 
         // Check for hex (JSON5)
@@ -2164,9 +2176,22 @@ impl Jsonb {
                     self.data.push(input[pos]);
                     pos += 1;
                     len += 1;
-                    has_digit = true;
+                    // Exponent digits do not count as mantissa digits:
+                    // '-e1' is not a number even in JSON5.
+                    if !in_exponent {
+                        has_digit = true;
+                    }
                 }
                 b'.' => {
+                    // A number holds at most one dot, and none inside
+                    // the exponent. SQLite reports the offending dot.
+                    if seen_dot || in_exponent {
+                        return Err(PError::Message {
+                            msg: "malformed JSON".to_string(),
+                            location: Some(pos),
+                        });
+                    }
+                    seen_dot = true;
                     is_float = true;
                     self.data.push(input[pos]);
                     pos += 1;
@@ -2178,7 +2203,16 @@ impl Jsonb {
                     }
                 }
                 b'e' | b'E' => {
+                    // A second exponent marker is reported like a
+                    // repeated dot.
+                    if in_exponent {
+                        return Err(PError::Message {
+                            msg: "malformed JSON".to_string(),
+                            location: Some(pos),
+                        });
+                    }
                     is_float = true;
+                    in_exponent = true;
                     self.data.push(input[pos]);
                     pos += 1;
                     len += 1;
@@ -2202,11 +2236,13 @@ impl Jsonb {
             }
         }
 
-        // Must have at least one digit
-        if !has_digit && (!is_json5 || !is_float) {
+        // A number needs at least one digit in its mantissa, even in
+        // JSON5: '.5' and '5.' are numbers, '+', '-' and '-e1' are
+        // not. SQLite reports these at the start of the number.
+        if !has_digit {
             return Err(PError::Message {
                 msg: "Not a digit".to_string(),
-                location: Some(pos),
+                location: Some(text_start),
             });
         }
 

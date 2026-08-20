@@ -203,6 +203,40 @@ expect error {
     ^(Runtime error: )?(Parse error: )?malformed JSON$
 }
 
+# Even JSON5 numbers need a digit in the mantissa: a bare dot, a bare
+# sign, and an exponent with no mantissa are all malformed. SQLite
+# reports an unsigned bare dot at the dot, a signed one just after the
+# dot, and the rest at the start of the number.
+test json5_numbers_need_a_mantissa_digit {
+    SELECT json_valid('.', 2), json_valid('+e1', 2), json_valid('-e1', 2),
+           json_valid('.5', 2), json_valid('5.', 2), json_valid('+.5', 2),
+           json_error_position('.'), json_error_position('.e1'),
+           json_error_position('+.'), json_error_position('-.'),
+           json_error_position('+'), json_error_position('[.5, .]');
+}
+expect {
+    0|0|0|1|1|1|1|1|3|3|1|6
+}
+
+# A number holds at most one dot and one exponent, and the exponent
+# cannot hold a dot. The offending character is reported.
+test json5_numbers_reject_repeated_dots_and_exponents {
+    SELECT json_valid('0..', 2), json_valid('1.2.3', 2), json_valid('1e1e1', 2),
+           json_valid('1e1.5', 2), json_valid('5.e2', 2),
+           json_error_position('0..'), json_error_position('1.2.3'),
+           json_error_position('1e1e1'), json_error_position('1e1.5');
+}
+expect {
+    0|0|0|0|1|3|4|4|4
+}
+
+test digitless_number_document_errors {
+    SELECT json('.');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
 # The error position counts characters, not bytes: é is one character
 # but two UTF-8 bytes, both before an unterminated end of input and
 # before any other syntax error.
