@@ -249,6 +249,7 @@ pub(super) fn choose_best_btree_candidate(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
+                partial: index.where_clause.is_some(),
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
@@ -259,6 +260,7 @@ pub(super) fn choose_best_btree_candidate(
             },
             None => IndexInfo {
                 unique: true,
+                partial: false,
                 covering: !usable_constraint_refs.is_empty(),
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
@@ -328,23 +330,33 @@ pub(super) fn choose_best_btree_candidate(
         // values pass the index's WHERE clause. Discount the row count estimate
         // accordingly so the cost model recognizes the partial index as cheaper
         // than a full table scan.
-        let candidate_base_row_count = match candidate
-            .index
-            .as_ref()
-            .and_then(|idx| idx.where_clause.as_ref())
-        {
-            Some(where_expr) => {
-                let selectivity = super::constraints::estimate_partial_index_where_selectivity(
-                    where_expr.as_ref(),
-                    rhs_table,
-                    schema,
-                    available_indexes,
-                    params,
-                )
-                .clamp(1e-6, 1.0);
-                RowCountEstimate::AnalyzeStats((*base_row_count * selectivity).max(1.0))
+        let candidate_base_row_count = match candidate.index.as_ref() {
+            Some(index) if index.where_clause.is_some() => {
+                let where_expr = index
+                    .where_clause
+                    .as_ref()
+                    .expect("guard requires a partial index");
+                let analyzed_rows = analyze_stats
+                    .table_stats(rhs_table.table.get_name())
+                    .and_then(|table_stats| table_stats.index_stats.get(&index.name))
+                    .and_then(|index_stats| index_stats.total_rows)
+                    .map(|rows| rows as f64);
+                let estimated_rows = analyzed_rows.unwrap_or_else(|| {
+                    // SQLite assumes a partial index has at most half as many rows
+                    // as its table when ANALYZE data is unavailable.
+                    let selectivity = super::constraints::estimate_partial_index_where_selectivity(
+                        where_expr.as_ref(),
+                        rhs_table,
+                        schema,
+                        available_indexes,
+                        params,
+                    )
+                    .clamp(1e-6, 0.5);
+                    *base_row_count * selectivity
+                });
+                RowCountEstimate::AnalyzeStats(estimated_rows.max(1.0))
             }
-            None => base_row_count,
+            _ => base_row_count,
         };
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
@@ -534,6 +546,7 @@ pub(super) fn choose_best_in_seek_candidate(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
+                partial: index.where_clause.is_some(),
                 covering: rowid_only || rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
@@ -544,6 +557,7 @@ pub(super) fn choose_best_in_seek_candidate(
             },
             None => IndexInfo {
                 unique: true,
+                partial: false,
                 covering: false,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
@@ -828,6 +842,7 @@ fn find_best_access_method_for_btree(
         let index_info = match best.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
+                partial: index.where_clause.is_some(),
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
@@ -838,6 +853,7 @@ fn find_best_access_method_for_btree(
             },
             None => IndexInfo {
                 unique: true,
+                partial: false,
                 covering: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
@@ -912,6 +928,7 @@ fn find_best_access_method_for_btree(
                 .count();
             let index_info = IndexInfo {
                 unique: false,
+                partial: false,
                 column_count,
                 covering: true,
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
@@ -1758,6 +1775,7 @@ fn find_best_access_method_for_subquery(
             estimate_rows_per_seek(
                 IndexInfo {
                     unique: false,
+                    partial: false,
                     column_count: key_col_positions.len(),
                     covering: true,
                     rows_per_leaf_page: params.rows_per_table_page,
