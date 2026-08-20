@@ -1208,6 +1208,7 @@ expect {
 }
 
 # Use the partial index when one side of its OR also constrains the index key.
+@skip-if sqlite "query plan explanation output is different in sqlite"
 test partial-index-or-term-with-equality-search {
     CREATE TABLE t (a, b);
     CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
@@ -1221,6 +1222,7 @@ expect {
 }
 
 # Use the partial index when it provides the requested order.
+@skip-if sqlite "query plan explanation output is different in sqlite"
 test partial-index-or-term-with-order {
     CREATE TABLE t (a, b);
     CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
@@ -1235,6 +1237,7 @@ expect {
 }
 
 # Use the partial index without table lookups when it contains the filtered column.
+@skip-if sqlite "query plan explanation output is different in sqlite"
 test partial-index-or-term-with-covering-scan {
     CREATE TABLE t (a, b);
     CREATE INDEX idx ON t(a, b) WHERE b < 5 OR a > 5;
@@ -1249,6 +1252,7 @@ expect {
 }
 
 # Use either side of the partial index OR to prove that the index is safe.
+@skip-if sqlite "query plan explanation output is different in sqlite"
 test partial-index-or-right-term-with-range-search {
     CREATE TABLE t (a, b);
     CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
