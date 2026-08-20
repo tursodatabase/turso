@@ -5,20 +5,19 @@ mod ops;
 pub(crate) mod path;
 pub(crate) mod vtab;
 
-use crate::alloc::TryReserveError;
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
     json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::numeric::Numeric;
+use crate::numeric::{str_to_i64, Numeric};
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
-    unescape_string, ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation,
-    SetOperation,
+    jsonb_error_position, unescape_string, ElementType, Jsonb, JsonbHeader, ParseInfo,
+    PathOperationMode, SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
 use std::str::FromStr;
@@ -123,6 +122,17 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 
+/// Parses like [parse_as_json_text] but also reports whether the text
+/// used any JSON5-only syntax, which json_valid needs to tell strict
+/// RFC 8259 documents apart from merely parseable ones.
+fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)> {
+    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let truncated = &slice[..zero_pos];
+    let str = std::str::from_utf8(truncated)
+        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+    Jsonb::from_str_tracking(str).map_err(Into::into)
+}
+
 fn malformed_json_error(error: JsonError) -> LimboError {
     match error {
         JsonError::OutOfMemory => LimboError::OutOfMemory,
@@ -130,25 +140,44 @@ fn malformed_json_error(error: JsonError) -> LimboError {
     }
 }
 
-fn is_jsonb_blob(slice: &[u8]) -> Result<bool, TryReserveError> {
+/// SQLite's shallow "superficially looks like JSONB" test
+/// (jsonFuncArgMightBeBinary): the outer header must parse, claim
+/// exactly the whole blob, and a NULL/TRUE/FALSE element must have no
+/// payload. The payload bytes themselves are never examined, so a blob
+/// can pass this test and still fail full validation.
+fn looks_like_jsonb_blob(slice: &[u8]) -> bool {
+    if slice.is_empty() {
+        return false;
+    }
+    // SQLite reads the 8-byte size encoding (header nibble 15) with a
+    // 32-bit size, so the header only parses when the first four size
+    // bytes are zero.
+    if slice[0] >> 4 == 15 && (slice.len() < 9 || slice[1..5] != [0, 0, 0, 0]) {
+        return false;
+    }
     let Ok((header, header_offset)) = JsonbHeader::from_slice(0, slice) else {
-        return Ok(false);
+        return false;
     };
     let payload_size = header.payload_size();
-    let Some(total_expected) = header_offset.checked_add(payload_size) else {
-        return Ok(false);
-    };
-    if total_expected != slice.len() {
-        return Ok(false);
+    if header_offset.checked_add(payload_size) != Some(slice.len()) {
+        return false;
     }
-
-    // A one-byte header cannot identify JSONB: any blob's first byte parses as a
-    // plausible header, and the length check above still admits arbitrary data --
-    // an 8-byte blob starting `0x7C` reads as "OBJECT, 7-byte payload". So the
-    // whole document must validate, because later readers trust its interior
-    // offsets and decode its text payloads as `&str`.
-    let jsonb = Jsonb::from_raw_data(slice)?;
-    Ok(jsonb.is_valid())
+    if payload_size > 0
+        && matches!(
+            header.element_type(),
+            ElementType::NULL | ElementType::TRUE | ElementType::FALSE
+        )
+    {
+        return false;
+    }
+    // RFC 8259 text can only masquerade as JSONB when it starts with
+    // '{', '[' or a digit, and in every such coincidence the claimed
+    // payload is at most 7 bytes. Like SQLite, resolve those blobs by
+    // validating strictly and falling back to text when that fails.
+    if payload_size <= 7 && matches!(slice[0], b'{' | b'[' | b'0'..=b'9') {
+        return jsonb_error_position(slice) == 0;
+    }
+    true
 }
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
@@ -857,34 +886,86 @@ where
     json_string_to_db_type(json, ElementType::OBJECT, OutputVariant::Binary)
 }
 
-/// Tries to convert the value to jsonb. Returns Value::from_i64(1) if the conversion
-/// succeeded, and Value::from_i64(0) if it didn't.
-pub fn is_json_valid(json_value: impl AsValueRef) -> Result<Value, TryReserveError> {
-    let json_value = json_value.as_value_ref();
-    Ok(match json_value {
-        ValueRef::Null => Value::Null,
-        ValueRef::Blob(blob) => {
-            let index = blob
-                .iter()
-                .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-                .unwrap_or(blob.len());
-            let slice = &blob[index..];
-            if is_jsonb_blob(slice)? {
-                Value::from_i64(0)
+/// json_valid() flag: X is text that is strict RFC 8259 JSON.
+pub const JSON_VALID_FLAG_TEXT_STRICT: i64 = 0x01;
+/// json_valid() flag: X is text that is JSON5.
+pub const JSON_VALID_FLAG_TEXT_JSON5: i64 = 0x02;
+/// json_valid() flag: X is a blob that superficially looks like JSONB.
+pub const JSON_VALID_FLAG_BLOB_PROBABLE: i64 = 0x04;
+/// json_valid() flag: X is a blob that is valid JSONB.
+pub const JSON_VALID_FLAG_BLOB_STRICT: i64 = 0x08;
+
+/// Implements json_valid(X, Y). Y is a bitmask of the JSON_VALID_FLAG_*
+/// constants picking which representations count as valid, and X is
+/// valid if any selected check passes. The one-argument json_valid(X)
+/// is defined by SQLite as json_valid(X, 1), so callers pass
+/// JSON_VALID_FLAG_TEXT_STRICT when Y is absent.
+pub fn is_json_valid(
+    json_value: impl AsValueRef,
+    flags_value: impl AsValueRef,
+) -> crate::Result<Value> {
+    let flags = match flags_value.as_value_ref() {
+        ValueRef::Numeric(Numeric::Integer(int)) => int,
+        ValueRef::Numeric(Numeric::Float(float)) => f64::from(float) as i64,
+        ValueRef::Text(text) => str_to_i64(text.as_str()).unwrap_or(0),
+        ValueRef::Blob(blob) => str_to_i64(String::from_utf8_lossy(blob)).unwrap_or(0),
+        ValueRef::Null => 0,
+    };
+    if !(1..=15).contains(&flags) {
+        // SQLite raises this through sqlite3_result_error, which is
+        // error class SQLITE_ERROR; a Constraint error would surface
+        // as SQLITE_CONSTRAINT through the C API.
+        return Err(LimboError::SqlError(
+            "FLAGS parameter to json_valid() must be between 1 and 15".to_string(),
+        ));
+    }
+
+    let text_checks = |slice: &[u8]| -> crate::Result<bool> {
+        // With neither text flag selected the answer is already 0.
+        // SQLite does not parse at all in that case, so a huge input
+        // must not turn into an out-of-memory error here either.
+        if flags & (JSON_VALID_FLAG_TEXT_STRICT | JSON_VALID_FLAG_TEXT_JSON5) == 0 {
+            return Ok(false);
+        }
+        match parse_as_json_text_tracking(slice) {
+            Ok((_, info)) => Ok(if info.has_json5 {
+                flags & JSON_VALID_FLAG_TEXT_JSON5 != 0
             } else {
-                match parse_as_json_text(slice, Conv::Strict) {
-                    Ok(_) => Value::from_i64(1),
-                    Err(LimboError::OutOfMemory) => return Err(TryReserveError),
-                    Err(_) => Value::from_i64(0),
-                }
+                flags & (JSON_VALID_FLAG_TEXT_STRICT | JSON_VALID_FLAG_TEXT_JSON5) != 0
+            }),
+            Err(LimboError::OutOfMemory) => Err(LimboError::OutOfMemory),
+            Err(_) => Ok(false),
+        }
+    };
+
+    let json_value = json_value.as_value_ref();
+    let valid = match json_value {
+        ValueRef::Null => return Ok(Value::Null),
+        ValueRef::Blob(blob) => {
+            // SQLite classifies the raw blob. The probable check is the
+            // shallow one: a valid outer wrapper with malformed contents
+            // passes flag 0x04 but fails flag 0x08.
+            if looks_like_jsonb_blob(blob) {
+                flags & JSON_VALID_FLAG_BLOB_PROBABLE != 0
+                    || (flags & JSON_VALID_FLAG_BLOB_STRICT != 0 && jsonb_error_position(blob) == 0)
+            } else {
+                text_checks(blob)?
             }
         }
-        _ => match convert_dbtype_to_jsonb(json_value, Conv::Strict) {
-            Ok(_) => Value::from_i64(1),
-            Err(LimboError::OutOfMemory) => return Err(TryReserveError),
-            Err(_) => Value::from_i64(0),
-        },
-    })
+        ValueRef::Text(text) => text_checks(text.as_str().as_bytes())?,
+        ValueRef::Numeric(Numeric::Float(float)) => {
+            let float: f64 = float.into();
+            if float.is_infinite() {
+                flags & JSON_VALID_FLAG_TEXT_JSON5 != 0
+            } else {
+                flags & (JSON_VALID_FLAG_TEXT_STRICT | JSON_VALID_FLAG_TEXT_JSON5) != 0
+            }
+        }
+        ValueRef::Numeric(_) => {
+            flags & (JSON_VALID_FLAG_TEXT_STRICT | JSON_VALID_FLAG_TEXT_JSON5) != 0
+        }
+    };
+    Ok(Value::from_i64(i64::from(valid)))
 }
 
 pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
@@ -932,6 +1013,18 @@ mod tests {
     use super::*;
     use crate::numeric::Numeric;
     use crate::types::Value;
+
+    #[test]
+    fn json_valid_bad_flags_are_a_plain_sql_error_not_a_constraint() {
+        // SQLite raises the FLAGS error through sqlite3_result_error,
+        // which is error class SQLITE_ERROR. The C bindings map
+        // LimboError::Constraint to SQLITE_CONSTRAINT, so the variant
+        // matters to C API users, not just the message.
+        for flags in [Value::from_i64(0), Value::from_i64(16), Value::Null] {
+            let err = is_json_valid(Value::build_text("{}"), &flags).unwrap_err();
+            assert!(matches!(err, LimboError::SqlError(_)), "{err:?}");
+        }
+    }
 
     #[test]
     fn test_jsonb_preserves_malformed_json_error_and_cache_reusability() {
@@ -1910,24 +2003,5 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(result.unwrap().to_text().unwrap(), r#"{"field":"value"}"#,);
-    }
-
-    #[test]
-    fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
-        // `|` is 0x7C: OBJECT with a 7-byte inline payload, so this is exactly at
-        // the length where a scalar blob and a JSONB object are indistinguishable
-        // by header alone.
-        let overlapping_scalar = b"|1234567";
-        assert_eq!(overlapping_scalar.len(), 8);
-        assert!(!is_jsonb_blob(overlapping_scalar).expect(crate::alloc::ALLOC_ERR_MSG));
-    }
-
-    /// Object with a payload larger than a scalar blob, so header inspection
-    /// alone accepts it, but the TEXT5 key holds bytes that are not UTF-8.
-    /// Reading such a key used to reach `str::from_utf8_unchecked`.
-    #[test]
-    fn test_is_jsonb_blob_rejects_invalid_utf8_key() {
-        let invalid_utf8_key = b"\x9C\x79aaaaaa\xF0\x00";
-        assert!(!is_jsonb_blob(invalid_utf8_key).expect(crate::alloc::ALLOC_ERR_MSG));
     }
 }

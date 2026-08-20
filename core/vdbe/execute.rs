@@ -8965,7 +8965,15 @@ pub fn op_function(
             }
             JsonFunc::JsonValid => {
                 let json_value = &state.registers[*start_reg];
-                state.registers[*dest].set_value(is_json_valid(json_value.get_value())?);
+                // json_valid(X) is defined as json_valid(X, 1).
+                let default_flags = Value::from_i64(json::JSON_VALID_FLAG_TEXT_STRICT);
+                let flags_value = if arg_count > 1 {
+                    state.registers[*start_reg + 1].get_value()
+                } else {
+                    &default_flags
+                };
+                state.registers[*dest]
+                    .set_value(is_json_valid(json_value.get_value(), flags_value)?);
             }
             JsonFunc::JsonPatch => {
                 assert_eq!(arg_count, 2);

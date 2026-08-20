@@ -343,7 +343,7 @@ set test_files {
   json104              pass
   json105              fail
   json106              fail
-  json107              fail
+  json107              pass
   json108              fail
   json501              fail
   json502              fail
