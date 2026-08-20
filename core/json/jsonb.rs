@@ -3434,7 +3434,6 @@ pub(super) fn validate_jsonb(data: &[u8]) -> bool {
 /// including numeric payload contents, otherwise the 1-based byte
 /// offset of the first malformed byte or element. json_valid(X, 8) and
 /// json_error_position report this strict check.
-#[allow(dead_code)] // json_valid blob classification adopts this
 pub(super) fn jsonb_error_position(data: &[u8]) -> usize {
     // SQLite starts jsonbValidityCheck at depth 1, so exactly
     // MAX_JSON_DEPTH nested containers pass and one more fails.

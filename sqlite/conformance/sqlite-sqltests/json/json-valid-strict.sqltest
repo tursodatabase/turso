@@ -128,6 +128,54 @@ expect {
     0|0
 }
 
+test json_valid_jsonb_blob_is_invalid_for_one_arg_form {
+    SELECT json_valid(jsonb('{"a":1}'));
+}
+expect {
+    0
+}
+
+test json_valid_non_jsonb_blob_validates_as_text {
+    SELECT json_valid(x'7B7D'), json_valid(x'ABCD');
+}
+expect {
+    1|0
+}
+
+# x'2033343535' is the text " 3455". The raw blob decides whether it is
+# JSONB; the leading space says it is not, so it validates as text even
+# though the bytes after the space happen to form a JSONB integer.
+test json_valid_blob_is_classified_before_whitespace {
+    SELECT json_valid(x'2033343535');
+}
+expect {
+    1
+}
+
+# x'5B6E756C6C5D' is the text "[null]", whose first byte also parses as
+# a JSONB array header claiming the whole blob. Text can only
+# masquerade like that with a '{', '[' or digit first byte and a small
+# payload, and there full validation decides: this one fails it and is
+# read as text.
+test json_valid_ambiguous_small_blob_falls_back_to_text {
+    SELECT json_valid(x'5B6E756C6C5D');
+}
+expect {
+    1
+}
+
+# The deciding validation checks payload bytes, not just structure:
+# x'34313233' is the text "4123", whose first byte claims an INT5
+# element, but "123" is not a hex literal, so the blob is read as
+# text. x'3431322E' really is "412." under the same headers, which is
+# not JSON either way.
+test json_valid_ambiguous_blob_checks_payload_bytes {
+    SELECT json_valid(x'34313233'), json_valid(x'35313233'), json_valid(x'3431322E');
+}
+expect {
+    1|1|0
+}
+
 test json_valid_error_position_still_json5_lenient {
     SELECT json_valid('{"x":+0}'), NOT json_error_position('{"x":+0}');
 }

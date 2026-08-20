@@ -17,8 +17,8 @@ use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
-    unescape_string, ElementType, Jsonb, JsonbHeader, ParseInfo, PathOperationMode,
-    SearchOperation, SetOperation,
+    jsonb_error_position, unescape_string, ElementType, Jsonb, JsonbHeader, ParseInfo,
+    PathOperationMode, SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
 use std::str::FromStr;
@@ -141,25 +141,44 @@ fn malformed_json_error(error: JsonError) -> LimboError {
     }
 }
 
-fn is_jsonb_blob(slice: &[u8]) -> Result<bool, TryReserveError> {
+/// SQLite's shallow "superficially looks like JSONB" test
+/// (jsonFuncArgMightBeBinary): the outer header must parse, claim
+/// exactly the whole blob, and a NULL/TRUE/FALSE element must have no
+/// payload. The payload bytes themselves are never examined, so a blob
+/// can pass this test and still fail full validation.
+fn looks_like_jsonb_blob(slice: &[u8]) -> bool {
+    if slice.is_empty() {
+        return false;
+    }
+    // SQLite reads the 8-byte size encoding (header nibble 15) with a
+    // 32-bit size, so the header only parses when the first four size
+    // bytes are zero.
+    if slice[0] >> 4 == 15 && (slice.len() < 9 || slice[1..5] != [0, 0, 0, 0]) {
+        return false;
+    }
     let Ok((header, header_offset)) = JsonbHeader::from_slice(0, slice) else {
-        return Ok(false);
+        return false;
     };
     let payload_size = header.payload_size();
-    let Some(total_expected) = header_offset.checked_add(payload_size) else {
-        return Ok(false);
-    };
-    if total_expected != slice.len() {
-        return Ok(false);
+    if header_offset.checked_add(payload_size) != Some(slice.len()) {
+        return false;
     }
-
-    // A one-byte header cannot identify JSONB: any blob's first byte parses as a
-    // plausible header, and the length check above still admits arbitrary data --
-    // an 8-byte blob starting `0x7C` reads as "OBJECT, 7-byte payload". So the
-    // whole document must validate, because later readers trust its interior
-    // offsets and decode its text payloads as `&str`.
-    let jsonb = Jsonb::from_raw_data(slice)?;
-    Ok(jsonb.is_valid())
+    if payload_size > 0
+        && matches!(
+            header.element_type(),
+            ElementType::NULL | ElementType::TRUE | ElementType::FALSE
+        )
+    {
+        return false;
+    }
+    // RFC 8259 text can only masquerade as JSONB when it starts with
+    // '{', '[' or a digit, and in every such coincidence the claimed
+    // payload is at most 7 bytes. Like SQLite, resolve those blobs by
+    // validating strictly and falling back to text when that fails.
+    if payload_size <= 7 && matches!(slice[0], b'{' | b'[' | b'0'..=b'9') {
+        return jsonb_error_position(slice) == 0;
+    }
+    true
 }
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
@@ -877,15 +896,13 @@ pub fn is_json_valid(json_value: impl AsValueRef) -> Result<Value, TryReserveErr
     Ok(match json_value {
         ValueRef::Null => Value::Null,
         ValueRef::Blob(blob) => {
-            let index = blob
-                .iter()
-                .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-                .unwrap_or(blob.len());
-            let slice = &blob[index..];
-            if is_jsonb_blob(slice)? {
+            // SQLite classifies the raw blob: anything that superficially
+            // looks like JSONB is invalid here, and only the rest is read
+            // as text (whose parser handles leading whitespace itself).
+            if looks_like_jsonb_blob(blob) {
                 Value::from_i64(0)
             } else {
-                strict_text_check(slice)?
+                strict_text_check(blob)?
             }
         }
         ValueRef::Text(text) => strict_text_check(text.as_str().as_bytes())?,
@@ -1928,24 +1945,5 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(result.unwrap().to_text().unwrap(), r#"{"field":"value"}"#,);
-    }
-
-    #[test]
-    fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
-        // `|` is 0x7C: OBJECT with a 7-byte inline payload, so this is exactly at
-        // the length where a scalar blob and a JSONB object are indistinguishable
-        // by header alone.
-        let overlapping_scalar = b"|1234567";
-        assert_eq!(overlapping_scalar.len(), 8);
-        assert!(!is_jsonb_blob(overlapping_scalar).expect(crate::alloc::ALLOC_ERR_MSG));
-    }
-
-    /// Object with a payload larger than a scalar blob, so header inspection
-    /// alone accepts it, but the TEXT5 key holds bytes that are not UTF-8.
-    /// Reading such a key used to reach `str::from_utf8_unchecked`.
-    #[test]
-    fn test_is_jsonb_blob_rejects_invalid_utf8_key() {
-        let invalid_utf8_key = b"\x9C\x79aaaaaa\xF0\x00";
-        assert!(!is_jsonb_blob(invalid_utf8_key).expect(crate::alloc::ALLOC_ERR_MSG));
     }
 }
