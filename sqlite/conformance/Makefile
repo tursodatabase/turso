@@ -71,8 +71,8 @@ run: build
 
 # Run tests with CLI backend (spawns tursodb subprocess)
 run-cli: build
-	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout 600 --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
-	$(TEST_RUNNER) run $(TURSO_TESTS) --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
+	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout 600 --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG) $(ARGS)
+	$(TEST_RUNNER) run $(TURSO_TESTS) --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG) $(ARGS)
 
 # Run tests with Rust backend (native turso bindings)
 run-rust: build-runner
