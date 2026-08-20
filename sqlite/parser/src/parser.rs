@@ -5481,6 +5481,22 @@ mod tests {
     }
 
     #[test]
+    fn test_namespace_qualified_parameter_names() {
+        // TCL passes `$::g` and `$ns::var` into SQL; each spelling is one
+        // parameter, keyed on its full text, and a repeat reuses its index.
+        let sql = "SELECT $ns::var, $::g, $ns::var, :::g, @a::b::";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        assert_eq!(cmd.to_string(), format!("{sql};"));
+        let index = |name: &str| p.named_variables[name.as_bytes()].get();
+        assert_eq!(index("$ns::var"), 1);
+        assert_eq!(index("$::g"), 2);
+        assert_eq!(index(":::g"), 3);
+        assert_eq!(index("@a::b::"), 4);
+        assert_eq!(p.named_variables.len(), 4);
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
