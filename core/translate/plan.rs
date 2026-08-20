@@ -2463,7 +2463,7 @@ fn query_output_columns(
                 None,
                 ColDef::default(),
             );
-            column.set_base_affinity(affinity);
+            column.override_affinity(affinity);
             column
         })
         .try_collect::<alloc::Vec<_>>()?;
@@ -2521,7 +2521,7 @@ impl JoinedTable {
                     None,
                     ColDef::default(),
                 );
-                column.set_base_affinity(affinity);
+                column.override_affinity(affinity);
                 column
             })
             .try_collect::<alloc::Vec<_>>()?;
@@ -2619,7 +2619,7 @@ impl JoinedTable {
         // see the stored value without the anchor query's affinity. Only the
         // outer read of the CTE keeps the derived affinity.
         for column in columns.iter_mut() {
-            column.set_base_affinity(Affinity::Blob);
+            column.override_affinity(Affinity::Blob);
         }
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),

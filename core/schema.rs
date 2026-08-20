@@ -3507,13 +3507,13 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs regardless of element type.
                 col.set_ty(Type::Blob);
-                col.set_base_affinity(Affinity::Blob);
+                col.override_affinity(Affinity::Blob);
                 continue;
             }
             if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
                 let (base_ty, _) = type_from_name(&resolved.primitive);
                 col.set_ty(base_ty);
-                col.set_base_affinity(Affinity::affinity(&resolved.primitive));
+                col.override_affinity(Affinity::affinity(&resolved.primitive));
             }
         }
     }
@@ -5241,8 +5241,8 @@ const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
 const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
 const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-// Bits 20-22: base type affinity override.
-// 0 = use ty_str-based affinity, anything else is `Affinity as u32`.
+// Bits 20-22: base type affinity. Column affinity will resolve to this
+// value only if it is > 0, else it uses ty_str.
 const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
 const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
@@ -5262,12 +5262,13 @@ impl Column {
         })
     }
 
-    /// Set the base type affinity override for a custom type column.
-    /// This ensures affinity rules use the custom type's BASE type
-    /// rather than applying SQLite name-based rules to the type name.
-    pub fn set_base_affinity(&mut self, affinity: Affinity) {
+    pub fn override_affinity(&mut self, affinity: Affinity) {
+        Self::set_raw_affinity(&mut self.raw, affinity);
+    }
+
+    fn set_raw_affinity(raw: &mut u32, affinity: Affinity) {
         let v: u32 = affinity as u32;
-        self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
+        *raw = (*raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
     }
 
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
@@ -5344,6 +5345,8 @@ impl Column {
         if coldef.hidden {
             raw |= F_HIDDEN
         }
+        Self::set_raw_affinity(&mut raw, Affinity::affinity(&ty_str));
+
         Self {
             name,
             ty_str,
@@ -7408,7 +7411,7 @@ mod tests {
                 None,
                 ColDef::default(),
             );
-            col.set_base_affinity(affinity);
+            col.override_affinity(affinity);
             assert_eq!(
                 col.affinity(),
                 affinity,
