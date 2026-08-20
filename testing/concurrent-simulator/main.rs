@@ -472,6 +472,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
             (10, Box::new(IntegrityCheckWorkload)),
+            (5, Box::new(PausedReadWorkload)),
         ];
 
         let p: Vec<Box<dyn Property>> = vec![
