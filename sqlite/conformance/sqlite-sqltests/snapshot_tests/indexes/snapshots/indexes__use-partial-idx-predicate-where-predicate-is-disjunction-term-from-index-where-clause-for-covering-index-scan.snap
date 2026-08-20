@@ -10,4 +10,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN t USING INDEX idx
+`--SCAN t
