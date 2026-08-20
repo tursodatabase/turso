@@ -1,13 +1,138 @@
 @database :memory:
 
+# One-argument json_valid() accepts only canonical RFC 8259 text.
+# JSON5-only syntax parses fine in the other JSON functions but must
+# return 0 here, matching SQLite.
+
+test json_valid_accepts_strict_document {
+    SELECT json_valid('{"a":5,"b":6}');
+}
+expect {
+    1
+}
+
+test json_valid_rejects_unquoted_object_keys {
+    SELECT json_valid('{a:5,b:6}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_object_trailing_comma {
+    SELECT json_valid('{"a":5, "b":6, }');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_array_trailing_comma {
+    SELECT json_valid('[5, 6,]');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_single_quoted_strings {
+    SELECT json_valid('{"a": ''abcd''}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_escaped_newline_in_string {
+    SELECT json_valid('{"a": "abc' || char(0x5c, 0x0a) || 'xyz"}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_raw_control_character_in_string {
+    SELECT json_valid('"abc' || char(1) || 'xyz"');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_plus_signed_number {
+    SELECT json_valid('{"x":+5}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_hex_number {
+    SELECT json_valid('{"x":0x35}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_trailing_dot_number {
+    SELECT json_valid('{"x":4.}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_infinity_literal {
+    SELECT json_valid('{"x":Infinity}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_nan_literal {
+    SELECT json_valid('{"x":NaN}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_comments {
+    SELECT json_valid('{"a":1} /*c*/'), json_valid('/*c*/ 1'), json_valid('// c
+1');
+}
+expect {
+    0|0|0
+}
+
+test json_valid_accepts_standard_escapes_and_whitespace {
+    SELECT json_valid('"aA\n\/b"'), json_valid(char(9,10,13,32)||'1');
+}
+expect {
+    1|1
+}
+
 # A JSON5-only escape or raw control byte keeps the string JSON5 even
 # when a standard escape follows it, and the stored JSONB element type
 # stays TEXT5 (0x69 header) rather than demoting to TEXTJ.
 test json_valid_json5_marking_survives_later_standard_escape {
-    SELECT hex(jsonb('"\x41\n"'));
+    SELECT json_valid('"\x41\n"'), json_valid('"a' || char(1) || '\n"'),
+           json_valid('"\n\x41"'), hex(jsonb('"\x41\n"'));
 }
 expect {
-    695C7834315C6E
+    0|0|0|695C7834315C6E
+}
+
+test json_valid_number_arguments_are_valid {
+    SELECT json_valid(123), json_valid(4.5);
+}
+expect {
+    1|1
+}
+
+test json_valid_infinite_float_argument_is_invalid {
+    SELECT json_valid(9e999), json_valid(-9e999);
+}
+expect {
+    0|0
+}
+
+test json_valid_error_position_still_json5_lenient {
+    SELECT json_valid('{"x":+0}'), NOT json_error_position('{"x":+0}');
+}
+expect {
+    0|1
 }
 
 # A string that hits end of input before its closing quote is

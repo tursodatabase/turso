@@ -17,8 +17,8 @@ use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
-    unescape_string, ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation,
-    SetOperation,
+    unescape_string, ElementType, Jsonb, JsonbHeader, ParseInfo, PathOperationMode,
+    SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
 use std::str::FromStr;
@@ -121,6 +121,17 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     let str = std::str::from_utf8(truncated)
         .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
+}
+
+/// Parses like [parse_as_json_text] but also reports whether the text
+/// used any JSON5-only syntax, which json_valid needs to tell strict
+/// RFC 8259 documents apart from merely parseable ones.
+fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)> {
+    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let truncated = &slice[..zero_pos];
+    let str = std::str::from_utf8(truncated)
+        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+    Jsonb::from_str_tracking(str).map_err(Into::into)
 }
 
 fn malformed_json_error(error: JsonError) -> LimboError {
@@ -857,8 +868,10 @@ where
     json_string_to_db_type(json, ElementType::OBJECT, OutputVariant::Binary)
 }
 
-/// Tries to convert the value to jsonb. Returns Value::from_i64(1) if the conversion
-/// succeeded, and Value::from_i64(0) if it didn't.
+/// Implements the one-argument json_valid(). Like SQLite, this form
+/// accepts only canonical RFC 8259 text: JSON5-only syntax and JSONB
+/// blobs both return 0 even though the rest of the JSON functions
+/// accept them.
 pub fn is_json_valid(json_value: impl AsValueRef) -> Result<Value, TryReserveError> {
     let json_value = json_value.as_value_ref();
     Ok(match json_value {
@@ -872,19 +885,24 @@ pub fn is_json_valid(json_value: impl AsValueRef) -> Result<Value, TryReserveErr
             if is_jsonb_blob(slice)? {
                 Value::from_i64(0)
             } else {
-                match parse_as_json_text(slice, Conv::Strict) {
-                    Ok(_) => Value::from_i64(1),
-                    Err(LimboError::OutOfMemory) => return Err(TryReserveError),
-                    Err(_) => Value::from_i64(0),
-                }
+                strict_text_check(slice)?
             }
         }
-        _ => match convert_dbtype_to_jsonb(json_value, Conv::Strict) {
-            Ok(_) => Value::from_i64(1),
-            Err(LimboError::OutOfMemory) => return Err(TryReserveError),
-            Err(_) => Value::from_i64(0),
-        },
+        ValueRef::Text(text) => strict_text_check(text.as_str().as_bytes())?,
+        ValueRef::Numeric(Numeric::Float(float)) => {
+            let float: f64 = float.into();
+            Value::from_i64(i64::from(!float.is_infinite()))
+        }
+        ValueRef::Numeric(_) => Value::from_i64(1),
     })
+}
+
+fn strict_text_check(slice: &[u8]) -> Result<Value, TryReserveError> {
+    match parse_as_json_text_tracking(slice) {
+        Ok((_, info)) => Ok(Value::from_i64(i64::from(!info.has_json5))),
+        Err(LimboError::OutOfMemory) => Err(TryReserveError),
+        Err(_) => Ok(Value::from_i64(0)),
+    }
 }
 
 pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
