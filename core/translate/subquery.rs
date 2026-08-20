@@ -1138,11 +1138,11 @@ fn update_column_used_masks(
             if let Some(joined_table) =
                 table_refs.find_joined_table_by_internal_id_mut(child_outer_query_ref.internal_id)
             {
-                // Propagate column_use_counts so that expression index coverage
+                // Propagate column_use_counts so that index coverage
                 // checks see the additional references from correlated subqueries.
-                // Without this, apply_expression_index_coverage() may conclude that
-                // all uses of a column are satisfied by an expression index when in
-                // fact the correlated subquery needs the column directly.
+                // Without this, apply_index_coverage() may conclude that all uses
+                // of a column are satisfied by index metadata when in fact the
+                // correlated subquery needs the column directly.
                 for col_idx in child_outer_query_ref.col_used_mask.iter() {
                     if col_idx >= joined_table.column_use_counts.len() {
                         joined_table.column_use_counts.resize(col_idx + 1, 0);

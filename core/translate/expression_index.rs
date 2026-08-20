@@ -8,6 +8,34 @@ use crate::Result;
 use turso_parser::ast;
 use turso_parser::ast::TableInternalId;
 
+pub(crate) fn normalize_bound_expr_for_index_matching(
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+) -> ast::Expr {
+    let mut expr = expr.clone();
+    let columns = table_reference.table.columns();
+
+    let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Column { column, .. } => {
+                if let Some(name) = columns.get(*column).and_then(|c| c.name.as_ref()) {
+                    *e = ast::Expr::Id(ast::Name::exact(name.clone()));
+                }
+            }
+            ast::Expr::RowId { .. } => {
+                *e = ast::Expr::Id(ast::Name::exact(ROWID_STRS[0].to_string()));
+            }
+            _ => {}
+        }
+
+        Ok(WalkControl::Continue)
+    };
+
+    let _ = walk_expr_mut(&mut expr, &mut normalize);
+
+    expr
+}
+
 /// Normalize a query expression so it can be compared with an
 /// expression stored on an index definition.
 ///
@@ -23,29 +51,13 @@ pub fn normalize_expr_for_index_matching(
     table_reference: &JoinedTable,
     table_references: &TableReferences,
 ) -> ast::Expr {
-    let mut expr = expr.clone();
     let _table_idx = table_references
         .joined_tables()
         .iter()
         .position(|t| t.internal_id == table_reference.internal_id)
         .expect("table must exist in table_references");
-    let columns = table_reference.table.columns();
-    let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Column { column, .. } => {
-                if let Some(name) = columns.get(*column).and_then(|c| c.name.as_ref()) {
-                    *e = ast::Expr::Id(ast::Name::exact(name.clone()));
-                }
-            }
-            ast::Expr::RowId { .. } => {
-                *e = ast::Expr::Id(ast::Name::exact(ROWID_STRS[0].to_string()));
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    };
-    let _ = walk_expr_mut(&mut expr, &mut normalize);
-    expr
+
+    normalize_bound_expr_for_index_matching(expr, table_reference)
 }
 
 /// Determine whether an expression references columns from exactly one table

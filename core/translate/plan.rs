@@ -12,8 +12,13 @@ use crate::{
             as_binary_components, expr_data_type, get_expr_affinity, get_expr_affinity_info,
             ExprAffinityInfo, StorageClassMask,
         },
-        expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
-        optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
+        expression_index::{
+            normalize_bound_expr_for_index_matching, normalize_expr_for_index_matching,
+            single_table_column_usage,
+        },
+        optimizer::constraints::{
+            partial_index_predicate_conjuncts, BinaryExprSide, SeekRangeConstraint,
+        },
         planner::determine_where_to_eval_term,
     },
     types::SeekOp,
@@ -1193,20 +1198,16 @@ pub struct JoinedTable {
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
-    /// Count of how many times each column is referenced.
-    ///
-    /// Expression indexes can satisfy a column requirement if the column is
-    /// only used to build the expression itself. Tracking counts lets us
-    /// subtract a column from the covering set only when every usage is
-    /// accounted for by an expression index.
+    /// Tracks how many times each column is referenced so it can be removed
+    /// from the covering set only when every usage is satisfied by the index.
     pub column_use_counts: Vec<usize>,
-    /// Expressions referencing this table that may be satisfied by an expression index.
+    /// Expressions referencing this table that may be satisfied by index metadata.
     ///
     /// Each entry stores the normalized expression text and the columns it
-    /// needs. During covering checks we ask: does an index contain this
-    /// expression? If yes, all columns that *only* feed this expression can be
-    /// removed from the required-column set.
-    pub expression_index_usages: Vec<ExpressionIndexUsage>,
+    /// needs. During covering checks we ask whether those column references
+    /// are covered by an expression-index key or by a proven partial-index
+    /// predicate.
+    pub expression_index_usages: Vec<IndexCoverageUsage>,
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
@@ -1433,19 +1434,29 @@ impl TableReferences {
             .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
     }
 
-    /// Resets the expression index usages for all joined tables.
-    pub fn reset_expression_index_usages(&mut self) {
+    /// Resets the index coverage usages for all joined tables.
+    pub fn reset_index_coverage_usages(&mut self) {
         for table in self.joined_tables.iter_mut() {
-            table.clear_expression_index_usages();
+            table.clear_index_coverage_usages();
         }
     }
 
-    /// Called before optimization so we can reuse the same registration
-    /// for result columns, ORDER BY, and GROUP BY expressions. If a
-    /// SELECT lists `LOWER(name)` and an index exists on `LOWER(name)`, we
-    /// can plan a covering scan because the expression value lives inside
-    /// the index key.
     pub fn register_expression_index_usage(&mut self, expr: &ast::Expr) {
+        self.register_index_coverage_usage(expr, true, false);
+    }
+
+    pub fn register_partial_index_predicate_usage(&mut self, expr: &ast::Expr) {
+        self.register_index_coverage_usage(expr, false, true);
+    }
+
+    /// Called before optimization so we can reuse the same registration for
+    /// result columns, ORDER BY, GROUP BY, and partial-index predicates.
+    fn register_index_coverage_usage(
+        &mut self,
+        expr: &ast::Expr,
+        expression_index: bool,
+        partial_index_predicate: bool,
+    ) {
         let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
             return;
         };
@@ -1462,7 +1473,12 @@ impl TableReferences {
             .iter_mut()
             .find(|t| t.internal_id == table_id)
         {
-            table_ref_mut.register_expression_index_usage(normalized, columns_mask);
+            table_ref_mut.register_index_coverage_usage(
+                normalized,
+                columns_mask,
+                expression_index,
+                partial_index_predicate,
+            );
         }
     }
 
@@ -2164,13 +2180,18 @@ impl<T> TryFrom<u128> for BitSet<T> {
 }
 
 #[derive(Clone, Debug)]
-pub struct ExpressionIndexUsage {
-    /// Normalized (non-bound) ast of the expression as stored on an index column.
-    /// Example: `lower(name)` for INDEX ON t(lower(name)).
+pub struct IndexCoverageUsage {
+    /// Normalized (non-bound) AST of the expression.
     pub normalized_expr: Box<ast::Expr>,
-    /// Columns required to compute the expression. Helps decide whether using
-    /// the expression value from the index fully covers those column reads.
+
+    /// Columns referenced by the expression.
     pub columns_mask: ColumnUsedMask,
+
+    /// Whether an expression-index key may satisfy this usage.
+    pub expression_index: bool,
+
+    /// Whether a proven partial-index predicate may satisfy this usage.
+    pub partial_index_predicate: bool,
 }
 
 /// Represents one key pair in a hash join equality condition.
@@ -2664,46 +2685,51 @@ impl JoinedTable {
         self.col_used_mask.set(index).expect("TODO: alloc error");
     }
 
-    /// Clear any previously registered expression index usages.
-    pub fn clear_expression_index_usages(&mut self) {
+    /// Clear any previously registered index coverage usages.
+    pub fn clear_index_coverage_usages(&mut self) {
         self.expression_index_usages.clear();
     }
 
-    /// Example: SELECT a+b FROM t WHERE a+b=5 with INDEX ON t(a+b)
-    /// We want to remember that (a+b) is available on an index key and that
-    /// columns a and b are only needed to produce that expression. Later we
-    /// can avoid opening the table cursor if all column references are
-    /// covered by expression keys.
-    pub fn register_expression_index_usage(
+    fn register_index_coverage_usage(
         &mut self,
         normalized_expr: ast::Expr,
         columns_mask: ColumnUsedMask,
+        expression_index: bool,
+        partial_index_predicate: bool,
     ) {
         if columns_mask.is_empty() {
             return;
         }
-        if self
+        if let Some(usage) = self
             .expression_index_usages
-            .iter()
-            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
+            .iter_mut()
+            .find(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
         {
+            debug_assert_eq!(usage.columns_mask, columns_mask);
+            usage.expression_index |= expression_index;
+            usage.partial_index_predicate |= partial_index_predicate;
             return;
         }
-        self.expression_index_usages.push(ExpressionIndexUsage {
+        self.expression_index_usages.push(IndexCoverageUsage {
             normalized_expr: Box::new(normalized_expr),
             columns_mask,
+            expression_index,
+            partial_index_predicate,
         });
     }
 
-    /// Provided an index that may contain expression keys, remove any
-    /// columns from `required_columns` that are fully covered by expression index values.
-    fn apply_expression_index_coverage(
-        &self,
-        index: &Index,
-        required_columns: &mut ColumnUsedMask,
-    ) {
+    /// Provided an index, remove any columns from `required_columns` that are
+    /// fully covered by index metadata.
+    fn apply_index_coverage(&self, index: &Index, required_columns: &mut ColumnUsedMask) {
         let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
         let mut any_covered = false;
+        let partial_index_predicates =
+            partial_index_predicate_conjuncts(index, self).map(|predicates| {
+                predicates
+                    .into_iter()
+                    .map(|predicate| normalize_bound_expr_for_index_matching(&predicate, self))
+                    .collect::<Vec<_>>()
+            });
         for usage in &self.expression_index_usages {
             // If the index stores the expression (e.g. idx on lower(name)), all
             // columns needed *solely* for that expression can be treated as
@@ -2712,10 +2738,19 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
-            if index
-                .expression_to_index_pos(&usage.normalized_expr)
-                .is_some()
-            {
+            let covered_by_expression_index = usage.expression_index
+                && index
+                    .expression_to_index_pos(&usage.normalized_expr)
+                    .is_some();
+
+            let covered_by_partial_index = usage.partial_index_predicate
+                && partial_index_predicates.as_ref().is_some_and(|predicates| {
+                    predicates
+                        .iter()
+                        .any(|predicate| exprs_are_equivalent(predicate, &usage.normalized_expr))
+                });
+
+            if covered_by_expression_index || covered_by_partial_index {
                 any_covered = true;
                 for col_idx in usage.columns_mask.iter() {
                     if col_idx >= coverage_counts.len() {
@@ -2873,7 +2908,7 @@ impl JoinedTable {
             Self::index_covers_columns(index, btree, &self.col_used_mask)
         } else {
             let mut required_columns = self.col_used_mask.clone();
-            self.apply_expression_index_coverage(index, &mut required_columns);
+            self.apply_index_coverage(index, &mut required_columns);
             if required_columns.is_empty() {
                 return true;
             }

@@ -10,4 +10,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN samples USING INDEX samples_user_processed_idx
+`--SCAN samples USING COVERING INDEX samples_user_processed_idx

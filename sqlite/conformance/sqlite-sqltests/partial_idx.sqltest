@@ -1164,7 +1164,7 @@ test plan-partial-index-and-where-eq-seek {
         WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'foo';
 }
 expect {
-    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+    1|0|0|SEARCH samples USING COVERING INDEX samples_pidx (name=?)
 }
 
 @skip-if sqlite "query plan explanation output is different in sqlite"
@@ -1176,7 +1176,7 @@ test plan-partial-index-and-where-reversed-order {
         WHERE attack_score IS NOT NULL AND library_id IS NULL AND name = 'foo';
 }
 expect {
-    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+    1|0|0|SEARCH samples USING COVERING INDEX samples_pidx (name=?)
 }
 
 # Partial index WHERE uses qualified column references; query references the same columns unqualified.
@@ -1190,7 +1190,7 @@ test plan-partial-index-qualified-where-matches {
         WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'foo';
 }
 expect {
-    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+    1|0|0|SEARCH samples USING COVERING INDEX samples_pidx (name=?)
 }
 
 # Partial index drives a full scan when the query WHERE matches the index
@@ -1204,7 +1204,139 @@ test plan-partial-index-full-scan-when-where-matched {
         WHERE library_id IS NULL AND attack_score IS NOT NULL;
 }
 expect {
-    1|0|0|SCAN samples USING INDEX samples_user_processed_idx
+    1|0|0|SCAN samples USING COVERING INDEX samples_user_processed_idx
+}
+
+# A column referenced only by the predicate of a partial index does not need
+# to be read from the table, allowing the index to be covering.
+# https://github.com/tursodatabase/turso/issues/8376
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-predicate-allows-covering-scan {
+    CREATE TABLE partial_covering(a INTEGER, b INTEGER);
+    CREATE INDEX partial_covering_idx ON partial_covering(a) WHERE b < 5;
+
+    EXPLAIN QUERY PLAN
+        SELECT a FROM partial_covering WHERE b < 5;
+}
+expect {
+    1|0|0|SCAN partial_covering USING COVERING INDEX partial_covering_idx
+}
+
+# The partial-index predicate is enough to satisfy b < 5,
+# so only column a has to be read from the index.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-predicate-can-cover {
+    CREATE TABLE partial_covering_seek(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX partial_covering_seek_idx ON partial_covering_seek(a) WHERE b < 5;
+
+    EXPLAIN QUERY PLAN
+        SELECT a
+        FROM partial_covering_seek
+        WHERE b < 5 AND a > 10;
+}
+expect {
+    1|0|0|SEARCH partial_covering_seek USING COVERING INDEX partial_covering_seek_idx (a>?)
+}
+
+# b is also part of the result, so its actual value still has to
+# be read from the table.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-selected-predicate-column-is-not-covering {
+    CREATE TABLE partial_covering_selected(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX partial_covering_selected_idx ON partial_covering_selected(a) WHERE b < 5;
+
+    EXPLAIN QUERY PLAN
+        SELECT a, b
+        FROM partial_covering_selected
+        WHERE b < 5 AND a > 10;
+}
+expect {
+    1|0|0|SEARCH partial_covering_selected USING INDEX partial_covering_selected_idx (a>?)
+}
+
+# Only one matching WHERE term is consumed by the partial-index proof.
+# The duplicate predicate still requires evaluating b.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-duplicate-predicate-is-not-covering {
+    CREATE TABLE partial_covering_duplicate(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX partial_covering_duplicate_idx ON partial_covering_duplicate(a) WHERE b < 5;
+
+    EXPLAIN QUERY PLAN
+        SELECT a
+        FROM partial_covering_duplicate
+        WHERE b < 5 AND b < 5 AND a > 10;
+}
+expect {
+    1|0|0|SEARCH partial_covering_duplicate USING INDEX partial_covering_duplicate_idx (a>?)
+}
+
+# c = 1 is not guaranteed by the partial index and c is not stored
+# in the index, so the table is still required.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-residual-filter-is-not-covering {
+    CREATE TABLE partial_covering_residual(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX partial_covering_residual_idx ON partial_covering_residual(a) WHERE b < 5;
+
+    EXPLAIN QUERY PLAN
+        SELECT a
+        FROM partial_covering_residual
+        WHERE b < 5 AND c = 1 AND a > 10;
+}
+expect {
+    1|0|0|SEARCH partial_covering_residual USING INDEX partial_covering_residual_idx (a>?)
+}
+
+# A partial index and an expression index can coexist without making
+# the expression index incorrectly cover a WHERE predicate.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-does-not-leak-coverage-to-expression-index {
+    CREATE TABLE mixed_indexes(
+        id INTEGER PRIMARY KEY,
+        b INTEGER,
+        c INTEGER
+    );
+
+    CREATE INDEX mixed_expr_idx
+        ON mixed_indexes((b < 5));
+
+    CREATE INDEX mixed_partial_idx
+        ON mixed_indexes(c)
+        WHERE c > 0;
+
+    EXPLAIN QUERY PLAN
+        SELECT id
+        FROM mixed_indexes INDEXED BY mixed_expr_idx
+        WHERE b < 5;
+}
+expect {
+    1|0|0|SCAN mixed_indexes USING INDEX mixed_expr_idx
+}
+
+# Verify that expression-index values and a partial-index predicate can
+# satisfy the query together without changing the result.
+test expression-partial-index-can-cover-both-parts {
+    CREATE TABLE mixed_partial_expr(
+        name TEXT,
+        active INTEGER
+    );
+
+    CREATE INDEX mixed_partial_expr_idx
+        ON mixed_partial_expr(lower(name))
+        WHERE active = 1;
+
+    INSERT INTO mixed_partial_expr VALUES
+        ('Alice', 1),
+        ('Bob', 1),
+        ('Carol', 0);
+
+    SELECT lower(name)
+    FROM mixed_partial_expr INDEXED BY mixed_partial_expr_idx
+    WHERE active = 1
+    ORDER BY lower(name);
+}
+expect {
+    alice
+    bob
 }
 
 # Partial index must NOT be used when the query only satisfies a subset of the
@@ -1229,7 +1361,7 @@ test plan-partial-index-equality-predicate {
         SELECT id FROM products WHERE status = 'active' AND sku = 'X';
 }
 expect {
-    1|0|0|SEARCH products USING INDEX idx_active_sku (sku=?)
+    1|0|0|SEARCH products USING COVERING INDEX idx_active_sku (sku=?)
 }
 
 # Partial index with range predicate in WHERE.
@@ -1240,7 +1372,7 @@ test plan-partial-index-range-predicate {
     EXPLAIN QUERY PLAN SELECT id FROM products WHERE price > 100 AND sku = 'X';
 }
 expect {
-    1|0|0|SEARCH products USING INDEX idx_expensive (sku=?)
+    1|0|0|SEARCH products USING COVERING INDEX idx_expensive (sku=?)
 }
 
 # Partial index whose WHERE predicate is *not* implied by the query → fallback

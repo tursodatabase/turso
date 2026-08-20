@@ -165,10 +165,11 @@ pub fn translate_expr(
 
     // At the very start we try to satisfy the expression from an expression index
     let has_expression_indexes = referenced_tables.is_some_and(|tables| {
-        tables
-            .joined_tables()
-            .iter()
-            .any(|t| !t.expression_index_usages.is_empty())
+        tables.joined_tables().iter().any(|t| {
+            t.expression_index_usages
+                .iter()
+                .any(|usage| usage.expression_index)
+        })
     });
     if has_expression_indexes
         && try_emit_expression_index_value(program, referenced_tables, expr, target_register)?

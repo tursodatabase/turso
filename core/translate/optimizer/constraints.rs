@@ -1458,45 +1458,67 @@ pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[u
     ordered
 }
 
+pub(crate) fn partial_index_predicate_conjuncts(
+    index: &Index,
+    table_reference: &JoinedTable,
+) -> Option<Vec<ast::Expr>> {
+    let index_where = index.where_clause.as_ref()?;
+
+    // Bind the index WHERE expression's column references to this query's
+    // table reference, rewrite equivalent predicate forms, and split the
+    // predicate into individual AND conjuncts.
+    let mut bound = (**index_where).clone();
+    bind_partial_index_columns(&mut bound, table_reference);
+    rewrite_between_exprs(&mut bound).ok()?;
+
+    let mut conjuncts = Vec::new();
+    break_predicate_at_and_boundaries(&bound, &mut conjuncts);
+
+    Some(conjuncts)
+}
+
 pub(super) fn partial_index_predicate_terms(
     index: &Index,
     table_reference: &JoinedTable,
     query_where_clause: &[WhereTerm],
 ) -> Option<SmallVec<[usize; 4]>> {
-    let index_where = index
+    index
         .where_clause
         .as_ref()
         .expect("partial_index_predicate_terms requires a partial index");
+
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
             return true;
         };
+
         if join_info.is_full_outer() {
             return false;
         }
+
         if join_info.is_outer() {
             return term.from_outer_join == Some(table_reference.internal_id);
         }
+
         true
     };
-    // Bind the index WHERE expression's column references to this query's
-    // table reference so it can be compared symmetrically against bound query
-    // WHERE terms. Each conjunct of the index WHERE must match some query
-    // WHERE term for the partial index to be safe to use.
-    let mut bound = (**index_where).clone();
-    bind_partial_index_columns(&mut bound, table_reference);
-    rewrite_between_exprs(&mut bound).ok()?;
-    let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
-    break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
+
+    let index_conjuncts = partial_index_predicate_conjuncts(index, table_reference)?;
+
+    // Each conjunct of the index WHERE must match a query WHERE term for
+    // the partial index to be safe to use.
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
-    for index_conjunct in index_conjuncts.iter() {
+
+    for index_conjunct in &index_conjuncts {
         let (term_idx, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
             can_use_query_term(term) && exprs_are_equivalent(index_conjunct, &term.expr)
         })?;
+
         if !matched_terms.contains(&term_idx) {
             matched_terms.push(term_idx);
         }
     }
+
     Some(matched_terms)
     // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).

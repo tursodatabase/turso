@@ -1872,15 +1872,16 @@ fn optimize_table_access_with_custom_modules(
     Ok(false)
 }
 
-/// We do a single pass over projected, grouping, and ordering expressions to
-/// capture every expression that could be served directly from an expression index.
+/// We do a single pass over projected, grouping, ordering, and filtering
+/// expressions to capture every expression whose column reads may be covered by
+/// index metadata.
 /// Example:
 ///   CREATE INDEX idx ON t(lower(a));
 ///   SELECT lower(a) FROM t ORDER BY lower(a);
 /// Both the SELECT list and ORDER BY can be covered by idx, avoiding a
 /// table cursor entirely. Recording them upfront lets both the cost model
 /// and covering checks reuse the same facts.
-fn register_expression_index_usages_for_plan(
+fn register_index_coverage_usages_for_plan(
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
     order_by: &[(
@@ -1889,8 +1890,10 @@ fn register_expression_index_usages_for_plan(
         Option<turso_parser::ast::NullsOrder>,
     )],
     group_by: Option<&GroupBy>,
+    where_clause: &[WhereTerm],
+    has_partial_index: bool,
 ) {
-    table_references.reset_expression_index_usages();
+    table_references.reset_index_coverage_usages();
     for rc in result_columns {
         table_references.register_expression_index_usage(&rc.expr);
     }
@@ -1905,6 +1908,11 @@ fn register_expression_index_usages_for_plan(
             for expr in having {
                 table_references.register_expression_index_usage(expr);
             }
+        }
+    }
+    if has_partial_index {
+        for term in where_clause {
+            table_references.register_partial_index_predicate_usage(&term.expr);
         }
     }
 }
@@ -2315,12 +2323,20 @@ fn find_table_access_plan(
             .is_some_and(|indexes| indexes.iter().any(|index| index.is_expression_index())))
     });
 
-    if has_expression_index {
-        register_expression_index_usages_for_plan(
+    let has_partial_index = table_references.joined_tables().iter().any(|t| {
+        matches!(&t.table, Table::BTree(_) if available_indexes
+        .indexes_for_table(t.internal_id)
+        .is_some_and(|indexes| indexes.iter().any(|index| index.where_clause.is_some())))
+    });
+
+    if has_expression_index || has_partial_index {
+        register_index_coverage_usages_for_plan(
             table_references,
             result_columns,
             order_by.as_slice(),
             group_by.as_ref(),
+            where_clause,
+            has_partial_index,
         );
     }
 
