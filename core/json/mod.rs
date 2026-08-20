@@ -785,8 +785,16 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             Ok(_) => Ok(Value::from_i64(0)),
             Err(JsonError::Message { location, .. }) => {
                 if let Some(loc) = location {
-                    let one_indexed = loc + 1;
-                    Ok(Value::from_i64(one_indexed as i64))
+                    // The parser reports a byte offset, but SQLite
+                    // reports the position in characters (jsonErrorFunc
+                    // counts the non-continuation bytes before the
+                    // error), which differs for multibyte UTF-8 input.
+                    let byte_offset = loc.min(t.as_str().len());
+                    let char_offset = t.as_str().as_bytes()[..byte_offset]
+                        .iter()
+                        .filter(|&&b| !(0x80..0xC0).contains(&b))
+                        .count();
+                    Ok(Value::from_i64(char_offset as i64 + 1))
                 } else {
                     Err(crate::error::LimboError::InternalError(
                         "failed to determine json error position".into(),

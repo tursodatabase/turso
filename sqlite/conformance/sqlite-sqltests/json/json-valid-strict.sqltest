@@ -203,6 +203,17 @@ expect error {
     ^(Runtime error: )?(Parse error: )?malformed JSON$
 }
 
+# The error position counts characters, not bytes: é is one character
+# but two UTF-8 bytes, both before an unterminated end of input and
+# before any other syntax error.
+test json_error_position_counts_characters_not_bytes {
+    SELECT json_error_position('"é'), json_error_position('"日本'),
+           json_error_position('{"é": x}');
+}
+expect {
+    3|4|7
+}
+
 # Two-argument json_valid(X, Y): Y is a bitmask picking which
 # representations count as valid (1 = strict RFC 8259 text, 2 = JSON5
 # text, 4 = blob that superficially looks like JSONB, 8 = blob that is
