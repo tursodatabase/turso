@@ -1,0 +1,116 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires-file materialized_views ""
+
+# Rows inserted before the view exists: the from-scratch populate path.
+test ivm-null-where-neq-string {
+    CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT);
+    INSERT INTO items VALUES ('a', 'Alice');
+    INSERT INTO items VALUES ('b', 'Bob');
+    INSERT INTO items VALUES ('c', NULL);
+    INSERT INTO items VALUES ('d', NULL);
+    INSERT INTO items VALUES ('e', '');
+
+    CREATE MATERIALIZED VIEW named AS SELECT id, name FROM items WHERE name != '';
+
+    SELECT id, name FROM named ORDER BY id;
+}
+expect {
+    a|Alice
+    b|Bob
+}
+
+test ivm-null-where-lt-string {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'apple');
+    INSERT INTO t VALUES (2, NULL);
+    INSERT INTO t VALUES (3, 'banana');
+    INSERT INTO t VALUES (4, NULL);
+    INSERT INTO t VALUES (5, 'cherry');
+
+    CREATE MATERIALIZED VIEW mv_lt AS SELECT id, val FROM t WHERE val < 'cherry';
+
+    SELECT id, val FROM mv_lt ORDER BY id;
+}
+expect {
+    1|apple
+    3|banana
+}
+
+test ivm-null-where-neq-incremental {
+    CREATE TABLE data (id INTEGER PRIMARY KEY, status TEXT);
+
+    CREATE MATERIALIZED VIEW active AS SELECT id, status FROM data WHERE status != 'deleted';
+
+    INSERT INTO data VALUES (1, 'active');
+    INSERT INTO data VALUES (2, NULL);
+    INSERT INTO data VALUES (3, 'pending');
+    INSERT INTO data VALUES (4, NULL);
+
+    SELECT id, status FROM active ORDER BY id;
+}
+expect {
+    1|active
+    3|pending
+}
+
+# `x <op> NULL` is NULL for every row, so none of these views may contain anything.
+test ivm-null-literal-comparisons {
+    CREATE TABLE nl (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE MATERIALIZED VIEW nl_eq  AS SELECT id FROM nl WHERE x =  NULL;
+    CREATE MATERIALIZED VIEW nl_neq AS SELECT id FROM nl WHERE x != NULL;
+    CREATE MATERIALIZED VIEW nl_gt  AS SELECT id FROM nl WHERE x >  NULL;
+    CREATE MATERIALIZED VIEW nl_ge  AS SELECT id FROM nl WHERE x >= NULL;
+    CREATE MATERIALIZED VIEW nl_lt  AS SELECT id FROM nl WHERE x <  NULL;
+    CREATE MATERIALIZED VIEW nl_le  AS SELECT id FROM nl WHERE x <= NULL;
+    INSERT INTO nl VALUES (1, 'a');
+    INSERT INTO nl VALUES (2, NULL);
+    SELECT 'eq',  id FROM nl_eq;
+    SELECT 'neq', id FROM nl_neq;
+    SELECT 'gt',  id FROM nl_gt;
+    SELECT 'ge',  id FROM nl_ge;
+    SELECT 'lt',  id FROM nl_lt;
+    SELECT 'le',  id FROM nl_le;
+}
+expect {
+}
+
+# 3VL through AND/OR: NULL OR true is true, NULL AND anything is not true.
+test ivm-null-3vl-compound-and-or {
+    CREATE TABLE cp (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE MATERIALIZED VIEW cp_or  AS SELECT id FROM cp WHERE a > 5 OR  b = 1;
+    CREATE MATERIALIZED VIEW cp_and AS SELECT id FROM cp WHERE a > 5 AND b = 1;
+    CREATE MATERIALIZED VIEW cp_col AS SELECT id FROM cp WHERE a < b;
+    INSERT INTO cp VALUES (1, NULL, 1);
+    INSERT INTO cp VALUES (2, 10, NULL);
+    INSERT INTO cp VALUES (3, NULL, NULL);
+    INSERT INTO cp VALUES (4, 10, 1);
+    INSERT INTO cp VALUES (5, 1, 2);
+    SELECT 'or',  id FROM cp_or  ORDER BY id;
+    SELECT 'and', id FROM cp_and ORDER BY id;
+    SELECT 'col', id FROM cp_col ORDER BY id;
+}
+expect {
+    or|1
+    or|2
+    or|4
+    and|4
+    col|5
+}
+
+test ivm-null-where-neq-after-update {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);
+
+    CREATE MATERIALIZED VIEW mv2 AS SELECT id, val FROM t2 WHERE val != '';
+
+    INSERT INTO t2 VALUES (1, 'hello');
+    INSERT INTO t2 VALUES (2, NULL);
+    INSERT INTO t2 VALUES (3, 'world');
+
+    UPDATE t2 SET val = NULL WHERE id = 1;
+
+    SELECT id, val FROM mv2 ORDER BY id;
+}
+expect {
+    3|world
+}
