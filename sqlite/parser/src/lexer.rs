@@ -865,9 +865,13 @@ impl<'a> Lexer<'a> {
         // the name is identifier bytes, and a "::" pair anywhere in it —
         // leading, middle or trailing — is part of the name. That is what
         // lets the TCL binding pass namespace-qualified variables ($::var,
-        // $ns::var) as one parameter. At least one identifier byte is
-        // required, so a bare `$` or `$::` is still an error.
+        // $ns::var) as one parameter. After at least one identifier byte,
+        // one "(...)" suffix ends the name, for TCL array elements like
+        // $arr(elem); it must be closed and may not contain whitespace.
+        // At least one identifier byte is required, so a bare `$` or `$::`
+        // is still an error.
         let mut n_id = 0usize;
+        let mut bad_suffix = false;
         loop {
             match self.peek() {
                 Some(b) if is_identifier_continue(b) => {
@@ -878,11 +882,22 @@ impl<'a> Lexer<'a> {
                     self.eat();
                     self.eat();
                 }
+                Some(b'(') if n_id > 0 => {
+                    self.eat();
+                    self.eat_while(|b| b != b')' && !b.is_ascii_whitespace());
+                    if self.peek() == Some(b')') {
+                        self.eat();
+                    } else {
+                        // Unclosed, or whitespace inside the suffix.
+                        bad_suffix = true;
+                    }
+                    break;
+                }
                 _ => break,
             }
         }
 
-        if n_id == 0 {
+        if n_id == 0 || bad_suffix {
             let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
             return Err(Error::BadVariableName {
                 span: (start, self.offset - start).into(),
@@ -1127,6 +1142,27 @@ mod tests {
                 b"$1::2".as_slice(),
                 Token::new(b"$1::2", TokenType::TK_VARIABLE),
             ),
+            // TCL array elements: one "(...)" suffix, no whitespace inside.
+            (
+                b"$arr(elem)".as_slice(),
+                Token::new(b"$arr(elem)", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$arr(12x)".as_slice(),
+                Token::new(b"$arr(12x)", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$a([b])".as_slice(),
+                Token::new(b"$a([b])", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$a('b')".as_slice(),
+                Token::new(b"$a('b')", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$ns::arr(k)".as_slice(),
+                Token::new(b"$ns::arr(k)", TokenType::TK_VARIABLE),
+            ),
             (
                 b"x'1234567890abcdef'".as_slice(),
                 Token::new(b"x'1234567890abcdef'", TokenType::TK_BLOB),
@@ -1170,9 +1206,20 @@ mod tests {
     #[test]
     fn test_lexer_bad_variable_names() {
         // A named parameter needs at least one identifier byte; "::" pairs
-        // alone do not make a name. Same as SQLite, which reports these as
+        // alone do not make a name, and a "(...)" suffix must be closed with
+        // no whitespace inside. Same as SQLite, which reports these as
         // unrecognized tokens.
-        let bad_inputs: Vec<&[u8]> = vec![b"$", b"$::", b"@", b"::::a"];
+        let bad_inputs: Vec<&[u8]> = vec![
+            b"$",
+            b"$::",
+            b"@",
+            b"::::a",
+            b"$(",
+            b"$(elem)",
+            b"$a(unclosed",
+            b"$a(x y)",
+            b"$a(b;",
+        ];
         for input in bad_inputs {
             let mut lexer = Lexer::new(input);
             let result = lexer.next().unwrap();
@@ -1494,6 +1541,31 @@ mod tests {
                     Token::new(b"$x::", TokenType::TK_VARIABLE),
                     Token::new(b" ", TokenType::TK_NONE),
                     Token::new(b"y", TokenType::TK_ID),
+                ],
+            ),
+            // The "(...)" suffix ends the name: what follows is a new token.
+            (
+                b"$a(b)c".as_slice(),
+                vec![
+                    Token::new(b"$a(b)", TokenType::TK_VARIABLE),
+                    Token::new(b"c", TokenType::TK_ID),
+                ],
+            ),
+            (
+                b"$a(b)+$c(d)".as_slice(),
+                vec![
+                    Token::new(b"$a(b)", TokenType::TK_VARIABLE),
+                    Token::new(b"+", TokenType::TK_PLUS),
+                    Token::new(b"$c(d)", TokenType::TK_VARIABLE),
+                ],
+            ),
+            (
+                b"$a(b)(c)".as_slice(),
+                vec![
+                    Token::new(b"$a(b)", TokenType::TK_VARIABLE),
+                    Token::new(b"(", TokenType::TK_LP),
+                    Token::new(b"c", TokenType::TK_ID),
+                    Token::new(b")", TokenType::TK_RP),
                 ],
             ),
         ];

@@ -5497,6 +5497,26 @@ mod tests {
     }
 
     #[test]
+    fn test_array_element_parameter_names() {
+        // TCL array elements, `$arr(elem)`, are one parameter including the
+        // suffix; only one suffix is allowed, so `$a(b)(c)` is a call-like
+        // syntax error, as in SQLite.
+        let sql = "SELECT $arr(elem), $ns::arr(k), $arr(elem)";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        assert_eq!(cmd.to_string(), format!("{sql};"));
+        assert_eq!(p.named_variables[b"$arr(elem)".as_slice()].get(), 1);
+        assert_eq!(p.named_variables[b"$ns::arr(k)".as_slice()].get(), 2);
+        assert_eq!(p.named_variables.len(), 2);
+
+        let mut p = Parser::new(b"SELECT $a(b)(c)");
+        assert!(p.next_cmd().is_err());
+        let mut p = Parser::new(b"SELECT $a(b c)");
+        let err = p.next_cmd().unwrap_err().to_string();
+        assert!(err.contains("bad variable name '$a(b'"), "{err}");
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
