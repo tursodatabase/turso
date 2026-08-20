@@ -81,11 +81,7 @@ impl SqlBackend for RustBackend {
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
-        HashSet::from_iter([
-            Capability::Trigger,
-            Capability::MaterializedViews,
-            Capability::CustomTypes,
-        ])
+        Capability::all_set()
     }
 
     fn supports_snapshots(&self) -> bool {

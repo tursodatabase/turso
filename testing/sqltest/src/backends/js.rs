@@ -70,7 +70,7 @@ impl SqlBackend for JsBackend {
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
-        HashSet::from_iter([Capability::Trigger])
+        Capability::all_set()
     }
 
     async fn create_database(
