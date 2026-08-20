@@ -20569,7 +20569,7 @@ fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
     writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
 
-/// Reproducer for https://github.com/tursodatabase/turso-server/issues/2972:
+/// Regression tests for https://github.com/tursodatabase/turso-server/issues/2972:
 /// production panic "transaction should exist in txs map".
 ///
 /// Every MVCC cursor copies the connection's transaction id when the cursor
@@ -20588,13 +20588,13 @@ fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
 /// `advance_cursor_and_get_row_id_for_table` — same invariant, same panic
 /// message, different cursor operation.
 ///
-/// When this is fixed (either by blocking COMMIT while any statement is
-/// paused, like SQLite's legacy behavior, or by failing the resumed
-/// statement with `TxTerminated`), replace `should_panic` with an assertion
-/// on the intended behavior.
+/// These tests assert the intended behavior and therefore FAIL with the
+/// panic while the bug exists. Any non-panicking resolution is accepted:
+/// rejecting COMMIT/ROLLBACK while any statement is paused (SQLite's legacy
+/// behavior), letting the resumed statement finish, or failing it with a
+/// clean error such as `TxTerminated`.
 #[test]
-#[should_panic(expected = "transaction should exist in txs map")]
-fn stepping_paused_select_after_commit_panics_with_txs_map_expect() {
+fn stepping_paused_select_after_commit_must_not_panic() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE a(x INTEGER)").unwrap();
@@ -20616,29 +20616,35 @@ fn stepping_paused_select_after_commit_panics_with_txs_map_expect() {
             other => panic!("unexpected step result: {other:?}"),
         }
     }
-    // The paused statement is read-only, so this passes the
-    // `n_active_writes` guard and removes the tx from the txs map.
-    conn.execute("COMMIT").unwrap();
-    // Resuming the statement advances an MVCC cursor whose tx id is gone.
+    // Today this succeeds (the paused statement is read-only, so it passes
+    // the `n_active_writes` guard) and removes the tx from the txs map. A
+    // fix may instead reject it with StatementsInProgress — both are fine.
+    let _ = conn.execute("COMMIT");
+    // Resuming the paused statement must not panic. Finishing the scan or
+    // failing with a clean error (e.g. TxTerminated) are both acceptable.
     loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {}
-            StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => io.step().unwrap(),
-            other => panic!("unexpected step result: {other:?}"),
+        match stmt.step() {
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::IO) | Ok(StepResult::Yield) => io.step().unwrap(),
+            Ok(other) => panic!("unexpected step result: {other:?}"),
+            Err(err) => {
+                // A clean statement error is an acceptable outcome.
+                println!("resumed statement failed gracefully: {err}");
+                break;
+            }
         }
     }
 }
 
-/// Same bug as `stepping_paused_select_after_commit_panics_with_txs_map_expect`,
-/// but the resumed statement's first MVCC operation is on an *index* cursor
-/// (the join probes b's TEXT primary key index), hitting the index-side
-/// `expect` in `advance_cursor_and_get_row_id_for_index` — the closest
-/// in-tree match to the production stack, which went through
-/// `MvccLazyCursor::seek` on a unique index.
+/// Same bug as `stepping_paused_select_after_commit_must_not_panic`, but the
+/// resumed statement's first MVCC operation is on an *index* cursor (the
+/// join probes b's TEXT primary key index), hitting the index-side `expect`
+/// in `advance_cursor_and_get_row_id_for_index` — the closest in-tree match
+/// to the production stack, which went through `MvccLazyCursor::seek` on a
+/// unique index.
 #[test]
-#[should_panic(expected = "transaction should exist in txs map")]
-fn stepping_paused_index_join_after_commit_panics_with_txs_map_expect() {
+fn stepping_paused_index_join_after_commit_must_not_panic() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE b(id TEXT PRIMARY KEY, v TEXT)")
@@ -20662,25 +20668,28 @@ fn stepping_paused_index_join_after_commit_panics_with_txs_map_expect() {
             other => panic!("unexpected step result: {other:?}"),
         }
     }
-    conn.execute("COMMIT").unwrap();
+    let _ = conn.execute("COMMIT");
     loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {}
-            StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => io.step().unwrap(),
-            other => panic!("unexpected step result: {other:?}"),
+        match stmt.step() {
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::IO) | Ok(StepResult::Yield) => io.step().unwrap(),
+            Ok(other) => panic!("unexpected step result: {other:?}"),
+            Err(err) => {
+                println!("resumed statement failed gracefully: {err}");
+                break;
+            }
         }
     }
 }
 
-/// ROLLBACK variant of
-/// `stepping_paused_select_after_commit_panics_with_txs_map_expect`. SQLite
-/// allows ROLLBACK while statements are paused and makes the paused
+/// ROLLBACK variant of `stepping_paused_select_after_commit_must_not_panic`.
+/// SQLite allows ROLLBACK while statements are paused and makes the paused
 /// statements fail their next step with SQLITE_ABORT; Turso removes the tx
-/// from the txs map and the resumed statement panics instead.
+/// from the txs map and the resumed statement panics instead of failing
+/// with an error.
 #[test]
-#[should_panic(expected = "transaction should exist in txs map")]
-fn stepping_paused_select_after_rollback_panics_with_txs_map_expect() {
+fn stepping_paused_select_after_rollback_must_not_panic() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE a(x INTEGER)").unwrap();
@@ -20701,13 +20710,17 @@ fn stepping_paused_select_after_rollback_panics_with_txs_map_expect() {
             other => panic!("unexpected step result: {other:?}"),
         }
     }
-    conn.execute("ROLLBACK").unwrap();
+    let _ = conn.execute("ROLLBACK");
     loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {}
-            StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => io.step().unwrap(),
-            other => panic!("unexpected step result: {other:?}"),
+        match stmt.step() {
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::IO) | Ok(StepResult::Yield) => io.step().unwrap(),
+            Ok(other) => panic!("unexpected step result: {other:?}"),
+            Err(err) => {
+                println!("resumed statement failed gracefully: {err}");
+                break;
+            }
         }
     }
 }
