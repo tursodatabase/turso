@@ -905,18 +905,35 @@ impl Whopper {
         }
         self.stats.checkpoint_probes += 1;
         let connection = self.context.fibers[fiber_idx].connection.clone();
+        // Default-mode MVCC rejects PASSIVE at prepare time (it requires
+        // experimental_mvcc_passive_checkpoint), so probe with a checkpoint
+        // mode the engine's configuration supports — same selection as
+        // WalCheckpointWorkload's allow_passive. The guard must refuse any
+        // mode while a statement is suspended.
+        let passive_allowed =
+            !self.context.enable_mvcc || self.experimental_mvcc_passive_checkpoint;
         let via_api = self.rng.random_bool(0.5);
         let outcome: Result<(), LimboError> = if via_api {
-            connection
-                .checkpoint(CheckpointMode::Passive {
+            let mode = if passive_allowed {
+                CheckpointMode::Passive {
                     upper_bound_inclusive: None,
-                })
-                .map(|_| ())
+                }
+            } else {
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                }
+            };
+            connection.checkpoint(mode).map(|_| ())
         } else {
             // Step the pragma until it resolves, driving any I/O it needs on
             // the way to the checkpoint opcode (bounded, so an engine bug
             // cannot hang the simulator).
-            let mut stmt = connection.prepare("PRAGMA wal_checkpoint(PASSIVE)")?;
+            let sql = if passive_allowed {
+                "PRAGMA wal_checkpoint(PASSIVE)"
+            } else {
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            };
+            let mut stmt = connection.prepare(sql)?;
             let mut budget = 10_000usize;
             loop {
                 match stmt.step() {
