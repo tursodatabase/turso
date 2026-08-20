@@ -203,6 +203,51 @@ expect error {
     ^(Runtime error: )?(Parse error: )?malformed JSON$
 }
 
+# Even JSON5 numbers need a digit in the mantissa: a bare dot, a bare
+# sign, and an exponent with no mantissa are all malformed. SQLite
+# reports an unsigned bare dot at the dot, a signed one just after the
+# dot, and the rest at the start of the number.
+test json5_numbers_need_a_mantissa_digit {
+    SELECT json_valid('.', 2), json_valid('+e1', 2), json_valid('-e1', 2),
+           json_valid('.5', 2), json_valid('5.', 2), json_valid('+.5', 2),
+           json_error_position('.'), json_error_position('.e1'),
+           json_error_position('+.'), json_error_position('-.'),
+           json_error_position('+'), json_error_position('[.5, .]');
+}
+expect {
+    0|0|0|1|1|1|1|1|3|3|1|6
+}
+
+# A number holds at most one dot and one exponent, and the exponent
+# cannot hold a dot. The offending character is reported.
+test json5_numbers_reject_repeated_dots_and_exponents {
+    SELECT json_valid('0..', 2), json_valid('1.2.3', 2), json_valid('1e1e1', 2),
+           json_valid('1e1.5', 2), json_valid('5.e2', 2),
+           json_error_position('0..'), json_error_position('1.2.3'),
+           json_error_position('1e1e1'), json_error_position('1e1.5');
+}
+expect {
+    0|0|0|0|1|3|4|4|4
+}
+
+test digitless_number_document_errors {
+    SELECT json('.');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+# The error position counts characters, not bytes: é is one character
+# but two UTF-8 bytes, both before an unterminated end of input and
+# before any other syntax error.
+test json_error_position_counts_characters_not_bytes {
+    SELECT json_error_position('"é'), json_error_position('"日本'),
+           json_error_position('{"é": x}');
+}
+expect {
+    3|4|7
+}
+
 # Two-argument json_valid(X, Y): Y is a bitmask picking which
 # representations count as valid (1 = strict RFC 8259 text, 2 = JSON5
 # text, 4 = blob that superficially looks like JSONB, 8 = blob that is
@@ -435,4 +480,475 @@ test json_valid_flag8_depth_limit {
 }
 expect {
     1|0
+}
+
+# json_quote must escape control characters so its output is always
+# strict RFC 8259 text: \b \f \n \r \t for the named ones, \u00xx for
+# the rest. The forward slash is not escaped.
+
+test json_quote_escapes_control_characters {
+    SELECT json_quote('a' || char(1) || 'z'), json_quote('a' || char(11) || 'z'),
+           json_quote('a' || char(31) || 'z');
+}
+expect {
+    "a\u0001z"|"a\u000bz"|"a\u001fz"
+}
+
+test json_quote_uses_short_escapes_for_named_controls {
+    SELECT json_quote('a' || char(10) || 'z'), json_quote('a' || char(9) || 'z'),
+           json_quote('a' || char(13) || 'z'), json_quote('a' || char(8) || 'z'),
+           json_quote('a' || char(12) || 'z');
+}
+expect {
+    "a\nz"|"a\tz"|"a\rz"|"a\bz"|"a\fz"
+}
+
+test json_quote_leaves_slash_alone {
+    SELECT json_quote('a/b'), json_quote('a"b');
+}
+expect {
+    "a/b"|"a\"b"
+}
+
+test json_quote_output_is_always_strict_json {
+    WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x < 0x1f)
+    SELECT sum(json_valid(json_quote('a' || char(x) || 'z'))) FROM c;
+}
+expect {
+    31
+}
+
+# JSON5 strings may span lines by escaping any of the four line
+# terminators: LF, CR, CRLF, U+2028 and U+2029. The continuation is
+# dropped from the string value.
+
+test json5_line_continuation_lf {
+    SELECT ('{a: "abc' || char(0x5c, 0x0a) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_cr {
+    SELECT ('{a: "abc' || char(0x5c, 0x0d) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_crlf_is_one_terminator {
+    SELECT ('{a: "abc' || char(0x5c, 0x0d, 0x0a) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_u2028_u2029 {
+    SELECT ('{a: "abc' || char(0x5c, 0x2028) || 'xyz"}') ->> 'a',
+           ('{a: "abc' || char(0x5c, 0x2029) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz|abcxyz
+}
+
+test json5_line_continuation_json_rendering {
+    SELECT json('{a: "abc' || char(0x5c, 0x0d) || 'xyz"}');
+}
+expect {
+    {"a":"abcxyz"}
+}
+
+test json5_escaped_double_quote_unescapes {
+    SELECT ('{a: "abc' || char(0x5c, 0x22) || 'xyz"}') ->> 'a';
+}
+expect {
+    abc"xyz
+}
+
+# The JSON5 vertical-tab escape decodes to U+000B on extraction, but
+# json() renders it with the horizontal-tab escape u0009, matching the
+# SQLite version we target (upstream fixed the escape in 3.51.2).
+
+test json5_vertical_tab_escape_decodes_to_0x0b {
+    SELECT hex(('{a: "x' || char(0x5c, 0x76) || 'z"}') ->> 'a'),
+           json('{a: "x' || char(0x5c, 0x76) || 'z"}');
+}
+expect {
+    780B7A|{"a":"x\u0009z"}
+}
+
+# JSON5 numbers with a trailing decimal point: the canonical rendering
+# inserts the missing zero after the dot, before any exponent. Numbers
+# whose only JSON5 feature is a leading '+' stay untouched.
+
+test json5_trailing_dot_gets_zero_inserted {
+    SELECT json('{x: 4.}'), json('{x: 4.e0}'), json('{x: +4.e1}'), json('{x: -4.e2}');
+}
+expect {
+    {"x":4.0}|{"x":4.0e0}|{"x":4.0e1}|{"x":-4.0e2}
+}
+
+# CAST to TEXT so the engine formats the REAL results; the JS driver
+# would otherwise render 4.0 as the bare number 4.
+test json5_trailing_dot_extracted_value {
+    SELECT CAST(('{x: 4.e0}')->>'x' AS TEXT),
+           CAST(('{x: +4.e1}')->>'x' AS TEXT),
+           CAST(('{x: -4.e2}')->>'x' AS TEXT);
+}
+expect {
+    4.0|40.0|-400.0
+}
+
+test json5_plus_only_numbers_stay_canonical {
+    SELECT json('{x: +4e1}'), json('{x: +5.5}'), json('{x: 4.E2}');
+}
+expect {
+    {"x":4e1}|{"x":5.5}|{"x":4.0E2}
+}
+
+# JSON5 Infinity: -> renders the JSON text 9e999, while ->> and
+# json_extract return the infinite REAL.
+
+test json5_infinity_arrow_renders_9e999 {
+    SELECT '{x:Infinity}'->'x', typeof('{x:Infinity}'->'x');
+}
+expect {
+    9e999|text
+}
+
+test json5_infinity_double_arrow_returns_real {
+    SELECT '{x:Infinity}'->>'x', typeof('{x:Infinity}'->>'x'),
+           '{x:-Infinity}'->>'x', json_extract('{x:Infinity}','$.x');
+}
+expect {
+    Inf|real|-Inf|Inf
+}
+
+test json5_infinity_document_renderings {
+    SELECT json('Infinity'), json('{x:-Infinity}'), json('{"x":9e999}'), json_quote(9e999);
+}
+expect {
+    9e999|{"x":-9e999}|{"x":9e999}|9.0e+999
+}
+
+# A leading-plus overflow number is an ordinary JSON5 number, not the
+# Infinity literal: its text must survive rendering unchanged even
+# though its value is infinite.
+test json5_plus_overflow_number_keeps_its_text {
+    SELECT '+9.0e+999'->'$', '{x: +9.0e+999}'->'$.x', typeof('+9.0e+999'->>'$');
+}
+expect {
+    9.0e+999|9.0e+999|real
+}
+
+# Unquoted JSON5 object keys follow SQLite's identifier rules: ASCII
+# letters, '_' and '$' may start one, digits may only continue one,
+# non-ASCII characters are accepted, everything else is malformed.
+
+test json5_unquoted_key_charset {
+    SELECT json_valid('{x1:5}',2), json_valid('{_x:5}',2), json_valid('{$x:5}',2),
+           json_valid('{éx:5}',2);
+}
+expect {
+    1|1|1|1
+}
+
+test json5_unquoted_key_rejects_illegal_characters {
+    SELECT json_valid('{1x:5}',2), json_valid('{x-y:5}',2), json_valid('{x.y:5}',2),
+           json_valid('{x/y:5}',2), json_valid('{:5}',2), json_valid('{a'||char(1)||':1}',2);
+}
+expect {
+    0|0|0|0|0|0
+}
+
+test json5_unquoted_key_slash_is_malformed {
+    SELECT json('{ MNO_123/xyz : 789 }');
+}
+expect error {
+    ^(Parse error: )?malformed JSON$
+}
+
+# \uXXXX escapes may appear anywhere in an unquoted key, whatever they
+# decode to; rendering keeps the escape and path matching decodes it.
+# No other escape is allowed in a key.
+test json5_unquoted_key_accepts_unicode_escapes {
+    SELECT json('{' || char(0x5c) || 'u0061:1}'),
+           ('{' || char(0x5c) || 'u0061:1}')->>'a',
+           ('{a' || char(0x5c) || 'u0062:1}')->>'ab',
+           json('{' || char(0x5c) || 'u0031:1}');
+}
+expect {
+    {"\u0061":1}|1|1|{"\u0031":1}
+}
+
+test json5_unquoted_key_rejects_other_escapes {
+    SELECT json_valid('{a' || char(0x5c) || 'tb:1}', 2),
+           json_valid('{a' || char(0x5c) || 'x62:1}', 2),
+           json_valid('{' || char(0x5c) || 'u061:1}', 2);
+}
+expect {
+    0|0|0
+}
+
+# A comment directly after an unquoted key acts as whitespace.
+test json5_unquoted_key_ends_at_comment {
+    SELECT json('{x/*c*/:1}'), json('{x//c' || char(10) || ':1}'), json_valid('{x/y:1}', 2);
+}
+expect {
+    {"x":1}|{"x":1}|0
+}
+
+# Array locators counting from the end: leading zeros in [#-n] keep the
+# sign, and [#-0] addresses the same one-past-the-end position as [#].
+
+test json_path_from_end_leading_zeros_keep_sign {
+    SELECT json_extract('{"b":[1,[2,3],4]}','$.b[#-02]'),
+           json_extract('{"b":[1,[2,3],4]}','$.b[#-000001]'),
+           json_extract('{"b":[1,2]}','$.b[#-00002]');
+}
+expect {
+    [2,3]|4|1
+}
+
+test json_path_minus_zero_is_one_past_the_end {
+    SELECT json_remove('{"b":[1,2]}','$.b[#-0]'),
+           json_extract('{"b":[1,2]}','$.b[#-0]') IS NULL;
+}
+expect {
+    {"b":[1,2]}|1
+}
+
+# Appending with [#] or the exact one-past-the-end index works for both
+# json_set and json_insert; larger indexes and from-end locators are
+# no-ops for insert-only mode.
+
+test json_array_append_with_hash_and_end_index {
+    SELECT json_insert('{"b":[1,2]}','$.b[#]','X'),
+           json_insert('{"b":[1,2]}','$.b[2]','X'),
+           json_set('{"b":[1,2]}','$.b[#]','X','$.b[#]','Y'),
+           json_insert('[1,2]','$[#]','X'),
+           json_insert('{"b":[[2,3]]}','$.b[0][2]','X');
+}
+expect {
+    {"b":[1,2,"X"]}|{"b":[1,2,"X"]}|{"b":[1,2,"X","Y"]}|[1,2,"X"]|{"b":[[2,3,"X"]]}
+}
+
+test json_array_append_out_of_range_is_noop {
+    SELECT json_insert('{"b":[1,2]}','$.b[5]','X'),
+           json_insert('{"b":[1,2]}','$.b[#-1]','X'),
+           json_insert('{"b":[[2,3]]}','$.b[0][5]','X');
+}
+expect {
+    {"b":[1,2]}|{"b":[1,2]}|{"b":[[2,3]]}
+}
+
+test json_appended_document_stays_well_formed {
+    SELECT json_extract(json_set('{"b":[1,2]}','$.b[#]','X'),'$.b[2]'),
+           json(jsonb_set('{"b":[1,2]}','$.b[#]','X'));
+}
+expect {
+    X|{"b":[1,2,"X"]}
+}
+
+# An 11-byte array payload sits exactly on a JSONB header size-format
+# boundary: appending grows the array's own header, which shifts the
+# contents. The appended value and the document must survive that.
+test json_append_across_array_header_size_boundary {
+    SELECT json_extract(json_set(json('{"b":' || json_array(
+               null,null,null,null,null,null,null,null,null,null,null) || '}'),
+               '$.b[#]', 'X'), '$.b[10]', '$.b[11]'),
+           json_valid(jsonb_set(json('{"b":' || json_array(
+               null,null,null,null,null,null,null,null,null,null,null) || '}'),
+               '$.b[11]', 'X'), 8);
+}
+expect {
+    [null,"X"]|1
+}
+
+# x'8C1762CB0413311332' encodes {"b":[1,2]} with a non-minimal
+# two-byte header on the array. Appending rewrites the header
+# minimally, which shrinks it and shifts the contents left.
+test json_append_shrinks_non_minimal_array_header {
+    SELECT json_insert(x'8C1762CB0413311332','$.b[2]','X'),
+           json_insert(x'8C1762CB0413311332','$.b[#]','X');
+}
+expect {
+    {"b":[1,2,"X"]}|{"b":[1,2,"X"]}
+}
+
+# When a later path segment fails, the placeholder container an
+# earlier append segment created must not survive: the document stays
+# unchanged.
+test json_append_failed_traversal_leaves_document_unchanged {
+    SELECT json_insert('{"b":[1,2]}','$.b[#][5]','X'),
+           json_insert('{"b":[1,2]}','$.b[2][5]','X'),
+           json_insert('{"b":[1,2]}','$.b[#][0]','X');
+}
+expect {
+    {"b":[1,2]}|{"b":[1,2]}|{"b":[1,2,["X"]]}
+}
+
+# Malformed paths report SQLite's message format, with the path quoted.
+
+test json_bad_path_error_message_format {
+    SELECT json_extract('{"b":[1]}', '$.b[#-]');
+}
+expect error {
+    ^(Parse error: )?bad JSON path: '\$\.b\[#-\]'$
+}
+
+# Apostrophes in the path are doubled in the message, like SQLite's %Q.
+test json_bad_path_message_doubles_apostrophes {
+    SELECT json_extract('{}', 'x''y''z');
+}
+expect error {
+    ^(Parse error: )?bad JSON path: 'x''y''z'$
+}
+
+# %Q reads a C string, so the message stops at an embedded NUL.
+test json_bad_path_message_stops_at_nul {
+    SELECT json_extract('{}', 'x' || char(0) || 'y');
+}
+expect error {
+    ^(Parse error: )?bad JSON path: 'x'$
+}
+
+# subtype() reports 74 ('J') for TEXT a JSON function produced, and 0
+# for everything else — including JSONB blobs, whose acceptance as
+# arguments is purely structural.
+
+test subtype_reports_json_text_only {
+    SELECT subtype(json('{}')), subtype(jsonb('{}')), subtype('{}'),
+           subtype(1), subtype(NULL), subtype(json_extract('{"a":[1]}','$.a')),
+           subtype(json_extract('{"a":1}','$.a'));
+}
+expect {
+    74|0|0|0|0|74|0
+}
+
+test double_arrow_result_never_carries_subtype {
+    SELECT subtype('{"a":[7,8]}'->'a'), subtype('{"a":[7,8]}'->>'a'),
+           typeof('{"a":[7,8]}'->>'a');
+}
+expect {
+    74|0|text
+}
+
+test jsonb_blob_arguments_accepted_structurally {
+    SELECT json_array(jsonb_array(1,2)), json(jsonb_array(json_array(1,2))),
+           json_object('ex', jsonb('[52,3.14159]')),
+           json_set('{"a":2,"c":4}', '$.c', jsonb('[97,96]')),
+           json_array(x'0B'), json_quote(x'0B');
+}
+expect {
+    [[1,2]]|[[1,2]]|{"ex":[52,3.14159]}|{"a":2,"c":[97,96]}|[[]]|[]
+}
+
+test non_jsonb_blob_arguments_error {
+    SELECT json_array(x'313233');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?JSON cannot hold BLOB values$
+}
+
+# Document arguments accept blobs everywhere: JSONB blobs directly,
+# and other blobs as JSON text (x'313233' is the text "123").
+test patch_and_error_position_accept_blobs {
+    SELECT json_patch(jsonb('{"a":1}'), jsonb('{"b":2}')),
+           json(jsonb_patch(jsonb('{"a":1}'), jsonb('{"b":2}'))),
+           json_patch(x'313233', '{}'),
+           json_error_position(jsonb('{"a":1}')),
+           json_error_position(x'313233'), json_error_position(x'ABCD');
+}
+expect {
+    {"a":1,"b":2}|{"a":1,"b":2}|{}|0|0|1
+}
+
+# Only text a JSON function produced as a JSON value carries the 'J'
+# subtype: json_quote and json_patch results do, while metadata text
+# from json_type and display text from json_pretty do not.
+test subtype_marks_json_values_not_metadata {
+    SELECT subtype(json_quote('x')), subtype(json_quote(5)), subtype(json_quote(NULL)),
+           subtype(json_patch('{}','null')), subtype(json_patch('{"a":1}','{"b":2}')),
+           subtype(json_type('{}')), subtype(json_type('[3]','$[0]')),
+           subtype(json_pretty('{}'));
+}
+expect {
+    74|74|74|74|74|0|0|0
+}
+
+# Unmarked json_type output nests as a plain string.
+test json_type_output_nests_as_text {
+    SELECT json_array(json_type('{}'));
+}
+expect {
+    ["object"]
+}
+
+# A JSON null patch result stays a JSON value: json_patch returns the
+# text 'null' with the 'J' subtype and jsonb_patch the JSONB null blob,
+# not SQL NULL.
+test patch_json_null_result_stays_json {
+    SELECT json_patch('{}', jsonb('null')), subtype(json_patch('{}', jsonb('null'))),
+           json_patch('{}', x'00'), json_patch('{}', 'null'),
+           json_patch('{"a":1}', 'null'),
+           hex(jsonb_patch('{}', jsonb('null'))), hex(jsonb_patch('{}', 'null'));
+}
+expect {
+    null|74|null|null|null|00|00
+}
+
+# A malformed blob target errors even when the patch is the text
+# 'null'.
+test patch_validates_target_before_null_patch {
+    SELECT json_patch(x'ABCD', 'null');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+test jsonb_patch_validates_target_before_null_patch {
+    SELECT jsonb_patch(x'ABCD', 'null');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+# json_error_position reads a non-JSONB blob as text that stops at the
+# first NUL: x'3132330078' is "123" followed by NUL and garbage.
+test json_error_position_blob_stops_at_nul {
+    SELECT json_error_position(x'3132330078');
+}
+expect {
+    0
+}
+
+# A blob that looks like JSONB reports the byte offset of its first
+# malformed element instead of being re-read as text: x'3B133132' is an
+# array whose second element claims to be FALSE with a payload, and
+# x'1301' and x'2B31FF' carry non-digit bytes in numeric payloads.
+# x'5B6E756C6C5D' is the text "[null]" whose first byte only looks like
+# an array header, and x'22FF22' reads as text because FALSE cannot
+# carry a payload.
+test json_error_position_reports_jsonb_offsets {
+    SELECT json_error_position(x'3B133132'), json_error_position(x'1301'),
+           json_error_position(x'2B31FF'), json_error_position(x'5B6E756C6C5D'),
+           json_error_position(x'22FF22'), json_error_position(x'CB01');
+}
+expect {
+    4|2|2|0|0|1
+}
+
+# Text parsed as a JSON document stops at the first NUL, like SQLite,
+# so trailing bytes after one are invisible to the parser. A text
+# value converted to a JSON string keeps the NUL as an escape.
+test json_text_stops_at_first_nul {
+    SELECT json('123' || char(0) || 'x'),
+           json_extract('{"a":7}' || char(0) || 'junk', '$.a'),
+           json_array_length('[1,2]' || char(0) || 'zzz'),
+           json_error_position('"a' || char(0) || '"x'),
+           json_insert('{}', '$.a', 'x' || char(0) || 'y');
+}
+expect {
+    123|7|2|3|{"a":"x\u0000y"}
 }

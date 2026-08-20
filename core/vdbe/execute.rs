@@ -9382,6 +9382,7 @@ pub fn op_function(
             | ScalarFunc::Upper
             | ScalarFunc::Length
             | ScalarFunc::OctetLength
+            | ScalarFunc::Subtype
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
             | ScalarFunc::Unistr
@@ -9399,6 +9400,7 @@ pub fn op_function(
                     ScalarFunc::Upper => reg_value.exec_upper(),
                     ScalarFunc::Length => Some(reg_value.exec_length()),
                     ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
+                    ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),

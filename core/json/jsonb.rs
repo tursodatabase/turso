@@ -19,7 +19,7 @@ const SIZE_MARKER_8BIT: u8 = 12;
 const SIZE_MARKER_16BIT: u8 = 13;
 const SIZE_MARKER_32BIT: u8 = 14;
 const MAX_JSON_DEPTH: usize = 1000;
-const INFINITY_CHAR_COUNT: u8 = 8;
+const INFINITY_CHAR_COUNT: u8 = 5;
 
 const fn make_whitespace_table() -> [u8; 256] {
     let mut table = [0u8; 256];
@@ -29,6 +29,17 @@ const fn make_whitespace_table() -> [u8; 256] {
     table[0x0A] = 1; // Line feed
     table[0x0D] = 1; // Carriage return
     table[0x20] = 1; // Space
+
+    // Bit 2 marks bytes that can start a JSON5-only whitespace
+    // sequence, so the hot path only calls json5_whitespace_len for
+    // them.
+    table[0x0B] |= 2; // Vertical tab
+    table[0x0C] |= 2; // Form feed
+    table[0xC2] |= 2; // First byte of NBSP
+    table[0xE1] |= 2; // First byte of U+1680
+    table[0xE2] |= 2; // First byte of U+2000..U+200A, U+2028/29/2F, U+205F
+    table[0xE3] |= 2; // First byte of U+3000
+    table[0xEF] |= 2; // First byte of U+FEFF
 
     table
 }
@@ -1011,6 +1022,27 @@ impl Jsonb {
         Ok(result)
     }
 
+    /// Returns the decoded text of the single string element this
+    /// document holds, unescaping straight from the stored payload.
+    /// This cannot go through [Jsonb::to_string], because JSON text
+    /// rendering translates the JSON5 \v escape to \u0009 for SQLite
+    /// bug-compatibility, while extraction must yield the real 0x0B.
+    pub fn scalar_string_value(&self) -> Result<String> {
+        let (JsonbHeader(_, len), header_size) = self.read_header(0)?;
+        // The 8-byte size format lets a crafted header declare a length
+        // near usize::MAX, so the end must be computed without overflow.
+        let payload_end = header_size
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        let payload = self
+            .data
+            .get(header_size..payload_end)
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        let text = from_utf8(payload)
+            .map_err(|_| LimboError::ParseError("Failed to serialize string!".to_string()))?;
+        Ok(unescape_string(text))
+    }
+
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
         let mut result = String::with_capacity(self.data.len() * 2);
         let ind = if let Some(ind) = indentation {
@@ -1275,7 +1307,12 @@ impl Jsonb {
                                     i += 2;
                                 }
 
-                                // Vertical tab
+                                // Vertical tab. SQLite (through 3.51.1)
+                                // renders it with the escape for
+                                // horizontal tab, and we are
+                                // bug-compatible with that; extraction
+                                // decodes the stored \v directly and
+                                // still yields the real 0x0B byte.
                                 b'v' => {
                                     string.push_str("\\u0009");
                                     i += 2;
@@ -1448,9 +1485,6 @@ impl Jsonb {
             bail_parse_error!("Integer is less then 2 chars: {}", float_str);
         }
         match float_str {
-            "9.0e+999" | "-9.0e+999" => {
-                string.push_str(float_str);
-            }
             val if val.starts_with("-.") => {
                 string.push_str("-0.");
                 string.push_str(&val[2..]);
@@ -1468,8 +1502,16 @@ impl Jsonb {
                 .next()
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-') =>
             {
-                string.push_str(val);
-                string.push('0');
+                match val.find('.') {
+                    Some(dot)
+                        if matches!(val[dot + 1..].chars().next(), None | Some('e' | 'E')) =>
+                    {
+                        string.push_str(&val[..=dot]);
+                        string.push('0');
+                        string.push_str(&val[dot + 1..]);
+                    }
+                    _ => string.push_str(val),
+                }
             }
             _ => bail_parse_error!("Unable to serialize float5: {}", float_str),
         }
@@ -1820,10 +1862,22 @@ impl Jsonb {
 
         // Special case for unquoted JSON5 keys (identifiers)
         if !quoted {
-            self.data.push(quote);
-            len += 1;
+            if quote == b'\\' && input.get(pos) == Some(&b'u') {
+                // The key starts with a \uXXXX escape, which SQLite
+                // accepts no matter what it decodes to. Rewind one byte
+                // so the escape handling below consumes it.
+                pos -= 1;
+            } else if !is_json5_id_char(quote, true) {
+                return Err(PError::Message {
+                    msg: "Invalid character in unquoted object key".to_string(),
+                    location: Some(pos),
+                });
+            } else {
+                self.data.push(quote);
+                len += 1;
+            }
 
-            if pos < input.len() && input[pos] == b':' {
+            if len > 0 && pos < input.len() && input[pos] == b':' {
                 self.write_element_header(string_start, element_type, len, false)
                     .map_err(|_| PError::Message {
                         msg: "Failed to write header".to_string(),
@@ -1859,6 +1913,14 @@ impl Jsonb {
 
                 let esc = input[pos];
                 pos += 1;
+
+                // SQLite allows only \uXXXX escapes in unquoted keys.
+                if !quoted && esc != b'u' {
+                    return Err(PError::Message {
+                        msg: "Invalid character in unquoted object key".to_string(),
+                        location: Some(pos),
+                    });
+                }
 
                 // A standard escape upgrades plain TEXT to TEXTJ but
                 // never demotes TEXT5: earlier JSON5 syntax keeps the
@@ -1943,6 +2005,29 @@ impl Jsonb {
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
+                    b'\r' => {
+                        // Line continuation; swallows a following LF so
+                        // \<CR><LF> counts as one line terminator.
+                        self.data.extend_from_slice(b"\\\r");
+                        len += 2;
+                        if pos < input.len() && input[pos] == b'\n' {
+                            self.data.push(b'\n');
+                            len += 1;
+                            pos += 1;
+                        }
+                        element_type = ElementType::TEXT5;
+                    }
+                    0xe2 if pos + 1 < input.len()
+                        && input[pos] == 0x80
+                        && (input[pos + 1] == 0xa8 || input[pos + 1] == 0xa9) =>
+                    {
+                        // Line continuation with U+2028 or U+2029
+                        self.data.push(b'\\');
+                        self.data.extend_from_slice(&input[pos - 1..pos + 2]);
+                        len += 4;
+                        pos += 2;
+                        element_type = ElementType::TEXT5;
+                    }
                     b'\'' => {
                         self.data.extend_from_slice(b"\\\'");
                         len += 2;
@@ -1994,10 +2079,21 @@ impl Jsonb {
                         });
                     }
                 }
-            } else if !quoted && (c == b':' || c.is_ascii_whitespace()) {
-                // End of unquoted identifier
+            } else if !quoted
+                && (c == b':'
+                    || c.is_ascii_whitespace()
+                    || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*'))))
+            {
+                // End of unquoted identifier. A comment right after the
+                // key acts as whitespace, so its opening '/' ends the
+                // key and the whitespace skipping before ':' eats it.
                 pos -= 1; // Put back the terminating character
                 break;
+            } else if !quoted && !is_json5_id_char(c, false) {
+                return Err(PError::Message {
+                    msg: "Invalid character in unquoted object key".to_string(),
+                    location: Some(pos),
+                });
             } else if c <= 0x1F {
                 // Control character
                 element_type = ElementType::TEXT5;
@@ -2040,10 +2136,13 @@ impl Jsonb {
         info: &mut ParseInfo,
     ) -> PResult<usize> {
         let num_start = self.len();
+        let text_start = pos;
         let mut len = 0;
         let mut is_float = false;
         let mut is_json5 = false;
         let mut has_digit = false;
+        let mut seen_dot = false;
+        let mut in_exponent = false;
 
         // Write placeholder header
         self.write_element_header(num_start, ElementType::INT, 0, false)
@@ -2068,6 +2167,15 @@ impl Jsonb {
         if pos < input.len() && input[pos] == b'.' {
             is_json5 = true;
             is_float = true;
+            // Even JSON5 needs a digit right after a leading dot.
+            // SQLite reports a bare dot at the dot itself and a
+            // signed one just after the dot.
+            if pos + 1 >= input.len() || !input[pos + 1].is_ascii_digit() {
+                return Err(PError::Message {
+                    msg: "Not a digit".to_string(),
+                    location: Some(if text_start == pos { pos } else { pos + 1 }),
+                });
+            }
         }
 
         // Check for hex (JSON5)
@@ -2141,8 +2249,11 @@ impl Jsonb {
 
             info.has_json5 = true;
 
-            // Write Infinity as 9.0e+999
-            self.data.extend_from_slice(b"9.0e+999");
+            // Store Infinity as the payload text 9e999, like SQLite. A
+            // leading-plus number such as +9e999 stores the same
+            // payload; both meanings render as 9e999 and extract as an
+            // infinite REAL, so they never need to be told apart.
+            self.data.extend_from_slice(b"9e999");
             self.write_element_header(
                 num_start,
                 ElementType::FLOAT5,
@@ -2164,9 +2275,22 @@ impl Jsonb {
                     self.data.push(input[pos]);
                     pos += 1;
                     len += 1;
-                    has_digit = true;
+                    // Exponent digits do not count as mantissa digits:
+                    // '-e1' is not a number even in JSON5.
+                    if !in_exponent {
+                        has_digit = true;
+                    }
                 }
                 b'.' => {
+                    // A number holds at most one dot, and none inside
+                    // the exponent. SQLite reports the offending dot.
+                    if seen_dot || in_exponent {
+                        return Err(PError::Message {
+                            msg: "malformed JSON".to_string(),
+                            location: Some(pos),
+                        });
+                    }
+                    seen_dot = true;
                     is_float = true;
                     self.data.push(input[pos]);
                     pos += 1;
@@ -2178,7 +2302,16 @@ impl Jsonb {
                     }
                 }
                 b'e' | b'E' => {
+                    // A second exponent marker is reported like a
+                    // repeated dot.
+                    if in_exponent {
+                        return Err(PError::Message {
+                            msg: "malformed JSON".to_string(),
+                            location: Some(pos),
+                        });
+                    }
                     is_float = true;
+                    in_exponent = true;
                     self.data.push(input[pos]);
                     pos += 1;
                     len += 1;
@@ -2202,11 +2335,13 @@ impl Jsonb {
             }
         }
 
-        // Must have at least one digit
-        if !has_digit && (!is_json5 || !is_float) {
+        // A number needs at least one digit in its mantissa, even in
+        // JSON5: '.5' and '5.' are numbers, '+', '-' and '-e1' are
+        // not. SQLite reports these at the start of the number.
+        if !has_digit {
             return Err(PError::Message {
                 msg: "Not a digit".to_string(),
-                location: Some(pos),
+                location: Some(text_start),
             });
         }
 
@@ -2512,11 +2647,19 @@ impl Jsonb {
     {
         let mode = operation.operation_mode();
 
-        let stack = self.navigate_path(path, mode)?;
-
-        operation.execute(self, stack)?;
-
-        Ok(())
+        // Traversal appends placeholder containers as it walks insert
+        // and upsert segments, so a failure part-way through must not
+        // publish those edits: a failed operation leaves the document
+        // unchanged.
+        let snapshot = self.data.clone();
+        let result = match self.navigate_path(path, mode) {
+            Ok(stack) => operation.execute(self, stack),
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            self.data = snapshot;
+        }
+        result
     }
 
     fn update_parent_references(
@@ -2595,7 +2738,8 @@ impl Jsonb {
                                 count += 1;
                             }
 
-                            if mode.allows_insert() && arr_pos == end_pos {
+                            if mode.allows_insert() && arr_pos == end_pos && count == *idx as usize
+                            {
                                 let placeholder =
                                     JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
                                 let placeholder_bytes = placeholder.as_bytes();
@@ -2635,6 +2779,9 @@ impl Jsonb {
 
                             let real_idx = element_idx + idx;
 
+                            if !mode.allows_replace() {
+                                bail_parse_error!("Not found!");
+                            }
                             if let Some(index) = idx_map.get(&real_idx) {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     pos,
@@ -2828,6 +2975,9 @@ impl Jsonb {
 
                             let real_idx = element_idx + idx;
 
+                            if !mode.allows_replace() {
+                                bail_parse_error!("Not found!");
+                            }
                             if let Some(index) = idx_map.get(&real_idx) {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     pos,
@@ -2941,7 +3091,7 @@ impl Jsonb {
                     ));
                 }
 
-                if current_pos != end_pos && mode.allows_replace() {
+                if current_pos != end_pos {
                     let key_idx = current_pos;
 
                     current_pos = self.skip_element(current_pos)?;
@@ -2974,17 +3124,28 @@ impl Jsonb {
 
                                 self.data
                                     .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
-                                self.write_element_header(
+                                // Rewriting the array header can change its
+                                // size in either direction: growing past a
+                                // size-format boundary (such as 11 bytes)
+                                // shifts the contents right, and rewriting a
+                                // non-minimal header shrinks it and shifts
+                                // them left. The placeholder position and the
+                                // parent delta must include that shift.
+                                let new_header_size = self.write_element_header(
                                     value_idx,
                                     ElementType::ARRAY,
                                     value_size + placeholder_bytes.len(),
                                     true,
                                 )?;
+                                let header_delta =
+                                    new_header_size as isize - value_header_size as isize;
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
                                     JsonLocationKind::ObjectProperty(key_idx),
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
+                                    placeholder_bytes.len() as isize + header_delta,
+                                    arr_pos
+                                        .checked_add_signed(header_delta)
+                                        .expect("array contents cannot move before the header"),
                                 ));
                             }
 
@@ -3012,6 +3173,9 @@ impl Jsonb {
 
                             let real_idx = element_idx + idx;
 
+                            if !mode.allows_replace() {
+                                bail_parse_error!("Not found!");
+                            }
                             if let Some(index) = idx_map.get(&real_idx) {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
@@ -3034,14 +3198,33 @@ impl Jsonb {
                                 let placeholder_bytes = placeholder.as_bytes();
                                 let insertion_point = value_idx + value_size + value_header_size;
 
-                                self.data.insert(insertion_point, placeholder_bytes[0]);
-                                let insertion_point = value_idx + value_size + value_header_size;
+                                self.data.splice(
+                                    insertion_point..insertion_point,
+                                    placeholder_bytes.iter().copied(),
+                                );
+                                // Rewriting the array header can change its
+                                // size in either direction: growing past a
+                                // size-format boundary (such as 11 bytes)
+                                // shifts the contents right, and rewriting a
+                                // non-minimal header shrinks it and shifts
+                                // them left. The placeholder position and the
+                                // parent delta must include that shift.
+                                let new_header_size = self.write_element_header(
+                                    value_idx,
+                                    ElementType::ARRAY,
+                                    value_size + placeholder_bytes.len(),
+                                    true,
+                                )?;
+                                let header_delta =
+                                    new_header_size as isize - value_header_size as isize;
 
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
                                     JsonLocationKind::ObjectProperty(key_idx),
-                                    placeholder_bytes.len() as isize,
-                                    insertion_point,
+                                    placeholder_bytes.len() as isize + header_delta,
+                                    insertion_point
+                                        .checked_add_signed(header_delta)
+                                        .expect("array contents cannot move before the header"),
                                 ));
                             } else {
                                 bail_parse_error!("Cant insert")
@@ -3931,6 +4114,18 @@ pub fn unescape_string(input: &str) -> String {
                 Some('"') => result.push('"'),
                 Some('b') => result.push('\u{0008}'),
                 Some('f') => result.push('\u{000C}'),
+                // JSON5 escapes, stored raw in TEXT5 payloads.
+                Some('v') => result.push('\u{000B}'),
+                Some('\'') => result.push('\''),
+                Some('0') => result.push('\u{0000}'),
+                // A backslash before a line terminator is a JSON5 line
+                // continuation: both characters disappear.
+                Some('\n') | Some('\u{2028}') | Some('\u{2029}') => {}
+                Some('\r') => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
                 Some('x') => {
                     code_point.clear();
                     for _ in 0..2 {
@@ -4033,6 +4228,34 @@ pub struct ParseInfo {
     pub has_json5: bool,
 }
 
+/// Whether `b` may appear in an unquoted JSON5 object key. Like
+/// SQLite, ASCII letters, '_' and '$' may start one, digits may only
+/// continue one, and every non-ASCII byte is accepted without decoding
+/// the character.
+fn is_json5_id_char(b: u8, first: bool) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x7f || (!first && b.is_ascii_digit())
+}
+
+/// Length of the JSON5-only whitespace sequence at the start of
+/// `input`, or 0 if it does not start with one. Covers VT, FF and the
+/// UTF-8 encodings of the Unicode space characters SQLite's JSON5
+/// parser skips: U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029,
+/// U+202F, U+205F, U+3000 and the U+FEFF byte order mark.
+#[inline]
+fn json5_whitespace_len(input: &[u8]) -> usize {
+    match input {
+        [0x0b | 0x0c, ..] => 1,
+        [0xc2, 0xa0, ..] => 2,
+        [0xe1, 0x9a, 0x80, ..] => 3,
+        [0xe2, 0x80, 0x80..=0x8a, ..] => 3,
+        [0xe2, 0x80, 0xa8 | 0xa9 | 0xaf, ..] => 3,
+        [0xe2, 0x81, 0x9f, ..] => 3,
+        [0xe3, 0x80, 0x80, ..] => 3,
+        [0xef, 0xbb, 0xbf, ..] => 3,
+        _ => 0,
+    }
+}
+
 /// The common case is no whitespace at all, so the check for it must
 /// inline into the deserializers the way the pre-tracking
 /// implementation did: an outlined call here costs more than the
@@ -4040,7 +4263,7 @@ pub struct ParseInfo {
 #[inline(always)]
 pub fn skip_whitespace_tracking(input: &[u8], pos: usize, info: &mut ParseInfo) -> usize {
     // Fast path for non-whitespace, non-comment
-    if pos >= input.len() || ((WS_TABLE[input[pos] as usize] & 1) == 0 && input[pos] != b'/') {
+    if pos >= input.len() || ((WS_TABLE[input[pos] as usize] & 3) == 0 && input[pos] != b'/') {
         return pos;
     }
     skip_whitespace_and_comments(input, pos, info)
@@ -4055,6 +4278,15 @@ fn skip_whitespace_and_comments(input: &[u8], mut pos: usize, info: &mut ParseIn
         if (WS_TABLE[ch as usize] & 1) != 0 {
             // Skip whitespace
             pos += 1;
+        } else if (WS_TABLE[ch as usize] & 2) != 0 {
+            let n = json5_whitespace_len(&input[pos..]);
+            if n == 0 {
+                // A JSON5 lead byte without the rest of the sequence
+                // is not whitespace.
+                break;
+            }
+            info.has_json5 = true;
+            pos += n;
         } else if ch == b'/' && pos + 1 < len {
             // Handle JSON5 comments
             match input[pos + 1] {
@@ -4369,6 +4601,17 @@ mod tests {
     }
 
     #[test]
+    fn scalar_string_value_rejects_overflowing_payload_length() {
+        // TEXT5 header in the 8-byte size format declaring a payload
+        // length near usize::MAX: the payload end computation must not
+        // overflow (SQL paths validate blobs first, but this decoder is
+        // public API).
+        let blob = [0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7];
+        let jsonb = Jsonb::from_raw_data(&blob).unwrap();
+        assert!(jsonb.scalar_string_value().is_err());
+    }
+
+    #[test]
     fn test_null_serialization() {
         // Create JSONB with null value
         let mut jsonb = Jsonb::new(10).unwrap();
@@ -4553,13 +4796,13 @@ mod tests {
         let parsed = Jsonb::from_str("1.5e+10").unwrap();
         assert_eq!(parsed.to_string().unwrap(), "1.5e+10");
 
-        // Infinity
+        // Infinity renders as SQLite's short form
         let parsed = Jsonb::from_str("Infinity").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "9.0e+999");
+        assert_eq!(parsed.to_string().unwrap(), "9e999");
 
         // Negative Infinity
         let parsed = Jsonb::from_str("-Infinity").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "-9.0e+999");
+        assert_eq!(parsed.to_string().unwrap(), "-9e999");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
