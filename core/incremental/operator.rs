@@ -39,6 +39,19 @@ impl DbspStateCursors {
     }
 }
 
+/// Give a circuit-owned cursor the same deterministic-yield context a VDBE
+/// cursor gets. Without this the DBSP state and view btrees are invisible to
+/// yield injection, so no simulator seed can schedule a yield inside an IVM
+/// write.
+#[inline]
+pub fn install_dbsp_yield_context(
+    _cursor: &mut BTreeCursor,
+    _pager: &crate::storage::pager::Pager,
+) {
+    #[cfg(any(test, injected_yields))]
+    _cursor.install_yield_context_from_pager(_pager);
+}
+
 /// Create an index definition for the DBSP state table
 /// This defines the primary key index on (operator_id, zset_id, element_id)
 pub fn create_dbsp_state_index(root_page: i64) -> Index {
@@ -211,6 +224,19 @@ pub trait IncrementalOperator: Debug + Send {
     /// # Arguments
     /// * `state` - The evaluation state (may be in progress from a previous I/O operation)
     /// * `cursors` - Cursors for reading operator state from storage (table and optional index)
+    ///
+    /// # Cursor contract
+    /// `cursors` is only guaranteed to live as long as one poll:
+    /// `DbspCircuit::execute` rebuilds it on every `IOResult::IO`. So `state`
+    /// must never encode "continue from wherever the cursor is now" — every
+    /// re-entry must re-derive its position from a key it stores itself
+    /// (`SeekKey`, a group key, `last_element_hash`, ...). A bare
+    /// `rewind()`/`next()` scan whose progress lives in `state` would silently
+    /// restart or drop rows, with no assertion to catch it. Writes have no
+    /// such freedom at all — a yielded btree write can only be re-driven on the
+    /// cursor that started it, which is why `commit` runs against a pair owned
+    /// by the caller's state (`CommitState::CommitOperators`,
+    /// `ExecuteState::ProcessingInputs`).
     ///
     /// # Returns
     /// The output delta from the evaluation
