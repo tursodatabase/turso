@@ -2130,6 +2130,69 @@ fn fts_trigger_writes_survive_repeated_subprogram_runs(tmp_db: TempDatabase) {
     );
 }
 
+/// A trigger that writes the same FTS-indexed table as its parent statement
+/// gives that statement two live FTS cursors on one index. Each cursor loads
+/// its own catalog view, so whichever flushes last overwrites the control
+/// manifest without the other's segment files, and every later open fails
+/// manifest validation with Corrupt. The index must stay readable and reflect
+/// both writers.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn fts_parent_and_trigger_writes_to_same_index_keep_index_readable(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER amend_docs AFTER INSERT ON docs BEGIN \
+         UPDATE docs SET body = NEW.body || ' amended' WHERE id = NEW.id; END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO docs VALUES (1, 'parent row'), (2, 'parent row')")
+        .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id, body FROM docs ORDER BY id"),
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Text("parent row amended".to_string()),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Text("parent row amended".to_string()),
+            ],
+        ]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'amended') ORDER BY id"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+        ]
+    );
+
+    // A connection without cached FTS state must be able to open the index
+    // from its backing B-tree alone.
+    let fresh = tmp_db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(
+            &fresh,
+            "SELECT id FROM docs WHERE fts_match(body, 'amended') ORDER BY id"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+        ]
+    );
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test(mvcc)]
 fn fts_raise_fail_keeps_base_rows_and_index_in_sync(tmp_db: TempDatabase) {
