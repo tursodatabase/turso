@@ -1595,7 +1595,13 @@ impl Jsonb {
         cursor
     }
 
-    fn deserialize_value(&mut self, input: &[u8], mut pos: usize, depth: usize) -> PResult<usize> {
+    fn deserialize_value(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        depth: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
@@ -1603,7 +1609,7 @@ impl Jsonb {
             });
         }
 
-        pos = skip_whitespace(input, pos);
+        pos = skip_whitespace_tracking(input, pos, info);
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
@@ -1614,11 +1620,11 @@ impl Jsonb {
         match input[pos] {
             b'{' => {
                 pos += 1; // consume '{'
-                pos = self.deserialize_obj(input, pos, depth + 1)?;
+                pos = self.deserialize_obj(input, pos, depth + 1, info)?;
             }
             b'[' => {
                 pos += 1; // consume '['
-                pos = self.deserialize_array(input, pos, depth + 1)?;
+                pos = self.deserialize_array(input, pos, depth + 1, info)?;
             }
             b't' => {
                 pos = self.deserialize_true(input, pos)?;
@@ -1627,10 +1633,10 @@ impl Jsonb {
                 pos = self.deserialize_false(input, pos)?;
             }
             b'n' | b'N' => {
-                pos = self.deserialize_null_or_nan(input, pos)?;
+                pos = self.deserialize_null_or_nan(input, pos, info)?;
             }
             b'"' | b'\'' => {
-                pos = self.deserialize_string(input, pos)?;
+                pos = self.deserialize_string(input, pos, info)?;
             }
             c if c.is_ascii_digit()
                 || c == b'-'
@@ -1638,7 +1644,7 @@ impl Jsonb {
                 || c == b'.'
                 || c.eq_ignore_ascii_case(&b'i') =>
             {
-                pos = self.deserialize_number(input, pos)?;
+                pos = self.deserialize_number(input, pos, info)?;
             }
             _ => {
                 return Err(PError::Message {
@@ -1651,7 +1657,13 @@ impl Jsonb {
         Ok(pos)
     }
 
-    fn deserialize_obj(&mut self, input: &[u8], mut pos: usize, depth: usize) -> PResult<usize> {
+    fn deserialize_obj(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        depth: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
@@ -1678,7 +1690,7 @@ impl Jsonb {
         let mut first = true;
 
         loop {
-            pos = skip_whitespace(input, pos);
+            pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1703,7 +1715,7 @@ impl Jsonb {
                 }
                 b',' if !first => {
                     pos += 1; // consume ','
-                    pos = skip_whitespace(input, pos);
+                    pos = skip_whitespace_tracking(input, pos, info);
                     if pos >= input.len() {
                         return Err(PError::Message {
                             msg: "Unexpected end of input after comma in object".to_string(),
@@ -1716,12 +1728,16 @@ impl Jsonb {
                             location: Some(pos),
                         });
                     }
+                    if input[pos] == b'}' {
+                        // Trailing comma
+                        info.has_json5 = true;
+                    }
                 }
                 _ => {
                     // Parse key (must be string)
-                    pos = self.deserialize_string(input, pos)?;
+                    pos = self.deserialize_string(input, pos, info)?;
 
-                    pos = skip_whitespace(input, pos);
+                    pos = skip_whitespace_tracking(input, pos, info);
                     if pos >= input.len() || input[pos] != b':' {
                         return Err(PError::Message {
                             msg: "Expected : after object key".to_string(),
@@ -1730,11 +1746,11 @@ impl Jsonb {
                     }
                     pos += 1; // consume ':'
 
-                    pos = skip_whitespace(input, pos);
+                    pos = skip_whitespace_tracking(input, pos, info);
 
                     // Parse value - can be any JSON value including another object
-                    pos = self.deserialize_value(input, pos, depth + 1)?;
-                    pos = skip_whitespace(input, pos);
+                    pos = self.deserialize_value(input, pos, depth + 1, info)?;
+                    pos = skip_whitespace_tracking(input, pos, info);
                     if pos < input.len() && !matches!(input[pos], b',' | b'}') {
                         return Err(PError::Message {
                             msg: "Should be , or }}".to_string(),
@@ -1747,7 +1763,13 @@ impl Jsonb {
         }
     }
 
-    fn deserialize_array(&mut self, input: &[u8], mut pos: usize, depth: usize) -> PResult<usize> {
+    fn deserialize_array(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        depth: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
@@ -1765,7 +1787,7 @@ impl Jsonb {
         let mut first = true;
 
         loop {
-            pos = skip_whitespace(input, pos);
+            pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1790,7 +1812,7 @@ impl Jsonb {
                 }
                 b',' if !first => {
                     pos += 1; // consume ','
-                    pos = skip_whitespace(input, pos);
+                    pos = skip_whitespace_tracking(input, pos, info);
                     if pos >= input.len() {
                         return Err(PError::Message {
                             msg: "Unexpected end of input after comma".to_string(),
@@ -1803,12 +1825,16 @@ impl Jsonb {
                             location: Some(pos),
                         });
                     }
+                    if input[pos] == b']' {
+                        // Trailing comma
+                        info.has_json5 = true;
+                    }
                 }
                 _ => {
-                    pos = skip_whitespace(input, pos);
+                    pos = skip_whitespace_tracking(input, pos, info);
 
                     // Parse array element
-                    pos = self.deserialize_value(input, pos, depth + 1)?;
+                    pos = self.deserialize_value(input, pos, depth + 1, info)?;
 
                     first = false;
                 }
@@ -1816,7 +1842,12 @@ impl Jsonb {
         }
     }
 
-    fn deserialize_string(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
+    fn deserialize_string(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
@@ -1826,6 +1857,12 @@ impl Jsonb {
 
         let string_start = self.len();
         let quote = input[pos];
+        if quote != b'"' {
+            // Only double-quoted strings are plain JSON. Anything else
+            // here is a single-quoted string or an unquoted object key,
+            // both of which are JSON5 syntax.
+            info.has_json5 = true;
+        }
         pos += 1; // consume quote
 
         let quoted = quote == b'"' || quote == b'\'';
@@ -2085,6 +2122,10 @@ impl Jsonb {
             });
         }
 
+        if matches!(element_type, ElementType::TEXT5) {
+            info.has_json5 = true;
+        }
+
         // Write final header with correct type and size
         self.write_element_header(string_start, element_type, len, false)
             .map_err(|_| PError::Message {
@@ -2095,7 +2136,12 @@ impl Jsonb {
         Ok(pos)
     }
 
-    fn deserialize_number(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
+    fn deserialize_number(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
         let num_start = self.len();
         let mut len = 0;
         let mut is_float = false;
@@ -2155,6 +2201,7 @@ impl Jsonb {
                     });
                 }
 
+                info.has_json5 = true;
                 self.write_element_header(num_start, ElementType::INT5, len, false)
                     .map_err(|_| PError::Message {
                         msg: "Unexpected input after json".to_string(),
@@ -2194,6 +2241,8 @@ impl Jsonb {
             }
 
             pos += infinity.len();
+
+            info.has_json5 = true;
 
             // Write Infinity as 9.0e+999
             self.data.extend_from_slice(b"9.0e+999");
@@ -2264,6 +2313,10 @@ impl Jsonb {
             });
         }
 
+        if is_json5 {
+            info.has_json5 = true;
+        }
+
         // Determine the appropriate element type
         let element_type = if is_float {
             if is_json5 {
@@ -2320,7 +2373,12 @@ impl Jsonb {
         Ok(pos)
     }
 
-    pub fn deserialize_null_or_nan(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
+    pub fn deserialize_null_or_nan(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
         // First check if we have enough bytes remaining for "nan" (minimum 3 bytes)
         if pos + 3 > input.len() {
             return Err(PError::Message {
@@ -2348,6 +2406,7 @@ impl Jsonb {
             && (input[pos + 2] == b'n' || input[pos + 2] == b'N')
         {
             pos += 3;
+            info.has_json5 = true;
             self.data.push(ElementType::NULL as u8);
             return Ok(pos);
         }
@@ -2415,8 +2474,13 @@ impl Jsonb {
     }
 
     fn from_str(input: &str) -> PResult<Self> {
+        Ok(Self::from_str_tracking(input)?.0)
+    }
+
+    pub fn from_str_tracking(input: &str) -> PResult<(Self, ParseInfo)> {
         let mut result = Self::new(input.len())?;
         let input = input.as_bytes();
+        let mut info = ParseInfo::default();
 
         if input.is_empty() {
             return Err(PError::Message {
@@ -2427,10 +2491,10 @@ impl Jsonb {
 
         // Parse the first complete JSON value
         let mut pos = 0;
-        pos = result.deserialize_value(input, pos, 0)?;
+        pos = result.deserialize_value(input, pos, 0, &mut info)?;
 
         // Skip any trailing whitespace
-        pos = skip_whitespace(input, pos);
+        pos = skip_whitespace_tracking(input, pos, &mut info);
 
         // Check for any non-whitespace characters after the JSON value
         if pos < input.len() {
@@ -2440,7 +2504,7 @@ impl Jsonb {
             });
         }
 
-        Ok(result)
+        Ok((result, info))
     }
 
     pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
@@ -3567,17 +3631,30 @@ pub fn unescape_string(input: &str) -> String {
     result
 }
 
-#[inline]
-pub fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
-    let len = input.len();
-    if pos >= len {
-        return pos;
-    }
+/// Parse-time record of whether the input used any JSON5-only syntax,
+/// like SQLite's JsonParse.hasNonstd. The parsed JSONB blob cannot
+/// answer this after the fact because trailing commas and comments
+/// leave no trace in it.
+#[derive(Debug, Default)]
+pub struct ParseInfo {
+    pub has_json5: bool,
+}
 
+/// The common case is no whitespace at all, so the check for it must
+/// inline into the deserializers the way the pre-tracking
+/// implementation did: an outlined call here costs more than the
+/// check itself and showed up as a double-digit parser regression.
+#[inline(always)]
+pub fn skip_whitespace_tracking(input: &[u8], pos: usize, info: &mut ParseInfo) -> usize {
     // Fast path for non-whitespace, non-comment
-    if (WS_TABLE[input[pos] as usize] & 1) == 0 && input[pos] != b'/' {
+    if pos >= input.len() || ((WS_TABLE[input[pos] as usize] & 1) == 0 && input[pos] != b'/') {
         return pos;
     }
+    skip_whitespace_and_comments(input, pos, info)
+}
+
+fn skip_whitespace_and_comments(input: &[u8], mut pos: usize, info: &mut ParseInfo) -> usize {
+    let len = input.len();
 
     // Process whitespace and comments
     while pos < len {
@@ -3590,6 +3667,7 @@ pub fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
             match input[pos + 1] {
                 b'/' => {
                     // Line comment - skip until newline
+                    info.has_json5 = true;
                     pos += 2;
                     while pos < len && input[pos] != b'\n' {
                         pos += 1;
@@ -3600,6 +3678,7 @@ pub fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
                 }
                 b'*' => {
                     // Block comment - skip until "*/"
+                    info.has_json5 = true;
                     pos += 2;
                     while pos + 1 < len {
                         if input[pos] == b'*' && input[pos + 1] == b'/' {
@@ -3652,6 +3731,50 @@ fn utf8_sequence_len(ch: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_has_json5(input: &str) -> bool {
+        let (_, info) = Jsonb::from_str_tracking(input).unwrap();
+        info.has_json5
+    }
+
+    #[test]
+    fn plain_json_does_not_set_the_json5_flag() {
+        for input in [
+            "{\"a\":1}",
+            "[1,2]",
+            "\"aA\\n\\u0041\\\"b\"",
+            " \t\r\n 1 ",
+            "-1.5e+2",
+            "null",
+            "true",
+        ] {
+            assert!(!parse_has_json5(input), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn each_json5_construct_sets_the_json5_flag() {
+        for input in [
+            "{a:1}",        // unquoted object key
+            "'x'",          // single-quoted string
+            "[1,]",         // trailing comma in array
+            "{\"a\":1,}",   // trailing comma in object
+            "/*c*/1",       // block comment
+            "//c\n1",       // line comment
+            "0x10",         // hex number
+            "+1",           // leading plus sign
+            ".5",           // leading decimal point
+            "4.",           // trailing decimal point
+            "Infinity",     // JSON5 infinity literal
+            "NaN",          // JSON5 not-a-number literal
+            "\"\\x41\"",    // JSON5 \x escape
+            "\"\\v\"",      // JSON5 \v escape
+            "\"a\u{1}b\"",  // raw control byte in a string
+            "\"\\x41\\n\"", // JSON5 escape followed by a standard escape
+        ] {
+            assert!(parse_has_json5(input), "{input:?}");
+        }
+    }
 
     #[test]
     fn test_null_serialization() {
