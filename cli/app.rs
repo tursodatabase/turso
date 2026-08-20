@@ -28,7 +28,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -126,6 +126,9 @@ pub struct Limbo {
     io: Arc<dyn turso_core::IO>,
     writer: Option<Box<dyn Write>>,
     conn: Arc<turso_core::Connection>,
+    /// The connection the Ctrl-C handler interrupts. Shared with the handler thread and
+    /// retargeted by `.open`, which replaces `conn`.
+    interrupt_target: Arc<Mutex<Arc<turso_core::Connection>>>,
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
@@ -286,11 +289,17 @@ impl Limbo {
             conn._free_extension_ctx(ext_api);
         }
         let interrupt_count = Arc::new(AtomicUsize::new(0));
+        let interrupt_target = Arc::new(Mutex::new(conn.clone()));
         {
             let interrupt_count: Arc<AtomicUsize> = Arc::clone(&interrupt_count);
+            let interrupt_target = Arc::clone(&interrupt_target);
             ctrlc::set_handler(move || {
                 // Increment the interrupt count on Ctrl-C
                 interrupt_count.fetch_add(1, Ordering::Release);
+                // Installing this handler suppresses the default SIGINT kill, so a statement
+                // that is already running can only be abandoned by asking the VDBE to stop.
+                // The request is a no-op when no statement is active, as in sqlite3_interrupt.
+                interrupt_target.lock().unwrap().interrupt();
             })
             .expect("Error setting Ctrl-C handler");
         }
@@ -303,6 +312,7 @@ impl Limbo {
             io,
             writer: Some(get_writer(&opts.output)),
             conn,
+            interrupt_target,
             interrupt_count,
             input_buff: ManuallyDrop::new(sql.unwrap_or_default()),
             read_state: ReadState::default(),
@@ -494,6 +504,7 @@ impl Limbo {
         };
         self.io = io;
         self.conn = db.connect()?;
+        *self.interrupt_target.lock().unwrap() = self.conn.clone();
         self.opts.db_file = path.to_string();
         Ok(())
     }
