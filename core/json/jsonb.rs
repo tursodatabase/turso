@@ -1900,12 +1900,14 @@ impl Jsonb {
         }
 
         let mut escape_buffer = [0u8; 6]; // Buffer for escape sequences
+        let mut closed = false;
 
         while pos < input.len() {
             let c = input[pos];
             pos += 1;
 
             if quoted && c == quote {
+                closed = true;
                 break; // End of string
             } else if !quoted && (c == b'"' || c == b'\'') {
                 return Err(PError::Message {
@@ -2055,6 +2057,15 @@ impl Jsonb {
                 self.data.push(c);
                 len += 1;
             }
+        }
+
+        // A quoted string must end with its closing quote before the
+        // input runs out.
+        if quoted && !closed {
+            return Err(PError::Message {
+                msg: "Unexpected end of input".to_string(),
+                location: Some(pos),
+            });
         }
 
         // Write final header with correct type and size

@@ -1,0 +1,21 @@
+@database :memory:
+
+# A string that hits end of input before its closing quote is
+# malformed. A NUL inside the text ends parsing like SQLite, so a
+# quoted string cut off by one is unterminated too.
+test unterminated_string_is_malformed {
+    SELECT json_valid('"abc'), json_valid('["a","b'),
+           json_valid('"a' || char(0) || '"x'),
+           json_error_position('"abc'), json_error_position('["a","b'),
+           json_error_position('[''abc');
+}
+expect {
+    0|0|0|5|8|6
+}
+
+test unterminated_string_document_errors {
+    SELECT json('"abc');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
