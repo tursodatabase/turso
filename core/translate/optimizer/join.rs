@@ -1988,7 +1988,6 @@ fn get_best_seek_score(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                partial: index.where_clause.is_some(),
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
@@ -1999,7 +1998,6 @@ fn get_best_seek_score(
             },
             None => IndexInfo {
                 unique: true,
-                partial: false,
                 covering: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,

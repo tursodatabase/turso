@@ -69,8 +69,6 @@ impl std::ops::Deref for Cost {
 pub struct IndexInfo {
     pub unique: bool,
     pub column_count: usize,
-    /// Whether this index contains only rows selected by an index WHERE clause.
-    pub partial: bool,
     /// Whether the index satisfies the query without table lookups.
     /// True for genuinely covering indexes and for multi-index branches
     /// that only harvest rowids into a RowSet.
@@ -446,9 +444,10 @@ pub fn estimate_cost_for_scan_or_seek(
     );
 
     let is_full_scan = usable_constraint_refs.is_empty();
-    // Penalize complete, non-covering indexes doing full scans when not ordered by
-    // the index. Partial-index scans already use their smaller row count above.
-    if !index_info.covering && !index_info.partial && is_full_scan && !is_index_ordered {
+    // Penalize non-covering indexes doing full scans when not ordered by the index.
+    // Without ordering benefit, a full scan on a non-covering index requires random
+    // table lookups for each row, which is expensive.
+    if !index_info.covering && is_full_scan && !is_index_ordered {
         // Full index scan without ordering benefit - prefer table scan instead
         Cost(base_cost.0 * 2.0)
     } else {
