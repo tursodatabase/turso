@@ -830,6 +830,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Lex a parameter marker: `?` or `?NNN`, or a named parameter that
+    /// starts with `$`, `@` or `:`.
     fn eat_var(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
         let tok = self.eat().unwrap();
@@ -844,27 +846,30 @@ impl<'a> Lexer<'a> {
                     TokenType::TK_VARIABLE,
                 ))
             }
-            _ => {
-                let start_id = self.offset;
-                self.eat_while(is_identifier_continue);
-
-                // empty variable name
-                if start_id == self.offset {
-                    let token_text =
-                        String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                    return Err(Error::BadVariableName {
-                        span: (start, self.offset - start).into(),
-                        token_text,
-                        offset: start,
-                    });
-                }
-
-                Ok(Token::new(
-                    &self.input[start..self.offset],
-                    TokenType::TK_VARIABLE,
-                ))
-            }
+            _ => self.eat_named_var(start),
         }
+    }
+
+    /// Lex the name of a named parameter. `start` is the offset of the
+    /// prefix byte (`$`, `@` or `:`), which the caller has already eaten.
+    fn eat_named_var(&mut self, start: usize) -> Result<Token<'a>> {
+        let start_id = self.offset;
+        self.eat_while(is_identifier_continue);
+
+        // empty variable name
+        if start_id == self.offset {
+            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+            return Err(Error::BadVariableName {
+                span: (start, self.offset - start).into(),
+                token_text,
+                offset: start,
+            });
+        }
+
+        Ok(Token::new(
+            &self.input[start..self.offset],
+            TokenType::TK_VARIABLE,
+        ))
     }
 
     #[inline]
