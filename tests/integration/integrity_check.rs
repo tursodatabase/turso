@@ -1967,13 +1967,13 @@ fn test_blob_read_corrupt_spilled_header_overflow_no_panic(db: TempDatabase) {
     // of 1 encode as serial type 9 (byte 0x09) with no body, so the header is a long
     // run of 0x09 — a distinctive signature for finding its overflow pages below.
     let cols: Vec<String> = (0..1500).map(|i| format!("c{i} INT")).collect();
-    conn.execute(&format!(
+    conn.execute(format!(
         "CREATE TABLE t(id INTEGER PRIMARY KEY, {}, data BLOB);",
         cols.join(", ")
     ))
     .unwrap();
     let ones = vec!["1"; 1500].join(", ");
-    conn.execute(&format!("INSERT INTO t VALUES (1, {ones}, zeroblob(64));"))
+    conn.execute(format!("INSERT INTO t VALUES (1, {ones}, zeroblob(64));"))
         .unwrap();
     checkpoint_database(&conn);
     drop(conn);

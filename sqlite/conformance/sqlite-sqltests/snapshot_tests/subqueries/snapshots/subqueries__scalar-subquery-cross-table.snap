@@ -41,7 +41,7 @@ addr  opcode                 p1  p2  p3  p4            p5  comment
   17            If            4  19   0                 0  if r[4] goto 19; don't emit group columns if continuing existing group
   18            Column        1   0   7                 0  r[7]=idx_orders_customer.customer_id
   19            Integer       1   4   0                 0  r[4]=1; indicate data in accumulator
-  20          Next            1   9   0                 0
+  20          Next            1   9   0                 1
   21          Gosub           3  25   0                 0  ; emit row for final group
   22          Goto            0  39   0                 0  ; group by finished
   23          Integer         1   5   0                 0  r[5]=1
@@ -76,7 +76,7 @@ addr  opcode                 p1  p2  p3  p4            p5  comment
   52    IfPos                19  55   0                 0  r[19]>0 -> r[19]-=0, goto 55
   53    NullRow               0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
   54    Goto                  0  45   0                 0
-  55  Next                    2  41   0                 0
+  55  Next                    2  41   0                 1
   56  Halt                    0   0   0                 0
   57  Transaction             0   1  11                 0  iDb=0 tx_mode=Read
   58  Integer                 1  12   0                 0  r[12]=1

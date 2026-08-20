@@ -107,7 +107,9 @@ impl InitLoop {
             emit_explain!(
                 program,
                 false,
-                format!("USE HASH TABLE FOR {}(DISTINCT)", agg.func)
+                crate::translate::eqp::EqpDetail::DistinctAggregate {
+                    function: agg.func.to_string(),
+                }
             );
         }
         // Include hash-join build tables so their cursors are opened for hash build.

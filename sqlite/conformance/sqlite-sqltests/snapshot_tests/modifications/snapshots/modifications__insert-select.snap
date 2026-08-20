@@ -29,7 +29,7 @@ addr  opcode            p1  p2  p3  p4                         p5  comment
    7    ColumnRange      0   1   4  4                           0  r[4..7]=orders.user_id..total_price
    8    RealAffinity     7   0   0                              0
    9    Yield            2   0   0                              0
-  10  Next               0   4   0                              0
+  10  Next               0   4   0                              1
   11  EndCoroutine       2   0   0                              0
   12  OpenWrite          1   7   0                              0  root=7; iDb=0
   13    Yield            2  37   0                              0

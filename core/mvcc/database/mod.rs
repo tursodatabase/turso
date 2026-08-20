@@ -4526,6 +4526,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .indexes
                     .values()
                     .flatten()
+                    .filter(|index| index.is_btree_backed())
                     .map(|index| index.root_page),
             )
             .collect::<Vec<_>>();
@@ -4927,6 +4928,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         .indexes
                         .values()
                         .flatten()
+                        .filter(|index| index.is_btree_backed())
                         .map(|index| index.root_page),
                 )
         };
@@ -9126,7 +9128,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     _ => None,
                                 };
                                 let has_btree = match row_type {
-                                    "index" => true,
+                                    "index" => root_page != 0,
                                     "table" => {
                                         !sql.is_some_and(crate::util::sql_is_create_virtual_table)
                                     }

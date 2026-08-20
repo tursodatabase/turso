@@ -57,7 +57,7 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   26    Subtract   22  23  21                                          0  r[21]=r[22]-r[23]
   27    Multiply   20  21  19                                          0  r[19]=r[20]*r[21]
   28    AggStep     0  19   3  sum                                     0  accum=r[3] step(r[19])
-  29  Next          0   5   0                                          0
+  29  Next          0   5   0                                          1
   30  AggFinal      0   2   0  sum                                     0  accum=r[2]
   31  AggFinal      0   3   0  sum                                     0  accum=r[3]
   32  Copy          2  27   0                                          0  r[27]=r[2]

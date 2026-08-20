@@ -29,7 +29,7 @@ addr  opcode          p1  p2  p3  p4                p5  comment
    8    Column         1   1   9                     0  r[9]=products.name
    9    MakeRecord     6   4   5                     0  r[5]=mkrec(r[6..9])
   10    SorterInsert   0   5   0  0                  0  key=r[5]
-  11  Next             1   4   0                     0
+  11  Next             1   4   0                     1
   12  OpenPseudo       2   5   4                     0  4 columns in r[5]
   13  SorterSort       0  19   0                     0
   14    SorterData     0   5   2                     0  r[5]=data

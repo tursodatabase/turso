@@ -11,6 +11,8 @@ use std::time::Duration;
 use turso_core::{
     Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect, Value as DbValue,
 };
+use turso_parser::ast::{Cmd, Stmt};
+use turso_parser::parser::Parser;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
@@ -51,6 +53,111 @@ struct InitializeRequest {
 struct CallToolRequest {
     name: String,
     arguments: Option<Value>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StmtClass {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Schema,
+}
+
+impl StmtClass {
+    fn of(stmt: &Stmt) -> Option<Self> {
+        match stmt {
+            Stmt::Select(_) => Some(Self::Select),
+            Stmt::Insert { .. } => Some(Self::Insert),
+            Stmt::Update(_) => Some(Self::Update),
+            Stmt::Delete { .. } => Some(Self::Delete),
+            Stmt::AlterTable(_)
+            | Stmt::CreateIndex { .. }
+            | Stmt::CreateTable { .. }
+            | Stmt::CreateTrigger { .. }
+            | Stmt::CreateView { .. }
+            | Stmt::CreateMaterializedView { .. }
+            | Stmt::CreateVirtualTable(_)
+            | Stmt::CreateType { .. }
+            | Stmt::CreateDomain { .. }
+            | Stmt::CreateSequence { .. }
+            | Stmt::DropIndex { .. }
+            | Stmt::DropTable { .. }
+            | Stmt::DropTrigger { .. }
+            | Stmt::DropView { .. }
+            | Stmt::DropType { .. }
+            | Stmt::DropDomain { .. }
+            | Stmt::DropSequence { .. } => Some(Self::Schema),
+            Stmt::Analyze { .. }
+            | Stmt::Attach { .. }
+            | Stmt::Begin { .. }
+            | Stmt::Commit { .. }
+            | Stmt::Detach { .. }
+            | Stmt::Pragma { .. }
+            | Stmt::Reindex { .. }
+            | Stmt::Release { .. }
+            | Stmt::Rollback { .. }
+            | Stmt::Savepoint { .. }
+            | Stmt::Vacuum { .. }
+            | Stmt::Optimize { .. } => None,
+        }
+    }
+
+    fn single_statement_error(self) -> &'static str {
+        match self {
+            Self::Select => "Only a single SELECT query is allowed",
+            Self::Insert => "Only a single INSERT statement is allowed",
+            Self::Update => "Only a single UPDATE statement is allowed",
+            Self::Delete => "Only a single DELETE statement is allowed",
+            Self::Schema => "Only a single schema modification statement is allowed",
+        }
+    }
+
+    fn wrong_class_error(self) -> &'static str {
+        match self {
+            Self::Select => "Only SELECT queries are allowed",
+            Self::Insert => "Only INSERT statements are allowed",
+            Self::Update => "Only UPDATE statements are allowed",
+            Self::Delete => "Only DELETE statements are allowed",
+            Self::Schema => "Only CREATE, ALTER, and DROP statements are allowed",
+        }
+    }
+}
+
+fn query_arg(arguments: &Option<Value>) -> Result<&str, String> {
+    match arguments {
+        Some(args) => match args.get("query") {
+            Some(Value::String(q)) => Ok(q),
+            _ => Err("Missing or invalid query parameter".to_string()),
+        },
+        None => Err("Missing query parameter".to_string()),
+    }
+}
+
+fn require_single_stmt(sql: &str, class: StmtClass) -> Result<(), String> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let cmd = match parser.next_cmd() {
+        Ok(Some(cmd)) => cmd,
+        Ok(None) => return Err("No SQL statement provided".to_string()),
+        Err(e) => return Err(format!("Failed to parse SQL: {e}")),
+    };
+    match parser.next_cmd() {
+        Ok(None) => {}
+        Ok(Some(_)) => return Err(class.single_statement_error().to_string()),
+        Err(e) => return Err(format!("Failed to parse SQL: {e}")),
+    }
+    match cmd {
+        Cmd::Stmt(stmt) if StmtClass::of(&stmt) == Some(class) => Ok(()),
+        Cmd::Stmt(_) | Cmd::Explain(_) | Cmd::ExplainQueryPlan { .. } => {
+            Err(class.wrong_class_error().to_string())
+        }
+    }
+}
+
+fn validated_query(arguments: &Option<Value>, class: StmtClass) -> Result<&str, String> {
+    let sql = query_arg(arguments)?;
+    require_single_stmt(sql, class)?;
+    Ok(sql)
 }
 
 pub struct TursoMcpServer {
@@ -557,19 +664,10 @@ impl TursoMcpServer {
     }
 
     fn execute_query(&self, arguments: &Option<Value>) -> String {
-        let query = match arguments {
-            Some(args) => match args.get("query") {
-                Some(Value::String(q)) => q,
-                _ => return "Missing or invalid query parameter".to_string(),
-            },
-            None => return "Missing query parameter".to_string(),
+        let query = match validated_query(arguments, StmtClass::Select) {
+            Ok(q) => q,
+            Err(e) => return e,
         };
-
-        // Basic validation to ensure it's a read-only query
-        let trimmed_query = query.trim().to_lowercase();
-        if !trimmed_query.starts_with("select") {
-            return "Only SELECT queries are allowed".to_string();
-        }
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.query(query) {
@@ -623,19 +721,10 @@ impl TursoMcpServer {
     }
 
     fn insert_data(&self, arguments: &Option<Value>) -> String {
-        let query = match arguments {
-            Some(args) => match args.get("query") {
-                Some(Value::String(q)) => q,
-                _ => return "Missing or invalid query parameter".to_string(),
-            },
-            None => return "Missing query parameter".to_string(),
+        let query = match validated_query(arguments, StmtClass::Insert) {
+            Ok(q) => q,
+            Err(e) => return e,
         };
-
-        // Basic validation to ensure it's an INSERT query
-        let trimmed_query = query.trim().to_lowercase();
-        if !trimmed_query.starts_with("insert") {
-            return "Only INSERT statements are allowed".to_string();
-        }
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.execute(query) {
@@ -645,19 +734,10 @@ impl TursoMcpServer {
     }
 
     fn update_data(&self, arguments: &Option<Value>) -> String {
-        let query = match arguments {
-            Some(args) => match args.get("query") {
-                Some(Value::String(q)) => q,
-                _ => return "Missing or invalid query parameter".to_string(),
-            },
-            None => return "Missing query parameter".to_string(),
+        let query = match validated_query(arguments, StmtClass::Update) {
+            Ok(q) => q,
+            Err(e) => return e,
         };
-
-        // Basic validation to ensure it's an UPDATE query
-        let trimmed_query = query.trim().to_lowercase();
-        if !trimmed_query.starts_with("update") {
-            return "Only UPDATE statements are allowed".to_string();
-        }
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.execute(query) {
@@ -667,19 +747,10 @@ impl TursoMcpServer {
     }
 
     fn delete_data(&self, arguments: &Option<Value>) -> String {
-        let query = match arguments {
-            Some(args) => match args.get("query") {
-                Some(Value::String(q)) => q,
-                _ => return "Missing or invalid query parameter".to_string(),
-            },
-            None => return "Missing query parameter".to_string(),
+        let query = match validated_query(arguments, StmtClass::Delete) {
+            Ok(q) => q,
+            Err(e) => return e,
         };
-
-        // Basic validation to ensure it's a DELETE query
-        let trimmed_query = query.trim().to_lowercase();
-        if !trimmed_query.starts_with("delete") {
-            return "Only DELETE statements are allowed".to_string();
-        }
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.execute(query) {
@@ -689,27 +760,172 @@ impl TursoMcpServer {
     }
 
     fn schema_change(&self, arguments: &Option<Value>) -> String {
-        let query = match arguments {
-            Some(args) => match args.get("query") {
-                Some(Value::String(q)) => q,
-                _ => return "Missing or invalid query parameter".to_string(),
-            },
-            None => return "Missing query parameter".to_string(),
+        let query = match validated_query(arguments, StmtClass::Schema) {
+            Ok(q) => q,
+            Err(e) => return e,
         };
-
-        // Basic validation to ensure it's a schema modification query
-        let trimmed_query = query.trim().to_lowercase();
-        if !trimmed_query.starts_with("create")
-            && !trimmed_query.starts_with("alter")
-            && !trimmed_query.starts_with("drop")
-        {
-            return "Only CREATE, ALTER, and DROP statements are allowed".to_string();
-        }
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.execute(query) {
             Ok(()) => "Schema change successful.".to_string(),
             Err(e) => format!("Error executing schema change: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory_server() -> TursoMcpServer {
+        let (_io, conn) =
+            Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
+                .expect("open memory database");
+        TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn query_arg(sql: &str) -> Option<Value> {
+        Some(json!({ "query": sql }))
+    }
+
+    fn seed_bench_orders(server: &TursoMcpServer) {
+        let conn = server.conn.lock().unwrap().clone();
+        conn.execute(
+            "CREATE TABLE bench_orders (
+                order_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                priority INTEGER NOT NULL
+            )",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO bench_orders VALUES (1, 'READY', 1), (2, 'HOLD', 2)")
+            .unwrap();
+    }
+
+    fn orders_dump(server: &TursoMcpServer) -> String {
+        server.execute_query(&query_arg(
+            "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
+        ))
+    }
+
+    #[test]
+    fn update_data_rejects_trailing_delete() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server.update_data(&query_arg(
+            "UPDATE bench_orders SET status='DONE' WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
+        ));
+
+        assert!(
+            result.contains("Only a single UPDATE statement is allowed"),
+            "expected single-statement rejection, got: {result}"
+        );
+
+        let dump = orders_dump(&server);
+        assert!(
+            dump.contains("1 | READY | 1"),
+            "UPDATE must not run: {dump}"
+        );
+        assert!(
+            dump.contains("2 | HOLD | 2"),
+            "trailing DELETE must not run: {dump}"
+        );
+    }
+
+    #[test]
+    fn update_data_allows_semicolon_inside_string() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server.update_data(&query_arg(
+            "UPDATE bench_orders SET status='DONE; DELETE' WHERE order_id=1",
+        ));
+        assert_eq!(result, "UPDATE successful.");
+
+        let dump = orders_dump(&server);
+        assert!(dump.contains("1 | DONE; DELETE | 1"), "{dump}");
+        assert!(dump.contains("2 | HOLD | 2"), "{dump}");
+    }
+
+    #[test]
+    fn insert_data_rejects_trailing_delete() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server.insert_data(&query_arg(
+            "INSERT INTO bench_orders VALUES (3, 'NEW', 3); DELETE FROM bench_orders WHERE order_id=2",
+        ));
+
+        assert!(
+            result.contains("Only a single INSERT statement is allowed"),
+            "expected single-statement rejection, got: {result}"
+        );
+        assert!(!orders_dump(&server).contains("3 | NEW | 3"));
+        assert!(orders_dump(&server).contains("2 | HOLD | 2"));
+    }
+
+    #[test]
+    fn delete_data_rejects_trailing_drop() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server.delete_data(&query_arg(
+            "DELETE FROM bench_orders WHERE order_id=1; DROP TABLE bench_orders",
+        ));
+
+        assert!(
+            result.contains("Only a single DELETE statement is allowed"),
+            "expected single-statement rejection, got: {result}"
+        );
+        let dump = orders_dump(&server);
+        assert!(dump.contains("1 | READY | 1"), "{dump}");
+        assert!(dump.contains("2 | HOLD | 2"), "{dump}");
+    }
+
+    #[test]
+    fn schema_change_rejects_trailing_delete() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server.schema_change(&query_arg(
+            "CREATE TABLE extra (id INTEGER); DELETE FROM bench_orders",
+        ));
+
+        assert!(
+            result.contains("Only a single schema modification statement is allowed"),
+            "expected single-statement rejection, got: {result}"
+        );
+        assert!(orders_dump(&server).contains("1 | READY | 1"));
+        assert!(orders_dump(&server).contains("2 | HOLD | 2"));
+    }
+
+    #[test]
+    fn execute_query_rejects_trailing_delete() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server.execute_query(&query_arg(
+            "SELECT order_id FROM bench_orders WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
+        ));
+
+        assert!(
+            result.contains("Only a single SELECT query is allowed"),
+            "expected single-statement rejection, got: {result}"
+        );
+        assert!(orders_dump(&server).contains("2 | HOLD | 2"));
+    }
+
+    #[test]
+    fn update_data_accepts_single_update() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server.update_data(&query_arg(
+            "UPDATE bench_orders SET status='DONE' WHERE order_id=1",
+        ));
+        assert_eq!(result, "UPDATE successful.");
+        assert!(orders_dump(&server).contains("1 | DONE | 1"));
+        assert!(orders_dump(&server).contains("2 | HOLD | 2"));
     }
 }

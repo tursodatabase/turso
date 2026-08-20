@@ -340,12 +340,12 @@ set test_files {
   json101              fail
   json102              fail
   json103              fail
-  json104              fail
-  json105              fail
+  json104              pass
+  json105              pass
   json106              fail
-  json107              fail
+  json107              pass
   json108              fail
-  json501              fail
+  json501              pass
   json502              fail
   jsonb01              pass
   keyword1             pass
@@ -686,14 +686,14 @@ set test_files {
   tkt3630              pass
   tkt3718              skip {hangs at tkt3718-1.2}
   tkt3731              pass
-  tkt3757              fail
+  tkt3757              pass
   tkt3761              fail
   tkt3762              fail
   tkt3773              pass
   tkt3791              pass
   tkt3793              fail
   tkt3810              fail
-  tkt3824              fail
+  tkt3824              pass
   tkt3832              pass
   tkt3838              fail
   tkt3841              pass

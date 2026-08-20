@@ -26,8 +26,9 @@ function createErrorByName(name, message) {
   return new ErrorConstructor(message);
 }
 
-// The engine returned STEP_SLEEP: its busy handler wants the statement retried
-// after a backoff delay. Park the step loop on a timer promise — unlike STEP_IO
+// The engine returned STEP_SLEEP: it wants the statement stepped again after a
+// delay (busy-handler backoff, or a yield with no pending I/O). Park the step
+// loop on a timer promise — unlike STEP_IO
 // there is no I/O completion coming to wake us up, so waiting on the IO
 // notifier would hang (WASM) or spin (native).
 function sleepBeforeRetry(ms: number): Promise<void> {

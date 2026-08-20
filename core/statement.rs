@@ -20,10 +20,13 @@ use crate::{
     turso_assert,
     vdbe::{
         self,
-        explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
+        explain::{
+            EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE,
+            EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
+        },
     },
-    LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value, EXPLAIN_COLUMNS,
-    EXPLAIN_QUERY_PLAN_COLUMNS,
+    EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
+    EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
 };
 
 type ProgramExecutionState = vdbe::ProgramExecutionState;
@@ -178,7 +181,7 @@ fn infer_expression_primitive(
     expr: &turso_parser::ast::Expr,
     referenced_tables: Option<&translate::plan::TableReferences>,
 ) -> Option<&'static str> {
-    use turso_parser::ast::{Expr, Operator};
+    use turso_parser::ast::{Expr, Operator, UnaryOperator};
 
     match expr {
         // Bare literal: read the parsed concrete value type.
@@ -195,11 +198,14 @@ fn infer_expression_primitive(
             infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
         }
         Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
-        Expr::Unary(_, inner) => {
-            // Unary +/-/NOT preserve the operand's primitive (NOT on INTEGER
-            // is still INTEGER in SQLite).
-            infer_expression_primitive(inner, referenced_tables)
-        }
+        Expr::Unary(op, inner) => match op {
+            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
+            UnaryOperator::Negative => Some(combine_arithmetic_primitive(
+                Some("INTEGER"),
+                infer_expression_primitive(inner, referenced_tables),
+            )),
+            UnaryOperator::Positive => infer_expression_primitive(inner, referenced_tables),
+        },
         Expr::Binary(left, op, right) => match op {
             // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
             // with REAL becomes REAL, fall through to NUMERIC otherwise.
@@ -352,7 +358,12 @@ impl Statement {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
-            QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Text,
+            } => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Json,
+            } => (EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(), 0),
         };
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
         Self {
@@ -889,7 +900,7 @@ impl Statement {
             let mode = self.query_mode;
             #[cfg(debug_assertions)]
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
             let prepare_options = PrepareOptions::default();
             translate::translate(
@@ -910,7 +921,12 @@ impl Statement {
         let (max_registers, cursor_count) = match self.query_mode {
             QueryMode::Normal => (new_program.max_registers, new_program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
-            QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Text,
+            } => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Json,
+            } => (EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(), 0),
         };
         // Repreparing a root statement must not make it disappear from
         // `n_active_root_statements` while it is still logically in progress.
@@ -930,7 +946,12 @@ impl Statement {
         match self.query_mode {
             QueryMode::Normal => self.program.result_columns.len(),
             QueryMode::Explain => EXPLAIN_COLUMNS.len(),
-            QueryMode::ExplainQueryPlan => EXPLAIN_QUERY_PLAN_COLUMNS.len(),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Text,
+            } => EXPLAIN_QUERY_PLAN_COLUMNS.len(),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Json,
+            } => EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(),
         }
     }
 
@@ -938,13 +959,12 @@ impl Statement {
         if self.query_mode == QueryMode::Explain {
             return Cow::Owned(EXPLAIN_COLUMNS.get(idx).expect("No column").to_string());
         }
-        if self.query_mode == QueryMode::ExplainQueryPlan {
-            return Cow::Owned(
-                EXPLAIN_QUERY_PLAN_COLUMNS
-                    .get(idx)
-                    .expect("No column")
-                    .to_string(),
-            );
+        if let QueryMode::ExplainQueryPlan { format } = self.query_mode {
+            let columns: &[&str] = match format {
+                EqpFormat::Text => &EXPLAIN_QUERY_PLAN_COLUMNS,
+                EqpFormat::Json => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
+            };
+            return Cow::Owned(columns.get(idx).expect("No column").to_string());
         }
         match self.query_mode {
             QueryMode::Normal => {
@@ -1012,12 +1032,20 @@ impl Statement {
                 }
             }
             QueryMode::Explain => Cow::Borrowed(EXPLAIN_COLUMNS[idx]),
-            QueryMode::ExplainQueryPlan => Cow::Borrowed(EXPLAIN_QUERY_PLAN_COLUMNS[idx]),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Text,
+            } => Cow::Borrowed(EXPLAIN_QUERY_PLAN_COLUMNS[idx]),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Json,
+            } => Cow::Borrowed(EXPLAIN_QUERY_PLAN_JSON_COLUMNS[idx]),
         }
     }
 
     pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
-        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
+        if matches!(
+            self.query_mode,
+            QueryMode::Explain | QueryMode::ExplainQueryPlan { .. }
+        ) {
             return None;
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
@@ -1049,13 +1077,12 @@ impl Statement {
                     .to_string(),
             );
         }
-        if self.query_mode == QueryMode::ExplainQueryPlan {
-            return Some(
-                EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
-                    .get(idx)
-                    .expect("No column")
-                    .to_string(),
-            );
+        if let QueryMode::ExplainQueryPlan { format } = self.query_mode {
+            let column_types: &[&str] = match format {
+                EqpFormat::Text => &EXPLAIN_QUERY_PLAN_COLUMNS_TYPE,
+                EqpFormat::Json => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
+            };
+            return Some(column_types.get(idx).expect("No column").to_string());
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
@@ -1205,13 +1232,12 @@ impl Statement {
                     .to_string(),
             );
         }
-        if self.query_mode == QueryMode::ExplainQueryPlan {
-            return Some(
-                EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
-                    .get(idx)
-                    .expect("No column")
-                    .to_string(),
-            );
+        if let QueryMode::ExplainQueryPlan { format } = self.query_mode {
+            let column_types: &[&str] = match format {
+                EqpFormat::Text => &EXPLAIN_QUERY_PLAN_COLUMNS_TYPE,
+                EqpFormat::Json => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
+            };
+            return Some(column_types.get(idx).expect("No column").to_string());
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {

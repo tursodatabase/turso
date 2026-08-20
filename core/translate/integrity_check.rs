@@ -585,6 +585,7 @@ fn translate_integrity_check_impl(
                     program.emit_insn(Insn::Next {
                         cursor_id: bound_index.cursor_id,
                         pc_if_next: next_exists,
+                        fullscan: false,
                     });
                     program.emit_insn(Insn::Goto {
                         target_pc: unique_ok,
@@ -616,6 +617,7 @@ fn translate_integrity_check_impl(
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
+            fullscan: false,
         });
         program.preassign_label_to_next_insn(table_empty_label);
 

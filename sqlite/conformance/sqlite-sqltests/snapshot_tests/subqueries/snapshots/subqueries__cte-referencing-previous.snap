@@ -78,7 +78,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   25            If               8  27   0                   0  if r[8] goto 27; don't emit group columns if continuing existing group
   26            Column           1   0  11                   0  r[11]=idx_order_items_product.product_id
   27            Integer          1   8   0                   0  r[8]=1; indicate data in accumulator
-  28          Next               1  11   0                   0
+  28          Next               1  11   0                   1
   29          Gosub              7  33   0                   0  ; emit row for final group
   30          Goto               0  45   0                   0  ; group by finished
   31          Integer            1   9   0                   0  r[9]=1

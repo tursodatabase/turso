@@ -227,6 +227,99 @@ fn full_commit_right_after_truncate_checkpoint_survives_power_loss() -> anyhow::
     Ok(())
 }
 
+#[test]
+fn savepoint_spill_crash_image_matches_sqlite_recovery() -> anyhow::Result<()> {
+    let db_path_sim = "savepoint-spill-sqlite-recovery.db";
+    const N_ROWS: usize = 82;
+    let old = "o".repeat(4096);
+    let new = "n".repeat(4096);
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
+    conn.execute("CREATE INDEX t_anchor_idx ON t(id, v)")?;
+    conn.execute("BEGIN IMMEDIATE")?;
+    for id in 1..=N_ROWS {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({id}, CAST('{old}' AS BLOB))"
+        ))?;
+    }
+    conn.execute("COMMIT")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    io.mark_all_durable();
+
+    conn.execute("PRAGMA cache_size=200")?;
+    conn.execute("BEGIN IMMEDIATE")?;
+    conn.execute("SAVEPOINT rollback_spill")?;
+    conn.execute("UPDATE t SET v = v || zeroblob(1024)")?;
+    conn.execute("ROLLBACK TO rollback_spill")?;
+    conn.execute("RELEASE rollback_spill")?;
+    conn.execute(format!("UPDATE t SET v = CAST('{new}' AS BLOB)"))?;
+    conn.execute("COMMIT")?;
+
+    let durable = io.durable_files();
+    let durable_db = durable
+        .get(db_path_sim)
+        .expect("the checkpointed main database must be durable");
+    let wal_path_sim = format!("{db_path_sim}-wal");
+    let durable_wal = durable
+        .get(&wal_path_sim)
+        .expect("the acknowledged FULL commit must leave a durable WAL");
+    assert!(
+        !durable_wal.is_empty(),
+        "the acknowledged FULL commit must leave durable WAL frames"
+    );
+
+    let sqlite_dir = tempfile::TempDir::new()?;
+    let sqlite_db_path = sqlite_dir.path().join("recovered.db");
+    std::fs::write(&sqlite_db_path, durable_db)?;
+    std::fs::write(sqlite_dir.path().join("recovered.db-wal"), durable_wal)?;
+
+    let (_turso_dir, turso_recovered) = crash_now_and_recover(&io, db_path_sim)?;
+    let table_sql = format!("SELECT COUNT(*) FROM t NOT INDEXED WHERE v = CAST('{new}' AS BLOB)");
+    let index_sql =
+        format!("SELECT COUNT(*) FROM t INDEXED BY t_anchor_idx WHERE v = CAST('{new}' AS BLOB)");
+    let turso_result = (
+        query_rows(&turso_recovered, "PRAGMA integrity_check")?,
+        query_rows(&turso_recovered, &table_sql)?,
+        query_rows(&turso_recovered, &index_sql)?,
+    );
+
+    let sqlite = rusqlite::Connection::open(sqlite_db_path)?;
+    let sqlite_result = (
+        vec![sqlite.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?],
+        vec![sqlite
+            .query_row(&table_sql, [], |row| row.get::<_, i64>(0))?
+            .to_string()],
+        vec![sqlite
+            .query_row(&index_sql, [], |row| row.get::<_, i64>(0))?
+            .to_string()],
+    );
+    let expected = (
+        vec!["ok".to_string()],
+        vec![N_ROWS.to_string()],
+        vec![N_ROWS.to_string()],
+    );
+
+    assert_eq!(
+        turso_result, sqlite_result,
+        "Turso and SQLite recovered different states from identical durable files"
+    );
+    assert_eq!(
+        sqlite_result, expected,
+        "SQLite rejected Turso's acknowledged commit from the durable WAL"
+    );
+    Ok(())
+}
+
 /// The same gate for the very first commit of a brand-new database: nothing
 /// has raised the WAL dirty flag yet, so before the fix the commit returned
 /// with all of its frames still unsynced.

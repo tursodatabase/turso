@@ -2438,6 +2438,7 @@ fn emit_window_full_scan(
     program.emit_insn(Insn::Next {
         cursor_id: scan_cursor,
         pc_if_next: label_loop,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(label_break);
     emit_window_agg_final(program, window, &registers, &minmax, true);
@@ -2932,6 +2933,7 @@ fn emit_window_op(
     program.emit_insn(Insn::Next {
         cursor_id: cursor_for_op,
         pc_if_next: label_after_next,
+        fullscan: false,
     });
     if let Some(break_target) = break_on_eof {
         program.emit_insn(Insn::Goto {

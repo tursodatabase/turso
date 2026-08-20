@@ -14,6 +14,10 @@ use crate::vtab::{VirtualTable, VirtualTableType};
 use turso_ext::VTabKind;
 
 /// SQLite version reported by compatibility APIs.
+///
+/// This is the source of truth for the SQLite version Turso tracks. Keep
+/// [`SQLITE_VERSION_NUMBER`], `scripts/install-sqlite3.sh`, README.md, and
+/// COMPAT.md in sync when bumping it.
 pub const SQLITE_VERSION: &str = "3.50.4";
 
 /// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
@@ -382,6 +386,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "time" => Ok(Some(Func::Scalar(ScalarFunc::Time))),
         "datetime" => Ok(Some(Func::Scalar(ScalarFunc::DateTime))),
         "typeof" => Ok(Some(Func::Scalar(ScalarFunc::Typeof))),
+        "subtype" => Ok(Some(Func::Scalar(ScalarFunc::Subtype))),
         "last_insert_rowid" => Ok(Some(Func::Scalar(ScalarFunc::LastInsertRowid))),
         "unicode" => Ok(Some(Func::Scalar(ScalarFunc::Unicode))),
         "unistr" => Ok(Some(Func::Scalar(ScalarFunc::Unistr))),

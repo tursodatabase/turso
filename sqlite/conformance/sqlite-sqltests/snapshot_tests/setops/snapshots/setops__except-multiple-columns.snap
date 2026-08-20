@@ -29,12 +29,12 @@ addr  opcode         p1  p2  p3  p4              p5  comment
    4    ColumnRange   1   1   1  2                0  r[1..2]=current_employees.name..department
    5    MakeRecord    1   2   3                   0  r[3]=mkrec(r[1..2]); for compound_dedupe
    6    IdxInsert     0   3   0                   8  key=r[3]
-   7  Next            1   4   0                   0
+   7  Next            1   4   0                   1
    8  OpenRead        2   3   0  k(5,B,B,B,B,B)   0  table=former_employees, root=3, iDb=0
    9  Rewind          2  13   0                   0  Rewind table former_employees
   10    ColumnRange   2   1   4  2                0  r[4..5]=former_employees.name..department
   11    IdxDelete     0   4   2                   0
-  12  Next            2  10   0                   0
+  12  Next            2  10   0                   1
   13  Rewind          0  16   0                   0  Rewind  ephemeral(compound_dedupe)
   14    ColumnRange   0   0   6  2                0  r[6..7]=ephemeral(compound_dedupe).name..department
   15    ResultRow     6   2   0                   0  output=r[6..7]

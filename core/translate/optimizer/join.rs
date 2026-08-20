@@ -14,6 +14,7 @@ use super::{
     AvailableIndexes, IndexMethodCandidate,
 };
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::translate::plan::BitSet;
 use crate::{
     schema::Schema,
     stats::AnalyzeStats,
@@ -80,8 +81,8 @@ fn constraint_output_multipliers(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
-    consumed_where_terms: &[usize],
-    skipped_where_terms: &[usize],
+    consumed_where_terms: &BitSet<usize>,
+    skipped_where_terms: &BitSet<usize>,
     params: &CostModelParams,
 ) -> f64 {
     let mut multiplier = 1.0;
@@ -106,8 +107,8 @@ fn constraint_output_multipliers(
         (lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
             || constraint.lhs_mask == rhs_self_mask
             || constraint.lhs_mask.is_empty())
-            && !consumed_where_terms.contains(&constraint.where_clause_pos.0)
-            && !skipped_where_terms.contains(&constraint.where_clause_pos.0)
+            && !consumed_where_terms.get(constraint.where_clause_pos.0)
+            && !skipped_where_terms.get(constraint.where_clause_pos.0)
     }) {
         multiplier *= constraint.selectivity;
 
@@ -154,7 +155,7 @@ fn rows_after_join(
         lhs_mask,
         rhs_mask,
         &method.consumed_where_terms,
-        &[],
+        &Default::default(),
         params,
     );
     input_cardinality * method.estimated_rows_per_outer_row * remaining_filter_selectivity
@@ -209,10 +210,10 @@ fn count_subquery_calls_after_join(
         });
         // A WHERE term cannot cut the call count for a subquery in that term
         // or in an earlier term. Terms before it may cut the count.
-        let skipped_where_terms: SmallVec<[usize; 2]> = if let Some(first) = first_subquery_term {
-            (first..where_clause.len()).collect()
+        let skipped_where_terms: BitSet<usize> = if let Some(first) = first_subquery_term {
+            (first..where_clause.len()).try_collect()?
         } else {
-            SmallVec::new()
+            Default::default()
         };
         let multiplier = constraint_output_multipliers(
             new_table_constraints,
@@ -679,7 +680,7 @@ fn join_lhs_and_rhs<'a>(
                     probe_multiplier,
                     subqueries,
                     params,
-                ) {
+                )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
                     let mem_budget = match &hash_join_method.params {
@@ -867,7 +868,7 @@ fn join_lhs_and_rhs<'a>(
             let mut index_method = AccessMethod {
                 cost: fts_cost,
                 estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
-                consumed_where_terms: candidate.where_covered.into_iter().collect(),
+                consumed_where_terms: candidate.where_covered.into_iter().try_collect()?,
                 params: AccessMethodParams::IndexMethod {
                     query: candidate.to_query(),
                     where_covered: candidate.where_covered,
@@ -4148,6 +4149,7 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
         )
+        .unwrap()
         .unwrap();
 
         assert!(method.estimated_rows_per_outer_row < 1_000.0);

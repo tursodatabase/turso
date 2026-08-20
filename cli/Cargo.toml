@@ -35,6 +35,7 @@ turso_core = { workspace = true, default-features = true, features = [
     "fs",
 	"fts",
 ] }
+turso_parser = { workspace = true }
 turso_sync_engine = { workspace = true }
 limbo_completion = { workspace = true, features = ["static"] }
 miette = { workspace = true, features = ["fancy"] }

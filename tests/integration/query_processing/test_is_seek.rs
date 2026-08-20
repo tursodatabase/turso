@@ -24,14 +24,23 @@ fn is_operator_uses_index_seek() {
     limbo_exec_rows(&conn, "CREATE TABLE t(a, b, c, PRIMARY KEY (a, b))");
     limbo_exec_rows(&conn, "CREATE TABLE s(k TEXT PRIMARY KEY, v)");
 
-    for query in [
-        "SELECT * FROM t WHERE a IS ? AND b IS ?",
-        "DELETE FROM t WHERE a IS ? AND b IS ?",
-        "UPDATE t SET c = ? WHERE a IS ? AND b IS ?",
+    for (query, expected) in [
+        (
+            "SELECT * FROM t WHERE a IS ? AND b IS ?",
+            "SEARCH t USING INDEX sqlite_autoindex_t_1 (a=? AND b=?)",
+        ),
+        (
+            "DELETE FROM t WHERE a IS ? AND b IS ?",
+            "SEARCH t USING COVERING INDEX sqlite_autoindex_t_1 (a=? AND b=?)",
+        ),
+        (
+            "UPDATE t SET c = ? WHERE a IS ? AND b IS ?",
+            "SEARCH t USING COVERING INDEX sqlite_autoindex_t_1 (a=? AND b=?)",
+        ),
     ] {
         let plan = query_plan(&conn, query);
         assert!(
-            plan.contains("SEARCH t USING INDEX sqlite_autoindex_t_1 (a=? AND b=?)"),
+            plan.contains(expected),
             "expected a two-column index seek for `{query}`, got:\n{plan}"
         );
     }

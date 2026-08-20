@@ -41,7 +41,7 @@ addr  opcode           p1  p2  p3  p4          p5  comment
   19      OpenRead      2   2   0  k(3,B,B,B)   0  table=t, root=2, iDb=0
   20      Rewind        2  23   0               0  Rewind table t
   21        AggStep     0  15  13  count        0  accum=r[13] step(r[15])
-  22      Next          2  21   0               0
+  22      Next          2  21   0               1
   23      AggFinal      0  13   0  count        0  accum=r[13]
   24      Copy         13  12   0               0  r[12]=r[13]
   25      Copy         12   1   0               0  r[1]=r[12]

@@ -1484,6 +1484,21 @@ pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[u
     ordered
 }
 
+/// This returns `None` if any of the index's WHERE clause conjunct terms don't match
+/// with at least one term from the query's WHERE clause.
+///
+/// Otherwise, it returns the indexes into `query_where_clause` of the matching terms.
+/// For example, using this partial index:
+///
+/// CREATE INDEX idx on t(a) WHERE length(a) < 5 AND substr(a, 1, 1) == 'B';
+///
+/// this will return 1 and 2:
+///
+/// SELECT a FROM t WHERE substr(a, 2, 2) == 'C' AND length(a) < 5 AND substr(a, 1, 1) == 'B';
+///
+/// And this will return `None`:
+///
+/// CREATE INDEX idx on t(a) WHERE length(a) < 1234 AND substr(a, 1, 1) == 'B';
 pub(super) fn partial_index_predicate_terms(
     index: &Index,
     table_reference: &JoinedTable,

@@ -28,7 +28,7 @@ addr  opcode          p1  p2  p3  p4                p5  comment
    7    RealAffinity   7   0   0                     0
    8    MakeRecord     5   3   4                     0  r[4]=mkrec(r[5..7])
    9    SorterInsert   0   4   0  0                  0  key=r[4]
-  10  Next             1   4   0                     0
+  10  Next             1   4   0                     1
   11  OpenPseudo       2   4   3                     0  3 columns in r[4]
   12  SorterSort       0  19   0                     0
   13    SorterData     0   4   2                     0  r[4]=data

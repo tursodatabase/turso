@@ -321,6 +321,7 @@ pub fn translate_expr(
                     program.emit_insn(Insn::Next {
                         cursor_id: *cursor_id,
                         pc_if_next: label_null_checks_loop_start,
+                        fullscan: false,
                     });
                     // Loop exhausted without finding all-NULL row
                     program.emit_insn(Insn::Goto {
@@ -772,7 +773,7 @@ pub fn translate_expr(
                         )
                     }
                     JsonFunc::JsonValid => {
-                        let args = expect_arguments_exact!(args, 1, j);
+                        let args = expect_arguments_max!(args, 2, j);
                         translate_function(
                             program,
                             args,
@@ -1219,6 +1220,7 @@ pub fn translate_expr(
                         | ScalarFunc::Upper
                         | ScalarFunc::Length
                         | ScalarFunc::OctetLength
+                        | ScalarFunc::Subtype
                         | ScalarFunc::Typeof
                         | ScalarFunc::Unicode
                         | ScalarFunc::Unistr
@@ -2676,7 +2678,7 @@ pub fn translate_expr(
         } => {
             let referenced_tables =
                 referenced_tables.expect("table_references needed translating Expr::RowId");
-            let (_, table) = referenced_tables
+            let (is_from_outer_query_scope, table) = referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .expect("table reference should be found");
             let Table::BTree(btree) = table else {
@@ -2684,6 +2686,26 @@ pub fn translate_expr(
             };
             if !btree.has_rowid {
                 crate::bail_parse_error!("no such column: rowid");
+            }
+
+            if is_from_outer_query_scope {
+                // A correlated subquery does not know whether the outer scan opened the
+                // table cursor or only a covering-index cursor.
+                if let Some(cursor_id) =
+                    program.resolve_cursor_id_safe(&CursorKey::table(*table_ref_id))
+                {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id,
+                        dest: target_register,
+                    });
+                } else {
+                    let cursor_id = program.resolve_any_index_cursor_id_for_table(*table_ref_id);
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id,
+                        dest: target_register,
+                    });
+                }
+                return Ok(target_register);
             }
 
             // When a cursor override is active, always read rowid from the override cursor.

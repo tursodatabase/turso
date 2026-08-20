@@ -320,6 +320,7 @@ pub(super) fn translate_sequence_function(
         program.emit_insn(Insn::Next {
             cursor_id,
             pc_if_next: loop_label,
+            fullscan: false,
         });
         program.preassign_label_to_next_insn(empty_label);
 

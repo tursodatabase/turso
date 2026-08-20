@@ -3272,6 +3272,7 @@ pub fn op_next(
         Next {
             cursor_id,
             pc_if_next,
+            fullscan,
         },
         insn
     );
@@ -3310,12 +3311,14 @@ pub fn op_next(
         state.record_rows_read(1);
         state.metrics.btree_next = state.metrics.btree_next.saturating_add(1);
         state.metrics.search_count = state.metrics.search_count.saturating_add(1);
-        // Track if this is a full table scan or index scan
+        // Only steps codegen marked as part of a full table scan count as
+        // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
+        if *fullscan {
+            state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
+        }
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
-            } else if matches!(cursor_type, CursorType::BTreeTable(_)) {
-                state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
         state.pc = pc_if_next.as_offset_int();
@@ -3335,6 +3338,7 @@ pub fn op_prev(
         Prev {
             cursor_id,
             pc_if_prev,
+            fullscan,
         },
         insn
     );
@@ -3358,12 +3362,14 @@ pub fn op_prev(
         state.record_rows_read(1);
         state.metrics.btree_prev = state.metrics.btree_prev.saturating_add(1);
         state.metrics.search_count = state.metrics.search_count.saturating_add(1);
-        // Track if this is a full table scan or index scan
+        // Only steps codegen marked as part of a full table scan count as
+        // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
+        if *fullscan {
+            state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
+        }
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
-            } else if matches!(cursor_type, CursorType::BTreeTable(_)) {
-                state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
         state.pc = pc_if_prev.as_offset_int();
@@ -8959,7 +8965,15 @@ pub fn op_function(
             }
             JsonFunc::JsonValid => {
                 let json_value = &state.registers[*start_reg];
-                state.registers[*dest].set_value(is_json_valid(json_value.get_value())?);
+                // json_valid(X) is defined as json_valid(X, 1).
+                let default_flags = Value::from_i64(json::JSON_VALID_FLAG_TEXT_STRICT);
+                let flags_value = if arg_count > 1 {
+                    state.registers[*start_reg + 1].get_value()
+                } else {
+                    &default_flags
+                };
+                state.registers[*dest]
+                    .set_value(is_json_valid(json_value.get_value(), flags_value)?);
             }
             JsonFunc::JsonPatch => {
                 assert_eq!(arg_count, 2);
@@ -9368,6 +9382,7 @@ pub fn op_function(
             | ScalarFunc::Upper
             | ScalarFunc::Length
             | ScalarFunc::OctetLength
+            | ScalarFunc::Subtype
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
             | ScalarFunc::Unistr
@@ -9385,6 +9400,7 @@ pub fn op_function(
                     ScalarFunc::Upper => reg_value.exec_upper(),
                     ScalarFunc::Length => Some(reg_value.exec_length()),
                     ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
+                    ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
@@ -12967,10 +12983,6 @@ pub fn op_index_method_create(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
-    }
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
@@ -12997,10 +13009,6 @@ pub fn op_index_method_destroy(
     load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
-    }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
     }
     if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
         if state.cursors[*cursor_id].is_none() {
@@ -13029,10 +13037,6 @@ pub fn op_index_method_optimize(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
-    }
     if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
@@ -13051,7 +13055,7 @@ pub fn op_index_method_optimize(
 }
 
 pub fn op_index_method_query(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -13066,10 +13070,6 @@ pub fn op_index_method_query(
         },
         insn
     );
-    let mv_store = program.connection.mv_store();
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
-    }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
         .expect("cursor should exist");

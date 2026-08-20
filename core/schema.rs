@@ -5240,10 +5240,13 @@ const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
 const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
 const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-// Bits 20-22: base type affinity override for custom type columns.
-// 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1
+// Bits 20-22: base type affinity override.
+// 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1,
+// 6 = no declared affinity at all (e.g. a FROM-subquery/CTE/view column
+// backed by a literal or computed expression, not a real declared type)
 const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
 const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
+const BASE_AFF_NO_DECLARED: u32 = 6;
 
 // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
 const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
@@ -5253,13 +5256,13 @@ impl Column {
     pub fn affinity(&self) -> Affinity {
         let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
         if v > 0 {
-            // Custom type column: use the base type's affinity
             match v {
                 1 => Affinity::Integer,
                 2 => Affinity::Text,
                 3 => Affinity::Blob,
                 4 => Affinity::Real,
-                _ => Affinity::Numeric,
+                5 => Affinity::Numeric,
+                _ => Affinity::Blob,
             }
         } else {
             Affinity::affinity(&self.ty_str)
@@ -5278,6 +5281,18 @@ impl Column {
             Affinity::Numeric => 5,
         };
         self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
+    }
+
+    /// Mark this column as backed by an expression with no real declared type
+    /// (e.g. a literal column in a FROM-subquery, CTE, or view).
+    pub fn set_no_declared_affinity(&mut self) {
+        self.raw = (self.raw & !BASE_AFF_MASK)
+            | ((BASE_AFF_NO_DECLARED << BASE_AFF_SHIFT) & BASE_AFF_MASK);
+    }
+
+    /// Whether this column has a real declared type. Always `true` for table columns.
+    pub fn has_declared_affinity(&self) -> bool {
+        ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) != BASE_AFF_NO_DECLARED
     }
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
@@ -5888,6 +5903,11 @@ impl Index {
         self.index_method
             .as_ref()
             .is_some_and(|x| x.definition().backing_btree)
+    }
+
+    /// Whether this schema index owns a B-tree root page.
+    pub fn is_btree_backed(&self) -> bool {
+        self.index_method.is_none() || self.is_backing_btree_index()
     }
 
     pub fn automatic_from_primary_key(
@@ -7391,5 +7411,50 @@ mod tests {
             !schema.sequences.contains_key("broken_seq"),
             "rejected descriptor must not land in the sequences map",
         );
+    }
+
+    fn new_blob_column() -> Column {
+        Column::new(
+            Some("x".to_string()),
+            "BLOB".to_string(),
+            None,
+            None,
+            Type::Blob,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    #[test]
+    fn column_has_declared_affinity_by_default() {
+        let col = new_blob_column();
+        assert!(col.has_declared_affinity());
+        assert_eq!(col.affinity(), Affinity::Blob);
+    }
+
+    #[test]
+    fn column_set_no_declared_affinity_reports_no_affinity() {
+        let mut col = new_blob_column();
+        col.set_no_declared_affinity();
+        assert!(!col.has_declared_affinity());
+        // Still resolves to BLOB at the runtime-conversion level.
+        assert_eq!(col.affinity(), Affinity::Blob);
+    }
+
+    #[test]
+    fn column_set_base_affinity_still_has_declared_affinity() {
+        let mut col = new_blob_column();
+        col.set_base_affinity(Affinity::Real);
+        assert!(col.has_declared_affinity());
+        assert_eq!(col.affinity(), Affinity::Real);
+    }
+
+    #[test]
+    fn column_no_declared_affinity_can_be_overwritten_by_base_affinity() {
+        let mut col = new_blob_column();
+        col.set_no_declared_affinity();
+        col.set_base_affinity(Affinity::Integer);
+        assert!(col.has_declared_affinity());
+        assert_eq!(col.affinity(), Affinity::Integer);
     }
 }

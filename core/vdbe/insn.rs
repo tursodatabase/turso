@@ -927,11 +927,18 @@ pub enum Insn {
     Next {
         cursor_id: CursorID,
         pc_if_next: BranchOffset,
+        /// True when this step is part of a full table scan (a loop over the
+        /// whole table with no index or rowid constraint). Only these steps
+        /// count toward SQLITE_STMTSTATUS_FULLSCAN_STEP, matching SQLite,
+        /// which tags the opcode with P5 at codegen time.
+        fullscan: bool,
     },
 
     Prev {
         cursor_id: CursorID,
         pc_if_prev: BranchOffset,
+        /// See [Insn::Next::fullscan].
+        fullscan: bool,
     },
 
     /// Halt the program.
@@ -1911,9 +1918,9 @@ pub enum Insn {
 
     // OP_Explain
     Explain {
-        p1: usize,         // P1: address of instruction
-        p2: Option<usize>, // P2: address of parent explain instruction
-        detail: String,    // P4: detail text
+        p1: usize,                                     // P1: address of instruction
+        p2: Option<usize>,                             // P2: address of parent explain instruction
+        detail: Box<crate::translate::eqp::EqpDetail>, // P4: structured plan that `Display`s to the detail text
     },
     // Increment a "constraint counter" by P2 (P2 may be negative or positive).
     // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).

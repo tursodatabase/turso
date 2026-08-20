@@ -49,7 +49,7 @@ addr  opcode                  p1  p2  p3  p4                    p5  comment
   19            If             6  21   0                         0  if r[6] goto 21; don't emit group columns if continuing existing group
   20            ColumnRange    1   0  10  2                      0  r[10..11]=idx_sales_category_region.category..region
   21            Integer        1   6   0                         0  r[6]=1; indicate data in accumulator
-  22          Next             1   8   0                         0
+  22          Next             1   8   0                         1
   23          Gosub            5  27   0                         0  ; emit row for final group
   24          Goto             0  40   0                         0  ; group by finished
   25          Integer          1   7   0                         0  r[7]=1
