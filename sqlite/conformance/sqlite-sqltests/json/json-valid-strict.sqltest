@@ -1,5 +1,15 @@
 @database :memory:
 
+# A JSON5-only escape or raw control byte keeps the string JSON5 even
+# when a standard escape follows it, and the stored JSONB element type
+# stays TEXT5 (0x69 header) rather than demoting to TEXTJ.
+test json_valid_json5_marking_survives_later_standard_escape {
+    SELECT hex(jsonb('"\x41\n"'));
+}
+expect {
+    695C7834315C6E
+}
+
 # A string that hits end of input before its closing quote is
 # malformed. A NUL inside the text ends parsing like SQLite, so a
 # quoted string cut off by one is unterminated too.

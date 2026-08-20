@@ -1926,37 +1926,52 @@ impl Jsonb {
                 let esc = input[pos];
                 pos += 1;
 
+                // A standard escape upgrades plain TEXT to TEXTJ but
+                // never demotes TEXT5: earlier JSON5 syntax keeps the
+                // string JSON5.
                 match esc {
                     b'b' => {
                         self.data.extend_from_slice(b"\\b");
                         len += 2;
-                        element_type = ElementType::TEXTJ;
+                        if element_type == ElementType::TEXT {
+                            element_type = ElementType::TEXTJ;
+                        }
                     }
                     b'f' => {
                         self.data.extend_from_slice(b"\\f");
                         len += 2;
-                        element_type = ElementType::TEXTJ;
+                        if element_type == ElementType::TEXT {
+                            element_type = ElementType::TEXTJ;
+                        }
                     }
                     b'n' => {
                         self.data.extend_from_slice(b"\\n");
                         len += 2;
-                        element_type = ElementType::TEXTJ;
+                        if element_type == ElementType::TEXT {
+                            element_type = ElementType::TEXTJ;
+                        }
                     }
                     b'r' => {
                         self.data.extend_from_slice(b"\\r");
                         len += 2;
-                        element_type = ElementType::TEXTJ;
+                        if element_type == ElementType::TEXT {
+                            element_type = ElementType::TEXTJ;
+                        }
                     }
                     b't' => {
                         self.data.extend_from_slice(b"\\t");
                         len += 2;
-                        element_type = ElementType::TEXTJ;
+                        if element_type == ElementType::TEXT {
+                            element_type = ElementType::TEXTJ;
+                        }
                     }
                     b'\\' | b'"' | b'/' => {
                         self.data.push(b'\\');
                         self.data.push(esc);
                         len += 2;
-                        element_type = ElementType::TEXTJ;
+                        if element_type == ElementType::TEXT {
+                            element_type = ElementType::TEXTJ;
+                        }
                     }
                     b'u' => {
                         // Unicode escape sequence
@@ -1984,7 +1999,9 @@ impl Jsonb {
                         self.data.extend_from_slice(&escape_buffer[0..6]);
                         len += 6;
                         pos += 4;
-                        element_type = ElementType::TEXTJ;
+                        if element_type == ElementType::TEXT {
+                            element_type = ElementType::TEXTJ;
+                        }
                     }
                     // JSON5 extensions
                     b'\n' => {
