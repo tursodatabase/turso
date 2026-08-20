@@ -33,6 +33,8 @@ pub enum LimboError {
     TxError(String),
     #[error(transparent)]
     CompletionError(#[from] CompletionError),
+    #[error("watermark {frame_watermark} is below the WAL backfill point {nbackfills}: snapshot checkpointed away")]
+    WatermarkBelowBackfill { frame_watermark: u64, nbackfills: u64 },
     #[error("Locking error: {0}")]
     LockingError(String),
     #[error("Parse error: {0}")]
