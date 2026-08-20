@@ -1535,10 +1535,12 @@ impl Statement {
                 }
 
                 if !halt_completed {
-                    if let Err(abort_err) =
-                        self.program
-                            .abort(&self.pager, reset_error.as_ref(), &mut self.state)
-                    {
+                    if let Err(abort_err) = self.program.abort(
+                        &self.pager,
+                        reset_error.as_ref(),
+                        &mut self.state,
+                        self.counted_as_active_root,
+                    ) {
                         capture_reset_error(
                             &mut reset_error,
                             abort_err,
@@ -1551,7 +1553,12 @@ impl Statement {
                 // yielded a Row (DML still in progress or hit Busy/error), or a
                 // write statement without RETURNING. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
-                if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+                if let Err(abort_err) = self.program.abort(
+                    &self.pager,
+                    None,
+                    &mut self.state,
+                    self.counted_as_active_root,
+                ) {
                     capture_reset_error(
                         &mut reset_error,
                         abort_err,
@@ -1561,7 +1568,12 @@ impl Statement {
             }
         } else {
             // Statement not running (Done/Failed/Init) — cleanup only.
-            if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+            if let Err(abort_err) = self.program.abort(
+                &self.pager,
+                None,
+                &mut self.state,
+                self.counted_as_active_root,
+            ) {
                 capture_reset_error(
                     &mut reset_error,
                     abort_err,

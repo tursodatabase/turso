@@ -181,3 +181,61 @@ fn test_checkpoint_probe_rejects_checkpoints_while_statements_are_suspended() {
         "the run never left a statement suspended, so the probe tested nothing"
     );
 }
+
+/// While a COMMIT was suspended inside its post-commit auto-checkpoint, a
+/// failed statement on the same connection (a rejected checkpoint probe) was
+/// dropped. Its teardown decided it was the last active statement — a failed
+/// statement leaves the active count on its step error, so the count held
+/// only the suspended sibling — and "rolled back" the connection: it reset
+/// the pager's in-flight commit and checkpoint state and closed the shared
+/// attached write transaction. The resumed COMMIT then started over and
+/// panicked releasing a WAL write lock it no longer held.
+///
+/// The seed replays a CI failure of the btree-rebalance whopper profile; the
+/// panic fired around step 14700.
+#[test]
+fn test_dropped_failed_statement_keeps_suspended_sibling_commit_intact() {
+    use rand::Rng;
+    use turso_whopper::chaotic_btree::BtreeRebalanceProfile;
+    use turso_whopper::chaotic_elle::ChaoticWorkloadProfile;
+    use turso_whopper::properties::{IntegrityCheckProperty, Property};
+    use turso_whopper::workloads::{IntegrityCheckWorkload, WalCheckpointWorkload, Workload};
+    use turso_whopper::{Whopper, WhopperOpts};
+
+    let workloads: Vec<(u32, Box<dyn Workload>)> = vec![
+        (20, Box::new(IntegrityCheckWorkload)),
+        (
+            5,
+            Box::new(WalCheckpointWorkload {
+                allow_passive: false,
+            }),
+        ),
+    ];
+    let properties: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
+    let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(
+        1.0,
+        "btree-rebalance",
+        Box::new(BtreeRebalanceProfile::default()),
+    )];
+
+    let opts = WhopperOpts::btree_rebalance()
+        .with_seed(16427142037514425436)
+        .with_max_steps(20_000)
+        .with_max_connections(4)
+        .with_workloads(workloads)
+        .with_properties(properties)
+        .with_chaotic_profiles(chaotic)
+        .with_allocation_fault_probability(0.0);
+    let mut whopper = Whopper::new(opts).expect("create whopper");
+    // Mirror main.rs's run_inprocess loop instead of Whopper::run: the CLI
+    // burns one rng draw per step on its reopen check, and this seed replays
+    // a CLI failure, so the draw must stay in the stream for the schedule to
+    // match.
+    while !whopper.is_done() {
+        let _ = whopper.rng.random_bool(0.0);
+        match whopper.step() {
+            Ok(_) => {}
+            Err(e) => panic!("statement teardown must not clobber a suspended commit: {e}"),
+        }
+    }
+}

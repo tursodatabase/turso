@@ -3407,7 +3407,9 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-    let can_autocommit_now = state.can_autocommit_now(&program.connection);
+    // halt() runs while the statement is still stepping, so it is always
+    // counted in n_active_root_statements here.
+    let can_autocommit_now = state.can_autocommit_now(&program.connection, true);
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
