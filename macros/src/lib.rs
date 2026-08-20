@@ -46,16 +46,24 @@
 //!    Typed comparison assertions that provide richer information to Antithesis than a
 //!    plain `turso_assert!(a > b)`.
 //!
-//! ## Note: fuzzer guidance temporarily disabled
+//! ## Note: boolean guidance still disabled
 //!
 //! The Antithesis SDK provides specialized `numeric_guidance_helper!` and
 //! `boolean_guidance_helper!` macros that give the fuzzer detailed numeric/boolean
-//! values to guide exploration. These were previously used by comparison and boolean
-//! macros but are currently disabled (replaced with plain `assert_always_or_unreachable!`
-//! / `assert_sometimes!`) while Antithesis investigates an issue.
+//! values to guide exploration. Both were disabled after guidance turned out to emit an
+//! event on every evaluation of an assertion whose value never changed, which on a hot
+//! path exhausted the Antithesis logging budget and burned enough cycles that the stress
+//! test never ran to completion.
 //!
-//! The macros still work correctly as assertions — they just don't give the fuzzer
-//! as much detail to work with. Guidance will be restored when the issue is resolved.
+//! SDK 0.2.8 fixed the numeric half: guidance is now emitted only when a value is
+//! strictly more extreme than the previous watermark, so the comparison macros below use
+//! it again. `boolean_guidance_helper!` has no such watermark and still emits on every
+//! call, so [`turso_assert_some!`] and [`turso_assert_all!`] remain plain
+//! `assert_always_or_unreachable!` assertions. They work correctly as assertions — they
+//! just don't give the fuzzer as much detail to work with.
+//!
+//! Note that numeric guidance requires operands the SDK can diff and serialize, which in
+//! practice means `Copy` numeric types.
 //!
 //! ## Quick reference
 //!
@@ -71,14 +79,14 @@
 //! | `turso_soft_unreachable!` | `assert_unreachable!` | Never | Soft signal, no-op w/o feature |
 //! | `turso_assert_eq!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | Drop-in for `assert_eq!` |
 //! | `turso_assert_ne!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | Drop-in for `assert_ne!` |
-//! | `turso_assert_greater_than!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | `left > right` |
-//! | `turso_assert_greater_than_or_equal!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | `left >= right` |
-//! | `turso_assert_less_than!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | `left < right` |
-//! | `turso_assert_less_than_or_equal!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | `left <= right` |
-//! | `turso_assert_sometimes_greater_than!` | `assert_sometimes!` | Never | Observational `left > right` |
-//! | `turso_assert_sometimes_less_than!` | `assert_sometimes!` | Never | Observational `left < right` |
-//! | `turso_assert_sometimes_greater_than_or_equal!` | `assert_sometimes!` | Never | Observational `left >= right` |
-//! | `turso_assert_sometimes_less_than_or_equal!` | `assert_sometimes!` | Never | Observational `left <= right` |
+//! | `turso_assert_greater_than!` | `assert_always_or_unreachable!` + numeric guidance | Yes (exit(0) w/ feature) | `left > right` |
+//! | `turso_assert_greater_than_or_equal!` | `assert_always_or_unreachable!` + numeric guidance | Yes (exit(0) w/ feature) | `left >= right` |
+//! | `turso_assert_less_than!` | `assert_always_or_unreachable!` + numeric guidance | Yes (exit(0) w/ feature) | `left < right` |
+//! | `turso_assert_less_than_or_equal!` | `assert_always_or_unreachable!` + numeric guidance | Yes (exit(0) w/ feature) | `left <= right` |
+//! | `turso_assert_sometimes_greater_than!` | `assert_sometimes_greater_than!` | Never | Observational `left > right` |
+//! | `turso_assert_sometimes_less_than!` | `assert_sometimes_less_than!` | Never | Observational `left < right` |
+//! | `turso_assert_sometimes_greater_than_or_equal!` | `assert_sometimes_greater_than_or_equal_to!` | Never | Observational `left >= right` |
+//! | `turso_assert_sometimes_less_than_or_equal!` | `assert_sometimes_less_than_or_equal_to!` | Never | Observational `left <= right` |
 
 extern crate proc_macro;
 mod atomic_enum;
@@ -886,6 +894,39 @@ fn emit_always_comparison(
         }
     };
 
+    // Numeric guidance keeps a watermark on `left - right` so the fuzzer can steer toward
+    // the most extreme value seen so far. For an "always" comparison the interesting
+    // direction is the one closest to violating it: the smallest difference for `>`/`>=`,
+    // the largest for `<`/`<=`. Equality gets no guidance because there is no direction to
+    // steer in, which is also why the SDK has no equality guidance macro.
+    let guidance_maximize = match op_str {
+        ">" | ">=" => Some(false),
+        "<" | "<=" => Some(true),
+        _ => None,
+    };
+
+    // `numeric_guidance_helper!` is undocumented but exported. We call it instead of the
+    // SDK's `assert_always_greater_than!` and friends because those wrap `assert_always!`,
+    // and we want `assert_always_or_unreachable!`: a comparison on a path the fuzzer never
+    // reaches is not a violation. Operands are dereferenced because the helper takes them
+    // by value, which limits guidance to `Copy` numeric types.
+    let antithesis_assert = match guidance_maximize {
+        Some(maximize) => quote! {
+            antithesis_sdk::numeric_guidance_helper!(
+                antithesis_sdk::assert_always_or_unreachable,
+                #op_tokens,
+                #maximize,
+                *__turso_left,
+                *__turso_right,
+                #prefixed,
+                #details
+            );
+        },
+        None => quote! {
+            antithesis_sdk::assert_always_or_unreachable!(__turso_left #op_tokens __turso_right, #prefixed, #details);
+        },
+    };
+
     let env_check = antithesis_env_check();
     quote! {
         {
@@ -894,7 +935,7 @@ fn emit_always_comparison(
             #[cfg(antithesis)]
             {
                 #env_check
-                antithesis_sdk::assert_always_or_unreachable!(__turso_left #op_tokens __turso_right, #prefixed, #details);
+                #antithesis_assert
                 if !(__turso_left #op_tokens __turso_right) {
                     eprint!("[antithesis] assertion failed: ");
                     eprintln!(#fmt_args);
@@ -913,7 +954,6 @@ fn emit_sometimes_comparison(
     input: ComparisonAssertInput,
     op_str: &str,
 ) -> proc_macro2::TokenStream {
-    let op_tokens: proc_macro2::TokenStream = op_str.parse().unwrap();
     let left = &input.left;
     let right = &input.right;
     let msg = input
@@ -924,6 +964,20 @@ fn emit_sometimes_comparison(
     let details = details_json(&input.details);
     let debug_check = details_debug_check(&input.details);
 
+    // These wrap the same `assert_sometimes!` we would otherwise call, and additionally
+    // guide the fuzzer toward satisfying the comparison rather than violating it, so we
+    // can use the SDK macros directly. Operands are dereferenced because they take them by
+    // value, which limits these macros to `Copy` numeric types.
+    let antithesis_assert = match op_str {
+        ">" => quote! { antithesis_sdk::assert_sometimes_greater_than! },
+        ">=" => quote! { antithesis_sdk::assert_sometimes_greater_than_or_equal_to! },
+        "<" => quote! { antithesis_sdk::assert_sometimes_less_than! },
+        "<=" => quote! { antithesis_sdk::assert_sometimes_less_than_or_equal_to! },
+        _ => unreachable!(
+            "sometimes comparisons are only emitted for ordered operators, got `{op_str}`"
+        ),
+    };
+
     let env_check = antithesis_env_check();
     quote! {
         {
@@ -932,7 +986,7 @@ fn emit_sometimes_comparison(
             #[cfg(antithesis)]
             {
                 #env_check
-                antithesis_sdk::assert_sometimes!(__turso_left #op_tokens __turso_right, #prefixed, #details);
+                #antithesis_assert(*__turso_left, *__turso_right, #prefixed, #details);
             }
             #[cfg(not(antithesis))]
             {
@@ -1379,8 +1433,9 @@ pub fn turso_soft_unreachable(input: TokenStream) -> TokenStream {
 /// # Behavior
 ///
 /// - **Without `antithesis` feature**: behaves like `assert!(left > right, ...)`.
-/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
-///   error and calls `std::process::exit(0)`.
+/// - **With `antithesis` feature**: reports to Antithesis and guides the fuzzer toward
+///   values that come close to violating the comparison, then on failure prints the error
+///   and calls `std::process::exit(0)`. Operands must be `Copy` numeric types.
 ///
 /// # Parameters
 ///
@@ -1421,8 +1476,9 @@ pub fn turso_assert_greater_than(input: TokenStream) -> TokenStream {
 /// # Behavior
 ///
 /// - **Without `antithesis` feature**: behaves like `assert!(left >= right, ...)`.
-/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
-///   error and calls `std::process::exit(0)`.
+/// - **With `antithesis` feature**: reports to Antithesis and guides the fuzzer toward
+///   values that come close to violating the comparison, then on failure prints the error
+///   and calls `std::process::exit(0)`. Operands must be `Copy` numeric types.
 ///
 /// # Parameters
 ///
@@ -1450,8 +1506,9 @@ pub fn turso_assert_greater_than_or_equal(input: TokenStream) -> TokenStream {
 /// # Behavior
 ///
 /// - **Without `antithesis` feature**: behaves like `assert!(left < right, ...)`.
-/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
-///   error and calls `std::process::exit(0)`.
+/// - **With `antithesis` feature**: reports to Antithesis and guides the fuzzer toward
+///   values that come close to violating the comparison, then on failure prints the error
+///   and calls `std::process::exit(0)`. Operands must be `Copy` numeric types.
 ///
 /// # Parameters
 ///
@@ -1479,8 +1536,9 @@ pub fn turso_assert_less_than(input: TokenStream) -> TokenStream {
 /// # Behavior
 ///
 /// - **Without `antithesis` feature**: behaves like `assert!(left <= right, ...)`.
-/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
-///   error and calls `std::process::exit(0)`.
+/// - **With `antithesis` feature**: reports to Antithesis and guides the fuzzer toward
+///   values that come close to violating the comparison, then on failure prints the error
+///   and calls `std::process::exit(0)`. Operands must be `Copy` numeric types.
 ///
 /// # Parameters
 ///
@@ -1573,7 +1631,9 @@ pub fn turso_assert_ne(input: TokenStream) -> TokenStream {
 /// # Behavior
 ///
 /// - **Without `antithesis` feature**: evaluates both operands, then discards the result. No-op.
-/// - **With `antithesis` feature**: reports the failure to Antithesis, then continues execution.
+/// - **With `antithesis` feature**: reports the failure to Antithesis via
+///   `assert_sometimes_greater_than!`, which also guides the fuzzer toward satisfying the
+///   comparison, then continues execution. Operands must be `Copy` numeric types.
 ///
 /// # Parameters
 ///
@@ -1606,7 +1666,9 @@ pub fn turso_assert_sometimes_greater_than(input: TokenStream) -> TokenStream {
 /// # Behavior
 ///
 /// - **Without `antithesis` feature**: evaluates both operands, then discards the result. No-op.
-/// - **With `antithesis` feature**: reports to Antithesis via `assert_sometimes!`.
+/// - **With `antithesis` feature**: reports to Antithesis via
+///   `assert_sometimes_less_than!`, which also guides the fuzzer toward satisfying the
+///   comparison. Operands must be `Copy` numeric types.
 ///
 /// # Parameters
 ///
@@ -1634,7 +1696,9 @@ pub fn turso_assert_sometimes_less_than(input: TokenStream) -> TokenStream {
 /// # Behavior
 ///
 /// - **Without `antithesis` feature**: evaluates both operands, then discards the result. No-op.
-/// - **With `antithesis` feature**: reports to Antithesis via `assert_sometimes!`.
+/// - **With `antithesis` feature**: reports to Antithesis via
+///   `assert_sometimes_greater_than_or_equal_to!`, which also guides the fuzzer toward
+///   satisfying the comparison. Operands must be `Copy` numeric types.
 ///
 /// # Parameters
 ///
@@ -1662,7 +1726,9 @@ pub fn turso_assert_sometimes_greater_than_or_equal(input: TokenStream) -> Token
 /// # Behavior
 ///
 /// - **Without `antithesis` feature**: evaluates both operands, then discards the result. No-op.
-/// - **With `antithesis` feature**: reports to Antithesis via `assert_sometimes!`.
+/// - **With `antithesis` feature**: reports to Antithesis via
+///   `assert_sometimes_less_than_or_equal_to!`, which also guides the fuzzer toward
+///   satisfying the comparison. Operands must be `Copy` numeric types.
 ///
 /// # Parameters
 ///
@@ -1695,4 +1761,108 @@ fn get_caller_file(input: &TokenStream) -> String {
 
 fn prefix_message(file_path: &str, msg: &LitStr) -> LitStr {
     LitStr::new(&format!("[{}] {}", file_path, msg.value()), msg.span())
+}
+
+#[cfg(test)]
+mod tests {
+    // Imported by name rather than with a glob: the crate has a `test` module, which
+    // would make the `#[test]` attribute ambiguous.
+    use super::{
+        emit_always_comparison, emit_sometimes_comparison, ComparisonAssertInput,
+        ComparisonFallback,
+    };
+
+    /// The emitted tokens are checked as a whitespace-normalized string because the
+    /// `#[cfg(antithesis)]` branch cannot be compiled here: it needs the SDK, and its
+    /// assertions exit(0) rather than panic.
+    fn emitted(tokens: proc_macro2::TokenStream) -> String {
+        tokens.to_string().split_whitespace().collect::<String>()
+    }
+
+    fn always(src: &str, op: &str) -> String {
+        let input = syn::parse_str::<ComparisonAssertInput>(src).unwrap();
+        emitted(emit_always_comparison(
+            "core/foo.rs",
+            input,
+            op,
+            ComparisonFallback::AssertOp,
+        ))
+    }
+
+    fn sometimes(src: &str, op: &str) -> String {
+        let input = syn::parse_str::<ComparisonAssertInput>(src).unwrap();
+        emitted(emit_sometimes_comparison("core/foo.rs", input, op))
+    }
+
+    #[test]
+    fn ordered_always_comparisons_emit_numeric_guidance() {
+        // `maximize` must track the difference toward the value closest to violating the
+        // assertion: the smallest for `>`/`>=`, the largest for `<`/`<=`.
+        for (op, maximize) in [
+            (">", "false"),
+            (">=", "false"),
+            ("<", "true"),
+            ("<=", "true"),
+        ] {
+            let out = always("a, b", op);
+            let expected = format!(
+                "antithesis_sdk::numeric_guidance_helper!(antithesis_sdk::assert_always_or_unreachable,{op},{maximize},*__turso_left,*__turso_right,"
+            );
+            assert!(
+                out.contains(&expected),
+                "expected `{expected}` in expansion of `a {op} b`, got: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn equality_comparisons_emit_no_guidance() {
+        for (op, fallback) in [
+            ("==", ComparisonFallback::AssertEq),
+            ("!=", ComparisonFallback::AssertNe),
+        ] {
+            let input = syn::parse_str::<ComparisonAssertInput>("a, b").unwrap();
+            let out = emitted(emit_always_comparison("core/foo.rs", input, op, fallback));
+            assert!(
+                !out.contains("guidance"),
+                "equality has no direction to guide toward, got: {out}"
+            );
+            assert!(
+                out.contains("antithesis_sdk::assert_always_or_unreachable!"),
+                "expected a plain always assertion for `a {op} b`, got: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_sometimes_comparisons_emit_numeric_guidance() {
+        for (op, sdk_macro) in [
+            (">", "assert_sometimes_greater_than"),
+            (">=", "assert_sometimes_greater_than_or_equal_to"),
+            ("<", "assert_sometimes_less_than"),
+            ("<=", "assert_sometimes_less_than_or_equal_to"),
+        ] {
+            let out = sometimes("a, b", op);
+            let expected = format!("antithesis_sdk::{sdk_macro}!(*__turso_left,*__turso_right,");
+            assert!(
+                out.contains(&expected),
+                "expected `{expected}` in expansion of `a {op} b`, got: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn guidance_forwards_the_assertion_message_and_details() {
+        // Antithesis links a guidance event to its assertion by message, so both have to
+        // carry the same prefixed message.
+        let out = always(r#"a, b, "must hold", { "page": page }"#, "<");
+        assert!(
+            out.contains(r#""[core/foo.rs]musthold""#),
+            "expected the prefixed message to reach the guidance call, got: {out}"
+        );
+        assert!(
+            out.contains(r#""page":format!("{:?}",&page)"#),
+            "expected details to reach the guidance call, got: {out}"
+        );
+    }
 }
