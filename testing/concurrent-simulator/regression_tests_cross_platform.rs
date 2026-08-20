@@ -129,3 +129,55 @@ fn test_concurrent_commit_no_yield_spin() {
     }
     assert_eq!(count, 2, "both inserts should be visible");
 }
+
+/// End-to-end coverage for checkpoints racing suspended statements: with the
+/// probe probability at 1.0, every simulation step that leaves a statement
+/// suspended mid-execution fires a same-connection checkpoint attempt
+/// (PRAGMA wal_checkpoint or the Connection::checkpoint API) and the run
+/// fails unless the engine rejects it with StatementsInProgress/TableLocked.
+/// On unguarded builds the checkpoint runs and the suspended statement
+/// panics on resume, loses its write, or silently returns wrong rows.
+#[test]
+fn test_checkpoint_probe_rejects_checkpoints_while_statements_are_suspended() {
+    use turso_whopper::properties::{IntegrityCheckProperty, Property};
+    use turso_whopper::workloads::{
+        BeginWorkload, CommitWorkload, InsertWorkload, IntegrityCheckWorkload, RollbackWorkload,
+        SelectWorkload, UpdateWorkload, WalCheckpointWorkload, Workload,
+    };
+    use turso_whopper::{Whopper, WhopperOpts};
+
+    let workloads: Vec<(u32, Box<dyn Workload>)> = vec![
+        (30, Box::new(InsertWorkload)),
+        (20, Box::new(UpdateWorkload)),
+        (15, Box::new(SelectWorkload)),
+        (10, Box::new(BeginWorkload)),
+        (8, Box::new(CommitWorkload)),
+        (4, Box::new(RollbackWorkload)),
+        (5, Box::new(IntegrityCheckWorkload)),
+        (
+            5,
+            Box::new(WalCheckpointWorkload {
+                allow_passive: true,
+            }),
+        ),
+    ];
+    let properties: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
+
+    let opts = WhopperOpts {
+        seed: Some(0xC0FFEE),
+        max_connections: 3,
+        max_steps: 5_000,
+        workloads,
+        properties,
+        checkpoint_probe_probability: 1.0,
+        ..WhopperOpts::default()
+    };
+    let mut whopper = Whopper::new(opts).expect("create whopper");
+    whopper
+        .run()
+        .expect("simulation must complete without contract violations");
+    assert!(
+        whopper.stats.checkpoint_probes > 0,
+        "the run never left a statement suspended, so the probe tested nothing"
+    );
+}

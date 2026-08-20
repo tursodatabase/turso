@@ -316,6 +316,11 @@ pub struct Statement {
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
     counted_as_active_root: bool,
+    /// True for the parked statement backing an incremental blob handle.
+    /// Counted separately in `Connection::n_active_blob_statements` so
+    /// explicit checkpoints can subtract it — an open blob handle must not
+    /// block checkpointing for its whole lifetime.
+    is_blob_handle: bool,
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
@@ -378,8 +383,20 @@ impl Statement {
             tail_offset,
             origin,
             counted_as_active_root: false,
+            is_blob_handle: false,
             nested_guard_active,
         }
+    }
+
+    /// Mark this statement as the parked backing statement of an incremental
+    /// blob handle. Must be called before the first `step()` so the blob
+    /// accounting stays in lockstep with the root-statement count.
+    pub(crate) fn mark_as_blob_handle(&mut self) {
+        turso_assert!(
+            !self.counted_as_active_root,
+            "blob handle marked after its statement started executing"
+        );
+        self.is_blob_handle = true;
     }
 
     pub fn tail_offset(&self) -> usize {
@@ -503,6 +520,16 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self) {
         if self.counted_as_active_root {
+            // Blob count drops before the root count so a concurrent
+            // checkpoint-guard read never sees fewer non-blob statements
+            // than are really active (a stale-high read only causes a
+            // spurious StatementsInProgress, never a missed one).
+            if self.is_blob_handle {
+                self.program
+                    .connection
+                    .n_active_blob_statements
+                    .fetch_sub(1, Ordering::SeqCst);
+            }
             let previous = self
                 .program
                 .connection
@@ -519,6 +546,14 @@ impl Statement {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
+            // After the root count, so the checkpoint guard's subtraction
+            // can only read stale-high (see release_active_root_if_counted).
+            if self.is_blob_handle {
+                self.program
+                    .connection
+                    .n_active_blob_statements
+                    .fetch_add(1, Ordering::SeqCst);
+            }
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper

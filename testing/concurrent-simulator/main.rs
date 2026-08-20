@@ -93,6 +93,10 @@ struct Args {
     /// Probability of failing a scoped Turso allocation while stepping a statement.
     #[arg(long, default_value_t = 0.05)]
     allocation_fault_probability: f64,
+    /// Probability of probing a same-connection checkpoint while a statement
+    /// is suspended (the checkpoint must be rejected).
+    #[arg(long)]
+    checkpoint_probe_probability: Option<f64>,
     /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
     #[arg(long)]
     history_output: Option<PathBuf>,
@@ -346,6 +350,13 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         println!("\n{allocation_faults} allocation faults injected");
     }
 
+    if whopper.stats.checkpoint_probes > 0 {
+        println!(
+            "\n{} checkpoint probes fired against suspended statements (all rejected)",
+            whopper.stats.checkpoint_probes
+        );
+    }
+
     if args.elle.is_some() {
         println!("\nElle history exported to: {}", args.elle_output);
     }
@@ -525,6 +536,10 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_properties(properties)
         .with_chaotic_profiles(chaotic_profiles)
         .with_allocation_fault_probability(args.allocation_fault_probability);
+    let opts = match args.checkpoint_probe_probability {
+        Some(probability) => opts.with_checkpoint_probe_probability(probability),
+        None => opts,
+    };
 
     Ok(opts)
 }

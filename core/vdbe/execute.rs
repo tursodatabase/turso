@@ -606,11 +606,19 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    if !program.connection.is_nested_stmt() && state.explicit_checkpoint_guard.is_none() {
+    if state.explicit_checkpoint_guard.is_none() {
+        // No exemption for nested statements: nothing in the engine prepares
+        // wal_checkpoint as a nested helper (VACUUM checkpoints through
+        // Connection::checkpoint), and nested statements are not counted in
+        // n_active_root_statements, so the guard's expected count still holds
+        // if one ever runs this opcode. Skipping the guard whenever *any*
+        // helper statement is alive on the connection would let a checkpoint
+        // clobber a suspended statement that holds one (e.g. a pragma vtab
+        // cursor's stored helper).
         state.explicit_checkpoint_guard = Some(
             program
                 .connection
-                .begin_explicit_checkpoint(pager.clone())?,
+                .begin_explicit_checkpoint(pager.clone(), true)?,
         );
     }
 
