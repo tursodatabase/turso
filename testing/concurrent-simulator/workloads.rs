@@ -25,6 +25,9 @@ pub struct WorkloadContext<'a> {
     pub sim_state: &'a SimulatorState,
     pub opts: &'a Opts,
     pub enable_mvcc: bool,
+    /// True when the fiber has a read statement parked mid-execution
+    /// (see `Operation::PausedRead`). Always false in multiprocess mode.
+    pub has_paused_read: bool,
     /// Tables vec built from sim_state.tables for GenerationContext
     pub(crate) tables_vec: Vec<Table>,
 }
@@ -465,6 +468,37 @@ fn existing_table_index_sql(
     ))
 }
 
+/// Pause a read mid-rows and resume it later, letting other operations
+/// (including COMMIT/ROLLBACK) run on the same connection in between. A real
+/// client can do this through the public API by holding a rows handle open
+/// while it runs other statements on the same connection. Regression driver
+/// for the "transaction should exist in txs map" panic
+/// (https://github.com/tursodatabase/turso-server/issues/2972).
+pub struct PausedReadWorkload;
+
+impl Workload for PausedReadWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.has_paused_read {
+            // Leave the statement parked half the time so transaction-ending
+            // operations from other workloads can land in between.
+            if rng.random_bool(0.5) {
+                return Some(Operation::ResumePausedRead);
+            }
+            return None;
+        }
+        if !ctx.fiber_state.is_in_tx() {
+            return None;
+        }
+        let table_name = match ctx.sim_state.simple_tables.pick(rng) {
+            Some((name, _)) => name.clone(),
+            None => return None,
+        };
+        Some(Operation::PausedRead {
+            sql: format!("SELECT key, length(value) FROM {table_name} ORDER BY key"),
+        })
+    }
+}
+
 /// Commit the current transaction.
 pub struct CommitWorkload;
 
@@ -877,6 +911,7 @@ mod tests {
             sim_state: &state,
             opts: &opts,
             enable_mvcc: true,
+            has_paused_read: false,
             tables_vec,
         };
         let mut rng = ChaCha8Rng::seed_from_u64(1);
@@ -956,6 +991,7 @@ mod tests {
             sim_state: &state,
             opts: &opts,
             enable_mvcc: false,
+            has_paused_read: false,
             tables_vec: vec![],
         };
         let mut rng = ChaCha8Rng::seed_from_u64(1);

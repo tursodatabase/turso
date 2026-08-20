@@ -80,6 +80,13 @@ pub enum Operation {
     },
     /// Generic SELECT query
     Select { sql: String },
+    /// SELECT stepped only to its first row, then parked on the fiber while
+    /// still mid-execution. Models a client holding a rows handle open while
+    /// it runs other statements (including COMMIT/ROLLBACK) on the same
+    /// connection — legal through the public API.
+    PausedRead { sql: String },
+    /// Resume and drain the fiber's parked read statement.
+    ResumePausedRead,
     /// Generic INSERT query
     Insert { sql: String },
     /// Generic UPDATE query
@@ -195,6 +202,8 @@ impl Operation {
                 )
             }
             Operation::Select { sql } => sql.clone(),
+            Operation::PausedRead { sql } => sql.clone(),
+            Operation::ResumePausedRead => "-- resume paused read".to_string(),
             Operation::Insert { sql } => sql.clone(),
             Operation::Update { sql } => sql.clone(),
             Operation::Delete { sql } => sql.clone(),
@@ -305,6 +314,21 @@ impl Operation {
     /// Prepare this operation on a connection.
     /// Returns Ok(Statement) on success, or an error.
     pub fn init_op(&self, ctx: &mut OpContext) -> Result<(), turso_core::LimboError> {
+        if matches!(self, Operation::ResumePausedRead) {
+            // Move the parked mid-execution statement back so the regular
+            // stepping loop drains it. No prepare: this is the same statement
+            // the earlier PausedRead left suspended.
+            let stmt = ctx.fiber.paused_statement.borrow_mut().take();
+            let Some(stmt) = stmt else {
+                // "not exist" makes the simulator skip the op instead of
+                // aborting the run.
+                return Err(turso_core::LimboError::InternalError(
+                    "paused read statement does not exist on this fiber".to_string(),
+                ));
+            };
+            ctx.fiber.statement.replace(Some(stmt));
+            return Ok(());
+        }
         let stmt = ctx.fiber.connection.prepare(self.sql())?;
         ctx.fiber.statement.replace(Some(stmt));
         Ok(())

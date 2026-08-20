@@ -20568,3 +20568,192 @@ fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
     // Now that the reader is gone, Truncate can proceed.
     writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
+
+/// Regression tests for https://github.com/tursodatabase/turso-server/issues/2972:
+/// production panic "transaction should exist in txs map".
+///
+/// Every MVCC cursor copies the connection's transaction id when the cursor
+/// is opened (`OpenRead`/`OpenWrite`). COMMIT and ROLLBACK remove the
+/// transaction from `MvStore::txs`, but their guard in `op_auto_commit`
+/// (vdbe/execute.rs) only rejects them while a *write* statement is paused
+/// (`n_active_writes > 0`). A paused read statement does not block them, so
+/// after COMMIT its cursors point at a transaction that no longer exists,
+/// and the next cursor advance/seek panics instead of returning an error
+/// (other read paths return `LimboError::TxTerminated` for exactly this
+/// state).
+///
+/// The production instance of this panic fired inside
+/// `MvStore::seek_index` via `op_no_conflict` while the server resumed a
+/// suspended `INSERT OR IGNORE`; this test hits the sibling `expect` in
+/// `advance_cursor_and_get_row_id_for_table` — same invariant, same panic
+/// message, different cursor operation.
+///
+/// These tests assert the intended behavior and therefore FAIL with the
+/// panic while the bug exists. Any non-panicking resolution is accepted:
+/// rejecting COMMIT/ROLLBACK while any statement is paused (SQLite's legacy
+/// behavior), letting the resumed statement finish, or failing it with a
+/// clean error such as `TxTerminated`.
+#[test]
+fn stepping_paused_select_after_commit_must_not_panic() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE a(x INTEGER)").unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO b VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let io = conn.pager.load().io.clone();
+    // Join so the statement pauses on a Row with open cursors on both tables.
+    let mut stmt = conn
+        .prepare("SELECT b.v FROM a JOIN b ON b.id = a.x")
+        .unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    // Today this succeeds (the paused statement is read-only, so it passes
+    // the `n_active_writes` guard) and removes the tx from the txs map. A
+    // fix may instead reject it with StatementsInProgress — both are fine.
+    let _ = conn.execute("COMMIT");
+    // Resuming the paused statement must not panic. Finishing the scan or
+    // failing with a clean error (e.g. TxTerminated) are both acceptable.
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::IO) | Ok(StepResult::Yield) => io.step().unwrap(),
+            Ok(other) => panic!("unexpected step result: {other:?}"),
+            Err(err) => {
+                // A clean statement error is an acceptable outcome.
+                println!("resumed statement failed gracefully: {err}");
+                break;
+            }
+        }
+    }
+}
+
+/// Same bug as `stepping_paused_select_after_commit_must_not_panic`, but the
+/// resumed statement's first MVCC operation is on an *index* cursor (the
+/// join probes b's TEXT primary key index), hitting the index-side `expect`
+/// in `advance_cursor_and_get_row_id_for_index` — the closest in-tree match
+/// to the production stack, which went through `MvccLazyCursor::seek` on a
+/// unique index.
+#[test]
+fn stepping_paused_index_join_after_commit_must_not_panic() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE b(id TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO b VALUES ('k1', 'one'), ('k2', 'two')")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let io = conn.pager.load().io.clone();
+    // The outer row source is a constant subquery (no MVCC cursor), so the
+    // first MVCC cursor operation after resuming is the index probe on b.
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.v FROM (SELECT 'k1' AS x UNION ALL SELECT 'k2') src \
+             JOIN b ON b.id = src.x",
+        )
+        .unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    let _ = conn.execute("COMMIT");
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::IO) | Ok(StepResult::Yield) => io.step().unwrap(),
+            Ok(other) => panic!("unexpected step result: {other:?}"),
+            Err(err) => {
+                println!("resumed statement failed gracefully: {err}");
+                break;
+            }
+        }
+    }
+}
+
+/// ROLLBACK variant of `stepping_paused_select_after_commit_must_not_panic`.
+/// SQLite allows ROLLBACK while statements are paused and makes the paused
+/// statements fail their next step with SQLITE_ABORT; Turso removes the tx
+/// from the txs map and the resumed statement panics instead of failing
+/// with an error.
+#[test]
+fn stepping_paused_select_after_rollback_must_not_panic() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE a(x INTEGER)").unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO b VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn
+        .prepare("SELECT b.v FROM a JOIN b ON b.id = a.x")
+        .unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    let _ = conn.execute("ROLLBACK");
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::IO) | Ok(StepResult::Yield) => io.step().unwrap(),
+            Ok(other) => panic!("unexpected step result: {other:?}"),
+            Err(err) => {
+                println!("resumed statement failed gracefully: {err}");
+                break;
+            }
+        }
+    }
+}
+
+/// Contrast case for the reproducers above: a paused *write* statement DOES
+/// block COMMIT (`n_active_writes` guard), so the txs-map panic cannot be
+/// reached through a suspended write on the same connection. This pins the
+/// guard asymmetry: writes are protected, reads are not.
+#[test]
+fn commit_is_rejected_while_a_write_statement_is_paused() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE src(x TEXT)").unwrap();
+    conn.execute("CREATE TABLE b(id TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES ('k1'), ('k2')")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let io = conn.pager.load().io.clone();
+    // RETURNING pauses the INSERT mid-execution after its first row.
+    let mut stmt = conn
+        .prepare("INSERT OR IGNORE INTO b(id, v) SELECT x, 'val' FROM src RETURNING id")
+        .unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    let err = conn.execute("COMMIT").unwrap_err();
+    assert!(
+        matches!(err, LimboError::StatementsInProgress(_)),
+        "COMMIT must be rejected while a write statement is paused, got: {err:?}"
+    );
+}

@@ -790,6 +790,7 @@ impl MultiprocessWhopper {
                         sim_state: &self.sim_state,
                         opts: &self.opts,
                         enable_mvcc: self.enable_mvcc,
+                        has_paused_read: false,
                         tables_vec: self.sim_state.tables_vec(),
                     };
                     let Some(op) = workload.generate(&ctx, &mut self.rng) else {
