@@ -1,7 +1,6 @@
 use clap::{
     Arg, Command, Error, Parser, ValueEnum,
     builder::{PossibleValue, TypedValueParser, ValueParserFactory},
-    command,
     error::{ContextKind, ContextValue, ErrorKind},
 };
 use serde::{Deserialize, Serialize};

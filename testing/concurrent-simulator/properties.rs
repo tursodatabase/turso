@@ -121,12 +121,12 @@ impl Property for SimpleKeysDoNotDisappear {
 
         // on successful COMMIT we move information about current transaction keys to the "commited" state (None key in the map)
         // note, that we use end_exec_id of current COMMIT operation as AdditionMoment of moved keys
-        if let Operation::Commit = &op {
-            if let Some(keys) = self.simple_keys_added_at.remove(&txn_id) {
-                let global = self.simple_keys_added_at.get_mut(&None).unwrap();
-                for (key, _) in keys {
-                    global.insert(key, end_exec_id);
-                }
+        if let Operation::Commit = &op
+            && let Some(keys) = self.simple_keys_added_at.remove(&txn_id)
+        {
+            let global = self.simple_keys_added_at.get_mut(&None).unwrap();
+            for (key, _) in keys {
+                global.insert(key, end_exec_id);
             }
         }
 
@@ -177,10 +177,9 @@ impl Property for SimpleKeysDoNotDisappear {
         // We still catch the canonical INSERT-then-SELECT pattern on
         // seeds without intervening arbitrary mutators.
         if let Operation::Delete { .. } | Operation::Update { .. } | Operation::Insert { .. } = &op
+            && let Some(global) = self.simple_keys_added_at.get_mut(&None)
         {
-            if let Some(global) = self.simple_keys_added_at.get_mut(&None) {
-                global.clear();
-            }
+            global.clear();
         }
 
         // on successful SELECT get information about the key AdditionMoment from the "commited" state: key_exec_id
@@ -420,14 +419,14 @@ impl ElleHistoryRecorder {
         } else {
             None
         };
-        if let Some(pending) = self.pending_txns.get_mut(&fiber_id) {
-            if result.is_ok() {
-                if let Some(idx) = new_index {
-                    pending.invoke_index = Some(idx);
-                    pending.invoke_time = Some(start_exec_id);
-                }
-                pending.ops.push(op);
+        if let Some(pending) = self.pending_txns.get_mut(&fiber_id)
+            && result.is_ok()
+        {
+            if let Some(idx) = new_index {
+                pending.invoke_index = Some(idx);
+                pending.invoke_time = Some(start_exec_id);
             }
+            pending.ops.push(op);
         }
     }
 
@@ -721,30 +720,29 @@ impl Property for ElleHistoryRecorder {
     }
 
     fn abort_fiber(&mut self, fiber_id: usize, _txn_id: Option<u64>) -> anyhow::Result<()> {
-        if let Some(pending) = self.pending_txns.remove(&fiber_id) {
-            if let Some(invoke_index) = pending.invoke_index {
-                if !pending.ops.is_empty() {
-                    let invoke_time = pending
-                        .invoke_time
-                        .expect("invoke_time must be set when invoke_index is set");
-                    let invoke_ops = nil_reads(&pending.ops);
-                    self.add_event(
-                        invoke_index,
-                        ElleEventType::Invoke,
-                        fiber_id,
-                        invoke_ops,
-                        invoke_time,
-                    );
-                    let info_index = self.next_index();
-                    self.add_event(
-                        info_index,
-                        ElleEventType::Info,
-                        fiber_id,
-                        pending.ops,
-                        invoke_time,
-                    );
-                }
-            }
+        if let Some(pending) = self.pending_txns.remove(&fiber_id)
+            && let Some(invoke_index) = pending.invoke_index
+            && !pending.ops.is_empty()
+        {
+            let invoke_time = pending
+                .invoke_time
+                .expect("invoke_time must be set when invoke_index is set");
+            let invoke_ops = nil_reads(&pending.ops);
+            self.add_event(
+                invoke_index,
+                ElleEventType::Invoke,
+                fiber_id,
+                invoke_ops,
+                invoke_time,
+            );
+            let info_index = self.next_index();
+            self.add_event(
+                info_index,
+                ElleEventType::Info,
+                fiber_id,
+                pending.ops,
+                invoke_time,
+            );
         }
 
         if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
@@ -1144,71 +1142,71 @@ impl Property for SequenceCorrectnessProperty {
         result: &OpResult,
     ) -> anyhow::Result<()> {
         // Handle NextVal/SetVal errors
-        if let Operation::NextVal { seq_name } | Operation::SetVal { seq_name, .. } = op {
-            if let Err(e) = result {
-                // Drop the in-flight baseline so a future NextVal on the
-                // same (fiber, seq) doesn't reuse a stale snapshot.
-                self.in_flight_nextval_baselines
-                    .remove(&(fiber_id, seq_name.clone()));
-                let err_msg = e.to_string();
-                // Sequence may have been dropped concurrently
-                if err_msg.contains("does not exist") {
-                    self.params.remove(seq_name);
-                    self.all_values.remove(seq_name);
-                    self.watermark.remove(seq_name);
-                    self.committed_watermark.remove(seq_name);
-                    self.last_setval_exec_id.remove(seq_name);
-                    self.fiber_last_nextval
-                        .retain(|(_fid, name), _| name != seq_name);
-                    return Ok(());
-                }
-                // nextval/setval are write transactions (backing table write),
-                // so concurrency errors are expected. Clear fiber_last_nextval
-                // because the Function instruction may have already set the
-                // connection's currval before the backing table write failed.
-                //
-                // The "setval requires an exclusive transaction" error is
-                // also accepted: SetValWorkload should not generate setval
-                // inside BEGIN CONCURRENT, but if a future scheduling change
-                // ever lets the fiber state drift between generate and
-                // execute we want a clean ignore rather than a spurious
-                // failure.
-                if matches!(e, LimboError::OutOfMemory)
-                    || err_msg.contains("Database is busy")
-                    || err_msg.contains("Database schema changed")
-                    || err_msg.contains("Database snapshot is stale")
-                    || err_msg.contains("Write-write conflict")
-                    || err_msg.contains("Commit dependency aborted")
-                    || err_msg.contains("Database schema conflict")
-                    || err_msg.contains("setval requires an exclusive transaction")
-                {
-                    self.fiber_last_nextval
-                        .remove(&(fiber_id, seq_name.clone()));
-                    return Ok(());
-                }
-                // Overflow is expected for bounded non-cycling sequences.
-                // If the sequence is no longer tracked, accept it too:
-                // the simulator can pick NextVal on a sequence that another
-                // fiber concurrently drops (generate-vs-execute race). The
-                // engine may still expose the dropped sequence as exhausted
-                // (e.g. when a defaulting table keeps it materialized), so
-                // "reached maximum/minimum" is a valid engine response and
-                // not a property violation.
-                let overflow_msg = err_msg.contains("reached maximum value")
-                    || err_msg.contains("reached minimum value");
-                if overflow_msg {
-                    match self.params.get(seq_name) {
-                        Some(params) if !params.cycle => return Ok(()),
-                        None => return Ok(()),
-                        _ => {}
-                    }
-                }
-                bail!(
-                    "unexpected nextval/setval error for seq={}: {}",
-                    seq_name,
-                    err_msg
-                );
+        if let Operation::NextVal { seq_name } | Operation::SetVal { seq_name, .. } = op
+            && let Err(e) = result
+        {
+            // Drop the in-flight baseline so a future NextVal on the
+            // same (fiber, seq) doesn't reuse a stale snapshot.
+            self.in_flight_nextval_baselines
+                .remove(&(fiber_id, seq_name.clone()));
+            let err_msg = e.to_string();
+            // Sequence may have been dropped concurrently
+            if err_msg.contains("does not exist") {
+                self.params.remove(seq_name);
+                self.all_values.remove(seq_name);
+                self.watermark.remove(seq_name);
+                self.committed_watermark.remove(seq_name);
+                self.last_setval_exec_id.remove(seq_name);
+                self.fiber_last_nextval
+                    .retain(|(_fid, name), _| name != seq_name);
+                return Ok(());
             }
+            // nextval/setval are write transactions (backing table write),
+            // so concurrency errors are expected. Clear fiber_last_nextval
+            // because the Function instruction may have already set the
+            // connection's currval before the backing table write failed.
+            //
+            // The "setval requires an exclusive transaction" error is
+            // also accepted: SetValWorkload should not generate setval
+            // inside BEGIN CONCURRENT, but if a future scheduling change
+            // ever lets the fiber state drift between generate and
+            // execute we want a clean ignore rather than a spurious
+            // failure.
+            if matches!(e, LimboError::OutOfMemory)
+                || err_msg.contains("Database is busy")
+                || err_msg.contains("Database schema changed")
+                || err_msg.contains("Database snapshot is stale")
+                || err_msg.contains("Write-write conflict")
+                || err_msg.contains("Commit dependency aborted")
+                || err_msg.contains("Database schema conflict")
+                || err_msg.contains("setval requires an exclusive transaction")
+            {
+                self.fiber_last_nextval
+                    .remove(&(fiber_id, seq_name.clone()));
+                return Ok(());
+            }
+            // Overflow is expected for bounded non-cycling sequences.
+            // If the sequence is no longer tracked, accept it too:
+            // the simulator can pick NextVal on a sequence that another
+            // fiber concurrently drops (generate-vs-execute race). The
+            // engine may still expose the dropped sequence as exhausted
+            // (e.g. when a defaulting table keeps it materialized), so
+            // "reached maximum/minimum" is a valid engine response and
+            // not a property violation.
+            let overflow_msg = err_msg.contains("reached maximum value")
+                || err_msg.contains("reached minimum value");
+            if overflow_msg {
+                match self.params.get(seq_name) {
+                    Some(params) if !params.cycle => return Ok(()),
+                    None => return Ok(()),
+                    _ => {}
+                }
+            }
+            bail!(
+                "unexpected nextval/setval error for seq={}: {}",
+                seq_name,
+                err_msg
+            );
         }
 
         // Handle CurrVal: validate against tracked per-fiber state
@@ -1505,12 +1503,11 @@ impl Property for SequenceCorrectnessProperty {
                     // wrapping) still fires.
                     if params.cycle {
                         let prev_wm = self.watermark.get(seq_name).map(|&(wm, _)| wm);
-                        if let Some(prev) = prev_wm {
-                            if is_cycle_wrap(params, value, prev) {
-                                if let Some(values) = self.all_values.get_mut(seq_name) {
-                                    values.clear();
-                                }
-                            }
+                        if let Some(prev) = prev_wm
+                            && is_cycle_wrap(params, value, prev)
+                            && let Some(values) = self.all_values.get_mut(seq_name)
+                        {
+                            values.clear();
                         }
                     }
                     // Skip the duplicate check for seqs that have ever been
@@ -1570,15 +1567,15 @@ impl Property for SequenceCorrectnessProperty {
                     // target whose target+inc was the actual match). A
                     // second emission of the same value WOULD trip the
                     // duplicate check on the next observation.
-                    if is_allowed_re_emission {
-                        if let Some(allowed) = self.pending_setval_re_emission.get_mut(seq_name) {
-                            if !allowed.remove(&value) {
-                                let derived = value.saturating_sub(params.increment);
-                                allowed.remove(&derived);
-                            }
-                            if allowed.is_empty() {
-                                self.pending_setval_re_emission.remove(seq_name);
-                            }
+                    if is_allowed_re_emission
+                        && let Some(allowed) = self.pending_setval_re_emission.get_mut(seq_name)
+                    {
+                        if !allowed.remove(&value) {
+                            let derived = value.saturating_sub(params.increment);
+                            allowed.remove(&derived);
+                        }
+                        if allowed.is_empty() {
+                            self.pending_setval_re_emission.remove(seq_name);
                         }
                     }
                 }
@@ -1629,28 +1626,30 @@ impl Property for SequenceCorrectnessProperty {
                 // so post-setval duplicates still fire there.
                 let skip_monotonicity = self.seqs_with_setval_ever.contains(seq_name)
                     || self.seqs_with_seq_default_ever.contains(seq_name);
-                if txn_id.is_none() && !setval_could_have_raced && !skip_monotonicity {
-                    if let Some(&(wm, wm_eid)) = self.watermark.get(seq_name) {
-                        if wm_eid < start_exec_id && !is_cycle_wrap(params, value, wm) {
-                            if params.increment > 0 && value <= wm {
-                                bail!(
-                                    "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
-                                    seq_name,
-                                    value,
-                                    wm,
-                                    params.increment
-                                );
-                            }
-                            if params.increment < 0 && value >= wm {
-                                bail!(
-                                    "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
-                                    seq_name,
-                                    value,
-                                    wm,
-                                    params.increment
-                                );
-                            }
-                        }
+                if txn_id.is_none()
+                    && !setval_could_have_raced
+                    && !skip_monotonicity
+                    && let Some(&(wm, wm_eid)) = self.watermark.get(seq_name)
+                    && wm_eid < start_exec_id
+                    && !is_cycle_wrap(params, value, wm)
+                {
+                    if params.increment > 0 && value <= wm {
+                        bail!(
+                            "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
+                            seq_name,
+                            value,
+                            wm,
+                            params.increment
+                        );
+                    }
+                    if params.increment < 0 && value >= wm {
+                        bail!(
+                            "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
+                            seq_name,
+                            value,
+                            wm,
+                            params.increment
+                        );
                     }
                 }
                 // Only autocommit emissions update the cross-fiber
@@ -1783,28 +1782,28 @@ impl Property for SequenceCorrectnessProperty {
                             // emit X+k*inc for varying k.
                             let skip_monotonicity = self.seqs_with_setval_ever.contains(&seq_name)
                                 || self.seqs_with_seq_default_ever.contains(&seq_name);
-                            if let Some(params) = params.as_ref() {
-                                if !params.cycle && !skip_monotonicity {
-                                    if let Some(prev) = baseline {
-                                        if params.increment > 0 && value <= prev {
-                                            bail!(
-                                                "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
-                                                seq_name,
-                                                value,
-                                                prev,
-                                                params.increment
-                                            );
-                                        }
-                                        if params.increment < 0 && value >= prev {
-                                            bail!(
-                                                "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
-                                                seq_name,
-                                                value,
-                                                prev,
-                                                params.increment
-                                            );
-                                        }
-                                    }
+                            if let Some(params) = params.as_ref()
+                                && !params.cycle
+                                && !skip_monotonicity
+                                && let Some(prev) = baseline
+                            {
+                                if params.increment > 0 && value <= prev {
+                                    bail!(
+                                        "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
+                                        seq_name,
+                                        value,
+                                        prev,
+                                        params.increment
+                                    );
+                                }
+                                if params.increment < 0 && value >= prev {
+                                    bail!(
+                                        "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
+                                        seq_name,
+                                        value,
+                                        prev,
+                                        params.increment
+                                    );
                                 }
                             }
                             // Duplicate check: tightened post-setval. The
@@ -1853,19 +1852,18 @@ impl Property for SequenceCorrectnessProperty {
                             } else {
                                 entry.insert(value);
                             }
-                            if is_allowed_re_emission {
-                                if let Some(allowed) =
+                            if is_allowed_re_emission
+                                && let Some(allowed) =
                                     self.pending_setval_re_emission.get_mut(&seq_name)
+                            {
+                                if !allowed.remove(&value)
+                                    && let Some(p) = params.as_ref()
                                 {
-                                    if !allowed.remove(&value) {
-                                        if let Some(p) = params.as_ref() {
-                                            let derived = value.saturating_sub(p.increment);
-                                            allowed.remove(&derived);
-                                        }
-                                    }
-                                    if allowed.is_empty() {
-                                        self.pending_setval_re_emission.remove(&seq_name);
-                                    }
+                                    let derived = value.saturating_sub(p.increment);
+                                    allowed.remove(&derived);
+                                }
+                                if allowed.is_empty() {
+                                    self.pending_setval_re_emission.remove(&seq_name);
                                 }
                             }
                             self.promote_committed(&seq_name, value);
@@ -2429,12 +2427,11 @@ impl Property for AutoincWatermarkMonotonicity {
                 self.snapshot_at_init.remove(&start_exec_id);
             }
             Operation::Commit => {
-                if let Some(t) = txn_id {
-                    if let Some(pending) = self.pending_per_tx.remove(&t) {
-                        if pending > self.committed_max {
-                            self.committed_max = pending;
-                        }
-                    }
+                if let Some(t) = txn_id
+                    && let Some(pending) = self.pending_per_tx.remove(&t)
+                    && pending > self.committed_max
+                {
+                    self.committed_max = pending;
                 }
             }
             Operation::Rollback => {

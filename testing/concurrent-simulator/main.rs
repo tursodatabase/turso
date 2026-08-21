@@ -307,11 +307,11 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
 
     let mut loop_err: Option<anyhow::Error> = None;
     while !whopper.is_done() {
-        if whopper.rng.random_bool(reopen_probability) {
-            if let Err(e) = whopper.reopen() {
-                loop_err = Some(e);
-                break;
-            }
+        if whopper.rng.random_bool(reopen_probability)
+            && let Err(e) = whopper.reopen()
+        {
+            loop_err = Some(e);
+            break;
         }
         match whopper.step() {
             Ok(StepResult::Ok) => {}

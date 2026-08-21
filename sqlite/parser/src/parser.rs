@@ -5511,7 +5511,6 @@ mod tests {
         }
     }
 
-    #[expect(clippy::large_stack_frames)]
     #[test]
     fn test_parser() {
         let test_cases = vec![

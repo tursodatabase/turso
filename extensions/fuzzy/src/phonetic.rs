@@ -25,10 +25,8 @@ pub fn phonetic_hash(z_in: &[u8]) -> Option<Vec<u8>> {
     let mut input = z_in;
     if z_in.len() > 2 {
         match z_in[0] {
-            b'g' | b'k' => {
-                if z_in[1] == b'n' {
-                    input = &z_in[1..];
-                }
+            b'g' | b'k' if z_in[1] == b'n' => {
+                input = &z_in[1..];
             }
             _ => {}
         }

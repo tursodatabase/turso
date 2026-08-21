@@ -3466,7 +3466,7 @@ fn gen_triggers(
             // Build sink table columns: id, tag, then one column per struct field
             let mut sink_cols = vec!["id INTEGER PRIMARY KEY".to_string(), "tag TEXT".to_string()];
             let mut sink_col_names = vec!["id".to_string(), "tag".to_string()];
-            let mut insert_exprs = vec![format!("NEW.id"), format!("union_tag(NEW.{col_name})")];
+            let mut insert_exprs = vec!["NEW.id".to_string(), format!("union_tag(NEW.{col_name})")];
 
             for (fi, (fname, ftype)) in sdef.fields.iter().enumerate() {
                 let sink_col = format!("f{fi}");
@@ -3555,17 +3555,17 @@ fn run_consistency_checks(
             }
         };
 
-        if let Ok(idx_rows) = execute_turso_rows(conn, &idx_sql) {
-            if scan_rows != idx_rows {
-                stats.consistency_failures += 1;
-                tracing::error!(
-                    "CONSISTENCY: scan vs index mismatch for {}\n  scan: {:?}\n  idx:  {:?}",
-                    eidx.expr_sql,
-                    scan_rows,
-                    idx_rows,
-                );
-                executed_sql.push(format!("-- CONSISTENCY FAIL: {}", eidx.expr_sql));
-            }
+        if let Ok(idx_rows) = execute_turso_rows(conn, &idx_sql)
+            && scan_rows != idx_rows
+        {
+            stats.consistency_failures += 1;
+            tracing::error!(
+                "CONSISTENCY: scan vs index mismatch for {}\n  scan: {:?}\n  idx:  {:?}",
+                eidx.expr_sql,
+                scan_rows,
+                idx_rows,
+            );
+            executed_sql.push(format!("-- CONSISTENCY FAIL: {}", eidx.expr_sql));
         }
     }
 
@@ -3579,19 +3579,21 @@ fn run_consistency_checks(
                     "SELECT COUNT(*) FROM {} WHERE {col_name} IS NOT NULL AND union_tag({col_name}) IS NULL",
                     table.name
                 );
-                if let Ok(rows) = execute_turso_rows(conn, &check_sql) {
-                    if rows.len() == 1 && rows[0].len() == 1 && rows[0][0] != "0" {
-                        stats.consistency_failures += 1;
-                        tracing::error!(
-                            "CONSISTENCY: union_tag returned NULL for non-NULL union values in {}.{col_name} ({} rows)",
-                            table.name,
-                            rows[0][0]
-                        );
-                        executed_sql.push(format!(
-                            "-- CONSISTENCY FAIL: NULL union_tag in {}.{col_name}",
-                            table.name
-                        ));
-                    }
+                if let Ok(rows) = execute_turso_rows(conn, &check_sql)
+                    && rows.len() == 1
+                    && rows[0].len() == 1
+                    && rows[0][0] != "0"
+                {
+                    stats.consistency_failures += 1;
+                    tracing::error!(
+                        "CONSISTENCY: union_tag returned NULL for non-NULL union values in {}.{col_name} ({} rows)",
+                        table.name,
+                        rows[0][0]
+                    );
+                    executed_sql.push(format!(
+                        "-- CONSISTENCY FAIL: NULL union_tag in {}.{col_name}",
+                        table.name
+                    ));
                 }
             }
         }
@@ -3611,16 +3613,15 @@ fn run_consistency_checks(
         if let (Ok(scan_rows), Ok(idx_rows)) = (
             execute_turso_rows(conn, &scan_count),
             execute_turso_rows(conn, &idx_count),
-        ) {
-            if scan_rows != idx_rows {
-                stats.consistency_failures += 1;
-                tracing::error!(
-                    "CONSISTENCY: COUNT mismatch for {} IS NOT NULL\n  scan: {:?}\n  idx:  {:?}",
-                    eidx.expr_sql,
-                    scan_rows,
-                    idx_rows,
-                );
-            }
+        ) && scan_rows != idx_rows
+        {
+            stats.consistency_failures += 1;
+            tracing::error!(
+                "CONSISTENCY: COUNT mismatch for {} IS NOT NULL\n  scan: {:?}\n  idx:  {:?}",
+                eidx.expr_sql,
+                scan_rows,
+                idx_rows,
+            );
         }
     }
 
@@ -3659,21 +3660,20 @@ fn run_consistency_checks(
             if let (Ok(scan_rows), Ok(idx_rows)) = (
                 execute_turso_rows(conn, &scan_sql),
                 execute_turso_rows(conn, &idx_sql),
-            ) {
-                if scan_rows != idx_rows {
-                    stats.consistency_failures += 1;
-                    tracing::error!(
-                        "CONSISTENCY: value lookup mismatch for {} = {}\n  scan: {:?}\n  idx:  {:?}",
-                        eidx.expr_sql,
-                        where_val,
-                        scan_rows,
-                        idx_rows,
-                    );
-                    executed_sql.push(format!(
-                        "-- CONSISTENCY FAIL: {} = {} lookup mismatch",
-                        eidx.expr_sql, where_val
-                    ));
-                }
+            ) && scan_rows != idx_rows
+            {
+                stats.consistency_failures += 1;
+                tracing::error!(
+                    "CONSISTENCY: value lookup mismatch for {} = {}\n  scan: {:?}\n  idx:  {:?}",
+                    eidx.expr_sql,
+                    where_val,
+                    scan_rows,
+                    idx_rows,
+                );
+                executed_sql.push(format!(
+                    "-- CONSISTENCY FAIL: {} = {} lookup mismatch",
+                    eidx.expr_sql, where_val
+                ));
             }
         }
     }
@@ -3699,20 +3699,19 @@ fn run_consistency_checks(
         if let (Ok(scan_rows), Ok(idx_rows)) = (
             execute_turso_rows(conn, &scan_sum),
             execute_turso_rows(conn, &idx_sum),
-        ) {
-            if scan_rows != idx_rows {
-                stats.consistency_failures += 1;
-                tracing::error!(
-                    "CONSISTENCY: SUM mismatch for {}\n  scan: {:?}\n  idx:  {:?}",
-                    eidx.expr_sql,
-                    scan_rows,
-                    idx_rows,
-                );
-                executed_sql.push(format!(
-                    "-- CONSISTENCY FAIL: SUM({}) mismatch",
-                    eidx.expr_sql
-                ));
-            }
+        ) && scan_rows != idx_rows
+        {
+            stats.consistency_failures += 1;
+            tracing::error!(
+                "CONSISTENCY: SUM mismatch for {}\n  scan: {:?}\n  idx:  {:?}",
+                eidx.expr_sql,
+                scan_rows,
+                idx_rows,
+            );
+            executed_sql.push(format!(
+                "-- CONSISTENCY FAIL: SUM({}) mismatch",
+                eidx.expr_sql
+            ));
         }
     }
 
@@ -3726,19 +3725,21 @@ fn run_consistency_checks(
                      array_length(array_append({col_name}, 99)) != array_length({col_name}) + 1",
                     table.name
                 );
-                if let Ok(rows) = execute_turso_rows(conn, &check_sql) {
-                    if rows.len() == 1 && rows[0].len() == 1 && rows[0][0] != "0" {
-                        stats.consistency_failures += 1;
-                        tracing::error!(
-                            "CONSISTENCY: array append identity violated for {}.{col_name}: {} rows",
-                            table.name,
-                            rows[0][0]
-                        );
-                        executed_sql.push(format!(
-                            "-- CONSISTENCY FAIL: array append identity {}.{col_name}",
-                            table.name
-                        ));
-                    }
+                if let Ok(rows) = execute_turso_rows(conn, &check_sql)
+                    && rows.len() == 1
+                    && rows[0].len() == 1
+                    && rows[0][0] != "0"
+                {
+                    stats.consistency_failures += 1;
+                    tracing::error!(
+                        "CONSISTENCY: array append identity violated for {}.{col_name}: {} rows",
+                        table.name,
+                        rows[0][0]
+                    );
+                    executed_sql.push(format!(
+                        "-- CONSISTENCY FAIL: array append identity {}.{col_name}",
+                        table.name
+                    ));
                 }
             }
         }
@@ -3753,15 +3754,17 @@ fn run_consistency_checks(
                     "SELECT COUNT(*) FROM {} WHERE {col_name} IS NOT NULL AND array_length({col_name}) < 0",
                     table.name
                 );
-                if let Ok(rows) = execute_turso_rows(conn, &check_sql) {
-                    if rows.len() == 1 && rows[0].len() == 1 && rows[0][0] != "0" {
-                        stats.consistency_failures += 1;
-                        tracing::error!(
-                            "CONSISTENCY: negative array_length for {}.{col_name}: {} rows",
-                            table.name,
-                            rows[0][0]
-                        );
-                    }
+                if let Ok(rows) = execute_turso_rows(conn, &check_sql)
+                    && rows.len() == 1
+                    && rows[0].len() == 1
+                    && rows[0][0] != "0"
+                {
+                    stats.consistency_failures += 1;
+                    tracing::error!(
+                        "CONSISTENCY: negative array_length for {}.{col_name}: {} rows",
+                        table.name,
+                        rows[0][0]
+                    );
                 }
             }
         }
@@ -3772,32 +3775,33 @@ fn run_consistency_checks(
     // from before the ALTER TABLE ADD COLUMN.
     for table in tables {
         for (col_idx, kind) in &table.custom_type_columns {
-            if let CustomColKind::Domain(dname) = kind {
-                if let Some(d) = types.domains.iter().find(|d| &d.name == dname) {
-                    if d.not_null {
-                        let col_name = &table.columns[*col_idx].0;
-                        if col_name.starts_with("alt") {
-                            continue;
-                        }
-                        let check_sql = format!(
-                            "SELECT COUNT(*) FROM {} WHERE {col_name} IS NULL",
-                            table.name
-                        );
-                        if let Ok(rows) = execute_turso_rows(conn, &check_sql) {
-                            if rows.len() == 1 && rows[0].len() == 1 && rows[0][0] != "0" {
-                                stats.consistency_failures += 1;
-                                tracing::error!(
-                                    "CONSISTENCY: NOT NULL domain {dname} has NULL values in {}.{col_name}: {} rows",
-                                    table.name,
-                                    rows[0][0]
-                                );
-                                executed_sql.push(format!(
-                                    "-- CONSISTENCY FAIL: NOT NULL domain {dname} has NULLs in {}.{col_name}",
-                                    table.name
-                                ));
-                            }
-                        }
-                    }
+            if let CustomColKind::Domain(dname) = kind
+                && let Some(d) = types.domains.iter().find(|d| &d.name == dname)
+                && d.not_null
+            {
+                let col_name = &table.columns[*col_idx].0;
+                if col_name.starts_with("alt") {
+                    continue;
+                }
+                let check_sql = format!(
+                    "SELECT COUNT(*) FROM {} WHERE {col_name} IS NULL",
+                    table.name
+                );
+                if let Ok(rows) = execute_turso_rows(conn, &check_sql)
+                    && rows.len() == 1
+                    && rows[0].len() == 1
+                    && rows[0][0] != "0"
+                {
+                    stats.consistency_failures += 1;
+                    tracing::error!(
+                        "CONSISTENCY: NOT NULL domain {dname} has NULL values in {}.{col_name}: {} rows",
+                        table.name,
+                        rows[0][0]
+                    );
+                    executed_sql.push(format!(
+                        "-- CONSISTENCY FAIL: NOT NULL domain {dname} has NULLs in {}.{col_name}",
+                        table.name
+                    ));
                 }
             }
         }
@@ -3806,29 +3810,31 @@ fn run_consistency_checks(
     // Check 9: domain CHECK constraints hold for all rows
     for table in tables {
         for (col_idx, kind) in &table.custom_type_columns {
-            if let CustomColKind::Domain(dname) = kind {
-                if let Some(d) = types.domains.iter().find(|d| &d.name == dname) {
-                    let col_name = &table.columns[*col_idx].0;
-                    for check_expr in &d.checks {
-                        let where_expr = check_expr.replace("value", col_name);
-                        let check_sql = format!(
-                            "SELECT COUNT(*) FROM {} WHERE {col_name} IS NOT NULL AND NOT ({where_expr})",
-                            table.name
+            if let CustomColKind::Domain(dname) = kind
+                && let Some(d) = types.domains.iter().find(|d| &d.name == dname)
+            {
+                let col_name = &table.columns[*col_idx].0;
+                for check_expr in &d.checks {
+                    let where_expr = check_expr.replace("value", col_name);
+                    let check_sql = format!(
+                        "SELECT COUNT(*) FROM {} WHERE {col_name} IS NOT NULL AND NOT ({where_expr})",
+                        table.name
+                    );
+                    if let Ok(rows) = execute_turso_rows(conn, &check_sql)
+                        && rows.len() == 1
+                        && rows[0].len() == 1
+                        && rows[0][0] != "0"
+                    {
+                        stats.consistency_failures += 1;
+                        tracing::error!(
+                            "CONSISTENCY: domain CHECK({check_expr}) violated in {}.{col_name}: {} rows",
+                            table.name,
+                            rows[0][0]
                         );
-                        if let Ok(rows) = execute_turso_rows(conn, &check_sql) {
-                            if rows.len() == 1 && rows[0].len() == 1 && rows[0][0] != "0" {
-                                stats.consistency_failures += 1;
-                                tracing::error!(
-                                    "CONSISTENCY: domain CHECK({check_expr}) violated in {}.{col_name}: {} rows",
-                                    table.name,
-                                    rows[0][0]
-                                );
-                                executed_sql.push(format!(
-                                    "-- CONSISTENCY FAIL: domain CHECK violated in {}.{col_name}",
-                                    table.name
-                                ));
-                            }
-                        }
+                        executed_sql.push(format!(
+                            "-- CONSISTENCY FAIL: domain CHECK violated in {}.{col_name}",
+                            table.name
+                        ));
                     }
                 }
             }
@@ -4640,7 +4646,7 @@ fn main() -> Result<()> {
         i += 1;
 
         // Periodic consistency checks (only outside transactions)
-        if i % 50 == 0 && !in_transaction {
+        if i.is_multiple_of(50) && !in_transaction {
             run_consistency_checks(
                 &conn,
                 &tables,

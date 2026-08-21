@@ -109,10 +109,9 @@ pub fn run_worker(
                     ref error_kind,
                     ref message,
                 } = response
+                    && (error_kind == "Panic" || error_kind == "Internal")
                 {
-                    if error_kind == "Panic" || error_kind == "Internal" {
-                        eprintln!("WORKER SQL ERROR [{error_kind}]: {message} (sql: {sql})");
-                    }
+                    eprintln!("WORKER SQL ERROR [{error_kind}]: {message} (sql: {sql})");
                 }
                 send_response(&response)?;
             }
@@ -430,7 +429,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                 "WORKER TRACE pid={} finish sql={:?} result={:?} steps={} ios={} elapsed_ms={} auto_commit={}",
                 std::process::id(),
                 sql,
-                &result,
+                result,
                 step_count,
                 io_count,
                 started_at.elapsed().as_millis(),

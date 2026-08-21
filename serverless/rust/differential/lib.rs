@@ -247,7 +247,7 @@ pub fn gen_value(tc: &TestCase) -> Val {
         "empty_blob" => Val::Blob(vec![]),
         "large_or_unicode" => {
             let pick: u8 = tc.draw(gs::integers::<u8>());
-            if pick % 2 == 0 {
+            if pick.is_multiple_of(2) {
                 Val::Blob(vec![0xAB; 256])
             } else {
                 let options = spec_unicode_options();
@@ -545,7 +545,7 @@ fn gen_transaction_workflow(
     let commit_byte: u8 = tc.draw(gs::integers::<u8>());
     Op::TransactionWorkflow {
         inner_ops,
-        commit: commit_byte % 2 == 0,
+        commit: commit_byte.is_multiple_of(2),
     }
 }
 

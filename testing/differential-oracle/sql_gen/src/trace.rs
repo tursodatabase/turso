@@ -274,7 +274,7 @@ impl CoverageTreeNode {
             .filter(|(_, c)| **c > 0)
             .map(|(k, c)| (*k, *c))
             .collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
         sorted
             .iter()
             .map(|(k, c)| format!("{k}: {c}"))
@@ -482,7 +482,7 @@ impl fmt::Display for CoverageReport<'_> {
         let mut stmt_distribution: Vec<_> = StmtKind::iter()
             .map(|k| (k, *self.coverage.stmt_counts.get(&k).unwrap_or(&0)))
             .collect();
-        stmt_distribution.sort_by(|a, b| b.1.cmp(&a.1));
+        stmt_distribution.sort_by_key(|e| std::cmp::Reverse(e.1));
 
         writeln!(f, "\n--- Statement Distribution ---")?;
         for (kind, count) in &stmt_distribution {
@@ -503,7 +503,7 @@ impl fmt::Display for CoverageReport<'_> {
         let mut expr_distribution: Vec<_> = ExprKind::iter()
             .map(|k| (k, *expr_counts.get(&k).unwrap_or(&0)))
             .collect();
-        expr_distribution.sort_by(|a, b| b.1.cmp(&a.1));
+        expr_distribution.sort_by_key(|e| std::cmp::Reverse(e.1));
 
         writeln!(f, "\n--- Expression Distribution ---")?;
         for (kind, count) in &expr_distribution {
@@ -574,7 +574,7 @@ impl fmt::Display for CoverageReport<'_> {
                             .filter(|(_, c)| **c > 0)
                             .map(|(k, c)| (*k, *c))
                             .collect();
-                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                        sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
                         let line: Vec<String> =
                             sorted.iter().map(|(k, c)| format!("{k}: {c}")).collect();
                         writeln!(f, "    {}", line.join(", "))?;

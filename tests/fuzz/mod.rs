@@ -5567,7 +5567,7 @@ mod fuzz_tests {
 
                         let alter_sql = format!(
                             "ALTER TABLE {} ADD COLUMN {} {}",
-                            table_to_alter, &new_col_name, col_type
+                            table_to_alter, new_col_name, col_type
                         );
 
                         stmts.push(alter_sql.clone());

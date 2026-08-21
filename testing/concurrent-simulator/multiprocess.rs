@@ -60,10 +60,10 @@ struct OperationHistoryWriter {
 impl OperationHistoryWriter {
     fn new(output_path: Option<&Path>) -> anyhow::Result<Self> {
         let output = if let Some(path) = output_path {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    create_dir_all(parent)?;
-                }
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                create_dir_all(parent)?;
             }
             Some(BufWriter::new(File::create(path)?))
         } else {
@@ -917,15 +917,14 @@ impl MultiprocessWhopper {
         }
 
         // Update fiber state for BEGIN
-        if let Operation::Begin { mode } = &op {
-            if op_result.is_ok() {
-                self.connection_states[connection_idx].fiber_state = if *mode == TxMode::Concurrent
-                {
-                    FiberState::InConcurrentTx
-                } else {
-                    FiberState::InTx
-                };
-            }
+        if let Operation::Begin { mode } = &op
+            && op_result.is_ok()
+        {
+            self.connection_states[connection_idx].fiber_state = if *mode == TxMode::Concurrent {
+                FiberState::InConcurrentTx
+            } else {
+                FiberState::InTx
+            };
         }
 
         // Apply state changes (sim_state + stats)
@@ -1043,10 +1042,9 @@ impl MultiprocessWhopper {
             .chaotic_workload
             .is_none()
             && self.connection_states[connection_idx].fiber_state == FiberState::Idle
+            && let Some(op) = self.pick_chaotic_workload(connection_idx)
         {
-            if let Some(op) = self.pick_chaotic_workload(connection_idx) {
-                self.connection_states[connection_idx].current_op = Some(op);
-            }
+            self.connection_states[connection_idx].current_op = Some(op);
         }
     }
 

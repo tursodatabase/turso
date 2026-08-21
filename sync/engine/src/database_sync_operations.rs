@@ -3016,12 +3016,14 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
         );
         rows_changed += 1;
         // we give user full control over CDC table - so let's not emit assert here for now
-        if last_change_id.is_some() && last_change_id.unwrap() + 1 != change_id {
-            tracing::debug!(
-                "out of order change sequence: {} -> {}",
-                last_change_id.unwrap(),
-                change_id
-            );
+        if let Some(last_change_id) = last_change_id {
+            if last_change_id + 1 != change_id {
+                tracing::debug!(
+                    "out of order change sequence: {} -> {}",
+                    last_change_id,
+                    change_id
+                );
+            }
         }
         last_change_id = Some(change_id);
         match transform_result {
