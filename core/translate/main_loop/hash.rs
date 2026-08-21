@@ -2,6 +2,7 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
+use crate::translate::expr::comparison_affinity;
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 

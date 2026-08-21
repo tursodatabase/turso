@@ -15741,7 +15741,7 @@ pub fn op_cast(
 
     let value = state.registers[*reg].get_value().clone();
     let result = match affinity {
-        Affinity::Blob => value.exec_cast("BLOB"),
+        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
@@ -17484,7 +17484,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
         }
 
         match affinity {
-            Affinity::Blob => return true,
+            Affinity::Blob | Affinity::None => return true,
 
             Affinity::Text => {
                 if matches!(value, Value::Text(_) | Value::Null) {
