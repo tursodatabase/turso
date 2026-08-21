@@ -3428,8 +3428,10 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
                 col.ty_str = "BLOB".to_string();
+                col.override_affinity(Affinity::Blob);
             } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
                 col.ty_str = resolved.primitive.to_uppercase();
+                col.override_affinity(Affinity::None);
             }
         }
         Arc::new(modified)
@@ -3481,6 +3483,7 @@ impl BTreeTable {
             if let Some(only) = effective_only {
                 if !only.get(i) {
                     col.ty_str = "ANY".to_string();
+                    col.override_affinity(Affinity::Blob);
                     continue;
                 }
             }
@@ -3488,6 +3491,7 @@ impl BTreeTable {
                 // Pre-encode: user input can be text ('[1,2]') or blob (ARRAY[]),
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
+                col.override_affinity(Affinity::Blob);
             } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
@@ -5345,7 +5349,7 @@ impl Column {
         if coldef.hidden {
             raw |= F_HIDDEN
         }
-        Self::set_raw_affinity(&mut raw, Affinity::affinity(&ty_str));
+        Self::set_raw_affinity(&mut raw, Affinity::affinity(&ty_str)); //FIXME this isn't compatible with custom types. But how do I know that the type is custom?
 
         Self {
             name,
