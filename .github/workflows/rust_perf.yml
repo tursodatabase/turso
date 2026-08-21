@@ -1,4 +1,4 @@
-name: Rust Benchmarks+Nyrkiö
+name: Rust Benchmarks
 
 on:
   workflow_dispatch:
@@ -56,46 +56,6 @@ jobs:
           name: bench-output-${{ matrix.bench }}
           path: output.txt
 
-  bench-report:
-    runs-on: ubuntu-latest
-    needs: bench
-    if: always() && !cancelled()
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: bench-output-*
-      - name: Merge outputs
-        run: cat bench-output-*/output.txt > output.txt
-      - name: Analyze benchmark result with Nyrkiö
-        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
-        with:
-          name: turso
-          tool: criterion
-          output-file-path: output.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-          # What to do if a change is immediately detected by Nyrkiö.
-          # Note that smaller changes are only detected with delay, usually after a change
-          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
-          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
-          # on pull events isn't compatible with this workflow being required to pass branch protection.
-          fail-on-alert: false
-          comment-on-alert: false
-          comment-always: false
-          # Nyrkiö configuration
-          # Get yours from https://nyrkio.com/docs/getting-started
-          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
-          # HTTP requests will fail for all non-core contributors that don't have their own token.
-          # Don't want that to spoil the build, so:
-          never-fail: true
-          # Make results and change points public, so that any oss contributor can see them
-          nyrkio-public: true
-
-          # parameters of the algorithm. Note: These are global, so we only set them once and for all.
-          # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
-          nyrkio-settings-pvalue: 0.00001
-          nyrkio-settings-threshold: 0%
-
   clickbench:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -112,48 +72,6 @@ jobs:
 
       - name: Clickbench
         run: make clickbench
-
-      - name: Analyze TURSO result with Nyrkiö
-        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
-        with:
-          name: clickbench/turso
-          tool: time
-          output-file-path: clickbench-tursodb.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # What to do if a change is immediately detected by Nyrkiö.
-          # Note that smaller changes are only detected with delay, usually after a change
-          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
-          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
-          # on pull events isn't compatible with this workflow being required to pass branch protection.
-          fail-on-alert: false
-          comment-on-alert: false
-          comment-always: false
-          # Nyrkiö configuration
-          # Get yours from https://nyrkio.com/docs/getting-started
-          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
-          # HTTP requests will fail for all non-core contributors that don't have their own token.
-          # Don't want that to spoil the build, so:
-          never-fail: true
-          # Make results and change points public, so that any oss contributor can see them
-          nyrkio-public: true
-          nyrkio-settings-pvalue: 0.00001
-          nyrkio-settings-threshold: 0%
-
-      - name: Analyze SQLITE3 result with Nyrkiö
-        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
-        with:
-          name: clickbench/sqlite3
-          tool: time
-          output-file-path: clickbench-sqlite3.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          fail-on-alert: false
-          comment-on-alert: false
-          comment-always: false
-          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
-          never-fail: true
-          nyrkio-public: true
-          nyrkio-settings-pvalue: 0.00001
-          nyrkio-settings-threshold: 0%
 
   tpc-h-criterion:
     runs-on: ubuntu-latest
@@ -182,35 +100,6 @@ jobs:
 
       - name: Bench
         run: cargo bench --bench tpc_h_benchmark --locked  2>&1 | tee output.txt
-      - name: Analyze benchmark result with Nyrkiö
-        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
-        with:
-          name: tpc-h
-          tool: criterion
-          output-file-path: output.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-          # What to do if a change is immediately detected by Nyrkiö.
-          # Note that smaller changes are only detected with delay, usually after a change
-          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
-          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
-          # on pull events isn't compatible with this workflow being required to pass branch protection.
-          fail-on-alert: false
-          comment-on-alert: false
-          comment-always: false
-          # Nyrkiö configuration
-          # Get yours from https://nyrkio.com/docs/getting-started
-          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
-          # HTTP requests will fail for all non-core contributors that don't have their own token.
-          # Don't want that to spoil the build, so:
-          never-fail: true
-          # Make results and change points public, so that any oss contributor can see them
-          nyrkio-public: true
-
-          # parameters of the algorithm. Note: These are global, so we only set them once and for all.
-          # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
-          nyrkio-settings-pvalue: 0.00001
-          nyrkio-settings-threshold: 0%
 
   tpc-h:
     runs-on: ubuntu-latest
