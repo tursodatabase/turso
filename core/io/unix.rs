@@ -383,6 +383,68 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
+    fn preadv(
+        &self,
+        pos: u64,
+        buffers: Vec<Arc<crate::Buffer>>,
+        c: Completion,
+    ) -> Result<Completion> {
+        if buffers.is_empty() {
+            c.complete(0);
+            return Ok(c);
+        }
+        let total_size: usize = buffers.iter().map(|b| b.len()).sum();
+        let mut iov: Vec<libc::iovec> = Vec::with_capacity(buffers.len().min(MAX_IOV));
+        for buf in &buffers {
+            if iov.len() == MAX_IOV {
+                break;
+            }
+            let slice = buf.as_mut_slice();
+            iov.push(libc::iovec {
+                iov_base: slice.as_mut_ptr() as *mut libc::c_void,
+                iov_len: slice.len(),
+            });
+        }
+
+        let mut total_read = 0usize;
+        let mut current_pos = pos;
+        // `preadv` may come up short; keep going until every buffer is filled
+        // or the file ends.
+        loop {
+            let n = unsafe {
+                libc::preadv(
+                    self.file.as_raw_fd(),
+                    iov.as_ptr(),
+                    iov.len() as i32,
+                    current_pos as libc::off_t,
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(io_error(e, "preadv"));
+            }
+            let read = n as usize;
+            total_read += read;
+            current_pos += read as u64;
+            // A zero-length read means end of file: report what we got and let
+            // the caller decide whether a short read is acceptable.
+            if read == 0 || total_read >= total_size || iov.is_empty() {
+                break;
+            }
+            trim_iovecs(&mut iov, read);
+            if iov.is_empty() {
+                break;
+            }
+        }
+        trace!("preadv complete: read {total_read}/{total_size} bytes");
+        c.complete(total_read as i32);
+        Ok(c)
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn pwritev(
         &self,
         pos: u64,

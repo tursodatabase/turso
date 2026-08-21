@@ -228,6 +228,14 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["vdbe_trace"],
         ),
+        PrefetchPages => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["prefetch_pages"],
+        ),
+        PrefetchStats => Pragma::new(
+            PragmaFlags::Result0,
+            &["hits", "hits_in_flight", "misses", "pages_fetched", "reads"],
+        ),
     }
 }
 

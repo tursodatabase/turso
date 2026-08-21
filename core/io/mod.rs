@@ -157,6 +157,67 @@ pub trait File: Send + Sync {
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
     /// Sync file data&metadata to disk.
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
+    /// Read `buffers.len()` consecutive chunks starting at `pos`, filling
+    /// `buffers` in order.
+    ///
+    /// Unlike [`File::pread`], the destinations are passed separately and `c`
+    /// carries no buffer of its own: it just reports the total bytes read.
+    /// Used by readahead to pull a run of pages in one request.
+    ///
+    /// The default issues one `pread` per buffer, which is right for backends
+    /// that queue requests rather than serve them inline.
+    fn preadv(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+        use crate::sync::atomic::{AtomicUsize, Ordering};
+        if buffers.is_empty() {
+            c.complete(0);
+            return Ok(c);
+        }
+        let mut pos = pos;
+        let outstanding = Arc::new(AtomicUsize::new(buffers.len()));
+        let total_read = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(crate::sync::atomic::AtomicBool::new(false));
+
+        for buf in buffers {
+            let len = buf.len();
+            let child_c = {
+                let c_main = c.clone();
+                let outstanding = outstanding.clone();
+                let total_read = total_read.clone();
+                let failed = failed.clone();
+                Completion::new_read(buf.clone(), move |res| {
+                    match res {
+                        Ok((_, n)) => {
+                            total_read.fetch_add(n.max(0) as usize, Ordering::SeqCst);
+                        }
+                        Err(err) => {
+                            // Remember the failure but keep counting down, so
+                            // the parent resolves exactly once either way.
+                            failed.store(true, Ordering::SeqCst);
+                            if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                c_main.error(err);
+                            }
+                            return Some(err);
+                        }
+                    }
+                    if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        if failed.load(Ordering::SeqCst) {
+                            c_main.error(crate::CompletionError::Aborted);
+                        } else {
+                            c_main.complete(total_read.load(Ordering::Acquire) as i32);
+                        }
+                    }
+                    None
+                })
+            };
+            if let Err(e) = self.pread(pos, child_c) {
+                c.abort();
+                return Err(e);
+            }
+            pos += len as u64;
+        }
+        Ok(c)
+    }
+
     fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use crate::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {

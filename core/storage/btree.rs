@@ -7146,6 +7146,11 @@ impl CursorTrait for BTreeCursor {
         loop {
             match self.rewind_state {
                 RewindState::Start => {
+                    // A walk of this whole b-tree is starting. Tell readahead
+                    // so it does not spend the first few pages working out
+                    // what it can already be told -- the same reason Linux
+                    // treats a read at offset 0 as sequential on sight.
+                    self.pager.hint_scan_start(self.root_page);
                     let c = return_if_io!(self.move_to_root_nonblock());
                     self.rewind_state = RewindState::NextRecord;
                     if let Some(c) = c {

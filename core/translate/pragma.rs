@@ -18,6 +18,7 @@ use crate::schema::{Schema, Table};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
+use crate::storage::pager::MAX_READAHEAD_WINDOW;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
@@ -775,6 +776,23 @@ fn update_pragma(
             let enabled = parse_pragma_enabled(&value);
             connection.set_vdbe_trace(enabled);
             Ok(TransactionMode::None)
+        }
+        PragmaName::PrefetchPages => {
+            let pages = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(pages))
+                    if (0..=MAX_READAHEAD_WINDOW as i64).contains(&pages) =>
+                {
+                    pages as u32
+                }
+                _ => bail_parse_error!(
+                    "prefetch_pages must be between 0 (off) and {MAX_READAHEAD_WINDOW}"
+                ),
+            };
+            pager.set_readahead_window(pages);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::PrefetchStats => {
+            bail_parse_error!("prefetch_stats is read-only")
         }
 
         PragmaName::FunctionList => query_pragma(
@@ -1570,6 +1588,34 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::VdbeTrace => Ok(TransactionMode::None),
+        PragmaName::PrefetchPages => {
+            let register = program.alloc_register();
+            program.emit_int(pager.readahead_window() as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::PrefetchStats => {
+            let stats = pager.readahead_stats();
+            let start = program.alloc_registers(5);
+            for (i, value) in [
+                stats.hits,
+                stats.hits_in_flight,
+                stats.misses,
+                stats.pages_fetched,
+                stats.reads,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                program.emit_int(value as i64, start + i);
+            }
+            program.emit_result_row(start, 5);
+            for column in ["hits", "hits_in_flight", "misses", "pages_fetched", "reads"] {
+                program.add_pragma_result_column(column.to_string());
+            }
+            Ok(TransactionMode::None)
+        }
         PragmaName::FreelistCount => {
             let value = pager.freepage_list();
             let register = program.alloc_register();
