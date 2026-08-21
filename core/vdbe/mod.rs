@@ -40,6 +40,8 @@ mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
 // for benchmarks
+// Re-exported for the benches, which reach vdbe only when it is public.
+#[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use crate::translate::collate::CollationSeq;
 use crate::{
     alloc::{DynAllocator, TryClone},

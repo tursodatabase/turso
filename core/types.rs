@@ -659,6 +659,9 @@ impl Value {
     }
 }
 
+// Equality deliberately compares the registered callbacks by address: two
+// states are the same aggregate only if they use the same functions.
+#[allow(unpredictable_function_pointer_comparisons)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalAggState {
     pub context: usize,
