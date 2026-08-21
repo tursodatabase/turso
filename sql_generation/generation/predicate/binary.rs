@@ -103,8 +103,12 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let lt_value =
-                            LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
+                        let lt_value = LTValue::arbitrary_from_maybe(
+                            rng,
+                            context,
+                            (value, column.column_type),
+                        )?
+                        .0;
                         Some(Expr::Binary(
                             Box::new(qualified_column_expr(&table_name, &column.name)),
                             ast::Operator::Greater,
@@ -115,8 +119,12 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let gt_value =
-                            GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
+                        let gt_value = GTValue::arbitrary_from_maybe(
+                            rng,
+                            context,
+                            (value, column.column_type),
+                        )?
+                        .0;
                         Some(Expr::Binary(
                             Box::new(qualified_column_expr(&table_name, &column.name)),
                             ast::Operator::Less,
@@ -211,8 +219,11 @@ impl Predicate {
                     )
                 }),
                 Box::new(|rng| {
+                    // `x > x` is false too, so the row's own value is a fine fallback
+                    // when nothing greater exists.
                     let gt_value =
-                        GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
+                        GTValue::arbitrary_from_maybe(rng, context, (value, column.column_type))
+                            .map_or_else(|| value.clone(), |gt| gt.0);
                     Expr::Binary(
                         Box::new(qualified_column_expr(&table_name, &column.name)),
                         ast::Operator::Greater,
@@ -221,7 +232,8 @@ impl Predicate {
                 }),
                 Box::new(|rng| {
                     let lt_value =
-                        LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
+                        LTValue::arbitrary_from_maybe(rng, context, (value, column.column_type))
+                            .map_or_else(|| value.clone(), |lt| lt.0);
                     Expr::Binary(
                         Box::new(qualified_column_expr(&table_name, &column.name)),
                         ast::Operator::Less,
@@ -273,30 +285,42 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(
+                    // When nothing is smaller than the value, `IS` keeps the
+                    // predicate true for this row.
+                    match LTValue::arbitrary_from_maybe(
                         rng,
                         context,
                         (column_value, column.column.column_type),
-                    )
-                    .0;
-                    Expr::Binary(
-                        Box::new(qualified_column_expr(table_name, &column.column.name)),
-                        ast::Operator::Greater,
-                        Box::new(Expr::Literal(lt_value.into())),
-                    )
+                    ) {
+                        Some(lt_value) => Expr::Binary(
+                            Box::new(qualified_column_expr(table_name, &column.column.name)),
+                            ast::Operator::Greater,
+                            Box::new(Expr::Literal(lt_value.0.into())),
+                        ),
+                        None => Expr::Binary(
+                            Box::new(qualified_column_expr(table_name, &column.column.name)),
+                            ast::Operator::Is,
+                            Box::new(Expr::Literal(column_value.into())),
+                        ),
+                    }
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(
+                    match GTValue::arbitrary_from_maybe(
                         rng,
                         context,
                         (column_value, column.column.column_type),
-                    )
-                    .0;
-                    Expr::Binary(
-                        Box::new(qualified_column_expr(table_name, &column.column.name)),
-                        ast::Operator::Less,
-                        Box::new(Expr::Literal(gt_value.into())),
-                    )
+                    ) {
+                        Some(gt_value) => Expr::Binary(
+                            Box::new(qualified_column_expr(table_name, &column.column.name)),
+                            ast::Operator::Less,
+                            Box::new(Expr::Literal(gt_value.0.into())),
+                        ),
+                        None => Expr::Binary(
+                            Box::new(qualified_column_expr(table_name, &column.column.name)),
+                            ast::Operator::Is,
+                            Box::new(Expr::Literal(column_value.into())),
+                        ),
+                    }
                 }),
             ],
             rng,
@@ -332,12 +356,14 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(
+                    // `x > x` is false too, so the row's own value is a fine fallback
+                    // when nothing greater exists.
+                    let gt_value = GTValue::arbitrary_from_maybe(
                         rng,
                         context,
                         (column_value, column.column.column_type),
                     )
-                    .0;
+                    .map_or_else(|| column_value.clone(), |gt| gt.0);
                     Expr::Binary(
                         Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::Greater,
@@ -345,12 +371,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(
+                    let lt_value = LTValue::arbitrary_from_maybe(
                         rng,
                         context,
                         (column_value, column.column.column_type),
                     )
-                    .0;
+                    .map_or_else(|| column_value.clone(), |lt| lt.0);
                     Expr::Binary(
                         Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::Less,

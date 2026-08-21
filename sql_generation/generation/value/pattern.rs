@@ -16,6 +16,10 @@ impl ArbitraryFromMaybe<&SimValue> for LikeValue {
         match &value.0 {
             value @ Value::Text(..) => {
                 let t = value.to_string();
+                if t.is_empty() {
+                    // The only pattern that matches the empty string.
+                    return Some(Self(SimValue(Value::build_text("%"))));
+                }
                 let mut t = t.chars().collect::<Vec<_>>();
                 // Remove a number of characters, either insert `_` for each character removed, or
                 // insert one `%` for the whole substring
