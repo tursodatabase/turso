@@ -9325,7 +9325,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         if !is_physically_sorted {
             // Sort cells by old physical offset in descending order.
             // Using unstable sort is fine as the original order doesn't matter.
-            cells.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
+            cells.sort_unstable_by_key(|c| std::cmp::Reverse(c.old_offset));
         }
 
         // Get direct mutable access to the page buffer.
@@ -11039,11 +11039,13 @@ mod tests {
     }
 
     fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
-        let seed = std::env::var("SEED").map_or(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
+        let seed = std::env::var("SEED").map_or_else(
+            |_| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            },
             |v| {
                 v.parse()
                     .expect("Failed to parse SEED environment variable as u64")
@@ -13301,8 +13303,9 @@ mod tests {
             #[cfg(debug_assertions)]
             debug_validate_cells_core(contents, pager.usable_space());
             // check cells are correct
-            let mut cell_idx_cloned = if prefix { size } else { 0 };
-            for cell_idx in 0..contents.cell_count() {
+            for (cell_idx_cloned, cell_idx) in
+                (if prefix { size } else { 0 }..).zip(0..contents.cell_count())
+            {
                 let buf = contents.as_ptr();
                 let (start, len) = contents
                     .cell_get_raw_region(cell_idx, pager.usable_space())
@@ -13310,7 +13313,6 @@ mod tests {
                 let cell_in_page = &buf[start..start + len];
                 let cell_in_array = &cells_cloned[cell_idx_cloned];
                 assert_eq!(cell_in_page, cell_in_array);
-                cell_idx_cloned += 1;
             }
         }
     }

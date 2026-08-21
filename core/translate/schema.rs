@@ -2908,7 +2908,7 @@ pub fn translate_drop_type(
     }
 
     // Check if any table uses this type
-    for (_, table) in resolver.schema().tables.iter() {
+    for table in resolver.schema().tables.values() {
         for col in table.columns() {
             if normalize_ident(&col.ty_str) == normalized_name {
                 bail_parse_error!(

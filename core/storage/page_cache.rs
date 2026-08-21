@@ -572,7 +572,7 @@ impl PageCache {
         const EST_SPILL: usize = 128;
         let mut spillable: Vec<PinGuard> = Vec::with_capacity(EST_SPILL);
 
-        for (_, &entry_ptr) in self.map.iter() {
+        for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             if Self::spillable(page) {

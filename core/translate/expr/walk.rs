@@ -117,7 +117,7 @@ where
                         }
                         stack.push(WalkItem::Expr(lhs));
                     }
-                    ast::Expr::InSelect { lhs, rhs: _, .. } => {
+                    ast::Expr::InSelect { lhs, .. } => {
                         stack.push(WalkItem::Expr(lhs));
                         // TODO: Walk through select statements if needed
                     }
@@ -393,7 +393,7 @@ where
                         }
                         stack.push(WalkItem::Expr(lhs));
                     }
-                    ast::Expr::InSelect { lhs, rhs: _, .. } => {
+                    ast::Expr::InSelect { lhs, .. } => {
                         stack.push(WalkItem::Expr(lhs));
                         // TODO: Walk through select statements if needed
                     }

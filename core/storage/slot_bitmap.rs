@@ -52,7 +52,7 @@ impl AtomicSlotBitmap {
     pub fn new(n_slots: u32) -> Self {
         turso_assert!(n_slots > 0, "number of slots must be non-zero");
         turso_assert!(
-            n_slots % WORD_BITS == 0,
+            n_slots.is_multiple_of(WORD_BITS),
             "number of slots in map must be a multiple of 64"
         );
         let n_words = (n_slots / WORD_BITS) as usize;

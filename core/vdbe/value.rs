@@ -105,7 +105,7 @@ mod cmath {
     }
 
     // SQLite's M_PI constant (same value as SQLite's func.c)
-    #[allow(clippy::excessive_precision)]
+    #[allow(clippy::excessive_precision, clippy::approx_constant)]
     const M_PI: f64 = 3.141592653589793238462643383279502884;
 
     pub fn degrees(x: f64) -> f64 {
@@ -263,10 +263,12 @@ impl Value {
             }
 
             let code = get_code(b);
-            if code.is_some() && code != prev_code {
-                result.push(code.unwrap());
-                prev_code = code;
-            } else if code.is_none() {
+            if let Some(c) = code {
+                if code != prev_code {
+                    result.push(c);
+                    prev_code = code;
+                }
+            } else {
                 // Reset previous code for vowels/separators (a,e,i,o,u,y)
                 prev_code = None;
             }
@@ -2130,7 +2132,7 @@ mod tests {
 
     #[test]
     fn test_exec_and() {
-        let inputs = vec![
+        let inputs = [
             (Value::from_i64(0), Value::Null),
             (Value::Null, Value::from_i64(1)),
             (Value::Null, Value::Null),

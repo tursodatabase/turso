@@ -1135,7 +1135,7 @@ pub fn translate_expr(
                             let iif_end_label = program.allocate_label();
                             let condition_reg = program.alloc_register();
 
-                            for pair in args.chunks_exact(2) {
+                            for pair in args.as_chunks::<2>().0 {
                                 let condition_expr = &pair[0];
                                 let value_expr = &pair[1];
                                 let next_check_label = program.allocate_label();

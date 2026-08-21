@@ -396,12 +396,11 @@ fn parse_timezone(mut z: &str, p: &mut DateTime) -> bool {
     }
 
     let c = z.as_bytes()[0] as char;
-    let sgn: i32;
 
-    if c == '-' {
-        sgn = -1;
+    let sgn: i32 = if c == '-' {
+        -1
     } else if c == '+' {
-        sgn = 1;
+        1
     } else if c == 'Z' || c == 'z' {
         z = &z[1..];
         p.is_local = false;
@@ -409,7 +408,7 @@ fn parse_timezone(mut z: &str, p: &mut DateTime) -> bool {
         return check_trailing_garbage(z);
     } else {
         return true;
-    }
+    };
 
     z = &z[1..];
 
@@ -1120,8 +1119,8 @@ where
     let sign: char;
     let mut y: i32;
     let mut m: i32;
-    let diff_ms: i64;
-    if d1.i_jd >= d2.i_jd {
+
+    let diff_ms: i64 = if d1.i_jd >= d2.i_jd {
         sign = '+';
         y = d1.y - d2.y;
         if y != 0 {
@@ -1155,7 +1154,7 @@ where
             d2.valid_jd = false;
             d2.compute_jd();
         }
-        diff_ms = d1.i_jd - d2.i_jd;
+        d1.i_jd - d2.i_jd
     } else {
         sign = '-';
         y = d2.y - d1.y;
@@ -1190,8 +1189,8 @@ where
             d2.valid_jd = false;
             d2.compute_jd();
         }
-        diff_ms = d2.i_jd - d1.i_jd;
-    }
+        d2.i_jd - d1.i_jd
+    };
     let days = diff_ms / 86400000;
     let rem_ms = diff_ms % 86400000;
     let hours = rem_ms / 3600000;
@@ -1535,7 +1534,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_date(&[input.clone()]);
+            let result = exec_date(std::slice::from_ref(&input));
             assert_eq!(
                 result,
                 Value::build_text(expected.to_string()),
@@ -1709,7 +1708,7 @@ mod tests {
         ];
 
         for case in invalid_cases {
-            let result = exec_time(&[case.clone()]);
+            let result = exec_time(std::slice::from_ref(&case));
             assert_eq!(result, Value::Null);
         }
     }

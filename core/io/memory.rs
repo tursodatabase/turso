@@ -253,7 +253,7 @@ impl MemStore {
 
     pub(super) fn punch_hole(&self, pos: usize, len: usize) {
         turso_assert!(
-            pos % PAGE_SIZE == 0 && len % PAGE_SIZE == 0,
+            pos.is_multiple_of(PAGE_SIZE) && len.is_multiple_of(PAGE_SIZE),
             "hole must be page aligned"
         );
         let mut inner = self.inner.write();

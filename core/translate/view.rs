@@ -233,7 +233,7 @@ pub fn translate_create_materialized_view(
     let dbsp_index_name = format!(
         "{}{}_1",
         PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-        &dbsp_table_name.as_str()
+        dbsp_table_name.as_str()
     );
     emit_schema_entry(
         program,

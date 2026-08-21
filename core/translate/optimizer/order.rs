@@ -199,7 +199,7 @@ pub fn compute_order_target(
                 order_by
                     .iter()
                     .position(|(order_by_expr, _, _)| exprs_are_equivalent(expr, order_by_expr))
-                    .map_or(usize::MAX, |i| i)
+                    .unwrap_or(usize::MAX)
             });
 
             // Now, regardless of whether we can eventually eliminate the sorting entirely in the optimizer,

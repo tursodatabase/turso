@@ -2912,11 +2912,10 @@ where
         }
     }
 
-    let mut field_idx = skip;
     let field_limit = unpacked.len().min(index_info.key_info.len());
 
     // assumes that that the `unpacked' iterator was not skipped outside this function call`
-    for rhs_value in unpacked.skip(skip) {
+    for (field_idx, rhs_value) in (skip..).zip(unpacked.skip(skip)) {
         let rhs_value = &rhs_value.as_value_ref();
         if field_idx >= field_limit || header_pos >= header_end {
             break;
@@ -2950,8 +2949,6 @@ where
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
         }
-
-        field_idx += 1;
     }
 
     Ok(tie_breaker)

@@ -19,13 +19,12 @@ fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) 
     let mut has_outer_ref = false;
     let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
         match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+            Expr::Column { table, .. } | Expr::RowId { table, .. }
                 if table_references
                     .find_outer_query_ref_by_internal_id(*table)
-                    .is_some()
-                {
-                    has_outer_ref = true;
-                }
+                    .is_some() =>
+            {
+                has_outer_ref = true;
             }
             _ => {}
         }

@@ -1183,7 +1183,9 @@ pub fn resolve_index_method_parameters(
                 ast::Literal::Blob(b) => crate::Value::Blob(
                     ast::blob_literal_hex(&b)
                         .as_bytes()
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|pair| {
                             // We assume that sqlite3-parser has already validated that
                             // the input is valid hex string, thus unwrap is safe.
@@ -1237,7 +1239,7 @@ pub fn translate_drop_index(
         } else {
             return Err(crate::error::LimboError::InvalidArgument(format!(
                 "No such index: {}",
-                &idx_name
+                idx_name
             )));
         }
     }

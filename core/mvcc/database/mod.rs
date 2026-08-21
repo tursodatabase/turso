@@ -9421,12 +9421,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
 
-            if schema_rows_after.is_some() {
+            if let Some(schema_rows_after) = schema_rows_after {
                 // Now that all table and index ops from this transaction have
                 // been replayed, publish the frame's final schema. No later index
                 // op from this frame can observe a half-applied sqlite_schema.
-                let schema_rows_after =
-                    schema_rows_after.expect("schema_rows_after must exist when schema changed");
                 let schema_after = schema_after
                     .expect("schema_after must exist when frame_changes_schema is true");
                 schema_rows = schema_rows_after;

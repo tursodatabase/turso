@@ -225,10 +225,8 @@ fn process_payload(payload_group: Group) -> String {
                 }
                 is_variable_name = false;
             }
-            TokenTree::Punct(punct) => {
-                if punct.to_string() == "," {
-                    is_variable_name = true;
-                }
+            TokenTree::Punct(punct) if punct.to_string() == "," => {
+                is_variable_name = true;
             }
             _ => {}
         }

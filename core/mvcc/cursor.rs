@@ -292,8 +292,9 @@ impl<A: ConcurrentAllocator> DualCursorPeek<A> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
+    #[default]
     Uninitialized,
     Row {
         key: RowKey,
@@ -302,12 +303,6 @@ enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
         versions: Option<RowVersions<A>>,
     },
     Exhausted,
-}
-
-impl<A: ConcurrentAllocator> Default for CursorPeek<A> {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
 }
 
 impl<A: ConcurrentAllocator> CursorPeek<A> {
@@ -1463,11 +1458,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             return Ok(IOResult::Done(None));
         }
         let rowid = match self.get_current_pos() {
-            CursorPosition::Loaded {
-                row_id,
-                in_btree: _,
-                ..
-            } => match &row_id.row_id {
+            CursorPosition::Loaded { row_id, .. } => match &row_id.row_id {
                 RowKey::Int(id) => Some(*id),
                 RowKey::Record(sortable_key) => {
                     // For index cursors, the rowid is stored in the last column of the index record
@@ -2069,12 +2060,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     inject_io_yield!(self, CursorYieldPoint::CountProgress);
                 }
                 Some(CountState::CheckBtreeKey { count }) => {
-                    if let CursorPosition::Loaded {
-                        row_id: _,
-                        in_btree: _,
-                        ..
-                    } = self.get_current_pos()
-                    {
+                    if let CursorPosition::Loaded { .. } = self.get_current_pos() {
                         self.count_state
                             .replace(CountState::NextBtree { count: count + 1 });
                         inject_io_yield!(self, CursorYieldPoint::CountProgress);

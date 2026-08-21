@@ -622,11 +622,8 @@ impl DbspCircuit {
                         // If we're starting a new row (GetRecord state), we need a fresh cursor
                         // due to btree cursor state machine limitations
                         if matches!(write_row_state, WriteRowView::GetRecord) {
-                            *view_cursor = Box::new(BTreeCursor::new_table(
-                                pager.clone(),
-                                main_data_root,
-                                num_columns,
-                            ));
+                            **view_cursor =
+                                BTreeCursor::new_table(pager.clone(), main_data_root, num_columns);
                         }
 
                         // Build the view row format: row values + weight
