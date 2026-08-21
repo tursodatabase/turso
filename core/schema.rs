@@ -649,7 +649,9 @@ pub fn is_system_table(table_name: &str) -> bool {
 pub fn allow_user_dml(table_name: &str) -> bool {
     const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
     !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))
-        || table_name.starts_with(TURSO_INTERNAL_PREFIX)) // internal name wouldn't be uppercase
+        || table_name
+            .to_ascii_lowercase()
+            .starts_with(TURSO_INTERNAL_PREFIX))
 }
 
 // Sequence persistence design
