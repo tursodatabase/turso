@@ -39,7 +39,7 @@ pub mod sorter;
 mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
-// for benchmarks
+#[allow(unused_imports)] // for benchmarks
 pub use crate::translate::collate::CollationSeq;
 use crate::{
     alloc::{DynAllocator, TryClone},
@@ -795,6 +795,8 @@ pub struct ProgramState {
     /// Per-execution statement deadline derived from the connection query timeout.
     /// `None` means no timeout.
     pub query_deadline: Option<crate::MonotonicInstant>,
+    /// Excludes new root statements while an explicit checkpoint is suspended.
+    pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -912,6 +914,7 @@ impl ProgramState {
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
             query_deadline: None,
+            explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -1032,6 +1035,7 @@ impl ProgramState {
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
+        self.explicit_checkpoint_guard = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -1085,7 +1089,14 @@ impl ProgramState {
     /// Whether this statement may finish the implicit autocommit transaction
     /// now, including re-entry while its commit is in progress.
     #[inline]
-    pub(crate) fn can_autocommit_now(&self, connection: &Connection) -> bool {
+    /// `self_counted` is true while this statement is still included in
+    /// `Connection::n_active_root_statements`. It is false when a statement
+    /// that already finished (released on Done or on its step error) is being
+    /// reset or dropped — then every counted statement is a *sibling*, and
+    /// treating the count as "just me" would make teardown finish or roll
+    /// back a transaction a suspended sibling is still using (e.g. a COMMIT
+    /// parked inside its post-commit auto-checkpoint).
+    pub(crate) fn can_autocommit_now(&self, connection: &Connection, self_counted: bool) -> bool {
         let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
         if is_already_committing {
             return true;
@@ -1105,7 +1116,8 @@ impl ProgramState {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-                && connection.n_active_root_statements.load(Ordering::SeqCst) == 1
+                && connection.n_active_root_statements.load(Ordering::SeqCst)
+                    == i32::from(self_counted)
                 && (self.is_active_write || active_writers == 0);
         }
         if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
@@ -1125,7 +1137,7 @@ impl ProgramState {
                     .any(|(_, pager)| pager.holds_read_lock() || pager.holds_write_lock())
             })
         };
-        if connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+        if connection.n_active_root_statements.load(Ordering::SeqCst) > i32::from(self_counted) {
             // Readers can finish while sibling readers remain active, but a
             // shared attached transaction may only be finished by the last
             // active statement, like SQLite's btreeEndTransaction keeps the
@@ -1893,7 +1905,9 @@ impl Program {
                         // the write itself succeeded.
                         let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
                         tracing::error!("Checkpoint failed: {checkpoint_err}");
-                        if let Err(abort_err) = self.abort(pager, Some(&checkpoint_err), state) {
+                        if let Err(abort_err) =
+                            self.abort(pager, Some(&checkpoint_err), state, true)
+                        {
                             tracing::error!(
                                 "Abort also failed during checkpoint error handling: {abort_err}"
                             );
@@ -1902,7 +1916,7 @@ impl Program {
                         return Err(checkpoint_err);
                     }
                     let err = err.into();
-                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
+                    if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
                         tracing::error!("Abort failed during error handling: {abort_err}");
                     }
                     return Err(err);
@@ -1919,7 +1933,7 @@ impl Program {
                     return Err(LimboError::InternalError("Connection closed".to_string()));
                 }
                 if self.maybe_request_interrupt(state, pager.io.as_ref()) {
-                    self.abort(pager, None, state)?;
+                    self.abort(pager, None, state, true)?;
                     return Ok(StepResult::Interrupt);
                 }
                 let (insn, _) = &self.insns[state.pc as usize];
@@ -2018,7 +2032,7 @@ impl Program {
                         return Ok(StepResult::Busy);
                     }
                     Err(err) => {
-                        if let Err(abort_err) = self.abort(pager, Some(&err), state) {
+                        if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
                             tracing::error!("Abort failed during error handling: {abort_err}");
                         }
                         return Err(err);
@@ -2599,11 +2613,18 @@ impl Program {
     /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
     /// This method is no-op if program was already finished (either aborted or executed to completion)
     /// Returns an error if cleanup operations (savepoint rollback/release) fail.
+    /// `self_counted` is true while this statement is still included in
+    /// `Connection::n_active_root_statements` (aborts during `step`).
+    /// Statement teardown passes its actual counted state: a statement that
+    /// already finished was released on Done or on its step error, so the
+    /// counted statements are all siblings (see
+    /// [`ProgramState::can_autocommit_now`]).
     pub fn abort(
         &self,
         pager: &Arc<Pager>,
         err: Option<&LimboError>,
         state: &mut ProgramState,
+        self_counted: bool,
     ) -> Result<()> {
         fn capture_abort_error(
             abort_error: &mut Option<LimboError>,
@@ -2617,6 +2638,7 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        state.explicit_checkpoint_guard = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.
@@ -2739,7 +2761,7 @@ impl Program {
                 self.connection.mark_tx_poisoned();
             }
 
-            let can_autocommit_now = state.can_autocommit_now(&self.connection);
+            let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
             let is_mvcc = self.connection.mv_store().is_some();
             let changed_shared_mvcc_auto_txn = !can_autocommit_now
                 && state.auto_txn_cleanup == TxnCleanup::RollbackTxn

@@ -3428,8 +3428,10 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
                 col.ty_str = "BLOB".to_string();
+                col.override_affinity(Affinity::Blob);
             } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
                 col.ty_str = resolved.primitive.to_uppercase();
+                col.override_affinity(Affinity::None);
             }
         }
         Arc::new(modified)
@@ -3481,6 +3483,7 @@ impl BTreeTable {
             if let Some(only) = effective_only {
                 if !only.get(i) {
                     col.ty_str = "ANY".to_string();
+                    col.override_affinity(Affinity::Blob);
                     continue;
                 }
             }
@@ -3488,6 +3491,7 @@ impl BTreeTable {
                 // Pre-encode: user input can be text ('[1,2]') or blob (ARRAY[]),
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
+                col.override_affinity(Affinity::Blob);
             } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
@@ -3507,13 +3511,13 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs regardless of element type.
                 col.set_ty(Type::Blob);
-                col.set_base_affinity(Affinity::Blob);
+                col.override_affinity(Affinity::Blob);
                 continue;
             }
             if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
                 let (base_ty, _) = type_from_name(&resolved.primitive);
                 col.set_ty(base_ty);
-                col.set_base_affinity(Affinity::affinity(&resolved.primitive));
+                col.override_affinity(Affinity::affinity(&resolved.primitive));
             }
         }
     }
@@ -4874,6 +4878,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
+                // ok
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
@@ -5240,13 +5245,10 @@ const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
 const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
 const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-// Bits 20-22: base type affinity override.
-// 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1,
-// 6 = no declared affinity at all (e.g. a FROM-subquery/CTE/view column
-// backed by a literal or computed expression, not a real declared type)
+// Bits 20-22: base type affinity. Column affinity will resolve to this
+// value only if it is > 0, else it uses ty_str.
 const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
 const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
-const BASE_AFF_NO_DECLARED: u32 = 6;
 
 // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
 const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
@@ -5254,46 +5256,25 @@ const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
 impl Column {
     pub fn affinity(&self) -> Affinity {
-        let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
-        if v > 0 {
-            match v {
-                1 => Affinity::Integer,
-                2 => Affinity::Text,
-                3 => Affinity::Blob,
-                4 => Affinity::Real,
-                5 => Affinity::Numeric,
-                _ => Affinity::Blob,
-            }
-        } else {
-            Affinity::affinity(&self.ty_str)
+        let v = (self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT;
+        if v == 0 {
+            return Affinity::affinity(&self.ty_str);
         }
+        Affinity::from_repr(v).unwrap_or_else(|| {
+            tracing::error!("column had invalid raw affinity {v}");
+            Affinity::None
+        })
     }
 
-    /// Set the base type affinity override for a custom type column.
-    /// This ensures affinity rules use the custom type's BASE type
-    /// rather than applying SQLite name-based rules to the type name.
-    pub fn set_base_affinity(&mut self, affinity: Affinity) {
-        let v: u32 = match affinity {
-            Affinity::Integer => 1,
-            Affinity::Text => 2,
-            Affinity::Blob => 3,
-            Affinity::Real => 4,
-            Affinity::Numeric => 5,
-        };
-        self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
+    pub fn override_affinity(&mut self, affinity: Affinity) {
+        Self::set_raw_affinity(&mut self.raw, affinity);
     }
 
-    /// Mark this column as backed by an expression with no real declared type
-    /// (e.g. a literal column in a FROM-subquery, CTE, or view).
-    pub fn set_no_declared_affinity(&mut self) {
-        self.raw = (self.raw & !BASE_AFF_MASK)
-            | ((BASE_AFF_NO_DECLARED << BASE_AFF_SHIFT) & BASE_AFF_MASK);
+    fn set_raw_affinity(raw: &mut u32, affinity: Affinity) {
+        let v: u32 = affinity as u32;
+        *raw = (*raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
     }
 
-    /// Whether this column has a real declared type. Always `true` for table columns.
-    pub fn has_declared_affinity(&self) -> bool {
-        ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) != BASE_AFF_NO_DECLARED
-    }
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob
@@ -5368,6 +5349,8 @@ impl Column {
         if coldef.hidden {
             raw |= F_HIDDEN
         }
+        Self::set_raw_affinity(&mut raw, Affinity::affinity(&ty_str)); //FIXME this isn't compatible with custom types. But how do I know that the type is custom?
+
         Self {
             name,
             ty_str,
@@ -7413,48 +7396,32 @@ mod tests {
         );
     }
 
-    fn new_blob_column() -> Column {
-        Column::new(
-            Some("x".to_string()),
-            "BLOB".to_string(),
-            None,
-            None,
-            Type::Blob,
-            None,
-            ColDef::default(),
-        )
-    }
-
     #[test]
-    fn column_has_declared_affinity_by_default() {
-        let col = new_blob_column();
-        assert!(col.has_declared_affinity());
-        assert_eq!(col.affinity(), Affinity::Blob);
-    }
-
-    #[test]
-    fn column_set_no_declared_affinity_reports_no_affinity() {
-        let mut col = new_blob_column();
-        col.set_no_declared_affinity();
-        assert!(!col.has_declared_affinity());
-        // Still resolves to BLOB at the runtime-conversion level.
-        assert_eq!(col.affinity(), Affinity::Blob);
-    }
-
-    #[test]
-    fn column_set_base_affinity_still_has_declared_affinity() {
-        let mut col = new_blob_column();
-        col.set_base_affinity(Affinity::Real);
-        assert!(col.has_declared_affinity());
-        assert_eq!(col.affinity(), Affinity::Real);
-    }
-
-    #[test]
-    fn column_no_declared_affinity_can_be_overwritten_by_base_affinity() {
-        let mut col = new_blob_column();
-        col.set_no_declared_affinity();
-        col.set_base_affinity(Affinity::Integer);
-        assert!(col.has_declared_affinity());
-        assert_eq!(col.affinity(), Affinity::Integer);
+    fn set_base_affinity_is_consistent_with_accessor() {
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            let mut col = Column::new(
+                Some("x".to_string()),
+                "BLOB".to_string(),
+                None,
+                None,
+                Type::Blob,
+                None,
+                ColDef::default(),
+            );
+            col.override_affinity(affinity);
+            assert_eq!(
+                col.affinity(),
+                affinity,
+                "stored {affinity:?} but read back {:?}",
+                col.affinity(),
+            );
+        }
     }
 }

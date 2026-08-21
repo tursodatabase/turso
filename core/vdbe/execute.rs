@@ -606,6 +606,21 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    if state.explicit_checkpoint_guard.is_none() {
+        // No exemption for nested statements: nothing in the engine prepares
+        // wal_checkpoint as a nested helper (VACUUM checkpoints through
+        // Connection::checkpoint), and nested statements are not counted in
+        // n_active_root_statements, so the guard's expected count still holds
+        // if one ever runs this opcode. Skipping the guard whenever *any*
+        // helper statement is alive on the connection would let a checkpoint
+        // clobber a suspended statement that holds one (e.g. a pragma vtab
+        // cursor's stored helper).
+        state.explicit_checkpoint_guard = Some(
+            program
+                .connection
+                .begin_explicit_checkpoint(pager.clone(), true)?,
+        );
+    }
 
     // In autocommit mode, this statement can still hold an implicit read tx.
     // RESTART/TRUNCATE checkpoint needs to restart WAL and may fail with Busy
@@ -659,6 +674,7 @@ pub fn op_checkpoint(
         // 3rd col: # pages moved to db after checkpoint
         state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
+        state.explicit_checkpoint_guard = None;
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -677,6 +693,7 @@ pub fn op_checkpoint(
             // 3rd col: # pages moved to db after checkpoint
             state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
+            state.explicit_checkpoint_guard = None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -684,6 +701,7 @@ pub fn op_checkpoint(
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
+            state.explicit_checkpoint_guard = None;
             state.registers[*dest].set_int(1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -3389,7 +3407,9 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-    let can_autocommit_now = state.can_autocommit_now(&program.connection);
+    // halt() runs while the statement is still stepping, so it is always
+    // counted in n_active_root_statements here.
+    let can_autocommit_now = state.can_autocommit_now(&program.connection, true);
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
@@ -15721,7 +15741,7 @@ pub fn op_cast(
 
     let value = state.registers[*reg].get_value().clone();
     let result = match affinity {
-        Affinity::Blob => value.exec_cast("BLOB"),
+        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
@@ -17464,7 +17484,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
         }
 
         match affinity {
-            Affinity::Blob => return true,
+            Affinity::Blob | Affinity::None => return true,
 
             Affinity::Text => {
                 if matches!(value, Value::Text(_) | Value::Null) {

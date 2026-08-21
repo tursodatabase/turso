@@ -140,6 +140,7 @@ pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
 /// A builder for `Database`.
 pub struct Builder {
     path: String,
+    read_only: bool,
     enable_encryption: bool,
     enable_attach: bool,
     enable_custom_types: bool,
@@ -160,6 +161,7 @@ impl Builder {
     pub fn new_local(path: &str) -> Self {
         Self {
             path: path.to_string(),
+            read_only: false,
             enable_encryption: false,
             enable_attach: false,
             enable_custom_types: false,
@@ -252,6 +254,12 @@ impl Builder {
         self
     }
 
+    /// Open the database without write access.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     fn build_features_string(&self) -> Option<String> {
         let mut features = Vec::new();
         if self.enable_encryption {
@@ -304,7 +312,11 @@ impl Builder {
                 io: self.io,
                 db_file: None,
                 page_codec: None,
-                open_flags: Default::default(),
+                open_flags: if self.read_only {
+                    turso_core::OpenFlags::ReadOnly
+                } else {
+                    turso_core::OpenFlags::default()
+                },
             });
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created

@@ -8,7 +8,7 @@ use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
     },
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -342,6 +342,30 @@ pub enum SyncRowStep {
     Upsert { stmt: Box<Statement> },
 }
 
+#[derive(Default)]
+pub(crate) struct StatementActivity {
+    explicit_checkpoint_active: bool,
+}
+
+pub(crate) struct ExplicitCheckpointGuard {
+    activity: Arc<Mutex<StatementActivity>>,
+    pager: Arc<Pager>,
+}
+
+impl Drop for ExplicitCheckpointGuard {
+    fn drop(&mut self) {
+        if self.pager.is_checkpointing() {
+            self.pager.cleanup_after_checkpoint_failure();
+        }
+        let mut activity = self.activity.lock();
+        turso_assert!(
+            activity.explicit_checkpoint_active,
+            "dropping an inactive explicit checkpoint guard"
+        );
+        activity.explicit_checkpoint_active = false;
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -483,6 +507,16 @@ pub struct Connection {
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
     /// subprogram execution.
     pub(crate) n_active_root_statements: AtomicI32,
+    /// How many of `n_active_root_statements` are parked incremental blob
+    /// handles. A blob handle keeps a Root statement open from `blob_open`
+    /// until close, but between blob operations it just sits on its row, so
+    /// explicit checkpoints subtract these instead of treating them as
+    /// statements in progress (SQLite checkpoints fine with open blob
+    /// handles; a handle re-positions on its next blob operation after the
+    /// checkpoint's cache clear).
+    pub(crate) n_active_blob_statements: AtomicI32,
+    /// Prevents root statements and explicit checkpoints from overlapping on this connection.
+    pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
@@ -2293,6 +2327,12 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        // Checkpointing invalidates this connection's cursors and page cache,
+        // which breaks any statement suspended mid-execution, so refuse to run
+        // while statements are active — same rule as PRAGMA wal_checkpoint.
+        // The guard also rejects new statements until the checkpoint finishes
+        // and cleans up pager checkpoint state if we bail out mid-flight.
+        let _checkpoint_guard = self.begin_explicit_checkpoint(self.pager.load().clone(), false)?;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
                 assert!(
@@ -4695,6 +4735,48 @@ impl Connection {
         if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
             self.interrupt_requested.store(false, Ordering::SeqCst);
         }
+    }
+
+    pub(crate) fn start_root_statement(&self) -> Result<()> {
+        let activity = self.statement_activity.lock();
+        if activity.explicit_checkpoint_active {
+            return Err(LimboError::StatementsInProgress(
+                "cannot start a statement while a checkpoint is active",
+            ));
+        }
+        self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// `from_statement` is true when the checkpoint runs inside a root
+    /// statement (PRAGMA wal_checkpoint), which itself counts as one active
+    /// root statement; the direct `Connection::checkpoint` API runs outside
+    /// any statement, so it requires zero.
+    pub(crate) fn begin_explicit_checkpoint(
+        &self,
+        pager: Arc<Pager>,
+        from_statement: bool,
+    ) -> Result<ExplicitCheckpointGuard> {
+        let statements_expected = if from_statement { 1 } else { 0 };
+        let mut activity = self.statement_activity.lock();
+        // Parked incremental blob handles don't count: they hold a Root
+        // statement open for their whole lifetime, but between blob
+        // operations they just sit on their row and re-position on their
+        // next blob operation after the checkpoint's cache clear. Counting
+        // them would make one open blob handle block every explicit
+        // checkpoint until it is closed.
+        let active_non_blob = self.n_active_root_statements.load(Ordering::SeqCst)
+            - self.n_active_blob_statements.load(Ordering::SeqCst);
+        if activity.explicit_checkpoint_active || active_non_blob != statements_expected {
+            return Err(LimboError::StatementsInProgress(
+                "cannot checkpoint while another statement is active",
+            ));
+        }
+        activity.explicit_checkpoint_active = true;
+        Ok(ExplicitCheckpointGuard {
+            activity: self.statement_activity.clone(),
+            pager,
+        })
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {

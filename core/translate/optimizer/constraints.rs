@@ -1,11 +1,13 @@
+use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
+use crate::translate::expr::comparison_affinity;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         expr::{
-            as_binary_components, comparison_affinity, get_expr_affinity, truth_test_rhs,
-            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
+            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
+            walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -27,8 +29,6 @@ use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
-
-use super::{cost_params::CostModelParams, AvailableIndexes};
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
