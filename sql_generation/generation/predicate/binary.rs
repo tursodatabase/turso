@@ -390,6 +390,27 @@ impl SimplePredicate {
     }
 }
 
+/// One simple predicate that is true (or false) for `row`. Unary simple
+/// predicates are built from literals only (see `true_unary`), so for a made-up
+/// row they would be constants that match every row or none; stick to column
+/// comparisons for those.
+fn simple_predicate<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
+    rng: &mut R,
+    context: &C,
+    table: &T,
+    row: &[SimValue],
+    rows_known: bool,
+    predicate_value: bool,
+) -> Predicate {
+    if rows_known {
+        SimplePredicate::arbitrary_from(rng, context, (table, row, predicate_value)).0
+    } else if predicate_value {
+        SimplePredicate::true_binary(rng, context, table, row).0
+    } else {
+        SimplePredicate::false_binary(rng, context, table, row).0
+    }
+}
+
 impl CompoundPredicate {
     /// Decide if you want to create an AND or an OR
     ///
@@ -400,23 +421,30 @@ impl CompoundPredicate {
         table: &T,
         predicate_value: bool,
     ) -> Self {
-        // Cannot pick a row if the table is empty
+        // The predicate is built to be true (or false) for one row of the
+        // table. When the caller tracks no rows — whopper hands over tables
+        // with none — make a row up from arbitrary values instead of falling
+        // back to a bare TRUE/FALSE, which would make every generated WHERE
+        // clause either match everything or nothing.
         let rows = table.rows();
-        if rows.is_empty() {
-            return Self(if predicate_value {
-                Predicate::true_()
-            } else {
-                Predicate::false_()
-            });
-        }
-        let row = pick(rows, rng);
+        let rows_known = !rows.is_empty();
+        let imaginary_row: Vec<SimValue>;
+        let row: &[SimValue] = if rows.is_empty() {
+            imaginary_row = table
+                .columns()
+                .map(|c| SimValue::arbitrary_from(rng, context, &c.column.column_type))
+                .collect();
+            &imaginary_row
+        } else {
+            pick(rows, rng).as_slice()
+        };
 
         let predicate = if rng.random_bool(0.7) {
             // An AND for true requires each of its children to be true
             // An AND for false requires at least one of its children to be false
             if predicate_value {
                 (0..rng.random_range(1..=3))
-                    .map(|_| SimplePredicate::arbitrary_from(rng, context, (table, row, true)).0)
+                    .map(|_| simple_predicate(rng, context, table, row, rows_known, true))
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
                             Box::new(accum.0),
@@ -440,7 +468,7 @@ impl CompoundPredicate {
 
                 booleans
                     .iter()
-                    .map(|b| SimplePredicate::arbitrary_from(rng, context, (table, row, *b)).0)
+                    .map(|b| simple_predicate(rng, context, table, row, rows_known, *b))
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
                             Box::new(accum.0),
@@ -466,7 +494,7 @@ impl CompoundPredicate {
 
                 booleans
                     .iter()
-                    .map(|b| SimplePredicate::arbitrary_from(rng, context, (table, row, *b)).0)
+                    .map(|b| simple_predicate(rng, context, table, row, rows_known, *b))
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
                             Box::new(accum.0),
@@ -477,7 +505,7 @@ impl CompoundPredicate {
                     .unwrap_or(Predicate::true_())
             } else {
                 (0..rng.random_range(1..=3))
-                    .map(|_| SimplePredicate::arbitrary_from(rng, context, (table, row, false)).0)
+                    .map(|_| simple_predicate(rng, context, table, row, rows_known, false))
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
                             Box::new(accum.0),
