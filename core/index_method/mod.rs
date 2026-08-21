@@ -1,12 +1,18 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use rustc_hash::FxHashMap as HashMap;
+#[cfg(any(test, injected_yields))]
+use strum::EnumCount;
 use turso_parser::ast;
 
 use crate::{
     mvcc::cursor::MvccCursorType,
     schema::IndexColumn,
-    storage::btree::{BTreeCursor, CursorTrait},
+    storage::{
+        btree::{BTreeCursor, CursorTrait},
+        journal_mode::JournalMode,
+    },
+    translate::emitter::TransactionMode,
     types::{IOResult, IndexInfo, KeyInfo},
     vdbe::Register,
     Connection, LimboError, MvCursor, Result, Value,
@@ -57,6 +63,14 @@ pub enum IndexMethodMvccSupport {
     ReadOnly,
     /// Persistent state is stored exclusively through core-provided,
     /// MVCC-aware backing storage.
+    ///
+    /// Under MVCC, at most one transaction may write a given index at a time
+    /// (a per-index write lease, taken on the first document mutation).
+    /// Contention is a retryable `Busy`; a writer whose read snapshot
+    /// predates the index's last publication gets `WriteWriteConflict` and
+    /// must restart its transaction. `BEGIN CONCURRENT` therefore does not
+    /// parallelize writes to one index of this kind — that is the write
+    /// throughput ceiling per index.
     TransactionalBackingStore,
     /// Persistent state is external and implements transaction outcome hooks.
     ExternalTransactional,
@@ -66,6 +80,8 @@ pub enum IndexMethodMvccSupport {
 pub struct IndexMethodDefinition<'a> {
     /// index method name
     pub method_name: &'a str,
+    /// table to which the index is attached
+    pub table_name: &'a str,
     /// index name
     pub index_name: &'a str,
     /// SELECT patterns where index method can be used
@@ -81,6 +97,316 @@ pub struct IndexMethodDefinition<'a> {
     pub results_materialized: bool,
     /// Declares how this method participates in MVCC transactions.
     pub mvcc_support: IndexMethodMvccSupport,
+}
+
+/// Transaction mode exposed to index methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethodTransactionMode {
+    Read,
+    Write,
+    Concurrent,
+}
+
+/// Stable coordinates for the snapshot visible to an index method operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethodSnapshotIdentity {
+    /// WAL readers are pinned to a checkpoint sequence and maximum frame.
+    Wal {
+        checkpoint_sequence: u32,
+        max_frame: u64,
+    },
+    /// MVCC readers are pinned to the transaction's begin timestamp.
+    Mvcc { begin_timestamp: u64 },
+}
+
+/// Append-only synthetic-yield markers for index-method lifecycle boundaries.
+///
+/// Ordinals are consumed by deterministic simulator plans; never reorder or
+/// reuse an existing value.
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+pub(crate) enum IndexMethodYieldPoint {
+    BeforePrepareStatement = 0,
+    AfterPrepareStatement = 1,
+}
+
+#[cfg(any(test, injected_yields))]
+impl crate::mvcc::yield_hooks::YieldPointMarker for IndexMethodYieldPoint {
+    const POINT_COUNT: u8 = Self::COUNT as u8;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexMethodDatabaseIdentity {
+    /// Connection-local slot used to address the database.
+    pub id: usize,
+    pub name: String,
+    /// Runtime identity of the shared `Database` object. Unlike `id` and
+    /// `name`, this distinguishes detach/reattach and close/reopen lifetimes.
+    pub incarnation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexMethodIdentity {
+    pub method_name: String,
+    pub table_name: String,
+    pub index_name: String,
+    /// Runtime identity derived from the database incarnation, the schema
+    /// generation, and the index's names. Attach/detach and close/reopen
+    /// cannot compare equal. Drop/recreate inside one MVCC transaction can
+    /// (MVCC DDL does not advance the schema generation); the consumers
+    /// tolerate that, because a colliding cursor is merely replaced-and-closed
+    /// and index content is validated separately by the persisted
+    /// (incarnation, generation) pair.
+    pub runtime_id: u64,
+    /// Schema root assigned to the logical definition. Custom index methods
+    /// must keep this at zero; physical ownership belongs to backing objects.
+    pub schema_root: i64,
+}
+
+fn index_method_runtime_id(
+    database_incarnation: u64,
+    schema_generation: u64,
+    definition: &IndexMethodDefinition<'_>,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ database_incarnation;
+    hash = (hash ^ schema_generation).wrapping_mul(0x100_0000_01b3);
+    for byte in definition
+        .method_name
+        .bytes()
+        .chain(definition.table_name.bytes())
+        .chain(definition.index_name.bytes())
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// Read-only execution and storage context for an index method operation.
+///
+/// Persistent cursors can only be created through this context, ensuring they
+/// are promoted to snapshot-aware MVCC cursors whenever MVCC is active.
+#[derive(Clone)]
+pub struct IndexMethodContext {
+    /// Weak so a cursor parked on its connection (with its context) does not
+    /// make the connection reference itself — a strong edge here kept leaked
+    /// connections alive forever, holding their WAL locks.
+    connection: Weak<Connection>,
+    database: IndexMethodDatabaseIdentity,
+    journal_mode: JournalMode,
+    transaction_mode: IndexMethodTransactionMode,
+    transaction_id: Option<u64>,
+    snapshot: IndexMethodSnapshotIdentity,
+    schema_generation: u64,
+    index: IndexMethodIdentity,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id: u64,
+}
+
+impl std::fmt::Debug for IndexMethodContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexMethodContext")
+            .field("database", &self.database)
+            .field("journal_mode", &self.journal_mode)
+            .field("transaction_mode", &self.transaction_mode)
+            .field("transaction_id", &self.transaction_id)
+            .field("snapshot", &self.snapshot)
+            .field("schema_generation", &self.schema_generation)
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IndexMethodContext {
+    pub(crate) fn new(
+        connection: &Arc<Connection>,
+        database_id: usize,
+        definition: &IndexMethodDefinition<'_>,
+    ) -> Result<Self> {
+        let pager = connection.get_pager_from_database_index(&database_id)?;
+        let schema_root = connection.with_schema(database_id, |schema| {
+            schema
+                .get_index(definition.table_name, definition.index_name)
+                .map_or(0, |index| index.root_page)
+        });
+        if !definition.backing_btree && schema_root != 0 {
+            return Err(LimboError::Corrupt(format!(
+                "logical index-method definition '{}.{}' owns physical root {schema_root}",
+                definition.table_name, definition.index_name
+            )));
+        }
+
+        let (journal_mode, transaction_mode, transaction_id, snapshot, schema_generation) =
+            if let Some(mv_store) = connection.mv_store_for_db(database_id) {
+                let (tx_id, mode) = connection.get_mv_tx_for_db(database_id).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "index method '{}' opened MVCC storage without an active transaction",
+                        definition.method_name
+                    ))
+                })?;
+                let transaction_mode = match mode {
+                    TransactionMode::None | TransactionMode::Read => {
+                        IndexMethodTransactionMode::Read
+                    }
+                    TransactionMode::Write => IndexMethodTransactionMode::Write,
+                    TransactionMode::Concurrent => IndexMethodTransactionMode::Concurrent,
+                };
+                (
+                    JournalMode::Mvcc,
+                    transaction_mode,
+                    Some(tx_id),
+                    IndexMethodSnapshotIdentity::Mvcc {
+                        begin_timestamp: mv_store.read_snapshot_ts(tx_id),
+                    },
+                    mv_store.schema_generation(),
+                )
+            } else {
+                let (checkpoint_sequence, max_frame) = pager.wal_pos();
+                (
+                    JournalMode::Wal,
+                    if connection.is_in_write_tx() {
+                        IndexMethodTransactionMode::Write
+                    } else {
+                        IndexMethodTransactionMode::Read
+                    },
+                    None,
+                    IndexMethodSnapshotIdentity::Wal {
+                        checkpoint_sequence,
+                        max_frame,
+                    },
+                    pager.get_schema_cookie_cached().unwrap_or_default() as u64,
+                )
+            };
+
+        let source_database = connection.get_source_database(database_id);
+        let database_incarnation = source_database.incarnation;
+        let runtime_id =
+            index_method_runtime_id(database_incarnation, schema_generation, definition);
+
+        Ok(Self {
+            connection: Arc::downgrade(connection),
+            database: IndexMethodDatabaseIdentity {
+                id: database_id,
+                name: connection
+                    .get_database_name_by_index(database_id)
+                    .unwrap_or_else(|| format!("database-{database_id}")),
+                incarnation: database_incarnation,
+            },
+            journal_mode,
+            transaction_mode,
+            transaction_id,
+            snapshot,
+            schema_generation,
+            index: IndexMethodIdentity {
+                method_name: definition.method_name.to_string(),
+                table_name: definition.table_name.to_string(),
+                index_name: definition.index_name.to_string(),
+                runtime_id,
+                schema_root,
+            },
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id: connection.next_yield_instance_id(),
+        })
+    }
+
+    /// Build the same core-owned context for raw index-method integration
+    /// tests. Production callers receive contexts only from the VDBE.
+    #[cfg(any(feature = "test_helper", feature = "conn_raw_api"))]
+    #[doc(hidden)]
+    pub fn for_test(
+        connection: &Arc<Connection>,
+        database_id: usize,
+        attachment: &dyn IndexMethodAttachment,
+    ) -> Result<Self> {
+        Self::new(connection, database_id, &attachment.definition())
+    }
+
+    /// The connection this context was built for. Errors once the connection
+    /// is being torn down; outcome hooks running at that point have nothing
+    /// left to clean up and should just return.
+    pub fn connection(&self) -> Result<Arc<Connection>> {
+        self.connection.upgrade().ok_or_else(|| {
+            LimboError::InternalError("index method context outlived its connection".to_string())
+        })
+    }
+
+    pub fn database(&self) -> &IndexMethodDatabaseIdentity {
+        &self.database
+    }
+
+    pub fn journal_mode(&self) -> JournalMode {
+        self.journal_mode
+    }
+
+    pub fn transaction_mode(&self) -> IndexMethodTransactionMode {
+        self.transaction_mode
+    }
+
+    pub fn transaction_id(&self) -> Option<u64> {
+        self.transaction_id
+    }
+
+    pub fn snapshot(&self) -> IndexMethodSnapshotIdentity {
+        self.snapshot
+    }
+
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+    }
+
+    pub fn index(&self) -> &IndexMethodIdentity {
+        &self.index
+    }
+
+    pub fn open_table_cursor(&self, table: &str) -> Result<Box<dyn CursorTrait>> {
+        open_table_cursor(&self.connection()?, self.database.id, table)
+    }
+
+    pub fn open_index_cursor<I, E>(
+        &self,
+        table: &str,
+        index: &str,
+        keys: I,
+    ) -> Result<Box<dyn CursorTrait>>
+    where
+        I: IntoIterator<Item = KeyInfo, IntoIter = E>,
+        E: ExactSizeIterator<Item = KeyInfo>,
+    {
+        open_index_cursor(&self.connection()?, self.database.id, table, index, keys)
+    }
+}
+
+#[cfg(any(test, injected_yields))]
+impl crate::mvcc::yield_hooks::ProvidesYieldContext for IndexMethodContext {
+    fn yield_context(&self) -> crate::mvcc::yield_hooks::YieldContext {
+        let mut selection_key = 0x494e_4458_4d45_5448u64;
+        selection_key ^= self.database.id as u64;
+        selection_key = selection_key.rotate_left(17) ^ self.schema_generation;
+        selection_key = selection_key.rotate_left(17) ^ self.index.schema_root as u64;
+        for byte in self
+            .index
+            .method_name
+            .bytes()
+            .chain(self.index.index_name.bytes())
+        {
+            selection_key = selection_key.wrapping_mul(0x100_0000_01b3) ^ u64::from(byte);
+        }
+        let connection = self
+            .connection
+            .upgrade()
+            .expect("yield context requires a live connection");
+        crate::mvcc::yield_hooks::YieldContext::new(
+            connection.yield_injector(),
+            connection.failure_injector(),
+            self.yield_instance_id,
+            selection_key,
+        )
+    }
 }
 
 pub(crate) fn ensure_mvcc_support(
@@ -132,6 +458,14 @@ pub struct IndexMethodCostContext<'a> {
 #[cfg(feature = "test_helper")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexMethodTestStats {
+    /// Persistent index-method storage format version.
+    pub storage_format_version: Option<u32>,
+    /// Persistent logical incarnation from the control record.
+    pub index_incarnation: Option<u64>,
+    /// Transactional manifest generation visible to this cursor.
+    pub manifest_generation: Option<u64>,
+    /// Files referenced by the visible manifest.
+    pub manifest_file_count: Option<usize>,
     /// Number of physical files visible in the index method's storage.
     pub storage_file_count: usize,
     /// Number of searchable engine segments, when the method is segmented.
@@ -140,30 +474,78 @@ pub struct IndexMethodTestStats {
     pub cached_connection_count: Option<usize>,
     /// Resident bytes held by retained read-snapshot file caches.
     pub cached_bytes: Option<usize>,
+    /// Complete snapshots rejected from retention because they exceed the
+    /// aggregate cache budget by themselves.
+    pub cache_admission_rejections: Option<usize>,
     /// Whether the method retained a committed writer for statement reuse.
     pub cached_writer: Option<bool>,
+    /// Number of Tantivy writers constructed by this attachment.
+    pub tantivy_writer_constructions: Option<usize>,
+    /// Retained-writer cache lookups.
+    pub writer_cache_lookups: Option<usize>,
+    /// Retained-writer cache hits.
+    pub writer_cache_hits: Option<usize>,
+    /// Retained writers rejected because their owner or snapshot diverged.
+    pub writer_cache_validation_failures: Option<usize>,
+    /// Transaction-private retained writers discarded by rollback.
+    pub writer_cache_rollback_discards: Option<usize>,
+    /// Retained-writer cache lookups with no reusable entry.
+    pub writer_cache_misses: Option<usize>,
+    /// Read-snapshot cache lookups.
+    pub read_cache_lookups: Option<usize>,
+    /// Snapshot cache checkouts that avoided a backing-directory scan.
+    pub read_cache_hits: Option<usize>,
+    /// Read-snapshot cache lookups that required a full snapshot load.
+    pub read_cache_misses: Option<usize>,
+    /// Complete backing-directory snapshots loaded by the async scan.
+    pub full_snapshot_loads: Option<usize>,
+    /// Cross-snapshot control-record validations that reused a cached manifest.
+    pub manifest_validation_hits: Option<usize>,
+    /// Cross-snapshot control-record validations that rejected a stale cache.
+    pub manifest_validation_misses: Option<usize>,
+    /// Number of successful MVCC writer-lease acquisitions, including
+    /// reentrant acquisition by the owning transaction.
+    pub write_lease_acquisitions: Option<usize>,
+    /// Number of writer-lease acquisitions rejected due to contention.
+    pub write_lease_rejections: Option<usize>,
 }
 
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
-pub trait IndexMethodCursor {
+///
+/// # Statement and transaction lifecycle
+///
+/// A cursor that wrote anything goes through these hooks, in this order:
+///
+/// 1. `prepare_statement_commit` — stage every pending change durably (the
+///    only fallible, I/O-capable phase), at the statement's halt.
+/// 2. `statement_committed` — the statement's savepoint was released.
+/// 3. Exactly one of three ends:
+///    * `transaction_committed` — the transaction is durable;
+///    * `transaction_rolled_back` — everything the transaction staged was
+///      undone;
+///    * replacement — a later statement in the same transaction opened a
+///      newer cursor for the same attachment, so this one is closed without
+///      either transaction outcome (the newer cursor receives it).
+/// 4. `close`.
+///
+/// A failed statement gets `abort_statement` instead of steps 1–2.
+///
+/// The empty default bodies below are correct **only for a method that keeps
+/// no transaction-private in-memory state** (everything lives in core-owned
+/// backing storage, which the engine rolls back on its own). A method that
+/// mirrors state in memory must implement every outcome hook: skipping
+/// `transaction_rolled_back` silently publishes rolled-back work, and
+/// skipping `prepare_statement_commit` silently loses writes.
+pub trait IndexMethodCursor: Send {
     /// create necessary components for index method (usually, this is a bunch of btree-s)
-    fn create(&mut self, connection: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>>;
+    fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
     /// destroy components created in the create(...) call for index method
-    fn destroy(&mut self, connection: &Arc<Connection>, database_id: usize)
-        -> Result<IOResult<()>>;
+    fn destroy(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
 
     /// open necessary components for reading the index
-    fn open_read(
-        &mut self,
-        connection: &Arc<Connection>,
-        database_id: usize,
-    ) -> Result<IOResult<()>>;
+    fn open_read(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
     /// open necessary components for writing the index
-    fn open_write(
-        &mut self,
-        connection: &Arc<Connection>,
-        database_id: usize,
-    ) -> Result<IOResult<()>>;
+    fn open_write(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
 
     /// handle insert action
     /// "values" argument contains registers with values for index columns followed by rowid Integer register
@@ -208,18 +590,37 @@ pub trait IndexMethodCursor {
     /// returned from query_rowid(...) method
     fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>>;
 
-    /// Called before transaction commit to flush any pending writes.
-    /// This ensures index method writes are persisted as part of the transaction.
-    fn pre_commit(&mut self) -> Result<IOResult<()>> {
+    /// Stage all pending index changes before the statement savepoint is
+    /// released. Any fallible work or I/O belongs in this phase.
+    fn prepare_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 
+    /// Discard statement-owned in-memory work. This hook must not perform I/O.
+    fn abort_statement(&mut self, _context: &IndexMethodContext) {}
+
+    /// Publish transaction-private in-memory state after the statement
+    /// savepoint has been released successfully. This hook is infallible and
+    /// must not make uncommitted state visible to another transaction.
+    fn statement_committed(&mut self, _context: &IndexMethodContext) {}
+
+    /// Publish in-memory state after the database transaction commits.
+    /// This hook is infallible and must not perform I/O.
+    fn transaction_committed(&mut self, _context: &IndexMethodContext) {}
+
+    /// Invalidate transaction-owned in-memory state after rollback.
+    /// This hook is infallible and must not perform I/O.
+    fn transaction_rolled_back(&mut self, _context: &IndexMethodContext) {}
+
+    /// Invalidate state newer than a rolled-back savepoint.
+    /// This hook is infallible and must not perform I/O.
+    fn savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {}
+
+    /// Release resources without performing I/O or persistent writes.
+    fn close(&mut self, _context: &IndexMethodContext) {}
+
     /// Optimize the index by merging segments or performing other maintenance.
-    fn optimize(
-        &mut self,
-        _connection: &Arc<Connection>,
-        _database_id: usize,
-    ) -> Result<IOResult<()>> {
+    fn optimize(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 
@@ -239,6 +640,17 @@ pub trait IndexMethodCursor {
     #[cfg(feature = "test_helper")]
     fn test_stats(&self) -> Result<Option<IndexMethodTestStats>> {
         Ok(None)
+    }
+}
+
+pub(crate) struct TransactionIndexMethodCursor {
+    pub(crate) cursor: Box<dyn IndexMethodCursor>,
+    pub(crate) context: Arc<IndexMethodContext>,
+}
+
+impl TransactionIndexMethodCursor {
+    pub(crate) fn same_attachment(&self, context: &IndexMethodContext) -> bool {
+        self.context.database == context.database && self.context.index == context.index
     }
 }
 
@@ -369,6 +781,7 @@ mod tests {
     fn definition(support: IndexMethodMvccSupport) -> IndexMethodDefinition<'static> {
         IndexMethodDefinition {
             method_name: "test_method",
+            table_name: "test_table",
             index_name: "test_index",
             patterns: &[],
             backing_btree: false,
