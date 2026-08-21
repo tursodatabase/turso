@@ -318,7 +318,7 @@ expect {
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END|value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
-    uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|'<'
+    uuid(value text)|blob|CASE WHEN typeof (value) = 'blob' THEN value ELSE uuid_blob (value) END|uuid_str (value)|uuid4_str ()|'<'
     varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
@@ -353,7 +353,7 @@ expect {
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END|value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
-    uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|'<'
+    uuid(value text)|blob|CASE WHEN typeof (value) = 'blob' THEN value ELSE uuid_blob (value) END|uuid_str (value)|uuid4_str ()|'<'
     varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
