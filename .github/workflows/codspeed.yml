@@ -40,7 +40,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.98.0"
 
       - name: Resolve benchmark shards
         id: benchmarks
@@ -71,7 +71,7 @@ jobs:
       built: ${{ steps.build_status.outputs.built }}
     env:
       TOOLCHAIN_LABEL: stable
-      TOOLCHAIN_VERSION: "1.88.0"
+      TOOLCHAIN_VERSION: "1.98.0"
       TOOLCHAIN_RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
@@ -207,7 +207,7 @@ jobs:
     # Allow this job to fail without failing the entire CI run
     continue-on-error: true
     env:
-      TOOLCHAIN_VERSION: "1.88.0"
+      TOOLCHAIN_VERSION: "1.98.0"
       TOOLCHAIN_LABEL: stable
       TOOLCHAIN_RUSTFLAGS: ""
     strategy:

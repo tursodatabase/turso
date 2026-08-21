@@ -463,7 +463,7 @@ jobs:
       matrix:
         toolchain:
           - label: stable
-            version: "1.88.0"
+            version: "1.98.0"
             rustflags: ""
           - label: nightly
             version: "nightly-2025-12-17"
