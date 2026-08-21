@@ -13,6 +13,7 @@ use sql_generation::{
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
+use std::num::NonZero;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
@@ -315,6 +316,9 @@ pub struct WhopperOpts {
     /// invalidate the connection's cursors and page cache, so allowing one
     /// would break the suspended statement.
     pub checkpoint_probe_probability: f64,
+    /// Options for the arbitrary SQL generator (`sql_generation`) used by the
+    /// Insert/Update/Delete/Select workloads.
+    pub sql_generation_opts: Opts,
 }
 
 /// Schema-generation bias
@@ -365,8 +369,23 @@ impl Default for WhopperOpts {
             reopen_probability: 0.0,
             allocation_fault_probability: 0.0,
             checkpoint_probe_probability: 0.01,
+            sql_generation_opts: default_sql_generation_opts(),
         }
     }
+}
+
+/// sql_generation options for whopper. Whopper hands the generator tables
+/// without rows, so it cannot bound `INSERT INTO t SELECT * FROM t`, which
+/// would otherwise double tables forever. Instead it inserts bigger batches,
+/// so the generated tables still reach thousands of rows — enough for their
+/// b-trees, and the ephemeral b-trees that UNION and IN subqueries build from
+/// them, to split several levels deep within a run.
+fn default_sql_generation_opts() -> Opts {
+    let mut opts = Opts::default();
+    opts.query.insert.nested_self_insert = false;
+    opts.query.insert.min_rows = NonZero::new(16).unwrap();
+    opts.query.insert.max_rows = NonZero::new(256).unwrap();
+    opts
 }
 
 impl WhopperOpts {
@@ -831,7 +850,7 @@ impl Whopper {
                 .map(std::sync::Mutex::new)
                 .collect(),
             total_weight,
-            opts: Opts::default(),
+            opts: opts.sql_generation_opts,
             current_step: 0,
             max_steps: opts.max_steps,
             max_drain_steps: opts.max_drain_steps,
