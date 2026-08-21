@@ -399,9 +399,42 @@ Upgrade is not supported.
 
 ## Transactions and Visibility
 
+The wire server opens a dedicated database connection per client, so each
+client has its own transaction and session state. Concurrency follows
+Turso's single-writer model rather than PostgreSQL's row-level locking,
+and transaction semantics currently differ in several ways:
+
+- Writers serialize on a database-wide write lock. A writer blocked by
+  another client's write transaction waits up to the busy timeout
+  (`tursopg --busy-timeout`, default 5000 ms) and then fails with SQLSTATE
+  55P03 (lock_not_available), where PostgreSQL would keep waiting on the
+  row lock.
+- A transaction reads from the snapshot taken at its first statement,
+  which behaves closest to REPEATABLE READ; PostgreSQL defaults to READ
+  COMMITTED. If another client commits after that snapshot is taken, the
+  transaction's next write fails immediately with SQLSTATE 40001
+  (serialization_failure); the client should roll back and retry the
+  transaction. (psycopg's rollback() can emit DEALLOCATE for auto-prepared
+  statements, which is not yet supported; set prepare_threshold=None until
+  it is.)
+- After a failed statement, PostgreSQL rejects everything until ROLLBACK
+  ("current transaction is aborted"); tursopg keeps executing the
+  transaction's subsequent statements, and COMMIT then commits the ones
+  that succeeded where PostgreSQL would discard the whole transaction.
+- Transaction-command no-ops error instead of warning: COMMIT or ROLLBACK
+  with no open transaction, and BEGIN inside one, are errors here where
+  PostgreSQL warns and continues.
+- A multi-statement simple-protocol message is not atomic: statements that
+  ran before an error stay applied, where PostgreSQL wraps the whole
+  message in an implicit transaction and rolls them back.
+- CREATE/DROP SCHEMA map to per-connection ATTACH state: schema files are
+  discovered when a client connects, so a schema created by one session is
+  not visible to sessions that were already connected.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Cursors | ❌ Not supported | DECLARE/FETCH/MOVE not translated |
+| Multiple concurrent clients | ✅ Supported | One database connection per wire client |
 | Savepoints | ✅ Supported | SAVEPOINT, RELEASE, ROLLBACK TO |
 | Serializable Snapshot Isolation | ❌ Not supported | BEGIN ISOLATION LEVEL ... accepted but the level is ignored |
 | Two-phase commit | ❌ Not supported | PREPARE TRANSACTION rejected |
