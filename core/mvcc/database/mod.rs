@@ -26,7 +26,9 @@ use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
-use crate::types::compare_immutable;
+use crate::types::compare_serialized_records;
+use crate::types::serialized_record_has_null_in_first_cols;
+use crate::types::serialized_record_prefixes_equal;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
@@ -201,72 +203,31 @@ impl SortableIndexKey {
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
-
-        let mut lhs = self.key.iter()?;
-        let mut rhs = other.key.iter()?;
-
-        for i in 0..num_cols {
-            let lhs_value = lhs.next().expect("we already checked length")?;
-            let rhs_value = rhs.next().expect("we already checked length")?;
-
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
-
-            if cmp != std::cmp::Ordering::Equal {
-                return Ok(cmp);
-            }
-        }
-
-        Ok(std::cmp::Ordering::Equal)
+        compare_serialized_records(
+            self.key.get_payload(),
+            other.key.get_payload(),
+            &self.metadata.key_info,
+            num_cols,
+        )
     }
 
     /// Check if the index key contains any NULL values (excluding the rowid column).
     /// In SQLite, NULLs don't violate UNIQUE constraints, so we skip conflict checks for NULL keys.
     pub fn contains_null(&self, num_indexed_cols: usize) -> Result<bool> {
-        let mut iter = self.key.iter()?;
         // Only check the indexed columns, not the rowid at the end
-        for _ in 0..num_indexed_cols {
-            if let Some(value) = iter.next() {
-                if matches!(value?, crate::types::ValueRef::Null) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        serialized_record_has_null_in_first_cols(self.key.get_payload(), num_indexed_cols)
     }
 
     /// Check if the first `num_cols` columns of this key match another key.
     /// Used for UNIQUE index conflict detection where we need to compare only
     /// the indexed columns, not the rowid suffix.
     pub fn matches_prefix(&self, other: &Self, num_cols: usize) -> Result<bool> {
-        let mut lhs = self.key.iter()?;
-        let mut rhs = other.key.iter()?;
-
-        for i in 0..num_cols {
-            let lhs_value = match lhs.next() {
-                Some(v) => v?,
-                None => return Ok(false),
-            };
-            let rhs_value = match rhs.next() {
-                Some(v) => v?,
-                None => return Ok(false),
-            };
-
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
-
-            if cmp != std::cmp::Ordering::Equal {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        serialized_record_prefixes_equal(
+            self.key.get_payload(),
+            other.key.get_payload(),
+            &self.metadata.key_info,
+            num_cols,
+        )
     }
 }
 
@@ -1463,7 +1424,10 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     Checkpoint {
         // TODO: if and when we transform this code to async we won't be needing this explicit state machine nor
         // the mutex
-        state_machine: Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>,
+        // Boxed so this rarely-entered variant doesn't inflate every
+        // `CommitStateMachine` (one is built per commit) to the checkpoint
+        // machine's size.
+        state_machine: Box<Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>>,
     },
     CommitEnd {
         end_ts: u64,
@@ -2157,18 +2121,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
         // (e.g. -58). On recovery, bootstrap reconstructs the map using
         // -(root_page), so log records must use that canonical form to be found.
+        //
+        // A commit logs many versions but usually touches one table plus a few
+        // indexes, so memoize the rootpage lookup per table id: a hash probe
+        // per version instead of a skiplist search. The memo lives for one
+        // chunk of this step; the rootpage binding cannot change mid-commit
+        // (checkpoints serialize behind the commit lock this tx holds).
+        let canonical_table_ids: std::cell::RefCell<HashMap<MVTableId, MVTableId>> =
+            std::cell::RefCell::new(HashMap::default());
         let canonicalize_table_id = |version: &mut RowVersion| {
             let table_id = version.row.id.table_id;
             if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                 return;
             }
-            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
-                if let Some(root_page) = entry.value().root_page {
-                    let canonical = MVTableId::from(-(root_page as i64));
-                    if canonical != table_id {
-                        version.row.id.table_id = canonical;
-                    }
-                }
+            let canonical = *canonical_table_ids
+                .borrow_mut()
+                .entry(table_id)
+                .or_insert_with(|| {
+                    mvcc_store
+                        .table_id_to_rootpage
+                        .get(&table_id)
+                        .and_then(|entry| entry.value().root_page)
+                        .map(|root_page| MVTableId::from(-(root_page as i64)))
+                        .unwrap_or(table_id)
+                });
+            if canonical != table_id {
+                version.row.id.table_id = canonical;
             }
         };
 
@@ -3353,7 +3331,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         self.db_id,
                         auto_checkpoint_mode,
                     ));
-                    let state_machine = Mutex::new(state_machine);
+                    let state_machine = Box::new(Mutex::new(state_machine));
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
                 }
@@ -3988,6 +3966,17 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// a mismatch, since a key inserted at or behind an already-positioned
     /// finger would otherwise be skipped (#7578).
     index_rows_epoch: AtomicU64,
+    /// Bumped on every write that can change which row version a transaction
+    /// sees: version inserts (tables and indexes), delete/end-marker writes,
+    /// and rollbacks (full and to-savepoint). Cursors use this to memoize the
+    /// serialized record for their current position: a snapshot of this
+    /// counter taken when the record was serialized is still current iff no
+    /// such write happened since. Only a transaction's own writes can change
+    /// its visible rows mid-transaction (snapshot isolation), and those
+    /// happen on the cursor's own thread, so `Relaxed` ordering suffices;
+    /// bumps from other threads' transactions merely cause a spurious
+    /// re-read.
+    version_mutation_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
@@ -4214,6 +4203,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
+            version_mutation_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             alloc,
@@ -4975,6 +4965,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
         tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
+        self.bump_version_mutation_epoch();
         let tx = self
             .txs
             .get(&tx_id)
@@ -5045,6 +5036,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row: Row,
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
+        self.bump_version_mutation_epoch();
         let version_id = self.get_version_id();
         let row_version = RowVersion {
             id: version_id,
@@ -5098,6 +5090,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             tx_id,
             row.id
         );
+        self.bump_version_mutation_epoch();
         let tx = self
             .txs
             .get(&tx_id)
@@ -5231,6 +5224,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<bool> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
+        self.bump_version_mutation_epoch();
+        // One transaction lookup for the whole call. The entry stays valid
+        // across the version loop: only this connection can finish the
+        // transaction, and it is busy running this delete.
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        turso_assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.get_or_create_index_rows(index_id)?;
@@ -5243,12 +5246,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let arc_key = row_versions_entry.key().clone();
                     let row_versions = row_versions_entry.value().clone();
                     for rv in row_versions.write().iter_mut().rev() {
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
@@ -5261,11 +5258,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
                         let version_id = rv.id;
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
                         tx.insert_to_write_set(id, row_versions.clone());
                         tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
@@ -5279,12 +5271,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let row_versions = row_versions_entry.value().clone();
                     let mut locked_row_versions = row_versions.write();
                     for rv in locked_row_versions.iter_mut().rev() {
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
@@ -5299,11 +5285,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
                         drop(locked_row_versions);
                         drop(row_versions_opt);
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
                         tx.insert_to_write_set(id.clone(), row_versions.clone());
                         tx.record_deleted_table_version(id.clone(), version_id);
                         return Ok(true);
@@ -5481,7 +5462,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         mv_store_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         tx_id: TxID,
-    ) -> Option<(RowID, RowVersions<A>)> {
+    ) -> Option<(Row, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_table_in_direction",
         );
@@ -5516,7 +5497,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
         tx_id: TxID,
-    ) -> Option<RowID> {
+    ) -> Option<(Arc<SortableIndexKey>, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_index_in_direction",
         );
@@ -5542,6 +5523,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ckpt_max: u64,
         reader_mark: WalPos,
     ) -> bool {
+        self.chain_is_write_buffer_for_inner(tx, versions, ckpt_max, reader_mark, false)
+    }
+
+    fn chain_is_write_buffer_for_inner(
+        &self,
+        tx: &Transaction<A>,
+        versions: &[RowVersion],
+        ckpt_max: u64,
+        reader_mark: WalPos,
+        sole_version_known_visible: bool,
+    ) -> bool {
         if versions.is_empty() {
             return false;
         }
@@ -5552,7 +5544,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let Some(TxTimestampOrID::Timestamp(begin_ts)) = rv.begin() else {
             return true;
         };
-        if rv.end().is_some() || !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
+        if rv.end().is_some() {
+            return true;
+        }
+        // Scans already established the sole version's visibility while
+        // locating it; skip re-deriving it for every row.
+        if !sole_version_known_visible
+            && !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states)
+        {
             return true;
         }
         // Passive may stamp materialized_at during write-out before publish.
@@ -5577,17 +5576,40 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         versions: &[RowVersion],
     ) -> bool {
+        self.btree_covers_chain_for_tx_inner(tx, table_id, versions, false)
+    }
+
+    /// `sole_version_known_visible`: the caller already proved the chain's
+    /// only version visible to `tx`; see [`Self::chain_is_write_buffer_for_inner`].
+    fn btree_covers_chain_for_tx_inner(
+        &self,
+        tx: &Transaction<A>,
+        table_id: MVTableId,
+        versions: &[RowVersion],
+        sole_version_known_visible: bool,
+    ) -> bool {
         if self.experimental_mvcc_passive_checkpoint {
             return false;
         }
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return false;
         }
-        if !self.is_btree_readable_at(&table_id, tx.begin_ts, tx.read_mark) {
+        // Check the chain shape before the B-tree binding: both must agree for
+        // the B-tree to cover the chain, and the chain-shape check is a scan of
+        // an already-locked Vec while `is_btree_readable_at` is a skiplist
+        // lookup. Scans call this for every row, and for not-yet-materialized
+        // chains (the common case for hot data) the shape check answers alone.
+        let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
+        if self.chain_is_write_buffer_for_inner(
+            tx,
+            versions,
+            ckpt_max,
+            tx.read_mark,
+            sole_version_known_visible,
+        ) {
             return false;
         }
-        let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
-        !self.chain_is_write_buffer_for(tx, versions, ckpt_max, tx.read_mark)
+        self.is_btree_readable_at(&table_id, tx.begin_ts, tx.read_mark)
     }
 
     /// Whether an already-resolved index version chain shadows (invalidates) the
@@ -5689,42 +5711,67 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         tx: &Transaction<A>,
         row: &TableRowEntry<'_, A>,
-    ) -> Option<(RowID, RowVersions<A>)> {
+    ) -> Option<(Row, RowVersions<A>)> {
+        let versions_arc = row.value();
+        let visible_row = {
+            let versions = versions_arc.read();
+            let visible = versions
+                .iter()
+                .rev()
+                .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
+            let visible_row = visible.row.clone();
+            // With one version in the chain, the version just found is it, so
+            // its visibility is already proven.
+            let sole_version_known_visible = versions.len() == 1;
+            if self.btree_covers_chain_for_tx_inner(
+                tx,
+                row.key().table_id,
+                &versions,
+                sole_version_known_visible,
+            ) {
+                return None;
+            }
+            visible_row
+        };
+        Some((visible_row, versions_arc.clone()))
+    }
+
+    /// Returns the entry's canonical key (shared with the version chain's
+    /// rows) rather than a cloned `Row`: an index row's payload is its key,
+    /// so the key alone fully identifies and materializes the row.
+    fn find_last_visible_index_version(
+        &self,
+        tx: &Transaction<A>,
+        row: IndexRowEntry<'_, A>,
+    ) -> Option<(Arc<SortableIndexKey>, RowVersions<A>)> {
         let versions_arc = row.value();
         {
             let versions = versions_arc.read();
-            let has_visible = versions
+            let visible = versions
                 .iter()
                 .rev()
-                .any(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states));
-            if !has_visible {
-                return None;
-            }
-            if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
+                .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
+            let table_id = visible.row.id.table_id;
+            // With one version in the chain, the version just found is it, so
+            // its visibility is already proven.
+            let sole_version_known_visible = versions.len() == 1;
+            if self.btree_covers_chain_for_tx_inner(
+                tx,
+                table_id,
+                &versions,
+                sole_version_known_visible,
+            ) {
                 return None;
             }
         }
         Some((row.key().clone(), versions_arc.clone()))
     }
 
-    fn find_last_visible_index_version(
+    fn find_next_visible_index_row<'a, I>(
         &self,
         tx: &Transaction<A>,
-        row: IndexRowEntry<'_, A>,
-    ) -> Option<RowID> {
-        let versions = row.value().read();
-        let visible = versions
-            .iter()
-            .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
-        let table_id = visible.row.id.table_id;
-        if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-            return None;
-        }
-        Some(visible.row.id.clone())
-    }
-
-    fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction<A>, mut rows: I) -> Option<RowID>
+        mut rows: I,
+    ) -> Option<(Arc<SortableIndexKey>, RowVersions<A>)>
     where
         I: Iterator<Item = IndexRowEntry<'a, A>>,
     {
@@ -5741,7 +5788,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx: &Transaction<A>,
         mut rows: I,
         table_id: MVTableId,
-    ) -> Option<(RowID, RowVersions<A>)>
+    ) -> Option<(Row, RowVersions<A>)>
     where
         I: Iterator<Item = TableRowEntry<'a, A>>,
     {
@@ -5764,7 +5811,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         direction: IterationDirection,
         tx_id: TxID,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
-    ) -> Option<RowID> {
+    ) -> Option<(Row, RowVersions<A>)> {
         let table_id = start.table_id;
         let iter_box = {
             let range = if eq_only {
@@ -5809,7 +5856,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
 
         self.find_next_visible_table_row(tx, mv_store_iterator, table_id)
-            .map(|(row_id, _versions)| row_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5822,7 +5868,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         direction: IterationDirection,
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-    ) -> Result<Option<RowID>> {
+    ) -> Result<Option<(Arc<SortableIndexKey>, RowVersions<A>)>> {
         let index_rows = self.get_or_create_index_rows(index_id)?;
         let index_rows = index_rows.value();
         let range = if eq_only {
@@ -6485,6 +6531,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         id = "rollback_transfers_frozen_write_set"
     )]
     fn rollback_tx_inner(&self, tx_id: TxID, connection: Option<&Connection>, db: usize) {
+        self.bump_version_mutation_epoch();
         let tx_unlocked = self
             .txs
             .get(&tx_id)
@@ -6711,6 +6758,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint<A>) {
+        self.bump_version_mutation_epoch();
         let Savepoint {
             header,
             header_dirty,
@@ -7264,6 +7312,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let _gate = GcGate(&self.gc_in_progress);
 
+        // GC can drop a chain's last version once the B-tree covers it, which
+        // changes where a read for that key resolves; invalidate cursors'
+        // epoch-guarded caches around the pass (entry and exit, so caches
+        // created mid-pass don't survive it either).
+        self.bump_version_mutation_epoch();
+        struct GcEpochBump<'a, Clock: LogicalClock, A: ConcurrentAllocator>(&'a MvStore<Clock, A>);
+        impl<Clock: LogicalClock, A: ConcurrentAllocator> Drop for GcEpochBump<'_, Clock, A> {
+            fn drop(&mut self) {
+                self.0.bump_version_mutation_epoch();
+            }
+        }
+        let _epoch_bump = GcEpochBump(self);
+
         let passive = self.experimental_mvcc_passive_checkpoint;
         // Passive: keep the last current SkipMap version (B-trees may still be mid-write).
         // Blocking Truncate: safe to drop it once the B-tree already has the row.
@@ -7480,6 +7541,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let mut referenced_tx_ids = HashSet::default();
 
+        // See `gc_incremental`: dropping versions can move a key's read to the
+        // B-tree, so cursors' epoch-guarded caches must not survive the pass.
+        self.bump_version_mutation_epoch();
+
         let dropped = self.gc_table_row_versions(
             lwm,
             ckpt_max,
@@ -7495,6 +7560,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             drop_current_if_in_btree,
             reader_mark_floor,
         );
+        self.bump_version_mutation_epoch();
         self.dec_live_version_count_approx(dropped);
         let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
 
@@ -7792,9 +7858,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<RowVersions<A>, TryReserveError> {
         // Retry if GC unlinked this slot while we waited for the write lock.
         loop {
-            let row_versions = self.get_or_create_table_row_versions(id.clone())?;
+            let entry = self.get_or_create_table_row_versions(id.clone())?;
+            let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.table_versions_still_mapped(&id, &row_versions) {
+            // GC removes a drained slot while holding its write lock, so once
+            // we hold the lock the node's removed flag is current: not removed
+            // means this arc is still the mapped chain. This replaces a second
+            // full skiplist lookup per insert.
+            if entry.is_removed() {
                 continue;
             }
             self.insert_version_raw(&mut versions, row_version)?;
@@ -7803,38 +7874,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// True if `arc` is still the mapped value for `id`.
-    fn table_versions_still_mapped(&self, id: &RowID, arc: &RowVersions<A>) -> bool {
-        self.rows
-            .get(id)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), arc))
-    }
-
-    /// True if `arc` is still the mapped value for `key`.
-    fn index_versions_still_mapped(
-        &self,
-        index: &IndexRowsMap<A>,
-        key: &SortableIndexKey,
-        arc: &RowVersions<A>,
-    ) -> bool {
-        index
-            .get(key)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), arc))
-    }
-
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TableRowsEntry)]
     fn get_or_create_table_row_versions(
         &self,
         id: RowID,
-    ) -> Result<RowVersions<A>, TryReserveError> {
+    ) -> Result<TableRowEntry<'_, A>, TryReserveError> {
         let alloc = self.alloc.clone();
-        let versions = self.rows.try_get_or_insert_with(id, move || {
+        self.rows.try_get_or_insert_with(id, move || {
             Arc::new(RwLock::new(<RowVersionChain<A> as TursoVecInExt<
                 RowVersion,
                 A,
             >>::new_in(alloc)))
-        })?;
-        Ok(versions.value().clone())
+        })
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -7872,7 +7923,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let canonical_key = entry.key().clone();
             let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
+            // See `insert_version`: with the write lock held, the removed flag
+            // answers "is this arc still mapped" without a second lookup.
+            if entry.is_removed() {
                 continue;
             }
             row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
@@ -7885,6 +7938,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Current epoch of `index_rows` key-set mutations; see the field docs.
     pub(crate) fn index_rows_epoch(&self) -> u64 {
         self.index_rows_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Current epoch of visibility-changing version mutations; see the field docs.
+    pub(crate) fn version_mutation_epoch(&self) -> u64 {
+        self.version_mutation_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Record a write that can change which row version a transaction sees;
+    /// see the field docs.
+    fn bump_version_mutation_epoch(&self) {
+        self.version_mutation_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Key-set mutation of `index_rows` (insert or empty-slot remove); see field docs.
@@ -7936,9 +8000,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // which performs a binary search for the insertion point.
         versions.try_reserve(1)?;
         let mut position = 0_usize;
+        let new_begin = self.resolve_begin_timestamp(&row_version.begin());
         for (i, v) in versions.iter().enumerate().rev() {
             let existing_begin = self.resolve_begin_timestamp(&v.begin());
-            let new_begin = self.resolve_begin_timestamp(&row_version.begin());
             if existing_begin <= new_begin {
                 // Recovery can replay multiple operations for the same row from one transaction
                 // (e.g. insert then delete), which share the same begin timestamp.
@@ -8018,6 +8082,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Clears the chain but keeps the empty SkipMap slot (write-set GC still looks it up).
     pub fn purge_row_versions_during_checkpoint(&self, rowid: RowID) {
         if let Some(entry) = self.rows.get(&rowid) {
+            self.bump_version_mutation_epoch();
             let mut versions = entry.value().write();
             self.dec_live_version_count_approx(versions.len());
             versions.clear();
@@ -8028,11 +8093,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
     pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
         loop {
-            let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
+            let Ok(entry) = self.get_or_create_table_row_versions(rowid.clone()) else {
                 return;
             };
+            let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.table_versions_still_mapped(&rowid, &row_versions) {
+            // See `insert_version` for why the removed flag suffices here.
+            if entry.is_removed() {
                 continue;
             }
             // End-stamp the live committed version, if any — collection then
@@ -8071,7 +8138,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         tx_id: TxID,
-    ) -> Option<RowKey> {
+    ) -> Option<(Row, RowVersions<A>)> {
         let tx = self
             .txs
             .get(&tx_id)
@@ -8101,16 +8168,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 tracing::trace!("get_last_table_rowid: reached end of table");
                 return None;
             }
-            if let Some(_visible_row) = self.find_last_visible_version(tx, &entry) {
+            if let Some((visible_row, versions)) = self.find_last_visible_version(tx, &entry) {
                 tracing::trace!(
                     "get_last_table_rowid: found visible row: {:?}",
-                    _visible_row
+                    visible_row.id
+                );
+                turso_assert!(
+                    matches!(visible_row.id.row_id, RowKey::Int(_)),
+                    "Expected RowKey::Int for table rowid"
                 );
                 // There is a visible version for this rowid, so we return it
-                return Some(RowKey::Int(match &entry.key().row_id {
-                    RowKey::Int(i) => *i,
-                    _ => panic!("Expected RowKey::Int for table rowid"),
-                }));
+                return Some((visible_row, versions));
             }
         }
     }
@@ -8137,7 +8205,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index_id: MVTableId,
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-    ) -> Result<Option<RowKey>> {
+    ) -> Result<Option<(Arc<SortableIndexKey>, RowVersions<A>)>> {
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         let iter_box = Box::new(index.iter().rev());
@@ -8150,9 +8218,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
-        Ok(self
-            .find_next_visible_index_row(tx, iter)
-            .map(|row| row.row_id))
+        Ok(self.find_next_visible_index_row(tx, iter))
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
@@ -9204,9 +9270,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                             };
                             {
-                                let versions =
-                                    self.get_or_create_table_row_versions(rowid.clone())?;
-                                let mut versions = versions.write();
+                                let entry = self.get_or_create_table_row_versions(rowid.clone())?;
+                                let mut versions = entry.value().write();
                                 self.insert_version_raw(&mut versions, row_version)?;
                             }
                             let allocator = self.get_rowid_allocator(&rowid.table_id);
@@ -9298,9 +9363,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     btree_resident: true,
                                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                                 };
-                                let versions =
-                                    self.get_or_create_table_row_versions(rowid.clone())?;
-                                let mut versions = versions.write();
+                                let entry = self.get_or_create_table_row_versions(rowid.clone())?;
+                                let mut versions = entry.value().write();
                                 self.insert_version_raw(&mut versions, row_version)?;
                             }
                             if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
@@ -10081,6 +10145,13 @@ fn is_begin_visible<A: ConcurrentAllocator>(
             tx.begin_ts > rv_begin_ts
         }
         Some(TxTimestampOrID::TxID(rv_begin)) => {
+            // Our own uncommitted version: we are Active (we are executing
+            // this very read), so the Active arm below would evaluate to
+            // `rv.end().is_none()`. Answer without the map lookup — reading
+            // your own writes is the common TxID-reference case.
+            if rv_begin == tx.tx_id {
+                return rv.end().is_none();
+            }
             let visible = match txs.get(&rv_begin) {
                 Some(tb_entry) => {
                     let tb = tb_entry.value();
@@ -10166,6 +10237,13 @@ fn is_end_visible<A: ConcurrentAllocator>(
     match row_version.end() {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
+            // We deleted this version ourselves: we are Active, so the Active
+            // arm below would evaluate to false. Answer without the map
+            // lookup — seeing your own deletes is the common TxID-reference
+            // case.
+            if rv_end == current_tx.tx_id {
+                return false;
+            }
             let visible = match txs.get(&rv_end) {
                 Some(other_tx_entry) => {
                     let other_tx = other_tx_entry.value();

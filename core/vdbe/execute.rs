@@ -1321,17 +1321,17 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                index.as_ref(),
-                num_columns,
-            )?);
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
                 IndexInfo::new_from_index_in(index, mv_store.allocator())?
             } else {
                 IndexInfo::new_from_index(index)?
             });
+            let btree_cursor = Box::new(BTreeCursor::new_index_with_info(
+                pager,
+                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                num_columns,
+                index_info.clone(),
+            ));
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -12852,20 +12852,20 @@ pub fn op_open_write(
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
-            let btree_cursor = btree_cursor_with_yield_context(
-                Box::new(BTreeCursor::new_index(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                    index.as_ref(),
-                    num_columns,
-                )?),
-                &program.connection,
-            );
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
                 IndexInfo::new_from_index_in(index, mv_store.allocator())?
             } else {
                 IndexInfo::new_from_index(index)?
             });
+            let btree_cursor = btree_cursor_with_yield_context(
+                Box::new(BTreeCursor::new_index_with_info(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                    num_columns,
+                    index_info.clone(),
+                )),
+                &program.connection,
+            );
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
