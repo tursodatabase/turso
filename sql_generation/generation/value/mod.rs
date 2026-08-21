@@ -42,12 +42,31 @@ impl ArbitraryFrom<&Vec<&SimValue>> for SimValue {
     }
 }
 
+impl SimValue {
+    /// A value of the given type whose record payload is empty: integer 0 or 1,
+    /// the empty string, or the empty blob. Floats have no such value.
+    pub fn tiny_value<R: Rng + ?Sized>(rng: &mut R, column_type: &ColumnType) -> Option<Self> {
+        let value = match column_type {
+            ColumnType::Integer => Value::from_i64(rng.random_range(0..=1)),
+            ColumnType::Float => return None,
+            ColumnType::Text => Value::build_text(""),
+            ColumnType::Blob => Value::Blob(turso_core::alloc::vec![]),
+        };
+        Some(SimValue(value))
+    }
+}
+
 impl ArbitraryFrom<&ColumnType> for SimValue {
     fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
-        _context: &C,
+        context: &C,
         column_type: &ColumnType,
     ) -> Self {
+        if rng.random_bool(context.opts().value.tiny_value_prob) {
+            if let Some(value) = SimValue::tiny_value(rng, column_type) {
+                return value;
+            }
+        }
         let value = match column_type {
             //TODO: widen back to the full i64 range once
             // https://github.com/tursodatabase/turso/issues/6715 is fixed
