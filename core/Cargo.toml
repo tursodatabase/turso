@@ -125,7 +125,6 @@ roaring = "0.11.2"
 arc-swap = "1.7"
 rustc-hash = "2.0"
 either = { workspace = true }
-tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
 simdutf8 = "0.1.5"
 branches = { version = "0.4.3", default-features = false }
@@ -175,6 +174,8 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 [dev-dependencies]
 memory-stats = "1.2.0"
 serde_json = { workspace = true }
+# Only tests set up a subscriber; the library itself just emits `tracing` events.
+tracing-subscriber = { workspace = true }
 criterion = { workspace = true, features = [
     "html_reports",
     "async",
