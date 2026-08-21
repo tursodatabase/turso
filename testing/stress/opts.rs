@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use clap::{command, Parser};
+use clap::Parser;
 
 /// Transaction mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

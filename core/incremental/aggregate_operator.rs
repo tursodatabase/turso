@@ -2825,7 +2825,7 @@ impl FetchDistinctState {
                 FetchDistinctState::Done => {
                     // For plain DISTINCT, construct AggregateState from the weights we fetched
                     if is_plain_distinct {
-                        for (_group_key_str, state) in existing_groups.iter_mut() {
+                        for state in existing_groups.values_mut() {
                             // For plain DISTINCT, sum all the weights to get total count
                             // Each weight represents how many times the distinct value appears
                             let total_weight: i64 = state.distinct_value_weights.values().sum();

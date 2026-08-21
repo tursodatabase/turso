@@ -55,49 +55,26 @@ impl Remaining {
         let total_setval = (max_interactions * opts.setval_weight) / total_weight;
         let total_drop_sequence = (max_interactions * opts.drop_sequence_weight) / total_weight;
 
-        let remaining_select = total_select
-            .checked_sub(stats.select_count)
-            .unwrap_or_default();
-        let remaining_insert = total_insert
-            .checked_sub(stats.insert_count)
-            .unwrap_or_default();
-        let remaining_create = total_create
-            .checked_sub(stats.create_count)
-            .unwrap_or_default();
-        let mut remaining_create_index = total_create_index
-            .checked_sub(stats.create_index_count)
-            .unwrap_or_default();
-        let remaining_delete = total_delete
-            .checked_sub(stats.delete_count)
-            .unwrap_or_default();
-        let remaining_update = total_update
-            .checked_sub(stats.update_count)
-            .unwrap_or_default();
-        let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
-        let remaining_pragma = total_pragma
-            .checked_sub(stats.pragma_count)
-            .unwrap_or_default();
+        let remaining_select = total_select.saturating_sub(stats.select_count);
+        let remaining_insert = total_insert.saturating_sub(stats.insert_count);
+        let remaining_create = total_create.saturating_sub(stats.create_count);
+        let mut remaining_create_index =
+            total_create_index.saturating_sub(stats.create_index_count);
+        let remaining_delete = total_delete.saturating_sub(stats.delete_count);
+        let remaining_update = total_update.saturating_sub(stats.update_count);
+        let remaining_drop = total_drop.saturating_sub(stats.drop_count);
+        let remaining_pragma = total_pragma.saturating_sub(stats.pragma_count);
 
-        let remaining_alter_table = total_alter_table
-            .checked_sub(stats.alter_table_count)
-            .unwrap_or_default();
+        let remaining_alter_table = total_alter_table.saturating_sub(stats.alter_table_count);
 
-        let mut remaining_drop_index = total_drop_index
-            .checked_sub(stats.drop_index_count)
-            .unwrap_or_default();
+        let mut remaining_drop_index = total_drop_index.saturating_sub(stats.drop_index_count);
 
-        let remaining_create_sequence = total_create_sequence
-            .checked_sub(stats.create_sequence_count)
-            .unwrap_or_default();
-        let mut remaining_nextval = total_nextval
-            .checked_sub(stats.nextval_count)
-            .unwrap_or_default();
-        let mut remaining_setval = total_setval
-            .checked_sub(stats.setval_count)
-            .unwrap_or_default();
-        let mut remaining_drop_sequence = total_drop_sequence
-            .checked_sub(stats.drop_sequence_count)
-            .unwrap_or_default();
+        let remaining_create_sequence =
+            total_create_sequence.saturating_sub(stats.create_sequence_count);
+        let mut remaining_nextval = total_nextval.saturating_sub(stats.nextval_count);
+        let mut remaining_setval = total_setval.saturating_sub(stats.setval_count);
+        let mut remaining_drop_sequence =
+            total_drop_sequence.saturating_sub(stats.drop_sequence_count);
 
         if mvcc {
             // TODO: index not supported yet for mvcc

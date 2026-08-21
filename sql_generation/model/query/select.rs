@@ -122,8 +122,7 @@ impl Select {
                     .from
                     .as_ref()
                     .map(|f| f.dependencies())
-                    .unwrap_or(vec![])
-                    .into_iter(),
+                    .unwrap_or(vec![]),
             );
         }
 

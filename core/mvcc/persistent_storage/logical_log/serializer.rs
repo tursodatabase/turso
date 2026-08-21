@@ -203,6 +203,9 @@ macro_rules! log_write {
         )
     }};
 }
+// In-file callers reach the macro textually; the path export is only needed
+// by the conn_raw_api portable-changes encoder.
+#[cfg(feature = "conn_raw_api")]
 pub(crate) use log_write;
 
 pub(crate) struct LogSerializer<'a, B: ?Sized = Vec<u8>> {

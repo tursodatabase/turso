@@ -305,11 +305,11 @@ impl SqlGenerator for PropTestBackend {
         // too - so that this oracle bug cannot change the compared row set.
         // Recursive LIMIT/OFFSET and priority ordering remain fully generated
         // inside the CTE.
-        if let sql_gen_prop::SqlStatement::Select(select) = &mut stmt {
-            if select.has_recursive_cte() {
-                select.limit = None;
-                select.offset = None;
-            }
+        if let sql_gen_prop::SqlStatement::Select(select) = &mut stmt
+            && select.has_recursive_cte()
+        {
+            select.limit = None;
+            select.offset = None;
         }
         let sql = stmt.to_string();
         let stmt_kind = sql_gen_prop::StatementKind::from(&stmt);

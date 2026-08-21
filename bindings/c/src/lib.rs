@@ -605,12 +605,10 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
                     "ro" | "rw" | "rwc" => {} // valid modes, no-op (Turso doesn't enforce read-only yet)
                     _ => return Err(()),      // unknown mode -> SQLITE_CANTOPEN
                 },
-                "cache" => {
-                    if value == "shared" {
-                        cache_shared = true;
-                    }
-                    // "private" is also valid but is the default behavior
+                "cache" if value == "shared" => {
+                    cache_shared = true;
                 }
+                // "private" is also valid but is the default behavior
                 _ => {}
             }
         }

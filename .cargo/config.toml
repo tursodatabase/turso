@@ -1,6 +1,17 @@
 [env]
 LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS" # necessary for rusqlite dependency in order to bundle SQLite with math functions included
 
+[alias]
+# Clippy and `cargo check` share the same fingerprint files, but clippy stamps
+# them with its own driver. Running one after the other therefore rebuilds every
+# workspace crate from scratch each time (turso_core alone is ~25s of that).
+# `cargo lint` runs the exact clippy invocation CI uses, but under the `clippy`
+# profile (see [profile.clippy] in Cargo.toml) so its artifacts live in
+# target/clippy/ and never invalidate the `cargo check`/`cargo build` caches.
+# Note: extra args land after the final `--`, so pass them to clippy directly
+# (with `--profile clippy`) if you need to lint a single package.
+lint = "clippy --workspace --all-features --all-targets --profile clippy -- --deny=warnings"
+
 [build]
 # turso-sync package uses tokio_unstable to seed LocalRuntime and make it deterministic
 # unfortunately, cargo commands invoked from workspace root didn't capture config.toml from dependent crate

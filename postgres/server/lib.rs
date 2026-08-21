@@ -523,7 +523,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
 
 /// Decode a hex string into bytes.
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_owned());
     }
     (0..hex.len())

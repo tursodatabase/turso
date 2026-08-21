@@ -591,7 +591,7 @@ fn estimate_residual_expr_selectivity(
         }
         _ => {
             let Ok((_, table_constraints)) = get_table_local_constraints_for_branch(
-                &[expr.clone()],
+                std::slice::from_ref(expr),
                 None,
                 rhs_table,
                 table_references,

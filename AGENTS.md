@@ -6,9 +6,14 @@ SQLite rewrite in Rust. 40+ crate workspace.
 
 ```bash
 cargo build                    # build. never build with --release
+cargo check -p turso_core      # fast type-check while iterating on core
 cargo test                     # rust unit/integration tests
 cargo fmt                      # format (required)
-cargo clippy --workspace --all-features --all-targets -- --deny=warnings  # lint
+cargo lint                     # clippy, same flags as CI (alias in .cargo/config.toml).
+                               # Runs under its own profile (artifacts in target/clippy/)
+                               # because clippy overwrites cargo check's fingerprints:
+                               # plain `cargo clippy` forces a full ~25s recheck of every
+                               # workspace crate afterwards
 cargo run -q --bin tursodb -- -q # run the interactive cli. never run with --release
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC

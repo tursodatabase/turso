@@ -430,14 +430,10 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
                     in_quotes = true;
                 }
             }
-            ',' => {
-                if !in_quotes {
-                    if !current_arg.trim().is_empty() {
-                        args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
-                        current_arg.clear();
-                    }
-                } else {
-                    current_arg.push(c);
+            ',' if !in_quotes => {
+                if !current_arg.trim().is_empty() {
+                    args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
+                    current_arg.clear();
                 }
             }
             _ => {
@@ -2306,11 +2302,11 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
                     return Ok(WalkControl::SkipChildren);
                 }
             }
-            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-                if col.as_str().eq_ignore_ascii_case(col_name_normalized) {
-                    found = true;
-                    return Ok(WalkControl::SkipChildren);
-                }
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col)
+                if col.as_str().eq_ignore_ascii_case(col_name_normalized) =>
+            {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
             }
             _ => {}
         }
@@ -3511,10 +3507,8 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
                 ast::Expr::InSelect { rhs, .. } => {
                     rewrite_select_table_refs(rhs, from, to);
                 }
-                ast::Expr::InTable { rhs, .. } => {
-                    if rhs.name.as_str().eq_ignore_ascii_case(from) {
-                        rhs.name = ast::Name::exact(to.to_owned());
-                    }
+                ast::Expr::InTable { rhs, .. } if rhs.name.as_str().eq_ignore_ascii_case(from) => {
+                    rhs.name = ast::Name::exact(to.to_owned());
                 }
                 _ => {}
             }
@@ -4227,10 +4221,10 @@ fn expr_still_references_renamed_column(
                     }
                 }
             }
-            ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) {
-                    found = true;
-                }
+            ast::Expr::Id(name) | ast::Expr::Name(name)
+                if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) =>
+            {
+                found = true;
             }
             _ => {}
         }

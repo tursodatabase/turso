@@ -995,10 +995,10 @@ fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
     let _guard = init_tracing(&opts)?;
 
-    let db_file = opts
-        .database
-        .as_ref()
-        .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
+    let db_file = opts.database.as_ref().map_or_else(
+        || ":memory:".to_string(),
+        |p| p.to_string_lossy().to_string(),
+    );
 
     let (io, conn) = open_database(&db_file, opts.vfs.as_ref(), opts.readonly)?;
 

@@ -467,7 +467,7 @@ fn collect_update_set_clauses(
         let expr = std::mem::replace(&mut set.expr, Box::new(Expr::Literal(ast::Literal::Null)));
         let values = split_update_set_values(*expr, set.col_names.len())?;
 
-        for (col_name, expr) in set.col_names.iter().zip(values.into_iter()) {
+        for (col_name, expr) in set.col_names.iter().zip(values) {
             let expr = Box::new(expr);
             let ident = normalize_ident(col_name.as_str());
 
@@ -508,7 +508,7 @@ fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
         if name.as_str().eq_ignore_ascii_case("array_set_element") && new_args.len() == 3 {
             let mut composed_args = new_args.clone();
             composed_args[0].clone_from(&existing.expr);
-            existing.expr = Box::new(Expr::FunctionCall {
+            *existing.expr = Expr::FunctionCall {
                 name: name.clone(),
                 distinctness: None,
                 args: composed_args,
@@ -518,7 +518,7 @@ fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
                     filter_clause: None,
                     over_clause: None,
                 },
-            });
+            };
             return;
         }
     }

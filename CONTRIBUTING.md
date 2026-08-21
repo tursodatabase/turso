@@ -142,6 +142,31 @@ echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
 ```
 
+## IDE setup and keeping `cargo check` fast
+
+RustRover's external linter and rust-analyzer's save check both run
+`cargo check --all-targets` across the workspace every time you save. With warm
+caches that costs a few seconds per save, even right after editing
+`turso_core`. If your IDE check regularly takes 25s+, the caches are being
+invalidated between runs. The usual causes, in order of likelihood:
+
+* Something runs clippy into the default target dir. Clippy overwrites plain
+  check/build fingerprints (and vice versa), so every clippy pass forces the
+  next check to rebuild every workspace crate from scratch. Always run clippy
+  through `cargo lint` (its own profile keeps the caches isolated), and in
+  RustRover keep Settings | Rust | External Linters set to **Cargo Check**, not
+  Clippy. If you want Clippy diagnostics in the IDE anyway, add
+  `--target-dir target/rustrover` to the linter's additional arguments so the
+  IDE gets its own cache universe.
+* The IDE and your terminal disagree on the environment. A `RUSTFLAGS` or
+  `RUSTC_WRAPPER` (e.g. sccache) configured in one but not the other flips the
+  shared fingerprints on every alternation, exactly like clippy does.
+
+If on-save checking still feels too slow, turn off "Run external linter to
+analyze code on the fly" in RustRover — its built-in analyzer keeps showing
+errors inline — and run `cargo check -p turso_core` yourself while iterating
+on core.
+
 ## Developing with AI coding agents
 
 You're welcome to develop Turso with AI coding agents such as Claude Code, Codex, or OpenCode. Used well, they can help you explore the codebase, draft tests, and polish your contributions. To make the most of them — and to get your PRs merged — keep the following in mind.
@@ -214,7 +239,7 @@ Fork the repository and open a pull request to submit your work.
 
 The CI checks for formatting, Clippy warnings, and test failures so remember to run the following before submitting your pull request:
 
-* `cargo fmt` and `cargo clippy --workspace --all-features --all-targets -- --deny=warnings` to keep the code formatting in check.
+* `cargo fmt` and `cargo lint` to keep the code formatting in check. (`cargo lint` is an alias defined in `.cargo/config.toml` that runs the same clippy invocation as CI, under a dedicated build profile so it doesn't invalidate your `cargo check`/`cargo build` caches.)
 * `make test` to run the test suite.
 
 **Keep your pull requests focused and as small as possible, but not smaller.** IOW, when preparing a pull request, ensure it focuses on a single thing and that your commits align with that. For example, a good pull request might fix a specific bug or a group of related bugs. Or a good pull request might add a new feature and test for it. Conversely, a bad pull request might fix a bug, add a new feature, and refactor some code.

@@ -886,15 +886,14 @@ fn build_materialized_build_input_plan(
                     }
                 }
             }
-            Operation::HashJoin(hash_join_op) => {
+            Operation::HashJoin(hash_join_op)
                 // Hash joins are driven by the probe table's loop. That probe table
                 // must be in the prefix; otherwise the hash join cannot be evaluated
                 // inside this subplan. The build table may live outside the prefix
                 // because the hash build phase scans it independently.
-                if !join_prefix_mask.get(hash_join_op.probe_table_idx) {
+                if !join_prefix_mask.get(hash_join_op.probe_table_idx) => {
                     reset_op = true;
                 }
-            }
             _ => {}
         }
 

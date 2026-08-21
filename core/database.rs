@@ -2422,7 +2422,7 @@ impl Database {
             match st {
                 DbHeaderReadState::Start => {
                     turso_assert!(
-                        PageSize::MIN % 512 == 0,
+                        PageSize::MIN.is_multiple_of(512),
                         "header read must be a multiple of 512 for O_DIRECT"
                     );
                     let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));

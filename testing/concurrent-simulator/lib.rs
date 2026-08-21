@@ -1071,14 +1071,14 @@ impl Whopper {
             let _enter = span.enter();
             debug!("result={step_result:?}, rows.len()={}", rows.len());
 
-            if let Operation::Begin { mode } = completed_op {
-                if step_result.is_ok() {
-                    ctx.fiber.state = if mode == TxMode::Concurrent {
-                        FiberState::InConcurrentTx
-                    } else {
-                        FiberState::InTx
-                    };
-                }
+            if let Operation::Begin { mode } = completed_op
+                && step_result.is_ok()
+            {
+                ctx.fiber.state = if mode == TxMode::Concurrent {
+                    FiberState::InConcurrentTx
+                } else {
+                    FiberState::InTx
+                };
             }
 
             let txn_id = ctx.fiber.txn_id;
@@ -1164,7 +1164,7 @@ impl Whopper {
                         continue;
                     }
                     let fiber = &self.context.fibers[fiber_idx];
-                    let state_str = format!("{:?}", &fiber.state);
+                    let state_str = format!("{:?}", fiber.state);
                     let span =
                         tracing::debug_span!("generate", fiber = fiber_idx, state = state_str);
                     let _enter = span.enter();
@@ -1195,7 +1195,7 @@ impl Whopper {
             let exec_id = self.context.state.gen_execution_id();
 
             let fiber = &mut self.context.fibers[fiber_idx];
-            let state_str = format!("{:?}", &fiber.state);
+            let state_str = format!("{:?}", fiber.state);
             let span = tracing::debug_span!(
                 "init",
                 step = self.current_step,
@@ -1269,10 +1269,9 @@ impl Whopper {
         // workloads start with BEGIN and can't nest inside an existing transaction)
         if self.context.fibers[fiber_idx].chaotic_workload.is_none()
             && self.context.fibers[fiber_idx].state == FiberState::Idle
+            && let Some(op) = self.pick_chaotic_workload(fiber_idx)
         {
-            if let Some(op) = self.pick_chaotic_workload(fiber_idx) {
-                self.context.fibers[fiber_idx].current_op = Some(op);
-            }
+            self.context.fibers[fiber_idx].current_op = Some(op);
         }
     }
 
@@ -1487,13 +1486,13 @@ impl Whopper {
         self.drain_active_statements("reopen")?;
         // Close and drop all fiber connections to release database Arc references
         {
-            let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
+            let fibers = std::mem::take(&mut self.context.fibers);
             for fiber in fibers {
                 drop(fiber.statement.into_inner());
-                if self.close_connections_gracefully {
-                    if let Err(e) = fiber.connection.close() {
-                        debug!("Error closing connection during restart: {}", e);
-                    }
+                if self.close_connections_gracefully
+                    && let Err(e) = fiber.connection.close()
+                {
+                    debug!("Error closing connection during restart: {}", e);
                 }
                 drop(fiber.connection);
             }
@@ -1664,10 +1663,10 @@ impl Whopper {
             if let Some(mv_store) = db.get_mv_store().as_ref() {
                 mv_store.set_checkpoint_threshold(-1);
             }
-        } else if let Some(threshold) = self.mvcc_checkpoint_threshold {
-            if let Some(mv_store) = db.get_mv_store().as_ref() {
-                mv_store.set_checkpoint_threshold(threshold);
-            }
+        } else if let Some(threshold) = self.mvcc_checkpoint_threshold
+            && let Some(mv_store) = db.get_mv_store().as_ref()
+        {
+            mv_store.set_checkpoint_threshold(threshold);
         }
 
         for i in 0..self.max_connections {

@@ -441,12 +441,11 @@ impl Fuzzer {
         if let Err(e) = self.write_sql_file(&executed_sql) {
             tracing::warn!("Failed to write test.sql: {e}");
         }
-        if self.config.coverage {
-            if let Some(cov) = coverage {
-                if let Err(e) = self.write_coverage_report(&cov) {
-                    tracing::warn!("Failed to write coverage report: {e}");
-                }
-            }
+        if self.config.coverage
+            && let Some(cov) = coverage
+            && let Err(e) = self.write_coverage_report(&cov)
+        {
+            tracing::warn!("Failed to write coverage report: {e}");
         }
         stats.print_table(&self.config);
 
@@ -713,10 +712,10 @@ impl Fuzzer {
         let check_ok = |result: &QueryResult, db_name: &str| -> Result<()> {
             match result {
                 QueryResult::Rows(rows) if rows.len() == 1 && rows[0].0.len() == 1 => {
-                    if let SqlValue::Text(ref text) = rows[0].0[0] {
-                        if text == "ok" {
-                            return Ok(());
-                        }
+                    if let SqlValue::Text(ref text) = rows[0].0[0]
+                        && text == "ok"
+                    {
+                        return Ok(());
                     }
                     bail!("{db_name} integrity check failed: {:?}", rows);
                 }

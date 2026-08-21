@@ -84,6 +84,9 @@ impl QueryProfile {
     }
 }
 
+// Not consumed yet; rustc 1.98 stopped counting derives as uses, hence the
+// allow.
+#[allow(dead_code)]
 #[derive(Debug, Clone, strum::VariantArray)]
 pub enum QueryTypes {
     CreateTable,

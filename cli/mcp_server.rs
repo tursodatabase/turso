@@ -40,6 +40,9 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
+// Documents the initialize payload shape; handle_initialize does not parse it
+// today. rustc 1.98 stopped counting derives as uses, hence the allow.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 struct InitializeRequest {
     #[serde(rename = "protocolVersion")]

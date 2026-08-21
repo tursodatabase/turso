@@ -450,7 +450,6 @@ pub fn resolve_upsert_target(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Emit the bytecode to implement the `DO UPDATE` arm of an UPSERT.
 ///
 /// This routine is entered after the caller has determined that an INSERT
@@ -1553,7 +1552,7 @@ pub fn collect_set_clauses_for_upsert(
                 values.len()
             );
         }
-        for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
+        for (cn, e) in set.col_names.iter().zip(values) {
             let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
                 bail_parse_error!("no such column: {}", cn);
             };

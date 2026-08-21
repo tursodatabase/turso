@@ -110,7 +110,7 @@ impl UnreliableIoState {
                 let mut write_idx = 0usize;
                 for op in &shadow.unsynced {
                     if matches!(op, UnsyncedOp::Write { .. }) {
-                        if write_idx % 2 == 0 {
+                        if write_idx.is_multiple_of(2) {
                             op.apply(&mut image);
                             persisted += 1;
                         } else {

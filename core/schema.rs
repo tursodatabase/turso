@@ -3899,12 +3899,7 @@ impl BTreeTable {
             };
 
             walk_expr_mut(expr, &mut |e| match e {
-                Expr::Column {
-                    table,
-                    column,
-                    is_rowid_alias: _,
-                    ..
-                } if table.is_self_table() => {
+                Expr::Column { table, column, .. } if table.is_self_table() => {
                     if *column == dropped_index {
                         return Err(LimboError::InternalError(
                             "dropped column remained referenced by generated column".to_string(),

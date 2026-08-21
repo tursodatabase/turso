@@ -651,16 +651,16 @@ where
                         (TransactionMode::Read, TransactionMode::Write) => {
                             snapshot.set_transaction_mode(transaction_mode)
                         }
-                        (TransactionMode::Concurrent, TransactionMode::Write) => {
-                            if query.requires_exclusive_tx() {
-                                // MVCC requires an exclusive write tx for DDL
-                                // (see Query::requires_exclusive_tx). The plan
-                                // generator forces a commit before these
-                                // statements, so this upgrade rarely fires —
-                                // kept for defensive correctness if a snapshot
-                                // is built directly.
-                                snapshot.set_transaction_mode(transaction_mode)
-                            }
+                        (TransactionMode::Concurrent, TransactionMode::Write)
+                            if query.requires_exclusive_tx() =>
+                        {
+                            // MVCC requires an exclusive write tx for DDL
+                            // (see Query::requires_exclusive_tx). The plan
+                            // generator forces a commit before these
+                            // statements, so this upgrade rarely fires —
+                            // kept for defensive correctness if a snapshot
+                            // is built directly.
+                            snapshot.set_transaction_mode(transaction_mode)
                         }
                         _ => {}
                     };
@@ -1832,11 +1832,10 @@ impl Paths {
     }
 
     pub fn delete_all_files(&self) {
-        if self.base.exists() {
-            let res = std::fs::remove_dir_all(&self.base);
-            if res.is_err() {
-                tracing::error!(error = %res.unwrap_err(),"failed to remove directory");
-            }
+        if self.base.exists()
+            && let Err(err) = std::fs::remove_dir_all(&self.base)
+        {
+            tracing::error!(error = %err, "failed to remove directory");
         }
     }
 }

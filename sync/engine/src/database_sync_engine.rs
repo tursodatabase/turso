@@ -3799,7 +3799,12 @@ mod tests {
             coro.yield_(SyncEngineIoResult::IO).await?;
         }
 
-        for (page_idx, page) in pages.chunks_exact(super::PAGE_SIZE).enumerate() {
+        for (page_idx, page) in pages
+            .as_chunks::<{ super::PAGE_SIZE }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let mut frame = vec![0; super::WAL_FRAME_SIZE];
             frame[super::WAL_FRAME_HEADER..].copy_from_slice(page);
             let frame_info = turso_core::types::WalFrameInfo {
@@ -4663,7 +4668,12 @@ mod tests {
             protocol: protocol as i32,
         };
         let mut bytes = header.encode_length_delimited_to_vec();
-        for (page_idx, page) in db_bytes.chunks_exact(super::PAGE_SIZE).enumerate() {
+        for (page_idx, page) in db_bytes
+            .as_chunks::<{ super::PAGE_SIZE }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let page_data = PageData {
                 page_id: page_idx as u64,
                 encoded_page: Bytes::copy_from_slice(page),

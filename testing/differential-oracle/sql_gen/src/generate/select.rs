@@ -2527,19 +2527,18 @@ mod tests {
         let mut found_qualified = false;
         for seed in 0..100 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
-                if !select.joins.is_empty() {
-                    let sql = select.to_string();
-                    // With multiple tables, column refs should be qualified (contain a dot)
-                    // Check that the SELECT columns part contains qualified references
-                    if let Some(select_part) = sql.strip_prefix("SELECT ") {
-                        if let Some(cols_part) = select_part.split(" FROM ").next() {
-                            if cols_part.contains('.') {
-                                found_qualified = true;
-                                break;
-                            }
-                        }
-                    }
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full)
+                && !select.joins.is_empty()
+            {
+                let sql = select.to_string();
+                // With multiple tables, column refs should be qualified (contain a dot)
+                // Check that the SELECT columns part contains qualified references
+                if let Some(select_part) = sql.strip_prefix("SELECT ")
+                    && let Some(cols_part) = select_part.split(" FROM ").next()
+                    && cols_part.contains('.')
+                {
+                    found_qualified = true;
+                    break;
                 }
             }
         }
@@ -2577,19 +2576,19 @@ mod tests {
         let mut found_self_join = false;
         for seed in 0..50 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
-                if !select.joins.is_empty() {
-                    let sql = select.to_string();
-                    // Self-join should have aliases (AS tN)
-                    if sql.contains("JOIN users AS ") {
-                        found_self_join = true;
-                        // The joined table must have an alias
-                        assert!(
-                            select.joins[0].alias.is_some(),
-                            "Self-join must have alias: {sql}"
-                        );
-                        break;
-                    }
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full)
+                && !select.joins.is_empty()
+            {
+                let sql = select.to_string();
+                // Self-join should have aliases (AS tN)
+                if sql.contains("JOIN users AS ") {
+                    found_self_join = true;
+                    // The joined table must have an alias
+                    assert!(
+                        select.joins[0].alias.is_some(),
+                        "Self-join must have alias: {sql}"
+                    );
+                    break;
                 }
             }
         }
@@ -2720,15 +2719,15 @@ mod tests {
 
         for seed in 0..50 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
-                if let Some(with) = &select.with_clause {
-                    for cte in &with.ctes {
-                        // Inner CTE query should NOT have its own WITH clause
-                        assert!(
-                            cte.query.with_clause.is_none(),
-                            "CTE inner query should not have a WITH clause (no recursion)"
-                        );
-                    }
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full)
+                && let Some(with) = &select.with_clause
+            {
+                for cte in &with.ctes {
+                    // Inner CTE query should NOT have its own WITH clause
+                    assert!(
+                        cte.query.with_clause.is_none(),
+                        "CTE inner query should not have a WITH clause (no recursion)"
+                    );
                 }
             }
         }
@@ -2784,15 +2783,13 @@ mod tests {
         let mut found_cte_from = false;
         for seed in 0..200 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
-                if select.with_clause.is_some() {
-                    if let Some(from) = &select.from {
-                        if from.table.starts_with("cte_") {
-                            found_cte_from = true;
-                            break;
-                        }
-                    }
-                }
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full)
+                && select.with_clause.is_some()
+                && let Some(from) = &select.from
+                && from.table.starts_with("cte_")
+            {
+                found_cte_from = true;
+                break;
             }
         }
         assert!(found_cte_from, "CTE table should be usable as FROM source");
@@ -2826,13 +2823,13 @@ mod tests {
         let mut found_cte_join = false;
         for seed in 0..200 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
-                if select.with_clause.is_some() {
-                    let sql = select.to_string();
-                    if sql.contains("JOIN cte_") {
-                        found_cte_join = true;
-                        break;
-                    }
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full)
+                && select.with_clause.is_some()
+            {
+                let sql = select.to_string();
+                if sql.contains("JOIN cte_") {
+                    found_cte_join = true;
+                    break;
                 }
             }
         }

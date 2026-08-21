@@ -1579,13 +1579,13 @@ fn bind_partial_index_columns(expr: &mut ast::Expr, table_reference: &JoinedTabl
                     *e = make_rowid();
                 }
             }
-            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                if qualifier_matches(ns.as_str()) {
-                    if let Some(idx) = column_pos(col.as_str()) {
-                        *e = make_column(idx);
-                    } else if is_rowid_keyword(col.as_str()) {
-                        *e = make_rowid();
-                    }
+            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col)
+                if qualifier_matches(ns.as_str()) =>
+            {
+                if let Some(idx) = column_pos(col.as_str()) {
+                    *e = make_column(idx);
+                } else if is_rowid_keyword(col.as_str()) {
+                    *e = make_rowid();
                 }
             }
             _ => {}

@@ -368,7 +368,7 @@ impl PyTursoStatement {
                     .to_string(),
             );
         }
-        Ok(PyTuple::new(py, columns.into_iter())?.unbind())
+        Ok(PyTuple::new(py, columns)?.unbind())
     }
     /// Get tuple with current row values
     /// This method is only valid to call after [Self::step] returned [PyTursoStatusCode::Row] status code

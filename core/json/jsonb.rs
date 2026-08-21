@@ -827,33 +827,27 @@ impl JsonbHeader {
                         None => bail_parse_error!("Failed to read 1-byte size"),
                     },
 
-                    13 => match Self::get_size_bytes(slice, cursor + 1, 2) {
-                        Ok(bytes) => {
-                            offset = 3;
-                            u16::from_be_bytes([bytes[0], bytes[1]]) as usize
-                        }
-                        Err(e) => return Err(e),
-                    },
+                    13 => {
+                        let bytes = Self::get_size_bytes(slice, cursor + 1, 2)?;
+                        offset = 3;
+                        u16::from_be_bytes([bytes[0], bytes[1]]) as usize
+                    }
 
-                    14 => match Self::get_size_bytes(slice, cursor + 1, 4) {
-                        Ok(bytes) => {
-                            offset = 5;
-                            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
-                        }
-                        Err(e) => return Err(e),
-                    },
+                    14 => {
+                        let bytes = Self::get_size_bytes(slice, cursor + 1, 4)?;
+                        offset = 5;
+                        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+                    }
 
                     // 15 = 8-byte payload size (for future expansion per SQLite spec)
-                    15 => match Self::get_size_bytes(slice, cursor + 1, 8) {
-                        Ok(bytes) => {
-                            offset = 9;
-                            u64::from_be_bytes([
-                                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-                                bytes[6], bytes[7],
-                            ]) as usize
-                        }
-                        Err(e) => return Err(e),
-                    },
+                    15 => {
+                        let bytes = Self::get_size_bytes(slice, cursor + 1, 8)?;
+                        offset = 9;
+                        u64::from_be_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ]) as usize
+                    }
 
                     _ => unreachable!(),
                 };

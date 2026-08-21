@@ -258,9 +258,11 @@ use serializer::EncryptedPayload;
 use serializer::{
     extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
 };
+pub(crate) use serializer::{LogBufferWrite, LogChunkStream, LogSerializer};
+// Only the conn_raw_api portable-changes encoder consumes the raw proto pieces.
+#[cfg(feature = "conn_raw_api")]
 pub(crate) use serializer::{
-    log_write, LogBufferWrite, LogChunkStream, LogSerializer, ProtoKey, ProtoSint64, ProtoVarint,
-    PROTO_WIRE_LENGTH_DELIMITED, PROTO_WIRE_VARINT,
+    log_write, ProtoKey, ProtoSint64, ProtoVarint, PROTO_WIRE_LENGTH_DELIMITED, PROTO_WIRE_VARINT,
 };
 
 /// Logical log size in bytes at which a committing transaction will trigger a checkpoint.

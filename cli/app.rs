@@ -1162,7 +1162,7 @@ impl Limbo {
                     let _ = self.writeln(format!(
                         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
                         row.get_value(0).to_string(),
-                        &(indent.repeat(indent_count) + &insn),
+                        (indent.repeat(indent_count) + &insn),
                         p1,
                         row.get_value(3).to_string(),
                         row.get_value(4).to_string(),
@@ -2163,7 +2163,7 @@ impl Limbo {
             // ASCII
             for &byte in chunk {
                 let ch = match byte {
-                    b' '..=b'~' if ![b'{', b'}', b'"', b'\\'].contains(&byte) => byte as char,
+                    b' '..=b'~' if !b"{}\"\\".contains(&byte) => byte as char,
                     _ => '.',
                 };
                 write!(self, "{ch}")?;
@@ -2198,7 +2198,7 @@ impl Limbo {
             "| size {} pagesize {} filename {}",
             metadata.page_count * metadata.page_size,
             metadata.page_size,
-            &metadata.filename
+            metadata.filename
         )?;
 
         let dump_sql = if let Some(pgno) = page_no {
@@ -2226,7 +2226,7 @@ impl Limbo {
             self.write_page_hexdump(&page, metadata.page_size)?;
         }
 
-        writeln!(self, "| end {}", &metadata.filename)?;
+        writeln!(self, "| end {}", metadata.filename)?;
 
         Ok(())
     }

@@ -503,7 +503,7 @@ impl PyTursoSyncIoItem {
                                 tuples
                                     .push(PyTuple::new(py, [key.clone(), value.clone()])?.unbind());
                             }
-                            PyList::new(py, tuples.into_iter())?.unbind()
+                            PyList::new(py, tuples)?.unbind()
                         },
                     },
                 )?),

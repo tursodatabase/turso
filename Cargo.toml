@@ -177,6 +177,14 @@ shuttle = { version = "0.8.1" }
 [profile.dev.package.similar]
 opt-level = 3
 
+# Same as dev, but under its own name so the `cargo lint` alias (see
+# .cargo/config.toml) writes to target/clippy/ instead of target/debug/.
+# Clippy overwrites plain check/build fingerprints, so running it in the
+# default profile forces a full rebuild of every workspace crate on the next
+# `cargo check`/`cargo build` and vice versa.
+[profile.clippy]
+inherits = "dev"
+
 [profile.release]
 debug = "line-tables-only"
 codegen-units = 4

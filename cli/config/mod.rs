@@ -24,11 +24,10 @@ where
     let v: toml::Value = Deserialize::deserialize(deserializer)?;
     let x = T::deserialize(v)
         .map(|v| {
-            let validate = v.validate();
-            if validate.is_err() {
+            if let Err(err) = v.validate() {
                 tracing::error!(
                     "Invalid value for {}.\n Original config value: {:?}",
-                    validate.unwrap_err(),
+                    err,
                     v
                 );
                 T::default()

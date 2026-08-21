@@ -139,7 +139,7 @@ impl DatabaseReplayGenerator {
         updates: &[turso_core::Value],
     ) -> HashMap<String, turso_core::Value> {
         let mut row = HashMap::with_capacity(info.column_names.len());
-        assert!(updates.len() % 2 == 0);
+        assert!(updates.len().is_multiple_of(2));
         let columns_cnt = updates.len() / 2;
         for (i, value) in updates.iter().take(columns_cnt).enumerate() {
             let updated = match value {
@@ -194,7 +194,7 @@ impl DatabaseReplayGenerator {
             }
             DatabaseChangeType::Update => {
                 let mut updates = updates.unwrap();
-                assert!(updates.len() % 2 == 0);
+                assert!(updates.len().is_multiple_of(2));
                 let columns_cnt = updates.len() / 2;
                 let mut values =
                     <crate::alloc::Vec<turso_core::Value> as TursoVecExt<_>>::with_capacity(

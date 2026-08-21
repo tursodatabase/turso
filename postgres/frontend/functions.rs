@@ -768,10 +768,8 @@ fn validate_json_braces(s: &str) -> bool {
         match ch {
             '{' => stack.push('}'),
             '[' => stack.push(']'),
-            '}' | ']' => {
-                if stack.pop() != Some(ch) {
-                    return false;
-                }
+            '}' | ']' if stack.pop() != Some(ch) => {
+                return false;
             }
             _ => {}
         }

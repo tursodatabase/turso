@@ -178,14 +178,12 @@ fn hash_join_materialization_does_not_read_unrewound_probe_cursor() {
                     positioned = true;
                 }
             }
-            "Column" | "RowId" => {
-                if p1 == Some(test_table3_cursor_id) {
-                    assert!(
-                        positioned,
-                        "test_table3 cursor read before being positioned; EXPLAIN row: {row:?}"
-                    );
-                    break;
-                }
+            "Column" | "RowId" if p1 == Some(test_table3_cursor_id) => {
+                assert!(
+                    positioned,
+                    "test_table3 cursor read before being positioned; EXPLAIN row: {row:?}"
+                );
+                break;
             }
             _ => {}
         }

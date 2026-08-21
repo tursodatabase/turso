@@ -129,11 +129,9 @@ pub(super) fn translate_function(
     func_ctx: FuncCtx,
 ) -> Result<usize> {
     let start_reg = program.alloc_registers(args.len());
-    let mut current_reg = start_reg;
 
-    for arg in args.iter() {
+    for (current_reg, arg) in (start_reg..).zip(args.iter()) {
         translate_expr(program, referenced_tables, arg, current_reg, resolver)?;
-        current_reg += 1;
     }
 
     program.emit_insn(Insn::Function {

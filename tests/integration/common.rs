@@ -375,7 +375,7 @@ pub fn compare_string(a: impl AsRef<str>, b: impl AsRef<str>) {
     for i in 0..len {
         if a[i] != b[i] {
             println!(
-                "Bytes differ \n\t at index: dec -> {} hex -> {:#02x} \n\t values dec -> {}!={} hex -> {:#02x}!={:#02x}",
+                "Bytes differ \n\t at index: dec -> {} hex -> {:#x} \n\t values dec -> {}!={} hex -> {:#x}!={:#x}",
                 i, i, a[i], b[i], a[i], b[i]
             );
             break;

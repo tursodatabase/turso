@@ -785,8 +785,10 @@ fn comparator() {
 
     fn decode(slice: &[u8]) -> impl Iterator<Item = OrderedF32> + '_ {
         slice
-            .chunks_exact(4)
-            .map(|b| OrderedF32(f32::from_le_bytes(b.try_into().unwrap())))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| OrderedF32(f32::from_le_bytes(*b)))
     }
 
     fn compare(lhs: &[u8], rhs: &[u8]) -> Ordering {

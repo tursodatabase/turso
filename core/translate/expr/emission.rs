@@ -36,7 +36,9 @@ pub fn emit_literal(
         ast::Literal::Blob(s) => {
             let bytes = ast::blob_literal_hex(s)
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     // We assume that sqlite3-parser has already validated that
                     // the input is valid hex string, thus unwrap is safe.
