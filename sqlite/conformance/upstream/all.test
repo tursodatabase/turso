@@ -176,7 +176,7 @@ set test_files {
   date2                fail
   date3                pass
   date4                fail
-  date5                fail
+  date5                pass
   dbfuzz001            fail
   dbpage               fail
   dbstatus             fail
@@ -338,7 +338,7 @@ set test_files {
   jrnlmode2            fail
   jrnlmode3            fail
   json101              fail
-  json102              fail
+  json102              pass
   json103              fail
   json104              pass
   json105              pass
@@ -574,7 +574,7 @@ set test_files {
   tkt-31338dca7e       pass
   tkt-313723c356       fail
   tkt-385a5b56b9       fail
-  tkt-38cb5df375       fail
+  tkt-38cb5df375       pass
   tkt-3998683a16       pass
   tkt-3a77c9714e       pass
   tkt-3fe897352e       fail

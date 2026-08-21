@@ -264,10 +264,18 @@ impl<'a> Iterator for Lexer<'a> {
                     )))
                 }
                 b':' => {
-                    // `:name` is a named parameter, but `:` followed by a digit
-                    // or non-identifier char is a standalone colon (used in slice syntax).
-                    match self.input.get(self.offset + 1) {
-                        Some(&b) if is_identifier_start(b) => Some(self.mark(|l| l.eat_var())),
+                    // `:name` is a named parameter, and so is `:::name` (the
+                    // name may start with a "::" pair, as in SQLite). Any other
+                    // `:` — before a digit, a space, `]`, a lone `:` — is a
+                    // standalone colon, which the slice syntax `a[1:2]` needs.
+                    // SQLite has no slices and reads `:2` as a parameter; that
+                    // is the one place we deviate from its tokenizer.
+                    match (
+                        self.input.get(self.offset + 1),
+                        self.input.get(self.offset + 2),
+                    ) {
+                        (Some(&b), _) if is_identifier_start(b) => Some(self.mark(|l| l.eat_var())),
+                        (Some(&b':'), Some(&b':')) => Some(self.mark(|l| l.eat_var())),
                         _ => Some(Ok(self.eat_one_token(TokenType::TK_COLON))),
                     }
                 }
@@ -830,6 +838,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Lex a parameter marker: `?` or `?NNN`, or a named parameter that
+    /// starts with `$`, `@` or `:`.
     fn eat_var(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
         let tok = self.eat().unwrap();
@@ -844,27 +854,62 @@ impl<'a> Lexer<'a> {
                     TokenType::TK_VARIABLE,
                 ))
             }
-            _ => {
-                let start_id = self.offset;
-                self.eat_while(is_identifier_continue);
+            _ => self.eat_named_var(start),
+        }
+    }
 
-                // empty variable name
-                if start_id == self.offset {
-                    let token_text =
-                        String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                    return Err(Error::BadVariableName {
-                        span: (start, self.offset - start).into(),
-                        token_text,
-                        offset: start,
-                    });
+    /// Lex the name of a named parameter. `start` is the offset of the
+    /// prefix byte (`$`, `@` or `:`), which the caller has already eaten.
+    fn eat_named_var(&mut self, start: usize) -> Result<Token<'a>> {
+        // Same rule as SQLite's tokenizer (sqlite3GetToken, CC_VARALPHA):
+        // the name is identifier bytes, and a "::" pair anywhere in it —
+        // leading, middle or trailing — is part of the name. That is what
+        // lets the TCL binding pass namespace-qualified variables ($::var,
+        // $ns::var) as one parameter. After at least one identifier byte,
+        // one "(...)" suffix ends the name, for TCL array elements like
+        // $arr(elem); it must be closed and may not contain whitespace.
+        // At least one identifier byte is required, so a bare `$` or `$::`
+        // is still an error.
+        let mut n_id = 0usize;
+        let mut bad_suffix = false;
+        loop {
+            match self.peek() {
+                Some(b) if is_identifier_continue(b) => {
+                    n_id += 1;
+                    self.eat();
                 }
-
-                Ok(Token::new(
-                    &self.input[start..self.offset],
-                    TokenType::TK_VARIABLE,
-                ))
+                Some(b':') if self.input.get(self.offset + 1) == Some(&b':') => {
+                    self.eat();
+                    self.eat();
+                }
+                Some(b'(') if n_id > 0 => {
+                    self.eat();
+                    self.eat_while(|b| b != b')' && !b.is_ascii_whitespace());
+                    if self.peek() == Some(b')') {
+                        self.eat();
+                    } else {
+                        // Unclosed, or whitespace inside the suffix.
+                        bad_suffix = true;
+                    }
+                    break;
+                }
+                _ => break,
             }
         }
+
+        if n_id == 0 || bad_suffix {
+            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+            return Err(Error::BadVariableName {
+                span: (start, self.offset - start).into(),
+                token_text,
+                offset: start,
+            });
+        }
+
+        Ok(Token::new(
+            &self.input[start..self.offset],
+            TokenType::TK_VARIABLE,
+        ))
     }
 
     #[inline]
@@ -1063,6 +1108,61 @@ mod tests {
                 b":named_param".as_slice(),
                 Token::new(b":named_param", TokenType::TK_VARIABLE),
             ),
+            // TCL-style names, lexed as SQLite does: "::" pairs belong to
+            // the name wherever they sit.
+            (
+                b"$::global_var".as_slice(),
+                Token::new(b"$::global_var", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$ns::var".as_slice(),
+                Token::new(b"$ns::var", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"@a::b::c".as_slice(),
+                Token::new(b"@a::b::c", TokenType::TK_VARIABLE),
+            ),
+            (
+                b":a::b::c".as_slice(),
+                Token::new(b":a::b::c", TokenType::TK_VARIABLE),
+            ),
+            (
+                b":::global_var".as_slice(),
+                Token::new(b":::global_var", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$a::".as_slice(),
+                Token::new(b"$a::", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$a::::b".as_slice(),
+                Token::new(b"$a::::b", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$1::2".as_slice(),
+                Token::new(b"$1::2", TokenType::TK_VARIABLE),
+            ),
+            // TCL array elements: one "(...)" suffix, no whitespace inside.
+            (
+                b"$arr(elem)".as_slice(),
+                Token::new(b"$arr(elem)", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$arr(12x)".as_slice(),
+                Token::new(b"$arr(12x)", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$a([b])".as_slice(),
+                Token::new(b"$a([b])", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$a('b')".as_slice(),
+                Token::new(b"$a('b')", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$ns::arr(k)".as_slice(),
+                Token::new(b"$ns::arr(k)", TokenType::TK_VARIABLE),
+            ),
             (
                 b"x'1234567890abcdef'".as_slice(),
                 Token::new(b"x'1234567890abcdef'", TokenType::TK_BLOB),
@@ -1100,6 +1200,34 @@ mod tests {
             println!("Input: {input:?}, Expected: {expect_value:?}, Got: {got_value:?}");
             assert_eq!(got_value, expect_value);
             assert_eq!(token.token_type, expected.token_type);
+        }
+    }
+
+    #[test]
+    fn test_lexer_bad_variable_names() {
+        // A named parameter needs at least one identifier byte; "::" pairs
+        // alone do not make a name, and a "(...)" suffix must be closed with
+        // no whitespace inside. Same as SQLite, which reports these as
+        // unrecognized tokens.
+        let bad_inputs: Vec<&[u8]> = vec![
+            b"$",
+            b"$::",
+            b"@",
+            b"::::a",
+            b"$(",
+            b"$(elem)",
+            b"$a(unclosed",
+            b"$a(x y)",
+            b"$a(b;",
+        ];
+        for input in bad_inputs {
+            let mut lexer = Lexer::new(input);
+            let result = lexer.next().unwrap();
+            assert!(
+                matches!(result, Err(Error::BadVariableName { .. })),
+                "expected BadVariableName for {:?}, got {result:?}",
+                String::from_utf8_lossy(input)
+            );
         }
     }
 
@@ -1317,6 +1445,127 @@ mod tests {
                     Token::new(b"u", TokenType::TK_ID),
                     Token::new(b".", TokenType::TK_DOT),
                     Token::new(b"email", TokenType::TK_ID),
+                ],
+            ),
+            // Slices keep their standalone colons: a `:` is only a
+            // parameter when an identifier byte or a "::" pair follows it.
+            (
+                b"a[1:2]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"1", TokenType::TK_INTEGER),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b"2", TokenType::TK_INTEGER),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            (
+                b"a[:2]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b"2", TokenType::TK_INTEGER),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            (
+                b"a[1:]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"1", TokenType::TK_INTEGER),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            (
+                b"a[:]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // `1::hi` is the slice colon followed by the parameter `:hi`:
+            // the first colon has no identifier byte or "::" pair after it.
+            (
+                b"a[1::hi]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"1", TokenType::TK_INTEGER),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // A bare "::" between identifiers is two colons; only ":::name"
+            // is a parameter.
+            (
+                b"a::b".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":b", TokenType::TK_VARIABLE),
+                ],
+            ),
+            // Like SQLite, the name is greedy: an unspaced slice whose lower
+            // bound is a parameter is one name. Write `a[$lo : :hi]` or
+            // `a[$lo:$hi]` for a slice.
+            (
+                b"a[$lo::hi]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"$lo::hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            (
+                b"a[$lo:$hi]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"$lo", TokenType::TK_VARIABLE),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b"$hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            (
+                b"$x:: y".as_slice(),
+                vec![
+                    Token::new(b"$x::", TokenType::TK_VARIABLE),
+                    Token::new(b" ", TokenType::TK_NONE),
+                    Token::new(b"y", TokenType::TK_ID),
+                ],
+            ),
+            // The "(...)" suffix ends the name: what follows is a new token.
+            (
+                b"$a(b)c".as_slice(),
+                vec![
+                    Token::new(b"$a(b)", TokenType::TK_VARIABLE),
+                    Token::new(b"c", TokenType::TK_ID),
+                ],
+            ),
+            (
+                b"$a(b)+$c(d)".as_slice(),
+                vec![
+                    Token::new(b"$a(b)", TokenType::TK_VARIABLE),
+                    Token::new(b"+", TokenType::TK_PLUS),
+                    Token::new(b"$c(d)", TokenType::TK_VARIABLE),
+                ],
+            ),
+            (
+                b"$a(b)(c)".as_slice(),
+                vec![
+                    Token::new(b"$a(b)", TokenType::TK_VARIABLE),
+                    Token::new(b"(", TokenType::TK_LP),
+                    Token::new(b"c", TokenType::TK_ID),
+                    Token::new(b")", TokenType::TK_RP),
                 ],
             ),
         ];

@@ -1751,6 +1751,39 @@ mod tests {
     }
 
     #[test]
+    fn test_tcl_style_parameter_names_bind_and_expand() {
+        // The TCL binding passes namespace-qualified variables ($::x,
+        // $ns::y) and array elements ($arr(k)) as parameter names. Each
+        // spelling is one parameter, found by its full text, and expanded
+        // SQL — which re-lexes the statement text — sees the same markers
+        // the parse did, so the bound values land in the right places.
+        let conn = open_test_connection().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT $::x, $ns::y, $arr(k), $::x, '$::x'")
+            .unwrap();
+        let x = stmt.parameter_index("$::x").unwrap();
+        let y = stmt.parameter_index("$ns::y").unwrap();
+        let k = stmt.parameter_index("$arr(k)").unwrap();
+        assert_eq!(stmt.parameters_count(), 3);
+        stmt.bind_at(x, Value::from_i64(1)).unwrap();
+        stmt.bind_at(y, Value::build_text("two")).unwrap();
+        stmt.bind_at(k, Value::from_i64(3)).unwrap();
+
+        assert_eq!(stmt.expanded_sql(), "SELECT 1, 'two', 3, 1, '$::x'");
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::from_i64(1),
+                Value::build_text("two"),
+                Value::from_i64(3),
+                Value::from_i64(1),
+                Value::build_text("$::x"),
+            ]]
+        );
+    }
+
+    #[test]
     fn test_metrics_persist_across_reset() {
         let conn = open_test_connection().unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
