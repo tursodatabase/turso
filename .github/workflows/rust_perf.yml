@@ -50,11 +50,7 @@ jobs:
           cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
       - name: Bench ${{ matrix.bench }}
-        run: cargo bench --bench ${{ matrix.bench }} ${{ matrix.features }} 2>&1 | tee output.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bench-output-${{ matrix.bench }}
-          path: output.txt
+        run: cargo bench --bench ${{ matrix.bench }} ${{ matrix.features }}
 
   clickbench:
     runs-on: ubuntu-latest
@@ -99,7 +95,7 @@ jobs:
         run: wget -O $DB_FILE --no-verbose $DB_URL
 
       - name: Bench
-        run: cargo bench --bench tpc_h_benchmark --locked  2>&1 | tee output.txt
+        run: cargo bench --bench tpc_h_benchmark --locked
 
   tpc-h:
     runs-on: ubuntu-latest
