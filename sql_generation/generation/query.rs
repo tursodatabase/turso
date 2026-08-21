@@ -422,12 +422,11 @@ impl Arbitrary for Insert {
                 1,
                 Box::new(gen_upsert_values) as Box<dyn Fn(&mut R) -> Option<Insert>>,
             ),
-            (
-                1,
-                Box::new(gen_nested_self_insert) as Box<dyn Fn(&mut R) -> Option<Insert>>,
-            ),
         ];
 
+        if insert_opts.nested_self_insert {
+            choices.push((1, Box::new(gen_nested_self_insert)));
+        }
         if env.opts().arbitrary_insert_into_select {
             choices.push((1, Box::new(gen_select)));
         }
