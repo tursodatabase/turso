@@ -1,3 +1,4 @@
+mod commit_wal_io_error_rollback;
 mod test_power_loss_before_first_checkpoint;
 mod test_wal;
 mod test_wal_publish_backfill_race;

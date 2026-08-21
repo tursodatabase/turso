@@ -26,16 +26,35 @@
 //! To reopen a database on a materialized post-crash image, write each
 //! file's bytes to disk and open with the regular platform IO.
 //!
-//! Other kinds of storage misbehavior tests need — injected write or fsync
-//! errors, reordered writeback — belong in this module too.
+//! Storage misbehavior is also injected here: [`UnreliableIo::arm_io_error`]
+//! makes a file's writes or fsyncs fail at *submit* time — the `File` method
+//! itself returns `Err`, the way `UnixIO` surfaces a failed `pwrite`/`fsync`
+//! syscall (ENOSPC, EIO, ...). Other kinds — reordered writeback — belong in
+//! this module too.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 
 use turso_core::{
-    io::FileSyncType, Buffer, Clock, Completion, File, MonotonicInstant, OpenFlags,
-    WallClockInstant, IO,
+    io::FileSyncType, Buffer, Clock, Completion, CompletionError, File, MonotonicInstant,
+    OpenFlags, WallClockInstant, IO,
 };
+
+/// The file operation an armed [`UnreliableIo::arm_io_error`] fault targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreliableOp {
+    Pwrite,
+    Sync,
+}
+
+/// An armed submit-time I/O error: while armed, every matching operation on
+/// the target file fails.
+struct IoErrorFault {
+    path: String,
+    op: UnreliableOp,
+    fired: bool,
+}
 
 /// A single not-yet-durable file mutation.
 enum UnsyncedOp {
@@ -92,6 +111,8 @@ struct UnreliableIoState {
     /// simulated power-loss point.
     armed_path: Mutex<Option<String>>,
     snapshot: Mutex<Option<CrashSnapshot>>,
+    /// When set, matching operations on the target file fail at submit time.
+    io_error: Mutex<Option<IoErrorFault>>,
 }
 
 impl UnreliableIoState {
@@ -149,6 +170,7 @@ impl UnreliableIo {
                 files: Mutex::new(HashMap::new()),
                 armed_path: Mutex::new(None),
                 snapshot: Mutex::new(None),
+                io_error: Mutex::new(None),
             }),
         }
     }
@@ -181,6 +203,35 @@ impl UnreliableIo {
             .iter()
             .map(|(path, shadow)| (path.clone(), shadow.lock().unwrap().durable.clone()))
             .collect()
+    }
+
+    /// Arm a submit-time I/O error: while armed, every `op` on `path` fails
+    /// with an I/O error returned from the `File` method itself, the way
+    /// `UnixIO` surfaces a failed syscall. Disarm with
+    /// [`Self::clear_io_error`]; check [`Self::io_error_fired`] to assert the
+    /// fault was actually reached.
+    pub fn arm_io_error(&self, path: &str, op: UnreliableOp) {
+        *self.state.io_error.lock().unwrap() = Some(IoErrorFault {
+            path: path.to_string(),
+            op,
+            fired: false,
+        });
+    }
+
+    /// Disarm the submit-time I/O error so later operations succeed again.
+    pub fn clear_io_error(&self) {
+        *self.state.io_error.lock().unwrap() = None;
+    }
+
+    /// True if the armed submit-time I/O error has failed at least one
+    /// operation.
+    pub fn io_error_fired(&self) -> bool {
+        self.state
+            .io_error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|fault| fault.fired)
     }
 
     /// True when `path` has writes not yet covered by a successful fsync.
@@ -264,6 +315,23 @@ struct UnreliableFile {
     state: Arc<UnreliableIoState>,
 }
 
+impl UnreliableFile {
+    /// Returns the armed submit-time error for `op` on this file, if any.
+    /// The failed operation never reaches the shadow: nothing entered the
+    /// page cache.
+    fn injected_error(&self, op: UnreliableOp) -> turso_core::Result<()> {
+        let mut guard = self.state.io_error.lock().unwrap();
+        let Some(fault) = guard
+            .as_mut()
+            .filter(|fault| fault.path == self.path && fault.op == op)
+        else {
+            return Ok(());
+        };
+        fault.fired = true;
+        Err(CompletionError::IOError(ErrorKind::Other, "unreliable_io injected error").into())
+    }
+}
+
 impl File for UnreliableFile {
     fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
         self.inner.lock_file(exclusive)
@@ -283,6 +351,7 @@ impl File for UnreliableFile {
         buffer: Arc<Buffer>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
+        self.injected_error(UnreliableOp::Pwrite)?;
         self.shadow
             .lock()
             .unwrap()
@@ -315,6 +384,7 @@ impl File for UnreliableFile {
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        self.injected_error(UnreliableOp::Sync)?;
         // Simulated power loss: crash while the armed file's fsync is in
         // flight, i.e. after its writes were submitted but before any of them
         // were made durable.

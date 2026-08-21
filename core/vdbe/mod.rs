@@ -3120,8 +3120,20 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
+                        // A COMMIT that fails mid-flight (e.g. a WAL I/O error)
+                        // has already flipped `auto_commit` back to true in
+                        // op_auto_commit while the write transaction is still
+                        // open, so `!auto_commit` is not a reliable "in a
+                        // transaction" signal here: also key the rollback off
+                        // the transaction state, or a later statement silently
+                        // commits the leaked dirty pages. (Deeper fix: stop
+                        // using the autocommit flag as the commit machinery's
+                        // finalize signal and flip it only after the commit
+                        // succeeds.)
                         if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
+                            || (err.is_some()
+                                && (!self.connection.get_auto_commit()
+                                    || self.connection.is_in_write_tx()))
                         {
                             self.rollback_current_txn(pager);
                         }
