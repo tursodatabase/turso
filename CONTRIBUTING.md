@@ -142,6 +142,31 @@ echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
 ```
 
+## IDE setup and keeping `cargo check` fast
+
+RustRover's external linter and rust-analyzer's save check both run
+`cargo check --all-targets` across the workspace every time you save. With warm
+caches that costs a few seconds per save, even right after editing
+`turso_core`. If your IDE check regularly takes 25s+, the caches are being
+invalidated between runs. The usual causes, in order of likelihood:
+
+* Something runs clippy into the default target dir. Clippy overwrites plain
+  check/build fingerprints (and vice versa), so every clippy pass forces the
+  next check to rebuild every workspace crate from scratch. Always run clippy
+  through `cargo lint` (its own profile keeps the caches isolated), and in
+  RustRover keep Settings | Rust | External Linters set to **Cargo Check**, not
+  Clippy. If you want Clippy diagnostics in the IDE anyway, add
+  `--target-dir target/rustrover` to the linter's additional arguments so the
+  IDE gets its own cache universe.
+* The IDE and your terminal disagree on the environment. A `RUSTFLAGS` or
+  `RUSTC_WRAPPER` (e.g. sccache) configured in one but not the other flips the
+  shared fingerprints on every alternation, exactly like clippy does.
+
+If on-save checking still feels too slow, turn off "Run external linter to
+analyze code on the fly" in RustRover — its built-in analyzer keeps showing
+errors inline — and run `cargo check -p turso_core` yourself while iterating
+on core.
+
 ## Developing with AI coding agents
 
 You're welcome to develop Turso with AI coding agents such as Claude Code, Codex, or OpenCode. Used well, they can help you explore the codebase, draft tests, and polish your contributions. To make the most of them — and to get your PRs merged — keep the following in mind.
