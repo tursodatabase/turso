@@ -17,7 +17,6 @@ on:
         default: false
         type: boolean
   pull_request:
-    branches: ["main"]
 
 permissions:
   contents: read
