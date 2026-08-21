@@ -239,6 +239,11 @@ pub struct InsertOpts {
     pub max_rows: NonZeroU32,
     #[garde(range(min = 0.0, max = 1.0))]
     pub upsert_prob: f64,
+    /// Generate `INSERT INTO t SELECT * FROM t WHERE ...` statements. Each one
+    /// can double the table, so callers that do not track row counts (and so
+    /// cannot bound the growth) should turn this off.
+    #[garde(skip)]
+    pub nested_self_insert: bool,
 }
 
 impl Default for InsertOpts {
@@ -247,6 +252,7 @@ impl Default for InsertOpts {
             min_rows: NonZero::new(1).unwrap(),
             max_rows: NonZero::new(10).unwrap(),
             upsert_prob: 0.15,
+            nested_self_insert: true,
         }
     }
 }
