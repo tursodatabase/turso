@@ -24,10 +24,34 @@ pub struct Opts {
     pub table: TableOpts,
     #[garde(dive)]
     pub query: QueryOpts,
+    #[garde(dive)]
+    pub value: ValueOpts,
     #[garde(skip)]
     /// Generate arbitrary INSERT INTO ... SELECT queries. This is disabled by default, as it makes
     /// the simulator very slow and generates huge databases.
     pub arbitrary_insert_into_select: bool,
+}
+
+/// Options for generating column values
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields, default)]
+pub struct ValueOpts {
+    /// Probability that a generated integer, text or blob value is one whose
+    /// record payload is empty: integer 0 or 1, the empty string, or the empty
+    /// blob. A one-column record holding such a value is 2 bytes, so an index
+    /// cell holding it is below the 4-byte minimum cell size. That is the shape
+    /// b-tree balancing has historically gotten wrong (see SQLite's in2.test),
+    /// so these values get a bias instead of being left to chance.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub tiny_value_prob: f64,
+}
+
+impl Default for ValueOpts {
+    fn default() -> Self {
+        Self {
+            tiny_value_prob: 0.02,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
