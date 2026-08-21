@@ -214,7 +214,7 @@ Fork the repository and open a pull request to submit your work.
 
 The CI checks for formatting, Clippy warnings, and test failures so remember to run the following before submitting your pull request:
 
-* `cargo fmt` and `cargo clippy --workspace --all-features --all-targets -- --deny=warnings` to keep the code formatting in check.
+* `cargo fmt` and `cargo lint` to keep the code formatting in check. (`cargo lint` is an alias defined in `.cargo/config.toml` that runs the same clippy invocation as CI, under a dedicated build profile so it doesn't invalidate your `cargo check`/`cargo build` caches.)
 * `make test` to run the test suite.
 
 **Keep your pull requests focused and as small as possible, but not smaller.** IOW, when preparing a pull request, ensure it focuses on a single thing and that your commits align with that. For example, a good pull request might fix a specific bug or a group of related bugs. Or a good pull request might add a new feature and test for it. Conversely, a bad pull request might fix a bug, add a new feature, and refactor some code.
