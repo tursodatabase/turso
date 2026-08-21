@@ -1741,7 +1741,7 @@ fn parse_table(
 
         // A CTE can read another CTE defined by the surrounding WITH clause.
         if let Some(outer_ref) =
-            table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+            table_references.find_outer_cte_source_by_identifier(&normalized_qualified_name)
         {
             if !args.is_empty() {
                 if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
@@ -1980,7 +1980,7 @@ fn parse_table(
     // but it's not part of the join order.
     if qualified_name.db_name.is_none() {
         if let Some(outer_ref) =
-            table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+            table_references.find_outer_cte_source_by_identifier(&normalized_qualified_name)
         {
             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                 table_references.add_joined_table(JoinedTable {

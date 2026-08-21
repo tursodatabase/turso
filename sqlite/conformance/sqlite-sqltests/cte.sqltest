@@ -1464,6 +1464,15 @@ expect {
     2
 }
 
+test cte-alias-is-not-visible-as-inner-from-source {
+    WITH original(x) AS (VALUES(1))
+    SELECT * FROM original AS alias
+    WHERE EXISTS (SELECT 1 FROM alias);
+}
+expect error {
+    no such table: alias
+}
+
 # An unqualified column in a correlated subquery resolves against a CTE joined
 # in the outer FROM clause, same as a plain table.
 test cte-unqualified-correlated-ref-in-exists {
