@@ -44,6 +44,8 @@ pub enum Generated {
         sqlite_sql: String,
         name: String,
         columns: Vec<sql_gen_prop::ColumnDef>,
+        /// The view reads `sqlite_sequence`.
+        reads_sequence_table: bool,
     },
     DropMatview {
         sql: String,
@@ -395,6 +397,7 @@ impl PropTestBackend {
             // replace hit an existing row.
             profile.generation.value = profile.generation.value.narrow();
             profile.generation.table_spelling.quoted = true;
+            profile.create_table.extra.autoincrement = true;
         }
         Self {
             test_runner,
@@ -439,6 +442,7 @@ impl SqlGenerator for PropTestBackend {
                 return Ok(Generated::CreateMatview {
                     turso_sql: create.to_string(),
                     sqlite_sql: create.plain_view_sql(),
+                    reads_sequence_table: create.reads_sequence_table(),
                     name: create.view_name,
                     columns: create.output_columns,
                 });
@@ -561,6 +565,9 @@ fn to_prop_schema(schema: &sql_gen::Schema, matviews: &Matviews) -> sql_gen_prop
     for (name, columns) in matviews {
         builder =
             builder.add_materialized_view(sql_gen_prop::Table::new(name.clone(), columns.clone()));
+    }
+    if schema.has_sequence_table {
+        builder = builder.with_sequence_table();
     }
     builder.build()
 }
@@ -849,6 +856,16 @@ mod tests {
                     ],
                 ),
             ),
+            (
+                "CREATE TABLE counters(id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)",
+                Table::new(
+                    "counters",
+                    vec![
+                        ColumnDef::new("id", DataType::Integer).primary_key(),
+                        ColumnDef::new("label", DataType::Text),
+                    ],
+                ),
+            ),
         ];
         for (sql, _) in &tables {
             turso.execute(sql).unwrap();
@@ -857,9 +874,9 @@ mod tests {
 
         let mut matviews = Matviews::new();
         let mut runner = TestRunner::deterministic();
-        let (mut same_name_joins, mut self_joins) = (0, 0);
+        let (mut same_name_joins, mut self_joins, mut sequence_views) = (0, 0, 0);
         for _ in 0..200 {
-            let mut builder = SchemaBuilder::new();
+            let mut builder = SchemaBuilder::new().with_sequence_table();
             for (_, table) in &tables {
                 builder = builder.add_table(table.clone());
             }
@@ -874,6 +891,17 @@ mod tests {
             let turso_result = DifferentialOracle::execute_turso(&turso, &turso_sql);
             let sqlite_result =
                 DifferentialOracle::execute_sqlite(&sqlite, &create.plain_view_sql());
+            sequence_views += usize::from(create.reads_sequence_table());
+            if crate::runner::turso_refused_sequence_table_view(
+                create.reads_sequence_table(),
+                &turso_result,
+                &sqlite_result,
+            ) {
+                sqlite
+                    .execute(&format!("DROP VIEW {}", create.view_name), [])
+                    .unwrap();
+                continue;
+            }
             assert!(
                 !matches!(turso_result, QueryResult::Error(_))
                     && !matches!(sqlite_result, QueryResult::Error(_)),
@@ -883,6 +911,6 @@ mod tests {
             self_joins += usize::from(turso_sql.contains(" AS sjk, "));
             matviews.insert(create.view_name, create.output_columns);
         }
-        assert!(same_name_joins > 0 && self_joins > 0);
+        assert!(same_name_joins > 0 && self_joins > 0 && sequence_views > 0);
     }
 }

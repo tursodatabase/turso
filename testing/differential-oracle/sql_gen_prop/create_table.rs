@@ -293,6 +293,9 @@ pub struct CreateTableProfile {
     /// Draw 4 in 10 column names from a small pool, so that different tables
     /// have columns with the same name.
     pub shared_column_names: bool,
+    /// Declare half of the INTEGER PRIMARY KEY columns AUTOINCREMENT, which
+    /// creates the `sqlite_sequence` table.
+    pub autoincrement: bool,
 }
 
 impl Default for CreateTableProfile {
@@ -306,6 +309,7 @@ impl Default for CreateTableProfile {
             column: ColumnProfile::default(),
             main_schema_only: false,
             shared_column_names: false,
+            autoincrement: false,
         }
     }
 }
@@ -322,6 +326,7 @@ impl CreateTableProfile {
             column: self.column.minimal(),
             main_schema_only: self.main_schema_only,
             shared_column_names: self.shared_column_names,
+            autoincrement: self.autoincrement,
         }
     }
 
@@ -336,6 +341,7 @@ impl CreateTableProfile {
             column: self.column.high_constraints(),
             main_schema_only: self.main_schema_only,
             shared_column_names: self.shared_column_names,
+            autoincrement: self.autoincrement,
         }
     }
 
@@ -350,6 +356,7 @@ impl CreateTableProfile {
             column: self.column.full_constraints(),
             main_schema_only: self.main_schema_only,
             shared_column_names: self.shared_column_names,
+            autoincrement: self.autoincrement,
         }
     }
 
@@ -364,6 +371,7 @@ impl CreateTableProfile {
             column: self.column,
             main_schema_only: self.main_schema_only,
             shared_column_names: self.shared_column_names,
+            autoincrement: self.autoincrement,
         }
     }
 
@@ -406,6 +414,8 @@ pub struct CreateTableStatement {
     pub if_not_exists: bool,
     pub strict: bool,
     pub temporary: Option<TemporaryKeyword>,
+    /// The first column is an INTEGER PRIMARY KEY declared AUTOINCREMENT.
+    pub autoincrement: bool,
 }
 
 impl fmt::Display for CreateTableStatement {
@@ -422,7 +432,10 @@ impl fmt::Display for CreateTableStatement {
 
         write!(f, "{} (", self.table_name)?;
 
-        let col_defs: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
+        let mut col_defs: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
+        if self.autoincrement {
+            col_defs[0].push_str(" AUTOINCREMENT");
+        }
         write!(f, "{})", col_defs.join(", "))?;
 
         if self.strict {
@@ -770,6 +783,11 @@ pub fn create_table(
     let strict_prob = create_table_profile.strict_probability;
     let shared_column_names = create_table_profile.shared_column_names;
     let names = column_names(shared_column_names);
+    let autoincrement_roll = if create_table_profile.autoincrement {
+        any::<bool>().boxed()
+    } else {
+        Just(false).boxed()
+    };
 
     any::<proptest::sample::Index>()
         .prop_flat_map(move |db_idx| {
@@ -789,6 +807,7 @@ pub fn create_table(
                     column_def_named(&column_profile, names.clone()),
                     column_count_range.clone(),
                 ),
+                autoincrement_roll.clone(),
             )
         })
         .prop_map(
@@ -800,6 +819,7 @@ pub fn create_table(
                 temp_keyword_long,
                 pk_col,
                 other_cols,
+                autoincrement_roll,
             )| {
                 let strict = strict_roll < strict_prob;
                 let temporary = match target_db.as_deref() {
@@ -807,6 +827,10 @@ pub fn create_table(
                     _ => None,
                 };
 
+                let autoincrement = autoincrement_roll
+                    && pk_col
+                        .as_ref()
+                        .is_some_and(|pk| pk.data_type == DataType::Integer);
                 let mut columns = Vec::with_capacity(other_cols.len() + 1);
                 if let Some(pk) = pk_col {
                     columns.push(pk);
@@ -852,6 +876,7 @@ pub fn create_table(
                     if_not_exists,
                     strict,
                     temporary,
+                    autoincrement,
                 }
             },
         )
@@ -928,6 +953,7 @@ mod tests {
             if_not_exists: false,
             strict: false,
             temporary: None,
+            autoincrement: false,
         };
 
         assert_eq!(
@@ -952,6 +978,7 @@ mod tests {
             if_not_exists: true,
             strict: false,
             temporary: None,
+            autoincrement: false,
         };
 
         assert_eq!(
@@ -976,6 +1003,7 @@ mod tests {
             if_not_exists: false,
             strict: false,
             temporary: Some(TemporaryKeyword::Temporary),
+            autoincrement: false,
         };
 
         assert_eq!(
@@ -1075,6 +1103,58 @@ mod tests {
             let dt = strategy.new_tree(&mut runner).unwrap().current();
             assert_eq!(dt, DataType::Integer);
         }
+    }
+
+    #[test]
+    fn autoincrement_follows_the_primary_key_of_the_first_column() {
+        let stmt = CreateTableStatement {
+            table_name: "seed".to_string(),
+            columns: vec![
+                ColumnDef::new("id", DataType::Integer).primary_key(),
+                ColumnDef::new("v", DataType::Text),
+            ],
+            if_not_exists: false,
+            strict: false,
+            temporary: None,
+            autoincrement: true,
+        };
+
+        assert_eq!(
+            stmt.to_string(),
+            "CREATE TABLE seed (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)"
+        );
+    }
+
+    fn generated_tables(autoincrement: bool) -> Vec<CreateTableStatement> {
+        let profile =
+            StatementProfile::default().with_create_table_profile(WeightedProfile::with_extra(
+                1,
+                CreateTableProfile {
+                    autoincrement,
+                    ..Default::default()
+                },
+            ));
+        let strategy = create_table(&empty_schema(), &profile);
+        let mut runner = TestRunner::deterministic();
+        (0..100)
+            .map(|_| strategy.new_tree(&mut runner).unwrap().current())
+            .collect()
+    }
+
+    #[test]
+    fn autoincrement_profile_declares_some_integer_primary_keys_autoincrement() {
+        let tables = generated_tables(true);
+        assert!(tables.iter().any(|t| t.autoincrement));
+        assert!(tables.iter().any(|t| !t.autoincrement));
+        for table in tables.iter().filter(|t| t.autoincrement) {
+            assert!(table.columns[0].primary_key);
+            assert_eq!(table.columns[0].data_type, DataType::Integer);
+        }
+    }
+
+    #[test]
+    fn default_profile_never_declares_autoincrement() {
+        assert!(generated_tables(false).iter().all(|t| !t.autoincrement));
     }
 
     proptest! {
