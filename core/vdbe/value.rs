@@ -1,3 +1,5 @@
+#[cfg(feature = "json")]
+use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
@@ -607,6 +609,14 @@ impl Value {
         }
     }
 
+    pub fn exec_subtype(&self) -> Value {
+        match self {
+            #[cfg(feature = "json")]
+            Value::Text(t) if t.subtype == TextSubtype::Json => Value::from_i64(74),
+            _ => Value::from_i64(0),
+        }
+    }
+
     pub fn exec_typeof(&self) -> Value {
         match self {
             Value::Null => Value::build_text("null"),
@@ -939,8 +949,7 @@ impl Value {
         }
         Ok(match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
-            // Historically called NONE, but it's the same as BLOB
-            Affinity::Blob => {
+            Affinity::Blob | Affinity::None => {
                 if let Value::Blob(blob) = self {
                     return Value::from_slice(blob);
                 }

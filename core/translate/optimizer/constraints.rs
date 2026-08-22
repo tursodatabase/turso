@@ -1,16 +1,18 @@
+use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
+use crate::translate::expr::comparison_affinity;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         expr::{
-            as_binary_components, comparison_affinity, get_expr_affinity, truth_test_rhs,
-            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
+            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
+            walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
-            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            TableReferences, WhereTerm,
+            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Plan,
+            SubqueryState, TableReferences, WhereTerm,
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -27,8 +29,6 @@ use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
-
-use super::{cost_params::CostModelParams, AvailableIndexes};
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
@@ -919,7 +919,6 @@ pub fn constraints_from_where_clause(
                     .expect("subquery not found");
                 // Only use as constraint if NOT correlated
                 if !subquery.correlated {
-                    let estimated_values = params.in_subquery_rows;
                     let table_stats = schema
                         .analyze_stats
                         .table_stats(table_reference.table.get_name());
@@ -927,6 +926,22 @@ pub fn constraints_from_where_clause(
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
                         as f64;
+                    // Use the inner plan's row count instead of always using 25.
+                    // FIXME: The plan does not estimate distinct result values.
+                    // Until it does, cap this estimate at the square root of the
+                    // table row count.
+                    let planned_rows = match &subquery.state {
+                        SubqueryState::Unevaluated {
+                            plan: Some(inner_plan),
+                        } => match inner_plan.as_ref() {
+                            Plan::Select(plan) => plan.estimated_output_rows,
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let estimated_values = planned_rows
+                        .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
+                        .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
                     let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
                     // SQLite's `comparisonAffinity` for IN-subquery combines the
                     // LHS column affinity with each result column via
@@ -1443,6 +1458,21 @@ pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[u
     ordered
 }
 
+/// This returns `None` if any of the index's WHERE clause conjunct terms don't match
+/// with at least one term from the query's WHERE clause.
+///
+/// Otherwise, it returns the indexes into `query_where_clause` of the matching terms.
+/// For example, using this partial index:
+///
+/// CREATE INDEX idx on t(a) WHERE length(a) < 5 AND substr(a, 1, 1) == 'B';
+///
+/// this will return 1 and 2:
+///
+/// SELECT a FROM t WHERE substr(a, 2, 2) == 'C' AND length(a) < 5 AND substr(a, 1, 1) == 'B';
+///
+/// And this will return `None`:
+///
+/// CREATE INDEX idx on t(a) WHERE length(a) < 1234 AND substr(a, 1, 1) == 'B';
 pub(super) fn partial_index_predicate_terms(
     index: &Index,
     table_reference: &JoinedTable,

@@ -270,6 +270,105 @@ pub struct HashBuildData {
     pub track_matched: bool,
 }
 
+/// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
+/// them. Most seeks have no such columns, so the empty mask is a null pointer
+/// and only IS-seeks allocate (boxed to keep Insn small).
+///
+/// Build it from a [`BitSet`] via `From`; that keeps the invariant that the
+/// inner option is `None` exactly when the mask is empty.
+#[derive(Debug, Clone, Default)]
+pub struct NullMatchingMask(Option<Box<BitSet>>);
+
+impl NullMatchingMask {
+    /// Returns true if key column `idx` uses `IS`, so NULL may match in it.
+    pub fn get(&self, idx: usize) -> bool {
+        self.0.as_ref().is_some_and(|mask| mask.get(idx))
+    }
+
+    /// Returns true if no key column uses `IS`.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<BitSet> for NullMatchingMask {
+    fn from(mask: BitSet) -> Self {
+        Self((!mask.is_empty()).then(|| Box::new(mask)))
+    }
+}
+
+/// Data for AddColumn instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AddColumnData {
+    pub db: usize,
+    pub table: String,
+    pub column: Column,
+    pub check_constraints: Vec<CheckConstraint>,
+    pub foreign_keys: Vec<Arc<ForeignKey>>,
+}
+
+/// Data for IntegrityCk instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct IntegrityCkData {
+    pub db: usize,
+    pub max_errors: usize,
+    pub roots: Vec<i64>,
+    pub dropped_roots: Vec<i64>,
+    pub message_register: usize,
+}
+
+/// Data for AddSequence instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AddSequenceData {
+    pub db: usize,
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+/// Data for SorterOpen instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct SorterOpenData {
+    pub cursor_id: CursorID, // P1
+    pub columns: usize,      // P2
+    /// Combined order, collation, and nulls ordering per column.
+    pub order_collations_nulls: crate::alloc::Vec<(
+        SortOrder,
+        Option<CollationSeq>,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
+    /// Per-column custom type comparators for ORDER BY sorting.
+    /// When present, the comparator is used instead of standard value comparison.
+    pub comparators: crate::alloc::Vec<Option<SortComparatorType>>,
+}
+
+/// Data for AggStep instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AggStepData {
+    pub acc_reg: usize,
+    pub col: usize,
+    pub delimiter: usize,
+    pub func: AccumulatorFunc,
+    /// Optional custom type comparator for MIN/MAX aggregates.
+    pub comparator: Option<SortComparatorType>,
+    /// Collation for comparison-based aggregates (MIN/MAX), resolved at
+    /// translation time from the argument expression.
+    pub collation: Option<CollationSeq>,
+}
+
+/// Data for ArrayEncode instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct ArrayEncodeData {
+    pub reg: usize,
+    pub element_affinity: Affinity,
+    pub element_type: Arc<str>,
+    pub table_name: Arc<str>,
+    pub col_name: Arc<str>,
+}
+
 /// Data for HashDistinct instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct HashDistinctData {
@@ -661,11 +760,7 @@ pub enum Insn {
     /// Input: reg = JSON text like '[1,2,3]'. Output: reg = record-format BLOB.
     /// Raises SQLITE_CONSTRAINT on type mismatch.
     ArrayEncode {
-        reg: usize,
-        element_affinity: Affinity,
-        element_type: Arc<str>,
-        table_name: Arc<str>,
-        col_name: Arc<str>,
+        data: Box<ArrayEncodeData>,
     },
 
     /// Convert a native record-format BLOB back to PostgreSQL-style array text for display.
@@ -832,11 +927,18 @@ pub enum Insn {
     Next {
         cursor_id: CursorID,
         pc_if_next: BranchOffset,
+        /// True when this step is part of a full table scan (a loop over the
+        /// whole table with no index or rowid constraint). Only these steps
+        /// count toward SQLITE_STMTSTATUS_FULLSCAN_STEP, matching SQLite,
+        /// which tags the opcode with P5 at codegen time.
+        fullscan: bool,
     },
 
     Prev {
         cursor_id: CursorID,
         pc_if_prev: BranchOffset,
+        /// See [Insn::Next::fullscan].
+        fullscan: bool,
     },
 
     /// Halt the program.
@@ -1000,7 +1102,7 @@ pub enum Insn {
         eq_only: bool,
         /// Key columns that use `IS` instead of `=`. NULL may match in these
         /// columns, so the seek must not stop when their key value is NULL.
-        null_matching_mask: BitSet,
+        null_matching_mask: NullMatchingMask,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -1040,7 +1142,7 @@ pub enum Insn {
         eq_only: bool,
         /// Key columns that use `IS` instead of `=`. NULL may match in these
         /// columns, so the seek must not stop when their key value is NULL.
-        null_matching_mask: BitSet,
+        null_matching_mask: NullMatchingMask,
     },
 
     // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -1097,15 +1199,7 @@ pub enum Insn {
     },
 
     AggStep {
-        acc_reg: usize,
-        col: usize,
-        delimiter: usize,
-        func: AccumulatorFunc,
-        /// Optional custom type comparator for MIN/MAX aggregates.
-        comparator: Option<SortComparatorType>,
-        /// Collation for comparison-based aggregates (MIN/MAX), resolved at
-        /// translation time from the argument expression.
-        collation: Option<CollationSeq>,
+        data: Box<AggStepData>,
     },
 
     /// Mirror-image of AggStep: fires when a row crosses the frame-start
@@ -1136,17 +1230,7 @@ pub enum Insn {
 
     /// Open a sorter.
     SorterOpen {
-        cursor_id: CursorID, // P1
-        columns: usize,      // P2
-        /// Combined order, collation, and nulls ordering per column.
-        order_collations_nulls: crate::alloc::Vec<(
-            SortOrder,
-            Option<CollationSeq>,
-            Option<turso_parser::ast::NullsOrder>,
-        )>,
-        /// Per-column custom type comparators for ORDER BY sorting.
-        /// When present, the comparator is used instead of standard value comparison.
-        comparators: crate::alloc::Vec<Option<SortComparatorType>>,
+        data: Box<SorterOpenData>,
     },
 
     /// Insert a row into the sorter.
@@ -1443,13 +1527,7 @@ pub enum Insn {
     /// Add a fully-configured sequence to the in-memory schema.
     /// Emitted by CREATE SEQUENCE after ParseSchema has added the backing table.
     AddSequence {
-        db: usize,
-        name: String,
-        start: i64,
-        increment: i64,
-        min_value: i64,
-        max_value: i64,
-        cycle: bool,
+        data: Box<AddSequenceData>,
     },
     /// Drop a sequence from the in-memory schema
     DropSequence {
@@ -1780,11 +1858,7 @@ pub enum Insn {
     /// In passive MVCC mode, `dropped_roots` lists checkpointed objects dropped before the next
     /// checkpoint; execute walks them after live roots and skips pages already accounted for.
     IntegrityCk {
-        db: usize,
-        max_errors: usize,
-        roots: Vec<i64>,
-        dropped_roots: Vec<i64>,
-        message_register: usize,
+        data: Box<IntegrityCkData>,
     },
     RenameTable {
         db: usize,
@@ -1797,11 +1871,7 @@ pub enum Insn {
         column_index: usize,
     },
     AddColumn {
-        db: usize,
-        table: String,
-        column: Box<Column>,
-        check_constraints: Vec<CheckConstraint>,
-        foreign_keys: Vec<Arc<ForeignKey>>,
+        data: Box<AddColumnData>,
     },
     AlterColumn {
         db: usize,
@@ -1848,9 +1918,9 @@ pub enum Insn {
 
     // OP_Explain
     Explain {
-        p1: usize,         // P1: address of instruction
-        p2: Option<usize>, // P2: address of parent explain instruction
-        detail: String,    // P4: detail text
+        p1: usize,                                     // P1: address of instruction
+        p2: Option<usize>,                             // P2: address of parent explain instruction
+        detail: Box<crate::translate::eqp::EqpDetail>, // P4: structured plan that `Display`s to the detail text
     },
     // Increment a "constraint counter" by P2 (P2 may be negative or positive).
     // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).

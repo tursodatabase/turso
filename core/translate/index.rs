@@ -1,7 +1,7 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
-use crate::index_method::{ensure_mvcc_support, IndexMethodConfiguration};
+use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
@@ -30,7 +30,7 @@ use crate::{
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
+        insn::{IdxInsertFlags, Insn, RegisterOrLiteral, SorterOpenData},
     },
 };
 use rustc_hash::FxHashMap as HashMap;
@@ -204,16 +204,12 @@ pub fn translate_create_index(
         }
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
-            let attachment = index_module.attach(&IndexMethodConfiguration {
+            index_method = Some(index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
                 columns: columns.try_clone()?,
                 parameters,
-            })?;
-            if connection.mvcc_enabled() {
-                ensure_mvcc_support(&attachment.definition(), true)?;
-            }
-            index_method = Some(attachment);
+            })?);
         }
     }
     let idx = Arc::new(Index {
@@ -450,6 +446,7 @@ fn emit_refill_index(
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
+            fullscan: false,
         });
         program.preassign_label_to_next_insn(loop_end_label);
     } else {
@@ -459,10 +456,12 @@ fn emit_refill_index(
             .map(|c| (c.order, c.collation, c.nulls_order))
             .try_collect()?;
         program.emit_insn(Insn::SorterOpen {
-            cursor_id: sorter_cursor_id,
-            columns: columns.len(),
-            order_collations_nulls,
-            comparators: crate::alloc::vec![],
+            data: Box::new(SorterOpenData {
+                cursor_id: sorter_cursor_id,
+                columns: columns.len(),
+                order_collations_nulls,
+                comparators: crate::alloc::vec![],
+            }),
         });
         // SorterData moves each sorted record into the pseudo cursor's
         // content register; the two must name the same register.
@@ -543,6 +542,7 @@ fn emit_refill_index(
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
+            fullscan: false,
         });
         program.preassign_label_to_next_insn(loop_end_label);
 
@@ -1359,6 +1359,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(loop_end_label);

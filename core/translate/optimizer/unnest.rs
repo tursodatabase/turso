@@ -24,6 +24,80 @@
 //! WHERE o.value < i.avg_value
 //! ```
 //!
+//! This is the **group-first** form: it groups the whole inner table first and
+//! then joins the groups to the outer rows. In this module, a "key" means one
+//! distinct value of the column that links the two queries (`i.key` above).
+//! Group-first:
+//!
+//! - computes the aggregate for each key once, even when many outer rows ask
+//!   for the same key;
+//! - also computes the aggregate for keys that no outer row asks for; and
+//! - is used for `avg`, `count`, `min`, `max`, and `total` when their inputs,
+//!   aggregate `FILTER` expressions, and inner `WHERE` expressions cannot fail.
+//!
+//! The second point is the dangerous one. The original subquery only reads the
+//! keys that outer rows ask for. Group-first reads every key, so it can hit an
+//! error that the original query never hits. For example:
+//!
+//! - `sum` can overflow for unused key 99 when its values are
+//!   `9223372036854775807` and `1`, although no outer row asks for 99;
+//! - `group_concat` or `string_agg` can build an unused string larger than the
+//!   largest SQL value that Turso allows; and
+//! - `avg(json_extract(value, '$'))` can read invalid JSON for an unused key.
+//!
+//! When group-first is unsafe, a direct `WHERE` comparison can instead use the
+//! **join-first** form: it joins each outer row to its matching inner rows
+//! first and then groups the joined rows back into one group per outer row.
+//!
+//! ```sql
+//! -- Before
+//! SELECT o.id
+//! FROM outer_table o
+//! WHERE o.limit > (
+//!   SELECT sum(i.value) FROM inner_table i WHERE i.key = o.key
+//! );
+//!
+//! -- After
+//! SELECT o.id
+//! FROM outer_table o
+//! LEFT JOIN inner_table i ON i.key = o.key
+//! GROUP BY o.rowid
+//! HAVING o.limit > sum(i.value) FILTER (WHERE i.rowid IS NOT NULL)
+//! ```
+//!
+//! The join only finds inner rows whose key some outer row asks for, so
+//! join-first never computes an aggregate for an unused key. The `i.rowid`
+//! filter keeps the NULL-filled row that a left join makes when no inner row
+//! matches out of the aggregate. Without it, `sum(1)` would read that row and
+//! return 1, while the original subquery returns NULL when nothing matches.
+//!
+//! Join-first is not used for every aggregate subquery:
+//!
+//! - Group-first does less work when several outer rows ask for the same key,
+//!   because join-first computes the aggregate again for each of those rows.
+//! - Join-first needs one outer B-tree table with a rowid so that
+//!   `GROUP BY o.rowid` makes exactly one group for each outer row.
+//! - It needs one inner B-tree table with a rowid, because `i.rowid IS NOT
+//!   NULL` is how it recognizes the NULL-filled row made by a left join with
+//!   no match.
+//! - The current code moves only one direct `WHERE` comparison to `HAVING`. It
+//!   does not handle the subquery value in a `SELECT` list, `ORDER BY`,
+//!   `HAVING`, or inside a larger expression.
+//! - The join makes each outer row appear once for each matching inner row,
+//!   and the other `WHERE` terms then run once per copy instead of once per
+//!   outer row. A term such as `random() % 2 = 0` could accept some copies and
+//!   reject others, so the aggregate would see only some of the row's inner
+//!   rows. Join-first is skipped when another `WHERE` term calls a
+//!   nondeterministic function or reads a correlated subquery.
+//! - Join-first must group by `o.rowid` to keep outer rows separate. An existing
+//!   `GROUP BY o.key` may instead combine several outer rows. Combining these
+//!   two groups needs another rewrite. Outer aggregates, `DISTINCT`, window
+//!   functions, `ORDER BY`, `LIMIT`, and `OFFSET` also need separate rules
+//!   around the new group. Those rules are not implemented.
+//! - Extension aggregates stay as subqueries. With no matching inner row,
+//!   `count` returns 0 and `sum` returns NULL. An extension aggregate may return
+//!   something else, and this code does not know which value to use.
+//!
 //! The code only moves direct `=` checks between an inner and outer column. Other
 //! forms stay as subqueries. `NOT IN` also stays as a subquery because NULL values
 //! can change its result. A one-value subquery stays as it is unless its result for
@@ -56,8 +130,8 @@ use crate::translate::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     expr::{
-        expr_contains_nondeterministic_scalar_function, expr_references_subquery_id,
-        get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
+        expr_references_subquery_id, get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::{
         plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinType, JoinedTable,
@@ -123,10 +197,12 @@ pub fn rewrite_correlated_subqueries(
                         continue;
                     }
                 }
-                if let Some(replacement) =
+                if let Some(rewrite) =
                     try_rewrite_single_value_aggregate(plan, subquery_index, resolver)?
                 {
-                    aggregate_replacements.insert(subquery_id, replacement);
+                    if let AggregateRewrite::GroupedTable(replacement) = rewrite {
+                        aggregate_replacements.insert(subquery_id, replacement);
+                    }
                     changed = true;
                     continue;
                 }
@@ -212,9 +288,27 @@ fn try_rewrite_in(
     else {
         return Ok(false);
     };
+    // A semi-join changes which expressions run and how many times they run:
+    //
+    // - IN runs the inner query to the end. For example,
+    //   `1 IN (SELECT json_extract(value, '$') FROM t)` must fail when any row
+    //   of `t` holds invalid JSON, even a row after the match. A semi-join
+    //   stops at the first match, so it would skip the invalid row and hide
+    //   the error.
+    // - IN evaluates its left side once per outer row. A semi-join uses the
+    //   left side as a join condition, so it can evaluate the left side once
+    //   for every inner row it scans.
+    //
+    // So: keep IN as a subquery when its left side, its result expression, or
+    // any inner WHERE expression can fail. JSON is only one example; the same
+    // rule applies to any function or operator that can return an error.
     if inner_plan.result_columns.len() != 1
-        || expr_contains_nondeterministic_scalar_function(&left, resolver)?
-        || expr_contains_nondeterministic_scalar_function(&right, resolver)?
+        || expression_can_fail_on_input(&left)
+        || expression_can_fail_on_input(&right)
+        || inner_plan
+            .where_clause
+            .iter()
+            .any(|term| expression_can_fail_on_input(&term.expr))
     {
         return Ok(false);
     }
@@ -383,17 +477,33 @@ struct ColumnPair {
     inner_was_left: bool,
 }
 
-/// Group an aggregate by the columns that link it to the outer query.
+/// Where the aggregate result is stored after a rewrite.
+#[expect(clippy::large_enum_variant)]
+enum AggregateRewrite {
+    /// The result is a column in a grouped table. Another reference to the same
+    /// subquery can read that column instead of building another grouped table.
+    GroupedTable(Expr),
+    /// The aggregate moved into the outer query and is used by its `HAVING`
+    /// clause. There is no result column for another subquery to reuse.
+    Joined,
+}
+
+/// Rewrite one correlated aggregate subquery using group-first or join-first.
 ///
-/// Use a left join because the old subquery returns one value even when no
-/// inner row matches.
+/// - Try group-first when computing the aggregate for unused keys cannot fail.
+///   This form computes each key once, and a second identical subquery can
+///   reuse its result.
+/// - Otherwise, try join-first. This form never computes an aggregate for an
+///   unused key, but it supports fewer query shapes.
+/// - Both forms use a left join. The original subquery returns one value even
+///   when no inner row matches, so the rewrite must keep such outer rows too.
 fn try_rewrite_single_value_aggregate(
     plan: &mut SelectPlan,
     subquery_index: usize,
     resolver: &Resolver<'_>,
-) -> Result<Option<Expr>> {
-    // Window planning keeps copies of its expressions. Leave those plans alone
-    // until all of those copies can be changed together.
+) -> Result<Option<AggregateRewrite>> {
+    // A window plan stores another copy of its expressions. Rewriting only the
+    // copy here would leave the other copy pointing at the removed subquery.
     if plan.window.is_some() {
         return Ok(None);
     }
@@ -463,13 +573,17 @@ fn try_rewrite_single_value_aggregate(
         let Some(pair) = read_column_pair(&term.expr, &outer_table_ids, &inner_table_ids) else {
             return Ok(None);
         };
-        if !column_pair_compares_the_same(&pair, &inner_plan.table_references) {
+        if !column_pair_compares_the_same(&pair, &inner_plan.table_references)? {
             return Ok(None);
         }
         pairs.push(pair);
     }
     if pairs.is_empty() || uses_outer_tables_outside_where(inner_plan, &outer_table_ids) {
         return Ok(None);
+    }
+
+    if !aggregate_can_run_for_unused_rows(inner_plan) {
+        return rewrite_aggregate_as_join_then_group(plan, subquery_index, subquery_id, resolver);
     }
 
     let mut inner_plan = *take_select_subquery_plan(plan, subquery_index);
@@ -570,10 +684,253 @@ fn try_rewrite_single_value_aggregate(
     }
     plan.table_references.add_joined_table(grouped_table);
     plan.non_from_clause_subqueries.remove(subquery_index);
-    Ok(Some(replacement))
+    Ok(Some(AggregateRewrite::GroupedTable(replacement)))
 }
 
-/// Return whether a one-value aggregate is simple enough to move into a join.
+/// Join matching rows before computing an aggregate such as `sum`.
+///
+/// ```sql
+/// -- Before
+/// SELECT o.id FROM outer_rows o
+/// WHERE o.limit > (SELECT sum(i.x) FROM inner_rows i WHERE i.key = o.key);
+///
+/// -- After
+/// SELECT o.id FROM outer_rows o
+/// LEFT JOIN inner_rows i ON i.key = o.key
+/// GROUP BY o.rowid
+/// HAVING o.limit > sum(i.x) FILTER (WHERE i.rowid IS NOT NULL);
+/// ```
+///
+/// Use this form only when all of these rules hold:
+///
+/// - The outer query reads one B-tree table with a rowid. `GROUP BY o.rowid`
+///   then makes one group for each original outer row.
+/// - The inner query reads one B-tree table with a rowid. The rewrite uses
+///   `i.rowid IS NOT NULL` to keep the NULL-filled row made by a left join with
+///   no match out of the aggregate.
+/// - The outer query has no aggregate, `GROUP BY`, `DISTINCT`, window function,
+///   `ORDER BY`, `LIMIT`, `OFFSET`, or `VALUES`. The current rewrite does not
+///   preserve these operations around its new grouping step.
+/// - The subquery is one complete side of one top-level `WHERE` comparison.
+///   That whole comparison can move to `HAVING` without leaving another use of
+///   the removed subquery.
+/// - Every other `WHERE` term keeps the same value each time it runs. After
+///   the rewrite, an outer row appears once for each matching inner row, and
+///   the other `WHERE` terms run once per copy instead of once per outer row.
+///   A term such as `random() % 2 = 0` could then accept some copies and
+///   reject others, and the aggregate would see only some of the row's inner
+///   rows. So a term must not call a nondeterministic function and must not
+///   read a correlated subquery, which runs again for each copy. Reading an
+///   uncorrelated subquery is fine because it runs once and its stored result
+///   is the same for every copy.
+fn rewrite_aggregate_as_join_then_group(
+    plan: &mut SelectPlan,
+    subquery_index: usize,
+    subquery_id: TableInternalId,
+    resolver: &Resolver<'_>,
+) -> Result<Option<AggregateRewrite>> {
+    if plan.table_references.joined_tables().len() != 1
+        || !plan.aggregates.is_empty()
+        || plan.group_by.is_some()
+        || !plan.order_by.is_empty()
+        || plan.limit.is_some()
+        || plan.offset.is_some()
+        || !plan.values.is_empty()
+        || plan.window.is_some()
+        || plan.distinctness.is_distinct()
+    {
+        return Ok(None);
+    }
+
+    let outer_table = &plan.table_references.joined_tables()[0];
+    if !matches!(&outer_table.table, Table::BTree(table) if table.has_rowid) {
+        return Ok(None);
+    }
+    let outer_table_id = outer_table.internal_id;
+
+    let Some(inner_plan) = select_subquery_plan(plan, subquery_index) else {
+        return Ok(None);
+    };
+    if inner_plan.table_references.joined_tables().len() != 1
+        || !matches!(
+            &inner_plan.table_references.joined_tables()[0].table,
+            Table::BTree(table) if table.has_rowid
+        )
+    {
+        return Ok(None);
+    }
+
+    let result = inner_plan.result_columns[0].expr.clone();
+    let Some((where_index, having)) =
+        find_direct_aggregate_comparison(plan, subquery_id, &result, resolver)?
+    else {
+        return Ok(None);
+    };
+
+    let mut inner_plan = *take_select_subquery_plan(plan, subquery_index);
+    let mut inner_tables = std::mem::take(inner_plan.table_references.joined_tables_mut());
+    let mut inner_table = inner_tables
+        .pop()
+        .expect("a checked aggregate subquery must have one table");
+    let inner_table_id = inner_table.internal_id;
+    inner_table.join_info = Some(JoinInfo {
+        join_type: JoinType::LeftOuter,
+        using: vec![],
+        no_reorder: false,
+    });
+    plan.table_references.add_joined_table(inner_table);
+
+    for mut term in inner_plan.where_clause {
+        term.from_outer_join = Some(inner_table_id);
+        term.consumed = false;
+        plan.where_clause.push(term);
+    }
+
+    let inner_row_exists = Expr::NotNull(Box::new(Expr::RowId {
+        database: None,
+        table: inner_table_id,
+    }));
+    for aggregate in &mut inner_plan.aggregates {
+        aggregate.filter_expr = Some(match aggregate.filter_expr.take() {
+            Some(filter) => Expr::Binary(
+                Box::new(inner_row_exists.clone()),
+                ast::Operator::And,
+                Box::new(filter),
+            ),
+            None => inner_row_exists.clone(),
+        });
+    }
+    plan.aggregates.extend(inner_plan.aggregates);
+    plan.where_clause.remove(where_index);
+    plan.group_by = Some(GroupBy {
+        exprs: vec![Expr::RowId {
+            database: None,
+            table: outer_table_id,
+        }],
+        sort_order: vec![SortOrder::Asc],
+        nulls_order: vec![None],
+        sort_elided: false,
+        having: Some(vec![having]),
+    });
+    plan.non_from_clause_subqueries.remove(subquery_index);
+    Ok(Some(AggregateRewrite::Joined))
+}
+
+/// Find one comparison that can move from `WHERE` to `HAVING`.
+///
+/// This form is accepted:
+///
+/// ```sql
+/// WHERE o.limit > (SELECT sum(i.x) FROM inner_rows i WHERE i.key = o.key)
+/// ```
+///
+/// These forms are rejected:
+///
+/// - `SELECT (SELECT sum(...))`: the value is used outside `WHERE`.
+/// - `WHERE o.limit > 1 + (SELECT sum(...))`: the subquery is inside a larger
+///   expression.
+/// - `WHERE (SELECT sum(...)) > (SELECT max(...))`: moving one subquery would
+///   leave another subquery in the new `HAVING` clause.
+/// - The same subquery is used by two `WHERE` terms.
+/// - The comparison came from an outer join condition. Moving it to `HAVING`
+///   would change which rows the outer join fills with NULL values.
+/// - Another `WHERE` term calls a nondeterministic function or reads a
+///   correlated subquery. After the rewrite these terms run once per joined
+///   copy of an outer row, so their value must be the same for every copy.
+///
+/// The rewrite removes the subquery, so every use of its value must be handled
+/// here. This function handles only one complete comparison.
+fn find_direct_aggregate_comparison(
+    plan: &SelectPlan,
+    subquery_id: TableInternalId,
+    replacement: &Expr,
+    resolver: &Resolver<'_>,
+) -> Result<Option<(usize, Expr)>> {
+    if plan
+        .result_columns
+        .iter()
+        .any(|column| expr_references_subquery_id(&column.expr, subquery_id))
+    {
+        return Ok(None);
+    }
+
+    let mut found = None;
+    for (index, term) in plan.where_clause.iter().enumerate() {
+        if !expr_references_subquery_id(&term.expr, subquery_id) {
+            if expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?
+                || expr_references_correlated_subquery(&term.expr, plan)
+            {
+                return Ok(None);
+            }
+            continue;
+        }
+        if found.is_some() || term.from_outer_join.is_some() {
+            return Ok(None);
+        }
+        let Expr::Binary(left, operator, right) = &term.expr else {
+            return Ok(None);
+        };
+        if !operator.is_comparison() {
+            return Ok(None);
+        }
+
+        let is_subquery = |expr: &Expr| {
+            matches!(
+                expr,
+                Expr::SubqueryResult {
+                    subquery_id: id,
+                    query_type: ast::SubqueryType::RowValue { num_regs: 1, .. },
+                    ..
+                } if *id == subquery_id
+            )
+        };
+        let expr = if is_subquery(left) && !expr_references_any_subquery(right) {
+            Expr::Binary(Box::new(replacement.clone()), *operator, right.clone())
+        } else if is_subquery(right) && !expr_references_any_subquery(left) {
+            Expr::Binary(left.clone(), *operator, Box::new(replacement.clone()))
+        } else {
+            return Ok(None);
+        };
+        found = Some((index, expr));
+    }
+    Ok(found)
+}
+
+/// Return whether an expression reads the result of a correlated subquery.
+fn expr_references_correlated_subquery(expr: &Expr, plan: &SelectPlan) -> bool {
+    plan.non_from_clause_subqueries
+        .iter()
+        .filter(|subquery| subquery.correlated)
+        .any(|subquery| expr_references_subquery_id(expr, subquery.internal_id))
+}
+
+/// Check whether an aggregate subquery uses a form that both rewrites support.
+///
+/// For example, this is supported:
+///
+/// ```sql
+/// SELECT avg(i.value) FROM inner_rows i WHERE i.key = o.key
+/// ```
+///
+/// The shared rules are:
+///
+/// - The subquery returns one expression, contains an aggregate, and reads at
+///   least one table.
+/// - It has no `GROUP BY`, `ORDER BY`, window function, `DISTINCT`, or `VALUES`.
+///   The two rewrites change the grouping and the location of the inner tables.
+///   Each of these operations needs its own rule to keep the same result, and
+///   those rules are not implemented.
+/// - It has no nested subquery. A nested subquery has a separate plan, and this
+///   rewrite does not move that plan with the inner tables.
+/// - Its only limit is `LIMIT 1`. Planning a scalar subquery adds this limit.
+///   `LIMIT 0` removes the result row, and `OFFSET 1` skips it.
+/// - It reads no virtual table. For example, the hidden columns of
+///   `generate_series(o.first, o.last)` are function arguments. They cannot be
+///   moved like normal `WHERE` checks.
+/// - It reads no correlated subquery in `FROM`. Such a subquery still needs
+///   values from the current outer row and needs a separate rewrite.
+/// - Its result and `WHERE` clause contain no function such as `random()` whose
+///   result can change between calls. A rewrite can change the number of calls.
 fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>) -> Result<bool> {
     if plan.result_columns.len() != 1
         || plan.aggregates.is_empty()
@@ -588,9 +945,6 @@ fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>
     {
         return Ok(false);
     }
-    if !aggregate_can_run_for_unused_rows(plan) {
-        return Ok(false);
-    }
     if !matches!(
         plan.limit.as_deref(),
         Some(Expr::Literal(ast::Literal::Numeric(value))) if value.parse::<i64>() == Ok(1)
@@ -602,8 +956,6 @@ fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>
         .joined_tables()
         .iter()
         .any(|table| match &table.table {
-            // A virtual table can store function arguments as hidden-column
-            // checks. Moving those checks would change the function call.
             crate::schema::Table::Virtual(_) => true,
             crate::schema::Table::FromClauseSubquery(subquery) => {
                 plan_is_correlated(&subquery.plan)
@@ -626,16 +978,34 @@ fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>
     Ok(true)
 }
 
-/// Return whether the aggregate can run for an inner row that no outer row uses.
+/// Return whether group-first may compute the aggregate for every key,
+/// including keys that no outer row asks for.
+///
+/// Suppose the outer query asks only for key 1, while the inner table also has
+/// key 99. Group-first computes the aggregate for both keys. This function
+/// returns true only when:
+///
+/// - every aggregate is `avg`, `count`, `min`, `max`, or `total`; and
+/// - no aggregate input, aggregate `FILTER`, or inner `WHERE` expression can
+///   fail for data stored under unused key 99.
+///
+/// `sum` can overflow. String aggregates can grow too large. Any aggregate not
+/// listed above also returns false because this code has not proved that it is
+/// safe for unused keys. The caller then tries join-first, which computes only
+/// keys requested by outer rows. If join-first does not support this kind of
+/// query, the correlated subquery stays unchanged.
 fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
-    // The grouped form reads every inner key. sum can fail on integer overflow.
-    // A function or special operator in an argument or filter can also fail on
-    // its input. Keep those forms correlated so they only read requested keys.
-    if plan
-        .aggregates
-        .iter()
-        .any(|aggregate| matches!(aggregate.func, AggFunc::Sum))
-    {
+    if !plan.aggregates.iter().all(|aggregate| {
+        matches!(
+            aggregate.func,
+            AggFunc::Avg
+                | AggFunc::Count
+                | AggFunc::Count0
+                | AggFunc::Max
+                | AggFunc::Min
+                | AggFunc::Total
+        )
+    }) {
         return false;
     }
 
@@ -649,7 +1019,23 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
         .any(expression_can_fail_on_input)
 }
 
-/// Return whether an expression has an operation that can fail for some input.
+/// Return whether evaluating this expression can return an error.
+///
+/// For example, `json_extract(value, '$')` fails when `value` contains invalid
+/// JSON. This check uses these simple, strict rules:
+///
+/// - Every function call counts because an extension function can return an
+///   error, and there is no list of functions proved to be safe.
+/// - `LIKE` counts because it can call a user-defined `like` function.
+/// - `RAISE` counts because its purpose is to return an error.
+/// - JSON and array operators count because they can reject invalid input.
+///
+/// Callers use this check in two cases:
+///
+/// - An `IN` semi-join stops after its first match. It must not hide an error in
+///   a later inner row.
+/// - A grouped table computes keys that no outer row uses. It must not create
+///   an error that the original correlated subquery never created.
 fn expression_can_fail_on_input(expr: &Expr) -> bool {
     let mut can_fail = false;
     walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
@@ -676,7 +1062,7 @@ fn expression_can_fail_on_input(expr: &Expr) -> bool {
             WalkControl::Continue
         })
     })
-    .expect("walking an aggregate expression cannot fail");
+    .expect("walking an expression cannot fail");
     can_fail
 }
 
@@ -785,26 +1171,24 @@ fn read_column_pair(
     }
 }
 
-/// Return whether grouping and joining compare this column pair the same way.
-fn column_pair_compares_the_same(pair: &ColumnPair, tables: &TableReferences) -> bool {
-    // GROUP BY and the join must treat these values the same way. With
-    // different value types or text sort rules, two inner groups can both
-    // equal one outer value and copy its row.
+/// Return whether grouping and joining use the same comparison rules.
+///
+/// For example, an inner `BINARY` key can put `A` and `a` in two groups, while
+/// an outer `NOCASE` key can join to both groups. An inner key can also put the
+/// number `1` and the text `'1'` in two groups, while a numeric outer key joins
+/// to both. Either case would return the outer row twice. Use the grouped form
+/// only when both columns use the same number/text conversion rule and the same
+/// text order.
+fn column_pair_compares_the_same(pair: &ColumnPair, tables: &TableReferences) -> Result<bool> {
     if get_expr_affinity(&pair.inner, Some(tables), None)
         != get_expr_affinity(&pair.outer, Some(tables), None)
     {
-        return false;
+        return Ok(false);
     }
 
-    let inner_collation = get_collseq_from_expr(&pair.inner, tables)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let outer_collation = get_collseq_from_expr(&pair.outer, tables)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    inner_collation == outer_collation
+    let inner_collation = get_collseq_from_expr(&pair.inner, tables)?.unwrap_or_default();
+    let outer_collation = get_collseq_from_expr(&pair.outer, tables)?.unwrap_or_default();
+    Ok(inner_collation == outer_collation)
 }
 
 /// Return whether the plan uses an outer table outside its `WHERE` clause.

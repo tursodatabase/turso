@@ -38,7 +38,7 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
   12    AggStep     0  17  11  max(Binary)          0  accum=r[11] step(r[17])
   13    Column      0   5  18                       0  r[18]=sales.quantity
   14    AggStep     0  18  12  sum                  0  accum=r[12] step(r[18])
-  15  Next          0   4   0                       0
+  15  Next          0   4   0                       1
   16  AggFinal      0   7   0  count                0  accum=r[7]
   17  AggFinal      0   8   0  sum                  0  accum=r[8]
   18  AggFinal      0   9   0  avg                  0  accum=r[9]

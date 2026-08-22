@@ -195,9 +195,10 @@ impl PostgreSQLTranslator {
             .as_ref()
             .and_then(|query| query.node.as_ref())
             .ok_or_else(|| ParseError::ParseError("EXPLAIN missing statement".to_string()))?;
-        Ok(ast::Cmd::ExplainQueryPlan(
-            self.translate_node(query.to_ref())?,
-        ))
+        Ok(ast::Cmd::ExplainQueryPlan {
+            stmt: self.translate_node(query.to_ref())?,
+            format: ast::EqpFormat::Text,
+        })
     }
 
     /// Translate a PostgreSQL CREATE TABLE statement into Turso AST.
@@ -6833,7 +6834,7 @@ mod tests {
         let parsed = crate::parse("EXPLAIN SELECT 1").unwrap();
         let translated = translator.translate_with_prereqs(&parsed).unwrap();
         assert!(translated.prereqs.is_empty());
-        assert!(matches!(translated.cmd, ast::Cmd::ExplainQueryPlan(_)));
+        assert!(matches!(translated.cmd, ast::Cmd::ExplainQueryPlan { .. }));
     }
 
     #[test]

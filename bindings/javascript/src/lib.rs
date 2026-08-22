@@ -208,7 +208,8 @@ fn step_sync(stmt: &StatementHandle) -> napi::Result<(u32, u32)> {
         .ok_or_else(|| create_generic_error("statement has been finalized"))?;
     match core_stmt.step() {
         Ok(turso_core::StepResult::Row) => Ok((STEP_ROW, 0)),
-        Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => Ok((STEP_IO, 0)),
+        Ok(turso_core::StepResult::IO) => Ok((STEP_IO, 0)),
+        Ok(turso_core::StepResult::Yield) => Ok((STEP_SLEEP, 1)),
         Ok(turso_core::StepResult::Sleep { duration }) => {
             // Round sub-millisecond delays up to 1ms: a 0ms setTimeout would
             // make the JS step loop spin without letting the backoff expire.

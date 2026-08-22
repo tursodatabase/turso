@@ -3,7 +3,7 @@ use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, RecursiveCteInput,
-        Schema, Table, Type, ROWID_SENTINEL,
+        Schema, Table, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -34,18 +34,18 @@ use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
 
-/// Infer the Type from an expression's affinity.
+/// Infer the affinity of a subquery result column from its expression.
 ///
 /// Used for subquery result columns. SQLite derives column affinity from:
 /// - Column references: the declared column type
 /// - CAST expressions: the cast target type
 /// - Subqueries: recursively from the subquery's result expression
-/// - Literals: BLOB affinity (no affinity)
+/// - Literals, function calls, and other computed expressions: no affinity
 ///
-/// The affinity determines comparison behavior in IN expressions, etc.
-fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Type {
-    let affinity = get_expr_affinity(expr, tables, None);
-    affinity.to_type()
+/// The affinity (and whether it's a real declared one) determines comparison
+/// behavior in IN expressions, etc.
+fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
+    get_expr_affinity(expr, tables, None)
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -60,13 +60,13 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> T
 /// class.
 fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
     if arms.is_empty() {
-        return Affinity::Blob;
+        return Affinity::None;
     }
-    let col_affinity = |arm: &SelectPlan| {
+    let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
             .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
-            .unwrap_or(Affinity::Blob)
+            .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
         arm.result_columns
@@ -75,26 +75,26 @@ fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
             .unwrap_or(StorageClassMask::from_null())
     };
 
-    let mut affinity = col_affinity(arms[0]);
+    let mut affinity = col_affinities(arms[0]);
     let mut data_types = StorageClassMask::from_null();
     let mut idx = 0;
     // Skip leading arms with no affinity, adopting the next arm's affinity.
-    while matches!(affinity, Affinity::Blob) && idx + 1 < arms.len() {
+    while affinity == Affinity::None && idx + 1 < arms.len() {
         data_types |= col_data_type(arms[idx]);
         idx += 1;
-        affinity = col_affinity(arms[idx]);
+        affinity = col_affinities(arms[idx]);
     }
-    if matches!(affinity, Affinity::Blob) {
-        return Affinity::Blob;
+    if affinity == Affinity::None {
+        return Affinity::None;
     }
-    // `affinity` is TEXT or numeric here; accumulate the remaining arms' classes.
+    // This arm has a real affinity; accumulate the remaining arms' classes.
     for &arm in &arms[idx + 1..] {
         data_types |= col_data_type(arm);
     }
     match affinity {
         Affinity::Text if data_types.has_numeric() => Affinity::Blob,
         a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
-        a => a,
+        _ => affinity,
     }
 }
 
@@ -2447,13 +2447,14 @@ fn query_output_columns(
             let name = explicit_columns
                 .and_then(|names| names.get(column_index).cloned())
                 .or_else(|| result_column.name(table_references).map(String::from));
-            let column_type = compound_arms
+            let affinity = compound_arms
                 .as_ref()
-                .map(|arms| compound_column_affinity(arms, column_index).to_type())
+                .map(|arms| compound_column_affinity(arms, column_index))
                 .unwrap_or_else(|| {
                     infer_type_from_expr(&result_column.expr, Some(table_references))
                 });
-            Column::new(
+            let column_type = affinity.to_type();
+            let mut column = Column::new(
                 name,
                 column_type.to_string(),
                 None,
@@ -2461,7 +2462,9 @@ fn query_output_columns(
                 column_type,
                 None,
                 ColDef::default(),
-            )
+            );
+            column.override_affinity(affinity);
+            column
         })
         .try_collect::<alloc::Vec<_>>()?;
 
@@ -2507,17 +2510,19 @@ impl JoinedTable {
             .result_columns
             .iter()
             .map(|rc| {
-                let col_type = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
-                let type_name = col_type.to_string();
-                Column::new(
+                let affinity = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let col_type = affinity.to_type();
+                let mut column = Column::new(
                     rc.name(&plan.table_references).map(String::from),
-                    type_name,
+                    col_type.to_string(),
                     None,
                     None,
                     col_type,
                     None,
                     ColDef::default(),
-                )
+                );
+                column.override_affinity(affinity);
+                column
             })
             .try_collect::<alloc::Vec<_>>()?;
 
@@ -2614,7 +2619,7 @@ impl JoinedTable {
         // see the stored value without the anchor query's affinity. Only the
         // outer read of the CTE keeps the derived affinity.
         for column in columns.iter_mut() {
-            column.set_base_affinity(Affinity::Blob);
+            column.override_affinity(Affinity::Blob);
         }
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
@@ -2696,9 +2701,16 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
+            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
+                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
+            } else {
+                false
+            };
+
             if index
                 .expression_to_index_pos(&usage.normalized_expr)
                 .is_some()
+                || matches_where_clause
             {
                 any_covered = true;
                 for col_idx in usage.columns_mask.iter() {
@@ -3083,10 +3095,10 @@ pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Optio
         .map(|a| a.aff_mask())
         .collect();
     for _ in num_key_cols..total_cols {
-        aff.push(affinity::SQLITE_AFF_NONE);
+        aff.push(affinity::SQLITE_AFF_BLOB);
     }
     aff.chars()
-        .any(|c| c != affinity::SQLITE_AFF_NONE)
+        .any(|c| c != affinity::SQLITE_AFF_BLOB)
         .then(|| Arc::new(aff))
 }
 

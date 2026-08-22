@@ -40,7 +40,7 @@ addr  opcode         p1  p2  p3  p4                                     p5  comm
   14    ColumnRange   0   5  23  2                                       0  r[23..24]=lineitem.L_EXTENDEDPRICE..L_DISCOUNT
   15    Multiply     23  24  22                                          0  r[22]=r[23]*r[24]
   16    AggStep       0  22   2  sum                                     0  accum=r[2] step(r[22])
-  17  Next            0   4   0                                          0
+  17  Next            0   4   0                                          1
   18  AggFinal        0   2   0  sum                                     0  accum=r[2]
   19  Copy            2   1   0                                          0  r[1]=r[2]
   20  ResultRow       1   1   0                                          0  output=r[1]

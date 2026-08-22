@@ -2,6 +2,7 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
+use crate::translate::expr::comparison_affinity;
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -526,6 +527,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         planner.program.emit_insn(Insn::Next {
             cursor_id: build_iter_cursor_id,
             pc_if_next: build_loop_start,
+            fullscan: false,
         });
 
         planner.program.preassign_label_to_next_insn(build_loop_end);

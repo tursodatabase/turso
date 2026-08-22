@@ -24,7 +24,7 @@ addr  opcode        p1  p2  p3  p4          p5  comment
    7    RowId        0   1   0               0  r[1]=uniform.rowid
    8    Column       0   2   2               0  r[2]=uniform.value
    9    ResultRow    1   2   0               0  output=r[1..2]
-  10  Next           0   3   0               0
+  10  Next           0   3   0               1
   11  Halt           0   0   0               0
   12  Transaction    0   1   4               0  iDb=0 tx_mode=Read
   13  String8        0   5   0  active       0  r[5]='active'

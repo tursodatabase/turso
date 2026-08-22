@@ -404,6 +404,103 @@ fn test_attach_inherits_index_method_flag_on_reattach(_tmp_db: TempDatabase) -> 
     Ok(())
 }
 
+/// Statements on an attached database never set the connection-level write
+/// transaction state, so an attached FTS write can pick up the connection's
+/// cached read state from an earlier query instead of loading writer state.
+/// The write must still reach the backing B-tree: a document inserted after a
+/// warm read has to be findable. The writing connection has no retained FTS
+/// writer of its own (another connection did the earlier write), which is
+/// what routes its open_write through the cached read state.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_attached_fts_insert_after_warm_read_is_searchable(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new().with_index_method(true));
+    let seeder = db.connect_limbo();
+
+    let aux_path = db.path.with_extension("attached_fts_warm_read.db");
+    seeder.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    seeder.execute("CREATE TABLE aux.docs(id INTEGER PRIMARY KEY, content TEXT)")?;
+    seeder.execute("CREATE INDEX aux.docs_fts ON docs USING fts(content)")?;
+    seeder.execute("INSERT INTO aux.docs VALUES (1, 'hello world')")?;
+
+    let conn = db.connect_limbo();
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    // Warm this connection's cached FTS read state for the attached index.
+    let warm: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'hello')");
+    assert_eq!(warm, vec![(1,)]);
+
+    conn.execute("INSERT INTO aux.docs VALUES (2, 'fresh needle')")?;
+
+    let fresh: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'needle')");
+    assert_eq!(
+        fresh,
+        vec![(2,)],
+        "a document inserted after a warm FTS read must be searchable"
+    );
+    let still_there: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'hello')");
+    assert_eq!(still_there, vec![(1,)]);
+
+    // The document must also have been persisted, not merely retained in
+    // this connection's in-memory caches.
+    conn.execute("DETACH aux")?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    let reopened: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'needle')");
+    assert_eq!(
+        reopened,
+        vec![(2,)],
+        "the document inserted after a warm FTS read must survive reattach"
+    );
+
+    Ok(())
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_attached_mvcc_fts_uses_attached_store(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new().with_index_method(true));
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("attached_mvcc_fts.db");
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")?;
+    conn.execute("CREATE TABLE aux.docs(id INTEGER PRIMARY KEY, content TEXT)")?;
+    conn.execute("CREATE INDEX aux.docs_fts ON docs USING fts(content)")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO aux.docs VALUES (1, 'attached committed')")?;
+    conn.execute("COMMIT")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO aux.docs VALUES (2, 'attached rolledback')")?;
+    conn.execute("ROLLBACK")?;
+
+    let committed: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'committed')");
+    assert_eq!(committed, vec![(1,)]);
+    // The MATCH operator spelling must plan against the attached database's
+    // FTS index too (it used to be rejected because the planner resolved the
+    // index against the main schema only).
+    let committed_match: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE content MATCH 'committed'");
+    assert_eq!(committed_match, vec![(1,)]);
+    let rolled_back: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'rolledback')");
+    assert!(rolled_back.is_empty());
+
+    conn.execute("DETACH aux")?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    let recovered: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'attached')");
+    assert_eq!(recovered, vec![(1,)]);
+    Ok(())
+}
+
 #[test]
 fn test_attach_create_stores_canonical_schema_sql() -> anyhow::Result<()> {
     let aux_db = TempDatabase::builder().build();

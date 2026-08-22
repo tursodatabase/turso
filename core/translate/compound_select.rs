@@ -6,12 +6,13 @@ use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
 };
+use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{Insn, SorterOpenData};
 use crate::{emit_explain, LimboError};
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
@@ -167,7 +168,7 @@ pub fn emit_program_for_compound_select(
         }
     };
 
-    emit_explain!(program, true, "COMPOUND QUERY".to_owned());
+    emit_explain!(program, true, EqpDetail::Compound);
 
     // The compound query's result columns are the leftmost subselect's result columns
     // (per SQLite semantics). Save them so we can install them on `program` after
@@ -325,7 +326,14 @@ fn emit_compound_select(
                     right_most_ctx.reg_offset = offset_reg;
                 }
 
-                emit_explain!(program, true, "UNION ALL".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::UnionAll,
+                        temp_btree: false,
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -373,7 +381,14 @@ fn emit_compound_select(
                     is_delete: false,
                 };
 
-                emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::Union,
+                        temp_btree: true,
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -426,7 +441,14 @@ fn emit_compound_select(
                     query_destination,
                 )?;
 
-                emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::Intersect,
+                        temp_btree: true,
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -477,7 +499,14 @@ fn emit_compound_select(
                     affinity_str: None,
                     is_delete: true,
                 };
-                emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::Except,
+                        temp_btree: true,
+                    }
+                );
                 right_most_ctx.materialized_build_inputs =
                     emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
                 emit_query(program, right_most, &mut right_most_ctx)?;
@@ -504,7 +533,14 @@ fn emit_compound_select(
                 right_most.offset.clone_from(offset);
                 right_most_ctx.reg_offset = offset_reg;
             }
-            emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
+            emit_explain!(
+                program,
+                true,
+                EqpDetail::CompoundArm {
+                    op: EqpCompoundOp::LeftMost,
+                    temp_btree: false,
+                }
+            );
             right_most_ctx.materialized_build_inputs =
                 emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
             emit_query(program, right_most, &mut right_most_ctx)?;
@@ -630,6 +666,7 @@ fn read_deduplicated_union_or_except_rows(
     program.emit_insn(Insn::Next {
         cursor_id: dedupe_cursor_id,
         pc_if_next: label_dedupe_loop_start,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(label_close);
     program.emit_insn(Insn::Close {
@@ -703,6 +740,7 @@ fn read_intersect_rows(
     program.emit_insn(Insn::Next {
         cursor_id: left_cursor_id,
         pc_if_next: label_loop_start,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(label_close);
@@ -880,10 +918,12 @@ fn emit_compound_order_by(
         .chain(std::iter::once(None))
         .try_collect()?;
     program.emit_insn(Insn::SorterOpen {
-        cursor_id: sort_cursor,
-        columns: order_collations_nulls.len(),
-        order_collations_nulls,
-        comparators,
+        data: Box::new(SorterOpenData {
+            cursor_id: sort_cursor,
+            columns: order_collations_nulls.len(),
+            order_collations_nulls,
+            comparators,
+        }),
     });
 
     // Read from collection index and insert into Sorter
@@ -959,6 +999,7 @@ fn emit_compound_order_by(
     program.emit_insn(Insn::Next {
         cursor_id: collection_cursor_id,
         pc_if_next: label_sorter_loop,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(label_sorter_done);
     program.emit_insn(Insn::Close {
@@ -1036,7 +1077,13 @@ fn emit_compound_order_by(
         .transpose()?;
 
     // Sort and emit results
-    emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+    emit_explain!(
+        program,
+        false,
+        EqpDetail::OrderBy {
+            method: EqpSortMethod::Sorter,
+        }
+    );
 
     let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
         column_count: sorter_column_count,

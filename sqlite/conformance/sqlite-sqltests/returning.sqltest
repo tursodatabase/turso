@@ -2468,3 +2468,64 @@ expect {
     3|10|3
     4|20|1
 }
+
+# The column names reported for a RETURNING clause should be the plain column
+# name, the same as SELECT, no matter how the column is written in the query.
+@backend cli
+@cross-check-integrity
+test insert-returning-column-names-are-unqualified {
+    .headers on
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'test') RETURNING id, "id", t.id, "t"."id";
+}
+expect {
+    id|id|id|id
+    1|1|1|1
+}
+
+# UPDATE and DELETE share process_returning_clause with INSERT, so they name
+# their RETURNING columns the same way. `.headers on` needs the CLI backend,
+# so these tests can only run there.
+@backend cli
+@cross-check-integrity
+test update-returning-column-names-are-unqualified {
+    .headers on
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'test');
+    UPDATE t SET name = 'other' RETURNING id, "id", t.id, "t"."id", id AS foo, id  +  1;
+}
+expect {
+    id|id|id|id|foo|id  +  1
+    1|1|1|1|1|2
+}
+
+@backend cli
+@cross-check-integrity
+test delete-returning-column-names-are-unqualified {
+    .headers on
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'test');
+    DELETE FROM t RETURNING id, "id", t.id, "t"."id", id AS foo, id  +  1;
+}
+expect {
+    id|id|id|id|foo|id  +  1
+    1|1|1|1|1|2
+}
+
+# A rowid reference in RETURNING is named like SELECT names it: the rowid
+# alias column's name when the table has one, "rowid" otherwise.
+@backend cli
+@cross-check-integrity
+test returning-rowid-column-names-default-pragmas {
+    .headers on
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE n (a INTEGER);
+    INSERT INTO t VALUES (1, 10) RETURNING rowid, oid, _rowid_;
+    INSERT INTO n VALUES (1) RETURNING rowid;
+}
+expect {
+    id|id|id
+    1|1|1
+    rowid
+    1
+}

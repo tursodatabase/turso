@@ -23,7 +23,9 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{
+    to_u32, AddSequenceData, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral,
+};
 use crate::Result;
 use turso_parser::ast;
 
@@ -630,6 +632,7 @@ pub(crate) fn emit_backing_table_compaction(
     program.emit_insn(Insn::Next {
         cursor_id,
         pc_if_next: loop_top_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(skip_label);
 }
@@ -704,6 +707,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.emit_insn(Insn::Next {
         cursor_id: sseq_cursor,
         pc_if_next: loop_top_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(insert_label);
 
@@ -878,13 +882,15 @@ pub fn translate_create_sequence(
 
     // Add the fully-configured Sequence to the in-memory schema
     program.emit_insn(Insn::AddSequence {
-        db: database_id,
-        name: normalized_name,
-        start: seq.start_value,
-        increment: seq.increment_by,
-        min_value: seq.min_value,
-        max_value: seq.max_value,
-        cycle: seq.cycle,
+        data: Box::new(AddSequenceData {
+            db: database_id,
+            name: normalized_name,
+            start: seq.start_value,
+            increment: seq.increment_by,
+            min_value: seq.min_value,
+            max_value: seq.max_value,
+            cycle: seq.cycle,
+        }),
     });
 
     // Bump schema version so other connections detect the change
@@ -980,6 +986,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(end_loop_label);
 

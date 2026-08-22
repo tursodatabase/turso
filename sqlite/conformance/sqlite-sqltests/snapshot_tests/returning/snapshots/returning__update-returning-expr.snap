@@ -40,7 +40,7 @@ addr  opcode          p1  p2  p3  p4        p5  comment
   22    MakeRecord    11   3  16             0  r[16]=mkrec(r[11..13])
   23    NewRowid       0  17   0             0  r[17]=rowid
   24    Insert         0  16  17             4  intkey=r[17] data=r[16]
-  25  Next             1   4   0             0
+  25  Next             1   4   0             1
   26  FkCheck          0   0   0             0
   27  Rewind           0  31   0             0  Rewind  ephemeral(t1)
   28    ColumnRange    0   0  18  3          0  r[18..20]=ephemeral(t1).id..value

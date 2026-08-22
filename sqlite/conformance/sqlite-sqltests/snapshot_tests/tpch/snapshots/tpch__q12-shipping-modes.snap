@@ -70,7 +70,7 @@ addr  opcode                  p1  p2  p3  p4                                    
   23            Column         2   5  13                                          0  r[13]=orders.O_ORDERPRIORITY
   24            MakeRecord    12   2  11                                          0  r[11]=mkrec(r[12..13])
   25            SorterInsert   0  11   0  0                                       0  key=r[11]
-  26          Next             3   9   0                                          0
+  26          Next             3   9   0                                          1
   27          OpenPseudo       1  11   2                                          0  2 columns in r[11]
   28          SorterSort       0  74   0                                          0
   29            SorterData     0  11   1                                          0  r[11]=data

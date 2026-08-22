@@ -4,6 +4,10 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '24 4 * * *'
+  # These jobs need the dedicated Nyrkiö runners and take ~45 minutes, so we only
+  # want them on the nightly schedule above, which runs on main. There is no branch
+  # named "notmain", which is how the push and pull_request triggers stay switched
+  # off. Removing these filters turns the benchmarks on for every push and every PR.
   push:
   #   branches: ["main", "notmain", "master"]
     branches: ["notmain"]

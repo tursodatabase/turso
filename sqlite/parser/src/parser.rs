@@ -1,8 +1,8 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
-    CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, Expr, ForeignKeyClause,
-    FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
+    CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, EqpFormat, Expr,
+    ForeignKeyClause, FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
     GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
     JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
     Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
@@ -297,7 +297,11 @@ impl<'a> Parser<'a> {
                     if self.peek_no_eof()?.token_type == TK_QUERY {
                         eat_assert!(self, TK_QUERY);
                         eat_expect!(self, TK_PLAN);
-                        Some(Cmd::ExplainQueryPlan(self.parse_stmt()?))
+                        let format = self.parse_explain_query_plan_format()?;
+                        Some(Cmd::ExplainQueryPlan {
+                            stmt: self.parse_stmt()?,
+                            format,
+                        })
                     } else {
                         Some(Cmd::Explain(self.parse_stmt()?))
                     }
@@ -337,6 +341,29 @@ impl<'a> Parser<'a> {
         }
 
         Ok(result)
+    }
+
+    /// Parse the optional `FORMAT=JSON` / `FORMAT=TEXT` clause after `EXPLAIN QUERY PLAN`.
+    fn parse_explain_query_plan_format(&mut self) -> Result<EqpFormat> {
+        let starts_format_clause = matches!(
+            self.peek()?,
+            Some(token)
+                if token.token_type == TK_ID && token.value.eq_ignore_ascii_case(b"FORMAT")
+        );
+        if !starts_format_clause {
+            return Ok(EqpFormat::Text);
+        }
+        eat_assert!(self, TK_ID);
+        eat_expect!(self, TK_EQ);
+        let token = eat_expect!(self, TK_ID);
+        match_ignore_ascii_case!(match token.value {
+            b"JSON" => Ok(EqpFormat::Json),
+            b"TEXT" => Ok(EqpFormat::Text),
+            _ => Err(Error::Custom(format!(
+                "unknown EXPLAIN QUERY PLAN format: {} (supported formats: TEXT, JSON)",
+                String::from_utf8_lossy(token.value)
+            ))),
+        })
     }
 
     #[inline(always)]
@@ -5454,6 +5481,42 @@ mod tests {
     }
 
     #[test]
+    fn test_namespace_qualified_parameter_names() {
+        // TCL passes `$::g` and `$ns::var` into SQL; each spelling is one
+        // parameter, keyed on its full text, and a repeat reuses its index.
+        let sql = "SELECT $ns::var, $::g, $ns::var, :::g, @a::b::";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        assert_eq!(cmd.to_string(), format!("{sql};"));
+        let index = |name: &str| p.named_variables[name.as_bytes()].get();
+        assert_eq!(index("$ns::var"), 1);
+        assert_eq!(index("$::g"), 2);
+        assert_eq!(index(":::g"), 3);
+        assert_eq!(index("@a::b::"), 4);
+        assert_eq!(p.named_variables.len(), 4);
+    }
+
+    #[test]
+    fn test_array_element_parameter_names() {
+        // TCL array elements, `$arr(elem)`, are one parameter including the
+        // suffix; only one suffix is allowed, so `$a(b)(c)` is a call-like
+        // syntax error, as in SQLite.
+        let sql = "SELECT $arr(elem), $ns::arr(k), $arr(elem)";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        assert_eq!(cmd.to_string(), format!("{sql};"));
+        assert_eq!(p.named_variables[b"$arr(elem)".as_slice()].get(), 1);
+        assert_eq!(p.named_variables[b"$ns::arr(k)".as_slice()].get(), 2);
+        assert_eq!(p.named_variables.len(), 2);
+
+        let mut p = Parser::new(b"SELECT $a(b)(c)");
+        assert!(p.next_cmd().is_err());
+        let mut p = Parser::new(b"SELECT $a(b c)");
+        let err = p.next_cmd().unwrap_err().to_string();
+        assert!(err.contains("bad variable name '$a(b'"), "{err}");
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
@@ -5505,10 +5568,43 @@ mod tests {
             ),
             (
                 b"EXPLAIN QUERY PLAN BEGIN".as_slice(),
-                vec![Cmd::ExplainQueryPlan(Stmt::Begin {
-                    typ: None,
-                    name: None,
-                })],
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::Text,
+                }],
+            ),
+            (
+                b"EXPLAIN QUERY PLAN FORMAT=JSON BEGIN".as_slice(),
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::Json,
+                }],
+            ),
+            (
+                b"explain query plan format = json begin".as_slice(),
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::Json,
+                }],
+            ),
+            (
+                b"EXPLAIN QUERY PLAN FORMAT=TEXT BEGIN".as_slice(),
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::Text,
+                }],
             ),
             (
                 b"BEGIN TRANSACTION".as_slice(),

@@ -1,4 +1,4 @@
--- LIMBO_SKIP: this currently takes too long on both engines due to lack of subquery decorrelation
+-- SQLITE_SKIP: SQLite is not able to decorrelate 'ps_availqty > ...' so it runs forever. Only run this on Turso.
 
 select
 	s_name,

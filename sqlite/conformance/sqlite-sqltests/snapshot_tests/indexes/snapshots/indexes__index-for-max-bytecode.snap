@@ -22,7 +22,7 @@ addr  opcode          p1  p2  p3  p4           p5  comment
    5    RealAffinity   3   0   0                0
    6    AggStep        0   3   2  max(Binary)   0  accum=r[2] step(r[3])
    7    Goto           0   9   0                0
-   8  Prev             0   4   0                0
+   8  Prev             0   4   0                1
    9  AggFinal         0   2   0  max           0  accum=r[2]
   10  Copy             2   1   0                0  r[1]=r[2]
   11  ResultRow        1   1   0                0  output=r[1]

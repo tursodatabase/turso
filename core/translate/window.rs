@@ -21,7 +21,7 @@ use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
-    to_u32, {IdxInsertFlags, InsertFlags, Insn},
+    to_u32, AggStepData, {IdxInsertFlags, InsertFlags, Insn},
 };
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Connection;
@@ -2438,6 +2438,7 @@ fn emit_window_full_scan(
     program.emit_insn(Insn::Next {
         cursor_id: scan_cursor,
         pc_if_next: label_loop,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(label_break);
     emit_window_agg_final(program, window, &registers, &minmax, true);
@@ -2932,6 +2933,7 @@ fn emit_window_op(
     program.emit_insn(Insn::Next {
         cursor_id: cursor_for_op,
         pc_if_next: label_after_next,
+        fullscan: false,
     });
     if let Some(break_target) = break_on_eof {
         program.emit_insn(Insn::Goto {
@@ -3243,12 +3245,14 @@ fn emit_function_step(
                 // 0-ary window funcs (row_number) ignore `col`; the runtime
                 // only reads `state.registers[col + i]` for i in 0..arity.
                 program.emit_insn(Insn::AggStep {
-                    acc_reg,
-                    col: arg_load_start.unwrap_or(0),
-                    delimiter: 0,
-                    func: AccumulatorFunc::Window(win_func.clone()),
-                    comparator: None,
-                    collation: None,
+                    data: Box::new(AggStepData {
+                        acc_reg,
+                        col: arg_load_start.unwrap_or(0),
+                        delimiter: 0,
+                        func: AccumulatorFunc::Window(win_func.clone()),
+                        comparator: None,
+                        collation: None,
+                    }),
                 });
             }
         }

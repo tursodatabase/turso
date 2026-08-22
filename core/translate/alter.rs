@@ -28,7 +28,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, DmlColumnContext, ProgramBuilder},
-        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
     LimboError, Numeric, Result, Value, ValueRef,
@@ -703,6 +703,7 @@ fn emit_add_virtual_column_validation(
     program.emit_insn(Insn::Next {
         cursor_id,
         pc_if_next: loop_start,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(skip_label);
@@ -1543,11 +1544,13 @@ pub fn translate_alter_table(
                         p5: 0,
                     });
                     program.emit_insn(Insn::AddColumn {
-                        db: database_id,
-                        table: table_name.to_owned(),
-                        column: Box::new(column),
-                        check_constraints: btree.check_constraints.to_vec(),
-                        foreign_keys: btree.foreign_keys.to_vec(),
+                        data: Box::new(AddColumnData {
+                            db: database_id,
+                            table: table_name.to_owned(),
+                            column,
+                            check_constraints: btree.check_constraints.to_vec(),
+                            foreign_keys: btree.foreign_keys.to_vec(),
+                        }),
                     });
                 },
             )?

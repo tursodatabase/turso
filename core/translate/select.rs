@@ -266,7 +266,7 @@ pub(crate) fn prepare_select_plan_from_arms(
         .map(|(plan, _)| plan)
         .chain(std::iter::once(&last))
         .collect();
-    let order_by = resolve_compound_order_by(&order_by, &all_plans)?;
+    let order_by = resolve_compound_order_by(&order_by, &all_plans, resolver)?;
 
     Ok(Plan::CompoundSelect {
         left,
@@ -1255,13 +1255,11 @@ fn replace_column_number_with_copy_of_column_expr(
     Ok(())
 }
 
-/// Resolves a compound SELECT ORDER BY expression to a 0-based column index.
-/// ORDER BY in compound selects can reference columns by:
-/// 1. Numeric position (1-based): ORDER BY 1
-/// 2. Column name or alias from any constituent SELECT: ORDER BY name
+/// Resolves a compound SELECT ORDER BY term to a 0-based result column index.
 fn resolve_compound_order_by_expr(
     expr: &ast::Expr,
     all_plans: &[&SelectPlan],
+    resolver: &Resolver,
     term_number: usize,
 ) -> Result<(usize, Option<CollationSeq>)> {
     let num_result_columns = all_plans[0].result_columns.len();
@@ -1270,8 +1268,9 @@ fn resolve_compound_order_by_expr(
         // reference and carry the collation so it overrides the referenced
         // column's own collation when the compound result is sorted.
         ast::Expr::Collate(inner, collation_name) => {
-            let (col_idx, _) = resolve_compound_order_by_expr(inner, all_plans, term_number)?;
-            Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)))
+            let (col_idx, _) =
+                resolve_compound_order_by_expr(inner, all_plans, resolver, term_number)?;
+            return Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)));
         }
         // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
         // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as
@@ -1285,55 +1284,63 @@ fn resolve_compound_order_by_expr(
                         num_result_columns
                     );
                 }
-                Ok((column_number as usize - 1, None))
-            } else {
-                crate::bail_parse_error!(
-                    "{} ORDER BY term does not match any column in the result set",
-                    ordinal(term_number)
-                );
+                return Ok((column_number as usize - 1, None));
             }
         }
-        // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
-        ast::Expr::Id(name) => {
-            let name_normalized = normalize_ident(name.as_str());
-            // Check aliases and column names across all constituent SELECTs
-            for plan in all_plans {
-                let result_columns = &plan.result_columns;
-                let table_references = &plan.table_references;
-                // Try matching against aliases
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(alias) = &rc.alias {
-                        if normalize_ident(alias) == name_normalized {
-                            return Ok((i, None));
-                        }
-                    }
-                }
-                // Try matching against column names from the table references
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(col_name) = rc.name(table_references) {
-                        if normalize_ident(col_name) == name_normalized {
-                            return Ok((i, None));
-                        }
+        _ => {}
+    }
+
+    for plan in all_plans {
+        if let ast::Expr::Id(name) = expr {
+            let normalized_name = normalize_ident(name.as_str());
+            for (index, result_column) in plan.result_columns.iter().enumerate() {
+                if let Some(alias) = &result_column.alias {
+                    if normalize_ident(alias) == normalized_name {
+                        return Ok((index, None));
                     }
                 }
             }
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
+            for (index, result_column) in plan.result_columns.iter().enumerate() {
+                if let Some(column_name) = result_column.name(&plan.table_references) {
+                    if normalize_ident(column_name) == normalized_name {
+                        return Ok((index, None));
+                    }
+                }
+            }
         }
-        _ => {
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
+
+        let mut bound_expr = expr.clone();
+        let mut table_references = plan.table_references.clone();
+        if bind_and_rewrite_expr(
+            &mut bound_expr,
+            Some(&mut table_references),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        if let Some(index) = plan
+            .result_columns
+            .iter()
+            .position(|result_column| exprs_are_equivalent(&bound_expr, &result_column.expr))
+        {
+            return Ok((index, None));
         }
     }
+
+    crate::bail_parse_error!(
+        "{} ORDER BY term does not match any column in the result set",
+        ordinal(term_number)
+    );
 }
 
 fn resolve_compound_order_by(
     order_by: &[ast::SortedColumn],
     plans: &[&SelectPlan],
+    resolver: &Resolver,
 ) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
     if order_by.is_empty() {
         return Ok(None);
@@ -1342,7 +1349,8 @@ fn resolve_compound_order_by(
         .iter()
         .enumerate()
         .map(|(index, term)| {
-            let (column, collation) = resolve_compound_order_by_expr(&term.expr, plans, index + 1)?;
+            let (column, collation) =
+                resolve_compound_order_by_expr(&term.expr, plans, resolver, index + 1)?;
             Ok((
                 column,
                 term.order.unwrap_or(ast::SortOrder::Asc),
@@ -1358,6 +1366,7 @@ pub(crate) fn resolve_recursive_cte_queue_order(
     order_by: &[ast::SortedColumn],
     initial_query: &Plan,
     recursive_query: &Plan,
+    resolver: &Resolver,
 ) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
     fn collect_selects<'a>(plan: &'a Plan, out: &mut Vec<&'a SelectPlan>) {
         match plan {
@@ -1377,7 +1386,7 @@ pub(crate) fn resolve_recursive_cte_queue_order(
     let mut plans = Vec::new();
     collect_selects(initial_query, &mut plans);
     collect_selects(recursive_query, &mut plans);
-    resolve_compound_order_by(order_by, &plans)
+    resolve_compound_order_by(order_by, &plans, resolver)
 }
 
 fn ordinal(n: usize) -> String {

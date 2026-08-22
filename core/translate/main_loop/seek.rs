@@ -1,5 +1,6 @@
 use super::*;
 use crate::translate::plan::BitSet;
+use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
@@ -10,7 +11,7 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .zip(seek_def.iter_affinity(seek_key))
         .map(|(key_component, aff)| match key_component {
             SeekKeyComponent::Expr(expr) if aff.expr_needs_no_affinity_change(expr) => {
-                affinity::SQLITE_AFF_NONE
+                affinity::SQLITE_AFF_BLOB
             }
             _ => aff.aff_mask(),
         })
@@ -200,12 +201,13 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         // Which key components match NULL rather than comparing with `=`; the
         // seek and the bloom-filter probe keep their "NULL key cannot match"
         // shortcut for the rest.
-        let mut null_matching_mask = BitSet::default();
+        let mut null_matching_bits = BitSet::default();
         for i in 0..num_regs {
             if self.seek_def.is_null_matching_key_component(i) {
-                null_matching_mask.set(i)?;
+                null_matching_bits.set(i)?;
             }
         }
+        let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
             encode_seek_keys_for_custom_types(
@@ -218,7 +220,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 &self.t_ctx.resolver,
             )?;
             let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
-            if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+            if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                 self.program.emit_insn(Insn::Affinity {
                     start_reg: self.start_reg,
                     count: std::num::NonZeroUsize::new(num_regs).unwrap(),
@@ -345,7 +347,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         &self.t_ctx.resolver,
                     )?;
                     let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
-                    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+                    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                         self.program.emit_insn(Insn::Affinity {
                             start_reg: self.start_reg,
                             count: std::num::NonZeroUsize::new(num_regs).unwrap(),

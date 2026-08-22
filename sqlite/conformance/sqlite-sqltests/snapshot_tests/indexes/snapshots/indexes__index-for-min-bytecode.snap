@@ -23,7 +23,7 @@ addr  opcode          p1  p2  p3  p4           p5  comment
    6    IsNull         3   9   0                0  if (r[3]==NULL) goto 9
    7    AggStep        0   3   2  min(Binary)   0  accum=r[2] step(r[3])
    8    Goto           0  10   0                0
-   9  Next             0   4   0                0
+   9  Next             0   4   0                1
   10  AggFinal         0   2   0  min           0  accum=r[2]
   11  Copy             2   1   0                0  r[1]=r[2]
   12  ResultRow        1   1   0                0  output=r[1]

@@ -41,7 +41,7 @@ See the [FAQ](#faq) for where the project stands on its way to 1.0.
 
 ## Features and Roadmap
 
-* **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
+* **SQLite compatibility** for SQL dialect, file formats, and the C API, tracking SQLite version 3.50.4 [see [document](COMPAT.md) for details]
 * **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Change data capture (CDC)** for real-time tracking of database changes.
 * **Multi-language support** for

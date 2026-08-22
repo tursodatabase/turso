@@ -54,7 +54,7 @@ addr  opcode                   p1  p2  p3  p4            p5  comment
   22            If              5  24   0                 0  if r[5] goto 24; don't emit group columns if continuing existing group
   23            Column          2   0   8                 0  r[8]=idx_orders_customer.customer_id
   24            Integer         1   5   0                 0  r[5]=1; indicate data in accumulator
-  25          Next              2  10   0                 0
+  25          Next              2  10   0                 1
   26          Gosub             4  30   0                 0  ; emit row for final group
   27          Goto              0  47   0                 0  ; group by finished
   28          Integer           1   6   0                 0  r[6]=1
@@ -87,7 +87,7 @@ addr  opcode                   p1  p2  p3  p4            p5  comment
   55      Column                0   1  23                 0  r[23]=ephemeral(ephemeral_subquery_t3).total_spent
   56      ResultRow            21   3   0                 0  output=r[21..23]
   57    Next                    0  52   0                 0
-  58  Next                      3  49   0                 0
+  58  Next                      3  49   0                 1
   59  Halt                      0   0   0                 0
   60  Transaction               0   1  11                 0  iDb=0 tx_mode=Read
   61  Integer                   1  15   0                 0  r[15]=1

@@ -2421,6 +2421,12 @@ impl IndexInfo {
         index: &Index,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
+        // A backing_btree stores the index method's complete opaque key. Unlike
+        // an ordinary secondary index, it must not append the base-table rowid.
+        // MVCC's commit-time conflict validation handles these
+        // `has_rowid == false` records by treating the whole key as the
+        // uniqueness prefix (see `check_index_for_conflicts`).
+        let has_rowid = index.has_rowid && !index.is_backing_btree_index();
         let key_info = index
             .columns
             .iter()
@@ -2429,15 +2435,15 @@ impl IndexInfo {
                 collation: c.collation.unwrap_or_default(),
                 nulls_order: c.nulls_order,
             })
-            .chain(index.has_rowid.then_some(KeyInfo {
+            .chain(has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::Binary,
                 nulls_order: None,
             }));
         Self::new_in(
             key_info,
-            index.has_rowid,
-            index.columns.len() + (index.has_rowid as usize),
+            has_rowid,
+            index.columns.len() + (has_rowid as usize),
             index.unique,
             alloc,
         )
@@ -3371,6 +3377,11 @@ impl Cursor {
             Self::Pseudo(_) => {}
             // Permanently null; the flag is a no-op.
             Self::NullRow => {}
+            // The FTS side of an outer join: columns are decoded from the
+            // base-table cursor (which receives its own NullRow), never from
+            // the index-method cursor, so there is no column state to null
+            // out here.
+            Self::IndexMethod(_) => {}
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");

@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
+use std::iter;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
@@ -17,8 +18,8 @@ use crate::translate::optimizer::constraints::{
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery, Plan,
-    SetOperation, SubqueryState, TableReferences, WhereTerm,
+    plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, NonFromClauseSubquery,
+    Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
@@ -58,7 +59,7 @@ pub struct AccessMethod {
     /// Estimated rows produced per outer row before applying remaining filters.
     pub estimated_rows_per_outer_row: f64,
     /// WHERE-term indices already accounted for by this access path's row estimate.
-    pub consumed_where_terms: SmallVec<[usize; 4]>,
+    pub consumed_where_terms: BitSet<usize>,
     /// Table-type specific access method details.
     pub params: AccessMethodParams,
 }
@@ -459,8 +460,8 @@ pub(super) fn choose_best_btree_candidate(
 fn consumed_where_terms_from_constraint_refs(
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
-) -> SmallVec<[usize; 4]> {
-    let mut consumed = SmallVec::new();
+) -> Result<BitSet<usize>> {
+    let mut consumed = BitSet::default();
     for cref in constraint_refs {
         for constraint_idx in [
             cref.eq.as_ref().map(|eq| eq.constraint_pos),
@@ -471,27 +472,24 @@ fn consumed_where_terms_from_constraint_refs(
         .flatten()
         {
             let where_term_idx = constraints[constraint_idx].where_clause_pos.0;
-            if !consumed.contains(&where_term_idx) {
-                consumed.push(where_term_idx);
-            }
+            consumed.set(where_term_idx)?;
         }
     }
-    consumed
+    Ok(consumed)
 }
 
 fn consume_partial_index_predicate_terms(
-    consumed: &mut SmallVec<[usize; 4]>,
+    consumed: &mut BitSet<usize>,
     index: &Index,
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
-) {
+) -> Result<()> {
     let predicate_terms = partial_index_predicate_terms(index, rhs_table, where_clause)
         .expect("selected partial index predicate must be implied by query");
     for term_idx in predicate_terms {
-        if !consumed.contains(&term_idx) {
-            consumed.push(term_idx);
-        }
+        consumed.set(term_idx)?;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -642,7 +640,7 @@ fn consider_in_seek_access_method(
     params: &CostModelParams,
     best_cost: Cost,
 ) -> Result<Option<AccessMethod>> {
-    Ok(choose_best_in_seek_candidate(
+    choose_best_in_seek_candidate(
         rhs_table,
         rhs_constraints,
         lhs_mask,
@@ -652,16 +650,19 @@ fn consider_in_seek_access_method(
         best_cost,
         BranchReadMode::FullRow,
     )?
-    .map(|chosen| AccessMethod {
-        cost: chosen.cost,
-        estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
-        consumed_where_terms: smallvec::smallvec![chosen.constraint_idx],
-        params: AccessMethodParams::InSeek {
-            index: chosen.index,
-            affinity: chosen.affinity,
-            where_term_idx: chosen.constraint_idx,
-        },
-    }))
+    .map(|chosen| -> Result<AccessMethod> {
+        Ok(AccessMethod {
+            cost: chosen.cost,
+            estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
+            consumed_where_terms: iter::once(chosen.constraint_idx).try_collect()?,
+            params: AccessMethodParams::InSeek {
+                index: chosen.index,
+                affinity: chosen.affinity,
+                where_term_idx: chosen.constraint_idx,
+            },
+        })
+    })
+    .transpose()
 }
 
 /// Add the cost of ready `WHERE` conditions.
@@ -673,12 +674,12 @@ fn cost_with_where_work(
 ) -> Cost {
     let used_steps: usize = ready_where
         .iter()
-        .filter(|(term_idx, _)| method.consumed_where_terms.contains(term_idx))
+        .filter(|(term_idx, _)| method.consumed_where_terms.get(*term_idx))
         .map(|(_, step_count)| step_count)
         .sum();
     let remaining_steps: usize = ready_where
         .iter()
-        .filter(|(term_idx, _)| !method.consumed_where_terms.contains(term_idx))
+        .filter(|(term_idx, _)| !method.consumed_where_terms.get(*term_idx))
         .map(|(_, step_count)| step_count)
         .sum();
     let output_rows = input_cardinality * method.estimated_rows_per_outer_row;
@@ -780,7 +781,7 @@ pub fn find_best_access_method_for_join_order(
                 None,
             ),
             estimated_rows_per_outer_row: 1.0,
-            consumed_where_terms: SmallVec::new(),
+            consumed_where_terms: Default::default(),
             params: AccessMethodParams::RecursiveCteInput,
         })),
     }
@@ -858,14 +859,14 @@ fn find_best_access_method_for_btree(
     let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
         &rhs_constraints.constraints,
         &best.constraint_refs,
-    );
+    )?;
     if let Some(index) = partial_index(best.index.as_ref()) {
         consume_partial_index_predicate_terms(
             &mut consumed_where_terms,
             index,
             rhs_table,
             where_clause,
-        );
+        )?;
     }
     let mut best_access_method = AccessMethod {
         cost: best.cost,
@@ -948,7 +949,7 @@ fn find_best_access_method_for_btree(
                 consumed_where_terms: consumed_where_terms_from_constraint_refs(
                     &rhs_constraints.constraints,
                     &constraint_refs,
-                ),
+                )?,
                 params: AccessMethodParams::BTreeTable {
                     iter_dir: best.iter_dir,
                     index: None,
@@ -987,7 +988,7 @@ fn find_best_access_method_for_btree(
                         index,
                         rhs_table,
                         where_clause,
-                    );
+                    )?;
                 }
             }
             replace_if_cheaper(
@@ -1091,9 +1092,9 @@ fn find_best_access_method_for_vtab(
                     .map(|(vtab_constraint, _)| {
                         constraints[vtab_constraint.index].where_clause_pos.0
                     })
-                    .collect()
+                    .try_collect()?
             } else {
-                SmallVec::new()
+                BitSet::default()
             };
             Ok(Some(AccessMethod {
                 // TODO: Base cost on `IndexInfo::estimated_cost`.
@@ -1249,12 +1250,12 @@ pub fn try_hash_join_access_method(
     probe_multiplier: f64,
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
-) -> Option<AccessMethod> {
+) -> Result<Option<AccessMethod>> {
     // Only works for B-tree tables
     if !matches!(build_table.table, Table::BTree(_))
         || !matches!(probe_table.table, Table::BTree(_))
     {
-        return None;
+        return Ok(None);
     }
     // Avoid hash join on self-joins over the same underlying table for INNER /
     // LEFT joins: a nested-loop with index seek is usually preferred and avoids
@@ -1267,13 +1268,13 @@ pub fn try_hash_join_access_method(
         .as_ref()
         .is_some_and(|ji| ji.is_full_outer());
     if build_root_page == probe_root_page && !is_full_outer {
-        return None;
+        return Ok(None);
     }
     // Explicit INDEXED BY / NOT INDEXED directives must be honored. A hash join
     // bypasses the normal access-path selection for the build/probe pair, so it
     // would ignore the user's requested scan shape.
     if build_table.indexed.is_some() || probe_table.indexed.is_some() {
-        return None;
+        return Ok(None);
     }
     // No hash join for semi/anti-joins (nested loop with index seek is preferred).
     if probe_table
@@ -1285,7 +1286,7 @@ pub fn try_hash_join_access_method(
             .as_ref()
             .is_some_and(|ji| ji.is_semi_or_anti())
     {
-        return None;
+        return Ok(None);
     }
     // Determine join type from the probe table's join_info.
     let hash_join_type = if probe_table
@@ -1311,7 +1312,7 @@ pub fn try_hash_join_access_method(
         .as_ref()
         .is_some_and(|ji| ji.is_outer())
     {
-        return None;
+        return Ok(None);
     }
 
     // Skip hash join on USING/NATURAL joins.
@@ -1324,7 +1325,7 @@ pub fn try_hash_join_access_method(
             .as_ref()
             .is_some_and(|ji| !ji.using.is_empty())
     {
-        return None;
+        return Ok(None);
     }
 
     // Avoid hash joins when there are correlated subqueries that reference the joined tables.
@@ -1340,7 +1341,7 @@ pub fn try_hash_join_access_method(
                     if *outer_ref_id == build_table.internal_id
                         || *outer_ref_id == probe_table.internal_id
                     {
-                        return None;
+                        return Ok(None);
                     }
                 }
             }
@@ -1364,7 +1365,7 @@ pub fn try_hash_join_access_method(
     // no equality (e.g. `a.x < b.x`) we still build a single-bucket hash join and
     // let the predicate apply as a residual, rather than rejecting the query.
     if join_keys.is_empty() && hash_join_type != HashJoinType::FullOuter {
-        return None;
+        return Ok(None);
     }
     // Custom-collated equality depends on a connection-owned callback, so the
     // hash join planner cannot derive a stable hash/equality pair here.
@@ -1372,7 +1373,7 @@ pub fn try_hash_join_access_method(
         expr_uses_custom_collation(join_key.get_build_expr(where_clause))
             || expr_uses_custom_collation(join_key.get_probe_expr(where_clause))
     }) {
-        return None;
+        return Ok(None);
     }
 
     // Prefer nested-loop with index lookup when an index exists on join columns.
@@ -1399,14 +1400,14 @@ pub fn try_hash_join_access_method(
                         // Check if the join column is a rowid alias directly from the table schema
                         if let Some(column) = probe_table.columns().get(col_pos) {
                             if column.is_rowid_alias() {
-                                return None;
+                                return Ok(None);
                             }
                         }
                         // Also check regular indexes
                         for candidate in &probe_constraints.candidates {
                             if let Some(index) = &candidate.index {
                                 if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return None;
+                                    return Ok(None);
                                 }
                             }
                         }
@@ -1426,14 +1427,14 @@ pub fn try_hash_join_access_method(
                         // Check if the join column is a rowid alias directly from the table schema
                         if let Some(column) = build_table.columns().get(col_pos) {
                             if column.is_rowid_alias() {
-                                return None;
+                                return Ok(None);
                             }
                         }
                         // Also check regular indexes
                         for candidate in &build_constraints.candidates {
                             if let Some(index) = &candidate.index {
                                 if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return None;
+                                    return Ok(None);
                                 }
                             }
                         }
@@ -1469,10 +1470,13 @@ pub fn try_hash_join_access_method(
         probe_multiplier,
         params,
     );
-    Some(AccessMethod {
+    Ok(Some(AccessMethod {
         cost,
         estimated_rows_per_outer_row,
-        consumed_where_terms: join_keys.iter().map(|key| key.where_clause_idx).collect(),
+        consumed_where_terms: join_keys
+            .iter()
+            .map(|key| key.where_clause_idx)
+            .try_collect()?,
         params: AccessMethodParams::HashJoin {
             build_table_idx,
             probe_table_idx,
@@ -1482,7 +1486,7 @@ pub fn try_hash_join_access_method(
             use_bloom_filter: false,
             join_type: hash_join_type,
         },
-    })
+    }))
 }
 
 /// Returns true when the expression is a simple column/rowid reference to the table.
@@ -1595,7 +1599,7 @@ fn find_best_access_method_for_subquery(
             // enclosing CTE/subquery might otherwise be shareable.
             cost: coroutine_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            consumed_where_terms: SmallVec::new(),
+            consumed_where_terms: Default::default(),
             params: AccessMethodParams::Subquery {
                 iter_dir: IterationDirection::Forwards,
             },
@@ -1655,7 +1659,7 @@ fn find_best_access_method_for_subquery(
             return Ok(Some(AccessMethod {
                 cost: scan_cost,
                 estimated_rows_per_outer_row: *base_row_count,
-                consumed_where_terms: SmallVec::new(),
+                consumed_where_terms: Default::default(),
                 params: AccessMethodParams::Subquery { iter_dir },
             }));
         }
@@ -1665,7 +1669,7 @@ fn find_best_access_method_for_subquery(
         return Ok(Some(AccessMethod {
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            consumed_where_terms: SmallVec::new(),
+            consumed_where_terms: Default::default(),
             params: AccessMethodParams::Subquery {
                 iter_dir: IterationDirection::Forwards,
             },
@@ -1678,7 +1682,7 @@ fn find_best_access_method_for_subquery(
         return Ok(Some(AccessMethod {
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            consumed_where_terms: SmallVec::new(),
+            consumed_where_terms: Default::default(),
             params: AccessMethodParams::Subquery {
                 iter_dir: IterationDirection::Forwards,
             },
@@ -1727,7 +1731,7 @@ fn find_best_access_method_for_subquery(
         return Ok(Some(AccessMethod {
             cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
-            consumed_where_terms: SmallVec::new(),
+            consumed_where_terms: Default::default(),
             params: AccessMethodParams::Subquery {
                 iter_dir: IterationDirection::Forwards,
             },
@@ -1786,7 +1790,7 @@ fn find_best_access_method_for_subquery(
     let scan_method = AccessMethod {
         cost: scan_cost,
         estimated_rows_per_outer_row: *base_row_count,
-        consumed_where_terms: SmallVec::new(),
+        consumed_where_terms: Default::default(),
         params: AccessMethodParams::Subquery {
             iter_dir: IterationDirection::Forwards,
         },
@@ -1797,7 +1801,7 @@ fn find_best_access_method_for_subquery(
         consumed_where_terms: consumed_where_terms_from_constraint_refs(
             &rhs_constraints.constraints,
             &usable_constraint_refs,
-        ),
+        )?,
         params: AccessMethodParams::MaterializedSubquery {
             index: ephemeral_index,
             constraint_refs: usable_constraint_refs,

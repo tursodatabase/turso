@@ -384,6 +384,7 @@ mod page_codec_tests {
     use crate::File;
     use crate::{io::IO, MemoryIO};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[derive(Debug)]
     struct XorPageCodec(u8);
@@ -419,6 +420,46 @@ mod page_codec_tests {
             output: &mut [u8],
         ) -> Result<()> {
             self.encode_page(context, input, output)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailOnEncodePageCodec {
+        fail_page_no: u32,
+        contexts: Arc<Mutex<Vec<PageCodecContext>>>,
+    }
+
+    impl PageCodec for FailOnEncodePageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            PageCodecId::new(*b"fail-on-page----")
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            0
+        }
+
+        fn encode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            self.contexts.lock().unwrap().push(context);
+            if context.page_no == self.fail_page_no {
+                return Err(LimboError::InternalError("codec encode failed".into()));
+            }
+            output.copy_from_slice(input);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            output.copy_from_slice(input);
+            Ok(())
         }
     }
 
@@ -588,6 +629,37 @@ mod page_codec_tests {
     }
 
     #[test]
+    fn page_codec_database_read_forwards_transport_error() {
+        let db_file = DatabaseFile {
+            file: Arc::new(MockFile {
+                read_result: Err(CompletionError::Aborted),
+                writes_submitted: Arc::new(AtomicUsize::new(0)),
+            }),
+        };
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_page_codec(Arc::new(XorPageCodec(0xa5)));
+        let original = Completion::new_read(Arc::new(Buffer::new_temporary(512)), |_| None);
+
+        let wrapped = db_file.read_page(2, &io_ctx, original.clone()).unwrap();
+        let err = MemoryIO::new().wait_for_completion(wrapped).unwrap_err();
+
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::Aborted)
+        ));
+        assert!(matches!(
+            original.get_error(),
+            Some(CompletionError::Aborted)
+        ));
+        assert!(original
+            .as_read()
+            .buf()
+            .as_slice()
+            .iter()
+            .all(|byte| *byte == 0));
+    }
+
+    #[test]
     fn page_codec_partial_database_read_fails_before_decode() {
         let db_file = DatabaseFile {
             file: Arc::new(MockFile {
@@ -646,6 +718,40 @@ mod page_codec_tests {
             writes_submitted.load(Ordering::Relaxed),
             0,
             "a codec error must prevent the database write from being submitted"
+        );
+    }
+
+    #[test]
+    fn page_codec_vectored_encode_error_does_not_submit_io() {
+        let writes_submitted = Arc::new(AtomicUsize::new(0));
+        let db_file = DatabaseFile {
+            file: Arc::new(MockFile {
+                read_result: Ok(0),
+                writes_submitted: writes_submitted.clone(),
+            }),
+        };
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_page_codec(Arc::new(FailOnEncodePageCodec {
+            fail_page_no: 3,
+            contexts: contexts.clone(),
+        }));
+        let buffers = (0..3)
+            .map(|_| Arc::new(Buffer::new_temporary(512)))
+            .collect();
+
+        let err = db_file
+            .write_pages(2, 512, buffers, &io_ctx, Completion::new_write(|_| {}))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("codec encode failed"));
+        assert_eq!(writes_submitted.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            *contexts.lock().unwrap(),
+            vec![
+                PageCodecContext::new(2, PageLocation::Database),
+                PageCodecContext::new(3, PageLocation::Database),
+            ]
         );
     }
 

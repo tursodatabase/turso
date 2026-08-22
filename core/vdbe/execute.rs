@@ -129,7 +129,10 @@ use super::{
         exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
-    insn::{Cookie, RegisterOrLiteral, SortComparatorType},
+    insn::{
+        AddSequenceData, AggStepData, ArrayEncodeData, Cookie, IntegrityCkData, RegisterOrLiteral,
+        SortComparatorType, SorterOpenData,
+    },
     CommitState,
 };
 use crate::sync::{Mutex, RwLock};
@@ -603,6 +606,21 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    if state.explicit_checkpoint_guard.is_none() {
+        // No exemption for nested statements: nothing in the engine prepares
+        // wal_checkpoint as a nested helper (VACUUM checkpoints through
+        // Connection::checkpoint), and nested statements are not counted in
+        // n_active_root_statements, so the guard's expected count still holds
+        // if one ever runs this opcode. Skipping the guard whenever *any*
+        // helper statement is alive on the connection would let a checkpoint
+        // clobber a suspended statement that holds one (e.g. a pragma vtab
+        // cursor's stored helper).
+        state.explicit_checkpoint_guard = Some(
+            program
+                .connection
+                .begin_explicit_checkpoint(pager.clone(), true)?,
+        );
+    }
 
     // In autocommit mode, this statement can still hold an implicit read tx.
     // RESTART/TRUNCATE checkpoint needs to restart WAL and may fail with Busy
@@ -656,6 +674,7 @@ pub fn op_checkpoint(
         // 3rd col: # pages moved to db after checkpoint
         state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
+        state.explicit_checkpoint_guard = None;
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -674,6 +693,7 @@ pub fn op_checkpoint(
             // 3rd col: # pages moved to db after checkpoint
             state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
+            state.explicit_checkpoint_guard = None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -681,6 +701,7 @@ pub fn op_checkpoint(
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
+            state.explicit_checkpoint_guard = None;
             state.registers[*dest].set_int(1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -737,7 +758,9 @@ pub fn op_null_row(
         turso_assert!(
             matches!(
                 cursor_type,
-                CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+                CursorType::BTreeTable(_)
+                    | CursorType::BTreeIndex(_)
+                    | CursorType::IndexMethod(_)
             ),
             "NullRow on unopened non-btree cursor",
             { "cursor_id": cursor_id }
@@ -1165,6 +1188,28 @@ pub fn op_if_not(
     Ok(InsnFunctionStepResult::Step)
 }
 
+fn ensure_index_method_context(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    database_id: usize,
+    attachment: &dyn crate::index_method::IndexMethodAttachment,
+) -> Result<Arc<crate::index_method::IndexMethodContext>> {
+    // Arc, not a deep clone: an opcode that yields on IO re-enters and calls
+    // this again — a cold FTS open does that hundreds of times per megabyte,
+    // and cloning the context's four heap strings each time adds up.
+    if let Some(context) = state.index_method_contexts[cursor_id].as_ref() {
+        return Ok(Arc::clone(context));
+    }
+    let context = Arc::new(crate::index_method::IndexMethodContext::new(
+        &program.connection,
+        database_id,
+        &attachment.definition(),
+    )?);
+    state.index_method_contexts[cursor_id] = Some(Arc::clone(&context));
+    Ok(context)
+}
+
 pub fn op_open_read(
     program: &Program,
     state: &mut ProgramState,
@@ -1186,6 +1231,11 @@ pub fn op_open_read(
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+        if mv_store.is_some() {
+            crate::index_method::ensure_mvcc_support(&module.definition(), false)?;
+        }
+        let context =
+            ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
             let cursor_ref = &mut state.cursors[*cursor_id];
@@ -1196,7 +1246,7 @@ pub fn op_open_read(
             .as_mut()
             .expect("cursor should exist after initialization");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_read(&program.connection, *db));
+        return_if_io!(cursor.open_read(&context));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -2167,6 +2217,13 @@ fn op_column_range_fetch(
             let filled = {
                 let cursor_ref =
                     must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "ColumnRange");
+                if matches!(cursor_ref, Cursor::NullRow) {
+                    tracing::trace!("op_column_range(null_row)");
+                    for reg in &mut state.registers[dest..dest + count] {
+                        reg.set_null();
+                    }
+                    return Ok(InsnFunctionStepResult::Step);
+                }
                 let cursor = cursor_ref.as_btree_mut();
 
                 if cursor.get_null_flag() {
@@ -2395,16 +2452,14 @@ pub fn op_array_encode(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        ArrayEncode {
-            reg,
-            element_affinity,
-            element_type,
-            table_name,
-            col_name,
-        },
-        insn
-    );
+    load_insn!(ArrayEncode { data }, insn);
+    let ArrayEncodeData {
+        reg,
+        element_affinity,
+        element_type,
+        table_name,
+        col_name,
+    } = data.as_ref();
 
     let val = state.registers[*reg].get_value();
     if matches!(val, Value::Null) {
@@ -3264,6 +3319,7 @@ pub fn op_next(
         Next {
             cursor_id,
             pc_if_next,
+            fullscan,
         },
         insn
     );
@@ -3302,12 +3358,14 @@ pub fn op_next(
         state.record_rows_read(1);
         state.metrics.btree_next = state.metrics.btree_next.saturating_add(1);
         state.metrics.search_count = state.metrics.search_count.saturating_add(1);
-        // Track if this is a full table scan or index scan
+        // Only steps codegen marked as part of a full table scan count as
+        // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
+        if *fullscan {
+            state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
+        }
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
-            } else if matches!(cursor_type, CursorType::BTreeTable(_)) {
-                state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
         state.pc = pc_if_next.as_offset_int();
@@ -3327,6 +3385,7 @@ pub fn op_prev(
         Prev {
             cursor_id,
             pc_if_prev,
+            fullscan,
         },
         insn
     );
@@ -3350,12 +3409,14 @@ pub fn op_prev(
         state.record_rows_read(1);
         state.metrics.btree_prev = state.metrics.btree_prev.saturating_add(1);
         state.metrics.search_count = state.metrics.search_count.saturating_add(1);
-        // Track if this is a full table scan or index scan
+        // Only steps codegen marked as part of a full table scan count as
+        // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
+        if *fullscan {
+            state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
+        }
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
-            } else if matches!(cursor_type, CursorType::BTreeTable(_)) {
-                state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
         state.pc = pc_if_prev.as_offset_int();
@@ -3373,16 +3434,22 @@ pub fn halt(
     description: &str,
     on_error: Option<ResolveType>,
 ) -> Result<InsnFunctionStepResult> {
+    state.halt_in_progress = true;
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-    let can_autocommit_now = state.can_autocommit_now(&program.connection);
+    // halt() runs while the statement is still stepping, so it is always
+    // counted in n_active_root_statements here.
+    let can_autocommit_now = state.can_autocommit_now(&program.connection, true);
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
     // for FAIL mode and need to continue the commit, then return the stored error.
     if let Some(pending_error) = state.pending_fail_error.take() {
         match program.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
-            IOResult::Done(_) => return Err(pending_error),
+            IOResult::Done(_) => {
+                index_method_on_transaction_committed_all(state, &program.connection);
+                return Err(pending_error);
+            }
             IOResult::IO(io) => {
                 state.pending_fail_error = Some(pending_error); // put it back and wait
                 return Ok(InsnFunctionStepResult::IO(io));
@@ -3398,6 +3465,13 @@ pub fn halt(
     if let Some(resolve_type) = on_error {
         // RAISE(IGNORE) signals the parent to skip the current row
         if resolve_type == ResolveType::Ignore {
+            // RAISE(IGNORE) is not an error: the frame unwinds, but everything
+            // the trigger wrote before the RAISE is kept. Stage index-method
+            // writes now, exactly like the normal trigger-subprogram halt
+            // below, so the kept base rows keep their index entries too.
+            if program.is_trigger_subprogram() {
+                return_if_io!(index_method_stage_statement_all(state));
+            }
             return Err(LimboError::RaiseIgnore);
         }
         if err_code > 0 {
@@ -3463,14 +3537,24 @@ pub fn halt(
                 ));
             }
 
-            // Release savepoint to preserve partial changes, then commit
-            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+            // Stage every custom index before releasing the statement
+            // savepoint, then commit the partial FAIL changes. Yielding for
+            // I/O here is safe because Halt is re-entrant: the whole opcode
+            // runs again on resume, recomputes the same outcome from the same
+            // registers, and `pending_fail_error` carries the decided error
+            // across resumes further down. `halt_in_progress` keeps
+            // interrupt, deadline, and progress-handler requests from
+            // replacing the outcome while the staged work is in flight.
             vtab_commit_all(&program.connection)?;
-            index_method_pre_commit_all(state, pager)?;
+            return_if_io!(index_method_stage_statement_all(state));
+            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
 
             // Commit the transaction with partial changes
             match program.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
-                IOResult::Done(_) => return Err(error),
+                IOResult::Done(_) => {
+                    index_method_on_transaction_committed_all(state, &program.connection);
+                    return Err(error);
+                }
                 IOResult::IO(io) => {
                     // store the error for reentrancy
                     state.pending_fail_error = Some(error);
@@ -3514,6 +3598,11 @@ pub fn halt(
     }
 
     if program.is_trigger_subprogram() {
+        // Trigger statements are cached and reset before the next firing.
+        // Stage their index-method writes now so reset cannot drop pending
+        // work from an earlier row in the parent statement. The parent still
+        // owns the statement savepoint and the final transaction outcome.
+        return_if_io!(index_method_stage_statement_all(state));
         return Ok(InsnFunctionStepResult::Done);
     }
 
@@ -3541,10 +3630,10 @@ pub fn halt(
                 ));
             }
         }
-        state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         if can_autocommit_now {
             vtab_commit_all(&program.connection)?;
-            index_method_pre_commit_all(state, pager)?;
+            return_if_io!(index_method_stage_statement_all(state));
+            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             // Sequence backing-table compaction and sqlite_sequence sync
             // are emitted as straight-line bytecode inside the
             // nextval / advance_past / setval translators
@@ -3559,6 +3648,7 @@ pub fn halt(
                 .map(Into::into);
             // Apply deferred CDC state and reset CDC txn ID after successful commit
             if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+                index_method_on_transaction_committed_all(state, &program.connection);
                 if let Some(cdc_info) = state.pending_cdc_info.take() {
                     program.connection.set_capture_data_changes_info(cdc_info);
                 }
@@ -3568,7 +3658,14 @@ pub fn halt(
         } else {
             // Another root statement may own the implicit autocommit
             // transaction. This statement can finish, but must not commit or
-            // roll back connection-level state it did not start.
+            // roll back connection-level state it did not start. Its
+            // index-method writes must still be staged before the statement
+            // savepoint is released, and its cursors handed to the connection
+            // so the sibling that eventually commits (or rolls back) the
+            // shared transaction delivers their outcome.
+            return_if_io!(index_method_stage_statement_all(state));
+            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+            index_method_register_transaction_all(state, &program.connection)?;
             //
             // FIXME: when this statement is a writer in MVCC mode, deferring
             // its commit to the last sibling statement means the writer's
@@ -3609,8 +3706,9 @@ pub fn halt(
         // Otherwise the cursor's Drop fallback performs these writes after
         // statement success, where an I/O error can no longer be returned to
         // the caller or rolled back at statement scope.
-        index_method_pre_commit_all(state, pager)?;
+        return_if_io!(index_method_stage_statement_all(state));
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+        index_method_register_transaction_all(state, &program.connection)?;
         // Apply deferred CDC state after successful statement completion
         if let Some(cdc_info) = state.pending_cdc_info.take() {
             program.connection.set_capture_data_changes_info(cdc_info);
@@ -3644,27 +3742,186 @@ pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     Ok(())
 }
 
-/// Flush pending writes on all index method cursors before transaction commit.
-/// This ensures index method writes are persisted as part of the transaction.
-pub(crate) fn index_method_pre_commit_all(
+/// Stage pending writes on every index-method cursor before releasing the
+/// statement savepoint. Cursor order is bytecode cursor order, which is stable
+/// across resumptions and avoids attachment-order ambiguity.
+pub(crate) fn index_method_stage_statement_all(
     state: &mut ProgramState,
-    pager: &Arc<Pager>,
-) -> crate::Result<()> {
-    for cursor_opt in state.cursors.iter_mut().flatten() {
-        let Cursor::IndexMethod(cursor) = cursor_opt else {
-            continue;
-        };
-        loop {
-            match cursor.pre_commit()? {
-                IOResult::Done(()) => break,
-                IOResult::IO(io) => {
-                    while !io.finished() {
-                        pager.io.step()?;
-                    }
-                }
+) -> crate::Result<IOResult<()>> {
+    if state.index_methods_finalized {
+        return Ok(IOResult::Done(()));
+    }
+
+    while state.index_method_finalize_cursor < state.cursors.len() {
+        let cursor_id = state.index_method_finalize_cursor;
+        if matches!(
+            state.cursors[cursor_id].as_ref(),
+            Some(Cursor::IndexMethod(_))
+        ) {
+            let Some(context) = state.index_method_contexts[cursor_id].clone() else {
+                return Err(LimboError::InternalError(format!(
+                    "index-method cursor {cursor_id} has no execution context"
+                )));
+            };
+            crate::mvcc::yield_points::inject_io_yield!(
+                context,
+                crate::index_method::IndexMethodYieldPoint::BeforePrepareStatement
+            );
+            let Some(Cursor::IndexMethod(cursor)) = state.cursors[cursor_id].as_mut() else {
+                unreachable!("cursor kind checked above")
+            };
+            match cursor.stage_statement_commit(&context)? {
+                IOResult::Done(()) => {}
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
+            state.index_method_finalize_cursor += 1;
+            crate::mvcc::yield_points::inject_io_yield!(
+                context,
+                crate::index_method::IndexMethodYieldPoint::AfterPrepareStatement
+            );
+            continue;
+        }
+        state.index_method_finalize_cursor += 1;
+    }
+
+    let subprogram_keys = state
+        .index_method_finalize_subprogram_keys
+        .get_or_insert_with(|| {
+            let mut keys = state
+                .subprogram_stmt_cache
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys
+        });
+    while state.index_method_finalize_subprogram < subprogram_keys.len() {
+        let key = subprogram_keys[state.index_method_finalize_subprogram];
+        let statement = state
+            .subprogram_stmt_cache
+            .get_mut(&key)
+            .expect("finalization key must reference a cached subprogram");
+        match statement.prepare_index_methods()? {
+            IOResult::Done(()) => state.index_method_finalize_subprogram += 1,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
         }
     }
+
+    state.index_methods_finalized = true;
+    Ok(IOResult::Done(()))
+}
+
+/// Discard statement-owned index-method work before a statement savepoint or
+/// transaction is rolled back. Hooks are deliberately infallible and may not
+/// perform I/O.
+pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
+    for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
+        let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
+            continue;
+        };
+        let Some(context) = state.index_method_contexts[cursor_id].as_ref() else {
+            // Every opcode that installs an index-method cursor builds its
+            // context first, so this cursor cannot have pending work.
+            debug_assert!(
+                false,
+                "index-method cursor {cursor_id} installed without a context"
+            );
+            continue;
+        };
+        cursor.abort_statement(context);
+    }
+    for (cursor, context) in &mut state.closed_index_method_cursors {
+        cursor.abort_statement(context);
+    }
+    for statement in state.subprogram_stmt_cache.values_mut() {
+        statement.abort_index_methods();
+    }
+    state.index_method_finalize_cursor = 0;
+    state.index_method_finalize_subprogram_keys = None;
+    state.index_method_finalize_subprogram = 0;
+    state.index_methods_finalized = false;
+}
+
+/// Publish safe in-memory state after a durable autocommit outcome.
+pub(crate) fn index_method_on_transaction_committed_all(
+    state: &mut ProgramState,
+    connection: &Connection,
+) {
+    tracing::trace!(
+        open_cursors = state
+            .cursors
+            .iter()
+            .filter(|cursor| matches!(cursor, Some(Cursor::IndexMethod(_))))
+            .count(),
+        closed_cursors = state.closed_index_method_cursors.len(),
+        subprograms = state.subprogram_stmt_cache.len(),
+        "publishing committed index-method state"
+    );
+    for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
+        let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
+            continue;
+        };
+        let Some(context) = state.index_method_contexts[cursor_id].as_ref() else {
+            // Every opcode that installs an index-method cursor builds its
+            // context first, so this cursor cannot have pending work.
+            debug_assert!(
+                false,
+                "index-method cursor {cursor_id} installed without a context"
+            );
+            continue;
+        };
+        cursor.on_transaction_committed(context);
+    }
+    for (cursor, context) in &mut state.closed_index_method_cursors {
+        cursor.on_transaction_committed(context);
+    }
+    for statement in state.subprogram_stmt_cache.values_mut() {
+        statement.commit_index_methods();
+    }
+    connection.index_methods_on_transaction_committed();
+}
+
+/// Transfer the final prepared cursor for every attachment touched by this
+/// statement into connection-level transaction ownership. Replacing an older
+/// cursor for the same attachment keeps outcome delivery exactly once while
+/// retaining the newest in-transaction view.
+pub(crate) fn index_method_register_transaction_all(
+    state: &mut ProgramState,
+    connection: &Connection,
+) -> crate::Result<()> {
+    let mut registered = 0usize;
+    for cursor_id in 0..state.cursors.len() {
+        if !matches!(state.cursors[cursor_id], Some(Cursor::IndexMethod(_))) {
+            continue;
+        }
+        let Some(Cursor::IndexMethod(cursor)) = state.cursors[cursor_id].take() else {
+            unreachable!("cursor kind checked above")
+        };
+        let context = state.index_method_contexts[cursor_id]
+            .take()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "index-method cursor {cursor_id} has no execution context"
+                ))
+            })?;
+        connection.register_index_method_transaction_cursor(
+            crate::index_method::TransactionIndexMethodCursor { cursor, context },
+        );
+        registered += 1;
+    }
+    for (cursor, context) in state.closed_index_method_cursors.drain(..) {
+        connection.register_index_method_transaction_cursor(
+            crate::index_method::TransactionIndexMethodCursor { cursor, context },
+        );
+        registered += 1;
+    }
+    for statement in state.subprogram_stmt_cache.values_mut() {
+        statement.register_index_methods(connection)?;
+    }
+    tracing::trace!(
+        registered,
+        "retained statement index-method cursors for transaction outcome"
+    );
     Ok(())
 }
 
@@ -4594,6 +4851,9 @@ pub fn op_auto_commit(
             res,
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
+            if !*rollback {
+                conn.index_methods_on_transaction_committed();
+            }
             conn.clear_tx_poison();
             conn.clear_named_savepoints();
         }
@@ -4654,6 +4914,7 @@ pub fn op_auto_commit(
                 }
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
+                conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -4703,12 +4964,13 @@ pub fn op_auto_commit(
         { "tx_op": tx_op }
     );
 
-    // For explicit COMMIT, flush pending writes before the actual commit
-    // so they are part of the same transaction. Sequence flush no longer
-    // belongs here — see the long-form comment in `op_halt` above.
-    if matches!(tx_op, TxOp::Commit) {
-        index_method_pre_commit_all(state, pager)?;
-    }
+    // Index-method staging is a per-statement Halt responsibility (each
+    // statement stages its writes at its own halt and hands its cursors to
+    // the connection), so the COMMIT program has nothing to stage here. A
+    // yield point at this spot would also be unsafe: `conn.auto_commit` was
+    // already flipped above, and re-entering this opcode from the top after
+    // an IO yield would then fail `valid_transition` with a torn-down
+    // transaction.
 
     let res = match program
         .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
@@ -4741,6 +5003,9 @@ pub fn op_auto_commit(
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
+    if matches!(tx_op, TxOp::Commit) {
+        conn.index_methods_on_transaction_committed();
+    }
     conn.clear_tx_poison();
     conn.clear_named_savepoints();
 
@@ -4981,6 +5246,7 @@ pub fn op_savepoint(
                 }
             });
             pager.set_schema_cookie(None);
+            conn.index_methods_on_savepoint_rolled_back();
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -8110,17 +8376,15 @@ pub fn op_agg_step(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        AggStep {
-            acc_reg,
-            col,
-            delimiter,
-            func,
-            comparator,
-            collation,
-        },
-        insn
-    );
+    load_insn!(AggStep { data }, insn);
+    let AggStepData {
+        acc_reg,
+        col,
+        delimiter,
+        func,
+        comparator,
+        collation,
+    } = data.as_ref();
 
     if let AccumulatorFunc::Window(win_func) = func {
         return op_window_step(state, *acc_reg, *col, win_func);
@@ -8383,15 +8647,13 @@ pub fn op_sorter_open(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        SorterOpen {
-            cursor_id,
-            columns: _,
-            order_collations_nulls,
-            comparators,
-        },
-        insn
-    );
+    load_insn!(SorterOpen { data }, insn);
+    let SorterOpenData {
+        cursor_id,
+        columns: _,
+        order_collations_nulls,
+        comparators,
+    } = data.as_ref();
     // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
     let page_size = match pager.with_header(|header| header.page_size) {
         Ok(IOResult::Done(page_size)) => page_size,
@@ -8954,7 +9216,15 @@ pub fn op_function(
             }
             JsonFunc::JsonValid => {
                 let json_value = &state.registers[*start_reg];
-                state.registers[*dest].set_value(is_json_valid(json_value.get_value())?);
+                // json_valid(X) is defined as json_valid(X, 1).
+                let default_flags = Value::from_i64(json::JSON_VALID_FLAG_TEXT_STRICT);
+                let flags_value = if arg_count > 1 {
+                    state.registers[*start_reg + 1].get_value()
+                } else {
+                    &default_flags
+                };
+                state.registers[*dest]
+                    .set_value(is_json_valid(json_value.get_value(), flags_value)?);
             }
             JsonFunc::JsonPatch => {
                 assert_eq!(arg_count, 2);
@@ -9363,6 +9633,7 @@ pub fn op_function(
             | ScalarFunc::Upper
             | ScalarFunc::Length
             | ScalarFunc::OctetLength
+            | ScalarFunc::Subtype
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
             | ScalarFunc::Unistr
@@ -9380,6 +9651,7 @@ pub fn op_function(
                     ScalarFunc::Upper => reg_value.exec_upper(),
                     ScalarFunc::Length => Some(reg_value.exec_length()),
                     ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
+                    ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
@@ -12721,6 +12993,11 @@ pub fn op_open_write(
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+        if mv_store.is_some() {
+            crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
+        }
+        let context =
+            ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
             let cursor_ref = &mut state.cursors[*cursor_id];
@@ -12731,7 +13008,7 @@ pub fn op_open_write(
             .as_mut()
             .expect("cursor should exist");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_write(&program.connection, *db));
+        return_if_io!(cursor.open_write(&context));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -12962,22 +13239,25 @@ pub fn op_index_method_create(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] else {
+        unreachable!("IndexMethodCreate emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
-    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
+    // Build the context before installing the cursor: a context error must
+    // not leave a cursor in the slot with no context, a state the statement
+    // outcome helpers cannot deliver hooks to.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
     }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
-        .expect("cursor should exist");
-    let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.create(&program.connection, *db));
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.create(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -12993,22 +13273,23 @@ pub fn op_index_method_destroy(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) else {
+        unreachable!("IndexMethodDestroy emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
-    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
+    // Context before cursor install; see op_index_method_create.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
     }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
-        .expect("cursor should exist");
-    let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.destroy(&program.connection, *db));
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.destroy(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13024,29 +13305,30 @@ pub fn op_index_method_optimize(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) else {
+        unreachable!("IndexMethodOptimize emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
-    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
+    // Context before cursor install; see op_index_method_create.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
     }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
-        .expect("cursor should exist");
-    let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.optimize(&program.connection, *db));
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.optimize(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_index_method_query(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -13061,10 +13343,6 @@ pub fn op_index_method_query(
         },
         insn
     );
-    let mv_store = program.connection.mv_store();
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
-    }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
         .expect("cursor should exist");
@@ -13338,18 +13616,16 @@ pub fn op_add_sequence(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        AddSequence {
-            db,
-            name,
-            start,
-            increment,
-            min_value,
-            max_value,
-            cycle,
-        },
-        insn
-    );
+    load_insn!(AddSequence { data }, insn);
+    let AddSequenceData {
+        db,
+        name,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+    } = data.as_ref();
     let seq = crate::schema::Sequence::new(
         name.clone(),
         Some(*start),
@@ -14024,6 +14300,24 @@ pub fn op_close(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Close { cursor_id }, insn);
+    if let Some(Cursor::IndexMethod(cursor)) = state.cursors[*cursor_id].as_mut() {
+        let context = state.index_method_contexts[*cursor_id]
+            .as_ref()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "index-method cursor {cursor_id} closed without an execution context"
+                ))
+            })?
+            .clone();
+        return_if_io!(cursor.stage_statement_commit(&context));
+        let Some(Cursor::IndexMethod(cursor)) = state.cursors[*cursor_id].take() else {
+            unreachable!("cursor variant checked above");
+        };
+        let context = state.index_method_contexts[*cursor_id]
+            .take()
+            .expect("index-method context checked above");
+        state.closed_index_method_cursors.push((cursor, context));
+    }
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
@@ -15537,16 +15831,14 @@ pub fn op_integrity_check(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        IntegrityCk {
-            db,
-            max_errors,
-            roots,
-            dropped_roots,
-            message_register,
-        },
-        insn
-    );
+    load_insn!(IntegrityCk { data }, insn);
+    let IntegrityCkData {
+        db,
+        max_errors,
+        roots,
+        dropped_roots,
+        message_register,
+    } = data.as_ref();
 
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
@@ -15720,7 +16012,7 @@ pub fn op_cast(
 
     let value = state.registers[*reg].get_value().clone();
     let result = match affinity {
-        Affinity::Blob => value.exec_cast("BLOB"),
+        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
@@ -16172,23 +16464,14 @@ pub fn op_add_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        AddColumn {
-            db,
-            table,
-            column,
-            check_constraints,
-            foreign_keys
-        },
-        insn
-    );
+    load_insn!(AddColumn { data }, insn);
 
     let conn = program.connection.clone();
-    let normalized_table_name = normalize_ident(table.as_str());
-    let new_check_constraints = check_constraints.try_to_vec()?;
-    let new_foreign_keys = foreign_keys.try_to_vec()?;
+    let normalized_table_name = normalize_ident(data.table.as_str());
+    let new_check_constraints = data.check_constraints.try_to_vec()?;
+    let new_foreign_keys = data.foreign_keys.try_to_vec()?;
 
-    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
+    conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
         let table_ref = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -16201,7 +16484,7 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns_mut().try_push((**column).clone())?;
+        btree.columns_mut().try_push(data.column.clone())?;
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints = new_check_constraints;
         // Update foreign keys to include any FK constraints from the new column
@@ -17472,7 +17755,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
         }
 
         match affinity {
-            Affinity::Blob => return true,
+            Affinity::Blob | Affinity::None => return true,
 
             Affinity::Text => {
                 if matches!(value, Value::Text(_) | Value::Null) {

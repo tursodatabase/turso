@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
+use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
@@ -41,9 +41,10 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
-    PreparedProgram, Program,
+    affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
+    PrepareContext, PreparedProgram, Program,
 };
+use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
 
@@ -191,6 +192,42 @@ impl DmlColumnContext {
     }
 }
 
+enum BuilderQueryMode {
+    Normal,
+    Explain,
+    ExplainQueryPlan {
+        format: ast::EqpFormat,
+        current_parent_idx: Option<usize>,
+    },
+}
+
+impl BuilderQueryMode {
+    const fn new(query_mode: QueryMode) -> Self {
+        match query_mode {
+            QueryMode::Normal => Self::Normal,
+            QueryMode::Explain => Self::Explain,
+            QueryMode::ExplainQueryPlan { format } => Self::ExplainQueryPlan {
+                format,
+                current_parent_idx: None,
+            },
+        }
+    }
+
+    const fn query_mode(&self) -> QueryMode {
+        match self {
+            Self::Normal => QueryMode::Normal,
+            Self::Explain => QueryMode::Explain,
+            Self::ExplainQueryPlan { format, .. } => {
+                QueryMode::ExplainQueryPlan { format: *format }
+            }
+        }
+    }
+
+    const fn is_explain_query_plan(&self) -> bool {
+        matches!(self, Self::ExplainQueryPlan { .. })
+    }
+}
+
 pub struct ProgramBuilder {
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
@@ -207,8 +244,7 @@ pub struct ProgramBuilder {
     /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
     /// position, even after `emit_constant_insns` reorders the program.
     label_to_resolved_offset: Vec<Option<InsnReference>>,
-    // map of instruction index to manual comment (used in EXPLAIN only)
-    comments: Vec<(InsnReference, &'static str)>,
+    explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
@@ -253,7 +289,7 @@ pub struct ProgramBuilder {
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
     /// The mode in which the query is being executed.
-    query_mode: QueryMode,
+    mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
     /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
@@ -267,8 +303,6 @@ pub struct ProgramBuilder {
     nested_level: usize,
     init_label: BranchOffset,
     start_offset: BranchOffset,
-    /// Current parent explain address, if any.
-    current_parent_explain_idx: Option<usize>,
     pub(crate) reg_result_cols_start: Option<usize>,
     pub resolve_type: ResolveType,
     /// When set, all triggers fired from this program should use this conflict resolution.
@@ -544,13 +578,15 @@ impl CursorType {
 pub enum QueryMode {
     Normal,
     Explain,
-    ExplainQueryPlan,
+    ExplainQueryPlan { format: ast::EqpFormat },
 }
 
 impl QueryMode {
     pub const fn new(cmd: &ast::Cmd) -> Self {
         match cmd {
-            ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
+            ast::Cmd::ExplainQueryPlan { format, .. } => {
+                QueryMode::ExplainQueryPlan { format: *format }
+            }
             ast::Cmd::Explain(_) => QueryMode::Explain,
             ast::Cmd::Stmt(_) => QueryMode::Normal,
         }
@@ -579,12 +615,12 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid allocating a String if we are not in explain mode.
+/// because we want to avoid building the [EqpDetail] if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
-        if let $crate::QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
-            $builder.emit_explain($push, $detail);
+        if let $crate::QueryMode::ExplainQueryPlan { .. } = $builder.get_query_mode() {
+            $builder.emit_explain_should_not_be_called_directly($push, $detail);
         }
     };
 }
@@ -669,7 +705,7 @@ impl ProgramBuilder {
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
-            comments: Vec::new(),
+            explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
@@ -685,8 +721,7 @@ impl ProgramBuilder {
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
-            query_mode,
-            current_parent_explain_idx: None,
+            mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
@@ -1304,40 +1339,85 @@ impl ProgramBuilder {
     }
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
-        if let QueryMode::Explain | QueryMode::ExplainQueryPlan = self.query_mode {
-            self.comments.push((insn_index.as_offset_int(), comment));
+        if let BuilderQueryMode::Explain | BuilderQueryMode::ExplainQueryPlan { .. } = self.mode {
+            self.explain
+                .comments
+                .push((insn_index.as_offset_int(), comment));
         }
     }
 
     pub const fn get_query_mode(&self) -> QueryMode {
-        self.query_mode
+        self.mode.query_mode()
     }
 
-    /// use emit_explain macro instead, because we don't want to allocate
-    /// String if we are not in explain mode
-    pub fn emit_explain(&mut self, push: bool, detail: String) {
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            self.emit_insn(Insn::Explain {
-                p1: self.insns.len(),
-                p2: self.current_parent_explain_idx,
-                detail,
-            });
-            if push {
-                self.current_parent_explain_idx = Some(self.insns.len() - 1);
-            }
+    /// Prefer calling the emit_explain! macro instead.
+    pub fn emit_explain_should_not_be_called_directly(&mut self, push: bool, detail: EqpDetail) {
+        let BuilderQueryMode::ExplainQueryPlan {
+            current_parent_idx, ..
+        } = self.mode
+        else {
+            return;
+        };
+        self.emit_insn(Insn::Explain {
+            p1: self.insns.len(),
+            p2: current_parent_idx,
+            detail: Box::new(detail),
+        });
+        if push {
+            let emitted = self.insns.len() - 1;
+            *self.current_parent_idx_mut() = Some(emitted);
         }
     }
 
-    pub fn pop_current_parent_explain(&mut self) {
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            if let Some(current) = self.current_parent_explain_idx {
-                let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
-                    unreachable!("current_parent_explain_idx must point to an Explain insn");
-                };
-                self.current_parent_explain_idx = *p2;
+    pub fn with_cte_materialization_eqp<T>(
+        &mut self,
+        cte_id: usize,
+        name: &str,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let insns_start = self.insns.len();
+        let emitted = emit(self)?;
+        if self.mode.is_explain_query_plan() {
+            let node_ids: Vec<usize> = (insns_start..self.insns.len())
+                .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
+                .collect();
+            if !node_ids.is_empty() {
+                self.explain
+                    .cte_materializations
+                    .push(EqpCteMaterialization {
+                        cte_id,
+                        name: name.to_string(),
+                        node_ids,
+                    });
             }
-        } else {
-            turso_debug_assert!(self.current_parent_explain_idx.is_none());
+        }
+        Ok(emitted)
+    }
+
+    pub fn pop_current_parent_explain(&mut self) {
+        let BuilderQueryMode::ExplainQueryPlan {
+            current_parent_idx: Some(current),
+            ..
+        } = self.mode
+        else {
+            return;
+        };
+        let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
+            unreachable!("current_parent_idx must point to an Explain insn");
+        };
+        let grandparent = *p2;
+        *self.current_parent_idx_mut() = grandparent;
+    }
+
+    /// Panics if `self.mode` is not `ExplainQueryPlan`.
+    fn current_parent_idx_mut(&mut self) -> &mut Option<usize> {
+        match &mut self.mode {
+            BuilderQueryMode::ExplainQueryPlan {
+                current_parent_idx, ..
+            } => current_parent_idx,
+            BuilderQueryMode::Normal | BuilderQueryMode::Explain => {
+                unreachable!("caller must check EXPLAIN QUERY PLAN mode first")
+            }
         }
     }
 
@@ -1397,14 +1477,9 @@ impl ProgramBuilder {
             }
         }
 
-        for (offset, _) in self.comments.iter_mut() {
-            *offset = old_to_new[*offset as usize] as u32;
-        }
+        self.explain.remap_insn_indices(&old_to_new);
 
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            self.current_parent_explain_idx =
-                self.current_parent_explain_idx.map(|old| old_to_new[old]);
-
+        if self.mode.is_explain_query_plan() {
             for i in 0..self.insns.len() {
                 let (Insn::Explain { p2, .. }, _) = &self.insns[i] else {
                     continue;
@@ -1419,6 +1494,9 @@ impl ProgramBuilder {
                 *p1 = i;
                 *p2 = new_p2;
             }
+
+            let current_parent_idx = self.current_parent_idx_mut();
+            *current_parent_idx = current_parent_idx.map(|old| old_to_new[old]);
         }
     }
 
@@ -2028,6 +2106,7 @@ impl ProgramBuilder {
         self.emit_insn(Insn::Next {
             cursor_id,
             pc_if_next: loop_start,
+            fullscan: false,
         });
         self.preassign_label_to_next_insn(loop_end);
     }
@@ -2189,7 +2268,7 @@ impl ProgramBuilder {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
-            comments: self.comments,
+            explain: self.explain,
             parameters: self.parameters,
             change_cnt_on,
             readonly: self.flags.readonly(),

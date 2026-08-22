@@ -4525,9 +4525,12 @@ impl Wal for WalFile {
         let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
-        let mut rolling_checksum: (u32, u32) = *self.last_checksum.read();
-
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
+        let mut rolling_checksum = if next_frame_id == 1 {
+            (header.checksum_1, header.checksum_2)
+        } else {
+            *self.last_checksum.read()
+        };
         // Build every frame in order, updating the rolling checksum
         for page in pages.iter() {
             tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
@@ -5331,11 +5334,16 @@ impl WalFile {
     /// MVCC helper: check if WAL state changed and refresh local snapshot without starting a read tx.
     /// FIXME: this isn't TOCTOU safe because we're not taking WAL read locks.
     ///
-    /// This is only used to invalidate page cache, so false positives are sort of acceptable since
-    /// MVCC reads currently don't read from WAL frames ever.
-    /// FIXME: MVCC should start using pager read transactions anyway so that we can get rid of
-    /// the stop-the-world MVCC checkpoint that blocks all reads.
+    /// No-op while this connection holds a read guard: an active read tx pinned the
+    /// connection's WAL view, and an MVCC transaction's `read_mark` was captured from it.
+    /// Advancing `max_frame` here would let the transaction's B-tree reads see pages a
+    /// passive checkpoint materialized after its snapshot, leaking later commits into it.
+    /// The guard also keeps everything at-or-below the pinned view immutable, so the page
+    /// cache stays valid and needs no invalidation.
     pub fn mvcc_refresh_if_db_changed(&self) -> bool {
+        if self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD {
+            return false;
+        }
         let snapshot = self.load_coordination_snapshot();
         let local_state = self.connection_state();
         let changed = self.db_changed_against(snapshot, local_state);
@@ -6471,6 +6479,57 @@ pub mod test {
         }
     }
 
+    #[derive(Debug)]
+    struct XorFailOnPageCodec {
+        mask: u8,
+        fail_encode_page: Option<u32>,
+        fail_decode_page: Option<u32>,
+    }
+
+    impl XorFailOnPageCodec {
+        fn transform(&self, input: &[u8], output: &mut [u8]) {
+            for (input, output) in input.iter().zip(output) {
+                *output = input ^ self.mask;
+            }
+        }
+    }
+
+    impl PageCodec for XorFailOnPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            PageCodecId::new(*b"wal-fail-page---")
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            0
+        }
+
+        fn encode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            if self.fail_encode_page == Some(context.page_no) {
+                return Err(LimboError::InternalError("codec encode failed".into()));
+            }
+            self.transform(input, output);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            if self.fail_decode_page == Some(context.page_no) {
+                return Err(LimboError::InternalError("codec decode failed".into()));
+            }
+            self.transform(input, output);
+            Ok(())
+        }
+    }
+
     fn set_test_page_codec(wal: &WalFile, codec: Arc<dyn PageCodec>) {
         let mut io_ctx = IOContext::default();
         io_ctx.set_page_codec(codec);
@@ -6649,6 +6708,33 @@ pub mod test {
     }
 
     #[test]
+    fn page_codec_vectored_spill_encode_error_does_not_advance_wal() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(
+            &wal,
+            Arc::new(XorFailOnPageCodec {
+                mask: 0xa5,
+                fail_encode_page: Some(33),
+                fail_decode_page: None,
+            }),
+        );
+        let pages = vec![
+            page_with_pattern(32, 0x10, &buffer_pool),
+            page_with_pattern(33, 0x20, &buffer_pool),
+        ];
+
+        let err = wal
+            .append_frames_vectored(pages, PageSize::new(page_size).unwrap())
+            .unwrap_err();
+
+        assert!(err.to_string().contains("codec encode failed"));
+        assert_eq!(wal.get_max_frame(), 0);
+        assert_eq!(wal.find_frame(32, None).unwrap(), None);
+        assert_eq!(wal.find_frame(33, None).unwrap(), None);
+    }
+
+    #[test]
     fn page_codec_round_trips_raw_wal_frames() {
         let page_size = 512;
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
@@ -6662,6 +6748,44 @@ pub mod test {
         let completion = wal.read_frame_raw(1, &mut frame).unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(&frame[WAL_FRAME_HEADER_SIZE..], expected.as_slice());
+    }
+
+    #[test]
+    fn page_codec_raw_wal_encode_error_does_not_advance_wal() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::ErrorEncode));
+        let page = vec![0; page_size as usize];
+
+        let err = wal
+            .write_frame_raw(buffer_pool, 1, 44, 0, &page, FileSyncType::Fsync)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("codec encode failed"));
+        assert_eq!(wal.get_max_frame(), 0);
+        assert_eq!(wal.find_frame(44, None).unwrap(), None);
+    }
+
+    #[test]
+    fn page_codec_raw_wal_duplicate_is_idempotent_and_detects_conflict() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let page = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
+
+        wal.write_frame_raw(buffer_pool.clone(), 1, 44, 0, &page, FileSyncType::Fsync)
+            .unwrap();
+        wal.write_frame_raw(buffer_pool.clone(), 1, 44, 0, &page, FileSyncType::Fsync)
+            .unwrap();
+
+        let mut different_page = page;
+        different_page[0] ^= 1;
+        let err = wal
+            .write_frame_raw(buffer_pool, 1, 44, 0, &different_page, FileSyncType::Fsync)
+            .unwrap_err();
+        assert!(matches!(err, LimboError::Conflict(_)));
+        assert_eq!(wal.get_max_frame(), 1);
+        assert_eq!(wal.find_frame(44, None).unwrap(), Some(1));
     }
 
     #[test]
@@ -6781,6 +6905,47 @@ pub mod test {
             err,
             CompletionError::PageCodecError { page_idx: 43 }
         ));
+    }
+
+    #[test]
+    fn page_codec_wal_batch_decode_failure_does_not_publish_earlier_pages() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let source_pages = vec![
+            page_with_pattern(32, 0x10, &buffer_pool),
+            page_with_pattern(33, 0x20, &buffer_pool),
+            page_with_pattern(34, 0x30, &buffer_pool),
+        ];
+        append_test_pages(&io, &wal, page_size, &source_pages);
+        set_test_page_codec(
+            &wal,
+            Arc::new(XorFailOnPageCodec {
+                mask: 0xa5,
+                fail_encode_page: None,
+                fail_decode_page: Some(33),
+            }),
+        );
+        let target_pages = vec![
+            Arc::new(crate::Page::new(32)),
+            Arc::new(crate::Page::new(33)),
+            Arc::new(crate::Page::new(34)),
+        ];
+
+        let completion = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        let err = wait_for_completion_error(&io, completion);
+
+        assert!(matches!(
+            err,
+            CompletionError::PageCodecError { page_idx: 33 }
+        ));
+        for page in target_pages {
+            assert!(!page.is_locked());
+            assert!(!page.is_loaded());
+            assert!(!page.has_wal_tag());
+        }
     }
 
     #[test]
@@ -7181,7 +7346,7 @@ pub mod test {
     }
 
     #[test]
-    fn test_mvcc_refresh_updates_snapshot_without_changing_read_guard() {
+    fn test_mvcc_refresh_updates_snapshot_only_when_no_read_guard_is_held() {
         let (shared, wal) = make_test_wal();
         let initial = WalSnapshot {
             max_frame: 4,
@@ -7207,13 +7372,23 @@ pub mod test {
         };
         set_shared_snapshot(&shared, updated);
 
-        assert!(wal.mvcc_refresh_if_db_changed());
+        // A held read guard pins this connection's WAL view; the refresh must not
+        // advance it past the snapshot an active transaction captured.
+        assert!(!wal.mvcc_refresh_if_db_changed());
         assert_eq!(
             wal.connection_state(),
             WalConnectionState::new(
-                updated,
+                initial,
                 ReadGuardKind::ReadMark(NonZeroUsize::new(2).unwrap())
             )
+        );
+
+        // With no read guard held the refresh picks up the new shared snapshot.
+        wal.install_connection_state(WalConnectionState::new(initial, ReadGuardKind::None));
+        assert!(wal.mvcc_refresh_if_db_changed());
+        assert_eq!(
+            wal.connection_state(),
+            WalConnectionState::new(updated, ReadGuardKind::None)
         );
     }
 

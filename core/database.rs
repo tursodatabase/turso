@@ -549,6 +549,10 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     dialect: Arc<dyn Dialect>,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
+    /// Process-unique id minted at construction. Unlike the `Arc`'s heap
+    /// address, this can never repeat within a process, so detach/reattach
+    /// and close/reopen produce distinguishable values.
+    pub(crate) incarnation: u64,
 
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
@@ -688,6 +692,18 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            incarnation: {
+                // Deliberately std, not crate::sync: this static outlives a
+                // shuttle test execution, and a shuttle-tracked atomic that
+                // survives into the next execution corrupts shuttle's vector
+                // clocks (task ids restart, the stale clock is longer than
+                // the new task table, and clock bookkeeping underflows).
+                // A plain std atomic is fine here: the counter only mints
+                // process-unique ids and needs no ordering guarantees.
+                static NEXT_DATABASE_INCARNATION: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
 
@@ -2390,8 +2406,14 @@ impl Database {
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
+            n_active_blob_statements: AtomicI32::new(0),
+            statement_activity: Arc::new(Mutex::new(
+                crate::connection::StatementActivity::default(),
+            )),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
+            has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
@@ -3591,6 +3613,164 @@ mod database_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct PageCodecFailureSwitches {
+        wal_encode: AtomicBool,
+        wal_decode: AtomicBool,
+        database_encode: AtomicBool,
+        database_decode_page: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct FailOnceTransformPageCodec {
+        inner: XorPageCodec,
+        failures: Arc<PageCodecFailureSwitches>,
+    }
+
+    impl PageCodec for FailOnceTransformPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            self.inner.codec_id()
+        }
+
+        fn bootstrap_page_info(
+            &self,
+            raw_page1_prefix: &[u8],
+        ) -> crate::Result<PageCodecHeaderInfo> {
+            self.inner.bootstrap_page_info(raw_page1_prefix)
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            self.inner.required_reserved_bytes()
+        }
+
+        fn encode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            let failure = match context.location {
+                PageLocation::Database => &self.failures.database_encode,
+                PageLocation::Wal => &self.failures.wal_encode,
+            };
+            if failure.swap(false, Ordering::Relaxed) {
+                return Err(LimboError::InternalError(format!(
+                    "injected {:?} encode failure",
+                    context.location
+                )));
+            }
+            self.inner.encode_page(context, input, output)
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            let fail = match context.location {
+                PageLocation::Database => self
+                    .failures
+                    .database_decode_page
+                    .compare_exchange(
+                        context.page_no as usize,
+                        0,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok(),
+                PageLocation::Wal => self.failures.wal_decode.swap(false, Ordering::Relaxed),
+            };
+            if fail {
+                if let (Some(input), Some(output)) = (input.first(), output.first_mut()) {
+                    *output = *input;
+                }
+                return Err(LimboError::InternalError(format!(
+                    "injected {:?} decode failure",
+                    context.location
+                )));
+            }
+            self.inner.decode_page(context, input, output)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TaggedPageCodec;
+
+    impl TaggedPageCodec {
+        const TAG_BYTES: usize = std::mem::size_of::<u64>();
+
+        // This is deliberately a small test-only integrity tag, not a
+        // cryptographic authenticator.
+        fn tag(context: PageCodecContext, data: &[u8]) -> u64 {
+            let location = match context.location {
+                PageLocation::Database => 0x4442_5041_4745_0000,
+                PageLocation::Wal => 0x5741_4c50_4147_4500,
+            };
+            data.iter()
+                .fold(location ^ u64::from(context.page_no), |tag, byte| {
+                    tag.rotate_left(5) ^ u64::from(*byte)
+                })
+        }
+    }
+
+    impl PageCodec for TaggedPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            PageCodecId::new(*b"tagged-page-----")
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            Self::TAG_BYTES as u8
+        }
+
+        fn encode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            if input.len() != output.len() || input.len() < Self::TAG_BYTES {
+                return Err(LimboError::InvalidArgument(
+                    "tagged codec requires equal page-sized buffers".into(),
+                ));
+            }
+            let data_len = input.len() - Self::TAG_BYTES;
+            output[..data_len].copy_from_slice(&input[..data_len]);
+            output[data_len..]
+                .copy_from_slice(&Self::tag(context, &input[..data_len]).to_le_bytes());
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            if input.len() != output.len() || input.len() < Self::TAG_BYTES {
+                return Err(LimboError::InvalidArgument(
+                    "tagged codec requires equal page-sized buffers".into(),
+                ));
+            }
+            let data_len = input.len() - Self::TAG_BYTES;
+            let stored = u64::from_le_bytes(
+                input[data_len..]
+                    .try_into()
+                    .expect("tag length was checked above"),
+            );
+            let expected = Self::tag(context, &input[..data_len]);
+            if stored != expected {
+                return Err(LimboError::Corrupt(format!(
+                    "invalid page tag for page {} at {:?}",
+                    context.page_no, context.location
+                )));
+            }
+            output[..data_len].copy_from_slice(&input[..data_len]);
+            output[data_len..].fill(0);
+            Ok(())
+        }
+    }
+
     #[derive(Debug)]
     struct LocationPageCodec;
 
@@ -3814,6 +3994,16 @@ mod database_tests {
         })
         .unwrap();
         count
+    }
+
+    fn try_count_test_rows(conn: &Arc<Connection>) -> crate::Result<i64> {
+        let mut stmt = conn.prepare("select count(*) from test")?;
+        let mut count = 0;
+        stmt.run_with_row_callback(|row| {
+            count = row.get(0)?;
+            Ok(())
+        })?;
+        Ok(count)
     }
 
     #[cfg(feature = "fs")]
@@ -4144,6 +4334,134 @@ mod database_tests {
             "checkpoint failure must not leave stale state or retain its guard: same connection \
              returned {same_connection_retry:?}, other connection returned {other_connection_retry:?}"
         );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_transaction_recovers_after_wal_encode_failure() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-commit-retry.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let failures = Arc::new(PageCodecFailureSwitches::default());
+        let codec: Arc<dyn PageCodec> = Arc::new(FailOnceTransformPageCodec {
+            inner: XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            },
+            failures: failures.clone(),
+        });
+        let db = open_with_page_codec(io.clone(), path, codec.clone());
+        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+
+        failures.wal_encode.store(true, Ordering::Relaxed);
+        let err = conn
+            .execute("insert into test(value) values ('not-committed')")
+            .unwrap_err();
+        assert!(err.to_string().contains("injected Wal encode failure"));
+        assert_eq!(count_test_rows(&conn), 0);
+
+        conn.execute("insert into test(value) values ('committed')")
+            .unwrap();
+        assert_eq!(count_test_rows(&conn), 1);
+        conn.checkpoint(crate::CheckpointMode::Full).unwrap();
+        drop(conn);
+        drop(db);
+
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_pager_read_recovers_after_decode_failure() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-read-retry.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let failures = Arc::new(PageCodecFailureSwitches::default());
+        let codec: Arc<dyn PageCodec> = Arc::new(FailOnceTransformPageCodec {
+            inner: XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            },
+            failures: failures.clone(),
+        });
+
+        {
+            let db = open_with_page_codec(io.clone(), path, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            conn.execute(
+                "create table test(id integer primary key, value text);
+                 insert into test(value) values ('persisted');",
+            )
+            .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        failures.database_decode_page.store(2, Ordering::Relaxed);
+        let err = try_count_test_rows(&conn).unwrap_err();
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::PageCodecError { page_idx: 2 })
+        ));
+
+        assert_eq!(try_count_test_rows(&conn).unwrap(), 1);
+        let second = db.connect_with_page_codec(codec).unwrap();
+        assert_eq!(try_count_test_rows(&second).unwrap(), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_checkpoint_recovers_after_backfill_transform_failures() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-backfill-retry.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let failures = Arc::new(PageCodecFailureSwitches::default());
+        let codec: Arc<dyn PageCodec> = Arc::new(FailOnceTransformPageCodec {
+            inner: XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            },
+            failures: failures.clone(),
+        });
+        let db = open_with_page_codec(io.clone(), path, codec.clone());
+        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        conn.execute(
+            "create table test(id integer primary key, value text);
+             insert into test(value) values ('first');",
+        )
+        .unwrap();
+
+        conn.pager.load().clear_page_cache(false);
+        failures.wal_decode.store(true, Ordering::Relaxed);
+        let err = conn.checkpoint(crate::CheckpointMode::Full).unwrap_err();
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::PageCodecError { .. })
+        ));
+        assert_eq!(count_test_rows(&conn), 1);
+        conn.checkpoint(crate::CheckpointMode::Full).unwrap();
+
+        conn.execute("insert into test(value) values ('second')")
+            .unwrap();
+        failures.database_encode.store(true, Ordering::Relaxed);
+        let err = conn.checkpoint(crate::CheckpointMode::Full).unwrap_err();
+        assert!(err.to_string().contains("injected Database encode failure"));
+        assert_eq!(count_test_rows(&conn), 2);
+        conn.checkpoint(crate::CheckpointMode::Full).unwrap();
+        drop(conn);
+        drop(db);
+
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 2);
     }
 
     #[cfg(feature = "fs")]
@@ -4533,6 +4851,277 @@ mod database_tests {
         let output = open_with_page_codec(io, output_path.to_str().unwrap(), codec.clone());
         let output_conn = output.connect_with_page_codec(codec).unwrap();
         assert_eq!(count_test_rows(&output_conn), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_connection_uses_plain_internal_temp_database() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-temp.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x4d,
+            reserved_bytes: 1,
+        });
+        let db = open_with_page_codec(io.clone(), path, codec.clone());
+        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        conn.execute(
+            "create table test(id integer primary key, value text);
+             insert into test(value) values ('main');
+             create temp table temp_values(value integer);
+             insert into temp_values values (3), (1), (2);",
+        )
+        .unwrap();
+
+        let mut values = Vec::new();
+        conn.prepare("select value from temp_values order by value")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                values.push(row.get::<i64>(0).unwrap());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(values, vec![1, 2, 3]);
+        assert_eq!(count_test_rows(&conn), 1);
+        drop(conn);
+        drop(db);
+
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_connections_preserve_old_reader_snapshot_during_checkpoint() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-connections.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec = || -> Arc<dyn PageCodec> {
+            Arc::new(XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            })
+        };
+        let db = open_with_page_codec(io.clone(), path, codec());
+        let writer = db.connect_with_page_codec(codec()).unwrap();
+        let old_reader = db.connect_with_page_codec(codec()).unwrap();
+        writer
+            .execute(
+                "create table test(id integer primary key, value text);
+                 insert into test(value) values ('first');",
+            )
+            .unwrap();
+
+        old_reader.execute("BEGIN").unwrap();
+        assert_eq!(count_test_rows(&old_reader), 1);
+        writer
+            .execute("insert into test(value) values ('second')")
+            .unwrap();
+        assert_eq!(count_test_rows(&old_reader), 1);
+
+        let new_reader = db.connect_with_page_codec(codec()).unwrap();
+        assert_eq!(count_test_rows(&new_reader), 2);
+        let passive = writer
+            .checkpoint(crate::CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+        assert!(passive.wal_total_backfilled < passive.wal_max_frame);
+        assert_eq!(count_test_rows(&old_reader), 1);
+        assert_eq!(count_test_rows(&new_reader), 2);
+
+        old_reader.execute("COMMIT").unwrap();
+        writer.checkpoint(crate::CheckpointMode::Full).unwrap();
+        drop(new_reader);
+        drop(old_reader);
+        drop(writer);
+        drop(db);
+
+        let db = open_with_page_codec(io, path, codec());
+        let conn = db.connect_with_page_codec(codec()).unwrap();
+        assert_eq!(count_test_rows(&conn), 2);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_accepts_minimum_usable_space_boundary() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-minimum-usable-space.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x5a,
+            reserved_bytes: 32,
+        });
+
+        {
+            let db = open_with_page_codec(io.clone(), path, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            conn.execute("PRAGMA page_size = 512").unwrap();
+            assert_eq!(conn.get_page_size().get(), 512);
+            conn.execute(
+                "create table test(id integer primary key, value blob);
+                 insert into test(value) values (zeroblob(2000));",
+            )
+            .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        assert_eq!(conn.get_page_size().get(), 512);
+        assert_eq!(count_test_rows(&conn), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_reserved_tail_detects_persistent_page_corruption() {
+        use std::fs::OpenOptions as StdOpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-tagged-page.db");
+        let path_str = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(TaggedPageCodec);
+
+        {
+            let db = open_with_page_codec(io.clone(), path_str, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            conn.execute("PRAGMA page_size = 512").unwrap();
+            conn.execute(
+                "create table test(id integer primary key, value blob);
+                 insert into test(value) values (zeroblob(2000));",
+            )
+            .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            assert_eq!(count_test_rows(&conn), 1);
+        }
+
+        let tag_offset = 2 * 512 - 1;
+        let mut file = StdOpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(tag_offset)).unwrap();
+        let mut original = [0];
+        file.read_exact(&mut original).unwrap();
+        file.seek(SeekFrom::Start(tag_offset)).unwrap();
+        file.write_all(&[original[0] ^ 1]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        {
+            let db = open_with_page_codec(io.clone(), path_str, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let err = try_count_test_rows(&conn).unwrap_err();
+            assert!(matches!(
+                err,
+                LimboError::CompletionError(CompletionError::PageCodecError { page_idx: 2 })
+            ));
+        }
+
+        let mut file = StdOpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(tag_offset)).unwrap();
+        file.write_all(&original).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let db = open_with_page_codec(io, path_str, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_reopens_checkpointed_database_read_only() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-read-only.db");
+        let path_str = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x5a,
+            reserved_bytes: 1,
+        });
+
+        {
+            let db = open_with_page_codec(io.clone(), path_str, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            conn.execute(
+                "create table test(id integer primary key, value text);
+                 insert into test(value) values ('read-only');",
+            )
+            .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let db = Database::open(
+            io,
+            path_str,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::ReadOnly)
+                .page_codec(codec.clone()),
+        )
+        .unwrap();
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 1);
+        drop(conn);
+        drop(db);
+        assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), before);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_rejects_database_already_in_mvcc_mode() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-existing-mvcc.db");
+        let path_str = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        {
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                path_str,
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0,
+            reserved_bytes: if cfg!(feature = "checksum") {
+                crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES
+            } else {
+                0
+            },
+        });
+        let err = open_with_page_codec_result(io.clone(), path_str, codec).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("external page codecs are not supported with MVCC databases"),
+            "unexpected error: {err}"
+        );
+
+        let db = Database::open_file_with_flags(
+            io,
+            path_str,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        db.connect().unwrap();
     }
 
     #[cfg(feature = "fs")]

@@ -14,7 +14,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, IdxInsertFlags, Insn},
+        insn::{to_u32, IdxInsertFlags, Insn, SorterOpenData},
     },
     Result,
 };
@@ -26,6 +26,7 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
+use crate::translate::eqp::{EqpDetail, EqpSortMethod};
 use crate::vdbe::insn::SortComparatorType;
 
 /// Maps a custom type `<` operator function name to a SortComparatorType.
@@ -312,10 +313,12 @@ impl EmitOrderBy {
             let key_len = order_collations_nulls.len();
 
             program.emit_insn(Insn::SorterOpen {
-                cursor_id: sort_cursor,
-                columns: key_len,
-                order_collations_nulls,
-                comparators,
+                data: Box::new(SorterOpenData {
+                    cursor_id: sort_cursor,
+                    columns: key_len,
+                    order_collations_nulls,
+                    comparators,
+                }),
             });
         }
         Ok(())
@@ -347,9 +350,21 @@ impl EmitOrderBy {
             + remappings.iter().filter(|r| !r.deduplicated).count();
 
         if use_heap_sort {
-            emit_explain!(program, false, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                EqpDetail::OrderBy {
+                    method: EqpSortMethod::TempBTree,
+                }
+            );
         } else {
-            emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                EqpDetail::OrderBy {
+                    method: EqpSortMethod::Sorter,
+                }
+            );
         }
 
         let cursor_id = if !use_heap_sort {
@@ -461,6 +476,7 @@ impl EmitOrderBy {
             program.emit_insn(Insn::Next {
                 cursor_id: sort_cursor,
                 pc_if_next: sort_loop_start_label,
+                fullscan: false,
             });
         }
         program.preassign_label_to_next_insn(sort_loop_end_label);
