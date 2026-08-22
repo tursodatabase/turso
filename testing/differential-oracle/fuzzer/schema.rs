@@ -12,6 +12,9 @@ use sql_gen::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
 /// Introspects schema from a database connection.
 pub struct SchemaIntrospector;
 
+const SEQUENCE_TABLE_QUERY: &str =
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'";
+
 impl SchemaIntrospector {
     /// Introspect schema from a Turso connection.
     pub fn from_turso(conn: &Arc<turso_core::Connection>) -> Result<Schema> {
@@ -315,7 +318,25 @@ impl SchemaIntrospector {
             builder = builder.trigger(trigger);
         }
 
+        if db_name.is_none() && Self::has_sequence_table_turso(conn)? {
+            builder = builder.sequence_table();
+        }
+
         Ok(builder)
+    }
+
+    fn has_sequence_table_turso(conn: &Arc<turso_core::Connection>) -> Result<bool> {
+        let mut rows = conn
+            .query(SEQUENCE_TABLE_QUERY)
+            .context("Failed to query sqlite_sequence")?
+            .context("Expected rows from query")?;
+        let mut found = false;
+        rows.run_with_row_callback(|_| {
+            found = true;
+            Ok(())
+        })
+        .context("Failed to iterate sqlite_sequence query")?;
+        Ok(found)
     }
 
     fn populate_sqlite_schema(
@@ -351,7 +372,18 @@ impl SchemaIntrospector {
             builder = builder.trigger(trigger);
         }
 
+        if db_name.is_none() && Self::has_sequence_table_sqlite(conn)? {
+            builder = builder.sequence_table();
+        }
+
         Ok(builder)
+    }
+
+    fn has_sequence_table_sqlite(conn: &rusqlite::Connection) -> Result<bool> {
+        let mut stmt = conn
+            .prepare(SEQUENCE_TABLE_QUERY)
+            .context("Failed to query sqlite_sequence")?;
+        stmt.exists([]).context("Failed to query sqlite_sequence")
     }
 
     fn get_columns_sqlite_query(
@@ -648,6 +680,23 @@ mod tests {
         let temp_tables = schema.table_names_in_database(Some("temp"));
 
         assert_eq!(temp_tables, HashSet::from([String::from("t")]));
+    }
+
+    #[test]
+    fn the_sequence_table_is_found_once_an_autoincrement_table_exists() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE plain(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            !SchemaIntrospector::from_sqlite_with_attached(&conn)
+                .unwrap()
+                .has_sequence_table
+        );
+        conn.execute_batch("CREATE TABLE seed(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .unwrap();
+        let schema = SchemaIntrospector::from_sqlite_with_attached(&conn).unwrap();
+        assert!(schema.has_sequence_table);
+        assert!(schema.tables.iter().all(|t| t.name != "sqlite_sequence"));
     }
 
     #[test]

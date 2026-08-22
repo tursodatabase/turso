@@ -34,6 +34,12 @@ impl fmt::Display for CreateMaterializedViewStatement {
 }
 
 impl CreateMaterializedViewStatement {
+    /// The view reads `sqlite_sequence`, which Turso cannot keep a materialized
+    /// view of up to date.
+    pub fn reads_sequence_table(&self) -> bool {
+        self.select_sql == SEQUENCE_TABLE_SELECT
+    }
+
     /// The same view as a plain `CREATE VIEW`, for engines without materialized views.
     pub fn plain_view_sql(&self) -> String {
         let if_not_exists = if self.if_not_exists {
@@ -67,7 +73,11 @@ enum Shape {
     ComplexFilterJoin,
     /// SELECT a.k, a.c, b.c FROM t a JOIN t b ON a.r = b.k WHERE <complex predicate>
     ComplexFilterSelfJoin,
+    /// SELECT name, seq FROM sqlite_sequence
+    SequenceTable,
 }
+
+const SEQUENCE_TABLE_SELECT: &str = "SELECT name, seq FROM sqlite_sequence";
 
 /// Tables and materialized views that a materialized view can read.
 ///
@@ -148,6 +158,9 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
             (1, Shape::ComplexFilterJoin),
         ]);
     }
+    if schema.has_sequence_table {
+        shapes.push((1, Shape::SequenceTable));
+    }
     let shape = proptest::strategy::Union::new_weighted(
         shapes
             .into_iter()
@@ -203,6 +216,14 @@ fn select_for_shape(
         .filter(|c| c.data_type == DataType::Integer)
         .count();
     match shape {
+        Shape::SequenceTable => Just((
+            SEQUENCE_TABLE_SELECT.to_string(),
+            vec![
+                ColumnDef::new("name", DataType::Text),
+                ColumnDef::new("seq", DataType::Integer),
+            ],
+        ))
+        .boxed(),
         Shape::FilteredColumns if source.columns.len() >= 2 && !filterable.is_empty() => {
             let projected = &source.columns[..source.columns.len().min(3)];
             let projection = projected
@@ -574,5 +595,31 @@ mod tests {
         assert!(sqls.iter().any(|sql| sql.contains(
             "SELECT a.id AS sjk, a.name AS sja, b.name AS sjb FROM users a JOIN users b ON a.manager_id = b.id"
         )));
+        assert!(!sqls.iter().any(|sql| sql.contains("sqlite_sequence")));
+    }
+
+    #[test]
+    fn views_read_the_sequence_table_only_when_it_exists() {
+        let schema = SchemaBuilder::new()
+            .add_table(Table::new(
+                "seed",
+                vec![ColumnDef::new("id", DataType::Integer).primary_key()],
+            ))
+            .with_sequence_table()
+            .build();
+        let strategy = create_materialized_view(&schema);
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        let views: Vec<CreateMaterializedViewStatement> = (0..100)
+            .map(|_| strategy.new_tree(&mut runner).unwrap().current())
+            .collect();
+        let sequence_view = views
+            .iter()
+            .find(|view| view.reads_sequence_table())
+            .expect("no view reads sqlite_sequence");
+        assert_eq!(
+            sequence_view.select_sql,
+            "SELECT name, seq FROM sqlite_sequence"
+        );
+        assert!(views.iter().any(|view| !view.reads_sequence_table()));
     }
 }

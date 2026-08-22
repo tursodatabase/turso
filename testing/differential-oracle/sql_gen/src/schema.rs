@@ -281,6 +281,7 @@ pub struct SchemaBuilder {
     indexes: Vec<Index>,
     triggers: Vec<Trigger>,
     attached_databases: Vec<String>,
+    has_sequence_table: bool,
 }
 
 impl SchemaBuilder {
@@ -311,12 +312,19 @@ impl SchemaBuilder {
         self
     }
 
+    /// The main database has the `sqlite_sequence` table.
+    pub fn sequence_table(mut self) -> Self {
+        self.has_sequence_table = true;
+        self
+    }
+
     pub fn build(self) -> Schema {
         Schema {
             tables: self.tables,
             indexes: self.indexes,
             triggers: self.triggers,
             attached_databases: self.attached_databases,
+            has_sequence_table: self.has_sequence_table,
         }
     }
 }
@@ -332,6 +340,9 @@ pub struct Schema {
     /// Empty means only the main database is available.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
     pub attached_databases: Vec<String>,
+    /// The main database has the `sqlite_sequence` table, which SQLite
+    /// creates with the first AUTOINCREMENT table.
+    pub has_sequence_table: bool,
 }
 
 impl Schema {
