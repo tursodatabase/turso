@@ -38,6 +38,8 @@ pub enum PopulateState {
         /// If we're in the middle of processing a row (merge_delta returned I/O)
         pending_row: Option<(i64, Vec<Value>)>, // (rowid, values)
     },
+    /// All source rows consumed; run the circuit once with no input
+    Finalize,
     /// Population complete
     Done,
 }
@@ -74,6 +76,7 @@ impl fmt::Debug for PopulateState {
                 .field("has_pending", &pending_row.is_some())
                 .field("total_queries", &queries.len())
                 .finish(),
+            PopulateState::Finalize => write!(f, "Finalize"),
             PopulateState::Done => write!(f, "Done"),
         }
     }
@@ -1196,8 +1199,8 @@ impl IncrementalView {
                     current_idx,
                 } => {
                     if current_idx >= queries.len() {
-                        self.populate_state = PopulateState::Done;
-                        return Ok(IOResult::Done(()));
+                        self.populate_state = PopulateState::Finalize;
+                        continue 'outer;
                     }
 
                     let query = queries[current_idx].clone();
@@ -1342,6 +1345,23 @@ impl IncrementalView {
                                 let completion = crate::io::Completion::new_yield();
                                 return Ok(IOResult::IO(crate::types::IOCompletions(completion)));
                             }
+                        }
+                    }
+                }
+
+                PopulateState::Finalize => {
+                    // Materializes operators whose output does not depend on any input
+                    // row: an ungrouped aggregate yields its one row over an empty source.
+                    match self.circuit.commit(HashMap::default(), pager.clone())? {
+                        IOResult::Done(_) => {
+                            self.populate_state = PopulateState::Done;
+                            return Ok(IOResult::Done(()));
+                        }
+                        IOResult::IO(io) => {
+                            // Re-entering resumes the in-flight commit rather than starting
+                            // a second one: the input map is only read in CommitState::Init.
+                            self.populate_state = PopulateState::Finalize;
+                            return Ok(IOResult::IO(io));
                         }
                     }
                 }
