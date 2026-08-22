@@ -16,16 +16,20 @@ use crate::{
 pub struct BackingBtreeIndexMethod;
 
 #[derive(Debug)]
-pub struct BackingBTreeIndexMethodAttachment(String);
+pub struct BackingBTreeIndexMethodAttachment {
+    table_name: String,
+    index_name: String,
+}
 
 impl IndexMethod for BackingBtreeIndexMethod {
     fn attach(
         &self,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
-        Ok(Arc::new(BackingBTreeIndexMethodAttachment(
-            configuration.index_name.clone(),
-        )))
+        Ok(Arc::new(BackingBTreeIndexMethodAttachment {
+            table_name: configuration.table_name.clone(),
+            index_name: configuration.index_name.clone(),
+        }))
     }
 }
 
@@ -33,7 +37,8 @@ impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: BACKING_BTREE_INDEX_METHOD_NAME,
-            index_name: &self.0,
+            table_name: &self.table_name,
+            index_name: &self.index_name,
             patterns: &[],
             backing_btree: true,
             results_materialized: false,

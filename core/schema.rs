@@ -1805,11 +1805,6 @@ impl Schema {
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
             )?;
-            if mvcc_enabled {
-                if let Some(index_method) = index.index_method.as_ref() {
-                    crate::index_method::ensure_mvcc_support(&index_method.definition(), false)?;
-                }
-            }
             self.add_index(Arc::new(index))?;
         }
 

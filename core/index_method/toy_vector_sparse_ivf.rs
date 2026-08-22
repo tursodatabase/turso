@@ -9,8 +9,8 @@ use crate::numeric::Numeric;
 use crate::util::quote_identifier;
 use crate::{
     index_method::{
-        open_index_cursor, open_table_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
-        IndexMethodConfiguration, IndexMethodCursor, IndexMethodDefinition,
+        parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
+        IndexMethodContext, IndexMethodCursor, IndexMethodDefinition,
         BACKING_BTREE_INDEX_METHOD_NAME, TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
     },
     return_if_io,
@@ -23,7 +23,7 @@ use crate::{
         operations,
         vector_types::{Vector, VectorType},
     },
-    Connection, LimboError, Result, Value, ValueRef,
+    LimboError, Result, Value, ValueRef,
 };
 
 /// Simple inverted index for sparse vectors
@@ -341,6 +341,7 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
+            table_name: &self.configuration.table_name,
             index_name: &self.configuration.index_name,
             patterns: self.patterns.as_slice(),
             backing_btree: false,
@@ -403,8 +404,10 @@ fn key_info() -> KeyInfo {
 }
 
 impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
-    fn create(&mut self, connection: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+    fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
         // we need to properly track subprograms and propagate result to the root program to make this execution async
+        let connection = context.connection()?;
+        let database_id = context.database().id;
 
         let columns = &self.configuration.columns;
         let columns = columns.iter().map(|x| x.name.as_str()).collect::<Vec<_>>();
@@ -447,11 +450,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn destroy(
-        &mut self,
-        connection: &Arc<Connection>,
-        database_id: usize,
-    ) -> Result<IOResult<()>> {
+    fn destroy(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+        let connection = context.connection()?;
+        let database_id = context.database().id;
         let db_prefix = connection
             .get_database_name_by_index(database_id)
             .filter(|name| name != "main")
@@ -476,57 +477,55 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn open_read(
-        &mut self,
-        connection: &Arc<Connection>,
-        database_id: usize,
-    ) -> Result<IOResult<()>> {
-        self.inverted_index_cursor = Some(open_index_cursor(
-            connection,
-            database_id,
+    fn open_read(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+        self.inverted_index_cursor = Some(context.open_index_cursor(
             &self.configuration.table_name,
             &self.inverted_index_btree,
             // component, length, rowid
             [key_info(), key_info(), key_info()],
         )?);
-        self.stats_cursor = Some(open_index_cursor(
-            connection,
-            database_id,
+        self.stats_cursor = Some(context.open_index_cursor(
             &self.configuration.table_name,
             &self.stats_btree,
             // component
             [key_info()],
         )?);
-        self.main_btree = Some(open_table_cursor(
-            connection,
-            database_id,
+        self.main_btree = Some(context.open_table_cursor(&self.configuration.table_name)?);
+        Ok(IOResult::Done(()))
+    }
+
+    fn open_write(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+        self.inverted_index_cursor = Some(context.open_index_cursor(
             &self.configuration.table_name,
+            &self.inverted_index_btree,
+            // component, length, rowid
+            [key_info(), key_info(), key_info()],
+        )?);
+        self.stats_cursor = Some(context.open_index_cursor(
+            &self.configuration.table_name,
+            &self.stats_btree,
+            // component
+            [key_info()],
         )?);
         Ok(IOResult::Done(()))
     }
 
-    fn open_write(
-        &mut self,
-        connection: &Arc<Connection>,
-        database_id: usize,
-    ) -> Result<IOResult<()>> {
-        self.inverted_index_cursor = Some(open_index_cursor(
-            connection,
-            database_id,
-            &self.configuration.table_name,
-            &self.inverted_index_btree,
-            // component, length, rowid
-            [key_info(), key_info(), key_info()],
-        )?);
-        self.stats_cursor = Some(open_index_cursor(
-            connection,
-            database_id,
-            &self.configuration.table_name,
-            &self.stats_btree,
-            // component
-            [key_info()],
-        )?);
+    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
+    }
+
+    fn abort_statement(&mut self, _context: &IndexMethodContext) {}
+
+    fn on_transaction_committed(&mut self, _context: &IndexMethodContext) {}
+
+    fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {}
+
+    fn on_savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {}
+
+    fn close(&mut self, _context: &IndexMethodContext) {
+        self.inverted_index_cursor = None;
+        self.stats_cursor = None;
+        self.main_btree = None;
     }
 
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>> {
