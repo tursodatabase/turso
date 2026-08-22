@@ -5,6 +5,8 @@
 
 use std::fmt::{self, Display, Formatter, Write as _};
 
+use turso_parser::ast::TableInternalId;
+
 use crate::{
     schema::Index,
     translate::plan::{
@@ -20,6 +22,7 @@ pub struct EqpTable {
     pub name: String,
     /// `u` in `users AS u`
     pub alias: Option<String>,
+    pub id: TableInternalId,
 }
 
 impl EqpTable {
@@ -28,6 +31,7 @@ impl EqpTable {
         Self {
             name: name.to_string(),
             alias: (name != table.identifier).then(|| table.identifier.clone()),
+            id: table.internal_id,
         }
     }
 
@@ -252,6 +256,7 @@ pub enum EqpDetail {
         table: EqpTable,
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
+        build_id: Option<TableInternalId>,
     },
     /// Materialize the build side of a hash join into an in-memory table.
     HashBuild {
@@ -437,6 +442,7 @@ pub(crate) fn eqp_detail_for_table_op(
     table: &JoinedTable,
     join: Option<EqpJoin>,
     subquery: Option<EqpSubquery>,
+    build_table: Option<&JoinedTable>,
 ) -> EqpDetail {
     let eqp_table = EqpTable::from_joined(table);
     match &table.op {
@@ -539,6 +545,7 @@ pub(crate) fn eqp_detail_for_table_op(
             table: eqp_table,
             join,
             subquery,
+            build_id: build_table.map(|build| build.internal_id),
         },
     }
 }
@@ -641,6 +648,30 @@ impl<'a> JsonBuilder<'a> {
 }
 
 impl EqpDetail {
+    fn table_id(&self) -> Option<TableInternalId> {
+        match self {
+            Self::Scan { table, .. }
+            | Self::Search { table, .. }
+            | Self::MultiIndex { table, .. }
+            | Self::HashJoin { table, .. } => Some(table.id),
+            _ => None,
+        }
+    }
+
+    fn materialized_build_id(&self) -> Option<TableInternalId> {
+        match self {
+            Self::HashBuild { table } => Some(table.id),
+            _ => None,
+        }
+    }
+
+    fn hash_join_build_id(&self) -> Option<TableInternalId> {
+        match self {
+            Self::HashJoin { build_id, .. } => *build_id,
+            _ => None,
+        }
+    }
+
     fn write_table_fields(
         obj: &mut JsonBuilder,
         table: &EqpTable,
@@ -674,7 +705,7 @@ impl EqpDetail {
     }
 
     /// Output the plan in json format for `EXPLAIN QUERY PLAN format=json`.
-    fn write_json(&self, out: &mut String) {
+    fn write_json(&self, out: &mut String, hash_join_build_node: Option<usize>) {
         let mut obj = JsonBuilder::new(out);
         match self {
             Self::ConstantRow => obj.str("type", "constant_row"),
@@ -733,9 +764,13 @@ impl EqpDetail {
                 table,
                 join,
                 subquery,
+                ..
             } => {
                 obj.str("type", "hash_join");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
+                if let Some(build_node) = hash_join_build_node {
+                    obj.num("build_node", build_node);
+                }
             }
             Self::HashBuild { table } => {
                 obj.str("type", "hash_build");
@@ -818,6 +853,38 @@ pub fn program_plan_json(program: &Program) -> String {
         .collect();
     top.str_array("result_columns", &column_names);
 
+    struct Step {
+        id: usize,
+        parent: Option<usize>,
+        table_id: Option<TableInternalId>,
+        materialized_build_id: Option<TableInternalId>,
+    }
+    let steps: Vec<Step> = program
+        .insns
+        .iter()
+        .filter_map(|(insn, _)| match insn {
+            Insn::Explain { p1, p2, detail } => Some(Step {
+                id: *p1,
+                parent: *p2,
+                table_id: detail.table_id(),
+                materialized_build_id: detail.materialized_build_id(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let build_node_of = |parent: Option<usize>, build_id: TableInternalId| {
+        let sibling = |id: &Option<TableInternalId>| *id == Some(build_id);
+        steps
+            .iter()
+            .find(|step| step.parent == parent && sibling(&step.materialized_build_id))
+            .or_else(|| {
+                steps
+                    .iter()
+                    .find(|step| step.parent == parent && sibling(&step.table_id))
+            })
+            .map(|step| step.id)
+    };
+
     let nodes = top.key("nodes");
     nodes.push('[');
     let mut first = true;
@@ -836,7 +903,10 @@ pub fn program_plan_json(program: &Program) -> String {
             None => node.key("parent").push_str("null"),
         }
         node.str("detail", &detail.to_string());
-        detail.write_json(node.key("op"));
+        let build_node = detail
+            .hash_join_build_id()
+            .and_then(|build_id| build_node_of(*p2, build_id));
+        detail.write_json(node.key("op"), build_node);
         node.finish();
     }
     nodes.push(']');

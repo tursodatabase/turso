@@ -197,3 +197,35 @@ expect {
     {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    INSERT INTO users(name) VALUES ('x');","result_columns":[],"nodes":[]}
     0
 }
+
+setup hash_join_schema {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, c INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, c INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, c INT, d INT);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, c INT, d INT);
+}
+
+@setup hash_join_schema
+test a-hash-join-names-the-node-that-reads-its-build-input {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM t1
+    LEFT JOIN t2 ON t1.a = t2.a
+    LEFT JOIN t3 ON t2.c IS t3.c
+    JOIN t4 ON t3.c = t4.c AND t3.d = t4.d
+    WHERE t3.d IS NOT NULL;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM t1\n    LEFT JOIN t2 ON t1.a = t2.a\n    LEFT JOIN t3 ON t2.c IS t3.c\n    JOIN t4 ON t3.c = t4.c AND t3.d = t4.d\n    WHERE t3.d IS NOT NULL;","result_columns":["id","a","c","id","a","c","id","c","d","id","c","d"],"nodes":[{"id":1,"parent":null,"detail":"HASH JOIN t4","op":{"type":"hash_join","table":"t4","join":"inner","build_node":4}},{"id":2,"parent":null,"detail":"HASH JOIN t2","op":{"type":"hash_join","table":"t2","join":"left","build_node":3}},{"id":3,"parent":null,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}},{"id":4,"parent":null,"detail":"SCAN t3","op":{"type":"scan","table":"t3","join":"inner","source":"table"}}]}
+}
+
+@setup hash_join_schema
+test a-hash-join-points-at-a-build-input-inside-its-own-subtree {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT t1.id, t3.d, t4.d
+    FROM t1
+    JOIN t3 ON t1.c = t3.c
+    JOIN t4 ON t1.c = t4.c;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT t1.id, t3.d, t4.d\n    FROM t1\n    JOIN t3 ON t1.c = t3.c\n    JOIN t4 ON t1.c = t4.c;","result_columns":["id","d","d"],"nodes":[{"id":1,"parent":null,"detail":"MATERIALIZE hash build input for t1","op":{"type":"hash_build","table":"t1"}},{"id":3,"parent":1,"detail":"HASH JOIN t1","op":{"type":"hash_join","table":"t1","build_node":4}},{"id":4,"parent":1,"detail":"SCAN t3","op":{"type":"scan","table":"t3","join":"inner","source":"table"}},{"id":51,"parent":null,"detail":"HASH JOIN t4","op":{"type":"hash_join","table":"t4","join":"inner","build_node":1}},{"id":52,"parent":null,"detail":"SCAN t3","op":{"type":"scan","table":"t3","join":"inner","source":"table"}},{"id":53,"parent":null,"detail":"HASH JOIN t1","op":{"type":"hash_join","table":"t1","build_node":52}}]}
+}
