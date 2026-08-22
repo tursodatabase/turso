@@ -889,6 +889,7 @@ impl Fuzzer {
                 sqlite_sql,
                 name,
                 columns,
+                reads_sequence_table,
             } => {
                 if self.config.verbose {
                     tracing::info!("Statement {i} [MATVIEW]: {turso_sql}");
@@ -897,6 +898,10 @@ impl Fuzzer {
                 executed_sql.push(format!("-- SQLITE: {sqlite_sql}"));
                 let turso = DifferentialOracle::execute_turso(&self.turso_conn(), turso_sql);
                 let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, sqlite_sql);
+                if turso_refused_sequence_table_view(*reads_sequence_table, &turso, &sqlite) {
+                    executed_sql.push(format!("-- EXPECTED REFUSAL: {turso:?}"));
+                    return self.drop_view_on_sqlite(name, stats, executed_sql);
+                }
                 // The generator only emits views that both engines accept.
                 if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_))
                 {
@@ -1091,6 +1096,21 @@ impl Fuzzer {
             executed_sql.push(format!("-- SOURCE GONE: {name}"));
             self.drop_view_on_both(&sql, stats, executed_sql)?;
             matviews.remove(&name);
+        }
+        Ok(())
+    }
+
+    fn drop_view_on_sqlite(
+        &self,
+        name: &str,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        let sql = format!("DROP VIEW {name}");
+        executed_sql.push(format!("-- SQLITE: {sql}"));
+        if let QueryResult::Error(e) = DifferentialOracle::execute_sqlite(&self.sqlite_conn, &sql) {
+            stats.oracle_failures += 1;
+            bail!("SQLite could not drop view {name}: {e}");
         }
         Ok(())
     }
@@ -1358,6 +1378,22 @@ fn open_turso(
     Ok((turso_db, turso_conn))
 }
 
+/// Turso refuses a materialized view over `sqlite_sequence` because it cannot
+/// keep it up to date, while SQLite accepts the plain view. Only that exact
+/// refusal of that exact view counts as expected.
+pub(crate) fn turso_refused_sequence_table_view(
+    reads_sequence_table: bool,
+    turso: &QueryResult,
+    sqlite: &QueryResult,
+) -> bool {
+    reads_sequence_table
+        && matches!(sqlite, QueryResult::Ok)
+        && matches!(turso, QueryResult::Error(e) if e == SEQUENCE_TABLE_VIEW_REFUSAL)
+}
+
+const SEQUENCE_TABLE_VIEW_REFUSAL: &str =
+    "Parse error: view cannot reference the internal table: sqlite_sequence";
+
 fn push_warning_comments(executed_sql: &mut Vec<String>, stmt_idx: usize, reason: &str) {
     for (line_idx, line) in reason.lines().enumerate() {
         executed_sql.push(format!(
@@ -1527,6 +1563,42 @@ mod tests {
     }
 
     #[test]
+    fn only_the_exact_refusal_of_a_sequence_table_view_is_expected() {
+        let refusal = QueryResult::Error(SEQUENCE_TABLE_VIEW_REFUSAL.to_string());
+        let error = |e: &str| QueryResult::Error(e.to_string());
+        assert!(turso_refused_sequence_table_view(
+            true,
+            &refusal,
+            &QueryResult::Ok
+        ));
+        assert!(!turso_refused_sequence_table_view(
+            false,
+            &refusal,
+            &QueryResult::Ok
+        ));
+        assert!(!turso_refused_sequence_table_view(
+            true,
+            &error("Parse error: no such table: sqlite_sequence"),
+            &QueryResult::Ok
+        ));
+        assert!(!turso_refused_sequence_table_view(
+            true,
+            &error("Parse error: view cannot reference the internal table: sqlite_schema"),
+            &QueryResult::Ok
+        ));
+        assert!(!turso_refused_sequence_table_view(
+            true,
+            &refusal,
+            &error("no such table: sqlite_sequence")
+        ));
+        assert!(!turso_refused_sequence_table_view(
+            true,
+            &QueryResult::Ok,
+            &QueryResult::Ok
+        ));
+    }
+
+    #[test]
     fn a_materialized_view_that_fails_on_both_engines_is_a_failure() {
         let fuzzer = matview_fuzzer();
         let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
@@ -1536,6 +1608,7 @@ mod tests {
         let create = Generated::CreateMatview {
             turso_sql: format!("CREATE MATERIALIZED VIEW w AS {select}"),
             sqlite_sql: format!("CREATE VIEW w AS {select}"),
+            reads_sequence_table: false,
             name: "w".to_string(),
             columns: vec![sql_gen_prop::ColumnDef::new(
                 "a",

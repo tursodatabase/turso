@@ -2877,6 +2877,37 @@ mod tests {
         }
     }
 
+    fn delta_for_unknown_table() -> HashMap<String, Delta> {
+        let mut delta = Delta::new();
+        delta.insert(
+            1,
+            vec![
+                Value::from_i64(1),
+                Value::Text("Alice".into()),
+                Value::from_i64(25),
+            ],
+        );
+        let mut inputs = HashMap::default();
+        inputs.insert("Users".to_string(), delta);
+        inputs
+    }
+
+    #[test]
+    #[should_panic(expected = "delta for table \"Users\" does not match any circuit input")]
+    fn execute_panics_on_delta_for_unknown_table() {
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users");
+        let _ = test_execute(&mut circuit, delta_for_unknown_table(), pager);
+    }
+
+    #[test]
+    #[should_panic(expected = "delta for table \"Users\" does not match any circuit input")]
+    fn commit_panics_on_delta_for_unknown_table() {
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users");
+        let _ = pager
+            .io
+            .block(|| circuit.commit(delta_for_unknown_table(), pager.clone()));
+    }
+
     #[test]
     fn test_execute_filter() {
         let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
