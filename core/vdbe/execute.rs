@@ -12527,11 +12527,12 @@ pub fn op_insert(
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
                 // If there are no dependent views, we don't need to capture the old record.
-                // We also don't need to do it if the rowid of the UPDATEd row was changed, because
-                // op_delete already captured the deletion for IVM, and this insert only needs to
-                // record the new row (which ApplyViewChange handles without old_record).
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                // We also don't need to do it when a preceding op_delete already captured the
+                // old row for IVM (UPDATE that moves a rowid, REPLACE that overwrites one);
+                // this insert only needs to record the new row.
+                let needs_capture = has_dependent_views
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    && !flag.has(InsertFlags::OLD_ROW_ALREADY_DELETED);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -12568,8 +12569,9 @@ pub fn op_insert(
                     return Ok(state.suspend_on_io(io));
                 }
                 let has_dependent_views = state.active_op_state.insert().has_dependent_views;
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                let needs_capture = has_dependent_views
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    && !flag.has(InsertFlags::OLD_ROW_ALREADY_DELETED);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
