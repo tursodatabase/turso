@@ -1,0 +1,127 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# `sqlite_master` is another spelling of `sqlite_schema`, so it has to reach the
+# same table. Case folding alone does not get there: the name has to be resolved
+# through the schema, the way writes to the schema table already are. Once it
+# does resolve, the view is refused, because rows reach the schema table through
+# the DDL path and no row maintenance would ever update the view.
+test matview-over-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT name FROM sqlite_master WHERE tbl_name = 'person';
+}
+expect error {
+    view cannot reference the internal table: sqlite_schema
+}
+
+test matview-over-mixed-case-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT name FROM SQLite_Master WHERE tbl_name = 'person';
+}
+expect error {
+    view cannot reference the internal table: sqlite_schema
+}
+
+test matview-over-sqlite-schema-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT name FROM sqlite_schema WHERE tbl_name = 'person';
+}
+expect error {
+    view cannot reference the internal table: sqlite_schema
+}
+
+test matview-over-quoted-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT name FROM "sqlite_master";
+}
+expect error {
+    view cannot reference the internal table: sqlite_schema
+}
+
+# The temp spellings resolve to the same table, so one condition catches them.
+test matview-over-sqlite-temp-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS SELECT name FROM sqlite_temp_master;
+}
+expect error {
+    view cannot reference the internal table: sqlite_schema
+}
+
+test matview-over-sqlite-temp-schema-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS SELECT name FROM sqlite_temp_schema;
+}
+expect error {
+    view cannot reference the internal table: sqlite_schema
+}
+
+# The schema table is refused wherever it appears, not only as the first table.
+test matview-joining-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT person.id FROM person JOIN sqlite_master ON person.name = sqlite_master.name;
+}
+expect error {
+    view cannot reference the internal table: sqlite_schema
+}
+
+# A plain view is not incrementally maintained, so it is unaffected.
+test plain-view-over-sqlite-master-allowed {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE VIEW person_schema AS SELECT name FROM sqlite_master WHERE tbl_name = 'person';
+    SELECT name FROM person_schema ORDER BY name;
+}
+expect {
+    person
+}
+
+# sqlite_sequence is written by the AUTOINCREMENT machinery rather than by row
+# maintenance, so a view over it goes stale the same way and is refused too.
+test matview-over-sqlite-sequence-refused {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE MATERIALIZED VIEW seqm AS SELECT name, seq FROM sqlite_sequence;
+}
+expect error {
+    view cannot reference the internal table: sqlite_sequence
+}
+
+test matview-over-mixed-case-sqlite-sequence-refused {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE MATERIALIZED VIEW seqm AS SELECT name, seq FROM SQLite_Sequence;
+}
+expect error {
+    view cannot reference the internal table: sqlite_sequence
+}
+
+test matview-over-quoted-sqlite-sequence-refused {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE MATERIALIZED VIEW seqm AS SELECT name, seq FROM "sqlite_sequence";
+}
+expect error {
+    view cannot reference the internal table: sqlite_sequence
+}
+
+test matview-joining-sqlite-sequence-refused {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE MATERIALIZED VIEW seqm AS
+    SELECT t.v FROM t JOIN sqlite_sequence ON sqlite_sequence.name = 't';
+}
+expect error {
+    view cannot reference the internal table: sqlite_sequence
+}
+
+# A plain view is not incrementally maintained, so it is unaffected.
+test plain-view-over-sqlite-sequence-allowed {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t(v) VALUES ('a'), ('b');
+    CREATE VIEW seqm AS SELECT name, seq FROM sqlite_sequence;
+    SELECT name, seq FROM seqm;
+}
+expect {
+    t|2
+}
