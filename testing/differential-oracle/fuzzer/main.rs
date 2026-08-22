@@ -108,6 +108,14 @@ struct Args {
     /// `--matview`, else 0.
     #[arg(long)]
     redundant_dml_probability: Option<f64>,
+
+    /// Probability that a step writes one existing row of a table that a
+    /// materialized view reads back with its own values, through INSERT OR
+    /// REPLACE or REPLACE INTO. Half of these steps first delete all other
+    /// rows of the table. Requires `--matview`. Default: 0.05 with
+    /// `--matview`.
+    #[arg(long)]
+    row_rewrite_probability: Option<f64>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,6 +160,7 @@ struct ConfigRecord {
     max_batch_size: usize,
     reopen_probability: Option<f64>,
     redundant_dml_probability: Option<f64>,
+    row_rewrite_probability: Option<f64>,
 }
 
 /// Summary written to the JSON report file.
@@ -178,6 +187,7 @@ impl ConfigRecord {
             max_batch_size: args.max_batch_size,
             reopen_probability: args.reopen_probability,
             redundant_dml_probability: args.redundant_dml_probability,
+            row_rewrite_probability: args.row_rewrite_probability,
         }
     }
 }
@@ -318,6 +328,9 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     if args.reopen_probability.is_some_and(|p| p > 0.0) && (!args.matview || args.mvcc) {
         anyhow::bail!("--reopen-probability requires --matview and does not support --mvcc");
     }
+    if args.row_rewrite_probability.is_some_and(|p| p > 0.0) && !args.matview {
+        anyhow::bail!("--row-rewrite-probability requires --matview");
+    }
     if args.max_batch_size < 2 {
         anyhow::bail!("--max-batch-size must be at least 2");
     }
@@ -343,6 +356,11 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         args.redundant_dml_probability,
         0.1,
     )?;
+    let row_rewrite_probability = probability(
+        "row-rewrite-probability",
+        args.row_rewrite_probability,
+        0.05,
+    )?;
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
@@ -367,6 +385,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         max_batch_size: args.max_batch_size,
         reopen_probability,
         redundant_dml_probability,
+        row_rewrite_probability,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
