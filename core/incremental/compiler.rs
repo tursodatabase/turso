@@ -280,6 +280,11 @@ impl DeltaSet {
         self.deltas
     }
 
+    /// Names the deltas are keyed on
+    pub fn table_names(&self) -> impl Iterator<Item = &str> {
+        self.deltas.keys().map(|k| k.as_str())
+    }
+
     /// Check if all deltas in the set are empty
     pub fn is_empty(&self) -> bool {
         self.deltas.values().all(|d| d.is_empty())
@@ -493,6 +498,32 @@ impl DbspCircuit {
         }
     }
 
+    /// Every delta handed to the circuit must name one of its Input nodes.
+    /// A key that matches nothing would silently feed an empty delta and leave
+    /// the view stale, so a mismatch is a bug in whoever produced the key.
+    fn assert_inputs_known(&self, deltas: &DeltaSet) {
+        for requested in deltas.table_names() {
+            let known = self.nodes.values().any(|node| {
+                matches!(&node.operator, DbspOperator::Input { name, .. } if name == requested)
+            });
+            assert!(
+                known,
+                "delta for table {requested:?} does not match any circuit input; known inputs: {:?}",
+                self.input_table_names()
+            );
+        }
+    }
+
+    fn input_table_names(&self) -> Vec<&str> {
+        self.nodes
+            .values()
+            .filter_map(|node| match &node.operator {
+                DbspOperator::Input { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Execute the circuit with incremental input data (deltas).
     ///
     /// # Arguments
@@ -505,6 +536,9 @@ impl DbspCircuit {
         execute_state: &mut ExecuteState,
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
+            if let ExecuteState::Init { input_data } = &*execute_state {
+                self.assert_inputs_known(input_data);
+            }
             // Create temporary cursors for execute (non-commit) operations
             let table_cursor =
                 BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
@@ -548,6 +582,7 @@ impl DbspCircuit {
 
         // Convert input_data to DeltaSet once, outside the loop
         let input_delta_set = DeltaSet::from_map(input_data);
+        self.assert_inputs_known(&input_delta_set);
 
         loop {
             // Take ownership of the state for processing, to avoid borrow checker issues (we have
