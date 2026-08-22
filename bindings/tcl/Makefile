@@ -19,6 +19,9 @@
 #   make clean
 
 ROOT_DIR  := $(shell cd ../.. && pwd)
+# The upstream SQLite suite runs thousands of statements per file, so the
+# extension links against a release build of turso_sqlite3: a debug build
+# makes files like in2.test take half an hour.
 TURSO_LIB := $(shell $(ROOT_DIR)/scripts/cargo-target-dir)/release
 SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
 INCLUDE   := $(ROOT_DIR)/bindings/c/include
