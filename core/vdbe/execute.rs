@@ -3447,7 +3447,7 @@ pub fn halt(
     if let Some(pending_error) = state.pending_fail_error.take() {
         match program.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
             IOResult::Done(_) => {
-                index_method_transaction_committed_all(state, &program.connection);
+                index_method_on_transaction_committed_all(state, &program.connection);
                 return Err(pending_error);
             }
             IOResult::IO(io) => {
@@ -3470,7 +3470,7 @@ pub fn halt(
             // writes now, exactly like the normal trigger-subprogram halt
             // below, so the kept base rows keep their index entries too.
             if program.is_trigger_subprogram() {
-                return_if_io!(index_method_prepare_statement_all(state));
+                return_if_io!(index_method_stage_statement_all(state));
             }
             return Err(LimboError::RaiseIgnore);
         }
@@ -3537,16 +3537,22 @@ pub fn halt(
                 ));
             }
 
-            // Prepare every custom index before releasing the statement
-            // savepoint, then commit the partial FAIL changes.
+            // Stage every custom index before releasing the statement
+            // savepoint, then commit the partial FAIL changes. Yielding for
+            // I/O here is safe because Halt is re-entrant: the whole opcode
+            // runs again on resume, recomputes the same outcome from the same
+            // registers, and `pending_fail_error` carries the decided error
+            // across resumes further down. `halt_in_progress` keeps
+            // interrupt, deadline, and progress-handler requests from
+            // replacing the outcome while the staged work is in flight.
             vtab_commit_all(&program.connection)?;
-            return_if_io!(index_method_prepare_statement_all(state));
+            return_if_io!(index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
 
             // Commit the transaction with partial changes
             match program.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
                 IOResult::Done(_) => {
-                    index_method_transaction_committed_all(state, &program.connection);
+                    index_method_on_transaction_committed_all(state, &program.connection);
                     return Err(error);
                 }
                 IOResult::IO(io) => {
@@ -3596,7 +3602,7 @@ pub fn halt(
         // Stage their index-method writes now so reset cannot drop pending
         // work from an earlier row in the parent statement. The parent still
         // owns the statement savepoint and the final transaction outcome.
-        return_if_io!(index_method_prepare_statement_all(state));
+        return_if_io!(index_method_stage_statement_all(state));
         return Ok(InsnFunctionStepResult::Done);
     }
 
@@ -3626,7 +3632,7 @@ pub fn halt(
         }
         if can_autocommit_now {
             vtab_commit_all(&program.connection)?;
-            return_if_io!(index_method_prepare_statement_all(state));
+            return_if_io!(index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             // Sequence backing-table compaction and sqlite_sequence sync
             // are emitted as straight-line bytecode inside the
@@ -3642,7 +3648,7 @@ pub fn halt(
                 .map(Into::into);
             // Apply deferred CDC state and reset CDC txn ID after successful commit
             if matches!(result, Ok(InsnFunctionStepResult::Done)) {
-                index_method_transaction_committed_all(state, &program.connection);
+                index_method_on_transaction_committed_all(state, &program.connection);
                 if let Some(cdc_info) = state.pending_cdc_info.take() {
                     program.connection.set_capture_data_changes_info(cdc_info);
                 }
@@ -3657,7 +3663,7 @@ pub fn halt(
             // savepoint is released, and its cursors handed to the connection
             // so the sibling that eventually commits (or rolls back) the
             // shared transaction delivers their outcome.
-            return_if_io!(index_method_prepare_statement_all(state));
+            return_if_io!(index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             index_method_register_transaction_all(state, &program.connection)?;
             //
@@ -3700,7 +3706,7 @@ pub fn halt(
         // Otherwise the cursor's Drop fallback performs these writes after
         // statement success, where an I/O error can no longer be returned to
         // the caller or rolled back at statement scope.
-        return_if_io!(index_method_prepare_statement_all(state));
+        return_if_io!(index_method_stage_statement_all(state));
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         index_method_register_transaction_all(state, &program.connection)?;
         // Apply deferred CDC state after successful statement completion
@@ -3739,7 +3745,7 @@ pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
 /// Stage pending writes on every index-method cursor before releasing the
 /// statement savepoint. Cursor order is bytecode cursor order, which is stable
 /// across resumptions and avoids attachment-order ambiguity.
-pub(crate) fn index_method_prepare_statement_all(
+pub(crate) fn index_method_stage_statement_all(
     state: &mut ProgramState,
 ) -> crate::Result<IOResult<()>> {
     if state.index_methods_finalized {
@@ -3764,7 +3770,7 @@ pub(crate) fn index_method_prepare_statement_all(
             let Some(Cursor::IndexMethod(cursor)) = state.cursors[cursor_id].as_mut() else {
                 unreachable!("cursor kind checked above")
             };
-            match cursor.prepare_statement_commit(&context)? {
+            match cursor.stage_statement_commit(&context)? {
                 IOResult::Done(()) => {}
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
@@ -3837,7 +3843,7 @@ pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
 }
 
 /// Publish safe in-memory state after a durable autocommit outcome.
-pub(crate) fn index_method_transaction_committed_all(
+pub(crate) fn index_method_on_transaction_committed_all(
     state: &mut ProgramState,
     connection: &Connection,
 ) {
@@ -3864,15 +3870,15 @@ pub(crate) fn index_method_transaction_committed_all(
             );
             continue;
         };
-        cursor.transaction_committed(context);
+        cursor.on_transaction_committed(context);
     }
     for (cursor, context) in &mut state.closed_index_method_cursors {
-        cursor.transaction_committed(context);
+        cursor.on_transaction_committed(context);
     }
     for statement in state.subprogram_stmt_cache.values_mut() {
         statement.commit_index_methods();
     }
-    connection.index_methods_transaction_committed();
+    connection.index_methods_on_transaction_committed();
 }
 
 /// Transfer the final prepared cursor for every attachment touched by this
@@ -4846,7 +4852,7 @@ pub fn op_auto_commit(
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
             if !*rollback {
-                conn.index_methods_transaction_committed();
+                conn.index_methods_on_transaction_committed();
             }
             conn.clear_tx_poison();
             conn.clear_named_savepoints();
@@ -4908,7 +4914,7 @@ pub fn op_auto_commit(
                 }
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
-                conn.index_methods_transaction_rolled_back();
+                conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -4998,7 +5004,7 @@ pub fn op_auto_commit(
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
     if matches!(tx_op, TxOp::Commit) {
-        conn.index_methods_transaction_committed();
+        conn.index_methods_on_transaction_committed();
     }
     conn.clear_tx_poison();
     conn.clear_named_savepoints();
@@ -5240,7 +5246,7 @@ pub fn op_savepoint(
                 }
             });
             pager.set_schema_cookie(None);
-            conn.index_methods_savepoint_rolled_back();
+            conn.index_methods_on_savepoint_rolled_back();
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -14303,7 +14309,7 @@ pub fn op_close(
                 ))
             })?
             .clone();
-        return_if_io!(cursor.prepare_statement_commit(&context));
+        return_if_io!(cursor.stage_statement_commit(&context));
         let Some(Cursor::IndexMethod(cursor)) = state.cursors[*cursor_id].take() else {
             unreachable!("cursor variant checked above");
         };

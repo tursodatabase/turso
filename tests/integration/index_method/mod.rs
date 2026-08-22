@@ -624,7 +624,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
         // Flush FTS data before executing SQL (which auto-commits the transaction)
         // This mimics the VDBE's explicit statement-finalization phase.
         run(&tmp_db, || {
-            cursor.prepare_statement_commit(&index_method_context(&conn, attached.as_ref()))
+            cursor.stage_statement_commit(&index_method_context(&conn, attached.as_ref()))
         })
         .unwrap();
         conn.execute(format!(

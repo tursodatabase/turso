@@ -510,17 +510,17 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn prepare_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 
     fn abort_statement(&mut self, _context: &IndexMethodContext) {}
 
-    fn transaction_committed(&mut self, _context: &IndexMethodContext) {}
+    fn on_transaction_committed(&mut self, _context: &IndexMethodContext) {}
 
-    fn transaction_rolled_back(&mut self, _context: &IndexMethodContext) {}
+    fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {}
 
-    fn savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {}
+    fn on_savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {}
 
     fn close(&mut self, _context: &IndexMethodContext) {
         self.inverted_index_cursor = None;

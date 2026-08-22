@@ -558,7 +558,7 @@ impl Drop for Connection {
             // A handle dropped mid-transaction rolls that transaction back
             // below, so parked index-method cursors must receive the same
             // rollback outcome they would get from an explicit close().
-            self.index_methods_transaction_rolled_back();
+            self.index_methods_on_transaction_rolled_back();
 
             // Roll back any active MVCC transactions so that MvStore entries
             // don't leak and block future checkpoints.  The tx may have
@@ -2424,7 +2424,7 @@ impl Connection {
                 self.set_tx_state(TransactionState::None);
             }
         }
-        self.index_methods_transaction_rolled_back();
+        self.index_methods_on_transaction_rolled_back();
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
@@ -5000,7 +5000,7 @@ impl Connection {
     /// Park a statement's index-method cursor on the connection until the
     /// transaction's outcome is known. A cursor replaced by a later
     /// statement's cursor for the same attachment is closed immediately and
-    /// receives neither `transaction_committed` nor `transaction_rolled_back`
+    /// receives neither `on_transaction_committed` nor `on_transaction_rolled_back`
     /// — that replacement is the third legitimate end of a cursor's life
     /// (see the `IndexMethodCursor` trait docs). Only the newest cursor per
     /// attachment gets the final outcome.
@@ -5008,7 +5008,7 @@ impl Connection {
         &self,
         mut entry: crate::index_method::TransactionIndexMethodCursor,
     ) {
-        entry.cursor.statement_committed(&entry.context);
+        entry.cursor.on_statement_committed(&entry.context);
         self.has_index_method_tx_cursors
             .store(true, Ordering::Release);
         let mut entries = self.index_method_tx_cursors.lock();
@@ -5059,31 +5059,31 @@ impl Connection {
         entries
     }
 
-    pub(crate) fn index_methods_transaction_committed(&self) {
+    pub(crate) fn index_methods_on_transaction_committed(&self) {
         let entries = self.take_index_method_transaction_cursors();
         tracing::trace!(
             attachments = entries.len(),
             "publishing transaction-scoped index-method state"
         );
         for mut entry in entries {
-            entry.cursor.transaction_committed(&entry.context);
+            entry.cursor.on_transaction_committed(&entry.context);
             entry.cursor.close(&entry.context);
         }
     }
 
-    pub(crate) fn index_methods_transaction_rolled_back(&self) {
+    pub(crate) fn index_methods_on_transaction_rolled_back(&self) {
         let entries = self.take_index_method_transaction_cursors();
         tracing::trace!(
             attachments = entries.len(),
             "invalidating transaction-scoped index-method state"
         );
         for mut entry in entries {
-            entry.cursor.transaction_rolled_back(&entry.context);
+            entry.cursor.on_transaction_rolled_back(&entry.context);
             entry.cursor.close(&entry.context);
         }
     }
 
-    pub(crate) fn index_methods_savepoint_rolled_back(&self) {
+    pub(crate) fn index_methods_on_savepoint_rolled_back(&self) {
         if !self.has_index_method_tx_cursors.load(Ordering::Acquire) {
             return;
         }
@@ -5093,7 +5093,7 @@ impl Connection {
             "invalidating index-method state after savepoint rollback"
         );
         for entry in entries.iter_mut() {
-            entry.cursor.savepoint_rolled_back(&entry.context);
+            entry.cursor.on_savepoint_rolled_back(&entry.context);
         }
     }
 
@@ -5120,7 +5120,7 @@ impl Connection {
             self.auto_commit.store(true, Ordering::SeqCst);
         }
         self.rollback_attached_wal_txns();
-        self.index_methods_transaction_rolled_back();
+        self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
     }
@@ -5148,7 +5148,7 @@ impl Connection {
                 self.rollback_attached_mvcc_txs(clear_attached_schemas);
             }
             self.rollback_attached_wal_txns();
-            self.index_methods_transaction_rolled_back();
+            self.index_methods_on_transaction_rolled_back();
             self.set_tx_state(TransactionState::None);
             self.auto_commit.store(true, Ordering::SeqCst);
         }

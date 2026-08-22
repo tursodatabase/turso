@@ -4041,6 +4041,12 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// read snapshot predates that publication is refused — its rebuild of
     /// the index state starts from a superseded base and committing it would
     /// overwrite the newer publication.
+    ///
+    /// One writer per index is the intended concurrency model, not a stopgap:
+    /// two transactions cannot merge the index state each rebuilt from its
+    /// own snapshot, so the later one would silently overwrite the earlier
+    /// one's work. The lease makes the second writer fail fast instead.
+    /// Writers on different indexes, and all readers, still run concurrently.
     index_method_write_leases: Mutex<HashMap<MVTableId, IndexMethodWriteLease>>,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,

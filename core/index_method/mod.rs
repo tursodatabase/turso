@@ -116,7 +116,11 @@ pub enum IndexMethodSnapshotIdentity {
         max_frame: u64,
     },
     /// MVCC readers are pinned to the transaction's begin timestamp.
-    Mvcc { begin_timestamp: u64 },
+    Mvcc {
+        /// The MVCC transaction the operation runs inside.
+        transaction_id: u64,
+        begin_timestamp: u64,
+    },
 }
 
 /// Append-only synthetic-yield markers for index-method lifecycle boundaries.
@@ -199,7 +203,6 @@ pub struct IndexMethodContext {
     database: IndexMethodDatabaseIdentity,
     journal_mode: JournalMode,
     transaction_mode: IndexMethodTransactionMode,
-    transaction_id: Option<u64>,
     snapshot: IndexMethodSnapshotIdentity,
     schema_generation: u64,
     index: IndexMethodIdentity,
@@ -214,7 +217,6 @@ impl std::fmt::Debug for IndexMethodContext {
             .field("database", &self.database)
             .field("journal_mode", &self.journal_mode)
             .field("transaction_mode", &self.transaction_mode)
-            .field("transaction_id", &self.transaction_id)
             .field("snapshot", &self.snapshot)
             .field("schema_generation", &self.schema_generation)
             .field("index", &self.index)
@@ -241,47 +243,45 @@ impl IndexMethodContext {
             )));
         }
 
-        let (journal_mode, transaction_mode, transaction_id, snapshot, schema_generation) =
-            if let Some(mv_store) = connection.mv_store_for_db(database_id) {
-                let (tx_id, mode) = connection.get_mv_tx_for_db(database_id).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "index method '{}' opened MVCC storage without an active transaction",
-                        definition.method_name
-                    ))
-                })?;
-                let transaction_mode = match mode {
-                    TransactionMode::None | TransactionMode::Read => {
-                        IndexMethodTransactionMode::Read
-                    }
-                    TransactionMode::Write => IndexMethodTransactionMode::Write,
-                    TransactionMode::Concurrent => IndexMethodTransactionMode::Concurrent,
-                };
-                (
-                    JournalMode::Mvcc,
-                    transaction_mode,
-                    Some(tx_id),
-                    IndexMethodSnapshotIdentity::Mvcc {
-                        begin_timestamp: mv_store.read_snapshot_ts(tx_id),
-                    },
-                    mv_store.schema_generation(),
-                )
-            } else {
-                let (checkpoint_sequence, max_frame) = pager.wal_pos();
-                (
-                    JournalMode::Wal,
-                    if connection.is_in_write_tx() {
-                        IndexMethodTransactionMode::Write
-                    } else {
-                        IndexMethodTransactionMode::Read
-                    },
-                    None,
-                    IndexMethodSnapshotIdentity::Wal {
-                        checkpoint_sequence,
-                        max_frame,
-                    },
-                    pager.get_schema_cookie_cached().unwrap_or_default() as u64,
-                )
+        let (journal_mode, transaction_mode, snapshot, schema_generation) = if let Some(mv_store) =
+            connection.mv_store_for_db(database_id)
+        {
+            let (tx_id, mode) = connection.get_mv_tx_for_db(database_id).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "index method '{}' opened MVCC storage without an active transaction",
+                    definition.method_name
+                ))
+            })?;
+            let transaction_mode = match mode {
+                TransactionMode::None | TransactionMode::Read => IndexMethodTransactionMode::Read,
+                TransactionMode::Write => IndexMethodTransactionMode::Write,
+                TransactionMode::Concurrent => IndexMethodTransactionMode::Concurrent,
             };
+            (
+                JournalMode::Mvcc,
+                transaction_mode,
+                IndexMethodSnapshotIdentity::Mvcc {
+                    transaction_id: tx_id,
+                    begin_timestamp: mv_store.read_snapshot_ts(tx_id),
+                },
+                mv_store.schema_generation(),
+            )
+        } else {
+            let (checkpoint_sequence, max_frame) = pager.wal_pos();
+            (
+                JournalMode::Wal,
+                if connection.is_in_write_tx() {
+                    IndexMethodTransactionMode::Write
+                } else {
+                    IndexMethodTransactionMode::Read
+                },
+                IndexMethodSnapshotIdentity::Wal {
+                    checkpoint_sequence,
+                    max_frame,
+                },
+                pager.get_schema_cookie_cached().unwrap_or_default() as u64,
+            )
+        };
 
         let source_database = connection.get_source_database(database_id);
         let database_incarnation = source_database.incarnation;
@@ -299,7 +299,6 @@ impl IndexMethodContext {
             },
             journal_mode,
             transaction_mode,
-            transaction_id,
             snapshot,
             schema_generation,
             index: IndexMethodIdentity {
@@ -347,8 +346,12 @@ impl IndexMethodContext {
         self.transaction_mode
     }
 
+    /// The MVCC transaction this operation runs inside; `None` under WAL.
     pub fn transaction_id(&self) -> Option<u64> {
-        self.transaction_id
+        match self.snapshot {
+            IndexMethodSnapshotIdentity::Mvcc { transaction_id, .. } => Some(transaction_id),
+            IndexMethodSnapshotIdentity::Wal { .. } => None,
+        }
     }
 
     pub fn snapshot(&self) -> IndexMethodSnapshotIdentity {
@@ -516,12 +519,12 @@ pub struct IndexMethodTestStats {
 ///
 /// A cursor that wrote anything goes through these hooks, in this order:
 ///
-/// 1. `prepare_statement_commit` — stage every pending change durably (the
+/// 1. `stage_statement_commit` — stage every pending change durably (the
 ///    only fallible, I/O-capable phase), at the statement's halt.
-/// 2. `statement_committed` — the statement's savepoint was released.
+/// 2. `on_statement_committed` — the statement's savepoint was released.
 /// 3. Exactly one of three ends:
-///    * `transaction_committed` — the transaction is durable;
-///    * `transaction_rolled_back` — everything the transaction staged was
+///    * `on_transaction_committed` — the transaction is durable;
+///    * `on_transaction_rolled_back` — everything the transaction staged was
 ///      undone;
 ///    * replacement — a later statement in the same transaction opened a
 ///      newer cursor for the same attachment, so this one is closed without
@@ -534,8 +537,8 @@ pub struct IndexMethodTestStats {
 /// no transaction-private in-memory state** (everything lives in core-owned
 /// backing storage, which the engine rolls back on its own). A method that
 /// mirrors state in memory must implement every outcome hook: skipping
-/// `transaction_rolled_back` silently publishes rolled-back work, and
-/// skipping `prepare_statement_commit` silently loses writes.
+/// `on_transaction_rolled_back` silently publishes rolled-back work, and
+/// skipping `stage_statement_commit` silently loses writes.
 pub trait IndexMethodCursor: Send {
     /// create necessary components for index method (usually, this is a bunch of btree-s)
     fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
@@ -592,7 +595,7 @@ pub trait IndexMethodCursor: Send {
 
     /// Stage all pending index changes before the statement savepoint is
     /// released. Any fallible work or I/O belongs in this phase.
-    fn prepare_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 
@@ -602,19 +605,19 @@ pub trait IndexMethodCursor: Send {
     /// Publish transaction-private in-memory state after the statement
     /// savepoint has been released successfully. This hook is infallible and
     /// must not make uncommitted state visible to another transaction.
-    fn statement_committed(&mut self, _context: &IndexMethodContext) {}
+    fn on_statement_committed(&mut self, _context: &IndexMethodContext) {}
 
     /// Publish in-memory state after the database transaction commits.
     /// This hook is infallible and must not perform I/O.
-    fn transaction_committed(&mut self, _context: &IndexMethodContext) {}
+    fn on_transaction_committed(&mut self, _context: &IndexMethodContext) {}
 
     /// Invalidate transaction-owned in-memory state after rollback.
     /// This hook is infallible and must not perform I/O.
-    fn transaction_rolled_back(&mut self, _context: &IndexMethodContext) {}
+    fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {}
 
     /// Invalidate state newer than a rolled-back savepoint.
     /// This hook is infallible and must not perform I/O.
-    fn savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {}
+    fn on_savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {}
 
     /// Release resources without performing I/O or persistent writes.
     fn close(&mut self, _context: &IndexMethodContext) {}

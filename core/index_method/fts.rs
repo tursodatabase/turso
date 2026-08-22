@@ -122,10 +122,20 @@ fn fts_max_retained_cache_bytes() -> usize {
 const FTS_CONTROL_PATH: &str = "__turso_fts_control_v1";
 const FTS_CONTROL_MAGIC: &[u8; 8] = b"TFTSCTL1";
 const FTS_CONTROL_FORMAT_VERSION: u32 = 1;
-/// Placeholder incarnation for an index with no persisted control record yet
-/// (an empty catalog). Deterministic, so every connection opening a
-/// never-written index agrees on it; the real incarnation is minted when the
-/// first control record is staged and is never this value.
+/// An "incarnation" identifies one lifetime of an index's stored content: it
+/// is minted once when the first control record is written and stays the same
+/// for every later write to that index. Dropping and recreating the index
+/// mints a new one. It is not a version counter — `manifest_generation`
+/// advances on every publish; the incarnation only changes when the stored
+/// content belongs to a different index life. Comparing it tells caches and
+/// verification that "the bytes I remembered" and "the bytes on disk" come
+/// from the same life of the index, even when names, root pages, or table ids
+/// were reused by a recreate.
+///
+/// This constant is the placeholder for an index with no persisted control
+/// record yet (an empty catalog). Deterministic, so every connection opening
+/// a never-written index agrees on it; the real incarnation is minted when
+/// the first control record is staged and is never this value.
 const FTS_EMPTY_INDEX_INCARNATION: u64 = 0;
 static NEXT_FTS_INDEX_INCARNATION: AtomicU64 = AtomicU64::new(1);
 /// Distinguishes cursor instances within a process so a cursor can recognize
@@ -261,8 +271,10 @@ pub fn fts_match(text: &str, query: &str) -> bool {
     })
 }
 
-/// Metadata about a file stored in the FTS directory.
-/// Used for merge-budget accounting.
+/// In-memory catalog entry for a file stored in the FTS directory: how big
+/// the file is and how many B-tree chunk rows hold its bytes. Used for
+/// merge-budget accounting. [`FtsManifestFile`] is this entry's persisted
+/// twin inside the control record.
 #[derive(Debug, Clone)]
 struct FileMetadata {
     /// Total file size in bytes
@@ -279,12 +291,24 @@ impl FileMetadata {
     }
 }
 
+/// The persisted form of one [`FileMetadata`] entry, as serialized inside the
+/// control record. `size` and `chunks` mean the same thing as there; both are
+/// `u64` here because the on-disk encoding is fixed-width and must not depend
+/// on the platform's `usize`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FtsManifestFile {
     size: u64,
     chunks: u64,
 }
 
+/// The one persisted record that says what the index's storage currently
+/// contains: which life of the index the bytes belong to
+/// (`index_incarnation`), how many times the file set has been published
+/// (`manifest_generation`), and the expected size and chunk count of every
+/// file. It is written in the same transaction as the file bytes, so reading
+/// it back answers two questions at once: "is my cached state still current?"
+/// (compare incarnation + generation) and "are the stored files intact?"
+/// (compare sizes and chunk counts).
 #[derive(Debug, Clone)]
 struct FtsControlRecord {
     index_incarnation: u64,
@@ -627,7 +651,7 @@ impl PendingFileMutations {
 ///
 /// File mutations are buffered in memory and flushed to the BTree when:
 /// - A Tantivy commit occurs (via `commit_and_flush`)
-/// - The statement is finalized (via `prepare_statement_commit`)
+/// - The statement is finalized (via `stage_statement_commit`)
 ///
 /// During flush, writes are moved to `flushing_writes` so they remain readable while
 /// the async BTree write completes.
@@ -1115,6 +1139,39 @@ impl IndexMethod for FtsIndexMethod {
     }
 }
 
+/// Which snapshot a cached FTS entry belongs to, and so who may reuse it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FtsCachedSnapshot {
+    /// Private to one live MVCC transaction; only that transaction may reuse
+    /// the entry, and only until the transaction resolves.
+    Mvcc { transaction_id: u64 },
+    /// Not private to any live transaction. `pos` is the WAL position the
+    /// entry was built at; `None` means there is nothing to compare cheaply
+    /// (the pager had no WAL identity, or the entry is a writer whose MVCC
+    /// transaction committed), so reuse first requires the slower
+    /// control-record or metadata-byte comparison.
+    Wal { pos: Option<(u32, u64)> },
+}
+
+impl FtsCachedSnapshot {
+    /// The live MVCC transaction that owns the entry, if any.
+    fn transaction_id(self) -> Option<u64> {
+        match self {
+            Self::Mvcc { transaction_id } => Some(transaction_id),
+            Self::Wal { .. } => None,
+        }
+    }
+
+    /// The WAL position to validate reuse against. `None` both for entries
+    /// that need the slower comparison and for transaction-private entries.
+    fn wal_pos(self) -> Option<(u32, u64)> {
+        match self {
+            Self::Wal { pos } => pos,
+            Self::Mvcc { .. } => None,
+        }
+    }
+}
+
 /// Cached FTS read state reused by cursors on the connection that populated it.
 ///
 /// The connection owner is part of the cache identity because the directory and
@@ -1124,13 +1181,8 @@ impl IndexMethod for FtsIndexMethod {
 /// pending-write state.
 pub struct CachedFtsState {
     connection: Weak<Connection>,
-    /// MVCC transaction that owns this snapshot. `None` denotes a WAL entry.
-    transaction_id: Option<u64>,
-    /// WAL snapshot at which the cached Tantivy metadata was loaded.
-    ///
-    /// `None` means the pager has no WAL identity and requires the slower
-    /// metadata-byte comparison before reuse.
-    snapshot_wal_pos: Option<(u32, u64)>,
+    /// Snapshot at which the cached Tantivy metadata was loaded.
+    snapshot: FtsCachedSnapshot,
     control: FtsControlRecord,
     directory: HybridBTreeDirectory,
     index: Index,
@@ -1146,10 +1198,11 @@ pub struct CachedFtsState {
 /// stale Tantivy segments.
 struct CachedFtsWriter {
     connection: Weak<Connection>,
-    /// MVCC transaction that exclusively owns this writer. `None` denotes a
-    /// WAL writer whose visibility remains connection-local until commit.
-    transaction_id: Option<u64>,
-    snapshot_wal_pos: Option<(u32, u64)>,
+    /// While the owning MVCC transaction is live this is `Mvcc`, and the
+    /// writer's visibility stays private to that transaction. On commit it is
+    /// re-tagged `Wal { pos: None }` so the next reuse validates against the
+    /// on-disk control record first.
+    snapshot: FtsCachedSnapshot,
     control: FtsControlRecord,
     directory: HybridBTreeDirectory,
     index: Index,
@@ -1173,6 +1226,31 @@ struct CachedFtsStates {
 impl CachedFtsState {
     fn resident_cache_bytes(&self) -> usize {
         self.directory.hot_cache.size()
+    }
+
+    /// Is this entry positioned at the very snapshot the current operation
+    /// reads from? MVCC entries compare transaction ids; WAL entries compare
+    /// the WAL position the entry was built at against the pager's current
+    /// one.
+    fn matches_snapshot(&self, context: &IndexMethodContext) -> bool {
+        match (context.transaction_id(), self.snapshot) {
+            (Some(current), FtsCachedSnapshot::Mvcc { transaction_id }) => {
+                current == transaction_id
+            }
+            (None, FtsCachedSnapshot::Wal { pos }) => pos
+                .is_some_and(|snapshot_wal_pos| self.directory.pager.wal_pos() == snapshot_wal_pos),
+            _ => false,
+        }
+    }
+
+    /// Was this entry built from the control record that is currently visible
+    /// on disk? True only when both the index life (incarnation) and the
+    /// publish counter (manifest generation) match.
+    fn matches_manifest(&self, visible_control: Option<&FtsControlRecord>) -> bool {
+        visible_control.is_some_and(|control| {
+            control.index_incarnation == self.control.index_incarnation
+                && control.manifest_generation == self.control.manifest_generation
+        })
     }
 }
 
@@ -1291,7 +1369,7 @@ pub struct FtsIndexAttachment {
 /// The slot is claimed on the cursor's first document mutation (a plan may
 /// open several write-mode cursors on one index but only one ever mutates it)
 /// and released once the cursor has staged its statement's writes
-/// (`prepare_statement_commit`), aborted, or closed — after that the cursor
+/// (`stage_statement_commit`), aborted, or closed — after that the cursor
 /// never flushes again, so a later statement's cursor may write. Writers on
 /// different connections are already serialized by the pager write lock (WAL)
 /// or the per-index MVCC write lease.
@@ -1301,6 +1379,12 @@ struct FtsWriterSlot {
     cursor_instance: u64,
 }
 
+/// Counters for cache and writer behavior, read back by invariant tests.
+///
+/// The fields are atomics because one `FtsRuntimeStats` is shared through an
+/// `Arc` by the attachment and every cursor opened on it, across all
+/// connections and their threads, and the counters are bumped at spots where
+/// no common lock is held.
 #[derive(Debug, Default)]
 struct FtsRuntimeStats {
     tantivy_writer_constructions: AtomicUsize,
@@ -2180,6 +2264,14 @@ impl FtsCursor {
         Arc::new(parser)
     }
 
+    /// "Check out" this connection's cached read state: hand the cursor
+    /// clones of the cache entry's immutable Tantivy objects (directory
+    /// catalog, index, reader, parser) so it can serve queries without
+    /// reloading everything from the backing B-tree. The entry itself stays
+    /// in the cache for the next cursor; only its position moves to
+    /// most-recently-used. Returns `None` when there is no entry for this
+    /// connection or the entry no longer reflects what a query would see on
+    /// disk.
     fn checkout_cached_state(
         &self,
         context: &IndexMethodContext,
@@ -2193,17 +2285,8 @@ impl FtsCursor {
         cache.prune();
         let position = cache.connection_position(&conn)?;
         let cached = &cache.entries[position];
-        let same_snapshot = match (context.transaction_id(), cached.transaction_id) {
-            (Some(current), Some(cached)) => current == cached,
-            (None, None) => cached.snapshot_wal_pos.is_some_and(|snapshot_wal_pos| {
-                cached.directory.pager.wal_pos() == snapshot_wal_pos
-            }),
-            _ => false,
-        };
-        let same_manifest = visible_control.is_some_and(|control| {
-            control.index_incarnation == cached.control.index_incarnation
-                && control.manifest_generation == cached.control.manifest_generation
-        });
+        let same_snapshot = cached.matches_snapshot(context);
+        let same_manifest = cached.matches_manifest(visible_control);
         if !same_snapshot && !same_manifest {
             if visible_control.is_some() {
                 cache.entries.remove(position);
@@ -2289,12 +2372,12 @@ impl FtsCursor {
         let metadata_matches = if conn.mv_store_for_db(database_id).is_some() {
             same_connection
                 && context.transaction_id().is_some()
-                && context.transaction_id() == cached.transaction_id
+                && context.transaction_id() == cached.snapshot.transaction_id()
         } else {
             same_connection
-                && cached.transaction_id.is_none()
                 && cached
-                    .snapshot_wal_pos
+                    .snapshot
+                    .wal_pos()
                     .is_some_and(|position| cached.directory.pager.wal_pos() == position)
         };
         if !metadata_matches {
@@ -2302,7 +2385,7 @@ impl FtsCursor {
             // record can be validated asynchronously by open_read().
             if conn.mv_store_for_db(database_id).is_some()
                 && same_connection
-                && cached.transaction_id.is_none()
+                && cached.snapshot.transaction_id().is_none()
             {
                 return Ok(false);
             }
@@ -2353,7 +2436,7 @@ impl FtsCursor {
             return false;
         };
         self.shared_writer.lock().as_ref().is_some_and(|cached| {
-            cached.transaction_id.is_none()
+            cached.snapshot.transaction_id().is_none()
                 && cached
                     .connection
                     .upgrade()
@@ -2380,7 +2463,7 @@ impl FtsCursor {
         let same_connection = owner
             .as_ref()
             .is_some_and(|owner| Arc::ptr_eq(owner, &conn));
-        let deferred = cached.transaction_id.is_none();
+        let deferred = cached.snapshot.transaction_id().is_none();
         let matches_control = cached.control.index_incarnation == visible_control.index_incarnation
             && cached.control.manifest_generation == visible_control.manifest_generation;
         if !(same_connection && deferred && matches_control) {
@@ -2439,7 +2522,9 @@ impl FtsCursor {
                 .as_ref()
                 .is_some_and(|cached| match cached.connection.upgrade() {
                     None => true,
-                    Some(owner) => Arc::ptr_eq(&owner, &conn) && cached.transaction_id.is_none(),
+                    Some(owner) => {
+                        Arc::ptr_eq(&owner, &conn) && cached.snapshot.transaction_id().is_none()
+                    }
                 });
         if !discard {
             return;
@@ -2509,7 +2594,7 @@ impl FtsCursor {
             tracing::trace!("FTS writer cache: cursor has no writer");
             return;
         }
-        // Keep `self.control` set: `transaction_committed` compares it against
+        // Keep `self.control` set: `on_transaction_committed` compares it against
         // the cached writer's control record before re-stamping the WAL
         // position.
         let Some(control) = self.control.clone() else {
@@ -2526,12 +2611,16 @@ impl FtsCursor {
             .take()
             .expect("FTS writer must have an initialized directory");
         let wal_pos = directory.pager.wal_pos();
-        let snapshot_wal_pos = (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos);
+        let snapshot = match context.transaction_id() {
+            Some(transaction_id) => FtsCachedSnapshot::Mvcc { transaction_id },
+            None => FtsCachedSnapshot::Wal {
+                pos: (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos),
+            },
+        };
 
         let previous = self.shared_writer.lock().replace(CachedFtsWriter {
             connection: Arc::downgrade(&conn),
-            transaction_id: context.transaction_id(),
-            snapshot_wal_pos,
+            snapshot,
             control,
             directory,
             index,
@@ -3729,7 +3818,12 @@ impl IndexMethodCursor for FtsCursor {
                         let query_parser = self.build_query_parser(index);
                         self.cached_parser = Some(Arc::clone(&query_parser));
                         let wal_pos = dir.pager.wal_pos();
-                        let snapshot_wal_pos = (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos);
+                        let snapshot = match context.transaction_id() {
+                            Some(transaction_id) => FtsCachedSnapshot::Mvcc { transaction_id },
+                            None => FtsCachedSnapshot::Wal {
+                                pos: (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos),
+                            },
+                        };
 
                         let mut cache = self.shared_cache.write();
                         let control = self.control.clone().ok_or_else(|| {
@@ -3745,8 +3839,7 @@ impl IndexMethodCursor for FtsCursor {
                         let retained = cache.insert(
                             CachedFtsState {
                                 connection: Arc::downgrade(&conn),
-                                transaction_id: context.transaction_id(),
-                                snapshot_wal_pos,
+                                snapshot,
                                 control,
                                 directory: dir.clone(),
                                 index: index.clone(),
@@ -4240,7 +4333,7 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Flushes pending writes before transaction commit.
     /// This ensures FTS writes are persisted as part of the transaction.
-    fn prepare_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
         // First, check if we're in the middle of a flush operation that needs to continue
         // This handles the case where commit_and_flush() returned IOResult::IO and we need
         // to continue the flush after IO completes
@@ -4290,8 +4383,8 @@ impl IndexMethodCursor for FtsCursor {
         // (e.g. the losing side of a lease conflict) must not evict another
         // connection's writer. Only remove what this connection's failed
         // statement could have produced: its own writer tagged with this
-        // transaction (both `None` in WAL mode). An MVCC deferred writer
-        // (`transaction_id == None`) predates this transaction, so it stays
+        // transaction (both WAL in WAL mode). An MVCC deferred writer
+        // (already re-tagged `Wal`) predates this transaction, so it stays
         // valid across this rollback. Entries with a dead owner are removed
         // opportunistically.
         let mut cached_writer = self.shared_writer.lock();
@@ -4301,7 +4394,8 @@ impl IndexMethodCursor for FtsCursor {
                 None => (true, false),
                 Some(owner) => (
                     false,
-                    Arc::ptr_eq(&owner, &conn) && cached.transaction_id == context.transaction_id(),
+                    Arc::ptr_eq(&owner, &conn)
+                        && cached.snapshot.transaction_id() == context.transaction_id(),
                 ),
             },
         };
@@ -4324,11 +4418,11 @@ impl IndexMethodCursor for FtsCursor {
         drop(deferred_directory);
     }
 
-    fn statement_committed(&mut self, context: &IndexMethodContext) {
+    fn on_statement_committed(&mut self, context: &IndexMethodContext) {
         self.cache_writer(context);
     }
 
-    fn transaction_committed(&mut self, context: &IndexMethodContext) {
+    fn on_transaction_committed(&mut self, context: &IndexMethodContext) {
         tracing::trace!(
             index = context.index().index_name,
             pending_documents = self.pending_docs_count,
@@ -4350,9 +4444,12 @@ impl IndexMethodCursor for FtsCursor {
                     .connection
                     .upgrade()
                     .is_some_and(|owner| Arc::ptr_eq(&owner, &conn));
-                if same_connection && cached.transaction_id == Some(transaction_id) {
-                    cached.transaction_id = None;
-                    cached.snapshot_wal_pos = None;
+                if same_connection
+                    && cached.snapshot == (FtsCachedSnapshot::Mvcc { transaction_id })
+                {
+                    // No WAL position on purpose: the next reuse must first
+                    // validate against the on-disk control record.
+                    cached.snapshot = FtsCachedSnapshot::Wal { pos: None };
                 }
             }
         } else if let Some(cached) = self.shared_writer.lock().as_mut() {
@@ -4373,17 +4470,19 @@ impl IndexMethodCursor for FtsCursor {
             });
             if same_connection && matches_cursor_control {
                 let wal_pos = cached.directory.pager.wal_pos();
-                cached.snapshot_wal_pos = (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos);
+                cached.snapshot = FtsCachedSnapshot::Wal {
+                    pos: (wal_pos != (u32::MAX, u64::MAX)).then_some(wal_pos),
+                };
             }
         }
         self.shared_cache.write().prune();
     }
 
-    fn transaction_rolled_back(&mut self, context: &IndexMethodContext) {
+    fn on_transaction_rolled_back(&mut self, context: &IndexMethodContext) {
         self.abort_statement(context);
     }
 
-    fn savepoint_rolled_back(&mut self, context: &IndexMethodContext) {
+    fn on_savepoint_rolled_back(&mut self, context: &IndexMethodContext) {
         // Correct but coarse: the hook carries no savepoint identity, so we
         // cannot tell whether the rollback actually reverted FTS chunk rows
         // this cursor's view depends on. Discard everything; the next FTS

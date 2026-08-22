@@ -336,7 +336,7 @@ impl std::fmt::Debug for Statement {
 
 impl Statement {
     pub(crate) fn prepare_index_methods(&mut self) -> Result<crate::IOResult<()>> {
-        crate::vdbe::execute::index_method_prepare_statement_all(&mut self.state)
+        crate::vdbe::execute::index_method_stage_statement_all(&mut self.state)
     }
 
     pub(crate) fn abort_index_methods(&mut self) {
@@ -344,7 +344,7 @@ impl Statement {
     }
 
     pub(crate) fn commit_index_methods(&mut self) {
-        crate::vdbe::execute::index_method_transaction_committed_all(
+        crate::vdbe::execute::index_method_on_transaction_committed_all(
             &mut self.state,
             &self.program.connection,
         );

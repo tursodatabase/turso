@@ -111,7 +111,7 @@ impl crate::index_method::IndexMethodCursor for FailingPrepareCursor {
         Ok(crate::IOResult::Done(None))
     }
 
-    fn prepare_statement_commit(
+    fn stage_statement_commit(
         &mut self,
         _context: &crate::index_method::IndexMethodContext,
     ) -> Result<crate::IOResult<()>> {

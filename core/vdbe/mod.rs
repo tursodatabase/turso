@@ -261,7 +261,7 @@ impl CommitState {
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
         connection.rollback_temp_schema();
-        connection.index_methods_transaction_rolled_back();
+        connection.index_methods_on_transaction_rolled_back();
     }
 }
 
@@ -2006,9 +2006,11 @@ impl Program {
                 // index-method writes must finish before abort() releases the
                 // statement savepoint and commits those partial changes.
                 if let Some(fail_error) = state.pending_fail_prepare_error.take() {
-                    match execute::index_method_prepare_statement_all(state) {
+                    match execute::index_method_stage_statement_all(state) {
                         Ok(IOResult::Done(())) => {
-                            if let Err(abort_err) = self.abort(pager, Some(&fail_error), state) {
+                            if let Err(abort_err) =
+                                self.abort(pager, Some(&fail_error), state, true)
+                            {
                                 tracing::error!(
                                     "Abort failed after preparing FAIL index methods: {abort_err}"
                                 );
@@ -2037,7 +2039,8 @@ impl Program {
                             // error to the caller.
                             let rollback_error =
                                 LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
-                            if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state)
+                            if let Err(abort_err) =
+                                self.abort(pager, Some(&rollback_error), state, true)
                             {
                                 tracing::error!(
                                     "Abort also failed after FAIL index-method preparation: \
@@ -3065,7 +3068,7 @@ impl Program {
                                 let halt_already_delivered =
                                     matches!(err, Some(LimboError::Constraint(_)));
                                 if committed && !halt_already_delivered {
-                                    execute::index_method_transaction_committed_all(
+                                    execute::index_method_on_transaction_committed_all(
                                         state,
                                         &self.connection,
                                     );
