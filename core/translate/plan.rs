@@ -1588,6 +1588,27 @@ impl TableReferences {
             })
     }
 
+    /// Like [`Self::find_table_and_internal_id_by_identifier`], but prefers a table
+    /// whose database matches `database_id`. Used for explicitly database-qualified
+    /// column references (`db.table.column`) so that a same-named table in another
+    /// database does not shadow the referenced one.
+    pub fn find_table_and_internal_id_by_database_and_identifier(
+        &self,
+        database_id: usize,
+        identifier: &str,
+    ) -> Option<(TableInternalId, &Table)> {
+        self.joined_tables
+            .iter()
+            .find(|t| t.identifier == identifier && t.database_id == database_id)
+            .map(|t| (t.internal_id, &t.table))
+            .or_else(|| {
+                self.outer_query_refs
+                    .iter()
+                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
+                    .map(|t| (t.internal_id, &t.table))
+            })
+    }
+
     /// Returns an immutable reference to the [JoinedTable] with the given internal ID.
     pub fn find_joined_table_by_internal_id(
         &self,

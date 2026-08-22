@@ -796,3 +796,65 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_correlated_subquery_with_same_named_table_across_databases(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("correlated_same_name_aux.db")
+        .to_string_lossy()
+        .to_string();
+
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")?;
+    conn.execute("INSERT INTO t1 VALUES (2, 'x')")?;
+    conn.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val TEXT)")?;
+    conn.execute("INSERT INTO aux.t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')")?;
+
+    // Regression test for #6279: a database-qualified column reference
+    // (`aux.t1.id`) inside a correlated subquery must bind to the outer
+    // `aux.t1`, not be shadowed by the same-named inner `main.t1`.
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, val FROM aux.t1 WHERE EXISTS (SELECT 1 FROM t1 WHERE t1.id = aux.t1.id)",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Text("b".into())
+            ],
+        ],
+        "EXISTS must correlate against outer aux.t1, not the same-named main.t1"
+    );
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, val FROM aux.t1 WHERE NOT EXISTS (SELECT 1 FROM t1 WHERE t1.id = aux.t1.id)",
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "NOT EXISTS must return the non-matching aux rows"
+    );
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, (SELECT val FROM t1 WHERE t1.id = aux.t1.id) AS mv FROM aux.t1",
+    );
+    assert_eq!(
+        rows[0],
+        vec![
+            rusqlite::types::Value::Integer(1),
+            rusqlite::types::Value::Null
+        ],
+        "scalar subquery must evaluate per-row, not once"
+    );
+    Ok(())
+}
