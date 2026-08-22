@@ -404,11 +404,11 @@ export class Session {
    */
   createRowObject(values: any[], columns: string[]): any {
     const row = [...values];
-    
-    // Add column name properties to the array as non-enumerable
-    // Only add valid identifier names to avoid conflicts
+
+    // Skip names the array already owns (`length`). Overwriting it
+    // truncates the row; a BigInt value throws TypeError.
     columns.forEach((column, index) => {
-      if (column && isValidIdentifier(column)) {
+      if (column && isValidIdentifier(column) && !Object.prototype.hasOwnProperty.call(row, column)) {
         Object.defineProperty(row, column, {
           value: values[index],
           enumerable: false,
@@ -417,7 +417,7 @@ export class Session {
         });
       }
     });
-    
+
     return row;
   }
 
