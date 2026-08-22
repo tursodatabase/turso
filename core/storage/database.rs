@@ -150,7 +150,14 @@ impl DatabaseStorage for DatabaseFile {
         turso_assert_greater_than_or_equal!(page_idx as i64, 0);
         let r = c.as_read();
         let size = r.buf().len();
-        turso_assert_greater_than!(page_idx, 0);
+        // Page numbers are 1-based; a reference to page 0 comes from a
+        // corrupted pointer (e.g. a zeroed overflow page number), not from
+        // any legitimate caller.
+        if page_idx == 0 {
+            return Err(LimboError::Corrupt(
+                "attempted to read page 0 (page numbers start at 1)".into(),
+            ));
+        }
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(LimboError::NotADB);
         }
