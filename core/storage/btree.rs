@@ -3731,6 +3731,14 @@ impl BTreeCursor {
                         if !is_last_sibling && !is_table_leaf {
                             // If we are a index page or a interior table page we need to take the divider cell too.
                             // But we don't need the last divider as it will remain the same.
+                            if is_leaf {
+                                // The divider holds the leaf cell's real size after its child pointer;
+                                // back on a leaf the cell takes the minimum size again.
+                                ensure_min_cell_size(
+                                    &mut reusable_divider_buffers[i],
+                                    LEFT_CHILD_PTR_SIZE_BYTES,
+                                );
+                            }
                             let mut divider_cell = reusable_divider_buffers[i].as_mut_slice();
                             // TODO(pere): in case of old pages are leaf pages, so index leaf page, we need to strip page pointers
                             // from divider cells in index interior pages (parent) because those should not be included.
@@ -4275,6 +4283,21 @@ impl BTreeCursor {
                             write_varint_to_vec(rowid, &mut balance_info.reusable_divider_cell)?;
                         } else {
                             // Leaf index
+                            // A leaf cell is read as at least MINIMUM_CELL_SIZE bytes, so a 2-byte
+                            // record carries one byte of padding here. The parent stores the cell's
+                            // real size after the child pointer, so drop the padding when promoting.
+                            let (payload_len, n_payload) = read_varint(divider_cell)?;
+                            let real_len = n_payload + payload_len as usize;
+                            let divider_cell = if real_len < divider_cell.len() {
+                                turso_assert!(
+                                    real_len < MINIMUM_CELL_SIZE,
+                                    "only cells below the minimum cell size carry padding",
+                                    { "real_len": real_len, "cell_len": divider_cell.len() }
+                                );
+                                &divider_cell[..real_len]
+                            } else {
+                                &divider_cell[..]
+                            };
                             balance_info
                                 .reusable_divider_cell
                                 .extend_from_slice(&(page.get().id as u32).to_be_bytes());
@@ -4993,7 +5016,15 @@ impl BTreeCursor {
                         PageType::IndexLeaf => {
                             let parent_cell_buf =
                                 &parent_buf[parent_cell_start..parent_cell_start + parent_cell_len];
-                            if parent_cell_buf[4..] != cell_buf_in_array[..] {
+                            // The parent stores the cell's real size; the cell array pads leaf
+                            // cells up to MINIMUM_CELL_SIZE.
+                            let parent_payload = &parent_cell_buf[4..];
+                            let padded = parent_payload.len() < MINIMUM_CELL_SIZE
+                                && cell_buf_in_array.len() == MINIMUM_CELL_SIZE;
+                            let matches = cell_buf_in_array.len() >= parent_payload.len()
+                                && cell_buf_in_array[..parent_payload.len()] == *parent_payload
+                                && (cell_buf_in_array.len() == parent_payload.len() || padded);
+                            if !matches {
                                 tracing::error!("balance_non_root(cell_divider_cell_index_leaf, page_id={}, cell_divider_idx={})",
                                     page.get().id,
                                     cell_divider_idx,
@@ -8099,6 +8130,21 @@ impl PartialOrd for IntegrityCheckCellRange {
     }
 }
 
+/// Pads the cell that starts at `cell_start` in `buf` with zero bytes until it takes
+/// MINIMUM_CELL_SIZE bytes, the least space any cell takes on a page (a freed cell must be
+/// able to hold a 4-byte freeblock header).
+///
+/// Only index cells can be smaller: a one-column record of 0, 1, '' or X'' is 2 bytes, so
+/// its cell is 3. A leaf page stores such a cell padded and cell_get_raw_region reports the
+/// padded size, while a divider in the parent stores the cell's real size after its child
+/// pointer. Padding the cell whenever it is headed for a leaf keeps balancing working with
+/// one size; the record's own length prefix keeps readers from ever looking at the padding.
+fn ensure_min_cell_size(buf: &mut crate::alloc::Vec<u8>, cell_start: usize) {
+    const ZEROS: [u8; MINIMUM_CELL_SIZE] = [0; MINIMUM_CELL_SIZE];
+    let padding = (cell_start + MINIMUM_CELL_SIZE).saturating_sub(buf.len());
+    buf.extend_from_slice(&ZEROS[..padding]);
+}
+
 #[cfg(debug_assertions)]
 fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
     for cell in &cell_array.cell_payloads {
@@ -9468,7 +9514,12 @@ fn _insert_into_cell(
                 turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential", { "page_id": page.id, "last_overflow_index": overflow_cell.index, "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len() });
             }
         }
-        let payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
+        let mut payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
+        if page.page_type()? == PageType::IndexLeaf {
+            // Balancing must see one size for every leaf cell, whether it sits on the page
+            // (where cell_get_raw_region reports at least the minimum size) or overflowed.
+            ensure_min_cell_size(&mut payload, 0);
+        }
         let overflow_cell = OverflowCell {
             index: cell_idx,
             payload: Pin::new(payload),

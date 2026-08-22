@@ -51,6 +51,8 @@ pub struct MultiprocessOpts {
     pub restart_probability: f64,
     pub history_output: Option<PathBuf>,
     pub keep_files: bool,
+    /// Options for the arbitrary SQL generator used by the workloads.
+    pub sql_generation_opts: Opts,
 }
 
 struct OperationHistoryWriter {
@@ -378,7 +380,7 @@ impl MultiprocessWhopper {
                 .collect(),
             chaotic_profiles: opts.chaotic_profiles,
             total_weight,
-            opts: Opts::default(),
+            opts: opts.sql_generation_opts,
             rng,
             current_step: 0,
             max_steps: opts.max_steps,

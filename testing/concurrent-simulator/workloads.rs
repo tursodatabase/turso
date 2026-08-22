@@ -3,7 +3,7 @@
 use rand::{Rng, seq::IndexedRandom};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
-    generation::{Arbitrary, GenerationContext, Opts},
+    generation::{Arbitrary, GenerationContext, Opts, query::SelectInSubquery},
     model::{
         query::{
             create_index::CreateIndex, delete::Delete, drop_index::DropIndex, insert::Insert,
@@ -152,6 +152,18 @@ pub struct SelectWorkload;
 impl Workload for SelectWorkload {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let select = Select::arbitrary(rng, ctx);
+        let sql = select.to_string();
+        Some(Operation::Select { sql })
+    }
+}
+
+/// `SELECT <value> IN (SELECT <column> FROM <table> ...)`: loads one column
+/// into an ephemeral index b-tree (works in both Idle and InTx states).
+pub struct SelectInSubqueryWorkload;
+
+impl Workload for SelectInSubqueryWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let select = SelectInSubquery::arbitrary(rng, ctx).0;
         let sql = select.to_string();
         Some(Operation::Select { sql })
     }
