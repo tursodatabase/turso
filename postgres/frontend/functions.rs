@@ -71,10 +71,10 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             ))),
         },
         "quote_literal" => Ok(exec_quote_literal(args.first().unwrap_or(&Value::Null))),
+        "pg_get_expr" => exec_pg_get_expr(args),
         // Catalog introspection stubs: accepted for compatibility, no output.
         // obj_description/col_description are NULL because COMMENT ON is not persisted.
-        "pg_get_expr"
-        | "pg_get_statisticsobjdef_columns"
+        "pg_get_statisticsobjdef_columns"
         | "pg_relation_is_publishable"
         | "pg_get_function_result"
         | "pg_get_function_arguments"
@@ -232,6 +232,23 @@ fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Value {
     };
     let valid = validate_pg_input(&s, type_name).is_none();
     Value::from_i64(if valid { 1 } else { 0 })
+}
+
+fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
+    match args.first() {
+        Some(Value::Text(expression)) => {
+            if args[1..].iter().any(|arg| matches!(arg, Value::Null)) {
+                return Ok(Value::Null);
+            }
+
+            // TursoPG stores adbin and conbin as rendered SQL, so the relation OID and pretty flag do not change the output.
+            Ok(Value::Text(expression.clone()))
+        }
+        Some(Value::Null) => Ok(Value::Null),
+        Some(_) | None => Err(LimboError::ConversionError(
+            "Expected text value".to_string(),
+        )),
+    }
 }
 
 fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
