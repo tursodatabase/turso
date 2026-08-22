@@ -2309,20 +2309,20 @@ impl PostgreSQLTranslator {
                 use pg_query::protobuf::SqlValueFunctionOp;
                 match SqlValueFunctionOp::try_from(svf.op) {
                     Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
-                        Ok(ast::Expr::Id(ast::Name::from_string("CURRENT_DATE")))
+                        Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
                     }
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
                         | SqlValueFunctionOp::SvfopCurrentTimeN
                         | SqlValueFunctionOp::SvfopLocaltime
                         | SqlValueFunctionOp::SvfopLocaltimeN,
-                    ) => Ok(ast::Expr::Id(ast::Name::from_string("CURRENT_TIME"))),
+                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
                         | SqlValueFunctionOp::SvfopCurrentTimestampN
                         | SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Id(ast::Name::from_string("CURRENT_TIMESTAMP"))),
+                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
                         | SqlValueFunctionOp::SvfopSessionUser
@@ -6450,8 +6450,29 @@ mod tests {
         let sql = "SELECT CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME FROM t";
         let parsed = crate::parse(sql).unwrap();
         let translated = translator.translate(&parsed).unwrap();
-        // Should translate without error
-        assert!(matches!(translated, ast::Stmt::Select(_)));
+
+        let ast::Stmt::Select(selected) = translated else {
+            panic!("Expected SELECT statement");
+        };
+
+        let ast::OneSelect::Select { columns, .. } = &selected.body.select else {
+            panic!("Expected SELECT body");
+        };
+
+        let expected = [
+            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+            ast::Expr::Literal(ast::Literal::CurrentDate),
+            ast::Expr::Literal(ast::Literal::CurrentTime),
+        ];
+
+        assert_eq!(columns.len(), expected.len());
+
+        for (col, expected_expr) in columns.iter().zip(&expected) {
+            let ast::ResultColumn::Expr(expr, _) = col else {
+                panic!("Expected column expression");
+            };
+            assert_eq!(expr.as_ref(), expected_expr);
+        }
     }
 
     #[test]
