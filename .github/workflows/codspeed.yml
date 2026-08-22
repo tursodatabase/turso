@@ -111,7 +111,7 @@ jobs:
           set -euo pipefail
 
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
-          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed
+          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed,jit
 
       - name: Upload benchmark binaries
         id: upload_artifact
@@ -179,7 +179,7 @@ jobs:
           set -euo pipefail
 
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
-          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed
+          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed,jit
 
       - name: Upload benchmark binaries
         id: upload_artifact

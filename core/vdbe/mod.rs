@@ -32,6 +32,8 @@ pub mod explain;
 #[allow(dead_code)]
 pub mod hash_table;
 pub mod insn;
+#[cfg(feature = "jit")]
+pub(crate) mod jit;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
@@ -871,6 +873,12 @@ pub struct ProgramState {
     /// Keep the error here while index-method writes from earlier rows finish
     /// through the normal resumable I/O path.
     pending_fail_prepare_error: Option<LimboError>,
+    /// Handoff slot for JIT-compiled code: when a JITted instruction produces
+    /// anything but a plain step (a row, I/O, an error), the result is left
+    /// here for the interpreter loop to handle exactly like an interpreted
+    /// instruction result.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_exit_result: Option<Result<execute::InsnFunctionStepResult>>,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
     /// arriving during Halt's resumable work (staging index-method writes,
@@ -979,6 +987,8 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_fail_prepare_error: None,
+            #[cfg(feature = "jit")]
+            jit_exit_result: None,
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
@@ -1129,6 +1139,10 @@ impl ProgramState {
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
+        #[cfg(feature = "jit")]
+        {
+            self.jit_exit_result = None;
+        }
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
@@ -1623,6 +1637,12 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Native code for this program, compiled on demand once the statement
+    /// has interpreted enough instructions to be worth compiling.
+    /// `None` inside the cell means compilation was attempted and the
+    /// program stays interpreted.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_code: std::sync::OnceLock<Option<Arc<jit::JitCode>>>,
 }
 
 #[derive(Clone)]
@@ -1712,7 +1732,7 @@ impl Program {
     }
 
     #[inline]
-    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I) -> bool
+    pub(crate) fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I) -> bool
     where
         I: crate::IO + ?Sized,
     {
@@ -1947,6 +1967,10 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        // Tracing needs to observe every instruction, so it forces the
+        // interpreter even when compiled code exists for this program.
+        #[cfg(feature = "jit")]
+        let use_jit = self.connection.jit_enabled() && !enable_tracing;
         // Invalidate the previous result row once per step call: rows are only
         // handed out between step calls, and ResultRow returns immediately
         // after setting a fresh one.
@@ -1987,7 +2011,7 @@ impl Program {
                 }
                 state.io_completions = None;
             }
-            loop {
+            'insn_loop: loop {
                 if self.connection.is_closed() {
                     // Connection is closed for whatever reason, rollback the transaction.
                     let state = self.connection.get_tx_state();
@@ -2051,52 +2075,76 @@ impl Program {
                         }
                     }
                 }
-                let (insn, _) = &self.insns[state.pc as usize];
-                let insn_function = insn.to_function();
-                if enable_tracing {
-                    trace_insn(self, state.pc as InsnReference, insn);
-                    crate::stack::trace_remaining("program_step:opcode");
-                }
-                if self.connection.get_vdbe_trace() {
-                    // Diff registers from PREVIOUS opcode
-                    // The last opcode (Halt) won't have its diff printed, but Halt
-                    // doesn't write to any registers
-                    if let Some(ref old) = state.pre_op_registers {
-                        for (i, (old_reg, new_reg)) in
-                            old.iter().zip(state.registers.iter()).enumerate()
-                        {
-                            if old_reg != new_reg {
-                                match new_reg {
-                                    Register::Value(v) => eprintln!("R[{i}] = {v}"),
-                                    Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
-                                    Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                #[cfg_attr(not(feature = "jit"), allow(unused_labels))]
+                let step_result = 'step_result: {
+                    // Compiled code runs whole stretches of the program and
+                    // leaves any non-step outcome in `state.jit_exit_result`;
+                    // that outcome is handled by the match below exactly like
+                    // an interpreted instruction result.
+                    #[cfg(feature = "jit")]
+                    if use_jit && !self.connection.get_vdbe_trace() {
+                        if let Some(code) = jit::maybe_jit(self, state) {
+                            match code.run(self, state, pager) {
+                                Some(jit::JitRunResult::Result(result)) => {
+                                    break 'step_result result;
                                 }
+                                // Interrupt or closed connection: re-run the
+                                // loop checks above, which handle both.
+                                Some(jit::JitRunResult::Loop) => continue 'insn_loop,
+                                // PC not covered by the compiled code:
+                                // interpret this instruction.
+                                None => {}
                             }
                         }
-                        state.pre_op_registers = None;
                     }
-
-                    // Print CURRENT opcode
-                    if matches!(insn, Insn::Init { .. }) {
-                        eprintln!("VDBE Trace:");
+                    let (insn, _) = &self.insns[state.pc as usize];
+                    let insn_function = insn.to_function();
+                    if enable_tracing {
+                        trace_insn(self, state.pc as InsnReference, insn);
+                        crate::stack::trace_remaining("program_step:opcode");
                     }
-                    eprintln!(
-                        "{}",
-                        explain::insn_to_str(
-                            self,
-                            state.pc,
-                            insn,
-                            String::new(),
-                            self.explain.comment_at(state.pc)
-                        )
-                    );
-                    // Snapshot for next iteration
-                    state.pre_op_registers = Some(state.registers.clone());
-                }
-                // Always increment VM steps for every loop iteration
-                state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+                    if self.connection.get_vdbe_trace() {
+                        // Diff registers from PREVIOUS opcode
+                        // The last opcode (Halt) won't have its diff printed, but Halt
+                        // doesn't write to any registers
+                        if let Some(ref old) = state.pre_op_registers {
+                            for (i, (old_reg, new_reg)) in
+                                old.iter().zip(state.registers.iter()).enumerate()
+                            {
+                                if old_reg != new_reg {
+                                    match new_reg {
+                                        Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                        Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                        Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                                    }
+                                }
+                            }
+                            state.pre_op_registers = None;
+                        }
 
-                match insn_function(self, state, insn, pager) {
+                        // Print CURRENT opcode
+                        if matches!(insn, Insn::Init { .. }) {
+                            eprintln!("VDBE Trace:");
+                        }
+                        eprintln!(
+                            "{}",
+                            explain::insn_to_str(
+                                self,
+                                state.pc,
+                                insn,
+                                String::new(),
+                                self.explain.comment_at(state.pc)
+                            )
+                        );
+                        // Snapshot for next iteration
+                        state.pre_op_registers = Some(state.registers.clone());
+                    }
+                    // Always increment VM steps for every loop iteration
+                    state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+
+                    insn_function(self, state, insn, pager)
+                };
+                match step_result {
                     Ok(InsnFunctionStepResult::Step) => {
                         // Instruction completed, moving to next
                         state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);

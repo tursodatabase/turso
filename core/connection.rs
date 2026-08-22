@@ -423,6 +423,11 @@ pub struct Connection {
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
+    /// Whether statements on this connection may run JIT-compiled. Defaults
+    /// to the process-wide setting (`TURSO_JIT`); mainly a benchmarking and
+    /// escape hatch. Only consulted when the `jit` feature is compiled in.
+    #[cfg(feature = "jit")]
+    pub(super) jit_enabled: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
     /// PRAGMA count_changes: when ON, each INSERT, UPDATE and DELETE returns
@@ -3882,6 +3887,21 @@ impl Connection {
 
     pub fn set_vdbe_trace(&self, value: bool) {
         self.vdbe_trace.store(value, Ordering::SeqCst);
+    }
+
+    /// Allow or forbid JIT compilation of statements on this connection.
+    /// A no-op unless the `jit` feature is compiled in. Statements already
+    /// running compiled code keep using it; this gates new JIT entries.
+    pub fn set_jit_enabled(&self, value: bool) {
+        #[cfg(feature = "jit")]
+        self.jit_enabled.store(value, Ordering::Relaxed);
+        #[cfg(not(feature = "jit"))]
+        let _ = value;
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_enabled(&self) -> bool {
+        self.jit_enabled.load(Ordering::Relaxed)
     }
 
     pub fn get_vdbe_trace(&self) -> bool {

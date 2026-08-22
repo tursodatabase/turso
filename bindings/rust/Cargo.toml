@@ -18,6 +18,7 @@ mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
 fts = ["turso_sdk_kit/fts"]
 stacker = ["turso_core/stacker"]
+jit = ["turso_core/jit"]
 test_helper = ["turso_core/test_helper"]
 # Test-only: exposes the `memory_yield` VFS for stress/simulator harnesses.
 io_memory_yield = ["turso_core/io_memory_yield"]

@@ -2284,6 +2284,8 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            #[cfg(feature = "jit")]
+            jit_code: std::sync::OnceLock::new(),
         };
         Ok(prepared)
     }

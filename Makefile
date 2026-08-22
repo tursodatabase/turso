@@ -193,7 +193,7 @@ codspeed-build-bench-exclude-tpc-h:
 		echo "No benchmarks found (excluding tpc_h_benchmark)."; \
 		exit 1; \
 	else \
-		cargo codspeed build $$benchmarks --features codspeed; \
+		cargo codspeed build $$benchmarks --features codspeed,jit; \
 	fi
 .PHONY: codspeed-build-bench-exclude-tpc-h
 

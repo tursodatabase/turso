@@ -2372,6 +2372,8 @@ impl Database {
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
+            #[cfg(feature = "jit")]
+            jit_enabled: AtomicBool::new(crate::vdbe::jit::runtime_enabled()),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
             dqs_dml: AtomicBool::new(true),
