@@ -1,0 +1,49 @@
+@database :memory:
+
+# A nested-loop join over a table with no usable index builds an automatic
+# index from the inner table once. When that table was empty, the Rewind that
+# starts the build loop jumped into the loop body instead of past it, so the
+# body ran once on an invalid cursor and inserted a record of NULLs into the
+# automatic index. A NULL-matching seek (`IS NULL`) then found that record and
+# the INNER JOIN produced one NULL-padded row per outer row, as if it were a
+# LEFT JOIN. Found by the differential simulator.
+
+setup outer-rows-empty-inner {
+    CREATE TABLE l(a REAL);
+    CREATE TABLE r(x INTEGER, y BLOB);
+    INSERT INTO l VALUES (1.5), (2.5);
+}
+
+@setup outer-rows-empty-inner
+test inner-join-empty-table-is-null-returns-nothing {
+    SELECT r.y, l.a FROM l INNER JOIN r WHERE r.y IS NULL;
+}
+expect {
+}
+
+@setup outer-rows-empty-inner
+test inner-join-empty-table-is-null-count-is-zero {
+    SELECT count(*) FROM l INNER JOIN r WHERE r.y IS NULL;
+}
+expect {
+    0
+}
+
+@setup outer-rows-empty-inner
+test inner-join-emptied-table-is-null-returns-nothing {
+    INSERT INTO r VALUES (1, X'01'), (2, NULL);
+    DELETE FROM r;
+    SELECT r.y, l.a FROM l INNER JOIN r WHERE r.y IS NULL;
+}
+expect {
+}
+
+@setup outer-rows-empty-inner
+test inner-join-is-null-matches-real-null-rows {
+    INSERT INTO r VALUES (1, X'01'), (2, NULL);
+    SELECT r.x, l.a FROM l INNER JOIN r WHERE r.y IS NULL ORDER BY l.a;
+}
+expect {
+    2|1.5
+    2|2.5
+}

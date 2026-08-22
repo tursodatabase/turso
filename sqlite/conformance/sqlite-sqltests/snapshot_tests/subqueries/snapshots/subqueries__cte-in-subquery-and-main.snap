@@ -134,7 +134,7 @@ addr  opcode                             p1   p2   p3  p4              p5  comme
   99    Le                               40   41  123  Binary           0  if r[40]<=r[41] goto 123
  100    Once                            109    0    0                   0  goto 109
  101    OpenAutoindex                     6    0    0                   0  cursor=6
- 102    Rewind                            2  103    0                   0  Rewind  ephemeral()
+ 102    Rewind                            2  109    0                   0  Rewind  ephemeral()
  103      ColumnRange                     2    0   44  2                0  r[44..45]=ephemeral().category_id..avg_price
  104      RowId                           2   46    0                   0  r[46]=ephemeral().rowid
  105      MakeRecord                     44    3   47                   0  r[47]=mkrec(r[44..46]); for ephemeral_subquery_t5
