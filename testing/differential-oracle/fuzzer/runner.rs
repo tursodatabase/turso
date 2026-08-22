@@ -216,6 +216,9 @@ pub struct SimConfig {
     pub reopen_probability: f64,
     /// Probability that a write that passed the check runs again unchanged.
     pub redundant_dml_probability: f64,
+    /// Probability that a step writes an existing row of a table that a
+    /// materialized view reads back with its own values.
+    pub row_rewrite_probability: f64,
 }
 
 impl Default for SimConfig {
@@ -240,6 +243,7 @@ impl Default for SimConfig {
             max_batch_size: 10,
             reopen_probability: 0.0,
             redundant_dml_probability: 0.0,
+            row_rewrite_probability: 0.0,
         }
     }
 }
@@ -265,6 +269,8 @@ pub struct SimStats {
     pub reopens: usize,
     /// Writes that ran a second time.
     pub repeats: usize,
+    /// Steps that wrote an existing row back with its own values.
+    pub row_rewrites: usize,
 }
 
 impl SimStats {
@@ -358,6 +364,10 @@ impl SimStats {
             Cell::new("Repeated writes").fg(Color::Blue),
             Cell::new(self.repeats).fg(Color::Blue),
         ]);
+        table.add_row(vec![
+            Cell::new("Row rewrites").fg(Color::Blue),
+            Cell::new(self.row_rewrites).fg(Color::Blue),
+        ]);
 
         table
     }
@@ -391,6 +401,10 @@ enum Step {
     /// Non-DDL statements run inside BEGIN ... COMMIT.
     Batch(Vec<GeneratedStatement>),
     Reopen,
+    RewriteRow {
+        table: String,
+        delete_other_rows_first: bool,
+    },
 }
 
 impl RefUnwindSafe for Fuzzer {}
@@ -689,6 +703,15 @@ impl Fuzzer {
         if self.roll(self.config.reopen_probability) {
             return Ok(Step::Reopen);
         }
+        if self.roll(self.config.row_rewrite_probability) {
+            let tables = self.tables_read_by_matviews(schema, matviews);
+            if !tables.is_empty() {
+                return Ok(Step::RewriteRow {
+                    table: tables[self.below(tables.len())].clone(),
+                    delete_other_rows_first: self.roll(0.5),
+                });
+            }
+        }
         let first = match pending.take() {
             Some(generated) => generated,
             None => generator.generate(schema, matviews)?,
@@ -744,7 +767,119 @@ impl Fuzzer {
             }
             Step::Batch(stmts) => self.run_batch(i, stmts, schema, matviews, stats, executed_sql),
             Step::Reopen => self.reopen(schema, matviews, stats, executed_sql),
+            Step::RewriteRow {
+                table,
+                delete_other_rows_first,
+            } => self.rewrite_row(
+                i,
+                table,
+                *delete_other_rows_first,
+                schema,
+                matviews,
+                stats,
+                executed_sql,
+            ),
         }
+    }
+
+    /// Main-database tables whose name appears in the SQL of a live materialized view.
+    fn tables_read_by_matviews(
+        &self,
+        schema: &sql_gen::Schema,
+        matviews: &Matviews,
+    ) -> Vec<String> {
+        let view_sql: Vec<String> = matviews
+            .keys()
+            .map(|name| {
+                self.sqlite_conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?1",
+                        [name],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_else(|e| panic!("view {name} is missing on SQLite: {e}"))
+            })
+            .collect();
+        schema
+            .tables
+            .iter()
+            .filter(|table| {
+                table.database.is_none()
+                    && view_sql.iter().any(|sql| {
+                        sql.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .any(|word| word.eq_ignore_ascii_case(&table.name))
+                    })
+            })
+            .map(|table| table.name.clone())
+            .collect()
+    }
+
+    /// Write one existing row back at its own rowid with its own values, so
+    /// the statement deletes the row and inserts it again. Deleting all other
+    /// rows first reaches a table that holds one row, which generated writes
+    /// rarely leave behind.
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_row(
+        &self,
+        i: usize,
+        table: &str,
+        delete_other_rows_first: bool,
+        schema: &mut sql_gen::Schema,
+        matviews: &mut Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        stats.row_rewrites += 1;
+        executed_sql.push("-- REWRITE ROW".to_string());
+        if delete_other_rows_first {
+            let delete = rewrite_statement(format!(
+                "DELETE FROM {table} WHERE rowid != (SELECT min(rowid) FROM {table})"
+            ));
+            self.current_sql.borrow_mut().clone_from(&delete.sql);
+            self.run_statement(i, &delete, schema, matviews, stats, executed_sql)?;
+        }
+        let columns: Vec<String> = schema
+            .tables
+            .iter()
+            .find(|t| t.name == table && t.database.is_none())
+            .unwrap_or_else(|| panic!("table {table} is not in the schema"))
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.name))
+            .collect();
+        let rows = self.sqlite_quoted_rows(table, &columns)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let row = &rows[self.below(rows.len())];
+        let verb = if self.roll(0.5) {
+            "INSERT OR REPLACE"
+        } else {
+            "REPLACE"
+        };
+        let rewrite = rewrite_statement(format!(
+            "{verb} INTO {table}(rowid, {}) VALUES ({})",
+            columns.join(", "),
+            row.join(", ")
+        ));
+        self.current_sql.borrow_mut().clone_from(&rewrite.sql);
+        self.run_statement(i, &rewrite, schema, matviews, stats, executed_sql)
+    }
+
+    /// Every row of `table` on SQLite as SQL literals: the rowid, then `columns`.
+    fn sqlite_quoted_rows(&self, table: &str, columns: &[String]) -> Result<Vec<Vec<String>>> {
+        let quoted: Vec<String> = std::iter::once("rowid")
+            .chain(columns.iter().map(String::as_str))
+            .map(|c| format!("quote({c})"))
+            .collect();
+        let sql = format!("SELECT {} FROM {table} ORDER BY rowid", quoted.join(", "));
+        let mut stmt = self.sqlite_conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            (0..quoted.len())
+                .map(|c| row.get::<_, String>(c))
+                .collect::<rusqlite::Result<Vec<String>>>()
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     fn run_batch(
@@ -1335,6 +1470,17 @@ impl Fuzzer {
 
 /// Open the Turso database file in `io` and attach an in-memory `aux` database,
 /// as SQLite has one.
+fn rewrite_statement(sql: String) -> GeneratedStatement {
+    GeneratedStatement {
+        sql,
+        is_ddl: false,
+        mutates_data: true,
+        has_unordered_limit: false,
+        unordered_limit_reason: None,
+        check_unnesting_invariant: false,
+    }
+}
+
 fn open_turso(
     io: &Arc<MemorySimIO>,
     out_dir: &std::path::Path,
@@ -1401,6 +1547,7 @@ mod tests {
             max_batch_size: 10,
             reopen_probability: 0.0,
             redundant_dml_probability: 0.0,
+            row_rewrite_probability: 0.0,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
@@ -1724,6 +1871,114 @@ mod tests {
         assert!(err.starts_with("Matview data mismatch in 'v'"), "{err}");
         assert!(err.contains("SQLite integrity check failed"), "{err}");
         assert_eq!(stats.oracle_failures, 2);
+    }
+
+    #[test]
+    fn a_row_rewrite_in_a_one_row_table_leaves_the_view_equal_to_sqlite() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = matview_over_every_row_of_t(&fuzzer, &mut executed_sql);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+
+        fuzzer
+            .run_step(
+                0,
+                &Step::RewriteRow {
+                    table: "t".to_string(),
+                    delete_other_rows_first: true,
+                },
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap();
+
+        let tail = &executed_sql[executed_sql.len() - 3..];
+        assert_eq!(tail[0], "-- REWRITE ROW");
+        assert_eq!(
+            tail[1],
+            "DELETE FROM t WHERE rowid != (SELECT min(rowid) FROM t)"
+        );
+        assert!(
+            tail[2].ends_with(r#"REPLACE INTO t(rowid, "a", "b") VALUES (1, 1, 'x')"#),
+            "{}",
+            tail[2]
+        );
+        assert_eq!(stats.row_rewrites, 1);
+        assert_eq!(stats.oracle_failures, 0);
+    }
+
+    #[test]
+    fn a_row_rewrite_without_the_delete_keeps_every_row() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = matview_over_every_row_of_t(&fuzzer, &mut executed_sql);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+
+        fuzzer
+            .run_step(
+                0,
+                &Step::RewriteRow {
+                    table: "t".to_string(),
+                    delete_other_rows_first: false,
+                },
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap();
+
+        assert!(!executed_sql.iter().any(|sql| sql.starts_with("DELETE")));
+        let count: i64 = fuzzer
+            .sqlite_conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(stats.oracle_failures, 0);
+    }
+
+    #[test]
+    fn only_tables_that_a_materialized_view_names_are_rewritten() {
+        let fuzzer = matview_fuzzer();
+        let mut executed_sql = Vec::new();
+        let matviews = matview_over_every_row_of_t(&fuzzer, &mut executed_sql);
+        for sql in ["CREATE TABLE tt(a INTEGER)", "CREATE TABLE u(a INTEGER)"] {
+            let (turso, sqlite) = fuzzer.execute_on_both(sql, &mut executed_sql);
+            assert!(!matches!(turso, QueryResult::Error(_)), "{turso:?}");
+            assert!(!matches!(sqlite, QueryResult::Error(_)), "{sqlite:?}");
+        }
+        let schema = fuzzer.introspect_and_verify_schemas().unwrap();
+
+        assert_eq!(fuzzer.tables_read_by_matviews(&schema, &matviews), ["t"]);
+    }
+
+    fn matview_over_every_row_of_t(fuzzer: &Fuzzer, executed_sql: &mut Vec<String>) -> Matviews {
+        for sql in [
+            "CREATE TABLE t(a INTEGER, b TEXT)",
+            "INSERT INTO t VALUES (1, 'x'), (2, 'y')",
+        ] {
+            let (turso, sqlite) = fuzzer.execute_on_both(sql, executed_sql);
+            assert!(!matches!(turso, QueryResult::Error(_)), "{turso:?}");
+            assert!(!matches!(sqlite, QueryResult::Error(_)), "{sqlite:?}");
+        }
+        let select = "SELECT a, b FROM t";
+        fuzzer
+            .turso_conn()
+            .execute(format!("CREATE MATERIALIZED VIEW v AS {select}"))
+            .unwrap();
+        fuzzer
+            .sqlite_conn
+            .execute(&format!("CREATE VIEW v AS {select}"), [])
+            .unwrap();
+        Matviews::from([(
+            "v".to_string(),
+            vec![
+                sql_gen_prop::ColumnDef::new("a", sql_gen_prop::DataType::Integer),
+                sql_gen_prop::ColumnDef::new("b", sql_gen_prop::DataType::Text),
+            ],
+        )])
     }
 
     #[test]
