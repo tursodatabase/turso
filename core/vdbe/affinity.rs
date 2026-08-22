@@ -610,7 +610,9 @@ fn create_result_from_significand(
 }
 
 pub fn is_space(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+    // Matches SQLite's ctype table (0x09-0x0D, 0x20), which includes 0x0B
+    // (vertical tab) unlike Rust's is_ascii_whitespace().
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
 }
 
 pub(crate) fn real_to_i64(r: f64) -> i64 {
@@ -741,6 +743,19 @@ mod tests {
         let val = Value::Text("0".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
         assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(0))));
+    }
+
+    #[test]
+    fn test_apply_numeric_affinity_vertical_tab() {
+        // vertical tab (0x0B) is whitespace to SQLite, unlike Rust's
+        // is_ascii_whitespace(). https://github.com/tursodatabase/turso/issues/8454
+        let val = Value::Text("\x0b12".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(12))));
+
+        let val = Value::Text("12\x0b".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(12))));
     }
 
     #[test]

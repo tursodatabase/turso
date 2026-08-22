@@ -1260,14 +1260,18 @@ pub fn decode_percent(uri: &str) -> String {
 }
 
 pub fn trim_ascii_whitespace(s: &str) -> &str {
+    // SQLite's ctype table treats 0x0B (vertical tab) as whitespace, unlike
+    // Rust's is_ascii_whitespace() which follows the WHATWG definition and
+    // excludes it. Match SQLite here.
+    let is_space = |b: u8| b.is_ascii_whitespace() || b == b'\x0b';
     let bytes = s.as_bytes();
     let start = bytes
         .iter()
-        .position(|&b| !b.is_ascii_whitespace())
+        .position(|&b| !is_space(b))
         .unwrap_or(bytes.len());
     let end = bytes
         .iter()
-        .rposition(|&b| !b.is_ascii_whitespace())
+        .rposition(|&b| !is_space(b))
         .map(|i| i + 1)
         .unwrap_or(0);
     if start <= end {
@@ -6230,6 +6234,16 @@ pub mod tests {
             checked_cast_text_to_numeric("123xxx", false).unwrap(),
             Value::from_i64(123)
         );
+        // vertical tab (0x0B) is whitespace to SQLite, unlike Rust's
+        // is_ascii_whitespace(). https://github.com/tursodatabase/turso/issues/8454
+        assert_eq!(
+            checked_cast_text_to_numeric("\x0b12", false).unwrap(),
+            Value::from_i64(12)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("12\x0b", false).unwrap(),
+            Value::from_i64(12)
+        );
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775807", false).unwrap(),
             Value::from_i64(i64::MAX)
@@ -6768,6 +6782,10 @@ pub mod tests {
         assert_eq!(trim_ascii_whitespace("hello"), "hello");
         assert_eq!(trim_ascii_whitespace("   "), "");
         assert_eq!(trim_ascii_whitespace(""), "");
+
+        // vertical tab (0x0B) is whitespace to SQLite's ctype table, unlike
+        // Rust's is_ascii_whitespace(). https://github.com/tursodatabase/turso/issues/8454
+        assert_eq!(trim_ascii_whitespace("\x0bhello\x0b"), "hello");
 
         // non-breaking space should NOT be trimmed
         assert_eq!(

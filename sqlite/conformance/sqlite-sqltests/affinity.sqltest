@@ -467,6 +467,41 @@ expect {
     text|3
 }
 
+# ============================================
+# Vertical tab (0x0B) is whitespace to SQLite's ctype table (0x09-0x0D)
+# even though it is not "ASCII whitespace" per Rust's is_ascii_whitespace().
+# https://github.com/tursodatabase/turso/issues/8454
+# ============================================
+@cross-check-integrity
+test affinity-vertical-tab-leading {
+    CREATE TABLE t1(i INTEGER);
+    INSERT INTO t1 VALUES (CHAR(11) || '12');
+    SELECT TYPEOF(i), i = 12 FROM t1;
+}
+expect {
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-vertical-tab-trailing {
+    CREATE TABLE t1(i INTEGER);
+    INSERT INTO t1 VALUES ('12' || CHAR(11));
+    SELECT TYPEOF(i), i = 12 FROM t1;
+}
+expect {
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-vertical-tab-integer-primary-key {
+    CREATE TABLE t1(i INTEGER PRIMARY KEY);
+    INSERT INTO t1 VALUES (CHAR(11) || '12');
+    SELECT COUNT(*), TYPEOF(i), i FROM t1;
+}
+expect {
+    1|integer|12
+}
+
 
 # ============================================
 # REAL affinity with leading + sign
@@ -560,6 +595,18 @@ expect {
     1.0e+100|real
     2251799813685247|integer
     2.25179981368525e+15|real
+}
+
+@cross-check-integrity
+test cast-text-to-numeric-vertical-tab {
+    SELECT CAST(CHAR(11) || '12' AS NUMERIC);
+    SELECT CAST('12' || CHAR(11) AS NUMERIC);
+    SELECT CAST(CHAR(9) || '12' AS NUMERIC);
+}
+expect {
+    12
+    12
+    12
 }
 expect @js {
     3|integer

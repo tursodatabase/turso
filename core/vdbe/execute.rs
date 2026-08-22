@@ -19418,6 +19418,8 @@ mod tests {
             ("\t42\t", 42i64),         // tab
             ("\n99\n", 99i64),         // newline
             (" \t\n123\r\n ", 123i64), // mixed ASCII whitespace
+            ("\x0b12", 12i64),         // leading vertical tab (0x0B)
+            ("12\x0b", 12i64),         // trailing vertical tab (0x0B)
         ];
 
         for (input, expected_int) in ascii_whitespace_cases {
