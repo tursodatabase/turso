@@ -1915,6 +1915,8 @@ pub enum PragmaName {
     PageCount,
     /// Return the page size of the database in bytes.
     PageSize,
+    /// Max pages a scan may read ahead of the cursor. 0 disables readahead.
+    PrefetchPages,
     /// make connection query only
     QueryOnly,
     /// Returns schema version of the database file.

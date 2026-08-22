@@ -211,6 +211,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["cache_spill"],
         ),
+        PragmaName::PrefetchPages => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["prefetch_pages"],
+        ),
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
