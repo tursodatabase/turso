@@ -29,7 +29,7 @@ use crate::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
             },
             cost::RowCountEstimate,
-            multi_index::MultiIndexBranchAccessParams,
+            multi_index::{MultiIndexAndTermsMemo, MultiIndexBranchAccessParams},
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
@@ -2469,9 +2469,11 @@ fn find_table_access_plan(
         &mut constraints_per_table,
     )?;
 
+    let and_terms_memo = MultiIndexAndTermsMemo::new(table_references.joined_tables().len());
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
+        and_terms_memo: &and_terms_memo,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
