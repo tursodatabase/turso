@@ -45,7 +45,8 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use strum::EnumCount;
 
-use crate::vdbe::execute::{InsnFunction, InsnFunctionStepResult};
+use crate::alloc::TryClone;
+use crate::vdbe::execute::{self, InsnFunction, InsnFunctionStepResult};
 use crate::vdbe::insn::{Insn, InsnVariants};
 use crate::vdbe::{BranchOffset, Program, ProgramState};
 use crate::{Pager, Result};
@@ -60,6 +61,21 @@ const JIT_EXIT_RESULT: u32 = 1;
 /// requested, connection closed, or a PC the compiled code cannot enter).
 const JIT_EXIT_LOOP: u32 = 2;
 
+/// A clonable atomic execution counter for [`PreparedProgram`]; a clone
+/// starts from the current count.
+///
+/// [`PreparedProgram`]: crate::vdbe::PreparedProgram
+#[derive(Debug, Default)]
+pub struct ExecutionCounter(pub std::sync::atomic::AtomicU32);
+
+impl Clone for ExecutionCounter {
+    fn clone(&self) -> Self {
+        Self(std::sync::atomic::AtomicU32::new(
+            self.0.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+}
+
 /// What `JitCode::run` tells the interpreter loop to do next.
 pub enum JitRunResult {
     /// A step result was produced; handle it like an interpreted instruction.
@@ -71,11 +87,27 @@ pub enum JitRunResult {
 
 pub struct JitConfig {
     enabled: bool,
-    /// Number of interpreted VM steps before a statement is compiled.
+    /// Minimum interpreted VM steps before a statement may be compiled.
+    /// 0 forces compilation on the first step, bypassing every other
+    /// gate below (used by tests).
     threshold: u64,
-    /// Programs with more instructions than this are never compiled.
+    /// Programs with more instructions than this are never compiled;
+    /// cranelift compile time grows superlinearly with function size, and
+    /// huge programs are usually straight-line multi-row DML where dispatch
+    /// overhead is irrelevant anyway.
     max_insns: usize,
 }
+
+/// Compile only once the current execution alone is this long: such a
+/// statement keeps a compile worthwhile even if it is never run again.
+const MIN_SINGLE_EXECUTION_STEPS: u64 = 1_000_000;
+/// Alternatively, compile once the same prepared program has completed this
+/// many executions: reuse amortizes the compile even for shorter statements.
+const MIN_COMPLETED_EXECUTIONS: u32 = 4;
+/// And in either case, require the program to have executed this many steps
+/// per instruction over its lifetime, so straight-line programs that visit
+/// each instruction a handful of times never compile.
+const MIN_STEPS_PER_INSN: u64 = 64;
 
 fn config() -> &'static JitConfig {
     static CONFIG: OnceLock<JitConfig> = OnceLock::new();
@@ -90,7 +122,7 @@ fn config() -> &'static JitConfig {
         let max_insns = std::env::var("TURSO_JIT_MAX_INSNS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000);
+            .unwrap_or(2_000);
         JitConfig {
             enabled,
             threshold,
@@ -107,14 +139,42 @@ pub fn runtime_enabled() -> bool {
 
 /// Returns the compiled code for this program if it is available or worth
 /// producing now. Called from the interpreter loop.
+///
+/// Compilation costs whole milliseconds, so it must provably amortize:
+/// either the current execution alone is long enough to repay it (a big
+/// scan/aggregation), or the same prepared program keeps being re-executed.
+/// One-shot statements — even huge ones like multi-row inserts — stay on
+/// the interpreter, where the per-instruction overhead they would save is
+/// dwarfed by the compile they would pay.
 #[inline]
-pub fn maybe_jit<'a>(program: &'a Program, state: &ProgramState) -> Option<&'a JitCode> {
-    let slot = &program.prepared().jit_code;
+pub fn maybe_jit<'a>(program: &'a Program, state: &mut ProgramState) -> Option<&'a JitCode> {
+    let prepared = program.prepared();
+    let slot = &prepared.jit_code;
     if let Some(compiled) = slot.get() {
         return compiled.as_deref();
     }
-    if state.metrics.vm_steps < config().threshold {
+    let lifetime_steps = state.metrics.vm_steps;
+    // Covers both the base threshold and the retry backoff below, so the
+    // common not-yet-hot case is a single compare.
+    if lifetime_steps < state.jit_next_compile_check.max(config().threshold) {
         return None;
+    }
+    if config().threshold != 0 {
+        let current_execution_steps =
+            lifetime_steps.saturating_sub(state.jit_steps_at_execution_start);
+        let reused = prepared
+            .jit_completed_executions
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= MIN_COMPLETED_EXECUTIONS;
+        let insn_count = prepared.insns.len() as u64;
+        if (current_execution_steps < MIN_SINGLE_EXECUTION_STEPS && !reused)
+            || lifetime_steps < insn_count.saturating_mul(MIN_STEPS_PER_INSN)
+        {
+            // Not worth compiling yet; don't re-evaluate every instruction.
+            state.jit_next_compile_check = lifetime_steps + (lifetime_steps / 2).max(8_192);
+            return None;
+        }
     }
     slot.get_or_init(|| compile(program).map(Arc::new))
         .as_deref()
@@ -317,6 +377,338 @@ extern "C-unwind" fn check_interrupt_wrapper(
         program.connection.is_closed() || program.maybe_request_interrupt(state, pager.io.as_ref());
     u32::from(interrupted)
 }
+
+/// Specialized helpers: slimmer entry points for the hottest simple opcodes.
+/// The JIT bakes the instruction's operands in as immediate arguments, so
+/// these skip the generic wrapper's instruction pointer load and the opcode's
+/// `load_insn!` destructuring, and they report taken/not-taken branches
+/// through their return code so the generated code can branch natively
+/// instead of re-reading `state.pc`.
+///
+/// Helpers never touch `state.pc`; the generated code stores the
+/// instruction's pc before every call so opcodes and error paths observe the
+/// same program state as under the interpreter.
+///
+/// Return codes: see SPEC_FALL / SPEC_JUMP / SPEC_RESULT.
+type SpecHelperFn = extern "C-unwind" fn(*const Program, *mut ProgramState, u64, u64, u64) -> u32;
+
+/// The instruction completed and control falls through to pc + 1.
+const SPEC_FALL: u32 = 0;
+/// The instruction completed and control goes to its static branch target.
+const SPEC_JUMP: u32 = 1;
+/// A result (an error) was stored in `state.jit_exit_result`.
+const SPEC_RESULT: u32 = 2;
+
+/// How the generated code should call an instruction's specialized helper.
+/// `name` must be registered in [`SPEC_HELPERS`].
+struct SpecCall {
+    name: &'static str,
+    args: [u64; 3],
+    /// Static branch target for helpers that can return SPEC_JUMP.
+    jump_target: Option<u32>,
+}
+
+/// Mirrors the interpreter loop: every attempt counts as a VM step.
+#[inline(always)]
+fn spec_count_attempt(state: &mut ProgramState) {
+    state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+}
+
+/// Mirrors the interpreter loop's Step arm: the instruction completed.
+#[inline(always)]
+fn spec_completed(state: &mut ProgramState, code: u32) -> u32 {
+    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+    code
+}
+
+/// Store an error outcome for the interpreter loop, mirroring the generic
+/// wrapper's non-Step handling (the interpreter arm does not count
+/// completed instructions for errors).
+#[inline(never)]
+fn spec_store_error(state: &mut ProgramState, err: crate::LimboError) -> u32 {
+    state.jit_exit_result = Some(Err(err));
+    SPEC_RESULT
+}
+
+/// `Insn::Integer`: r[dest] = value.
+extern "C-unwind" fn spec_integer(
+    _program: *const Program,
+    state: *mut ProgramState,
+    value: u64,
+    dest: u64,
+    _c: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    state.registers[dest as usize].set_int(value as i64);
+    spec_completed(state, SPEC_FALL)
+}
+
+/// `Insn::Copy`: r[dst..=dst+extra] = r[src..=src+extra] (clones).
+extern "C-unwind" fn spec_copy(
+    _program: *const Program,
+    state: *mut ProgramState,
+    src_reg: u64,
+    dst_reg: u64,
+    extra_amount: u64,
+) -> u32 {
+    use crate::types::Value;
+    use crate::vdbe::Register;
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    for i in 0..=extra_amount as usize {
+        let (src, dst) = (src_reg as usize + i, dst_reg as usize + i);
+        if src == dst {
+            continue;
+        }
+        let [src, dst] = state
+            .registers
+            .get_disjoint_mut([src, dst])
+            .expect("Copy source and destination registers are distinct");
+        // Cloning a numeric into a register that owns no allocation is a
+        // plain copy; everything else goes through the allocation-reusing
+        // clone the interpreter opcode uses.
+        if let (
+            Register::Value(src_val @ (Value::Numeric(_) | Value::Null)),
+            Register::Value(dst_val @ (Value::Numeric(_) | Value::Null)),
+        ) = (&*src, &mut *dst)
+        {
+            *dst_val = match src_val {
+                Value::Numeric(n) => Value::Numeric(*n),
+                _ => Value::Null,
+            };
+        } else if let Err(err) = dst.try_clone_from(src) {
+            return spec_store_error(state, err.into());
+        }
+    }
+    spec_completed(state, SPEC_FALL)
+}
+
+/// `Insn::Move`: r[dest..dest+count] = r[source..source+count], sources
+/// become NULL.
+extern "C-unwind" fn spec_move(
+    _program: *const Program,
+    state: *mut ProgramState,
+    source_reg: u64,
+    dest_reg: u64,
+    count: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    for i in 0..count as usize {
+        state.registers[dest_reg as usize + i] = std::mem::replace(
+            &mut state.registers[source_reg as usize + i],
+            crate::vdbe::Register::Value(crate::types::Value::Null),
+        );
+    }
+    spec_completed(state, SPEC_FALL)
+}
+
+macro_rules! spec_arith {
+    ($name:ident, $exec:ident) => {
+        /// Arithmetic: r[dest] = r[lhs] op r[rhs] via the shared exec
+        /// primitive the interpreter opcode uses.
+        extern "C-unwind" fn $name(
+            _program: *const Program,
+            state: *mut ProgramState,
+            lhs: u64,
+            rhs: u64,
+            dest: u64,
+        ) -> u32 {
+            let state = unsafe { &mut *state };
+            spec_count_attempt(state);
+            state.registers[dest as usize].set_value(
+                state.registers[lhs as usize]
+                    .get_value()
+                    .$exec(state.registers[rhs as usize].get_value()),
+            );
+            spec_completed(state, SPEC_FALL)
+        }
+    };
+}
+
+spec_arith!(spec_add, exec_add);
+spec_arith!(spec_subtract, exec_subtract);
+spec_arith!(spec_multiply, exec_multiply);
+
+/// `Insn::If` / `Insn::IfNot`: branch on the truthiness of r[reg].
+extern "C-unwind" fn spec_if(
+    _program: *const Program,
+    state: *mut ProgramState,
+    reg: u64,
+    jump_if_null: u64,
+    negate: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let jump = state.registers[reg as usize]
+        .get_value()
+        .exec_if(jump_if_null != 0, negate != 0);
+    spec_completed(state, if jump { SPEC_JUMP } else { SPEC_FALL })
+}
+
+/// `Insn::IfPos`: if r[reg] > 0 { r[reg] -= decrement_by; jump }.
+extern "C-unwind" fn spec_if_pos(
+    _program: *const Program,
+    state: *mut ProgramState,
+    reg: u64,
+    decrement_by: u64,
+    _c: u64,
+) -> u32 {
+    use crate::numeric::Numeric;
+    use crate::types::Value;
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    match state.registers[reg as usize].get_value() {
+        Value::Numeric(Numeric::Integer(n)) if *n > 0 => {
+            let n = *n;
+            state.registers[reg as usize].set_int(n - decrement_by as i64);
+            spec_completed(state, SPEC_JUMP)
+        }
+        Value::Numeric(Numeric::Integer(_)) => spec_completed(state, SPEC_FALL),
+        _ => spec_store_error(
+            state,
+            crate::LimboError::InternalError(
+                "IfPos: the value in the register is not an integer".into(),
+            ),
+        ),
+    }
+}
+
+/// `Insn::AggStep`: forwards to the shared implementation with the payload
+/// pointer baked in, skipping instruction decode. The payload lives in the
+/// program's instruction array, which outlives the compiled code.
+extern "C-unwind" fn spec_agg_step(
+    program: *const Program,
+    state: *mut ProgramState,
+    data: u64,
+    _b: u64,
+    _c: u64,
+) -> u32 {
+    let program = unsafe { &*program };
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let data = unsafe { &*(data as usize as *const crate::vdbe::insn::AggStepData) };
+    match execute::agg_step_impl(program, state, data) {
+        Ok(InsnFunctionStepResult::Step) => spec_completed(state, SPEC_FALL),
+        other => {
+            state.jit_exit_result = Some(other);
+            SPEC_RESULT
+        }
+    }
+}
+
+/// Chooses a specialized helper for an instruction, or None to use the
+/// generic wrapper. Only instructions whose full semantics the helpers
+/// reproduce may be specialized; branch targets must be resolved offsets and
+/// in bounds, and fall-through must stay in bounds.
+fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
+    let fall_ok = (pc as usize + 1) < insn_count;
+    let target_of = |b: &BranchOffset| -> Option<u32> {
+        match b {
+            BranchOffset::Offset(o) if (*o as usize) < insn_count => Some(*o),
+            _ => None,
+        }
+    };
+    debug_assert!(
+        SPEC_HELPERS.len() == 9,
+        "keep SPEC_HELPERS in sync with specialize()"
+    );
+    let spec = match insn {
+        Insn::Integer { value, dest } if fall_ok => SpecCall {
+            name: "spec_integer",
+            args: [*value as u64, *dest as u64, 0],
+            jump_target: None,
+        },
+        Insn::Copy {
+            src_reg,
+            dst_reg,
+            extra_amount,
+        } if fall_ok => SpecCall {
+            name: "spec_copy",
+            args: [*src_reg as u64, *dst_reg as u64, *extra_amount as u64],
+            jump_target: None,
+        },
+        Insn::Move {
+            source_reg,
+            dest_reg,
+            count,
+        } if fall_ok => SpecCall {
+            name: "spec_move",
+            args: [*source_reg as u64, *dest_reg as u64, *count as u64],
+            jump_target: None,
+        },
+        Insn::Add { lhs, rhs, dest } if fall_ok => SpecCall {
+            name: "spec_add",
+            args: [*lhs as u64, *rhs as u64, *dest as u64],
+            jump_target: None,
+        },
+        Insn::Subtract { lhs, rhs, dest } if fall_ok => SpecCall {
+            name: "spec_subtract",
+            args: [*lhs as u64, *rhs as u64, *dest as u64],
+            jump_target: None,
+        },
+        Insn::Multiply { lhs, rhs, dest } if fall_ok => SpecCall {
+            name: "spec_multiply",
+            args: [*lhs as u64, *rhs as u64, *dest as u64],
+            jump_target: None,
+        },
+        Insn::If {
+            reg,
+            target_pc,
+            jump_if_null,
+        } if fall_ok => SpecCall {
+            name: "spec_if",
+            args: [*reg as u64, u64::from(*jump_if_null), 0],
+            jump_target: Some(target_of(target_pc)?),
+        },
+        Insn::IfNot {
+            reg,
+            target_pc,
+            jump_if_null,
+        } if fall_ok => SpecCall {
+            name: "spec_if",
+            args: [*reg as u64, u64::from(*jump_if_null), 1],
+            jump_target: Some(target_of(target_pc)?),
+        },
+        Insn::IfPos {
+            reg,
+            target_pc,
+            decrement_by,
+        } if fall_ok => SpecCall {
+            name: "spec_if_pos",
+            args: [*reg as u64, *decrement_by as u64, 0],
+            jump_target: Some(target_of(target_pc)?),
+        },
+        Insn::AggStep { data } if fall_ok => {
+            // Window functions route through different state handling; keep
+            // them on the generic path.
+            if matches!(data.func, crate::function::AccumulatorFunc::Window(_)) {
+                return None;
+            }
+            SpecCall {
+                name: "spec_agg_step",
+                args: [data.as_ref() as *const _ as usize as u64, 0, 0],
+                jump_target: None,
+            }
+        }
+        _ => return None,
+    };
+    Some(spec)
+}
+
+/// All specialized helpers, for symbol registration.
+const SPEC_HELPERS: &[(&str, SpecHelperFn)] = &[
+    ("spec_integer", spec_integer),
+    ("spec_copy", spec_copy),
+    ("spec_move", spec_move),
+    ("spec_add", spec_add),
+    ("spec_subtract", spec_subtract),
+    ("spec_multiply", spec_multiply),
+    ("spec_if", spec_if),
+    ("spec_if_pos", spec_if_pos),
+    ("spec_agg_step", spec_agg_step),
+];
 
 /// Panics when called from generated code; used by the unwind test below.
 #[cfg(test)]
@@ -561,6 +953,9 @@ fn make_module() -> Option<(JITModule, cranelift_codegen::isa::CallConv, OwnedIs
     // Needed to build the .eh_frame that lets panics unwind through
     // generated frames.
     flag_builder.set("unwind_info", "true").ok()?;
+    // The IR verifier is a compiler-development tool and costs a double-digit
+    // share of compile time.
+    flag_builder.set("enable_verifier", "false").ok()?;
     let isa_builder = cranelift_native::builder().ok()?;
     let isa = isa_builder
         .finish(settings::Flags::new(flag_builder))
@@ -570,6 +965,9 @@ fn make_module() -> Option<(JITModule, cranelift_codegen::isa::CallConv, OwnedIs
     builder.symbol("check_interrupt", check_interrupt_wrapper as *const u8);
     for (i, wrapper) in INSN_WRAPPERS.iter().enumerate() {
         builder.symbol(format!("insn_wrapper_{i}"), *wrapper as *const u8);
+    }
+    for (name, helper) in SPEC_HELPERS {
+        builder.symbol(*name, *helper as *const u8);
     }
     Some((JITModule::new(builder), call_conv, isa))
 }
@@ -632,6 +1030,32 @@ pub fn compile(program: &Program) -> Option<JitCode> {
     let check_id = module
         .declare_function("check_interrupt", Linkage::Import, &check_sig)
         .ok()?;
+
+    let mut spec_sig = module.make_signature();
+    spec_sig.call_conv = call_conv;
+    spec_sig.params.push(AbiParam::new(ptr_type));
+    spec_sig.params.push(AbiParam::new(ptr_type));
+    for _ in 0..3 {
+        spec_sig.params.push(AbiParam::new(types::I64));
+    }
+    spec_sig.returns.push(AbiParam::new(types::I32));
+
+    // Pick specialized helpers up front and declare the ones in use.
+    let specs: Vec<Option<SpecCall>> = insns
+        .iter()
+        .enumerate()
+        .map(|(pc, (insn, _))| specialize(insn, pc as u32, insns.len()))
+        .collect();
+    let mut spec_ids: std::collections::HashMap<&'static str, FuncId> =
+        std::collections::HashMap::new();
+    for spec in specs.iter().flatten() {
+        if !spec_ids.contains_key(spec.name) {
+            let id = module
+                .declare_function(spec.name, Linkage::Import, &spec_sig)
+                .ok()?;
+            spec_ids.insert(spec.name, id);
+        }
+    }
 
     let mut entry_sig = module.make_signature();
     entry_sig.call_conv = call_conv;
@@ -732,6 +1156,110 @@ pub fn compile(program: &Program) -> Option<JitCode> {
         for (pc, (insn, _)) in insns.iter().enumerate() {
             let pc = pc as u32;
             fb.switch_to_block(insn_blocks[pc as usize]);
+
+            // Opcodes and their error paths observe the interpreter's
+            // invariant that state.pc names the executing instruction, so
+            // materialize it before every call: specialized helpers never
+            // write pc, and after one runs the stale value must not leak
+            // into the next opcode.
+            let state_v = fb.use_var(var_state);
+            let pc_const = fb.ins().iconst(types::I32, i64::from(pc));
+            fb.ins()
+                .store(MemFlags::trusted(), pc_const, state_v, pc_offset);
+
+            if let Some(spec) = &specs[pc as usize] {
+                // Specialized call: operands are immediates and the branch
+                // decision comes back in the return code, so no pc reload.
+                let spec_ref = module.declare_func_in_func(spec_ids[spec.name], fb.func);
+                let program_v = fb.use_var(var_program);
+                let state_v = fb.use_var(var_state);
+                let a = fb.ins().iconst(types::I64, spec.args[0] as i64);
+                let b = fb.ins().iconst(types::I64, spec.args[1] as i64);
+                let c = fb.ins().iconst(types::I64, spec.args[2] as i64);
+                let call = fb.ins().call(spec_ref, &[program_v, state_v, a, b, c]);
+                let code = fb.inst_results(call)[0];
+
+                let fall_block = insn_blocks[pc as usize + 1];
+                match spec.jump_target {
+                    None => {
+                        // SPEC_FALL falls through; anything else stored a
+                        // result.
+                        let result_block = fb.create_block();
+                        fb.ins().brif(
+                            code,
+                            result_block,
+                            &[] as &[BlockArg],
+                            fall_block,
+                            &[] as &[BlockArg],
+                        );
+                        fb.switch_to_block(result_block);
+                        let result_code = fb.ins().iconst(types::I32, i64::from(JIT_EXIT_RESULT));
+                        fb.ins().jump(exit_block, &[BlockArg::Value(result_code)]);
+                    }
+                    Some(target) => {
+                        let jump_const = fb.ins().iconst(types::I32, i64::from(SPEC_JUMP));
+                        let is_jump = fb.ins().icmp(
+                            cranelift_codegen::ir::condcodes::IntCC::Equal,
+                            code,
+                            jump_const,
+                        );
+                        let taken_block = fb.create_block();
+                        let not_jump_block = fb.create_block();
+                        fb.ins().brif(
+                            is_jump,
+                            taken_block,
+                            &[] as &[BlockArg],
+                            not_jump_block,
+                            &[] as &[BlockArg],
+                        );
+
+                        fb.switch_to_block(not_jump_block);
+                        let result_block = fb.create_block();
+                        fb.ins().brif(
+                            code,
+                            result_block,
+                            &[] as &[BlockArg],
+                            fall_block,
+                            &[] as &[BlockArg],
+                        );
+                        fb.switch_to_block(result_block);
+                        let result_code = fb.ins().iconst(types::I32, i64::from(JIT_EXIT_RESULT));
+                        fb.ins().jump(exit_block, &[BlockArg::Value(result_code)]);
+
+                        fb.switch_to_block(taken_block);
+                        // Branch taken: pc must name the next instruction
+                        // before any interrupt exit or opcode call.
+                        let state_v = fb.use_var(var_state);
+                        let target_const = fb.ins().iconst(types::I32, i64::from(target));
+                        fb.ins()
+                            .store(MemFlags::trusted(), target_const, state_v, pc_offset);
+                        if target <= pc {
+                            // Backward branch: poll for interrupts.
+                            let program_v = fb.use_var(var_program);
+                            let state_v2 = fb.use_var(var_state);
+                            let pager_v = fb.use_var(var_pager);
+                            let call = fb.ins().call(check_ref, &[program_v, state_v2, pager_v]);
+                            let check_code = fb.inst_results(call)[0];
+                            let go_block = fb.create_block();
+                            let check_exit = fb.create_block();
+                            fb.ins().brif(
+                                check_code,
+                                check_exit,
+                                &[] as &[BlockArg],
+                                go_block,
+                                &[] as &[BlockArg],
+                            );
+                            fb.switch_to_block(check_exit);
+                            let loop_code = fb.ins().iconst(types::I32, i64::from(JIT_EXIT_LOOP));
+                            fb.ins().jump(exit_block, &[BlockArg::Value(loop_code)]);
+                            fb.switch_to_block(go_block);
+                        }
+                        fb.ins()
+                            .jump(insn_blocks[target as usize], &[] as &[BlockArg]);
+                    }
+                }
+                continue;
+            }
 
             let wrapper_id = wrapper_ids[insn.discriminant() as usize]
                 .expect("wrapper declared for every discriminant in the program");

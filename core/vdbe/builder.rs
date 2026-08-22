@@ -2286,6 +2286,8 @@ impl ProgramBuilder {
             read_databases: self.read_databases,
             #[cfg(feature = "jit")]
             jit_code: std::sync::OnceLock::new(),
+            #[cfg(feature = "jit")]
+            jit_completed_executions: Default::default(),
         };
         Ok(prepared)
     }

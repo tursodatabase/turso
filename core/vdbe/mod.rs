@@ -879,6 +879,15 @@ pub struct ProgramState {
     /// instruction result.
     #[cfg(feature = "jit")]
     pub(crate) jit_exit_result: Option<Result<execute::InsnFunctionStepResult>>,
+    /// `metrics.vm_steps` as of the start of the current execution, letting
+    /// the JIT judge how long this execution alone has been running.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_steps_at_execution_start: u64,
+    /// Don't re-evaluate the JIT compile gates until `metrics.vm_steps`
+    /// reaches this; rechecking every instruction would tax statements that
+    /// never qualify.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_next_compile_check: u64,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
     /// arriving during Halt's resumable work (staging index-method writes,
@@ -989,6 +998,10 @@ impl ProgramState {
             pending_fail_prepare_error: None,
             #[cfg(feature = "jit")]
             jit_exit_result: None,
+            #[cfg(feature = "jit")]
+            jit_steps_at_execution_start: 0,
+            #[cfg(feature = "jit")]
+            jit_next_compile_check: 0,
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
@@ -1142,6 +1155,9 @@ impl ProgramState {
         #[cfg(feature = "jit")]
         {
             self.jit_exit_result = None;
+            self.jit_steps_at_execution_start = self.metrics.vm_steps;
+            // A new execution may newly qualify (reuse count grew).
+            self.jit_next_compile_check = 0;
         }
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
@@ -1643,6 +1659,10 @@ pub struct PreparedProgram {
     /// program stays interpreted.
     #[cfg(feature = "jit")]
     pub(crate) jit_code: std::sync::OnceLock<Option<Arc<jit::JitCode>>>,
+    /// Number of completed executions of this program, used by the JIT to
+    /// decide whether compiling will amortize across reuse.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_completed_executions: jit::ExecutionCounter,
 }
 
 #[derive(Clone)]
@@ -2153,6 +2173,11 @@ impl Program {
                         // Instruction completed execution
                         state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
+                        #[cfg(feature = "jit")]
+                        self.prepared
+                            .jit_completed_executions
+                            .0
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Ok(StepResult::Done);
                     }
                     Ok(InsnFunctionStepResult::IO(io)) => {

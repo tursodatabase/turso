@@ -8377,6 +8377,17 @@ pub fn op_agg_step(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AggStep { data }, insn);
+    agg_step_impl(program, state, data)
+}
+
+/// Body of [`op_agg_step`], also callable with a pre-resolved payload so the
+/// JIT can skip instruction decoding.
+#[inline]
+pub(crate) fn agg_step_impl(
+    program: &Program,
+    state: &mut ProgramState,
+    data: &AggStepData,
+) -> Result<InsnFunctionStepResult> {
     let AggStepData {
         acc_reg,
         col,
@@ -8384,7 +8395,7 @@ pub fn op_agg_step(
         func,
         comparator,
         collation,
-    } = data.as_ref();
+    } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
         return op_window_step(state, *acc_reg, *col, win_func);
