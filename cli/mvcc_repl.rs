@@ -95,7 +95,9 @@ fn open_mvcc_db(path: &str, passive_checkpoint: bool) -> anyhow::Result<Arc<Data
         path,
         None,
         OpenFlags::default(),
-        DatabaseOpts::default().with_experimental_mvcc_passive_checkpoint(passive_checkpoint),
+        DatabaseOpts::default()
+            .with_experimental_mvcc_passive_checkpoint(passive_checkpoint)
+            .with_index_method(true),
         None,
         Arc::new(SqliteDialect),
     )

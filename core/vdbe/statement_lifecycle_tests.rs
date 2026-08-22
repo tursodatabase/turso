@@ -6,7 +6,123 @@ use crate::mvcc::cursor::CursorYieldPoint;
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::sync::{Arc, Mutex};
+#[cfg(feature = "fts")]
+use crate::StepResult;
 use crate::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Value};
+
+#[derive(Debug)]
+struct FailingPrepareIndexMethod;
+
+#[derive(Debug)]
+struct FailingPrepareAttachment {
+    table_name: String,
+    index_name: String,
+}
+
+#[derive(Debug, Default)]
+struct FailingPrepareCursor {
+    dirty: bool,
+}
+
+impl crate::index_method::IndexMethod for FailingPrepareIndexMethod {
+    fn attach(
+        &self,
+        configuration: &crate::index_method::IndexMethodConfiguration,
+    ) -> Result<Arc<dyn crate::index_method::IndexMethodAttachment>> {
+        Ok(Arc::new(FailingPrepareAttachment {
+            table_name: configuration.table_name.clone(),
+            index_name: configuration.index_name.clone(),
+        }))
+    }
+}
+
+impl crate::index_method::IndexMethodAttachment for FailingPrepareAttachment {
+    fn definition<'a>(&'a self) -> crate::index_method::IndexMethodDefinition<'a> {
+        crate::index_method::IndexMethodDefinition {
+            method_name: "failing_prepare",
+            table_name: &self.table_name,
+            index_name: &self.index_name,
+            patterns: &[],
+            backing_btree: false,
+            results_materialized: true,
+            mvcc_support: crate::index_method::IndexMethodMvccSupport::ExternalTransactional,
+        }
+    }
+
+    fn init(&self) -> Result<Box<dyn crate::index_method::IndexMethodCursor>> {
+        Ok(Box::new(FailingPrepareCursor::default()))
+    }
+}
+
+impl crate::index_method::IndexMethodCursor for FailingPrepareCursor {
+    fn create(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn destroy(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn open_read(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn open_write(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn insert(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<()>> {
+        self.dirty = true;
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn delete(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<()>> {
+        self.dirty = true;
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn query_start(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<bool>> {
+        Ok(crate::IOResult::Done(false))
+    }
+
+    fn query_next(&mut self) -> Result<crate::IOResult<bool>> {
+        Ok(crate::IOResult::Done(false))
+    }
+
+    fn query_column(&mut self, _idx: usize) -> Result<crate::IOResult<Value>> {
+        Err(LimboError::InternalError(
+            "failing_prepare has no query rows".to_string(),
+        ))
+    }
+
+    fn query_rowid(&mut self) -> Result<crate::IOResult<Option<i64>>> {
+        Ok(crate::IOResult::Done(None))
+    }
+
+    fn stage_statement_commit(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> Result<crate::IOResult<()>> {
+        if self.dirty {
+            return Err(LimboError::InternalError(
+                "forced index-method preparation failure".to_string(),
+            ));
+        }
+        Ok(crate::IOResult::Done(()))
+    }
+}
 
 #[derive(Debug)]
 struct FixedYieldInjector {
@@ -47,6 +163,103 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     })
     .unwrap();
     rows
+}
+
+#[test]
+fn fail_rolls_back_base_rows_when_index_method_preparation_fails() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:index-method-failing-prepare",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    db.builtin_syms.write().index_methods.insert(
+        "failing_prepare".to_string(),
+        Arc::new(FailingPrepareIndexMethod),
+    );
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fail ON docs USING failing_prepare(body)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER fail_second BEFORE INSERT ON docs WHEN NEW.id = 2 BEGIN \
+         SELECT RAISE(FAIL, 'stop'); END",
+    )
+    .unwrap();
+
+    let error = conn
+        .execute("INSERT INTO docs VALUES (1, 'first'), (2, 'second')")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced index-method preparation failure"),
+        "unexpected error: {error}"
+    );
+    assert!(get_rows(&conn, "SELECT id FROM docs").is_empty());
+}
+
+#[cfg(feature = "fts")]
+#[test]
+fn abandoning_after_index_method_prepare_rolls_back_without_drop_io() {
+    use crate::index_method::IndexMethodYieldPoint;
+
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:index-method-finalize-abandon",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        IndexMethodYieldPoint::AfterPrepareStatement.point(),
+    ])));
+    let mut insert = conn
+        .prepare("INSERT INTO docs VALUES (1, 'abandoned after prepare')")
+        .unwrap();
+    loop {
+        match insert.step().unwrap() {
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => break,
+            StepResult::Done => panic!("INSERT completed before the injected finalization yield"),
+            other => panic!("unexpected INSERT result: {other:?}"),
+        }
+    }
+    drop(insert);
+    conn.set_yield_injector(None);
+
+    assert!(get_rows(&conn, "SELECT id FROM docs").is_empty());
+    assert!(get_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(body, 'abandoned')"
+    )
+    .is_empty());
+
+    conn.execute("INSERT INTO docs VALUES (2, 'surviving retry')")
+        .unwrap();
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'surviving')"
+        ),
+        vec![vec![Value::from_i64(2)]]
+    );
 }
 
 fn open_mvcc_database_with_opts(path: &str, opts: DatabaseOpts) -> Arc<Database> {
@@ -1398,5 +1611,167 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
         env.observer_ids(),
         Vec::<i64>::new(),
         "pins the deferred-commit gap: a failing joined writer discards the completed writer's row"
+    );
+}
+
+#[cfg(feature = "fts")]
+fn open_fts_mvcc_db(path: &str) -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    let observer = db.connect().unwrap();
+    (db, conn, observer)
+}
+
+/// A writer that finishes while a sibling statement holds the shared implicit
+/// MVCC transaction open defers its commit to the last sibling (see
+/// test_completed_writer_waits_for_sibling_mvcc_reader_to_commit). Its FTS
+/// writes must be deferred with it: once the base row commits, the document
+/// must be searchable. The deferred halt path must stage the writer's
+/// index-method work or hand its cursor to the connection — otherwise the
+/// pending documents die with the statement and the base row commits without
+/// its index entries.
+#[cfg(feature = "fts")]
+#[test]
+fn fts_writes_survive_deferred_shared_autocommit() {
+    let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-deferred-shared-autocommit");
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (10, 'existing seed')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut reader = conn.prepare("SELECT id FROM docs ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 10);
+
+    let mut writer = conn
+        .prepare("INSERT INTO docs VALUES (1, 'deferred needle') RETURNING id")
+        .unwrap();
+    assert_eq!(step_returning_id(&mut writer), 1);
+    finish_without_rows(&mut writer);
+    drop(writer);
+
+    finish_without_rows(&mut reader);
+    drop(reader);
+
+    assert_eq!(
+        ids_from_query(&observer, "SELECT id FROM docs ORDER BY id"),
+        vec![1, 10],
+        "the last sibling statement commits the completed writer's base row"
+    );
+    assert_eq!(
+        ids_from_query(
+            &observer,
+            "SELECT id FROM docs WHERE fts_match(body, 'needle')"
+        ),
+        vec![1],
+        "the FTS document must commit together with its base row"
+    );
+}
+
+/// Dropping a connection mid-transaction is how the engine recovers when an
+/// application abandons its handle (e.g. after a panic): Connection::drop
+/// rolls the transaction back and releases its locks and leases. A
+/// transaction-owned index-method cursor registered on the connection holds a
+/// context whose Arc points back at that same connection, and the cycle must
+/// not keep the connection alive — otherwise the drop recovery never runs,
+/// the MVCC transaction stays active, and its FTS write lease blocks every
+/// other writer forever.
+#[cfg(feature = "fts")]
+#[test]
+fn dropping_connection_mid_transaction_releases_its_fts_write_lease() {
+    let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-conn-drop-mid-tx");
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'abandoned mid transaction')")
+        .unwrap();
+
+    let weak = Arc::downgrade(&conn);
+    drop(conn);
+
+    observer
+        .execute("INSERT INTO docs VALUES (2, 'after the drop')")
+        .expect("dropping the writing connection must release its FTS write lease");
+    assert!(
+        weak.upgrade().is_none(),
+        "a dropped connection must be freed; a registered index-method cursor must not keep it alive"
+    );
+}
+
+/// INSERT OR FAIL keeps the rows changed before the failing one. The
+/// constraint error is parked while the kept rows' index-method writes are
+/// staged; an interrupt request arriving in that window must not replace the
+/// statement's outcome and roll back the rows FAIL promised to keep.
+#[cfg(feature = "fts")]
+#[test]
+fn interrupt_during_fail_staging_keeps_fail_outcome() {
+    use crate::index_method::IndexMethodYieldPoint;
+
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:fts-interrupt-during-fail",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        IndexMethodYieldPoint::AfterPrepareStatement.point(),
+    ])));
+    let mut insert = conn
+        .prepare("INSERT OR FAIL INTO docs VALUES (1, 'kept row'), (1, 'duplicate')")
+        .unwrap();
+    expect_injected_yield(&mut insert, "OR FAIL index-method staging");
+    conn.set_yield_injector(None);
+
+    // The statement is suspended between staging the kept row's FTS writes
+    // and surfacing the parked constraint error.
+    conn.interrupt();
+
+    let err = loop {
+        match insert.step() {
+            Err(err) => break err,
+            Ok(StepResult::IO) => io.step().unwrap(),
+            Ok(other) => panic!("OR FAIL must surface its constraint error, got {other:?}"),
+        }
+    };
+    assert!(
+        matches!(err, LimboError::Constraint(_)),
+        "expected the parked constraint error, got {err:?}"
+    );
+    drop(insert);
+
+    assert_eq!(
+        ids_from_query(&conn, "SELECT id FROM docs ORDER BY id"),
+        vec![1],
+        "OR FAIL keeps rows changed before the failure"
+    );
+    assert_eq!(
+        ids_from_query(&conn, "SELECT id FROM docs WHERE fts_match(body, 'kept')"),
+        vec![1],
+        "the kept row's FTS document must survive the interrupt request"
     );
 }
