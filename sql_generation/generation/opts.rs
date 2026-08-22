@@ -151,6 +151,15 @@ pub struct SelectOpts {
     pub free_expr_size: u32,
     #[garde(length(min = 1))]
     pub compound_selects: Vec<CompoundSelectWeight>,
+    /// Probability that a generated SELECT gets a `LIMIT` clause. Callers that
+    /// cannot bound their tables (whopper) use this to keep a join from
+    /// returning millions of rows; the UNION and IN b-trees behind the query
+    /// are still built in full.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub limit_prob: f64,
+    /// Largest `LIMIT` value generated.
+    #[garde(skip)]
+    pub max_limit: NonZeroU32,
 }
 
 impl Default for SelectOpts {
@@ -158,6 +167,8 @@ impl Default for SelectOpts {
         Self {
             order_by_prob: 0.3,
             free_expr_size: 8,
+            limit_prob: 0.0,
+            max_limit: NonZero::new(1000).unwrap(),
             compound_selects: vec![
                 CompoundSelectWeight {
                     num_compound_selects: 0,

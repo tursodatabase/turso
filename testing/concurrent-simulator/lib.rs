@@ -385,6 +385,12 @@ fn default_sql_generation_opts() -> Opts {
     opts.query.insert.nested_self_insert = false;
     opts.query.insert.min_rows = NonZero::new(16).unwrap();
     opts.query.insert.max_rows = NonZero::new(256).unwrap();
+    // With tables in the thousands of rows, a generated join can return
+    // millions of rows, which a single statement cannot finish within
+    // whopper's reopen drain budget. A LIMIT caps the output; UNION and IN
+    // subqueries still build their ephemeral b-trees in full.
+    opts.query.select.limit_prob = 1.0;
+    opts.query.select.max_limit = NonZero::new(1000).unwrap();
     opts
 }
 

@@ -229,6 +229,10 @@ impl Arbitrary for Select {
             }
         }
 
+        let limit = rng
+            .random_bool(opts.limit_prob)
+            .then(|| rng.random_range(1..=opts.max_limit.get() as usize));
+
         Self {
             body: SelectBody {
                 select: Box::new(first),
@@ -240,7 +244,7 @@ impl Arbitrary for Select {
                     })
                     .collect(),
             },
-            limit: None,
+            limit,
         }
     }
 }
