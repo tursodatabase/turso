@@ -394,6 +394,7 @@ impl PropTestBackend {
             // Repeated keys let a DELETE or UPDATE empty a group and let a
             // replace hit an existing row.
             profile.generation.value = profile.generation.value.narrow();
+            profile.generation.table_spelling.quoted = true;
         }
         Self {
             test_runner,
@@ -734,6 +735,52 @@ mod tests {
             weights(&sql_gen_prop::StatementProfile::default())
         );
         assert_eq!(weights(&backend.profile), expected);
+    }
+
+    fn generated_dml(matview: bool) -> Vec<String> {
+        use sql_gen::{ColumnDef, DataType, Table};
+        let schema = sql_gen::Schema {
+            tables: vec![Table::new(
+                "msg",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Text),
+                ],
+            )],
+            ..Default::default()
+        };
+        let mut backend = PropTestBackend::new([3; 32], false, WeightProfile::Writes, matview);
+        (0..300)
+            .filter_map(
+                |_| match backend.generate(&schema, &Matviews::new()).unwrap() {
+                    Generated::Statement(stmt) if stmt.mutates_data => Some(stmt.sql),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn matview_mode_writes_table_names_in_quotes() {
+        let dml = generated_dml(true);
+        for spelling in ["INTO \"msg\"", "UPDATE [msg]", "FROM `msg`"] {
+            assert!(
+                dml.iter().any(|sql| sql.contains(spelling)),
+                "no DML contains {spelling:?}"
+            );
+        }
+        assert!(dml.iter().any(|sql| sql.contains(" msg ")));
+    }
+
+    #[test]
+    fn default_mode_writes_table_names_as_created() {
+        let dml = generated_dml(false);
+        assert!(!dml.is_empty());
+        assert!(dml.iter().all(|sql| {
+            ["\"msg\"", "[msg]", "`msg`"]
+                .iter()
+                .all(|quoted| !sql.contains(quoted))
+        }));
     }
 
     #[test]

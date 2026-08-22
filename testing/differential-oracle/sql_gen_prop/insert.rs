@@ -7,6 +7,7 @@ use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
+use crate::spelling::table_name_spelling;
 
 // =============================================================================
 // INSERT STATEMENT PROFILE
@@ -155,7 +156,7 @@ fn insert_with_conflict(
     profile: &StatementProfile,
     on_conflict: OnConflict,
 ) -> BoxedStrategy<InsertStatement> {
-    let table_name = table.qualified_name();
+    let table_name = table_name_spelling(table, &profile.generation.table_spelling);
     let columns = table.columns.clone();
     let is_strict = table.strict;
     let functions = builtin_functions();
@@ -195,11 +196,9 @@ fn insert_with_conflict(
         })
         .collect();
 
-    value_strategies
-        .into_iter()
-        .collect::<Vec<_>>()
-        .prop_map(move |values| InsertStatement {
-            table: table_name.clone(),
+    (value_strategies.into_iter().collect::<Vec<_>>(), table_name)
+        .prop_map(move |(values, table)| InsertStatement {
+            table,
             columns: col_names.clone(),
             values,
             on_conflict: on_conflict.clone(),
