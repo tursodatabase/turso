@@ -944,9 +944,10 @@ pub fn translate_insert(
 
     // For REPLACE (statement-level or constraint-level), we need to force a seek on the
     // insert, as we may have already deleted the conflicting row and the cursor is not
-    // guaranteed to be positioned.
+    // guaranteed to be positioned. That delete already recorded the old row for
+    // materialized view maintenance, so this insert must not record it a second time.
     if matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace {
-        insert_flags = insert_flags.require_seek();
+        insert_flags = insert_flags.require_seek().old_row_already_deleted();
     }
     program.emit_insn(Insn::Insert {
         cursor: ctx.cursor_id,
