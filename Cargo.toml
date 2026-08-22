@@ -7,6 +7,7 @@ members = [
     "bindings/javascript",
     "bindings/javascript/sync",
     "bindings/python",
+    "bindings/ruby",
     "bindings/rust",
     "cli",
     "core",
@@ -60,6 +61,7 @@ default-members = [
     "bindings/javascript",
     "bindings/javascript/sync",
     "bindings/python",
+    "bindings/ruby",
     "bindings/rust",
     "cli",
     "core",
@@ -108,6 +110,7 @@ repository = "https://github.com/tursodatabase/turso"
 [workspace.dependencies]
 turso = { path = "bindings/rust", version = "0.8.0-pre.7" }
 turso_node = { path = "bindings/javascript", version = "0.8.0-pre.7" }
+turso_ruby = { path = "bindings/ruby", version = "0.8.0-pre.7" }
 turso_sdk_kit = { path = "sdk-kit", version = "0.8.0-pre.7" }
 turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.8.0-pre.7" }
 turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.8.0-pre.7" }
@@ -121,6 +124,7 @@ turso_pg = { path = "postgres/frontend", version = "0.8.0-pre.7" }
 turso_pg_client = { path = "postgres/client", version = "0.8.0-pre.7" }
 turso_pg_parser = { path = "postgres/parser", version = "0.8.0-pre.7" }
 turso_pg_server = { path = "postgres/server", version = "0.8.0-pre.7" }
+
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
