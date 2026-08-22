@@ -8,6 +8,7 @@ use crate::function::builtin_functions;
 use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, Schema, TableRef};
 use crate::select::optional_where_clause;
+use crate::spelling::table_name_spelling;
 
 // =============================================================================
 // UPDATE STATEMENT PROFILE
@@ -91,7 +92,7 @@ pub fn update_for_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<UpdateStatement> {
-    let table_name = table.qualified_name();
+    let table_name = table_name_spelling(table, &profile.generation.table_spelling);
     let updatable: Vec<ColumnDef> = table.updatable_columns().cloned().collect();
     let is_strict = table.strict;
     let functions = builtin_functions();
@@ -105,9 +106,12 @@ pub fn update_for_table(
     let schema_clone = schema.clone();
     let profile_clone = profile.clone();
     if updatable.is_empty() {
-        return optional_where_clause(&table_clone, &schema_clone, &profile_clone)
-            .prop_map(move |where_clause| UpdateStatement {
-                table: table_name.clone(),
+        return (
+            optional_where_clause(&table_clone, &schema_clone, &profile_clone),
+            table_name,
+        )
+            .prop_map(|(where_clause, table)| UpdateStatement {
+                table,
                 assignments: vec![],
                 where_clause,
             })
@@ -158,12 +162,12 @@ pub fn update_for_table(
                 })
                 .collect();
 
-            let table_name = table_name.clone();
-            assignment_strategies
-                .into_iter()
-                .collect::<Vec<_>>()
-                .prop_map(move |assignments| UpdateStatement {
-                    table: table_name.clone(),
+            (
+                assignment_strategies.into_iter().collect::<Vec<_>>(),
+                table_name.clone(),
+            )
+                .prop_map(move |(assignments, table)| UpdateStatement {
+                    table,
                     assignments,
                     where_clause: where_clause.clone(),
                 })
