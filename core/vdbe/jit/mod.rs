@@ -946,7 +946,8 @@ type OwnedIsa = std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>;
 fn make_module() -> Option<(JITModule, cranelift_codegen::isa::CallConv, OwnedIsa)> {
     let mut flag_builder = settings::builder();
     // Generated code is calls and short branches; compile speed matters more
-    // than code quality ("speed" was measured to make no difference here).
+    // than code quality ("speed" was measured to help neither instruction
+    // counts nor the L1i footprint of the generated glue).
     flag_builder.set("opt_level", "none").ok()?;
     flag_builder.set("use_colocated_libcalls", "false").ok()?;
     flag_builder.set("is_pic", "false").ok()?;
@@ -1086,6 +1087,8 @@ pub fn compile(program: &Program) -> Option<JitCode> {
         let entry_block = fb.create_block();
         let dispatch_block = fb.create_block();
         let exit_block = fb.create_block();
+        // Shared cold exit for specialized helpers that stored a result.
+        let spec_result_block = fb.create_block();
         // One block per instruction, plus a continuation block used after the
         // opcode call for successor selection.
         let insn_blocks: Vec<_> = insns.iter().map(|_| fb.create_block()).collect();
@@ -1103,6 +1106,9 @@ pub fn compile(program: &Program) -> Option<JitCode> {
         fb.switch_to_block(exit_block);
         let code_param = fb.block_params(exit_block)[0];
         fb.ins().return_(&[code_param]);
+        fb.switch_to_block(spec_result_block);
+        let result_code = fb.ins().iconst(types::I32, i64::from(JIT_EXIT_RESULT));
+        fb.ins().jump(exit_block, &[BlockArg::Value(result_code)]);
 
         // dispatch_block: poll for interrupts, then jump through the table.
         // This is the target of every dynamic branch and of function entry,
@@ -1123,7 +1129,6 @@ pub fn compile(program: &Program) -> Option<JitCode> {
             cont_block,
             &[] as &[BlockArg],
         );
-
         fb.switch_to_block(check_exit_block);
         // Interrupt requested or connection closed: rerun the loop checks.
         let loop_code = fb.ins().iconst(types::I32, i64::from(JIT_EXIT_LOOP));
@@ -1146,7 +1151,6 @@ pub fn compile(program: &Program) -> Option<JitCode> {
         let jt_data = cranelift_codegen::ir::JumpTableData::new(default_call, &table_entries);
         let jt = fb.create_jump_table(jt_data);
         fb.ins().br_table(pc_val, jt);
-
         fb.switch_to_block(loop_exit_for_default);
         let loop_code2 = fb.ins().iconst(types::I32, i64::from(JIT_EXIT_LOOP));
         fb.ins().jump(exit_block, &[BlockArg::Value(loop_code2)]);
