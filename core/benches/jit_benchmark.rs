@@ -58,6 +58,7 @@ fn run_all(db: &Arc<Database>, conn: &Arc<turso_core::Connection>, sql: &str) ->
     rows
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_queries(criterion: &mut Criterion) {
     let queries = [
         (
