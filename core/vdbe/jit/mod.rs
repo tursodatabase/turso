@@ -401,6 +401,10 @@ const SPEC_RESULT: u32 = 2;
 /// The helper does not cover this case; run the generic wrapper instead.
 /// The helper must not have modified any state before returning this.
 const SPEC_BAIL: u32 = 3;
+/// The helper wrote a data-dependent target into `state.pc`; continue at the
+/// dynamic dispatch block (which also polls for interrupts, so multi-target
+/// loops stay interruptible).
+const SPEC_DISPATCH: u32 = 4;
 
 /// How the generated code should call an instruction's specialized helper.
 /// `name` must be registered in [`SPEC_HELPERS`].
@@ -415,6 +419,9 @@ struct SpecCall {
     /// Reserves a comparison cache site; `compile` patches the site index
     /// into args[2].
     needs_cmp_site: bool,
+    /// Whether the helper may return SPEC_DISPATCH after writing `state.pc`
+    /// itself (multi-target branches like Jump).
+    can_dispatch: bool,
 }
 
 /// Mirrors the interpreter loop: every attempt counts as a VM step.
@@ -845,7 +852,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
         }
     };
     debug_assert!(
-        SPEC_HELPERS.len() == 12,
+        SPEC_HELPERS.len() == 21,
         "keep SPEC_HELPERS in sync with specialize()"
     );
     let spec = match insn {
@@ -855,6 +862,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: None,
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::Copy {
             src_reg,
@@ -866,6 +874,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: None,
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::Move {
             source_reg,
@@ -877,6 +886,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: None,
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::Add { lhs, rhs, dest } if fall_ok => SpecCall {
             name: "spec_add",
@@ -884,6 +894,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: None,
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::Subtract { lhs, rhs, dest } if fall_ok => SpecCall {
             name: "spec_subtract",
@@ -891,6 +902,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: None,
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::Multiply { lhs, rhs, dest } if fall_ok => SpecCall {
             name: "spec_multiply",
@@ -898,6 +910,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: None,
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::If {
             reg,
@@ -909,6 +922,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: Some(target_of(target_pc)?),
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::IfNot {
             reg,
@@ -920,6 +934,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: Some(target_of(target_pc)?),
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::IfPos {
             reg,
@@ -931,6 +946,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: Some(target_of(target_pc)?),
             can_bail: false,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::Column {
             cursor_id,
@@ -947,6 +963,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: None,
             can_bail: true,
             needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::ColumnRange {
             cursor_id,
@@ -963,6 +980,121 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             jump_target: None,
             can_bail: true,
             needs_cmp_site: false,
+            can_dispatch: false,
+        },
+        Insn::Next {
+            cursor_id,
+            pc_if_next,
+            fullscan,
+        } if fall_ok => SpecCall {
+            name: "spec_next",
+            args: [(*cursor_id as u64) | ((*fullscan as u64) << 32), 0, 0],
+            jump_target: Some(target_of(pc_if_next)?),
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: false,
+        },
+        Insn::Rewind {
+            cursor_id,
+            pc_if_empty,
+        } if fall_ok => SpecCall {
+            name: "spec_rewind",
+            args: [*cursor_id as u64, 0, 0],
+            jump_target: Some(target_of(pc_if_empty)?),
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: false,
+        },
+        Insn::SorterNext {
+            cursor_id,
+            pc_if_next,
+        } if fall_ok => SpecCall {
+            name: "spec_sorter_next",
+            args: [*cursor_id as u64, 0, 0],
+            jump_target: Some(target_of(pc_if_next)?),
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: false,
+        },
+        Insn::SorterInsert {
+            cursor_id,
+            record_reg,
+        } if fall_ok => SpecCall {
+            name: "spec_sorter_insert",
+            args: [(*cursor_id as u64) | ((*record_reg as u64) << 32), 0, 0],
+            jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: false,
+        },
+        Insn::SorterData {
+            cursor_id,
+            dest_reg,
+            pseudo_cursor,
+        } if fall_ok => SpecCall {
+            name: "spec_sorter_data",
+            args: [
+                (*cursor_id as u64) | ((*pseudo_cursor as u64) << 32),
+                *dest_reg as u64,
+                0,
+            ],
+            jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: false,
+        },
+        Insn::Compare {
+            start_reg_a,
+            start_reg_b,
+            count,
+            key_info,
+        } if fall_ok => SpecCall {
+            name: "spec_compare",
+            args: [
+                (*start_reg_a as u64) | ((*start_reg_b as u64) << 32),
+                (*count as u64) | ((key_info.len() as u64) << 32),
+                key_info.as_ptr() as usize as u64,
+            ],
+            jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: false,
+        },
+        Insn::Jump {
+            target_pc_lt,
+            target_pc_eq,
+            target_pc_gt,
+        } if fall_ok => SpecCall {
+            name: "spec_jump",
+            args: [
+                u64::from(target_of(target_pc_lt)?) | (u64::from(target_of(target_pc_eq)?) << 32),
+                u64::from(target_of(target_pc_gt)?),
+                0,
+            ],
+            jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: true,
+        },
+        Insn::SeekRowid {
+            cursor_id,
+            src_reg,
+            target_pc,
+        } if fall_ok => SpecCall {
+            name: "spec_seek_rowid",
+            args: [(*cursor_id as u64) | ((*src_reg as u64) << 32), 0, 0],
+            jump_target: Some(target_of(target_pc)?),
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: false,
+        },
+        Insn::ResultRow { start_reg, count } if fall_ok => SpecCall {
+            name: "spec_result_row",
+            args: [*start_reg as u64, *count as u64, 0],
+            jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
+            can_dispatch: false,
         },
         Insn::Eq { .. }
         | Insn::Ne { .. }
@@ -1039,6 +1171,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
                 jump_target: Some(target_of(target_pc)?),
                 can_bail: true,
                 needs_cmp_site: true,
+                can_dispatch: false,
             }
         }
         Insn::AggStep { data } if fall_ok => {
@@ -1053,6 +1186,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
                 jump_target: None,
                 can_bail: false,
                 needs_cmp_site: false,
+                can_dispatch: false,
             }
         }
         _ => return None,
@@ -1074,6 +1208,15 @@ const SPEC_HELPERS: &[(&str, SpecHelperFn)] = &[
     ("spec_cmp", spec_cmp),
     ("spec_column", spec_column),
     ("spec_column_range", spec_column_range),
+    ("spec_next", spec_next),
+    ("spec_rewind", spec_rewind),
+    ("spec_sorter_next", spec_sorter_next),
+    ("spec_sorter_insert", spec_sorter_insert),
+    ("spec_sorter_data", spec_sorter_data),
+    ("spec_compare", spec_compare),
+    ("spec_jump", spec_jump),
+    ("spec_seek_rowid", spec_seek_rowid),
+    ("spec_result_row", spec_result_row),
 ];
 
 /// `Insn::Column` for a cursor with no pending deferred seek or suspended
@@ -1138,6 +1281,188 @@ extern "C-unwind" fn spec_column_range(
             SPEC_RESULT
         }
     }
+}
+
+/// Wires a `*_step`-style body's completion into the specialized-call
+/// protocol: `Step` completes with the given code, anything else is a stored
+/// result for the interpreter loop.
+#[inline(always)]
+fn spec_step_outcome(
+    state: &mut ProgramState,
+    result: crate::Result<InsnFunctionStepResult>,
+    completed_code: u32,
+) -> u32 {
+    match result {
+        Ok(InsnFunctionStepResult::Step) => spec_completed(state, completed_code),
+        other => {
+            state.jit_exit_result = Some(other);
+            SPEC_RESULT
+        }
+    }
+}
+
+/// `Insn::Next`: advance the cursor; SPEC_JUMP means a row is available.
+extern "C-unwind" fn spec_next(
+    program: *const Program,
+    state: *mut ProgramState,
+    ids: u64,
+    _b: u64,
+    _c: u64,
+) -> u32 {
+    let (program, state) = unsafe { (&*program, &mut *state) };
+    spec_count_attempt(state);
+    let (cursor_id, fullscan) = ((ids & 0xffff_ffff) as usize, (ids >> 32) != 0);
+    let mut has_row = false;
+    let result = execute::op_next_advance(program, state, cursor_id, fullscan, &mut has_row);
+    spec_step_outcome(state, result, if has_row { SPEC_JUMP } else { SPEC_FALL })
+}
+
+/// `Insn::Rewind`: position on the first row; SPEC_JUMP means empty.
+extern "C-unwind" fn spec_rewind(
+    _program: *const Program,
+    state: *mut ProgramState,
+    cursor_id: u64,
+    _b: u64,
+    _c: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let mut is_empty = false;
+    let result = execute::op_rewind_advance(state, cursor_id as usize, &mut is_empty);
+    spec_step_outcome(state, result, if is_empty { SPEC_JUMP } else { SPEC_FALL })
+}
+
+/// `Insn::SorterNext`: advance the sorter; SPEC_JUMP means a row is
+/// available.
+extern "C-unwind" fn spec_sorter_next(
+    _program: *const Program,
+    state: *mut ProgramState,
+    cursor_id: u64,
+    _b: u64,
+    _c: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let mut has_more = false;
+    let result = execute::op_sorter_next_advance(state, cursor_id as usize, &mut has_more);
+    spec_step_outcome(state, result, if has_more { SPEC_JUMP } else { SPEC_FALL })
+}
+
+/// `Insn::SorterInsert`: insert r[record] into the sorter.
+extern "C-unwind" fn spec_sorter_insert(
+    _program: *const Program,
+    state: *mut ProgramState,
+    ids: u64,
+    _b: u64,
+    _c: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let (cursor_id, record_reg) = ((ids & 0xffff_ffff) as usize, (ids >> 32) as usize);
+    let result = execute::op_sorter_insert_step(state, cursor_id, record_reg);
+    spec_step_outcome(state, result, SPEC_FALL)
+}
+
+/// `Insn::SorterData`: move the sorter's current record into the pseudo
+/// cursor's content register.
+extern "C-unwind" fn spec_sorter_data(
+    _program: *const Program,
+    state: *mut ProgramState,
+    ids: u64,
+    dest_reg: u64,
+    _c: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let (cursor_id, pseudo_cursor) = ((ids & 0xffff_ffff) as usize, (ids >> 32) as usize);
+    match execute::op_sorter_data_step(state, cursor_id, dest_reg as usize, pseudo_cursor) {
+        Ok(()) => spec_completed(state, SPEC_FALL),
+        Err(err) => spec_store_error(state, err),
+    }
+}
+
+/// `Insn::Compare`: compare two register ranges into `state.last_compare`.
+extern "C-unwind" fn spec_compare(
+    _program: *const Program,
+    state: *mut ProgramState,
+    regs: u64,
+    counts: u64,
+    key_info: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let (start_reg_a, start_reg_b) = ((regs & 0xffff_ffff) as usize, (regs >> 32) as usize);
+    let (count, key_len) = ((counts & 0xffff_ffff) as usize, (counts >> 32) as usize);
+    // SAFETY: points at the instruction's key_info buffer, which lives as
+    // long as the program (and therefore the compiled code).
+    let key_info = unsafe {
+        std::slice::from_raw_parts(key_info as usize as *const crate::types::KeyInfo, key_len)
+    };
+    match execute::op_compare_step(state, start_reg_a, start_reg_b, count, key_info) {
+        Ok(()) => spec_completed(state, SPEC_FALL),
+        Err(err) => spec_store_error(state, err),
+    }
+}
+
+/// `Insn::Jump`: three-way branch on the pending comparison. Writes the
+/// baked target into `state.pc` and returns SPEC_DISPATCH.
+extern "C-unwind" fn spec_jump(
+    _program: *const Program,
+    state: *mut ProgramState,
+    lt_eq: u64,
+    gt: u64,
+    _c: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let (lt, eq) = ((lt_eq & 0xffff_ffff) as u32, (lt_eq >> 32) as u32);
+    match execute::op_jump_target(state, lt, eq, gt as u32) {
+        Ok(target) => {
+            state.pc = target;
+            spec_completed(state, SPEC_DISPATCH)
+        }
+        Err(err) => spec_store_error(state, err),
+    }
+}
+
+/// `Insn::SeekRowid`: seek to the rowid in r[src]; SPEC_JUMP means no
+/// matching row.
+extern "C-unwind" fn spec_seek_rowid(
+    _program: *const Program,
+    state: *mut ProgramState,
+    ids: u64,
+    _b: u64,
+    _c: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let (cursor_id, src_reg) = ((ids & 0xffff_ffff) as usize, (ids >> 32) as usize);
+    let mut not_found = false;
+    let result = execute::op_seek_rowid_step(state, cursor_id, src_reg, &mut not_found);
+    spec_step_outcome(state, result, if not_found { SPEC_JUMP } else { SPEC_FALL })
+}
+
+/// `Insn::ResultRow`: expose r[start..start+count] as the result row. The
+/// row is a stored result for the interpreter loop (which counts it), so
+/// only the attempt is counted here; pc advances past the instruction first
+/// so execution resumes after it.
+extern "C-unwind" fn spec_result_row(
+    _program: *const Program,
+    state: *mut ProgramState,
+    start_reg: u64,
+    count: u64,
+    _c: u64,
+) -> u32 {
+    let state = unsafe { &mut *state };
+    spec_count_attempt(state);
+    let row = crate::vdbe::Row {
+        values: &state.registers[start_reg as usize] as *const crate::vdbe::Register,
+        count: count as usize,
+    };
+    state.result_row = Some(row);
+    state.pc += 1;
+    state.jit_exit_result = Some(Ok(InsnFunctionStepResult::Row));
+    SPEC_RESULT
 }
 
 /// Panics when called from generated code; used by the unwind test below.
@@ -1626,6 +1951,26 @@ pub fn compile(program: &Program) -> Option<JitCode> {
                 // Bailing helpers re-run the instruction through the generic
                 // wrapper, emitted below in this same iteration.
                 let generic_block = spec.can_bail.then(|| fb.create_block());
+                if spec.can_dispatch {
+                    // The helper wrote a data-dependent target into state.pc
+                    // (or stored a result); such helpers never fall, jump
+                    // statically, or bail.
+                    debug_assert!(spec.jump_target.is_none() && !spec.can_bail);
+                    let dispatch_const = fb.ins().iconst(types::I32, i64::from(SPEC_DISPATCH));
+                    let is_dispatch = fb.ins().icmp(
+                        cranelift_codegen::ir::condcodes::IntCC::Equal,
+                        code,
+                        dispatch_const,
+                    );
+                    fb.ins().brif(
+                        is_dispatch,
+                        dispatch_block,
+                        &[] as &[BlockArg],
+                        spec_result_block,
+                        &[] as &[BlockArg],
+                    );
+                    continue;
+                }
                 match spec.jump_target {
                     None => match generic_block {
                         // SPEC_FALL falls through; anything else stored a
@@ -1979,6 +2324,9 @@ mod tests {
              WHERE t1.a BETWEEN 100 AND 120 ORDER BY t1.a",
             "SELECT max(c), min(b), sum(a * c) FROM t WHERE b <> 'v7'",
             "SELECT a, c FROM t WHERE c > 900.0 ORDER BY c DESC LIMIT 3",
+            "SELECT a, b FROM t WHERE rowid = 1500",
+            "SELECT t1.b FROM t t2 JOIN t t1 ON t1.rowid = t2.a \
+             WHERE t2.a < 50 ORDER BY t1.a",
         ];
         for sql in queries {
             let interpreted = run_to_completion(&db, &conn, sql, false);

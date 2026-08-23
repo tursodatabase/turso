@@ -26,7 +26,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
     compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    IOCompletions, IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
@@ -787,10 +787,21 @@ pub fn op_compare(
         },
         insn
     );
-    let start_reg_a = *start_reg_a;
-    let start_reg_b = *start_reg_b;
-    let count = *count;
+    op_compare_step(state, *start_reg_a, *start_reg_b, *count, key_info)?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
 
+/// `Compare`'s body with the operands already destructured; also the body of
+/// the JIT's specialized helper.
+#[inline]
+pub(super) fn op_compare_step(
+    state: &mut ProgramState,
+    start_reg_a: usize,
+    start_reg_b: usize,
+    count: usize,
+    key_info: &[KeyInfo],
+) -> Result<()> {
     if unlikely(start_reg_a + count > start_reg_b) {
         return Err(LimboError::InternalError(
             "Compare registers overlap".to_string(),
@@ -806,8 +817,7 @@ pub fn op_compare(
     let cmp = compare_immutable(a_range, b_range, key_info);
 
     state.last_compare = Some(cmp);
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+    Ok(())
 }
 
 pub fn op_jump(
@@ -827,19 +837,37 @@ pub fn op_jump(
     assert!(target_pc_lt.is_offset());
     assert!(target_pc_eq.is_offset());
     assert!(target_pc_gt.is_offset());
+    state.pc = op_jump_target(
+        state,
+        target_pc_lt.as_offset_int(),
+        target_pc_eq.as_offset_int(),
+        target_pc_gt.as_offset_int(),
+    )?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Picks `Jump`'s target from the pending comparison; also the body of the
+/// JIT's specialized helper.
+#[inline]
+pub(super) fn op_jump_target(
+    state: &mut ProgramState,
+    target_pc_lt: u32,
+    target_pc_eq: u32,
+    target_pc_gt: u32,
+) -> Result<u32> {
     let cmp = state.last_compare.take();
     if unlikely(cmp.is_none()) {
         return Err(LimboError::InternalError(
             "Jump without compare".to_string(),
         ));
     }
-    let target_pc = match cmp.expect("comparison should succeed for valid operands") {
-        std::cmp::Ordering::Less => *target_pc_lt,
-        std::cmp::Ordering::Equal => *target_pc_eq,
-        std::cmp::Ordering::Greater => *target_pc_gt,
-    };
-    state.pc = target_pc.as_offset_int();
-    Ok(InsnFunctionStepResult::Step)
+    Ok(
+        match cmp.expect("comparison should succeed for valid operands") {
+            std::cmp::Ordering::Less => target_pc_lt,
+            std::cmp::Ordering::Equal => target_pc_eq,
+            std::cmp::Ordering::Greater => target_pc_gt,
+        },
+    )
 }
 
 pub fn op_move(
@@ -1757,13 +1785,35 @@ pub fn op_rewind(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    let mut is_empty = false;
+    let result = op_rewind_advance(state, *cursor_id, &mut is_empty)?;
+    if !matches!(result, InsnFunctionStepResult::Step) {
+        return Ok(result);
+    }
+    if is_empty {
+        state.pc = pc_if_empty.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Positions the cursor on the first row and reports through `is_empty`
+/// whether there is one; the caller picks the branch. Also the body of the
+/// JIT's specialized Rewind helper.
+#[inline]
+pub(super) fn op_rewind_advance(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    is_empty: &mut bool,
+) -> Result<InsnFunctionStepResult> {
     // Clear any bloom filter associated with this cursor so stale filter data
     // does not incorrectly reject valid matches in subsequent iterations.
-    if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
+    if let Some(filter) = state.get_bloom_filter_mut(cursor_id) {
         filter.clear();
     }
-    let is_empty = {
-        let cursor = state.get_cursor(*cursor_id);
+    let empty = {
+        let cursor = state.get_cursor(cursor_id);
         match cursor {
             Cursor::BTree(btree_cursor) => {
                 return_if_io!(btree_cursor.rewind());
@@ -1776,13 +1826,11 @@ pub fn op_rewind(
             _ => panic!("Rewind on non-btree/materialized-view cursor"),
         }
     };
-    if is_empty {
-        state.pc = pc_if_empty.as_offset_int();
-    } else {
+    if !empty {
         // Rewind positions to the first row, which is effectively a read
         state.record_rows_read(1);
-        state.pc += 1;
     }
+    *is_empty = empty;
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -3326,8 +3374,33 @@ pub fn op_next(
         insn
     );
     assert!(pc_if_next.is_offset());
+    let mut has_row = false;
+    let result = op_next_advance(program, state, *cursor_id, *fullscan, &mut has_row)?;
+    if !matches!(result, InsnFunctionStepResult::Step) {
+        return Ok(result);
+    }
+    if has_row {
+        state.pc = pc_if_next.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Advances the cursor and reports through `has_row` whether a row is
+/// available; the caller picks the branch. Also the body of the JIT's
+/// specialized Next helper. Only a `Step` result completes the advance —
+/// anything else must be returned as-is and retried.
+#[inline]
+pub(super) fn op_next_advance(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    fullscan: bool,
+    has_row: &mut bool,
+) -> Result<InsnFunctionStepResult> {
     let is_empty = {
-        let cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(cursor_id);
         match cursor {
             Cursor::BTree(btree_cursor) => {
                 // If cursor is in NullRow state, don't advance - just return empty.
@@ -3362,18 +3435,16 @@ pub fn op_next(
         state.metrics.search_count = state.metrics.search_count.saturating_add(1);
         // Only steps codegen marked as part of a full table scan count as
         // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
-        if *fullscan {
+        if fullscan {
             state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
         }
-        if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
+        if let Some((_, cursor_type)) = program.cursor_ref.get(cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
             }
         }
-        state.pc = pc_if_next.as_offset_int();
-    } else {
-        state.pc += 1;
     }
+    *has_row = !is_empty;
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -5872,14 +5943,38 @@ pub fn op_seek_rowid(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
-    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
-    let (pc, did_seek) = {
-        let cursor = get_cursor!(state, *cursor_id);
+    let mut not_found = false;
+    let result = op_seek_rowid_step(state, *cursor_id, *src_reg, &mut not_found)?;
+    if !matches!(result, InsnFunctionStepResult::Step) {
+        return Ok(result);
+    }
+    if not_found {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Seeks the cursor to the rowid in `src_reg` and reports through
+/// `not_found` whether the caller must take the miss branch (no matching
+/// row, or a key that is not an integer and does not convert to one). Also
+/// the body of the JIT's specialized SeekRowid helper.
+#[inline]
+pub(super) fn op_seek_rowid_step(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    src_reg: usize,
+    not_found: &mut bool,
+) -> Result<InsnFunctionStepResult> {
+    invalidate_deferred_seeks_for_cursor(state, cursor_id);
+    let (missed, did_seek) = {
+        let cursor = get_cursor!(state, cursor_id);
 
         // Handle MaterializedView cursor
-        let (pc, did_seek) = match cursor {
+        match cursor {
             Cursor::MaterializedView(mv_cursor) => {
-                let rowid = match state.registers[*src_reg].get_value() {
+                let rowid = match state.registers[src_reg].get_value() {
                     Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
                     Value::Null => None,
                     _ => None,
@@ -5889,18 +5984,13 @@ pub fn op_seek_rowid(
                     Some(rowid) => {
                         let seek_result = return_if_io!(mv_cursor
                             .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
-                        let pc = if !matches!(seek_result, SeekResult::Found) {
-                            target_pc.as_offset_int()
-                        } else {
-                            state.pc + 1
-                        };
-                        (pc, true)
+                        (!matches!(seek_result, SeekResult::Found), true)
                     }
-                    None => (target_pc.as_offset_int(), false),
+                    None => (true, false),
                 }
             }
             Cursor::BTree(btree_cursor) => {
-                let rowid = match state.registers[*src_reg].get_value() {
+                let rowid = match state.registers[src_reg].get_value() {
                     Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
                     Value::Null => None,
                     // For non-integer values try to apply affinity and convert them to integer.
@@ -5923,25 +6013,19 @@ pub fn op_seek_rowid(
                     Some(rowid) => {
                         let seek_result = return_if_io!(btree_cursor
                             .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
-                        let pc = if !matches!(seek_result, SeekResult::Found) {
-                            target_pc.as_offset_int()
-                        } else {
-                            state.pc + 1
-                        };
-                        (pc, true)
+                        (!matches!(seek_result, SeekResult::Found), true)
                     }
-                    None => (target_pc.as_offset_int(), false),
+                    None => (true, false),
                 }
             }
             _ => panic!("SeekRowid on non-btree/materialized-view cursor"),
-        };
-        (pc, did_seek)
+        }
     };
     // Increment btree_seeks metric for SeekRowid operation after cursor is dropped
     if did_seek {
         state.metrics.btree_seeks = state.metrics.btree_seeks.saturating_add(1);
     }
-    state.pc = pc;
+    *not_found = missed;
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -8741,39 +8825,51 @@ pub fn op_sorter_data(
         },
         insn
     );
+    op_sorter_data_step(state, *cursor_id, *dest_reg, *pseudo_cursor)?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// `SorterData`'s body with the operands already destructured; also the body
+/// of the JIT's specialized helper.
+#[inline]
+pub(super) fn op_sorter_data_step(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    dest_reg: usize,
+    pseudo_cursor: usize,
+) -> Result<()> {
     // Column ops read the record through the pseudo cursor's content register,
     // so SorterData's destination must be that same register.
     {
         let content_reg = state
-            .get_cursor(*pseudo_cursor)
+            .get_cursor(pseudo_cursor)
             .as_pseudo_mut()
             .content_reg();
-        if content_reg != *dest_reg {
+        if content_reg != dest_reg {
             return Err(LimboError::InternalError(format!(
                 "SorterData: destination register {dest_reg} must be pseudo-cursor {pseudo_cursor}'s content register {content_reg}"
             )));
         }
     }
     {
-        let cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(cursor_id);
         if cursor.as_sorter_mut().record().is_none() {
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
+            return Ok(());
         }
     }
     // Move the record into the content register with no allocation or copy;
     // the register's spent buffer seeds the sorter's next row.
-    let buf = state.registers[*dest_reg].take_buf();
+    let buf = state.registers[dest_reg].take_buf();
     let record = {
-        let cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(cursor_id);
         cursor
             .as_sorter_mut()
             .take_current(buf)
             .expect("sorter record checked above")
     };
-    state.registers[*dest_reg] = Register::Record(record);
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+    state.registers[dest_reg] = Register::Record(record);
+    Ok(())
 }
 
 pub fn op_sorter_insert(
@@ -8789,16 +8885,30 @@ pub fn op_sorter_insert(
         },
         insn
     );
-    {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_sorter_mut();
-        let record = match &state.registers[*record_reg] {
-            Register::Record(record) => record,
-            _ => unreachable!("SorterInsert on non-record register"),
-        };
-        return_if_io!(cursor.insert(record));
+    let result = op_sorter_insert_step(state, *cursor_id, *record_reg)?;
+    if !matches!(result, InsnFunctionStepResult::Step) {
+        return Ok(result);
     }
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// `SorterInsert`'s body with the operands already destructured; also the
+/// body of the JIT's specialized helper. Only a `Step` result completes the
+/// insert.
+#[inline]
+pub(super) fn op_sorter_insert_step(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    record_reg: usize,
+) -> Result<InsnFunctionStepResult> {
+    let cursor = get_cursor!(state, cursor_id);
+    let cursor = cursor.as_sorter_mut();
+    let record = match &state.registers[record_reg] {
+        Register::Record(record) => record,
+        _ => unreachable!("SorterInsert on non-record register"),
+    };
+    return_if_io!(cursor.insert(record));
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -8851,18 +8961,38 @@ pub fn op_sorter_next(
         insn
     );
     assert!(pc_if_next.is_offset());
-    let has_more = {
-        let cursor = state.get_cursor(*cursor_id);
-        let cursor = cursor.as_sorter_mut();
-        return_if_io!(cursor.next());
-        cursor.has_more()
-    };
+    let mut has_more = false;
+    let result = op_sorter_next_advance(state, *cursor_id, &mut has_more)?;
+    if !matches!(result, InsnFunctionStepResult::Step) {
+        return Ok(result);
+    }
     if has_more {
-        state.metrics.search_count = state.metrics.search_count.saturating_add(1);
         state.pc = pc_if_next.as_offset_int();
     } else {
         state.pc += 1;
     }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Advances the sorter and reports through `has_more` whether a row is
+/// available; the caller picks the branch. Also the body of the JIT's
+/// specialized SorterNext helper.
+#[inline]
+pub(super) fn op_sorter_next_advance(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    has_more: &mut bool,
+) -> Result<InsnFunctionStepResult> {
+    let more = {
+        let cursor = state.get_cursor(cursor_id);
+        let cursor = cursor.as_sorter_mut();
+        return_if_io!(cursor.next());
+        cursor.has_more()
+    };
+    if more {
+        state.metrics.search_count = state.metrics.search_count.saturating_add(1);
+    }
+    *has_more = more;
     Ok(InsnFunctionStepResult::Step)
 }
 
