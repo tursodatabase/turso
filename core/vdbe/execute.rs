@@ -2029,7 +2029,8 @@ fn op_column_impl(
 }
 
 /// Fetches one column of the cursor's current row into a register.
-fn op_column_fetch(
+/// Also the body of the JIT's specialized Column helper.
+pub(super) fn op_column_fetch(
     program: &Program,
     state: &mut ProgramState,
     cursor_id: usize,
@@ -2189,7 +2190,8 @@ fn apply_column_default(default: &Option<Value>, reg: &mut Register) -> Result<(
     Ok(())
 }
 
-fn op_column_range_fetch(
+/// Also the body of the JIT's specialized ColumnRange helper.
+pub(super) fn op_column_range_fetch(
     program: &Program,
     state: &mut ProgramState,
     cursor_id: usize,

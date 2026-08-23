@@ -845,7 +845,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
         }
     };
     debug_assert!(
-        SPEC_HELPERS.len() == 10,
+        SPEC_HELPERS.len() == 12,
         "keep SPEC_HELPERS in sync with specialize()"
     );
     let spec = match insn {
@@ -930,6 +930,38 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             args: [*reg as u64, *decrement_by as u64, 0],
             jump_target: Some(target_of(target_pc)?),
             can_bail: false,
+            needs_cmp_site: false,
+        },
+        Insn::Column {
+            cursor_id,
+            column,
+            dest,
+            default,
+        } if fall_ok => SpecCall {
+            name: "spec_column",
+            args: [
+                (*cursor_id as u64) | ((*column as u64) << 32),
+                *dest as u64,
+                default as *const Option<crate::types::Value> as usize as u64,
+            ],
+            jump_target: None,
+            can_bail: true,
+            needs_cmp_site: false,
+        },
+        Insn::ColumnRange {
+            cursor_id,
+            start_column,
+            dest,
+            defaults,
+        } if fall_ok => SpecCall {
+            name: "spec_column_range",
+            args: [
+                (*cursor_id as u64) | ((*start_column as u64) << 32),
+                (*dest as u64) | ((defaults.len() as u64) << 32),
+                defaults.as_ptr() as usize as u64,
+            ],
+            jump_target: None,
+            can_bail: true,
             needs_cmp_site: false,
         },
         Insn::Eq { .. }
@@ -1040,7 +1072,73 @@ const SPEC_HELPERS: &[(&str, SpecHelperFn)] = &[
     ("spec_if_pos", spec_if_pos),
     ("spec_agg_step", spec_agg_step),
     ("spec_cmp", spec_cmp),
+    ("spec_column", spec_column),
+    ("spec_column_range", spec_column_range),
 ];
+
+/// `Insn::Column` for a cursor with no pending deferred seek or suspended
+/// state: forwards to the shared fetch with operands baked in. Bails when
+/// the instruction's resumable state machinery is needed.
+extern "C-unwind" fn spec_column(
+    program: *const Program,
+    state: *mut ProgramState,
+    ids: u64,
+    dest: u64,
+    default: u64,
+) -> u32 {
+    let (program, state) = unsafe { (&*program, &mut *state) };
+    let (cursor_id, column) = ((ids & 0xffff_ffff) as usize, (ids >> 32) as usize);
+    // Mirrors op_column_impl's fast-path condition; anything else needs the
+    // interpreter's resumable state machine.
+    if !state.active_op_state.is_idle() || state.deferred_seeks[cursor_id].is_some() {
+        return SPEC_BAIL;
+    }
+    spec_count_attempt(state);
+    // SAFETY: points at the instruction's default value, which lives in the
+    // program's instruction array and outlives the compiled code.
+    let default = unsafe { &*(default as usize as *const Option<crate::types::Value>) };
+    match execute::op_column_fetch(program, state, cursor_id, column, dest as usize, default) {
+        Ok(InsnFunctionStepResult::Step) => spec_completed(state, SPEC_FALL),
+        other => {
+            state.jit_exit_result = Some(other);
+            SPEC_RESULT
+        }
+    }
+}
+
+/// `Insn::ColumnRange`, same contract as [`spec_column`].
+extern "C-unwind" fn spec_column_range(
+    program: *const Program,
+    state: *mut ProgramState,
+    ids: u64,
+    dest_count: u64,
+    defaults: u64,
+) -> u32 {
+    let (program, state) = unsafe { (&*program, &mut *state) };
+    let (cursor_id, start_column) = ((ids & 0xffff_ffff) as usize, (ids >> 32) as usize);
+    if !state.active_op_state.is_idle() || state.deferred_seeks[cursor_id].is_some() {
+        return SPEC_BAIL;
+    }
+    spec_count_attempt(state);
+    let (dest, count) = (
+        (dest_count & 0xffff_ffff) as usize,
+        (dest_count >> 32) as usize,
+    );
+    // SAFETY: the instruction's defaults slice, alive as long as the program.
+    let defaults = unsafe {
+        std::slice::from_raw_parts(
+            defaults as usize as *const Option<crate::types::Value>,
+            count,
+        )
+    };
+    match execute::op_column_range_fetch(program, state, cursor_id, start_column, dest, defaults) {
+        Ok(InsnFunctionStepResult::Step) => spec_completed(state, SPEC_FALL),
+        other => {
+            state.jit_exit_result = Some(other);
+            SPEC_RESULT
+        }
+    }
+}
 
 /// Panics when called from generated code; used by the unwind test below.
 #[cfg(test)]
@@ -1529,17 +1627,43 @@ pub fn compile(program: &Program) -> Option<JitCode> {
                 // wrapper, emitted below in this same iteration.
                 let generic_block = spec.can_bail.then(|| fb.create_block());
                 match spec.jump_target {
-                    None => {
+                    None => match generic_block {
                         // SPEC_FALL falls through; anything else stored a
-                        // result (fall-only helpers never bail).
-                        fb.ins().brif(
-                            code,
-                            spec_result_block,
-                            &[] as &[BlockArg],
-                            fall_block,
-                            &[] as &[BlockArg],
-                        );
-                    }
+                        // result.
+                        None => {
+                            fb.ins().brif(
+                                code,
+                                spec_result_block,
+                                &[] as &[BlockArg],
+                                fall_block,
+                                &[] as &[BlockArg],
+                            );
+                        }
+                        Some(generic_block) => {
+                            let not_fall_block = fb.create_block();
+                            fb.ins().brif(
+                                code,
+                                not_fall_block,
+                                &[] as &[BlockArg],
+                                fall_block,
+                                &[] as &[BlockArg],
+                            );
+                            fb.switch_to_block(not_fall_block);
+                            let bail_const = fb.ins().iconst(types::I32, i64::from(SPEC_BAIL));
+                            let is_bail = fb.ins().icmp(
+                                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                                code,
+                                bail_const,
+                            );
+                            fb.ins().brif(
+                                is_bail,
+                                generic_block,
+                                &[] as &[BlockArg],
+                                spec_result_block,
+                                &[] as &[BlockArg],
+                            );
+                        }
+                    },
                     Some(target) => {
                         let jump_const = fb.ins().iconst(types::I32, i64::from(SPEC_JUMP));
                         let is_jump = fb.ins().icmp(
@@ -1861,6 +1985,49 @@ mod tests {
             let jitted = run_to_completion(&db, &conn, sql, true);
             assert_eq!(interpreted, jitted, "row mismatch for query: {sql}");
         }
+    }
+
+    /// A specialized fall-through helper that bails must re-run its
+    /// instruction through the generic wrapper. Column bails when its cursor
+    /// has a pending deferred seek, so an index scan that reads a table
+    /// column exercises exactly that path: the compiled code used to route
+    /// SPEC_BAIL to the result exit, which then found no stored result and
+    /// panicked.
+    #[test]
+    fn bailing_column_falls_back_to_the_generic_wrapper() {
+        if !runtime_enabled() {
+            return;
+        }
+        let (db, conn) = memory_db();
+        run_to_completion(&db, &conn, "CREATE TABLE t(a INTEGER, b TEXT)", false);
+        run_to_completion(&db, &conn, "CREATE INDEX ia ON t(a)", false);
+        run_to_completion(
+            &db,
+            &conn,
+            "WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM g WHERE x < 500) \
+             INSERT INTO t SELECT x % 97, 'v' || x FROM g",
+            false,
+        );
+        let sql = "SELECT b FROM t WHERE a BETWEEN 10 AND 40 ORDER BY a";
+        // The premise: this plan reads the table column through a deferred
+        // seek. If the planner stops emitting one here, this test no longer
+        // covers the bail path and needs a new query.
+        let stmt = conn.prepare(sql).unwrap();
+        assert!(
+            stmt.program
+                .prepared()
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. })),
+            "query plan must contain a deferred seek for this test to cover the bail path"
+        );
+        drop(stmt);
+        let interpreted = run_to_completion(&db, &conn, sql, false);
+        let jitted = run_to_completion(&db, &conn, sql, true);
+        assert_eq!(interpreted, jitted);
+        // Every returned row read its column through a pending deferred
+        // seek, so a non-empty result proves the bail path ran.
+        assert!(!interpreted.is_empty());
     }
 
     /// Opcode panics must unwind through generated frames: build a native
