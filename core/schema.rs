@@ -650,8 +650,8 @@ pub fn allow_user_dml(table_name: &str) -> bool {
     const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
     !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))
         || table_name
-            .to_ascii_lowercase()
-            .starts_with(TURSO_INTERNAL_PREFIX))
+            .get(..TURSO_INTERNAL_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX)))
 }
 
 // Sequence persistence design
