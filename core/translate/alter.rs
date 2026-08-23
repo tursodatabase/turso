@@ -505,7 +505,7 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
 
     apply_affinity_to_value(&mut value, column.affinity());
 
-    let ty = column.ty_str.as_str();
+    let ty = column.base_type_name();
     if ty.eq_ignore_ascii_case("ANY") {
         return Ok(false);
     };
@@ -1277,7 +1277,7 @@ pub fn translate_alter_table(
 
             let default_type_mismatch;
             {
-                let ty = column.ty_str.as_str();
+                let ty = column.base_type_name();
                 if btree.is_strict && ty.is_empty() {
                     return Err(LimboError::ParseError(format!(
                         "missing datatype for {table_name}.{new_column_name}"

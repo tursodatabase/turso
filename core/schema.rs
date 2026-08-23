@@ -979,14 +979,14 @@ impl Schema {
         if !is_strict {
             return None;
         }
-        self.type_registry.get(&type_name.to_lowercase())
+        self.type_registry.get(&lookup_key(type_name))
     }
 
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
     pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
-        self.type_registry.get(&type_name.to_lowercase())
+        self.type_registry.get(&lookup_key(type_name))
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
@@ -1006,7 +1006,7 @@ impl Schema {
     /// Resolve a custom type fully without a strictness check.
     /// Returns `Ok(None)` if the type is not in the registry.
     pub fn resolve_type_unchecked(&self, type_name: &str) -> crate::Result<Option<ResolvedType>> {
-        let key = type_name.to_lowercase();
+        let key = lookup_key(type_name);
         if !self.type_registry.contains_key(&key) {
             return Ok(None);
         }
@@ -1028,7 +1028,7 @@ impl Schema {
     ) -> crate::Result<(String, Vec<Arc<TypeDef>>)> {
         let mut chain = vec![];
         let mut visited = std::collections::HashSet::new();
-        let mut current = type_name.to_lowercase();
+        let mut current = lookup_key(type_name);
 
         loop {
             if !visited.insert(current.clone()) {
@@ -4653,8 +4653,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
                 let ty_str = col_type
                     .as_ref()
-                    .cloned()
-                    .map(|ast::Type { name, .. }| name)
+                    .map(render_declared_type)
                     .unwrap_or_default();
 
                 let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
@@ -5234,6 +5233,18 @@ impl Column {
             .unwrap_or_else(|| Affinity::affinity(&self.ty_str))
     }
 
+    /// The declared type with any size parameters or array suffix removed,
+    /// e.g. `DECIMAL(10,2)` -> `DECIMAL`. Use this for exact-match lookups of
+    /// custom types and domains; `ty_str` alone may now carry size parameters
+    /// because SQLite-compatible `PRAGMA table_info` must show them.
+    pub fn base_type_name(&self) -> &str {
+        let s = self.ty_str.trim();
+        match s.find(['(', '[']) {
+            Some(i) => s[..i].trim_end(),
+            None => s,
+        }
+    }
+
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob
@@ -5448,6 +5459,47 @@ impl Column {
 }
 
 // TODO: This might replace some of util::columns_from_create_table_body
+/// Registry lookup key for a custom type or domain: lowercased, with any size
+/// parameters or array suffix removed. Column `ty_str` now keeps the declared
+/// form (`DECIMAL(10,2)`, `doubled(5)`, `INT[]`), but type names are plain
+/// identifiers and are registered without parameters — so lookups must strip
+/// before matching.
+fn lookup_key(type_name: &str) -> String {
+    let base = match type_name.find(['(', '[']) {
+        Some(i) => &type_name[..i],
+        None => type_name,
+    };
+    base.trim_end().to_lowercase()
+}
+
+/// Render a parsed column type back to its declared form, keeping the size
+/// parameters: `VARCHAR(100)`, `DECIMAL(10,2)`. SQLite stores the declared
+/// type verbatim and reports it through `PRAGMA table_info`, so we must not
+/// drop the parameters. Array brackets are not appended: array-ness is tracked
+/// separately in `Column::array_dimensions`, matching how
+/// `get_column_decltype` already names array types. Note: spacing written
+/// inside the parentheses in the original statement is not preserved (the
+/// parser does not keep it).
+pub(crate) fn render_declared_type(ty: &ast::Type) -> String {
+    let mut out = ty.name.clone();
+    match &ty.size {
+        Some(ast::TypeSize::MaxSize(expr)) => {
+            out.push('(');
+            out.push_str(&expr.to_string());
+            out.push(')');
+        }
+        Some(ast::TypeSize::TypeSize(precision, scale)) => {
+            out.push('(');
+            out.push_str(&precision.to_string());
+            out.push(',');
+            out.push_str(&scale.to_string());
+            out.push(')');
+        }
+        None => {}
+    }
+    out
+}
+
 impl TryFrom<&ColumnDefinition> for Column {
     type Error = crate::LimboError;
 
@@ -5503,7 +5555,7 @@ impl TryFrom<&ColumnDefinition> for Column {
         let ty_str = value
             .col_type
             .as_ref()
-            .map(|t| t.name.to_string())
+            .map(render_declared_type)
             .unwrap_or_default();
 
         let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {

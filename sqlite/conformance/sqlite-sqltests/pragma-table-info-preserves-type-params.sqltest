@@ -1,0 +1,55 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/5762
+# PRAGMA table_info must report the declared column type exactly as written,
+# including parenthesized size parameters, matching SQLite.
+
+test table-info-keeps-size-params {
+    CREATE TABLE t(
+        a VARCHAR(100),
+        b CHAR(50),
+        c DECIMAL(10,2),
+        d NUMERIC(5,3),
+        e FLOAT(24),
+        f NVARCHAR(200)
+    );
+    SELECT name, type FROM pragma_table_info('t');
+}
+expect {
+    a|VARCHAR(100)
+    b|CHAR(50)
+    c|DECIMAL(10,2)
+    d|NUMERIC(5,3)
+    e|FLOAT(24)
+    f|NVARCHAR(200)
+}
+
+test table-info-no-params-stays-bare {
+    CREATE TABLE t2(x INTEGER, y TEXT);
+    SELECT name, type FROM pragma_table_info('t2');
+}
+expect {
+    x|INTEGER
+    y|TEXT
+}
+
+test add-column-keeps-size-params {
+    CREATE TABLE t3(x TEXT);
+    ALTER TABLE t3 ADD COLUMN y DECIMAL(10,2);
+    SELECT name, type FROM pragma_table_info('t3');
+}
+expect {
+    x|TEXT
+    y|DECIMAL(10,2)
+}
+
+# Values inserted into parameterized columns keep normal type affinity.
+test affinity-unchanged-by-size-params {
+    CREATE TABLE t4(v VARCHAR(100));
+    INSERT INTO t4 VALUES ('abc'), (123);
+    SELECT typeof(v) FROM t4 ORDER BY rowid;
+}
+expect {
+    text
+    text
+}
