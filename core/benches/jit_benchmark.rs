@@ -1,10 +1,14 @@
-//! Interpreter-vs-JIT benchmarks on TPC-H-shaped queries.
+//! Interpreter-vs-JIT benchmarks on TPC-H-shaped scans and OLTP-style
+//! statement shapes.
 //!
 //! The dataset is generated in memory, so unlike the tpc_h_benchmark this
 //! runs on CodSpeed. Each query is measured twice on identical data: once on
 //! a connection with the JIT disabled and once with it enabled, so the two
-//! benchmark series track the interpreter and the JIT independently. Without
-//! the `jit` feature both series measure the interpreter.
+//! benchmark series track the interpreter and the JIT independently, and the
+//! jit-vs-interp delta within one run is the query-time effect of the JIT.
+//! Prepare (and for the reused group, eager compilation) always happens
+//! outside the measured region, so no series includes prepare or compile
+//! latency. Without the `jit` feature both series measure the interpreter.
 
 use std::sync::Arc;
 
@@ -17,6 +21,7 @@ use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion, Samp
 use turso_core::{Database, MemoryIO, SqliteDialect, StepResult};
 
 const ROW_COUNT: usize = 100_000;
+const ORDER_COUNT: usize = 25_000;
 
 fn setup() -> (Arc<Database>, Arc<turso_core::Connection>) {
     let io = Arc::new(MemoryIO::new());
@@ -36,6 +41,37 @@ fn setup() -> (Arc<Database>, Arc<turso_core::Connection>) {
                     CASE (x * 11) % 3 WHEN 0 THEN 'A' WHEN 1 THEN 'N' ELSE 'R' END, \
                     CASE (x * 5) % 2 WHEN 0 THEN 'F' ELSE 'O' END, \
                     printf('19%02d-%02d-%02d', 92 + (x % 7), 1 + (x * 5) % 12, 1 + (x * 9) % 28) \
+             FROM g"
+        ),
+    );
+    run_all(
+        &db,
+        &conn,
+        "CREATE TABLE orders(orderkey INTEGER PRIMARY KEY, custkey INT, orderdate TEXT)",
+    );
+    run_all(
+        &db,
+        &conn,
+        &format!(
+            "WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < {ORDER_COUNT}) \
+             INSERT INTO orders \
+             SELECT x, (x * 17) % 1000, \
+                    printf('19%02d-%02d-%02d', 94 + (x % 2), 1 + (x * 7) % 12, 1 + (x * 3) % 28) \
+             FROM g"
+        ),
+    );
+    run_all(
+        &db,
+        &conn,
+        "CREATE TABLE orderitem(orderkey INT, amount REAL, qty REAL)",
+    );
+    run_all(
+        &db,
+        &conn,
+        &format!(
+            "WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < {ROW_COUNT}) \
+             INSERT INTO orderitem \
+             SELECT x % {ORDER_COUNT} + 1, ((x * 937) % 90000) / 100.0 + 100.0, (x * 7) % 50 + 1 \
              FROM g"
         ),
     );
@@ -76,6 +112,25 @@ fn bench_queries(criterion: &mut Criterion) {
              WHERE shipdate >= '1994-01-01' AND shipdate < '1995-01-01' \
              AND discount BETWEEN 0.03 AND 0.05 AND quantity < 24",
         ),
+        (
+            "q14_conditional_agg",
+            "SELECT 100.0 * sum(CASE WHEN returnflag = 'A' \
+             THEN extendedprice * (1 - discount) ELSE 0 END) / \
+             sum(extendedprice * (1 - discount)) FROM lineitem \
+             WHERE shipdate >= '1995-09-01' AND shipdate < '1995-10-01'",
+        ),
+        (
+            "top100_by_price",
+            "SELECT quantity, extendedprice FROM lineitem \
+             WHERE discount > 0.05 ORDER BY extendedprice DESC LIMIT 100",
+        ),
+        (
+            "join_daily_revenue",
+            "SELECT o.orderdate, sum(i.amount * i.qty) AS revenue \
+             FROM orderitem i JOIN orders o ON i.orderkey = o.orderkey \
+             WHERE o.orderdate >= '1995-01-01' \
+             GROUP BY o.orderdate ORDER BY revenue DESC LIMIT 10",
+        ),
     ];
     let (db, conn) = setup();
     for (name, sql) in queries {
@@ -114,14 +169,17 @@ fn bench_queries(criterion: &mut Criterion) {
 /// Steady-state execution of short statements that an application prepares
 /// once and reuses for its lifetime — the shape `Statement::jit_compile`
 /// exists for. Prepare and eager compilation happen outside the measurement;
-/// each iteration runs a batch of executions with fresh bindings.
+/// each iteration runs a batch of executions with fresh bindings. The
+/// point_update case keeps a write shape in the mix: its program contains
+/// opcodes the JIT does not specialize, so it mostly guards that the JIT
+/// never hurts short autocommit writes.
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_reused_statements(criterion: &mut Criterion) {
     use std::num::NonZero;
     use turso_core::{Numeric, Value};
 
     let (db, conn) = setup();
-    let cases: [(&str, &str, u64, usize); 2] = [
+    let cases: [(&str, &str, u64, usize); 3] = [
         (
             "point_lookup",
             "SELECT quantity, extendedprice FROM lineitem WHERE rowid = ?",
@@ -134,6 +192,12 @@ fn bench_reused_statements(criterion: &mut Criterion) {
              WHERE rowid BETWEEN ? AND ?",
             2,
             32,
+        ),
+        (
+            "point_update",
+            "UPDATE lineitem SET quantity = quantity + 1 WHERE rowid = ?",
+            1,
+            256,
         ),
     ];
     for (name, sql, params, batch) in cases {
