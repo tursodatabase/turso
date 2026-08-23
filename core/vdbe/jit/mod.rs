@@ -627,8 +627,12 @@ impl CmpCacheSlot {
         self.len as usize == text.len() && &self.bytes[..text.len()] == text
     }
 
-    fn store(&mut self, text: &[u8]) {
-        if text.len() <= Self::CAP {
+    /// First failed text claims the slot; later different texts (a column
+    /// operand producing fresh values every row) leave it alone, so the
+    /// constant operand's entry is never churned away and misses cost only
+    /// the length check.
+    fn store_if_empty(&mut self, text: &[u8]) {
+        if self.len == Self::EMPTY && text.len() <= Self::CAP {
             self.len = text.len() as u32;
             self.bytes[..text.len()].copy_from_slice(text);
         }
@@ -661,7 +665,7 @@ fn cached_numeric_attempt<'a>(
     match crate::vdbe::affinity::apply_numeric_affinity(text, false) {
         Some(converted) => Some(converted),
         None => {
-            slot.store(bytes);
+            slot.store_if_empty(bytes);
             None
         }
     }
@@ -1982,6 +1986,86 @@ mod tests {
             let jitted = run_to_completion(&db, &conn, sql, true);
             assert_eq!(interpreted, jitted, "row mismatch for query: {sql}");
         }
+    }
+
+    /// The eager compile API: skips hotness gates, is best-effort, and the
+    /// statement produces identical rows compiled or not.
+    #[test]
+    fn statement_jit_compile_is_eager_and_best_effort() {
+        if !runtime_enabled() {
+            return;
+        }
+        let (db, conn) = memory_db();
+        run_to_completion(&db, &conn, "CREATE TABLE t(a INTEGER, b TEXT)", false);
+        run_to_completion(
+            &db,
+            &conn,
+            "INSERT INTO t SELECT x, 'v' || x FROM (WITH RECURSIVE g(x) AS \
+             (SELECT 1 UNION ALL SELECT x+1 FROM g WHERE x < 50) SELECT x FROM g)",
+            false,
+        );
+        let sql = "SELECT b FROM t WHERE a BETWEEN ? AND ? ORDER BY a";
+        let interpreted = {
+            conn.set_jit_enabled(false);
+            let mut stmt = conn.prepare(sql).unwrap();
+            assert!(
+                !stmt.jit_compile().unwrap(),
+                "jit_compile must be a no-op on a jit-disabled connection"
+            );
+            conn.set_jit_enabled(true);
+            bind_range_and_collect(&db, &mut stmt, 10, 20)
+        };
+        let mut stmt = conn.prepare(sql).unwrap();
+        let compiled = stmt.jit_compile().unwrap();
+        if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            assert!(compiled, "eager compile must work on supported platforms");
+        }
+        // Second call is idempotent.
+        assert_eq!(stmt.jit_compile().unwrap(), compiled);
+        let jitted = bind_range_and_collect(&db, &mut stmt, 10, 20);
+        assert_eq!(interpreted, jitted);
+    }
+
+    fn bind_range_and_collect(
+        db: &Arc<Database>,
+        stmt: &mut crate::Statement,
+        lo: i64,
+        hi: i64,
+    ) -> Vec<String> {
+        use crate::numeric::Numeric;
+        use crate::types::Value;
+        use std::num::NonZero;
+        stmt.reset().unwrap();
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::Numeric(Numeric::Integer(lo)),
+        )
+        .unwrap();
+        stmt.bind_at(
+            NonZero::new(2).unwrap(),
+            Value::Numeric(Numeric::Integer(hi)),
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    rows.push(
+                        row.get_values()
+                            .map(|v| format!("{v:?}"))
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    );
+                }
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    db.io.step().unwrap();
+                }
+                StepResult::Done => break,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        rows
     }
 
     /// Programs with subprogram instructions (triggers) must refuse to

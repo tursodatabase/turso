@@ -1349,6 +1349,34 @@ impl Statement {
         Ok(())
     }
 
+    /// Compile this statement to native code now instead of waiting for the
+    /// JIT's hotness heuristics. By calling this the application asserts the
+    /// statement will be reused enough to repay the compile (typically:
+    /// prepared during initialization and executed for the process
+    /// lifetime), so the reuse and execution-length gates are skipped.
+    ///
+    /// Best effort: returns Ok(true) once compiled code exists for this
+    /// statement, and Ok(false) when it stays interpreted — the `jit`
+    /// feature is not compiled in, the JIT is disabled for this connection,
+    /// the platform has no JIT support, or the program contains
+    /// instructions the JIT does not cover. Never fails for "won't
+    /// compile"; execution is identical either way.
+    pub fn jit_compile(&mut self) -> Result<bool> {
+        #[cfg(feature = "jit")]
+        {
+            if !self.program.connection.jit_enabled() {
+                return Ok(false);
+            }
+            let compiled =
+                self.program.prepared().jit_code.get_or_init(|| {
+                    crate::vdbe::jit::compile(&self.program).map(std::sync::Arc::new)
+                });
+            Ok(compiled.is_some())
+        }
+        #[cfg(not(feature = "jit"))]
+        Ok(false)
+    }
+
     /// Returns the SQL text with every parameter marker replaced by the
     /// literal of its currently bound value (NULL when unbound), following
     /// SQLite's sqlite3_expanded_sql rendering. The text is re-tokenized

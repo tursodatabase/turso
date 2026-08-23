@@ -111,10 +111,87 @@ fn bench_queries(criterion: &mut Criterion) {
     }
 }
 
+/// Steady-state execution of short statements that an application prepares
+/// once and reuses for its lifetime — the shape `Statement::jit_compile`
+/// exists for. Prepare and eager compilation happen outside the measurement;
+/// each iteration runs a batch of executions with fresh bindings.
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_reused_statements(criterion: &mut Criterion) {
+    use std::num::NonZero;
+    use turso_core::{Numeric, Value};
+
+    let (db, conn) = setup();
+    let cases: [(&str, &str, u64, usize); 2] = [
+        (
+            "point_lookup",
+            "SELECT quantity, extendedprice FROM lineitem WHERE rowid = ?",
+            1,
+            256,
+        ),
+        (
+            "small_agg",
+            "SELECT count(*), sum(extendedprice * discount) FROM lineitem \
+             WHERE rowid BETWEEN ? AND ?",
+            2,
+            32,
+        ),
+    ];
+    for (name, sql, params, batch) in cases {
+        let mut group = criterion.benchmark_group(format!("JIT reused `{name}`"));
+        group.sampling_mode(SamplingMode::Flat);
+        group.sample_size(10);
+        for (label, jit) in [("interp", false), ("jit", true)] {
+            conn.set_jit_enabled(jit);
+            let mut stmt = conn.prepare(sql).unwrap();
+            if jit {
+                // Eager compilation is part of setup, like prepare itself.
+                let _ = stmt.jit_compile().unwrap();
+            }
+            let mut key = 0u64;
+            group.bench_function(label, |b| {
+                b.iter(|| {
+                    let mut rows = 0u64;
+                    for _ in 0..batch {
+                        // Weyl-style walk over the table's rowids.
+                        key = key.wrapping_add(0x9E3779B97F4A7C15);
+                        let start = (key % (ROW_COUNT as u64 - 200)) as i64 + 1;
+                        stmt.reset().unwrap();
+                        stmt.bind_at(
+                            NonZero::new(1).unwrap(),
+                            Value::Numeric(Numeric::Integer(start)),
+                        )
+                        .unwrap();
+                        if params > 1 {
+                            stmt.bind_at(
+                                NonZero::new(2).unwrap(),
+                                Value::Numeric(Numeric::Integer(start + 127)),
+                            )
+                            .unwrap();
+                        }
+                        loop {
+                            match stmt.step().unwrap() {
+                                StepResult::Row => rows += 1,
+                                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                                    db.io.step().unwrap();
+                                }
+                                StepResult::Done => break,
+                                other => panic!("unexpected step result {other:?}"),
+                            }
+                        }
+                    }
+                    rows
+                });
+            });
+        }
+        conn.set_jit_enabled(true);
+        group.finish();
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_queries
+    targets = bench_queries, bench_reused_statements
 }
 
 criterion_main!(benches);
