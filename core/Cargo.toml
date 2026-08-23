@@ -283,6 +283,10 @@ name = "prepare_benchmark"
 harness = false
 
 [[bench]]
+name = "import_prepare_reuse_benchmark"
+harness = false
+
+[[bench]]
 name = "record_recycling"
 harness = false
 

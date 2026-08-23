@@ -272,6 +272,28 @@ def test_import_csv_create_table_from_header():
     shell.quit()
 
 
+def test_import_csv_multi_batch():
+    shell = TestTursoShell()
+    shell.run_test("open-memory", ".open :memory:", "")
+    shell.run_test("create-multi-batch-table", "CREATE TABLE multi_batch_table (id INT, val INT);", "")
+    shell.run_test(
+        "import-csv-multi-batch",
+        ".import --csv -v ./testing/cli_tests/test_files/test_multi_batch.csv multi_batch_table",
+        "Added 2500 rows with 0 errors using 2500 lines of input",
+    )
+    shell.run_test(
+        "verify-multi-batch-count",
+        "select count(*) from multi_batch_table;",
+        "2500",
+    )
+    shell.run_test(
+        "verify-multi-batch-boundaries",
+        "select id, val from multi_batch_table where id in (1, 1000, 1001, 2000, 2001, 2500) order by id;",
+        "1|2\n1000|2000\n1001|2002\n2000|4000\n2001|4002\n2500|5000",
+    )
+    shell.quit()
+
+
 def test_table_patterns():
     shell = TestTursoShell()
     shell.run_test("tables-pattern", ".tables us%", "users")
@@ -540,6 +562,7 @@ def main():
     test_import_csv_verbose()
     test_import_csv_skip()
     test_import_csv_create_table_from_header()
+    test_import_csv_multi_batch()
     test_table_patterns()
     test_update_delete_reject_limit()
     test_uri_readonly()
