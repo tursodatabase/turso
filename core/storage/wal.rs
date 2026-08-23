@@ -2682,7 +2682,7 @@ pub struct WalFile {
     coordination: Arc<dyn WalCoordination>,
 
     syncing: Arc<AtomicBool>,
-    write_lock_held: AtomicBool,
+    writer_guard: RwLock<Option<WalWriterGuard>>,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
     checkpoint_threshold: usize,
@@ -3054,6 +3054,20 @@ impl Drop for CheckpointLocks {
     }
 }
 
+enum WalWriterGuard {
+    Coordination(Arc<dyn WalCoordination>),
+    Local(Arc<RwLock<WalFileShared>>),
+}
+
+impl Drop for WalWriterGuard {
+    fn drop(&mut self) {
+        match self {
+            Self::Coordination(coordination) => coordination.end_write_tx(),
+            Self::Local(shared) => shared.read().runtime.write_lock.unlock(),
+        }
+    }
+}
+
 /// Result of try_begin_read_tx - either success or a retriable condition.
 enum TryBeginReadResult {
     /// Successfully started read transaction, returns whether DB changed
@@ -3219,6 +3233,18 @@ impl WalFile {
         drop(guard);
     }
 
+    fn install_writer_guard(&self, guard: WalWriterGuard) {
+        let mut slot = self.writer_guard.write();
+        turso_assert!(slot.is_none(), "WAL writer guard is already installed");
+        *slot = Some(guard);
+    }
+
+    fn release_writer_guard(&self) {
+        let guard = self.writer_guard.write().take();
+        turso_assert!(guard.is_some(), "WAL writer guard is not held");
+        drop(guard);
+    }
+
     /// Try to begin a read transaction. Returns Retry for transient conditions
     /// that should be retried immediately, Ok for success.
     fn try_begin_read_tx(&self) -> TryBeginReadResult {
@@ -3374,53 +3400,30 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<()> {
         tracing::debug!("begin_write_tx");
-        let begin_write_result: Result<()> = {
-            // sqlite/src/wal.c 3702
-            // Cannot start a write transaction without first holding a read
-            // transaction.
-            // assert(pWal->readLock >= 0);
-            // assert(pWal->writeLock == 0 && pWal->iReCksum == 0);
-            turso_assert!(
-                self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
-                "must have a read transaction to begin a write transaction"
-            );
-            turso_assert!(
-                !self.holds_write_lock(),
-                "write lock already held by this connection"
-            );
-            if !self.coordination.try_begin_write_tx() {
-                return Err(LimboError::Busy);
-            }
-            let db_changed =
-                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
-            if db_changed {
-                // Snapshot is stale, give up and let caller retry from scratch.
-                // Return BusySnapshot instead of Busy so the caller knows it must
-                // restart the read transaction to get a fresh snapshot.
-                // Retrying with busy_timeout will NEVER HELP.
-                tracing::debug!(
-                    "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
-                    self.max_frame.load(Ordering::Acquire),
-                    self.load_coordination_snapshot().max_frame
-                );
-                self.coordination.end_write_tx();
-                return Err(LimboError::BusySnapshot);
-            }
-
-            Ok(())
-        };
-        begin_write_result?;
-        if self
-            .write_lock_held
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            self.coordination.end_write_tx();
-            turso_assert!(
-                false,
-                "begin_write_tx called while write lock already held according to connection state"
-            );
+        // sqlite/src/wal.c 3702: a writer must already hold a read transaction.
+        turso_assert!(
+            self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
+            "must have a read transaction to begin a write transaction"
+        );
+        turso_assert!(
+            !self.holds_write_lock(),
+            "write lock already held by this connection"
+        );
+        if !self.coordination.try_begin_write_tx() {
+            return Err(LimboError::Busy);
         }
+
+        let writer_guard = WalWriterGuard::Coordination(self.coordination.clone());
+        let shared_snapshot = self.load_coordination_snapshot();
+        if self.db_changed_against(shared_snapshot, self.connection_state()) {
+            tracing::debug!(
+                "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
+                self.max_frame.load(Ordering::Acquire),
+                shared_snapshot.max_frame
+            );
+            return Err(LimboError::BusySnapshot);
+        }
+        self.install_writer_guard(writer_guard);
 
         if !allowed_auto_actions.contains(WalAutoActions::Restart) {
             return Ok(());
@@ -3432,14 +3435,7 @@ impl Wal for WalFile {
             return Ok(());
         }
 
-        // don't forget to release the write-lock if
-        self.coordination.end_write_tx();
-        turso_assert!(
-            self.write_lock_held
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "end_write_tx called while write lock not held according to connection state"
-        );
+        self.release_writer_guard();
 
         Err(result.expect_err("Ok case handled above"))
     }
@@ -3447,13 +3443,7 @@ impl Wal for WalFile {
     /// End a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
-        turso_assert!(
-            self.write_lock_held
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "end_write_tx called while write lock not held according to connection state"
-        );
-        self.coordination.end_write_tx();
+        self.release_writer_guard();
     }
 
     /// Returns true if this WAL instance currently holds a read lock.
@@ -3463,7 +3453,7 @@ impl Wal for WalFile {
 
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool {
-        self.write_lock_held.load(Ordering::Acquire)
+        self.writer_guard.read().is_some()
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -4195,16 +4185,7 @@ impl Wal for WalFile {
             self.with_shared(|shared| shared.runtime.write_lock.write()),
             "begin_vacuum_blocking_tx: write lock held after VACUUM lock acquired"
         );
-        if self
-            .write_lock_held
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            turso_assert!(
-                false,
-                "begin_vacuum_blocking_tx: write_lock_held already set"
-            );
-        }
+        self.install_writer_guard(WalWriterGuard::Local(self.coordination.shared_wal_state()));
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         Ok(())
     }
@@ -4703,7 +4684,7 @@ impl WalFile {
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
-            write_lock_held: AtomicBool::new(false),
+            writer_guard: RwLock::new(None),
             vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
