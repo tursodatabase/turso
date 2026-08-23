@@ -888,6 +888,11 @@ pub struct ProgramState {
     /// never qualify.
     #[cfg(feature = "jit")]
     pub(crate) jit_next_compile_check: u64,
+    /// Per-comparison-site caches of texts known not to convert under
+    /// numeric affinity. Content-keyed, so entries can never go stale;
+    /// grown on demand by the JIT's comparison helper.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_cmp_caches: Vec<jit::CmpCacheSlot>,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
     /// arriving during Halt's resumable work (staging index-method writes,
@@ -1002,6 +1007,8 @@ impl ProgramState {
             jit_steps_at_execution_start: 0,
             #[cfg(feature = "jit")]
             jit_next_compile_check: 0,
+            #[cfg(feature = "jit")]
+            jit_cmp_caches: Vec::new(),
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),

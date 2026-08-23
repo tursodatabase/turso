@@ -398,6 +398,9 @@ const SPEC_FALL: u32 = 0;
 const SPEC_JUMP: u32 = 1;
 /// A result (an error) was stored in `state.jit_exit_result`.
 const SPEC_RESULT: u32 = 2;
+/// The helper does not cover this case; run the generic wrapper instead.
+/// The helper must not have modified any state before returning this.
+const SPEC_BAIL: u32 = 3;
 
 /// How the generated code should call an instruction's specialized helper.
 /// `name` must be registered in [`SPEC_HELPERS`].
@@ -406,6 +409,12 @@ struct SpecCall {
     args: [u64; 3],
     /// Static branch target for helpers that can return SPEC_JUMP.
     jump_target: Option<u32>,
+    /// Whether the helper may return SPEC_BAIL, in which case the generated
+    /// code re-runs the instruction through the generic wrapper.
+    can_bail: bool,
+    /// Reserves a comparison cache site; `compile` patches the site index
+    /// into args[2].
+    needs_cmp_site: bool,
 }
 
 /// Mirrors the interpreter loop: every attempt counts as a VM step.
@@ -598,6 +607,227 @@ extern "C-unwind" fn spec_agg_step(
     }
 }
 
+/// Per-site cache of a text value known not to convert under numeric
+/// affinity, so repeated comparisons against the same non-numeric text (a
+/// date-string constant, most commonly) skip the failed parse each row.
+/// Content-keyed, so buffer reuse or register rewrites can never produce a
+/// stale hit; lives in the ProgramState, so concurrent executions of one
+/// program never share it.
+#[derive(Clone)]
+pub(crate) struct CmpCacheSlot {
+    len: u32,
+    bytes: [u8; Self::CAP],
+}
+
+impl CmpCacheSlot {
+    const CAP: usize = 24;
+    const EMPTY: u32 = u32::MAX;
+
+    fn matches(&self, text: &[u8]) -> bool {
+        self.len as usize == text.len() && &self.bytes[..text.len()] == text
+    }
+
+    fn store(&mut self, text: &[u8]) {
+        if text.len() <= Self::CAP {
+            self.len = text.len() as u32;
+            self.bytes[..text.len()].copy_from_slice(text);
+        }
+    }
+}
+
+impl Default for CmpCacheSlot {
+    fn default() -> Self {
+        Self {
+            len: Self::EMPTY,
+            bytes: [0; Self::CAP],
+        }
+    }
+}
+
+/// Numeric-affinity conversion attempt for one comparison operand, memoized
+/// for texts that are known not to convert.
+#[inline]
+fn cached_numeric_attempt<'a>(
+    slot: &mut CmpCacheSlot,
+    text: crate::types::ValueRef<'a>,
+) -> Option<crate::types::ValueRef<'a>> {
+    let crate::types::ValueRef::Text(t) = text else {
+        return None;
+    };
+    let bytes = t.as_str().as_bytes();
+    if slot.matches(bytes) {
+        return None;
+    }
+    match crate::vdbe::affinity::apply_numeric_affinity(text, false) {
+        Some(converted) => Some(converted),
+        None => {
+            slot.store(bytes);
+            None
+        }
+    }
+}
+
+/// `Insn::Eq`..`Insn::Ge` with binary collation and no array comparison:
+/// handles NULLs, numeric-numeric and text-text operands exactly like
+/// `op_comparison` (including writing converted values back to the
+/// registers), and bails to the generic wrapper for everything else.
+extern "C-unwind" fn spec_cmp(
+    _program: *const Program,
+    state: *mut ProgramState,
+    regs: u64,
+    packed: u64,
+    site: u64,
+) -> u32 {
+    use crate::translate::collate::CollationSeq;
+    use crate::types::{AsValueRef, Value};
+    use crate::vdbe::value::ComparisonOp;
+
+    enum Outcome {
+        Bail,
+        Jump(bool),
+        JumpWriteBack {
+            jump: bool,
+            lhs: Option<Value>,
+            rhs: Option<Value>,
+        },
+        Error(crate::LimboError),
+    }
+
+    let state = unsafe { &mut *state };
+    let (lhs, rhs) = ((regs & 0xffff_ffff) as usize, (regs >> 32) as usize);
+    let op = match packed & 0x7 {
+        0 => ComparisonOp::Eq,
+        1 => ComparisonOp::Ne,
+        2 => ComparisonOp::Lt,
+        3 => ComparisonOp::Le,
+        4 => ComparisonOp::Gt,
+        _ => ComparisonOp::Ge,
+    };
+    let null_eq = packed & 0x8 != 0;
+    let jump_if_null = packed & 0x10 != 0;
+    let numeric_affinity = packed & 0x20 != 0;
+    let text_affinity = packed & 0x40 != 0;
+    let collation = CollationSeq::Binary;
+
+    // Grow the cache before borrowing registers; sites are compile-time
+    // constants, so this settles after the first execution.
+    let cache_base = site as usize * 2;
+    if numeric_affinity && state.jit_cmp_caches.len() < cache_base + 2 {
+        state
+            .jit_cmp_caches
+            .resize(cache_base + 2, Default::default());
+    }
+
+    let outcome = {
+        let lhs_value = state.registers[lhs].get_value();
+        let rhs_value = state.registers[rhs].get_value();
+
+        // Mirrors op_comparison's match order exactly.
+        match (lhs_value, rhs_value) {
+            (Value::Null, _) | (_, Value::Null) => {
+                let jump = if null_eq {
+                    let order = crate::types::compare_immutable_single(
+                        lhs_value.as_value_ref(),
+                        rhs_value.as_value_ref(),
+                        collation,
+                    );
+                    comparison_matches_order_jit(op, order)
+                } else {
+                    jump_if_null
+                };
+                Outcome::Jump(jump)
+            }
+            (
+                Value::Numeric(crate::numeric::Numeric::Integer(_)),
+                Value::Numeric(crate::numeric::Numeric::Integer(_)),
+            ) => Outcome::Jump(op.compare(lhs_value, rhs_value, collation)),
+            (Value::Numeric(_), Value::Numeric(_)) if !text_affinity => {
+                // Numeric and no-op affinities leave numerics untouched
+                // (convert_for_compare returns None for both sides).
+                Outcome::Jump(op.compare(lhs_value, rhs_value, collation))
+            }
+            (Value::Text(_), Value::Text(_)) if !text_affinity => {
+                let (l_conv, r_conv) = if numeric_affinity {
+                    let [l_slot, r_slot] = state
+                        .jit_cmp_caches
+                        .get_disjoint_mut([cache_base, cache_base + 1])
+                        .expect("distinct cache slots");
+                    (
+                        cached_numeric_attempt(l_slot, lhs_value.as_value_ref()),
+                        cached_numeric_attempt(r_slot, rhs_value.as_value_ref()),
+                    )
+                } else {
+                    (None, None)
+                };
+                let jump = op.compare(
+                    l_conv.unwrap_or_else(|| lhs_value.as_value_ref()),
+                    r_conv.unwrap_or_else(|| rhs_value.as_value_ref()),
+                    collation,
+                );
+                // Mirror op_comparison: converted operands replace the
+                // register contents.
+                let owned = |conv: Option<crate::types::ValueRef<'_>>| match conv {
+                    None => Ok(None),
+                    Some(v) => v.to_owned().map(Some),
+                };
+                match (owned(l_conv), owned(r_conv)) {
+                    (Ok(l), Ok(r)) => Outcome::JumpWriteBack {
+                        jump,
+                        lhs: l,
+                        rhs: r,
+                    },
+                    (Err(e), _) | (_, Err(e)) => Outcome::Error(e.into()),
+                }
+            }
+            // Mixed shapes (text vs numeric, blobs, ...) are rarer and often
+            // transient thanks to the write-back above; keep them generic.
+            _ => Outcome::Bail,
+        }
+    };
+
+    match outcome {
+        Outcome::Bail => SPEC_BAIL,
+        Outcome::Jump(jump) => {
+            spec_count_attempt(state);
+            spec_completed(state, if jump { SPEC_JUMP } else { SPEC_FALL })
+        }
+        Outcome::JumpWriteBack {
+            jump,
+            lhs: l,
+            rhs: r,
+        } => {
+            spec_count_attempt(state);
+            if let Some(l) = l {
+                state.registers[lhs].set_value(l);
+            }
+            if let Some(r) = r {
+                state.registers[rhs].set_value(r);
+            }
+            spec_completed(state, if jump { SPEC_JUMP } else { SPEC_FALL })
+        }
+        Outcome::Error(err) => {
+            spec_count_attempt(state);
+            spec_store_error(state, err)
+        }
+    }
+}
+
+/// Same as execute::comparison_matches_order, private there.
+fn comparison_matches_order_jit(
+    op: crate::vdbe::value::ComparisonOp,
+    order: std::cmp::Ordering,
+) -> bool {
+    use crate::vdbe::value::ComparisonOp;
+    match op {
+        ComparisonOp::Eq => order.is_eq(),
+        ComparisonOp::Ne => !order.is_eq(),
+        ComparisonOp::Lt => order.is_lt(),
+        ComparisonOp::Le => order.is_le(),
+        ComparisonOp::Gt => order.is_gt(),
+        ComparisonOp::Ge => order.is_ge(),
+    }
+}
+
 /// Chooses a specialized helper for an instruction, or None to use the
 /// generic wrapper. Only instructions whose full semantics the helpers
 /// reproduce may be specialized; branch targets must be resolved offsets and
@@ -611,7 +841,7 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
         }
     };
     debug_assert!(
-        SPEC_HELPERS.len() == 9,
+        SPEC_HELPERS.len() == 10,
         "keep SPEC_HELPERS in sync with specialize()"
     );
     let spec = match insn {
@@ -619,6 +849,8 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             name: "spec_integer",
             args: [*value as u64, *dest as u64, 0],
             jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
         },
         Insn::Copy {
             src_reg,
@@ -628,6 +860,8 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             name: "spec_copy",
             args: [*src_reg as u64, *dst_reg as u64, *extra_amount as u64],
             jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
         },
         Insn::Move {
             source_reg,
@@ -637,21 +871,29 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             name: "spec_move",
             args: [*source_reg as u64, *dest_reg as u64, *count as u64],
             jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
         },
         Insn::Add { lhs, rhs, dest } if fall_ok => SpecCall {
             name: "spec_add",
             args: [*lhs as u64, *rhs as u64, *dest as u64],
             jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
         },
         Insn::Subtract { lhs, rhs, dest } if fall_ok => SpecCall {
             name: "spec_subtract",
             args: [*lhs as u64, *rhs as u64, *dest as u64],
             jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
         },
         Insn::Multiply { lhs, rhs, dest } if fall_ok => SpecCall {
             name: "spec_multiply",
             args: [*lhs as u64, *rhs as u64, *dest as u64],
             jump_target: None,
+            can_bail: false,
+            needs_cmp_site: false,
         },
         Insn::If {
             reg,
@@ -661,6 +903,8 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             name: "spec_if",
             args: [*reg as u64, u64::from(*jump_if_null), 0],
             jump_target: Some(target_of(target_pc)?),
+            can_bail: false,
+            needs_cmp_site: false,
         },
         Insn::IfNot {
             reg,
@@ -670,6 +914,8 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             name: "spec_if",
             args: [*reg as u64, u64::from(*jump_if_null), 1],
             jump_target: Some(target_of(target_pc)?),
+            can_bail: false,
+            needs_cmp_site: false,
         },
         Insn::IfPos {
             reg,
@@ -679,7 +925,86 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
             name: "spec_if_pos",
             args: [*reg as u64, *decrement_by as u64, 0],
             jump_target: Some(target_of(target_pc)?),
+            can_bail: false,
+            needs_cmp_site: false,
         },
+        Insn::Eq { .. }
+        | Insn::Ne { .. }
+        | Insn::Lt { .. }
+        | Insn::Le { .. }
+        | Insn::Gt { .. }
+        | Insn::Ge { .. }
+            if fall_ok =>
+        {
+            let (lhs, rhs, target_pc, flags, collation, op_code) = match insn {
+                Insn::Eq {
+                    lhs,
+                    rhs,
+                    target_pc,
+                    flags,
+                    collation,
+                } => (lhs, rhs, target_pc, flags, collation, 0u64),
+                Insn::Ne {
+                    lhs,
+                    rhs,
+                    target_pc,
+                    flags,
+                    collation,
+                } => (lhs, rhs, target_pc, flags, collation, 1),
+                Insn::Lt {
+                    lhs,
+                    rhs,
+                    target_pc,
+                    flags,
+                    collation,
+                } => (lhs, rhs, target_pc, flags, collation, 2),
+                Insn::Le {
+                    lhs,
+                    rhs,
+                    target_pc,
+                    flags,
+                    collation,
+                } => (lhs, rhs, target_pc, flags, collation, 3),
+                Insn::Gt {
+                    lhs,
+                    rhs,
+                    target_pc,
+                    flags,
+                    collation,
+                } => (lhs, rhs, target_pc, flags, collation, 4),
+                Insn::Ge {
+                    lhs,
+                    rhs,
+                    target_pc,
+                    flags,
+                    collation,
+                } => (lhs, rhs, target_pc, flags, collation, 5),
+                _ => unreachable!(),
+            };
+            use crate::translate::collate::CollationSeq;
+            use crate::vdbe::affinity::Affinity;
+            if !matches!(collation.unwrap_or_default(), CollationSeq::Binary)
+                || flags.has_array_cmp()
+            {
+                return None;
+            }
+            let affinity = flags.get_affinity();
+            let packed = op_code
+                | u64::from(flags.has_nulleq()) << 3
+                | u64::from(flags.has_jump_if_null()) << 4
+                | u64::from(matches!(
+                    affinity,
+                    Affinity::Numeric | Affinity::Integer | Affinity::Real
+                )) << 5
+                | u64::from(matches!(affinity, Affinity::Text)) << 6;
+            SpecCall {
+                name: "spec_cmp",
+                args: [(*lhs as u64) | ((*rhs as u64) << 32), packed, 0],
+                jump_target: Some(target_of(target_pc)?),
+                can_bail: true,
+                needs_cmp_site: true,
+            }
+        }
         Insn::AggStep { data } if fall_ok => {
             // Window functions route through different state handling; keep
             // them on the generic path.
@@ -690,6 +1015,8 @@ fn specialize(insn: &Insn, pc: u32, insn_count: usize) -> Option<SpecCall> {
                 name: "spec_agg_step",
                 args: [data.as_ref() as *const _ as usize as u64, 0, 0],
                 jump_target: None,
+                can_bail: false,
+                needs_cmp_site: false,
             }
         }
         _ => return None,
@@ -708,6 +1035,7 @@ const SPEC_HELPERS: &[(&str, SpecHelperFn)] = &[
     ("spec_if", spec_if),
     ("spec_if_pos", spec_if_pos),
     ("spec_agg_step", spec_agg_step),
+    ("spec_cmp", spec_cmp),
 ];
 
 /// Panics when called from generated code; used by the unwind test below.
@@ -1042,11 +1370,20 @@ pub fn compile(program: &Program) -> Option<JitCode> {
     spec_sig.returns.push(AbiParam::new(types::I32));
 
     // Pick specialized helpers up front and declare the ones in use.
-    let specs: Vec<Option<SpecCall>> = insns
+    let mut specs: Vec<Option<SpecCall>> = insns
         .iter()
         .enumerate()
         .map(|(pc, (insn, _))| specialize(insn, pc as u32, insns.len()))
         .collect();
+    // Assign each comparison site its cache index.
+    let mut cmp_sites = 0u64;
+    for spec in specs.iter_mut().flatten() {
+        if spec.needs_cmp_site {
+            spec.args[2] = cmp_sites;
+            cmp_sites += 1;
+        }
+    }
+    let specs = specs;
     let mut spec_ids: std::collections::HashMap<&'static str, FuncId> =
         std::collections::HashMap::new();
     for spec in specs.iter().flatten() {
@@ -1184,21 +1521,20 @@ pub fn compile(program: &Program) -> Option<JitCode> {
                 let code = fb.inst_results(call)[0];
 
                 let fall_block = insn_blocks[pc as usize + 1];
+                // Bailing helpers re-run the instruction through the generic
+                // wrapper, emitted below in this same iteration.
+                let generic_block = spec.can_bail.then(|| fb.create_block());
                 match spec.jump_target {
                     None => {
                         // SPEC_FALL falls through; anything else stored a
-                        // result.
-                        let result_block = fb.create_block();
+                        // result (fall-only helpers never bail).
                         fb.ins().brif(
                             code,
-                            result_block,
+                            spec_result_block,
                             &[] as &[BlockArg],
                             fall_block,
                             &[] as &[BlockArg],
                         );
-                        fb.switch_to_block(result_block);
-                        let result_code = fb.ins().iconst(types::I32, i64::from(JIT_EXIT_RESULT));
-                        fb.ins().jump(exit_block, &[BlockArg::Value(result_code)]);
                     }
                     Some(target) => {
                         let jump_const = fb.ins().iconst(types::I32, i64::from(SPEC_JUMP));
@@ -1218,17 +1554,41 @@ pub fn compile(program: &Program) -> Option<JitCode> {
                         );
 
                         fb.switch_to_block(not_jump_block);
-                        let result_block = fb.create_block();
-                        fb.ins().brif(
-                            code,
-                            result_block,
-                            &[] as &[BlockArg],
-                            fall_block,
-                            &[] as &[BlockArg],
-                        );
-                        fb.switch_to_block(result_block);
-                        let result_code = fb.ins().iconst(types::I32, i64::from(JIT_EXIT_RESULT));
-                        fb.ins().jump(exit_block, &[BlockArg::Value(result_code)]);
+                        match generic_block {
+                            None => {
+                                fb.ins().brif(
+                                    code,
+                                    spec_result_block,
+                                    &[] as &[BlockArg],
+                                    fall_block,
+                                    &[] as &[BlockArg],
+                                );
+                            }
+                            Some(generic_block) => {
+                                let not_fall_block = fb.create_block();
+                                fb.ins().brif(
+                                    code,
+                                    not_fall_block,
+                                    &[] as &[BlockArg],
+                                    fall_block,
+                                    &[] as &[BlockArg],
+                                );
+                                fb.switch_to_block(not_fall_block);
+                                let bail_const = fb.ins().iconst(types::I32, i64::from(SPEC_BAIL));
+                                let is_bail = fb.ins().icmp(
+                                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                                    code,
+                                    bail_const,
+                                );
+                                fb.ins().brif(
+                                    is_bail,
+                                    generic_block,
+                                    &[] as &[BlockArg],
+                                    spec_result_block,
+                                    &[] as &[BlockArg],
+                                );
+                            }
+                        }
 
                         fb.switch_to_block(taken_block);
                         // Branch taken: pc must name the next instruction
@@ -1262,7 +1622,15 @@ pub fn compile(program: &Program) -> Option<JitCode> {
                             .jump(insn_blocks[target as usize], &[] as &[BlockArg]);
                     }
                 }
-                continue;
+                match generic_block {
+                    // Fully handled by the helper.
+                    None => continue,
+                    // Emit the generic path below as the bail target. The pc
+                    // store at block entry still holds (helpers that bail
+                    // change nothing), so the wrapper sees the same state as
+                    // under the interpreter.
+                    Some(generic_block) => fb.switch_to_block(generic_block),
+                }
             }
 
             let wrapper_id = wrapper_ids[insn.discriminant() as usize]
@@ -1561,6 +1929,59 @@ mod tests {
         assert_eq!(message, "jit unwind probe");
         drop(eh_frame);
         unsafe { module.free_memory() };
+    }
+
+    /// Comparison-heavy queries exercising the specialized compare helper:
+    /// numeric-affinity text operands (the cached no-conversion path),
+    /// text-affinity comparisons (bail path), NULLs, and mixed
+    /// numeric/text operands.
+    #[test]
+    fn jit_comparisons_match_interpreter() {
+        if !runtime_enabled() {
+            return;
+        }
+        let (db, conn) = memory_db();
+        run_to_completion(
+            &db,
+            &conn,
+            "CREATE TABLE ord(id INTEGER, ship DATE, note TEXT, qty REAL, disc REAL)",
+            false,
+        );
+        run_to_completion(
+            &db,
+            &conn,
+            "WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM g WHERE x < 3000) \
+             INSERT INTO ord SELECT x, \
+               printf('19%02d-%02d-%02d', 94 + (x % 3), 1 + (x * 5) % 12, 1 + (x * 9) % 28), \
+               CASE x % 5 WHEN 0 THEN NULL WHEN 1 THEN 'n' || x ELSE CAST(x AS TEXT) END, \
+               (x * 7) % 50 + 0.5, \
+               ((x * 13) % 11) / 100.0 \
+             FROM g",
+            false,
+        );
+        let queries = [
+            // Numeric affinity, text column vs text constant: the cached
+            // failed-conversion path on both sides.
+            "SELECT count(*), sum(qty) FROM ord \
+             WHERE ship >= '1994-06-01' AND ship < '1996-02-15'",
+            // Numeric affinity where the column text DOES convert (note
+            // holds plain digits for most rows) plus rows where it doesn't.
+            "SELECT count(*) FROM ord WHERE note > '150'",
+            // Text-affinity comparison between two text operands (bail).
+            "SELECT count(*) FROM ord WHERE note < 'n2000'",
+            // Numeric-numeric with floats and BETWEEN.
+            "SELECT count(*) FROM ord WHERE disc BETWEEN 0.02 AND 0.07 AND qty < 24.5",
+            // NULLs flowing through comparisons.
+            "SELECT count(*) FROM ord WHERE note IS NULL OR note > 'zzz'",
+            // Mixed: integer column against text constant under numeric
+            // affinity (constant converts and is written back).
+            "SELECT count(*) FROM ord WHERE id > '2500'",
+        ];
+        for sql in queries {
+            let interpreted = run_to_completion(&db, &conn, sql, false);
+            let jitted = run_to_completion(&db, &conn, sql, true);
+            assert_eq!(interpreted, jitted, "row mismatch for query: {sql}");
+        }
     }
 
     /// Programs with subprogram instructions (triggers) must refuse to
