@@ -13,6 +13,7 @@ mod test_vacuum;
 mod test_write_path;
 
 mod encryption;
+mod test_compound_select_collation;
 mod test_expr_index;
 mod test_multi_thread;
 mod test_non_utf8_text;

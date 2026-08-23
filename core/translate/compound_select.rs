@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::get_collseq_from_expr;
+use crate::translate::collate::get_compound_arm_collseq;
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
@@ -573,20 +573,18 @@ fn create_dedupe_index(
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
+        let left_collation = get_compound_arm_collseq(
             &left_select.result_columns[i].expr,
             &left_select.table_references,
         )?;
-        let right_collation = get_collseq_from_expr(
+        let right_collation = get_compound_arm_collseq(
             &right_select.result_columns[i].expr,
             &right_select.table_references,
         )?;
-        // Left precedence
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
+        // Left precedence per multiSelectCollSeq: a bare column names its own
+        // (possibly default BINARY) collation and only a no-opinion arm --
+        // literal, function, ... -- defers to the other side (#8272).
+        let collation = left_collation.or(right_collation);
         column.collation = collation;
     }
 
@@ -799,19 +797,16 @@ fn create_collection_index(
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
+        let left_collation = get_compound_arm_collseq(
             &left_select.result_columns[i].expr,
             &left_select.table_references,
         )?;
-        let right_collation = get_collseq_from_expr(
+        let right_collation = get_compound_arm_collseq(
             &right_select.result_columns[i].expr,
             &right_select.table_references,
         )?;
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
+        // Same left-precedence rule as the dedupe index (#8272).
+        let collation = left_collation.or(right_collation);
         column.collation = collation;
     }
 

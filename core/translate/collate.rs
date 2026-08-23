@@ -377,6 +377,26 @@ pub fn get_collseq_from_expr_with_symbols(
     Ok(explicit.or(column))
 }
 
+/// Collation for one arm's result column in a compound SELECT, following
+/// SQLite's multiSelectCollSeq -> sqlite3ExprCollSeq semantics (#8272): a
+/// bare column operand carries its declared collation or the default BINARY
+/// and never defers to later arms; literals, functions and other synthetic
+/// expressions have no opinion and return None so resolution falls through.
+pub fn get_compound_arm_collseq(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<CollationSeq>> {
+    let (explicit, column) =
+        get_collseq_parts_from_expr_with_symbols(top_expr, referenced_tables, None)?;
+    if let Some(seq) = explicit.or(column) {
+        return Ok(Some(seq));
+    }
+    Ok(match top_expr {
+        Expr::Column { .. } | Expr::RowId { .. } => Some(CollationSeq::default()),
+        _ => None,
+    })
+}
+
 /// Return the collation context that standalone expression translation would
 /// propagate to a parent comparison when this expression is reused from cache.
 ///
