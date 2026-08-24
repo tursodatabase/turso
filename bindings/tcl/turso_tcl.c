@@ -25,6 +25,7 @@
 #include <tcl.h>
 #include <sqlite3.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 
 /* Tcl_Size was introduced in Tcl 9.0; fall back to int for 8.x */
@@ -427,12 +428,14 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         "eval", "one", "exists", "changes", "total_changes",
         "last_insert_rowid", "errorcode", "errmsg", "null", "nullvalue",
         "func", "function", "close", "limit", "status", "transaction",
+        "cache",
         NULL
     };
     enum {
         CMD_EVAL, CMD_ONE, CMD_EXISTS, CMD_CHANGES, CMD_TOTAL_CHANGES,
         CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL, CMD_NULLVALUE,
-        CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT, CMD_STATUS, CMD_TRANSACTION
+        CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT, CMD_STATUS, CMD_TRANSACTION,
+        CMD_CACHE
     };
     int cmdIdx;
 
@@ -495,6 +498,29 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     case CMD_LIMIT:
         Tcl_SetObjResult(interp, Tcl_NewIntObj(1000000));
         return TCL_OK;
+
+    /* ---- cache ---- */
+
+    case CMD_CACHE: {
+        /*
+         * db cache flush — finalize the prepared statement cache.
+         * db cache size N — upstream resizes the cache; ours is fixed,
+         * so accept and ignore the value.
+         */
+        if (objc < 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "flush|size ?N?");
+            return TCL_ERROR;
+        }
+        const char *op = Tcl_GetString(objv[2]);
+        if (strcmp(op, "flush") == 0) {
+            cache_free(tdb);
+        } else if (strcmp(op, "size") != 0) {
+            Tcl_AppendResult(interp, "bad option \"", op,
+                             "\": must be flush or size", NULL);
+            return TCL_ERROR;
+        }
+        return TCL_OK;
+    }
 
     /* ---- status ---- */
 
@@ -1615,6 +1641,114 @@ static int TursoColumnTableNameCmd(ClientData cd, Tcl_Interp *interp,
     return TCL_OK;
 }
 
+/* sqlite3_stmt_readonly STMT — a NULL statement reports read-only,
+ * matching the C API. */
+static int TursoStmtReadonlyCmd(ClientData cd, Tcl_Interp *interp,
+                                int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc == 2 && is_null_stmt(objv[1])) {
+        Tcl_SetObjResult(interp, Tcl_NewBooleanObj(1));
+        return TCL_OK;
+    }
+    StmtHandle *h;
+    if (stmt_only_args(interp, objc, objv, &h) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp,
+        Tcl_NewBooleanObj(sqlite3_stmt_readonly(h->stmt)));
+    return TCL_OK;
+}
+
+/* sqlite3_stmt_busy STMT — a NULL statement is never busy. */
+static int TursoStmtBusyCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc == 2 && is_null_stmt(objv[1])) {
+        Tcl_SetObjResult(interp, Tcl_NewBooleanObj(0));
+        return TCL_OK;
+    }
+    StmtHandle *h;
+    if (stmt_only_args(interp, objc, objv, &h) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewBooleanObj(sqlite3_stmt_busy(h->stmt)));
+    return TCL_OK;
+}
+
+/* sqlite3_stmt_isexplain STMT — 1 for EXPLAIN, 2 for EXPLAIN QUERY
+ * PLAN, 0 otherwise. The compat layer has no such entry point, so
+ * decide from the statement's SQL text, which is what determines the
+ * property. */
+static int TursoStmtIsexplainCmd(ClientData cd, Tcl_Interp *interp,
+                                 int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc == 2 && is_null_stmt(objv[1])) {
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(0));
+        return TCL_OK;
+    }
+    StmtHandle *h;
+    if (stmt_only_args(interp, objc, objv, &h) != TCL_OK) return TCL_ERROR;
+
+    const char *sql = sqlite3_sql(h->stmt);
+    int result = 0;
+    if (sql) {
+        while (*sql == ' ' || *sql == '\n' || *sql == '\t' || *sql == '\r') {
+            sql++;
+        }
+        if (strncasecmp(sql, "EXPLAIN", 7) == 0) {
+            const char *rest = sql + 7;
+            while (*rest == ' ' || *rest == '\n' || *rest == '\t' ||
+                   *rest == '\r') {
+                rest++;
+            }
+            result = (strncasecmp(rest, "QUERY", 5) == 0) ? 2 : 1;
+        }
+    }
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(result));
+    return TCL_OK;
+}
+
+/*
+ * sqlite3_next_stmt DB STMT
+ *
+ * Iterates over the prepared statements of a connection: STMT of 0 (or
+ * empty) returns the first one, otherwise the one after STMT; an empty
+ * result ends the iteration. Upstream walks the connection's own
+ * statement list; we walk the harness handle registry filtered by
+ * connection, which covers every statement the tests can name.
+ */
+static int TursoNextStmtCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB STMT");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ",
+                         Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+
+    StmtHandle *from;
+    if (is_null_stmt(objv[2])) {
+        from = stmt_handles;
+    } else {
+        StmtHandle *h = find_stmt_handle(interp, objv[2]);
+        if (!h) return TCL_ERROR;
+        from = h->next;
+    }
+    for (; from; from = from->next) {
+        if (from->db == tdb->db) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(from->name, -1));
+            return TCL_OK;
+        }
+    }
+    Tcl_ResetResult(interp);
+    return TCL_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* C-API bind commands (upstream test1.c)                               */
 /* ------------------------------------------------------------------ */
@@ -2590,6 +2724,14 @@ int Tursotcl_Init(Tcl_Interp *interp)
                          TursoColumnDecltypeCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_column_table_name",
                          TursoColumnTableNameCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_stmt_readonly",
+                         TursoStmtReadonlyCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_stmt_busy",
+                         TursoStmtBusyCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_next_stmt",
+                         TursoNextStmtCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_stmt_isexplain",
+                         TursoStmtIsexplainCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_bind_int",
                          TursoBindInt64Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_bind_int64",
