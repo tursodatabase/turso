@@ -1232,6 +1232,795 @@ static int TursoBlobCloseCmd(ClientData cd, Tcl_Interp *interp,
 }
 
 /* ------------------------------------------------------------------ */
+/* C-API statement commands (upstream test1.c)                          */
+/* ------------------------------------------------------------------ */
+
+/* Prepared statements made by [sqlite3_prepare], keyed by a generated
+ * name so a stale or garbage handle argument is a clean TCL error
+ * instead of a wild pointer, as with blob handles above. */
+typedef struct StmtHandle {
+    sqlite3_stmt      *stmt;
+    sqlite3           *db;      /* owning connection, for error reports */
+    char               name[24];
+    struct StmtHandle *next;
+} StmtHandle;
+
+static StmtHandle *stmt_handles    = NULL;
+static int         stmt_handle_seq = 0;
+
+static StmtHandle *find_stmt_handle(Tcl_Interp *interp, Tcl_Obj *name_obj)
+{
+    const char *name = Tcl_GetString(name_obj);
+    StmtHandle *h;
+    for (h = stmt_handles; h; h = h->next) {
+        if (strcmp(h->name, name) == 0) return h;
+    }
+    Tcl_AppendResult(interp, "no such statement handle: ", name, NULL);
+    return NULL;
+}
+
+/* Turso prefixes some error messages (e.g. "Parse error: no such table")
+ * where SQLite reports just the message; the C-API tests match on the
+ * SQLite form, so strip the prefix like tester.tcl's normalize_errmsg. */
+static const char *strip_err_prefix(const char *msg)
+{
+    static const char *prefixes[] = { "Parse error: ", "Runtime error: ", NULL };
+    int i;
+    if (!msg) return "";
+    for (i = 0; prefixes[i]; i++) {
+        size_t n = strlen(prefixes[i]);
+        if (strncmp(msg, prefixes[i], n) == 0) return msg + n;
+    }
+    return msg;
+}
+
+/*
+ * sqlite3_prepare DB SQL BYTES ?TAILVAR?
+ * sqlite3_prepare_v2 DB SQL BYTES ?TAILVAR?
+ *
+ * The upstream test1.c commands: prepare the first statement of SQL,
+ * store the unparsed remainder in TAILVAR, and return a statement
+ * handle for the other C-API commands. On error the result is
+ * "(rc) errmsg", which is what the tests match on. Turso has one
+ * prepare implementation, so both spellings share it.
+ */
+static int TursoPrepareCmd(ClientData cd, Tcl_Interp *interp,
+                           int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+
+    if (objc != 4 && objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB SQL BYTES ?TAILVAR?");
+        return TCL_ERROR;
+    }
+
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ",
+                         Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+
+    Tcl_Size    sql_len;
+    const char *sql = Tcl_GetStringFromObj(objv[2], &sql_len);
+    int         bytes;
+    if (Tcl_GetIntFromObj(interp, objv[3], &bytes) != TCL_OK) return TCL_ERROR;
+
+    Tcl_Size limit = sql_len;
+    if (bytes >= 0 && (Tcl_Size)bytes < sql_len) limit = bytes;
+
+    sqlite3_stmt *stmt = NULL;
+    const char   *tail = NULL;
+    int rc = sqlite3_prepare_v2(tdb->db, sql, bytes, &stmt, &tail);
+
+    if (objc == 5) {
+        Tcl_Obj *tail_obj;
+        if (tail && tail >= sql && tail <= sql + limit) {
+            tail_obj = Tcl_NewStringObj(tail, (Tcl_Size)(sql + limit - tail));
+        } else {
+            tail_obj = Tcl_NewStringObj("", 0);
+        }
+        if (Tcl_ObjSetVar2(interp, objv[4], NULL, tail_obj,
+                           TCL_LEAVE_ERR_MSG) == NULL) {
+            if (stmt) sqlite3_finalize(stmt);
+            return TCL_ERROR;
+        }
+    }
+
+    if (rc != SQLITE_OK) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("(%d) %s", rc,
+            strip_err_prefix(sqlite3_errmsg(tdb->db))));
+        return TCL_ERROR;
+    }
+    if (!stmt) {
+        Tcl_ResetResult(interp);
+        return TCL_OK;
+    }
+
+    StmtHandle *h = (StmtHandle *)Tcl_Alloc(sizeof(StmtHandle));
+    h->stmt = stmt;
+    h->db   = tdb->db;
+    snprintf(h->name, sizeof(h->name), "stmt_%d", ++stmt_handle_seq);
+    h->next = stmt_handles;
+    stmt_handles = h;
+
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(h->name, -1));
+    return TCL_OK;
+}
+
+/* sqlite3_step STMT — returns the symbolic result code (SQLITE_ROW,
+ * SQLITE_DONE, or an error name) as a normal result. */
+static int TursoStepCmd(ClientData cd, Tcl_Interp *interp,
+                        int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "STMT");
+        return TCL_ERROR;
+    }
+    StmtHandle *h = find_stmt_handle(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+    Tcl_SetResult(interp, (char *)turso_err_name(sqlite3_step(h->stmt)),
+                  TCL_STATIC);
+    return TCL_OK;
+}
+
+/* An empty or "0" handle stands for a NULL statement pointer, which
+ * upstream accepts in finalize and reset as a harmless no-op. */
+static int is_null_stmt(Tcl_Obj *obj)
+{
+    const char *s = Tcl_GetString(obj);
+    return s[0] == '\0' || strcmp(s, "0") == 0;
+}
+
+/* sqlite3_finalize STMT — finalizes and forgets the handle; returns the
+ * symbolic result code. A null handle is a no-op, as upstream. */
+static int TursoFinalizeCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "STMT");
+        return TCL_ERROR;
+    }
+    if (is_null_stmt(objv[1])) {
+        Tcl_SetResult(interp, (char *)"SQLITE_OK", TCL_STATIC);
+        return TCL_OK;
+    }
+    StmtHandle *h = find_stmt_handle(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+
+    int rc = sqlite3_finalize(h->stmt);
+
+    /* The handle is spent even when finalize reports an error. */
+    StmtHandle **pp;
+    for (pp = &stmt_handles; *pp; pp = &(*pp)->next) {
+        if (*pp == h) {
+            *pp = h->next;
+            break;
+        }
+    }
+    Tcl_Free((char *)h);
+
+    Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
+    return TCL_OK;
+}
+
+/* sqlite3_reset STMT — returns the symbolic result code. */
+static int TursoResetCmd(ClientData cd, Tcl_Interp *interp,
+                         int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "STMT");
+        return TCL_ERROR;
+    }
+    if (is_null_stmt(objv[1])) {
+        Tcl_SetResult(interp, (char *)"SQLITE_OK", TCL_STATIC);
+        return TCL_OK;
+    }
+    StmtHandle *h = find_stmt_handle(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+    Tcl_SetResult(interp, (char *)turso_err_name(sqlite3_reset(h->stmt)),
+                  TCL_STATIC);
+    return TCL_OK;
+}
+
+/* Shared argument parsing for STMT-only counter commands. */
+static int stmt_only_args(Tcl_Interp *interp, int objc, Tcl_Obj *const objv[],
+                          StmtHandle **out)
+{
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "STMT");
+        return TCL_ERROR;
+    }
+    *out = find_stmt_handle(interp, objv[1]);
+    return *out ? TCL_OK : TCL_ERROR;
+}
+
+/* sqlite3_column_count STMT */
+static int TursoColumnCountCmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    if (stmt_only_args(interp, objc, objv, &h) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_column_count(h->stmt)));
+    return TCL_OK;
+}
+
+/* sqlite3_data_count STMT */
+static int TursoDataCountCmd(ClientData cd, Tcl_Interp *interp,
+                             int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    if (stmt_only_args(interp, objc, objv, &h) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_data_count(h->stmt)));
+    return TCL_OK;
+}
+
+/* Shared argument parsing for STMT COLUMN accessor commands. */
+static int stmt_col_args(Tcl_Interp *interp, int objc, Tcl_Obj *const objv[],
+                         StmtHandle **out, int *col)
+{
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "STMT column");
+        return TCL_ERROR;
+    }
+    *out = find_stmt_handle(interp, objv[1]);
+    if (!*out) return TCL_ERROR;
+    return Tcl_GetIntFromObj(interp, objv[2], col);
+}
+
+/* sqlite3_column_type STMT column — returns the type name. */
+static int TursoColumnTypeCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    const char *name;
+    switch (sqlite3_column_type(h->stmt, col)) {
+    case SQLITE_INTEGER: name = "INTEGER"; break;
+    case SQLITE_FLOAT:   name = "FLOAT";   break;
+    case SQLITE_TEXT:    name = "TEXT";    break;
+    case SQLITE_BLOB:    name = "BLOB";    break;
+    default:             name = "NULL";    break;
+    }
+    Tcl_SetResult(interp, (char *)name, TCL_STATIC);
+    return TCL_OK;
+}
+
+/* sqlite3_column_text STMT column */
+static int TursoColumnTextCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    const char *text = (const char *)sqlite3_column_text(h->stmt, col);
+    int nbytes = sqlite3_column_bytes(h->stmt, col);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(text ? text : "",
+                                              text ? nbytes : 0));
+    return TCL_OK;
+}
+
+/* sqlite3_column_blob STMT column */
+static int TursoColumnBlobCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    const void *blob = sqlite3_column_blob(h->stmt, col);
+    int nbytes = sqlite3_column_bytes(h->stmt, col);
+    Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(
+        (const unsigned char *)(blob ? blob : ""), blob ? nbytes : 0));
+    return TCL_OK;
+}
+
+/* sqlite3_column_int STMT column */
+static int TursoColumnIntCmd(ClientData cd, Tcl_Interp *interp,
+                             int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    /* sqlite3_column_int is not in the compat header; the C API defines
+     * it as the int64 value truncated to int, so do that directly. */
+    Tcl_SetObjResult(interp,
+        Tcl_NewIntObj((int)sqlite3_column_int64(h->stmt, col)));
+    return TCL_OK;
+}
+
+/* sqlite3_column_int64 STMT column */
+static int TursoColumnInt64Cmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewWideIntObj(
+        (Tcl_WideInt)sqlite3_column_int64(h->stmt, col)));
+    return TCL_OK;
+}
+
+/* sqlite3_column_double STMT column */
+static int TursoColumnDoubleCmd(ClientData cd, Tcl_Interp *interp,
+                                int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp,
+        Tcl_NewDoubleObj(sqlite3_column_double(h->stmt, col)));
+    return TCL_OK;
+}
+
+/* sqlite3_column_bytes STMT column */
+static int TursoColumnBytesCmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_column_bytes(h->stmt, col)));
+    return TCL_OK;
+}
+
+/* sqlite3_column_name STMT column */
+static int TursoColumnNameCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    const char *name = sqlite3_column_name(h->stmt, col);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(name ? name : "", -1));
+    return TCL_OK;
+}
+
+/* sqlite3_column_decltype STMT column */
+static int TursoColumnDecltypeCmd(ClientData cd, Tcl_Interp *interp,
+                                  int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    const char *type = sqlite3_column_decltype(h->stmt, col);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(type ? type : "", -1));
+    return TCL_OK;
+}
+
+/* sqlite3_column_table_name STMT column */
+static int TursoColumnTableNameCmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int col;
+    if (stmt_col_args(interp, objc, objv, &h, &col) != TCL_OK) return TCL_ERROR;
+    const char *name = sqlite3_column_table_name(h->stmt, col);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(name ? name : "", -1));
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* C-API bind commands (upstream test1.c)                               */
+/* ------------------------------------------------------------------ */
+
+/* Shared argument parsing for STMT IDX VALUE bind commands; the value
+ * object stays in objv[3] for the caller to convert. */
+static int stmt_bind_args(Tcl_Interp *interp, int objc, Tcl_Obj *const objv[],
+                          int expected, const char *usage,
+                          StmtHandle **out, int *idx)
+{
+    if (objc != expected) {
+        Tcl_WrongNumArgs(interp, 1, objv, usage);
+        return TCL_ERROR;
+    }
+    *out = find_stmt_handle(interp, objv[1]);
+    if (!*out) return TCL_ERROR;
+    return Tcl_GetIntFromObj(interp, objv[2], idx);
+}
+
+/* Report a bind result as upstream: empty result on success, the
+ * symbolic result code as a TCL error otherwise. */
+static int bind_result(Tcl_Interp *interp, int rc)
+{
+    if (rc != SQLITE_OK) {
+        Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
+        return TCL_ERROR;
+    }
+    Tcl_ResetResult(interp);
+    return TCL_OK;
+}
+
+/* sqlite3_bind_int STMT IDX VALUE (also registered as sqlite3_bind_int64) */
+static int TursoBindInt64Cmd(ClientData cd, Tcl_Interp *interp,
+                             int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int idx;
+    Tcl_WideInt val;
+    if (stmt_bind_args(interp, objc, objv, 4, "STMT N VALUE",
+                       &h, &idx) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetWideIntFromObj(interp, objv[3], &val) != TCL_OK) return TCL_ERROR;
+    return bind_result(interp,
+        sqlite3_bind_int64(h->stmt, idx, (int64_t)val));
+}
+
+/* sqlite3_bind_double STMT IDX VALUE */
+static int TursoBindDoubleCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int idx;
+    double val;
+    if (stmt_bind_args(interp, objc, objv, 4, "STMT N VALUE",
+                       &h, &idx) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetDoubleFromObj(interp, objv[3], &val) != TCL_OK) return TCL_ERROR;
+    return bind_result(interp, sqlite3_bind_double(h->stmt, idx, val));
+}
+
+/* sqlite3_bind_null STMT IDX */
+static int TursoBindNullCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int idx;
+    if (stmt_bind_args(interp, objc, objv, 3, "STMT N",
+                       &h, &idx) != TCL_OK) return TCL_ERROR;
+    return bind_result(interp, sqlite3_bind_null(h->stmt, idx));
+}
+
+/* sqlite3_bind_text STMT IDX STRING BYTES */
+static int TursoBindTextCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int idx, bytes;
+    if (stmt_bind_args(interp, objc, objv, 5, "STMT N VALUE BYTES",
+                       &h, &idx) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetIntFromObj(interp, objv[4], &bytes) != TCL_OK) return TCL_ERROR;
+    Tcl_Size len;
+    const char *value = Tcl_GetStringFromObj(objv[3], &len);
+    if (bytes < 0) bytes = (int)len;
+    return bind_result(interp,
+        sqlite3_bind_text(h->stmt, idx, value, bytes, SQLITE_TRANSIENT));
+}
+
+/* sqlite3_bind_blob STMT IDX DATA BYTES */
+static int TursoBindBlobCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int idx, bytes;
+    if (stmt_bind_args(interp, objc, objv, 5, "STMT N DATA BYTES",
+                       &h, &idx) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetIntFromObj(interp, objv[4], &bytes) != TCL_OK) return TCL_ERROR;
+    Tcl_Size len;
+    unsigned char *data = Tcl_GetByteArrayFromObj(objv[3], &len);
+    if (bytes < 0 || bytes > (int)len) bytes = (int)len;
+    return bind_result(interp,
+        sqlite3_bind_blob(h->stmt, idx, data, bytes, SQLITE_TRANSIENT));
+}
+
+/* sqlite3_bind_zeroblob STMT IDX N — turso's compat layer has no
+ * zeroblob binder, and a zeroblob is defined as N zero bytes, so bind
+ * exactly that. */
+static int TursoBindZeroblobCmd(ClientData cd, Tcl_Interp *interp,
+                                int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int idx, n;
+    if (stmt_bind_args(interp, objc, objv, 4, "STMT IDX N",
+                       &h, &idx) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetIntFromObj(interp, objv[3], &n) != TCL_OK) return TCL_ERROR;
+    if (n < 0) n = 0;
+    unsigned char *zeros = (unsigned char *)Tcl_Alloc(n > 0 ? n : 1);
+    memset(zeros, 0, n > 0 ? n : 1);
+    int rc = sqlite3_bind_blob(h->stmt, idx, zeros, n, SQLITE_TRANSIENT);
+    Tcl_Free((char *)zeros);
+    return bind_result(interp, rc);
+}
+
+/* sqlite3_bind_parameter_count STMT */
+static int TursoBindParameterCountCmd(ClientData cd, Tcl_Interp *interp,
+                                      int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    if (stmt_only_args(interp, objc, objv, &h) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp,
+        Tcl_NewIntObj(sqlite3_bind_parameter_count(h->stmt)));
+    return TCL_OK;
+}
+
+/* sqlite3_bind_parameter_name STMT N */
+static int TursoBindParameterNameCmd(ClientData cd, Tcl_Interp *interp,
+                                     int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    int idx;
+    if (stmt_col_args(interp, objc, objv, &h, &idx) != TCL_OK) return TCL_ERROR;
+    const char *name = sqlite3_bind_parameter_name(h->stmt, idx);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(name ? name : "", -1));
+    return TCL_OK;
+}
+
+/* sqlite3_bind_parameter_index STMT NAME */
+static int TursoBindParameterIndexCmd(ClientData cd, Tcl_Interp *interp,
+                                      int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "STMT NAME");
+        return TCL_ERROR;
+    }
+    StmtHandle *h = find_stmt_handle(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(
+        sqlite3_bind_parameter_index(h->stmt, Tcl_GetString(objv[2]))));
+    return TCL_OK;
+}
+
+/* sqlite3_clear_bindings STMT */
+static int TursoClearBindingsCmd(ClientData cd, Tcl_Interp *interp,
+                                 int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    StmtHandle *h;
+    if (stmt_only_args(interp, objc, objv, &h) != TCL_OK) return TCL_ERROR;
+    Tcl_SetResult(interp,
+        (char *)turso_err_name(sqlite3_clear_bindings(h->stmt)), TCL_STATIC);
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* C-API connection commands (upstream test1.c)                         */
+/* ------------------------------------------------------------------ */
+
+/* Shared argument parsing for DB-only commands. */
+static int db_only_args(Tcl_Interp *interp, int objc, Tcl_Obj *const objv[],
+                        TursoDb **out)
+{
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB");
+        return TCL_ERROR;
+    }
+    *out = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!*out) {
+        Tcl_AppendResult(interp, "no such database: ",
+                         Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
+/* sqlite3_errcode DB — symbolic name of the most recent primary result
+ * code on the connection. */
+static int TursoErrcodeCmd(ClientData cd, Tcl_Interp *interp,
+                           int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    TursoDb *tdb;
+    if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
+    Tcl_SetResult(interp, (char *)turso_err_name(sqlite3_errcode(tdb->db)),
+                  TCL_STATIC);
+    return TCL_OK;
+}
+
+/* sqlite3_extended_errcode DB */
+static int TursoExtendedErrcodeCmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    TursoDb *tdb;
+    if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
+    Tcl_SetResult(interp,
+        (char *)turso_err_name(sqlite3_extended_errcode(tdb->db)), TCL_STATIC);
+    return TCL_OK;
+}
+
+/* sqlite3_errmsg DB — most recent error message. */
+static int TursoErrmsgCmd(ClientData cd, Tcl_Interp *interp,
+                          int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    TursoDb *tdb;
+    if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
+    Tcl_SetResult(interp,
+        (char *)strip_err_prefix(sqlite3_errmsg(tdb->db)), TCL_VOLATILE);
+    return TCL_OK;
+}
+
+/* sqlite3_changes DB */
+static int TursoChangesCmd(ClientData cd, Tcl_Interp *interp,
+                           int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    TursoDb *tdb;
+    if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_changes(tdb->db)));
+    return TCL_OK;
+}
+
+/* sqlite3_total_changes DB */
+static int TursoTotalChangesCmd(ClientData cd, Tcl_Interp *interp,
+                                int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    TursoDb *tdb;
+    if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_total_changes(tdb->db)));
+    return TCL_OK;
+}
+
+/* sqlite3_last_insert_rowid DB */
+static int TursoLastInsertRowidCmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    TursoDb *tdb;
+    if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp,
+        Tcl_NewWideIntObj((Tcl_WideInt)sqlite3_last_insert_rowid(tdb->db)));
+    return TCL_OK;
+}
+
+/* sqlite3_complete SQL — 1 if the SQL ends in a complete statement. */
+static int TursoCompleteCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "SQL");
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp,
+        Tcl_NewIntObj(sqlite3_complete(Tcl_GetString(objv[1]))));
+    return TCL_OK;
+}
+
+/*
+ * sqlite3_open FILENAME ?OPTIONS?
+ *
+ * The upstream test1.c command over the sqlite3_open C API: returns a
+ * handle for the other C-API commands (in upstream a pointer string;
+ * here a generated command name so [sqlite3_prepare $H ...] resolves
+ * it). OPTIONS is accepted and ignored, as upstream.
+ */
+static int TursoCApiOpenCmd(ClientData cd, Tcl_Interp *interp,
+                            int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    static int open_seq = 0;
+
+    if (objc != 2 && objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FILENAME ?OPTIONS?");
+        return TCL_ERROR;
+    }
+
+    sqlite3 *db = NULL;
+    sqlite3_open(Tcl_GetString(objv[1]), &db);
+    if (!db) {
+        /* Upstream returns a pointer string even for a failed open (the
+         * handle carries the error state); turso returns no object, so
+         * an empty handle is the closest equivalent. */
+        Tcl_ResetResult(interp);
+        return TCL_OK;
+    }
+
+    TursoDb *tdb = (TursoDb *)Tcl_Alloc(sizeof(TursoDb));
+    memset(tdb, 0, sizeof(TursoDb));
+    tdb->db     = db;
+    tdb->interp = interp;
+
+    char handle_name[24];
+    snprintf(handle_name, sizeof(handle_name), "dbptr_%d", ++open_seq);
+    Tcl_CreateObjCommand(interp, handle_name, TursoDbCmd,
+                         (ClientData)tdb, TursoDbFree);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(handle_name, -1));
+    return TCL_OK;
+}
+
+/* sqlite3_close DB — closes the connection and returns the symbolic
+ * result code; the handle command is deleted on success. */
+static int TursoCApiCloseCmd(ClientData cd, Tcl_Interp *interp,
+                             int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ",
+                         Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+
+    /* Cached statements must die before the connection they belong to. */
+    cache_free(tdb);
+    int rc = sqlite3_close(tdb->db);
+    if (rc == SQLITE_OK) {
+        tdb->db = NULL; /* TursoDbFree must not close it again */
+        Tcl_DeleteCommand(interp, Tcl_GetString(objv[1]));
+    }
+    Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
+    return TCL_OK;
+}
+
+/*
+ * sqlite3_table_column_metadata DB DBNAME TABLE ?COLUMN?
+ *
+ * Returns {decltype collseq notnull primarykey autoincrement} on
+ * success, or raises the error message as a TCL error, as upstream.
+ */
+static int TursoTableColumnMetadataCmd(ClientData cd, Tcl_Interp *interp,
+                                       int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 4 && objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB dbname tblname ?colname?");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ",
+                         Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+
+    const char *db_name  = Tcl_GetString(objv[2]);
+    const char *tbl_name = Tcl_GetString(objv[3]);
+    const char *col_name = (objc == 5) ? Tcl_GetString(objv[4]) : NULL;
+    if (db_name[0] == '\0') db_name = NULL;
+
+    const char *decltype = NULL;
+    const char *collseq  = NULL;
+    int notnull = 0, primarykey = 0, autoincrement = 0;
+
+    int rc = sqlite3_table_column_metadata(tdb->db, db_name, tbl_name,
+        col_name, &decltype, &collseq, &notnull, &primarykey, &autoincrement);
+    if (rc != SQLITE_OK) {
+        Tcl_SetResult(interp,
+            (char *)strip_err_prefix(sqlite3_errmsg(tdb->db)), TCL_VOLATILE);
+        return TCL_ERROR;
+    }
+
+    Tcl_Obj *result = Tcl_NewListObj(0, NULL);
+    Tcl_ListObjAppendElement(interp, result,
+        Tcl_NewStringObj(decltype ? decltype : "", -1));
+    Tcl_ListObjAppendElement(interp, result,
+        Tcl_NewStringObj(collseq ? collseq : "", -1));
+    Tcl_ListObjAppendElement(interp, result, Tcl_NewIntObj(notnull));
+    Tcl_ListObjAppendElement(interp, result, Tcl_NewIntObj(primarykey));
+    Tcl_ListObjAppendElement(interp, result, Tcl_NewIntObj(autoincrement));
+    Tcl_SetObjResult(interp, result);
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* sqlite3BitvecBuiltinTest command                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1764,6 +2553,83 @@ int Tursotcl_Init(Tcl_Interp *interp)
     Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer",
                          TursoConnectionPointerCmd, NULL, NULL);
+
+    Tcl_CreateObjCommand(interp, "sqlite3_prepare",
+                         TursoPrepareCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_prepare_v2",
+                         TursoPrepareCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_step",
+                         TursoStepCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_finalize",
+                         TursoFinalizeCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_reset",
+                         TursoResetCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_count",
+                         TursoColumnCountCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_data_count",
+                         TursoDataCountCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_type",
+                         TursoColumnTypeCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_text",
+                         TursoColumnTextCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_blob",
+                         TursoColumnBlobCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_int",
+                         TursoColumnIntCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_int64",
+                         TursoColumnInt64Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_double",
+                         TursoColumnDoubleCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_bytes",
+                         TursoColumnBytesCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_name",
+                         TursoColumnNameCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_decltype",
+                         TursoColumnDecltypeCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_column_table_name",
+                         TursoColumnTableNameCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_int",
+                         TursoBindInt64Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_int64",
+                         TursoBindInt64Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_double",
+                         TursoBindDoubleCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_null",
+                         TursoBindNullCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_text",
+                         TursoBindTextCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_blob",
+                         TursoBindBlobCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_zeroblob",
+                         TursoBindZeroblobCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_parameter_count",
+                         TursoBindParameterCountCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_parameter_name",
+                         TursoBindParameterNameCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_bind_parameter_index",
+                         TursoBindParameterIndexCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_clear_bindings",
+                         TursoClearBindingsCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_errcode",
+                         TursoErrcodeCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_extended_errcode",
+                         TursoExtendedErrcodeCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_errmsg",
+                         TursoErrmsgCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_changes",
+                         TursoChangesCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_total_changes",
+                         TursoTotalChangesCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_last_insert_rowid",
+                         TursoLastInsertRowidCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_complete",
+                         TursoCompleteCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_open",
+                         TursoCApiOpenCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_close",
+                         TursoCApiCloseCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_table_column_metadata",
+                         TursoTableColumnMetadataCmd, NULL, NULL);
 
     Tcl_CreateObjCommand(interp, "btree_varint_test",
                          TursoBtreeVarintTestCmd, NULL, NULL);
