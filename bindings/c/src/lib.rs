@@ -1034,9 +1034,6 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
     let result = stmt_run_to_completion(stmt);
-    if result != SQLITE_OK {
-        return result;
-    }
 
     if !stmt_ref.db.is_null() {
         let db = &mut *stmt_ref.db;
@@ -1064,7 +1061,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
     }
     stmt_ref.clear_text_cache();
     let _ = Box::from_raw(stmt);
-    SQLITE_OK
+    result
 }
 
 #[no_mangle]
@@ -1400,15 +1397,14 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
     let result = stmt_run_to_completion(stmt);
-    if result != SQLITE_OK {
-        return result;
-    }
     if let Err(err) = stmt.stmt.reset() {
-        return handle_limbo_err(err, std::ptr::null_mut());
+        if result == SQLITE_OK {
+            return handle_limbo_err(err, std::ptr::null_mut());
+        }
     }
     stmt.prev_search_count = 0;
     stmt.clear_text_cache();
-    SQLITE_OK
+    result
 }
 
 #[no_mangle]
@@ -3699,6 +3695,112 @@ mod tests {
             sqlite3_finalize(stmt);
             sqlite3_close(db);
         }
+    }
+
+    /// A statement that hit SQLITE_BUSY cannot be run to completion at
+    /// finalize time while another connection still holds the write lock.
+    /// sqlite3_finalize must free it anyway and report the error, like
+    /// SQLite does. Returning early instead leaked the statement and left
+    /// it counted as an active root statement on the connection forever,
+    /// so every later "no statements active" check failed — an explicit
+    /// checkpoint always errored and DETACH reported the database locked.
+    #[test]
+    fn test_finalize_frees_statement_stuck_on_busy() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let (writer, blocked, stmt) = prepare_statement_stuck_on_busy(&dir);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_BUSY);
+
+            assert_eq!(
+                sqlite3_exec(
+                    writer,
+                    c"COMMIT".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            // The finalized statement must no longer count as active: an
+            // explicit checkpoint refuses to run while a statement is in
+            // progress on the connection.
+            assert_eq!(sqlite3_wal_checkpoint(blocked, ptr::null()), SQLITE_OK);
+            assert_eq!(sqlite3_close(blocked), SQLITE_OK);
+            assert_eq!(sqlite3_close(writer), SQLITE_OK);
+        }
+    }
+
+    /// Same contract for sqlite3_reset: it must reset the statement even
+    /// when the pending execution cannot be completed, returning the error
+    /// of the most recent evaluation. The statement stays usable and stops
+    /// counting as active once finalized.
+    #[test]
+    fn test_reset_resets_statement_stuck_on_busy() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let (writer, blocked, stmt) = prepare_statement_stuck_on_busy(&dir);
+
+            assert_eq!(sqlite3_reset(stmt), SQLITE_BUSY);
+
+            assert_eq!(
+                sqlite3_exec(
+                    writer,
+                    c"COMMIT".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            // The reset must have released the statement's active slot
+            // already, before it is stepped again: an explicit checkpoint
+            // refuses to run while a statement is in progress.
+            assert_eq!(sqlite3_wal_checkpoint(blocked, ptr::null()), SQLITE_OK);
+            // The reset statement runs again from the start now that the
+            // lock is gone.
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(blocked), SQLITE_OK);
+            assert_eq!(sqlite3_close(writer), SQLITE_OK);
+        }
+    }
+
+    /// Opens two connections to the same file, makes `writer` hold the write
+    /// lock, and returns a statement on the second connection whose step just
+    /// failed with SQLITE_BUSY.
+    unsafe fn prepare_statement_stuck_on_busy(
+        dir: &tempfile::TempDir,
+    ) -> (*mut sqlite3, *mut sqlite3, *mut sqlite3_stmt) {
+        let path = CString::new(dir.path().join("busy.db").to_str().unwrap()).unwrap();
+        let mut writer = ptr::null_mut();
+        let mut blocked = ptr::null_mut();
+        assert_eq!(sqlite3_open(path.as_ptr(), &mut writer), SQLITE_OK);
+        assert_eq!(sqlite3_open(path.as_ptr(), &mut blocked), SQLITE_OK);
+        assert_eq!(
+            sqlite3_exec(
+                writer,
+                c"CREATE TABLE t(x); BEGIN; INSERT INTO t VALUES (1);".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+
+        let mut stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(
+                blocked,
+                c"INSERT INTO t VALUES (2)".as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(stmt), SQLITE_BUSY);
+        (writer, blocked, stmt)
     }
 
     #[test]
