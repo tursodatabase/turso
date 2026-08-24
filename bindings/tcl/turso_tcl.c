@@ -2530,7 +2530,9 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
 
     Tcl_CreateObjCommand(interp, handle_name, TursoDbCmd,
                          (ClientData)tdb, TursoDbFree);
-    Tcl_SetResult(interp, (char *)handle_name, TCL_VOLATILE);
+    /* The upstream TCL binding returns an empty result from [sqlite3],
+     * and tests compare against exactly that. */
+    Tcl_ResetResult(interp);
     return TCL_OK;
 }
 
