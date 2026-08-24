@@ -279,7 +279,7 @@ set test_files {
   ieee754              fail
   imposter1            fail
   in                   fail
-  in2                  fail
+  in2                  pass
   in3                  fail
   in4                  fail
   in5                  fail

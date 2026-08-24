@@ -3727,6 +3727,14 @@ impl BTreeCursor {
                         if !is_last_sibling && !is_table_leaf {
                             // If we are a index page or a interior table page we need to take the divider cell too.
                             // But we don't need the last divider as it will remain the same.
+                            if is_leaf {
+                                // The divider holds the leaf cell's real size after its child pointer;
+                                // back on a leaf the cell takes the minimum size again.
+                                ensure_min_cell_size(
+                                    &mut reusable_divider_buffers[i],
+                                    LEFT_CHILD_PTR_SIZE_BYTES,
+                                );
+                            }
                             let mut divider_cell = reusable_divider_buffers[i].as_mut_slice();
                             // TODO(pere): in case of old pages are leaf pages, so index leaf page, we need to strip page pointers
                             // from divider cells in index interior pages (parent) because those should not be included.
@@ -4271,6 +4279,21 @@ impl BTreeCursor {
                             write_varint_to_vec(rowid, &mut balance_info.reusable_divider_cell)?;
                         } else {
                             // Leaf index
+                            // A leaf cell is read as at least MINIMUM_CELL_SIZE bytes, so a 2-byte
+                            // record carries one byte of padding here. The parent stores the cell's
+                            // real size after the child pointer, so drop the padding when promoting.
+                            let (payload_len, n_payload) = read_varint(divider_cell)?;
+                            let real_len = n_payload + payload_len as usize;
+                            let divider_cell = if real_len < divider_cell.len() {
+                                turso_assert!(
+                                    real_len < MINIMUM_CELL_SIZE,
+                                    "only cells below the minimum cell size carry padding",
+                                    { "real_len": real_len, "cell_len": divider_cell.len() }
+                                );
+                                &divider_cell[..real_len]
+                            } else {
+                                &divider_cell[..]
+                            };
                             balance_info
                                 .reusable_divider_cell
                                 .extend_from_slice(&(page.get().id as u32).to_be_bytes());
@@ -4989,7 +5012,15 @@ impl BTreeCursor {
                         PageType::IndexLeaf => {
                             let parent_cell_buf =
                                 &parent_buf[parent_cell_start..parent_cell_start + parent_cell_len];
-                            if parent_cell_buf[4..] != cell_buf_in_array[..] {
+                            // The parent stores the cell's real size; the cell array pads leaf
+                            // cells up to MINIMUM_CELL_SIZE.
+                            let parent_payload = &parent_cell_buf[4..];
+                            let padded = parent_payload.len() < MINIMUM_CELL_SIZE
+                                && cell_buf_in_array.len() == MINIMUM_CELL_SIZE;
+                            let matches = cell_buf_in_array.len() >= parent_payload.len()
+                                && cell_buf_in_array[..parent_payload.len()] == *parent_payload
+                                && (cell_buf_in_array.len() == parent_payload.len() || padded);
+                            if !matches {
                                 tracing::error!("balance_non_root(cell_divider_cell_index_leaf, page_id={}, cell_divider_idx={})",
                                     page.get().id,
                                     cell_divider_idx,
@@ -8095,6 +8126,21 @@ impl PartialOrd for IntegrityCheckCellRange {
     }
 }
 
+/// Pads the cell that starts at `cell_start` in `buf` with zero bytes until it takes
+/// MINIMUM_CELL_SIZE bytes, the least space any cell takes on a page (a freed cell must be
+/// able to hold a 4-byte freeblock header).
+///
+/// Only index cells can be smaller: a one-column record of 0, 1, '' or X'' is 2 bytes, so
+/// its cell is 3. A leaf page stores such a cell padded and cell_get_raw_region reports the
+/// padded size, while a divider in the parent stores the cell's real size after its child
+/// pointer. Padding the cell whenever it is headed for a leaf keeps balancing working with
+/// one size; the record's own length prefix keeps readers from ever looking at the padding.
+fn ensure_min_cell_size(buf: &mut crate::alloc::Vec<u8>, cell_start: usize) {
+    const ZEROS: [u8; MINIMUM_CELL_SIZE] = [0; MINIMUM_CELL_SIZE];
+    let padding = (cell_start + MINIMUM_CELL_SIZE).saturating_sub(buf.len());
+    buf.extend_from_slice(&ZEROS[..padding]);
+}
+
 #[cfg(debug_assertions)]
 fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
     for cell in &cell_array.cell_payloads {
@@ -9429,8 +9475,20 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
 #[cfg(debug_assertions)]
 /// Only enabled in debug mode, where we ensure that all cells are valid.
 fn debug_validate_cells_core(page: &PageContent, usable_space: usize) {
+    let pointer_array_end = page.offset() + page.header_size() + 2 * page.cell_count();
+    turso_assert_greater_than_or_equal!(
+        page.cell_content_area() as usize,
+        pointer_array_end,
+        "cell content area overlaps cell pointer array"
+    );
     for i in 0..page.cell_count() {
         let (offset, size) = page.cell_get_raw_region(i, usable_space).unwrap();
+        turso_assert_greater_than_or_equal!(
+            offset,
+            pointer_array_end,
+            "cell overlaps cell pointer array",
+            { "idx": i }
+        );
         let _buf = &page.as_ptr()[offset..offset + size];
         // E.g. the following table btree cell may just have two bytes:
         // Payload size 0 (stored as SerialTypeKind::ConstInt0)
@@ -9473,8 +9531,11 @@ fn _insert_into_cell(
     let enough_space = if already_has_overflow && !allow_regular_insert_despite_overflow {
         false
     } else {
-        // otherwise, we need to check if we have enough space
-        payload.len() + CELL_PTR_SIZE_BYTES <= free
+        // otherwise, we need to check if we have enough space.
+        // allocate_cell_space() never allocates less than MINIMUM_CELL_SIZE
+        // bytes, so a smaller payload must reserve that much or the cell
+        // content area slides into the cell pointer array.
+        payload.len().max(MINIMUM_CELL_SIZE) + CELL_PTR_SIZE_BYTES <= free
     };
     if !enough_space {
         #[cfg(debug_assertions)]
@@ -9483,7 +9544,12 @@ fn _insert_into_cell(
                 turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential", { "page_id": page.id, "last_overflow_index": overflow_cell.index, "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len() });
             }
         }
-        let payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
+        let mut payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
+        if page.page_type()? == PageType::IndexLeaf {
+            // Balancing must see one size for every leaf cell, whether it sits on the page
+            // (where cell_get_raw_region reports at least the minimum size) or overflowed.
+            ensure_min_cell_size(&mut payload, 0);
+        }
         let overflow_cell = OverflowCell {
             index: cell_idx,
             payload: Pin::new(payload),
@@ -12792,6 +12858,48 @@ mod tests {
         let payload = add_record(0, 0, page.clone(), record, &conn);
         let free = compute_free_space(page_contents, usable_space).unwrap();
         assert_eq!(free, 4096 - payload.len() - 2 - header_size);
+    }
+
+    /// A cell smaller than MINIMUM_CELL_SIZE still takes MINIMUM_CELL_SIZE
+    /// bytes on the page. If the free-space check in insert_into_cell()
+    /// forgets that, a 3-byte cell inserted into a page with exactly 5 free
+    /// bytes passes the check (3 + 2 == 5) but the allocation takes 6, and
+    /// the cell content area slides one byte into the cell pointer array.
+    /// The cell must go to the overflow path instead.
+    #[test]
+    pub fn test_tiny_cell_insert_must_not_overlap_cell_pointer_array() {
+        let page = get_page(2);
+        btree_init_page(&page, PageType::IndexLeaf, 0, 4096);
+        let contents = page.get_contents();
+        let usable_space = 4096;
+
+        // Fill the page so exactly 5 free bytes remain: the empty index leaf
+        // has 4096 - 8 = 4088 free bytes, and 679 four-byte cells plus one
+        // seven-byte cell consume 679 * (4 + 2) + (7 + 2) = 4083 of them.
+        let four_byte_cell = [0x03, b'a', b'b', b'c'];
+        for i in 0..679 {
+            insert_into_cell(contents, &four_byte_cell, i, usable_space).unwrap();
+        }
+        let seven_byte_cell = [0x06, b'a', b'b', b'c', b'd', b'e', b'f'];
+        insert_into_cell(contents, &seven_byte_cell, 679, usable_space).unwrap();
+        assert_eq!(compute_free_space(contents, usable_space).unwrap(), 5);
+
+        let three_byte_cell = [0x02, b'x', b'y'];
+        insert_into_cell(contents, &three_byte_cell, 680, usable_space).unwrap();
+
+        assert_eq!(
+            contents.overflow_cells.len(),
+            1,
+            "a 3-byte cell needs MINIMUM_CELL_SIZE + 2 = 6 bytes, so it must overflow when only 5 are free"
+        );
+        let pointer_array_end =
+            contents.offset() + contents.header_size() + 2 * contents.cell_count();
+        assert!(
+            contents.cell_content_area() as usize >= pointer_array_end,
+            "cell content area ({}) overlaps the cell pointer array (ends at {})",
+            contents.cell_content_area(),
+            pointer_array_end
+        );
     }
 
     #[test]
