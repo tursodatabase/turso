@@ -15,8 +15,10 @@ set ALL_TESTS 1
 #          do not fail the run. If such a file becomes fully green the run
 #          fails with a request to move it to "pass", so the known-bad list
 #          only ever shrinks.
-#   skip - not run at all. Reserved for files that hang or that die on a
-#          missing test-harness command; the reason is noted next to each.
+#   skip - not run at all. Used for files that hang, that die on a missing
+#          test-harness command, or that test features Turso will never
+#          support (for example the rollback journal modes; Turso is
+#          WAL-only). The reason is noted next to each.
 #
 # To bless a file: fix the remaining failures, then change its status here
 # from "fail" to "pass".
@@ -331,12 +333,12 @@ set test_files {
   joinE                pass
   joinF                fail
   joinH                fail
-  journal1             fail
-  journal2             fail
-  journal3             fail
-  jrnlmode             fail
-  jrnlmode2            fail
-  jrnlmode3            fail
+  journal1             skip {tests rollback journal files; Turso is WAL-only and will never support rollback journal modes}
+  journal2             skip {tests rollback journal files; Turso is WAL-only and will never support rollback journal modes}
+  journal3             skip {tests rollback journal files; Turso is WAL-only and will never support rollback journal modes}
+  jrnlmode             skip {tests journal_mode delete/truncate/persist/memory/off; Turso is WAL-only and will never support these modes}
+  jrnlmode2            skip {tests journal_mode delete/truncate/persist/memory/off; Turso is WAL-only and will never support these modes}
+  jrnlmode3            skip {tests journal_mode delete/truncate/persist/memory/off; Turso is WAL-only and will never support these modes}
   json101              fail
   json102              pass
   json103              fail
@@ -368,8 +370,8 @@ set test_files {
   lookaside            fail
   main                 fail
   manydb               pass
-  memjournal           fail
-  memjournal2          fail
+  memjournal           skip {tests journal_mode=memory; Turso is WAL-only and will never support it}
+  memjournal2          skip {tests journal_mode=memory; Turso is WAL-only and will never support it}
   memleak              fail
   memsubsys1           fail
   memsubsys2           fail
@@ -387,7 +389,7 @@ set test_files {
   misc7                fail
   misc8                fail
   misuse               fail
-  mjournal             fail
+  mjournal             skip {tests master journal files (rollback mode only); Turso is WAL-only and will never support them}
   mmap1                fail
   mmap3                fail
   mmap4                fail

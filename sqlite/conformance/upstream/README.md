@@ -56,8 +56,10 @@ the `test_files` table at the top of `all.test` with one of three statuses:
 - `fail` — known-bad: the file runs and its failures are printed, but they do
   not fail the run. If a known-bad file becomes fully green, the run fails
   with a request to bless it, so the known-bad list only ever shrinks.
-- `skip` — not run at all. Reserved for files that hang or die on a missing
-  test-harness command; the reason is noted next to each entry.
+- `skip` — not run at all. Used for files that hang, die on a missing
+  test-harness command, or test features Turso will never support (for
+  example the rollback journal modes; Turso is WAL-only). The reason is
+  noted next to each entry.
 
 To bless a file after fixing its remaining failures, change its status from
 `fail` to `pass` in `all.test`. A TCL error while sourcing a known-bad file
