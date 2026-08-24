@@ -318,7 +318,7 @@ set test_files {
   io                   fail
   istrue               fail
   join                 fail
-  join2                skip {needs "do_vmstep_test"}
+  join2                fail
   join3                skip {dies mid-file on a TCL error}
   join4                fail
   join5                fail

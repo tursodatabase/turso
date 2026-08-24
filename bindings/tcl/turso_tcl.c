@@ -2104,6 +2104,52 @@ static int TursoCApiCloseCmd(ClientData cd, Tcl_Interp *interp,
     return TCL_OK;
 }
 
+/* sqlite3_close_v2 DB — like sqlite3_close; turso's compat close_v2
+ * has the same semantics. */
+static int TursoCApiCloseV2Cmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ",
+                         Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    cache_free(tdb);
+    int rc = sqlite3_close_v2(tdb->db);
+    if (rc == SQLITE_OK) {
+        tdb->db = NULL; /* TursoDbFree must not close it again */
+        Tcl_DeleteCommand(interp, Tcl_GetString(objv[1]));
+    }
+    Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
+    return TCL_OK;
+}
+
+/* sqlite3_db_filename DB DBNAME */
+static int TursoDbFilenameCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB DBNAME");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ",
+                         Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    const char *name = sqlite3_db_filename(tdb->db, Tcl_GetString(objv[2]));
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(name ? name : "", -1));
+    return TCL_OK;
+}
+
 /*
  * sqlite3_table_column_metadata DB DBNAME TABLE ?COLUMN?
  *
@@ -2772,6 +2818,10 @@ int Tursotcl_Init(Tcl_Interp *interp)
                          TursoCApiOpenCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_close",
                          TursoCApiCloseCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_close_v2",
+                         TursoCApiCloseV2Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_db_filename",
+                         TursoDbFilenameCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_table_column_metadata",
                          TursoTableColumnMetadataCmd, NULL, NULL);
 

@@ -545,6 +545,138 @@ proc atomic_batch_write {file} {
   return 0
 }
 
+# Drop every table, view and explicitly created index, ported verbatim
+# from upstream tester.tcl. Tests use these to reset the schema without
+# recreating the database file.
+proc drop_all_tables {{db db}} {
+  ifcapable trigger&&foreignkey {
+    set pk [$db one "PRAGMA foreign_keys"]
+    $db eval "PRAGMA foreign_keys = OFF"
+  }
+  foreach {idx name file} [db eval {PRAGMA database_list}] {
+    if {$idx==1} {
+      set master sqlite_temp_master
+    } else {
+      set master $name.sqlite_master
+    }
+    foreach {t type} [$db eval "
+      SELECT name, type FROM $master
+      WHERE type IN('table', 'view') AND name NOT LIKE 'sqliteX_%' ESCAPE 'X'
+    "] {
+      $db eval "DROP $type \"$t\""
+    }
+  }
+  ifcapable trigger&&foreignkey {
+    $db eval "PRAGMA foreign_keys = $pk"
+  }
+}
+
+proc drop_all_indexes {{db db}} {
+  set L [$db eval {
+    SELECT name FROM sqlite_master WHERE type='index' AND sql LIKE 'create%'
+  }]
+  foreach idx $L { $db eval "DROP INDEX $idx" }
+}
+
+# Run a batch of {name sql result} SELECT tests, ported verbatim from
+# upstream tester.tcl.
+proc do_select_tests {prefix args} {
+
+  set testlist [lindex $args end]
+  set switches [lrange $args 0 end-1]
+
+  set errfmt ""
+  set countonly 0
+  set tclquery ""
+  set repair ""
+
+  for {set i 0} {$i < [llength $switches]} {incr i} {
+    set s [lindex $switches $i]
+    set n [string length $s]
+    if {$n>=2 && [string equal -length $n $s "-query"]} {
+      set tclquery [list execsql [lindex $switches [incr i]]]
+    } elseif {$n>=2 && [string equal -length $n $s "-tclquery"]} {
+      set tclquery [lindex $switches [incr i]]
+    } elseif {$n>=2 && [string equal -length $n $s "-errorformat"]} {
+      set errfmt [lindex $switches [incr i]]
+    } elseif {$n>=2 && [string equal -length $n $s "-repair"]} {
+      set repair [lindex $switches [incr i]]
+    } elseif {$n>=2 && [string equal -length $n $s "-count"]} {
+      set countonly 1
+    } else {
+      error "unknown switch: $s"
+    }
+  }
+
+  if {$countonly && $errfmt!=""} {
+    error "Cannot use -count and -errorformat together"
+  }
+  set nTestlist [llength $testlist]
+  if {$nTestlist%3 || $nTestlist==0 } {
+    error "SELECT test list contains [llength $testlist] elements"
+  }
+
+  eval $repair
+  foreach {tn sql res} $testlist {
+    if {$tclquery != ""} {
+      execsql $sql
+      uplevel do_test ${prefix}.$tn [list $tclquery] [list [list {*}$res]]
+    } elseif {$countonly} {
+      set nRow 0
+      db eval $sql {incr nRow}
+      uplevel do_test ${prefix}.$tn [list [list set {} $nRow]] [list $res]
+    } elseif {$errfmt==""} {
+      uplevel do_execsql_test ${prefix}.${tn} [list $sql] [list [list {*}$res]]
+    } else {
+      set res [list 1 [string trim [format $errfmt {*}$res]]]
+      uplevel do_catchsql_test ${prefix}.${tn} [list $sql] [list $res]
+    }
+    eval $repair
+  }
+
+}
+
+# Assert the extended error code of a connection, ported from upstream
+# tester.tcl.
+proc verify_ex_errcode {name expected {db db}} {
+  do_test $name [list sqlite3_extended_errcode $db] $expected
+}
+
+# Run a query and assert a bound on its VM step count, ported from
+# upstream tester.tcl over our [db status vmstep].
+proc do_vmstep_test {tn sql nstep {res {}}} {
+  uplevel [list do_execsql_test $tn.0 $sql $res]
+
+  set vmstep [db status vmstep]
+  if {[string range $nstep 0 0]=="+"} {
+    set body "if {$vmstep<$nstep} {
+      error \"got $vmstep, expected more than [string range $nstep 1 end]\"
+    }"
+  } else {
+    set body "if {$vmstep>$nstep} {
+      error \"got $vmstep, expected less than $nstep\"
+    }"
+  }
+
+  set name "$tn.1"
+  uplevel [list do_test $name $body {}]
+}
+
+# TCL 8.5+ integers are arbitrary precision, so 64-bit arithmetic
+# always works; upstream probes the platform here.
+proc working_64bit_int {} {
+  return 1
+}
+
+# Turso has no soft heap limit; tests only save and restore the value,
+# so report it as unset.
+proc sqlite3_soft_heap_limit {args} {
+  return 0
+}
+proc sqlite3_soft_heap_limit64 {args} {
+  return 0
+}
+
 # File operation utilities
 proc forcedelete {args} {
   foreach filename $args {
