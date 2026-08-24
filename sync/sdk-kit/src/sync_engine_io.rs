@@ -232,6 +232,11 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
     pub fn get_completion(&self) -> &SyncEngineIoCompletion<TBytes> {
         &self.completion
     }
+    /// Split the item into its request and completion. Taking the request by
+    /// value lets IO workers send large request bodies without copying them.
+    pub fn into_parts(self) -> (SyncEngineIoRequest, SyncEngineIoCompletion<TBytes>) {
+        (self.request, self.completion)
+    }
     pub fn to_capi(self: Box<Self>) -> *mut c::turso_sync_io_item_t {
         Box::into_raw(self) as *mut c::turso_sync_io_item_t
     }
