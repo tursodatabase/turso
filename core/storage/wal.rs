@@ -1915,6 +1915,7 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
+        let previous_snapshot = self.authority.snapshot();
         {
             let mut shared = self.shared.write();
             shared
@@ -1936,13 +1937,13 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
-        if self.authority.frame_index_overflowed() {
-            let snapshot = self.authority.snapshot();
-            let shared = self.shared.read();
-            let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
-            if coverage.covers(snapshot, commit.max_frame.saturating_sub(1)) {
-                coverage.record_snapshot(snapshot, commit.max_frame);
-            }
+        let snapshot = self.authority.snapshot();
+        let shared = self.shared.read();
+        let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+        if previous_snapshot.max_frame == 0
+            || coverage.covers(previous_snapshot, previous_snapshot.max_frame)
+        {
+            coverage.record_snapshot(snapshot, commit.max_frame);
         }
     }
 
@@ -8199,6 +8200,42 @@ pub mod test {
             matches!(wal.begin_read_tx(), Err(LimboError::Busy)),
             "new readers must also refuse an uncovered overflowed frame index without blocking"
         );
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn live_overflow_uses_complete_local_frame_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-covered-live-overflow.db-wal");
+        let shm_path = dir.path().join("test-covered-live-overflow.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+
+        coordination.cache_frame(7, 1);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 1,
+            last_checksum: (31, 37),
+            transaction_count: 1,
+        });
+
+        authority.mark_frame_index_overflowed_for_tests();
+        coordination.cache_frame(9, 2);
+        coordination.cache_frame(11, 3);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 3,
+            last_checksum: (41, 43),
+            transaction_count: 2,
+        });
+
+        let snapshot = coordination.load_snapshot();
+        coordination
+            .ensure_local_frame_cache_covers(&io, snapshot)
+            .expect("same-process commits must keep the overflow fallback complete");
+        assert_eq!(coordination.find_frame(11, 0, 3, None), Some(3));
     }
 
     #[cfg(host_shared_wal)]
