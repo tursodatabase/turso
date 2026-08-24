@@ -3042,21 +3042,106 @@ pub unsafe extern "C" fn sqlite3_create_collation(
     name: *const ffi::c_char,
     enc: ffi::c_int,
     context: *mut ffi::c_void,
-    cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
+    cmp: Option<sqlite3_collation_compare>,
 ) -> ffi::c_int {
     sqlite3_create_collation_v2(db, name, enc, context, cmp, None)
 }
 
+/// SQLite's collation comparator: (pArg, nLeft, pLeft, nRight, pRight) -> int.
+pub type sqlite3_collation_compare = unsafe extern "C" fn(
+    *mut ffi::c_void,
+    ffi::c_int,
+    *const ffi::c_void,
+    ffi::c_int,
+    *const ffi::c_void,
+) -> ffi::c_int;
+
+/// Bridges one registered collation from turso_core's comparator ABI to the
+/// SQLite one. Boxed and handed to core as the opaque context; the trampoline
+/// and destructor below reconstitute it.
+struct CollationBridge {
+    cmp: sqlite3_collation_compare,
+    p_app: *mut ffi::c_void,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+}
+
+/// turso_core's comparator passes (context, lptr, llen, rptr, rlen); SQLite's
+/// comparator wants (pArg, llen, lptr, rlen, rptr), so the arguments are
+/// reordered here.
+unsafe extern "C" fn collation_trampoline(
+    context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32 {
+    let bridge = &*(context as *const CollationBridge);
+    (bridge.cmp)(
+        bridge.p_app,
+        left_len as ffi::c_int,
+        left_ptr as *const ffi::c_void,
+        right_len as ffi::c_int,
+        right_ptr as *const ffi::c_void,
+    )
+}
+
+/// Frees the boxed CollationBridge, first running the caller's xDestroy on
+/// its application data.
+unsafe extern "C" fn collation_ctx_destructor(context: usize) {
+    let bridge = Box::from_raw(context as *mut CollationBridge);
+    if let Some(destroy) = bridge.destroy {
+        destroy(bridge.p_app);
+    }
+}
+
+/// Registers a user collation. A NULL comparator unregisters the name, as in
+/// SQLite. `enc` is accepted and ignored: turso_core is UTF-8 only.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_collation_v2(
-    _db: *mut sqlite3,
-    _name: *const ffi::c_char,
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
     _enc: ffi::c_int,
-    _context: *mut ffi::c_void,
-    _cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
-    _destroy: Option<unsafe extern "C" fn()>,
+    context: *mut ffi::c_void,
+    cmp: Option<sqlite3_collation_compare>,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 ) -> ffi::c_int {
-    SQLITE_ERROR
+    if db.is_null() || name.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let db: &sqlite3 = &*db;
+    let inner = match db.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return SQLITE_MISUSE,
+    };
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    match cmp {
+        None => {
+            inner.conn.unregister_external_collation(&name);
+            // A destructor supplied with a NULL comparator still owns the
+            // application data.
+            if let Some(destroy) = destroy {
+                destroy(context);
+            }
+        }
+        Some(cmp) => {
+            let bridge = Box::into_raw(Box::new(CollationBridge {
+                cmp,
+                p_app: context,
+                destroy,
+            }));
+            inner.conn.register_external_collation(
+                name,
+                bridge as usize,
+                collation_trampoline,
+                Some(collation_ctx_destructor),
+            );
+        }
+    }
+    SQLITE_OK
 }
 
 /// The pre-v2 registration entry point: identical to
