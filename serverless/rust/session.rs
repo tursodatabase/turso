@@ -18,7 +18,7 @@ use crate::{
         ENCRYPTION_KEY_HEADER,
     },
     rows::Row,
-    Column, Error, Result,
+    AuthTokenFn, Column, Error, Result,
 };
 
 /// Rewrite `libsql://` and `turso://` URLs to `https://` and strip any
@@ -56,7 +56,7 @@ pub struct StmtOutput {
 
 pub struct Session {
     client: reqwest::Client,
-    auth_token: Option<String>,
+    auth_token: Option<AuthTokenFn>,
     remote_encryption_key: Option<String>,
     base_url: String,
     baton: Option<String>,
@@ -127,7 +127,7 @@ impl LineReader {
 impl Session {
     pub fn new(
         url: &str,
-        auth_token: Option<String>,
+        auth_token: Option<AuthTokenFn>,
         remote_encryption_key: Option<String>,
     ) -> (Self, Arc<SharedState>) {
         let shared = Arc::new(SharedState {
@@ -158,7 +158,10 @@ impl Session {
             .client
             .post(&url)
             .header("Content-Type", "application/json");
-        if let Some(token) = &self.auth_token {
+        // Resolved here rather than once at construction so dynamic providers
+        // can rotate the token between requests.
+        if let Some(provider) = &self.auth_token {
+            let token = provider().await?;
             request = request.header("Authorization", format!("Bearer {token}"));
         }
         if let Some(key) = &self.remote_encryption_key {
