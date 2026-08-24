@@ -273,6 +273,14 @@ pub struct WhopperOpts {
     /// would routinely exhaust the main budget during a reopen near the end
     /// of a run. Exceeding `max_drain_steps` within a single reopen surfaces
     /// as an error.
+    ///
+    /// The budget must cover the most expensive legitimate statement, not
+    /// just typical ones: a generated `UNION` over a cross-product join
+    /// builds its deduplication b-tree in full before its `LIMIT` applies,
+    /// and a measured worst case (a 4.6M-row join feeding a UNION between
+    /// ~2600- and ~1750-row tables, seed 1153096812076377252) needed 1.13M
+    /// iterations to finish. The default gives roughly 9x headroom over
+    /// that while still detecting a genuine hang within minutes.
     pub max_drain_steps: usize,
     /// Probability of cosmic ray bit flip on each step (0.0-1.0).
     pub cosmic_ray_probability: f64,
@@ -352,7 +360,7 @@ impl Default for WhopperOpts {
             seed: None,
             max_connections: 4,
             max_steps: 100_000,
-            max_drain_steps: 1_000_000,
+            max_drain_steps: 10_000_000,
             cosmic_ray_probability: 0.0,
             keep_files: false,
             enable_mvcc: false,
@@ -1471,18 +1479,26 @@ impl Whopper {
             .any(|f| f.statement.borrow().is_some())
         {
             if drain_iterations >= self.max_drain_steps {
-                let stuck: Vec<usize> = self
+                let stuck: Vec<String> = self
                     .context
                     .fibers
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
+                    .filter(|(_, f)| f.statement.borrow().is_some())
+                    .map(|(i, f)| {
+                        format!(
+                            "fiber {i} (rows so far: {}): {:?}",
+                            f.rows.len(),
+                            f.current_op
+                        )
+                    })
                     .collect();
                 anyhow::bail!(
-                    "{reason} drain exceeded max_drain_steps ({}) with statements still live on \
-                     fibers {:?}; likely a leaked lock or other infinite loop in the engine",
+                    "{reason} drain exceeded max_drain_steps ({}) with statements still live; \
+                     either a leaked lock or other infinite loop in the engine, or a legitimate \
+                     statement whose work exceeds the budget (check the statements below)\n{}",
                     self.max_drain_steps,
-                    stuck,
+                    stuck.join("\n"),
                 );
             }
             for fiber_idx in 0..self.context.fibers.len() {
@@ -1496,6 +1512,9 @@ impl Whopper {
             }
             self.io.step()?;
             drain_iterations += 1;
+        }
+        if drain_iterations > 100_000 {
+            tracing::debug!("drain completed after {drain_iterations} iterations");
         }
         Ok(())
     }
