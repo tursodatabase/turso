@@ -313,7 +313,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
     }
 }
 
-fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
+pub(crate) fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
     if let ValueRef::Blob(blob) = value {
         if !is_jsonb_blob(blob) {
             crate::bail_constraint_error!("JSON cannot hold BLOB values")
@@ -494,9 +494,9 @@ pub fn json_arrow_extract(
         return Ok(Value::Null);
     }
 
+    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-        let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
         let mut op = SearchOperation::new(json.len())?;
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.result();
@@ -521,9 +521,9 @@ pub fn json_arrow_shift_extract(
     if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
+    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-        let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
         let mut op = SearchOperation::new(json.len())?;
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.result();
@@ -788,7 +788,7 @@ fn json_path_from_db_value<'a>(
                     JsonPath {
                         elements: vec![
                             PathElement::Root(),
-                            PathElement::Key(Cow::Borrowed(t.as_str()), false),
+                            PathElement::Key(Cow::Borrowed(t.as_str()), true),
                         ],
                     }
                 }
@@ -1780,7 +1780,7 @@ mod tests {
 
         let result = result.unwrap();
         match &result.elements[..] {
-            [PathElement::Root(), PathElement::Key(field, false)] if *field == "field" => {}
+            [PathElement::Root(), PathElement::Key(field, true)] if *field == "field" => {}
             _ => panic!("Expected root and field"),
         }
     }

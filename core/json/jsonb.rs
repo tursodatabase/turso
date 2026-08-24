@@ -2876,11 +2876,7 @@ impl Jsonb {
                     }
 
                     if mode.allows_insert() {
-                        let key_type = if *is_raw {
-                            ElementType::TEXTRAW
-                        } else {
-                            ElementType::TEXT
-                        };
+                        let key_type = new_key_element_type(path_key, *is_raw);
 
                         let key_header = JsonbHeader::new(key_type, path_key.len()).into_bytes();
                         let key_header_bytes = key_header.as_bytes();
@@ -3050,11 +3046,7 @@ impl Jsonb {
                         }
                     }
 
-                    let key_header_type = if *is_raw {
-                        ElementType::TEXTRAW
-                    } else {
-                        ElementType::TEXT
-                    };
+                    let key_header_type = new_key_element_type(path_key, *is_raw);
 
                     let key_header = JsonbHeader::new(key_header_type, path_key.len()).into_bytes();
                     let key_header_bytes = key_header.as_bytes();
@@ -3577,28 +3569,49 @@ fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
     from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
 }
 
+/// Picks the element type for an object key created from a path label.
+/// A quoted label that contains a backslash carries escape sequences
+/// that must stay escape sequences, so it is stored as TEXT5 exactly
+/// like SQLite stores it; a quoted label without escapes is raw text
+/// (TEXTRAW). An unquoted label keeps the historical TEXT encoding,
+/// whose serialization also escapes the raw bytes.
+fn new_key_element_type(path_key: &str, is_quoted: bool) -> ElementType {
+    if is_quoted && path_key.contains('\\') {
+        ElementType::TEXT5
+    } else if is_quoted {
+        ElementType::TEXTRAW
+    } else {
+        ElementType::TEXT
+    }
+}
+
+/// Compares a stored object key against a path label the way SQLite's
+/// jsonLabelCompare does: a side that holds no escape sequences is
+/// compared as-is, and a side that does is decoded first.
+///
+/// The stored key is escape-free when its element type is TEXT (never
+/// needs escapes) or TEXTRAW (kept as raw bytes). The path label is
+/// escape-free when it was written without quotes (backslashes in an
+/// unquoted label are literal characters), or quoted but containing no
+/// backslash.
 #[inline]
 fn compare(key: (&str, ElementType), path_key: (&str, bool)) -> bool {
     let (key, element_type) = key;
-    let (path_key, is_raw) = path_key;
-    if !is_raw && element_type == ElementType::TEXT {
-        if key.len() == path_key.len() {
-            return key == path_key;
-        } else {
-            return false;
-        }
+    let (path_key, is_quoted) = path_key;
+    if !matches!(
+        element_type,
+        ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW
+    ) {
+        return false;
     }
-    if !is_raw {
-        return unescape_string(key) == path_key;
+    let key_is_raw = matches!(element_type, ElementType::TEXT | ElementType::TEXTRAW);
+    let path_is_raw = !is_quoted || !path_key.contains('\\');
+    match (key_is_raw, path_is_raw) {
+        (true, true) => key == path_key,
+        (true, false) => key == unescape_string(path_key),
+        (false, true) => unescape_string(key) == path_key,
+        (false, false) => unescape_string(key) == unescape_string(path_key),
     }
-    match element_type {
-        ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW | ElementType::TEXT => {
-            return unescape_string(key) == unescape_string(path_key);
-        }
-        _ => {}
-    };
-
-    false
 }
 
 #[inline]

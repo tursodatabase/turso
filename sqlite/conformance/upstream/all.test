@@ -341,14 +341,14 @@ set test_files {
   jrnlmode3            skip {tests journal_mode delete/truncate/persist/memory/off; Turso is WAL-only and will never support these modes}
   json101              fail
   json102              pass
-  json103              fail
+  json103              pass
   json104              pass
   json105              pass
   json106              fail
   json107              pass
   json108              fail
   json501              pass
-  json502              fail
+  json502              pass
   jsonb01              pass
   keyword1             pass
   lastinsert           fail
