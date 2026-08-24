@@ -5513,7 +5513,7 @@ mod tests {
         assert!(p.next_cmd().is_err());
         let mut p = Parser::new(b"SELECT $a(b c)");
         let err = p.next_cmd().unwrap_err().to_string();
-        assert!(err.contains("bad variable name '$a(b'"), "{err}");
+        assert!(err.contains("unrecognized token: \"$a(b\""), "{err}");
     }
 
     #[test]

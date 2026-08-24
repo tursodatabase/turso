@@ -901,7 +901,7 @@ def test_csv():
     )
     turso.run_test_fn(
         "create virtual table t1 using csv(data='1'\\'2');",
-        lambda res: "unrecognized token " in res,
+        lambda res: "unrecognized token" in res,
         "Create CSV table with malformed escape sequence",
     )
 

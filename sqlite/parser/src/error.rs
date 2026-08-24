@@ -6,7 +6,7 @@ use crate::token::TokenType;
 #[diagnostic()]
 pub enum Error {
     /// Lexer error
-    #[error("unrecognized token '{token_text}' at offset {offset}")]
+    #[error("unrecognized token: \"{token_text}\"")]
     UnrecognizedToken {
         #[label("here")]
         span: miette::SourceSpan,
@@ -32,14 +32,6 @@ pub enum Error {
     /// Missing `*/`
     #[error("non-terminated block comment '{token_text}' at offset {offset}")]
     UnterminatedBlockComment {
-        #[label("here")]
-        span: miette::SourceSpan,
-        token_text: String,
-        offset: usize,
-    },
-    /// Invalid parameter name
-    #[error("bad variable name '{token_text}' at offset {offset}")]
-    BadVariableName {
         #[label("here")]
         span: miette::SourceSpan,
         token_text: String,
