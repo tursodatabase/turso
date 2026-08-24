@@ -636,6 +636,19 @@ proc do_select_tests {prefix args} {
 
 }
 
+# Real-number comparison helpers, ported verbatim from upstream
+# tester.tcl: different TCL versions display floating point values
+# differently, so both sides are normalized before comparing.
+proc realnum_normalize {r} {
+  string map {1.#INF inf Inf inf .0e e} [regsub -all {(e[+-])0+} $r {\1}]
+}
+
+proc do_realnum_test {name cmd expected} {
+  uplevel [list do_test $name [
+    subst -nocommands { realnum_normalize [ $cmd ] }
+  ] [realnum_normalize $expected]]
+}
+
 # Assert the extended error code of a connection, ported from upstream
 # tester.tcl.
 proc verify_ex_errcode {name expected {db db}} {
