@@ -21,7 +21,10 @@ env:
 jobs:
   bench:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
-    timeout-minutes: 45 # FIXME: make this run faster
+    # Compiling the benchmarks takes ~16 minutes on this 4-CPU runner and the
+    # benchmarks themselves ~90 minutes (mvcc_recovery_benchmark alone is ~20
+    # minutes: 15 bench functions with a 60 s measurement window each).
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: useblacksmith/setup-node@v5
@@ -38,6 +41,9 @@ jobs:
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
       - name: Bench
+        # `shell: bash` turns on pipefail, so a benchmark binary that crashes
+        # (e.g. gets OOM-killed) fails this step instead of being hidden by `tee`.
+        shell: bash
         run: make bench-exclude-tpc-h  2>&1 | tee output.txt
       - name: Analyze benchmark result with Nyrkiö
         uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
