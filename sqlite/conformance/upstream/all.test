@@ -31,7 +31,7 @@ set test_files {
   aggorderby           fail
   alias                fail
   alter                skip {dies mid-file on a TCL error}
-  alter2               skip {dies mid-file on a TCL error}
+  alter2               fail
   alter3               fail
   alter4               fail
   altercol             fail
@@ -110,8 +110,8 @@ set test_files {
   capi3                fail
   capi3b               fail
   capi3c               fail
-  capi3d               fail
-  capi3e               fail
+  capi3d               pass
+  capi3e               pass
   carray01             fail
   cast                 fail
   changes              fail
@@ -253,7 +253,7 @@ set test_files {
   fordelete            fail
   format4              fail
   full                 fail
-  func                 skip {needs "sqlite3_connection_pointer"}
+  func                 skip {needs "sqlite_register_test_function"}
   func2                pass
   func3                fail
   func4                skip {needs "load_static_extension" (totype)}
@@ -386,7 +386,7 @@ set test_files {
   misc4                fail
   misc5                fail
   misc6                fail
-  misc7                fail
+  misc7                skip {fd-exhaustion loop runs one test per available fd; effectively hangs with modern ulimits (524288)}
   misc8                fail
   misuse               fail
   mjournal             skip {tests master journal files (rollback mode only); Turso is WAL-only and will never support them}
