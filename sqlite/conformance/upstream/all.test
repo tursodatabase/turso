@@ -346,7 +346,7 @@ set test_files {
   json107              pass
   json108              fail
   json501              pass
-  json502              fail
+  json502              pass
   jsonb01              pass
   keyword1             pass
   lastinsert           fail
