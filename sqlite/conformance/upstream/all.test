@@ -95,10 +95,10 @@ set test_files {
   bitvec               fail
   blob                 fail
   bloom1               fail
-  boundary1            fail
-  boundary2            fail
-  boundary3            fail
-  boundary4            fail
+  boundary1            pass
+  boundary2            pass
+  boundary3            pass
+  boundary4            pass
   btree01            skip {aborts the harness on an engine panic}
   btree02              fail
   busy                 fail
@@ -115,7 +115,7 @@ set test_files {
   carray01             fail
   cast                 fail
   changes              fail
-  changes2             fail
+  changes2             pass
   check                fail
   chunksize            fail
   cksumvfs             fail
@@ -135,7 +135,7 @@ set test_files {
   collateB             pass
   colmeta              fail
   colname              fail
-  columncount          fail
+  columncount          pass
   conflict             fail
   conflict2            fail
   conflict3            fail
@@ -190,7 +190,7 @@ set test_files {
   delete_db            fail
   descidx1             fail
   descidx2             fail
-  descidx3             fail
+  descidx3             pass
   diskfull             fail
   distinct             fail
   distinct2            fail
@@ -202,7 +202,7 @@ set test_files {
   e_changes            fail
   e_createtable        fail
   e_delete             fail
-  e_droptrigger        fail
+  e_droptrigger        pass
   e_dropview           fail
   e_expr               fail
   e_fkey               fail
@@ -222,7 +222,7 @@ set test_files {
   emptytable           fail
   enc                  fail
   enc2                 fail
-  enc3                 fail
+  enc3                 pass
   enc4                 fail
   eqp                  fail
   eqp2                 fail
@@ -292,7 +292,7 @@ set test_files {
   index                fail
   index2               pass
   index3               fail
-  index4               fail
+  index4               pass
   index5               fail
   index6               fail
   index7               fail
@@ -465,7 +465,7 @@ set test_files {
   rollback2          skip {aborts the harness on an engine panic at core/storage/btree.rs:8315}
   round1               pass
   rowallock            fail
-  rowhash              fail
+  rowhash              pass
   rowid                skip {hangs at rowid-13.1}
   rowvalue             fail
   rowvalue2            pass
@@ -568,8 +568,8 @@ set test_files {
   temptrigger          fail
   timediff1            fail
   tkt-02a8e81d44       pass
-  tkt-18458b1a         fail
-  tkt-26ff0c2d1e       fail
+  tkt-18458b1a         pass
+  tkt-26ff0c2d1e       pass
   tkt-2a5629202f       fail
   tkt-2d1a5c67d        fail
   tkt-2ea2425d34       fail
@@ -608,7 +608,7 @@ set test_files {
   tkt-a8a0d2996a       pass
   tkt-b1d3a2e531       fail
   tkt-b351d95f9        fail
-  tkt-b72787b1         fail
+  tkt-b72787b1         pass
   tkt-b75a9ca6b0       fail
   tkt-ba7cbfaedc       pass
   tkt-bd484a090c       fail
@@ -703,7 +703,7 @@ set test_files {
   tkt3879              pass
   tkt3911              fail
   tkt3918              fail
-  tkt3922              fail
+  tkt3922              pass
   tkt3929              pass
   tkt3935              fail
   tkt3992              pass
