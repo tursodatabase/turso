@@ -339,7 +339,7 @@ set test_files {
   jrnlmode3            fail
   json101              fail
   json102              pass
-  json103              fail
+  json103              pass
   json104              pass
   json105              pass
   json106              fail

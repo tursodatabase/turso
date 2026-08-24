@@ -148,14 +148,14 @@ use crate::vdbe::vacuum::{
 
 #[cfg(feature = "json")]
 use crate::{
-    function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::get_json,
-    json::is_json_valid, json::json_array, json::json_array_length, json::json_arrow_extract,
-    json::json_arrow_shift_extract, json::json_error_position, json::json_extract,
-    json::json_from_raw_bytes_agg, json::json_insert, json::json_object, json::json_patch,
-    json::json_quote, json::json_remove, json::json_replace, json::json_set, json::json_type,
-    json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert, json::jsonb_object,
-    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
-    json::raw_jsonb_element_len, json::Conv,
+    function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::ensure_blob_arg_is_jsonb,
+    json::get_json, json::is_json_valid, json::json_array, json::json_array_length,
+    json::json_arrow_extract, json::json_arrow_shift_extract, json::json_error_position,
+    json::json_extract, json::json_from_raw_bytes_agg, json::json_insert, json::json_object,
+    json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
+    json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
+    json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
+    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
 };
 
 use super::{Program, ProgramState, Register};
@@ -7171,6 +7171,7 @@ fn update_agg_payload(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
             };
+            ensure_blob_arg_is_jsonb(value.as_value_ref())?;
             let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
             let mut val_vec = convert_dbtype_to_raw_jsonb(value, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
@@ -7221,6 +7222,7 @@ fn update_agg_payload(
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
+            ensure_blob_arg_is_jsonb(arg.as_value_ref())?;
             let mut data = convert_dbtype_to_raw_jsonb(arg, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();

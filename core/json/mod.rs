@@ -313,7 +313,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
     }
 }
 
-fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
+pub(crate) fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
     if let ValueRef::Blob(blob) = value {
         if !is_jsonb_blob(blob) {
             crate::bail_constraint_error!("JSON cannot hold BLOB values")
