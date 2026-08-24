@@ -494,9 +494,9 @@ pub fn json_arrow_extract(
         return Ok(Value::Null);
     }
 
+    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-        let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
         let mut op = SearchOperation::new(json.len())?;
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.result();
@@ -521,9 +521,9 @@ pub fn json_arrow_shift_extract(
     if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
+    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-        let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
         let mut op = SearchOperation::new(json.len())?;
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.result();
