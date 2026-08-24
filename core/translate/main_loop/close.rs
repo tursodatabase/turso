@@ -521,7 +521,14 @@ pub(super) fn emit_autoindex(
         if let Some(columns) = table_columns {
             if let Some(column_def) = columns.get(col.pos_in_table) {
                 if column_def.is_virtual_generated() {
-                    crate::translate::expr::emit_table_column(
+                    // The table's plan operation already points at this
+                    // ephemeral index, so column references inside the
+                    // generation expression would resolve to the index we are
+                    // in the middle of building and read garbage. Force them
+                    // to the source table cursor for the duration of the
+                    // build loop.
+                    program.set_cursor_override(table_ref_id, table_cursor_id);
+                    let result = crate::translate::expr::emit_table_column(
                         program,
                         table_cursor_id,
                         table_ref_id,
@@ -530,7 +537,9 @@ pub(super) fn emit_autoindex(
                         col.pos_in_table,
                         reg,
                         resolver,
-                    )?;
+                    );
+                    program.clear_cursor_override(table_ref_id);
+                    result?;
                     continue;
                 }
             }

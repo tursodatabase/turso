@@ -1,0 +1,41 @@
+@database :memory:
+
+# Regression test: a VIRTUAL generated column referenced in a join's ON
+# clause must be computed from the source table while the automatic
+# (ephemeral) index is being built.
+#
+# Previously the table's plan operation already pointed at the ephemeral
+# index, so the column references inside the generation expression resolved
+# to the index that was still being filled. The reads returned NULL, the
+# index was built from NULL keys, and the INNER JOIN returned no rows.
+#
+# Found by the differential simulator (seed 13703993978349289638).
+
+setup vjoin {
+    CREATE TABLE t0 (a REAL);
+    INSERT INTO t0 VALUES (1), (2);
+    CREATE TABLE t9 (v INTEGER AS (- c) VIRTUAL, c REAL);
+    INSERT INTO t9 (c) VALUES (100.5), (200.5), (-300.5);
+}
+
+@setup vjoin
+test gencol-virtual-join-autoindex-eq {
+    SELECT t9.c FROM t9 INNER JOIN t0 ON (t9.v > -1000.0 AND t9.c = 200.5);
+}
+expect {
+    200.5
+    200.5
+}
+
+@setup vjoin
+test gencol-virtual-join-autoindex-range-only {
+    SELECT t9.c FROM t9 INNER JOIN t0 ON (t9.v > -1000.0) ORDER BY t9.c;
+}
+expect {
+    -300.5
+    -300.5
+    100.5
+    100.5
+    200.5
+    200.5
+}
