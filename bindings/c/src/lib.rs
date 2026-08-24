@@ -966,6 +966,19 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     };
     let stmt = match db.conn.prepare(sql_str) {
         Ok(stmt) => stmt,
+        // The C API contract (https://www.sqlite.org/c3ref/prepare.html)
+        // treats SQL with nothing to compile (empty string, whitespace,
+        // comments) as success with *ppStmt set to NULL, while core
+        // reports it as an error so the higher-level bindings can throw.
+        Err(LimboError::InvalidArgument(ref msg))
+            if msg == "The supplied SQL string contains no statements" =>
+        {
+            if !tail.is_null() {
+                *tail = sql.add(sql_bytes.len());
+            }
+            *out_stmt = std::ptr::null_mut();
+            return SQLITE_OK;
+        }
         Err(err) => {
             return set_db_err(&mut db, err);
         }

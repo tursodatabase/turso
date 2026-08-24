@@ -27,6 +27,7 @@ void test_sqlite3_extended_result_codes();
 void test_sqlite3_sql_introspection();
 void test_sqlite3_mprintf();
 void test_sqlite3_exec_null_values();
+void test_sqlite3_prepare_no_statements();
 
 int allocated = 0;
 
@@ -53,7 +54,36 @@ int main(void)
     test_sqlite3_sql_introspection();
     test_sqlite3_mprintf();
     test_sqlite3_exec_null_values();
+    test_sqlite3_prepare_no_statements();
     return 0;
+}
+
+/* SQL with nothing to compile (empty string, whitespace, comments) must
+ * prepare to a NULL statement with SQLITE_OK, not an error, and the tail
+ * must point at the end of the input. */
+void test_sqlite3_prepare_no_statements()
+{
+    sqlite3 *db;
+    sqlite3_stmt *stmt;
+    const char *tail;
+    int rc;
+    static const char *empty_sql[] = { "", "   \n\t", "-- comment only",
+                                       "/* block comment */", ";;;", NULL };
+    int i;
+
+    rc = sqlite3_open("../../../testing/testing.db", &db);
+    assert(rc == SQLITE_OK);
+
+    for (i = 0; empty_sql[i]; i++) {
+        stmt = (sqlite3_stmt *)0x1; /* poison: must be overwritten */
+        tail = NULL;
+        rc = sqlite3_prepare_v2(db, empty_sql[i], -1, &stmt, &tail);
+        assert(rc == SQLITE_OK);
+        assert(stmt == NULL);
+        assert(tail != NULL && *tail == '\0');
+    }
+
+    sqlite3_close(db);
 }
 
 
