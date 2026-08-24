@@ -788,7 +788,7 @@ fn json_path_from_db_value<'a>(
                     JsonPath {
                         elements: vec![
                             PathElement::Root(),
-                            PathElement::Key(Cow::Borrowed(t.as_str()), false),
+                            PathElement::Key(Cow::Borrowed(t.as_str()), true),
                         ],
                     }
                 }
@@ -1780,7 +1780,7 @@ mod tests {
 
         let result = result.unwrap();
         match &result.elements[..] {
-            [PathElement::Root(), PathElement::Key(field, false)] if *field == "field" => {}
+            [PathElement::Root(), PathElement::Key(field, true)] if *field == "field" => {}
             _ => panic!("Expected root and field"),
         }
     }
