@@ -2248,17 +2248,15 @@ impl BTreeCursor {
             let record = self.get_immutable_record();
             let record = record.as_ref().unwrap();
 
-            let interior_cell_vs_index_key = record_comparer
-                .compare(
-                    record,
-                    key_values,
-                    self.index_info
-                        .as_ref()
-                        .expect("indexbtree_move_to: index_info required"),
-                    0,
-                    tie_breaker,
-                )
-                .unwrap();
+            let interior_cell_vs_index_key = record_comparer.compare(
+                record,
+                key_values,
+                self.index_info
+                    .as_ref()
+                    .expect("indexbtree_move_to: index_info required"),
+                0,
+                tie_breaker,
+            )?;
 
             // in sqlite btrees left child pages have <= keys.
             // in general, in forwards iteration we want to find the first key that matches the seek condition.
@@ -2690,7 +2688,7 @@ impl BTreeCursor {
             self.index_info
                 .as_ref()
                 .expect("indexbtree_seek: index_info required"),
-        );
+        )?;
         if found {
             state.nearest_matching_cell.replace(cur_cell_idx as usize);
             match iter_dir {
@@ -2732,14 +2730,12 @@ impl BTreeCursor {
         seek_op: SeekOp,
         record_comparer: &RecordCompare,
         index_info: &IndexInfo,
-    ) -> (Ordering, bool) {
+    ) -> Result<(Ordering, bool)> {
         let record = self.get_immutable_record();
         let record = record.as_ref().unwrap();
 
         let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-        let cmp = record_comparer
-            .compare(record, key_values, index_info, 0, tie_breaker)
-            .unwrap();
+        let cmp = record_comparer.compare(record, key_values, index_info, 0, tie_breaker)?;
 
         let found = match seek_op {
             SeekOp::GT => cmp.is_gt(),
@@ -2749,7 +2745,7 @@ impl BTreeCursor {
             SeekOp::LE { eq_only: false } => cmp.is_le(),
             SeekOp::LT => cmp.is_lt(),
         };
-        (cmp, found)
+        Ok((cmp, found))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -9020,6 +9016,9 @@ fn free_cell_range(
     // clearing that amount of fragmented bytes, since a 1-3 byte range cannot be a valid cell.
     if let Some(next) = next_block {
         if end + SINGLE_FRAGMENT_SIZE_MAX >= next {
+            if unlikely(end > next) {
+                return_corrupt!("free_cell_range: freed range overlaps next freeblock: end={end} next_block={next}");
+            }
             removed_fragmentation = (next - end) as u8;
             let next_size = page.read_u16_no_offset(next + 2) as usize;
             end = next + next_size;
@@ -9315,19 +9314,9 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
 
     // Helper function to process cells and defragment the page.
     // This is generic over the slice type to work with both stack and heap storage.
+    // Cells must already be sorted by old physical offset in descending order.
     #[inline]
-    fn process_cells(
-        page: &PageContent,
-        usable_space: usize,
-        cells: &mut [CellInfo],
-        is_physically_sorted: bool,
-    ) -> Result<()> {
-        if !is_physically_sorted {
-            // Sort cells by old physical offset in descending order.
-            // Using unstable sort is fine as the original order doesn't matter.
-            cells.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
-        }
-
+    fn process_cells(page: &PageContent, usable_space: usize, cells: &[CellInfo]) -> Result<()> {
         // Get direct mutable access to the page buffer.
         let buffer = page.as_ptr();
         let cell_pointer_area_offset = page.cell_pointer_array_offset();
@@ -9406,7 +9395,33 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         });
     }
 
-    process_cells(page, usable_space, &mut cells, is_physically_sorted)?;
+    // Sort once, descending by old physical offset — the order the copy
+    // loop in `process_cells` needs. Using unstable sort is fine as the
+    // original order doesn't matter.
+    if !is_physically_sorted {
+        cells.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
+    }
+
+    // Cells below the pointer array or overlapping each other mean the
+    // page is corrupt (each region was individually bounds-checked above).
+    // Moving them would compound the damage: defragmentation interleaves
+    // pointer-array writes with cell copies, so a cell sourced from inside
+    // the pointer array — or from another cell's region — gets its bytes
+    // rewritten before or while it is copied. Walking the descending sort
+    // in reverse checks the regions in ascending offset order.
+    let first_allowed_cell_offset = cell_offset + 2 * cell_count;
+    let mut previous_end = first_allowed_cell_offset;
+    for cell in cells.iter().rev() {
+        if (cell.old_offset as usize) < previous_end {
+            return Err(LimboError::Corrupt(format!(
+                "page has overlapping or misplaced cells at offset {}",
+                cell.old_offset
+            )));
+        }
+        previous_end = cell.old_offset as usize + cell.size as usize;
+    }
+
+    process_cells(page, usable_space, &cells)?;
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
