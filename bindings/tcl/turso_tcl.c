@@ -867,9 +867,9 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             sql_n_args,
             0, /* SQLITE_UTF8 */
             (void *)func_data,
-            (void (*)(void))tcl_scalar_bridge,
+            (void (*)(sqlite3_context *, int, sqlite3_value **))tcl_scalar_bridge,
             NULL, NULL,
-            (void (*)(void))tcl_func_destroy
+            (void (*)(void *))tcl_func_destroy
         );
 
         if (rc != SQLITE_OK) {
