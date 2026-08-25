@@ -295,6 +295,9 @@ pub struct SqliteContext {
     pub(crate) result: ExtValue,
     pub(crate) p_app: *mut ffi::c_void,
     pub(crate) db: *mut sqlite3,
+    /// Per-group accumulator for an aggregate step/final call, null for a
+    /// scalar context. Backs sqlite3_aggregate_context.
+    pub(crate) agg: *mut turso_ext::AggCtx,
 }
 
 // SAFETY: SqliteContext is only used single-threaded within a function call.
@@ -338,6 +341,7 @@ unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue)
         result: ExtValue::null(),
         p_app: p_app as *mut ffi::c_void,
         db: db as *mut sqlite3,
+        agg: std::ptr::null_mut(),
     };
 
     x_func(
@@ -2832,10 +2836,23 @@ pub unsafe extern "C" fn sqlite3_result_error(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_aggregate_context(
-    _context: *mut ffi::c_void,
-    _n: ffi::c_int,
+    context: *mut ffi::c_void,
+    n: ffi::c_int,
 ) -> *mut ffi::c_void {
-    std::ptr::null_mut()
+    if context.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ctx = &mut *(context as *mut SqliteContext);
+    if ctx.agg.is_null() {
+        return std::ptr::null_mut();
+    }
+    let agg = &mut *ctx.agg;
+    // First request with n > 0 zero-allocates the per-group buffer; later
+    // requests return the same pointer, as SQLite does.
+    if agg.state.is_null() && n > 0 {
+        agg.state = libc::calloc(1, n as usize);
+    }
+    agg.state
 }
 
 // `unsafe_op_in_unsafe_fn`: opt this FFI entry point out of the legacy rule that an
@@ -3160,6 +3177,134 @@ pub unsafe extern "C" fn sqlite3_create_function(
     sqlite3_create_function_v2(db, name, n_args, enc, context, func, step, final_, None)
 }
 
+/// Bridges one registered aggregate to turso_core's init/step/finalize ABI.
+/// Boxed and passed as the registration `context`, shared read-only across
+/// groups; the per-group accumulator lives in the AggCtx that init allocates
+/// and finalize frees, reachable from xStep/xFinal via
+/// sqlite3_aggregate_context.
+struct AggBridge {
+    step: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
+    final_: unsafe extern "C" fn(*mut ffi::c_void),
+    p_app: *mut ffi::c_void,
+    db: *mut sqlite3,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+}
+
+unsafe extern "C" fn agg_init(_context: usize) -> *mut turso_ext::AggCtx {
+    Box::into_raw(Box::new(turso_ext::AggCtx {
+        state: std::ptr::null_mut(),
+    }))
+}
+
+unsafe extern "C" fn agg_step(
+    context: usize,
+    ctx: *mut turso_ext::AggCtx,
+    argc: i32,
+    argv: *const ExtValue,
+) -> ExtValue {
+    let bridge = &*(context as *const AggBridge);
+    let mut arg_ptrs: Vec<*mut ffi::c_void> = (0..argc as usize)
+        .map(|i| argv.add(i) as *mut ffi::c_void)
+        .collect();
+    let mut sctx = SqliteContext {
+        result: ExtValue::null(),
+        p_app: bridge.p_app,
+        db: bridge.db,
+        agg: ctx,
+    };
+    (bridge.step)(
+        &mut sctx as *mut SqliteContext as *mut ffi::c_void,
+        argc,
+        arg_ptrs.as_mut_ptr(),
+    );
+    // Aggregate step produces no value; state lives in the AggCtx.
+    ExtValue::null()
+}
+
+unsafe extern "C" fn agg_finalize(context: usize, ctx: *mut turso_ext::AggCtx) -> ExtValue {
+    let bridge = &*(context as *const AggBridge);
+    let mut sctx = SqliteContext {
+        result: ExtValue::null(),
+        p_app: bridge.p_app,
+        db: bridge.db,
+        agg: ctx,
+    };
+    (bridge.final_)(&mut sctx as *mut SqliteContext as *mut ffi::c_void);
+    // xFinal is called once per init; free the per-group buffer and AggCtx.
+    if !ctx.is_null() {
+        let agg = Box::from_raw(ctx);
+        if !agg.state.is_null() {
+            libc::free(agg.state);
+        }
+    }
+    sctx.result
+}
+
+/// Called by core when the aggregate is removed: free the shared bridge and
+/// run the caller's xDestroy on its application data.
+unsafe extern "C" fn agg_ctx_destructor(context: usize) {
+    let bridge = Box::from_raw(context as *mut AggBridge);
+    if let Some(destroy) = bridge.destroy {
+        destroy(bridge.p_app);
+    }
+}
+
+/// Registers an aggregate (xStep + xFinal) via turso_core's aggregate ABI.
+unsafe fn register_aggregate(
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
+    n_args: ffi::c_int,
+    context: *mut ffi::c_void,
+    step_raw: unsafe extern "C" fn(),
+    final_raw: unsafe extern "C" fn(),
+    destroy_raw: Option<unsafe extern "C" fn()>,
+) -> ffi::c_int {
+    let step: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void) =
+        std::mem::transmute(step_raw);
+    let final_: unsafe extern "C" fn(*mut ffi::c_void) = std::mem::transmute(final_raw);
+    let destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)> =
+        destroy_raw.map(|f| std::mem::transmute(f));
+
+    let name_c = match CStr::from_ptr(name).to_str() {
+        Ok(s) => match CString::new(s) {
+            Ok(c) => c,
+            Err(_) => return SQLITE_MISUSE,
+        },
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    let bridge = Box::into_raw(Box::new(AggBridge {
+        step,
+        final_,
+        p_app: context,
+        db,
+        destroy,
+    }));
+
+    let db_ref = &*db;
+    let inner = db_ref.inner.lock().unwrap();
+    let api = inner.conn._build_turso_ext();
+    let rc = (api.register_aggregate_function)(
+        api.ctx,
+        name_c.as_ptr(),
+        n_args,
+        bridge as usize,
+        agg_init,
+        agg_step,
+        agg_finalize,
+        Some(agg_ctx_destructor),
+        None,
+        None,
+    );
+    inner.conn._free_extension_ctx(api);
+
+    if rc != turso_ext::ResultCode::OK {
+        drop(Box::from_raw(bridge));
+        return SQLITE_ERROR;
+    }
+    SQLITE_OK
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_function_v2(
     db: *mut sqlite3,
@@ -3175,10 +3320,15 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     if db.is_null() || name.is_null() {
         return SQLITE_MISUSE;
     }
-    // Only scalar functions (xFunc) are supported for now; skip aggregate registration.
+    // An aggregate provides xStep + xFinal and no xFunc.
     let x_func_raw = match func {
         Some(f) => f,
-        None => return SQLITE_OK,
+        None => match (_step, _final_) {
+            (Some(step), Some(final_)) => {
+                return register_aggregate(db, name, _n_args, context, step, final_, _destroy);
+            }
+            _ => return SQLITE_OK,
+        },
     };
     // Cast the opaque fn() pointer to the real scalar callback signature.
     let x_func: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void) =
