@@ -519,12 +519,9 @@ pub(super) fn emit_autoindex(
         if let Some(columns) = table_columns {
             if let Some(column_def) = columns.get(col.pos_in_table) {
                 if column_def.is_virtual_generated() {
-                    // Generated-column dependencies must come from the source row while the
-                    // automatic index is still being populated. Without this override, expression
-                    // translation sees the new index in the table's plan and reads dependencies
-                    // from the empty index cursor instead.
-                    let previous_cursor_id =
-                        program.set_cursor_override(table_ref_id, table_cursor_id);
+                    // Override the table cursor to the base table, because generated
+                    // columns may need to read from it to compute their expression.
+                    program.set_cursor_override(table_ref_id, table_cursor_id);
                     let result = crate::translate::expr::emit_table_column(
                         program,
                         table_cursor_id,
@@ -535,12 +532,7 @@ pub(super) fn emit_autoindex(
                         reg,
                         resolver,
                     );
-                    match previous_cursor_id {
-                        Some(cursor_id) => {
-                            program.set_cursor_override(table_ref_id, cursor_id);
-                        }
-                        None => program.clear_cursor_override(table_ref_id),
-                    }
+                    program.clear_cursor_override(table_ref_id);
                     result?;
                     continue;
                 }
