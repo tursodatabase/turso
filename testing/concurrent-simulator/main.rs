@@ -212,6 +212,7 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         restart_probability: args.restart_probability,
         history_output: args.history_output.clone(),
         keep_files: args.keep,
+        sql_generation_opts: WhopperOpts::default().sql_generation_opts,
     };
 
     println!(
@@ -464,9 +465,12 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (10, Box::new(CreateSimpleTableWorkload)),
             (20, Box::new(SimpleSelectWorkload)),
             (20, Box::new(SimpleInsertWorkload)),
+            (20, Box::new(InsertWorkload)),
+            (10, Box::new(SelectWorkload)),
+            (10, Box::new(SelectInSubqueryWorkload)),
             (20, Box::new(JsonWorkload)),
             (15, Box::new(UpdateWorkload)),
-            (15, Box::new(DeleteWorkload)),
+            (5, Box::new(DeleteWorkload)),
             (2, Box::new(CreateIndexWorkload)),
             (2, Box::new(DropIndexWorkload)),
             (5, Box::new(CreateSequenceWorkload)),
@@ -502,8 +506,8 @@ type TableSchemas = Vec<(String, String)>;
 type ChaosProfiles = Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>;
 type BuildArtifacts = (WorkerWorkloads, PropertyList, TableSchemas, ChaosProfiles);
 
-fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
-    let mut base_opts = match args.mode.as_str() {
+fn base_opts_for_mode(mode: &str) -> anyhow::Result<WhopperOpts> {
+    Ok(match mode {
         "fast" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
         "schema-clone-faults" => WhopperOpts::schema_clone_faults(),
@@ -511,7 +515,11 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         "ragnarök" | "ragnarok" => WhopperOpts::ragnarok(),
         "recovery-heavy" => WhopperOpts::recovery_heavy(),
         mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
-    };
+    })
+}
+
+fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
+    let mut base_opts = base_opts_for_mode(&args.mode)?;
 
     if let Some(max_steps) = args.max_steps {
         base_opts = base_opts.with_max_steps(max_steps);

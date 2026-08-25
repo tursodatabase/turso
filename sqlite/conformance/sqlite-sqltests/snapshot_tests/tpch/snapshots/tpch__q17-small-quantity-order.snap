@@ -99,7 +99,7 @@ addr  opcode                  p1  p2  p3  p4                                    
   61      IdxGT                0  83  29                                          0  key=[29..29]
   62      Once                71   0   0                                          0  goto 71
   63      OpenAutoindex        5   0   0                                          0  cursor=5
-  64      Rewind               4  65   0                                          0  Rewind table lineitem
+  64      Rewind               4  71   0                                          0  Rewind table lineitem
   65        Column             4   1  30                                          0  r[30]=lineitem.L_PARTKEY
   66        ColumnRange        4   4  31  2                                       0  r[31..32]=lineitem.L_QUANTITY..L_EXTENDEDPRICE
   67        RowId              4  33   0                                          0  r[33]=lineitem.rowid

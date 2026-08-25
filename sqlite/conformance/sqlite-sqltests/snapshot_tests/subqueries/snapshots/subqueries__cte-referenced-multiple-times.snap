@@ -187,7 +187,7 @@ addr  opcode                                       p1   p2   p3  p4            p
  147  Rewind                                        7  169    0                 0  Rewind table customers
  148    Once                                      156    0    0                 0  goto 156
  149    OpenAutoindex                               8    0    0                 0  cursor=8
- 150    Rewind                                      4  151    0                 0  Rewind  ephemeral()
+ 150    Rewind                                      4  156    0                 0  Rewind  ephemeral()
  151      ColumnRange                               4    0   58  2              0  r[58..59]=ephemeral().customer_id..total
  152      RowId                                     4   60    0                 0  r[60]=ephemeral().rowid
  153      MakeRecord                               58    3   61                 0  r[61]=mkrec(r[58..60]); for ephemeral_subquery_t5

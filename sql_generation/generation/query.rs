@@ -229,6 +229,10 @@ impl Arbitrary for Select {
             }
         }
 
+        let limit = rng
+            .random_bool(opts.limit_prob)
+            .then(|| rng.random_range(1..=opts.max_limit.get() as usize));
+
         Self {
             body: SelectBody {
                 select: Box::new(first),
@@ -240,8 +244,48 @@ impl Arbitrary for Select {
                     })
                     .collect(),
             },
-            limit: None,
+            limit,
         }
+    }
+}
+
+/// `SELECT <value> [NOT] IN (SELECT <column> FROM <table> WHERE <predicate>)`.
+///
+/// The subquery's rows are loaded into an ephemeral index b-tree whose records
+/// hold just the one selected column. That is the only way a generated query
+/// pushes one-column records — including the 2-byte ones made of `0`, `1`,
+/// `''` and `X''` (see `ValueOpts::tiny_value_prob`) — through index b-tree
+/// balancing, which is where SQLite's in2.test found its 2007 bug.
+pub struct SelectInSubquery(pub Select);
+
+impl Arbitrary for SelectInSubquery {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+        const WHOLE_COLUMN_PROB: f64 = 0.75;
+        const NOT_IN_PROB: f64 = 0.2;
+
+        let table = pick(env.tables(), rng);
+        let column = pick(&table.columns, rng);
+        // Mostly load the whole column into the IN b-tree so it grows with the
+        // table; sometimes filter it so the b-tree is built from a subset.
+        let where_clause = if rng.random_bool(WHOLE_COLUMN_PROB) {
+            Predicate::true_()
+        } else {
+            Predicate::arbitrary_from(rng, env, table)
+        };
+        let subquery = Select::single(
+            table.name.clone(),
+            vec![ResultColumn::Column(column.name.clone())],
+            where_clause,
+            None,
+            Distinctness::All,
+        );
+        let needle = SimValue::arbitrary_from(rng, env, &column.column_type);
+        let expr = Expr::in_select(
+            Expr::Literal(needle.into()),
+            rng.random_bool(NOT_IN_PROB),
+            subquery.to_sql_ast(),
+        );
+        Self(Select::expr(Predicate(expr)))
     }
 }
 
@@ -382,12 +426,11 @@ impl Arbitrary for Insert {
                 1,
                 Box::new(gen_upsert_values) as Box<dyn Fn(&mut R) -> Option<Insert>>,
             ),
-            (
-                1,
-                Box::new(gen_nested_self_insert) as Box<dyn Fn(&mut R) -> Option<Insert>>,
-            ),
         ];
 
+        if insert_opts.nested_self_insert {
+            choices.push((1, Box::new(gen_nested_self_insert)));
+        }
         if env.opts().arbitrary_insert_into_select {
             choices.push((1, Box::new(gen_select)));
         }

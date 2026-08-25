@@ -13,6 +13,7 @@ use sql_generation::{
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
+use std::num::NonZero;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
@@ -272,6 +273,14 @@ pub struct WhopperOpts {
     /// would routinely exhaust the main budget during a reopen near the end
     /// of a run. Exceeding `max_drain_steps` within a single reopen surfaces
     /// as an error.
+    ///
+    /// The budget must cover the most expensive legitimate statement, not
+    /// just typical ones: a generated `UNION` over a cross-product join
+    /// builds its deduplication b-tree in full before its `LIMIT` applies,
+    /// and a measured worst case (a 4.6M-row join feeding a UNION between
+    /// ~2600- and ~1750-row tables, seed 1153096812076377252) needed 1.13M
+    /// iterations to finish. The default gives roughly 9x headroom over
+    /// that while still detecting a genuine hang within minutes.
     pub max_drain_steps: usize,
     /// Probability of cosmic ray bit flip on each step (0.0-1.0).
     pub cosmic_ray_probability: f64,
@@ -315,6 +324,9 @@ pub struct WhopperOpts {
     /// invalidate the connection's cursors and page cache, so allowing one
     /// would break the suspended statement.
     pub checkpoint_probe_probability: f64,
+    /// Options for the arbitrary SQL generator (`sql_generation`) used by the
+    /// Insert/Update/Delete/Select workloads.
+    pub sql_generation_opts: Opts,
 }
 
 /// Schema-generation bias
@@ -348,7 +360,7 @@ impl Default for WhopperOpts {
             seed: None,
             max_connections: 4,
             max_steps: 100_000,
-            max_drain_steps: 1_000_000,
+            max_drain_steps: 10_000_000,
             cosmic_ray_probability: 0.0,
             keep_files: false,
             enable_mvcc: false,
@@ -365,8 +377,29 @@ impl Default for WhopperOpts {
             reopen_probability: 0.0,
             allocation_fault_probability: 0.0,
             checkpoint_probe_probability: 0.01,
+            sql_generation_opts: default_sql_generation_opts(),
         }
     }
+}
+
+/// sql_generation options for whopper. Whopper hands the generator tables
+/// without rows, so it cannot bound `INSERT INTO t SELECT * FROM t`, which
+/// would otherwise double tables forever. Instead it inserts bigger batches,
+/// so the generated tables still reach thousands of rows — enough for their
+/// b-trees, and the ephemeral b-trees that UNION and IN subqueries build from
+/// them, to split several levels deep within a run.
+fn default_sql_generation_opts() -> Opts {
+    let mut opts = Opts::default();
+    opts.query.insert.nested_self_insert = false;
+    opts.query.insert.min_rows = NonZero::new(16).unwrap();
+    opts.query.insert.max_rows = NonZero::new(256).unwrap();
+    // With tables in the thousands of rows, a generated join can return
+    // millions of rows, which a single statement cannot finish within
+    // whopper's reopen drain budget. A LIMIT caps the output; UNION and IN
+    // subqueries still build their ephemeral b-trees in full.
+    opts.query.select.limit_prob = 1.0;
+    opts.query.select.max_limit = NonZero::new(1000).unwrap();
+    opts
 }
 
 impl WhopperOpts {
@@ -831,7 +864,7 @@ impl Whopper {
                 .map(std::sync::Mutex::new)
                 .collect(),
             total_weight,
-            opts: Opts::default(),
+            opts: opts.sql_generation_opts,
             current_step: 0,
             max_steps: opts.max_steps,
             max_drain_steps: opts.max_drain_steps,
@@ -1446,18 +1479,26 @@ impl Whopper {
             .any(|f| f.statement.borrow().is_some())
         {
             if drain_iterations >= self.max_drain_steps {
-                let stuck: Vec<usize> = self
+                let stuck: Vec<String> = self
                     .context
                     .fibers
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
+                    .filter(|(_, f)| f.statement.borrow().is_some())
+                    .map(|(i, f)| {
+                        format!(
+                            "fiber {i} (rows so far: {}): {:?}",
+                            f.rows.len(),
+                            f.current_op
+                        )
+                    })
                     .collect();
                 anyhow::bail!(
-                    "{reason} drain exceeded max_drain_steps ({}) with statements still live on \
-                     fibers {:?}; likely a leaked lock or other infinite loop in the engine",
+                    "{reason} drain exceeded max_drain_steps ({}) with statements still live; \
+                     either a leaked lock or other infinite loop in the engine, or a legitimate \
+                     statement whose work exceeds the budget (check the statements below)\n{}",
                     self.max_drain_steps,
-                    stuck,
+                    stuck.join("\n"),
                 );
             }
             for fiber_idx in 0..self.context.fibers.len() {
@@ -1471,6 +1512,9 @@ impl Whopper {
             }
             self.io.step()?;
             drain_iterations += 1;
+        }
+        if drain_iterations > 100_000 {
+            tracing::debug!("drain completed after {drain_iterations} iterations");
         }
         Ok(())
     }

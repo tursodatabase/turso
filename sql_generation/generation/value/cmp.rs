@@ -1,25 +1,28 @@
 use turso_core::{Numeric, Value};
 
 use crate::{
-    generation::{ArbitraryFrom, GenerationContext},
+    generation::{ArbitraryFromMaybe, GenerationContext},
     model::table::{ColumnType, SimValue},
 };
 
+/// A literal that compares strictly less than the given value in a column of
+/// the given type. `None` when no such literal exists: NULL, `i64::MIN`, the
+/// empty string (a numeric literal would get the column's TEXT affinity and
+/// become text, and any text sorts at or after `''`), and the empty blob.
 pub struct LTValue(pub SimValue);
 
-impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
+impl ArbitraryFromMaybe<(&SimValue, ColumnType)> for LTValue {
+    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         (value, _col_type): (&SimValue, ColumnType),
-    ) -> Self {
+    ) -> Option<Self> {
         let new_value = match &value.0 {
             Value::Numeric(Numeric::Integer(i)) => {
-                if *i <= i64::MIN + 1 {
-                    Value::from_i64(i64::MIN) // avoid panic on empty range
-                } else {
-                    Value::from_i64(rng.random_range(i64::MIN..*i - 1))
+                if *i == i64::MIN {
+                    return None;
                 }
+                Value::from_i64(rng.random_range(i64::MIN..*i))
             }
             Value::Numeric(Numeric::Float(f)) => {
                 Value::from_f64(f64::from(*f) - rng.random_range(0.0..1e10))
@@ -27,6 +30,9 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
             value @ Value::Text(..) => {
                 // Either shorten the string, or make at least one character smaller and mutate the rest
                 let mut t = value.to_string();
+                if t.is_empty() {
+                    return None;
+                }
                 if rng.random_bool(0.01) {
                     t.pop();
                     Value::build_text(t)
@@ -38,8 +44,9 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
                 // Either shorten the blob, or make at least one byte smaller and mutate the rest
                 let mut b = b.clone();
                 if b.is_empty() {
-                    Value::Blob(b)
-                } else if rng.random_bool(0.01) {
+                    return None;
+                }
+                if rng.random_bool(0.01) {
                     b.pop();
                     Value::Blob(b)
                 } else {
@@ -52,35 +59,36 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
                     Value::Blob(b)
                 }
             }
-            // A value with storage class NULL is considered less than any other value (including another value with storage class NULL)
-            Value::Null => Value::Null,
+            // Nothing compares less than NULL: `x < NULL` is NULL, not true.
+            Value::Null => return None,
         };
-        Self(SimValue(new_value))
+        Some(Self(SimValue(new_value)))
     }
 }
 
+/// A literal that compares strictly greater than the given value in a column
+/// of the given type. `None` when no such literal exists: NULL, `i64::MAX`,
+/// and floats at or above the generator's upper bound.
 pub struct GTValue(pub SimValue);
 
-impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
+impl ArbitraryFromMaybe<(&SimValue, ColumnType)> for GTValue {
+    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
-        context: &C,
-        (value, col_type): (&SimValue, ColumnType),
-    ) -> Self {
+        _context: &C,
+        (value, _col_type): (&SimValue, ColumnType),
+    ) -> Option<Self> {
         let new_value = match &value.0 {
             Value::Numeric(Numeric::Integer(i)) => {
-                if *i >= i64::MAX - 1 {
-                    Value::from_i64(i64::MAX) // avoid panic on empty range
-                } else {
-                    Value::from_i64(rng.random_range(*i + 1..=i64::MAX))
+                if *i == i64::MAX {
+                    return None;
                 }
+                Value::from_i64(rng.random_range(*i + 1..=i64::MAX))
             }
             Value::Numeric(Numeric::Float(f)) => {
                 if f64::from(*f) >= 1e10 {
-                    Value::from_f64(1e10) // avoid panic on empty range
-                } else {
-                    Value::from_f64(rng.random_range(f64::from(*f)..1e10))
+                    return None;
                 }
+                Value::from_f64(rng.random_range(f64::from(*f)..1e10))
             }
             value @ Value::Text(..) => {
                 // Either lengthen the string, or make at least one character smaller and mutate the rest
@@ -112,12 +120,10 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
                     Value::Blob(b)
                 }
             }
-            Value::Null => {
-                // Any value is greater than NULL, except NULL
-                SimValue::arbitrary_from(rng, context, col_type).0
-            }
+            // Nothing compares greater than NULL: `x > NULL` is NULL, not true.
+            Value::Null => return None,
         };
-        Self(SimValue(new_value))
+        Some(Self(SimValue(new_value)))
     }
 }
 
@@ -220,7 +226,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let ctx = TestContext::default();
 
-        let cases: [(SimValue, ColumnType); 8] = [
+        let cases: [(SimValue, ColumnType); 11] = [
             (SimValue(Value::from_i64(i64::MIN)), ColumnType::Integer),
             (SimValue(Value::from_i64(i64::MIN + 1)), ColumnType::Integer),
             (SimValue(Value::from_i64(i64::MAX)), ColumnType::Integer),
@@ -235,12 +241,64 @@ mod tests {
                 SimValue(Value::Blob(turso_core::alloc::vec![0, 255])),
                 ColumnType::Blob,
             ),
+            (SimValue(Value::build_text("")), ColumnType::Text),
+            (SimValue(Value::build_text("a")), ColumnType::Text),
+            (SimValue(Value::Null), ColumnType::Integer),
         ];
         for (val, col_type) in &cases {
             for _ in 0..200 {
-                let _ = LTValue::arbitrary_from(&mut rng, &ctx, (val, *col_type));
-                let _ = GTValue::arbitrary_from(&mut rng, &ctx, (val, *col_type));
+                let _ = LTValue::arbitrary_from_maybe(&mut rng, &ctx, (val, *col_type));
+                let _ = GTValue::arbitrary_from_maybe(&mut rng, &ctx, (val, *col_type));
             }
+        }
+    }
+
+    /// Values with nothing below or above them must yield `None` instead of a
+    /// value that is not actually smaller or greater.
+    #[test]
+    fn lt_gt_value_report_missing_neighbours() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let ctx = TestContext::default();
+
+        let empty_text = SimValue(Value::build_text(""));
+        let empty_blob = SimValue(Value::Blob(turso_core::alloc::vec![]));
+        let null = SimValue(Value::Null);
+        let min = SimValue(Value::from_i64(i64::MIN));
+        let max = SimValue(Value::from_i64(i64::MAX));
+        for _ in 0..100 {
+            assert!(
+                LTValue::arbitrary_from_maybe(&mut rng, &ctx, (&empty_text, ColumnType::Text))
+                    .is_none()
+            );
+            assert!(
+                LTValue::arbitrary_from_maybe(&mut rng, &ctx, (&empty_blob, ColumnType::Blob))
+                    .is_none()
+            );
+            assert!(
+                LTValue::arbitrary_from_maybe(&mut rng, &ctx, (&null, ColumnType::Integer))
+                    .is_none()
+            );
+            assert!(
+                LTValue::arbitrary_from_maybe(&mut rng, &ctx, (&min, ColumnType::Integer))
+                    .is_none()
+            );
+            assert!(
+                GTValue::arbitrary_from_maybe(&mut rng, &ctx, (&null, ColumnType::Integer))
+                    .is_none()
+            );
+            assert!(
+                GTValue::arbitrary_from_maybe(&mut rng, &ctx, (&max, ColumnType::Integer))
+                    .is_none()
+            );
+
+            let gt = GTValue::arbitrary_from_maybe(&mut rng, &ctx, (&empty_text, ColumnType::Text))
+                .unwrap()
+                .0;
+            assert!(gt > empty_text, "{gt:?}");
+            let gt = GTValue::arbitrary_from_maybe(&mut rng, &ctx, (&empty_blob, ColumnType::Blob))
+                .unwrap()
+                .0;
+            assert!(gt > empty_blob, "{gt:?}");
         }
     }
 

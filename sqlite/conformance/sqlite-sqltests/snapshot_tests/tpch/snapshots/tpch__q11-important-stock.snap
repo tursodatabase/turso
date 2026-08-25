@@ -66,7 +66,7 @@ addr  opcode                       p1   p2  p3  p4                  p5  comment
   14              Ne               18   19  37  Binary               0  if r[18]!=r[19] goto 37
   15              Once             26    0   0                       0  goto 26
   16              OpenAutoindex     4    0   0                       0  cursor=4
-  17              Rewind            3   18   0                       0  Rewind table partsupp
+  17              Rewind            3   26   0                       0  Rewind table partsupp
   18                Column          3    1  20                       0  r[20]=partsupp.PS_SUPPKEY
   19                Column          3    0  21                       0  r[21]=partsupp.PS_PARTKEY
   20                ColumnRange     3    2  22  2                    0  r[22..23]=partsupp.PS_AVAILQTY..PS_SUPPLYCOST
@@ -130,7 +130,7 @@ addr  opcode                       p1   p2  p3  p4                  p5  comment
   78          Ne                   39   40  98  Binary               0  if r[39]!=r[40] goto 98
   79          Once                 88    0   0                       0  goto 88
   80          OpenAutoindex         8    0   0                       0  cursor=8
-  81          Rewind                7   82   0                       0  Rewind table partsupp
+  81          Rewind                7   88   0                       0  Rewind table partsupp
   82            ColumnRange         7    1  41  3                    0  r[41..43]=partsupp.PS_SUPPKEY..PS_SUPPLYCOST
   83            RowId               7   44   0                       0  r[44]=partsupp.rowid
   84            MakeRecord         41    4  45                       0  r[45]=mkrec(r[41..44]); for ephemeral_partsupp_t5

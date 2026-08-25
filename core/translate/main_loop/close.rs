@@ -503,11 +503,13 @@ pub(super) fn emit_autoindex(
     program.emit_insn(Insn::OpenAutoindex {
         cursor_id: index_cursor_id,
     });
-    // Rewind source table
+    // Rewind source table. An empty table must skip the build loop entirely:
+    // running the body on an invalid cursor would insert a record of NULLs
+    // into the index, which a NULL-matching seek (`IS NULL`) then finds.
     let label_ephemeral_build_loop_start = program.allocate_label();
     program.emit_insn(Insn::Rewind {
         cursor_id: table_cursor_id,
-        pc_if_empty: label_ephemeral_build_loop_start,
+        pc_if_empty: label_ephemeral_build_end,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_loop_start);
     // Emit all columns from source table that are needed in the ephemeral index.
@@ -519,7 +521,14 @@ pub(super) fn emit_autoindex(
         if let Some(columns) = table_columns {
             if let Some(column_def) = columns.get(col.pos_in_table) {
                 if column_def.is_virtual_generated() {
-                    crate::translate::expr::emit_table_column(
+                    // The table's plan operation already points at this
+                    // ephemeral index, so column references inside the
+                    // generation expression would resolve to the index we are
+                    // in the middle of building and read garbage. Force them
+                    // to the source table cursor for the duration of the
+                    // build loop.
+                    program.set_cursor_override(table_ref_id, table_cursor_id);
+                    let result = crate::translate::expr::emit_table_column(
                         program,
                         table_cursor_id,
                         table_ref_id,
@@ -528,7 +537,9 @@ pub(super) fn emit_autoindex(
                         col.pos_in_table,
                         reg,
                         resolver,
-                    )?;
+                    );
+                    program.clear_cursor_override(table_ref_id);
+                    result?;
                     continue;
                 }
             }
