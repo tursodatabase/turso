@@ -1170,7 +1170,7 @@ pub fn prepare_cdc_if_necessary(
     // gets the cursor.
     if let Some(changed_table_name) = changed_table_name {
         if changed_table_name == cdc_table
-            || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+            || changed_table_name == crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
         {
             return Ok(None);
         }

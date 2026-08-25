@@ -25,7 +25,9 @@ use crate::translate::plan::BitSet;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
+use crate::{
+    bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value, CDC_VERSION_CURRENT,
+};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -1913,11 +1915,6 @@ fn update_cache_size(
 
     Ok(())
 }
-
-pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
-pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-
-pub use crate::CDC_VERSION_CURRENT;
 
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
