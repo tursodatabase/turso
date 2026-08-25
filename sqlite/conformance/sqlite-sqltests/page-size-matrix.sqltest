@@ -1,0 +1,198 @@
+@database :memory:
+
+# Coverage for every valid SQLite page size (powers of two in [512, 65536]).
+# Before this file the only sizes exercised outside of narrow regression
+# fixtures were 1024 (round-trip in pragma/memory.sqltest), 512, 2048 and
+# 65536 (all inside single-purpose regression tests). The three sizes at
+# 8192, 16384 and 32768 had no coverage at all.
+
+# Set-then-read on an uninitialized in-memory database. The write is
+# committed by bumping user_version, which forces the b-tree to initialize
+# with the requested page size, and then the read observes it. If Turso
+# rejects a valid size or accepts it but stores something different, the
+# expected value catches it directly.
+
+test pragma-page-size-set-512 {
+    PRAGMA page_size = 512;
+    PRAGMA user_version = 1;
+    PRAGMA page_size
+}
+expect {
+    512
+}
+
+test pragma-page-size-set-1024 {
+    PRAGMA page_size = 1024;
+    PRAGMA user_version = 1;
+    PRAGMA page_size
+}
+expect {
+    1024
+}
+
+test pragma-page-size-set-2048 {
+    PRAGMA page_size = 2048;
+    PRAGMA user_version = 1;
+    PRAGMA page_size
+}
+expect {
+    2048
+}
+
+test pragma-page-size-set-4096 {
+    PRAGMA page_size = 4096;
+    PRAGMA user_version = 1;
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+test pragma-page-size-set-8192 {
+    PRAGMA page_size = 8192;
+    PRAGMA user_version = 1;
+    PRAGMA page_size
+}
+expect {
+    8192
+}
+
+test pragma-page-size-set-16384 {
+    PRAGMA page_size = 16384;
+    PRAGMA user_version = 1;
+    PRAGMA page_size
+}
+expect {
+    16384
+}
+
+test pragma-page-size-set-32768 {
+    PRAGMA page_size = 32768;
+    PRAGMA user_version = 1;
+    PRAGMA page_size
+}
+expect {
+    32768
+}
+
+test pragma-page-size-set-65536 {
+    PRAGMA page_size = 65536;
+    PRAGMA user_version = 1;
+    PRAGMA page_size
+}
+expect {
+    65536
+}
+
+# Non-power-of-two and out-of-range values are silently ignored by SQLite:
+# the pragma returns the current page size, and a following read still
+# reports the default. Turso must match, or a caller that "thinks" it set
+# an odd size will silently keep 4096 while its file bytes report
+# something else on write.
+
+test pragma-page-size-set-invalid-511 {
+    PRAGMA page_size = 511;
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+test pragma-page-size-set-invalid-513 {
+    PRAGMA page_size = 513;
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+test pragma-page-size-set-invalid-3000 {
+    PRAGMA page_size = 3000;
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+test pragma-page-size-set-invalid-100000 {
+    PRAGMA page_size = 100000;
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+test pragma-page-size-set-invalid-131072 {
+    PRAGMA page_size = 131072;
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+# A basic insert/select workload at each valid page size. The rows fit in
+# a single page at every size, so anything other than a straight table
+# scan and correct row ordering points at initialization or storage
+# corruption at that page size. @cross-check-integrity also runs
+# PRAGMA integrity_check on the resulting temp file against sqlite3, so
+# a b-tree that "looks fine to Turso" but sqlite3 rejects will fail.
+
+@cross-check-integrity
+test page-size-workload-512 {
+    PRAGMA page_size = 512;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'alpha');
+    INSERT INTO t VALUES (2, 'beta');
+    INSERT INTO t VALUES (3, 'gamma');
+    SELECT a, b FROM t ORDER BY a
+}
+expect {
+    1|alpha
+    2|beta
+    3|gamma
+}
+
+@cross-check-integrity
+test page-size-workload-8192 {
+    PRAGMA page_size = 8192;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'alpha');
+    INSERT INTO t VALUES (2, 'beta');
+    INSERT INTO t VALUES (3, 'gamma');
+    SELECT a, b FROM t ORDER BY a
+}
+expect {
+    1|alpha
+    2|beta
+    3|gamma
+}
+
+@cross-check-integrity
+test page-size-workload-16384 {
+    PRAGMA page_size = 16384;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'alpha');
+    INSERT INTO t VALUES (2, 'beta');
+    INSERT INTO t VALUES (3, 'gamma');
+    SELECT a, b FROM t ORDER BY a
+}
+expect {
+    1|alpha
+    2|beta
+    3|gamma
+}
+
+@cross-check-integrity
+test page-size-workload-32768 {
+    PRAGMA page_size = 32768;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'alpha');
+    INSERT INTO t VALUES (2, 'beta');
+    INSERT INTO t VALUES (3, 'gamma');
+    SELECT a, b FROM t ORDER BY a
+}
+expect {
+    1|alpha
+    2|beta
+    3|gamma
+}
