@@ -594,6 +594,13 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
         percent_decode(raw_path).ok_or(())?
     };
 
+    // An empty URI path (e.g. "file:?cache=shared") requests a private
+    // temporary database, backed by an in-memory one as elsewhere.
+    let path = if path.is_empty() {
+        ":memory:".to_string()
+    } else {
+        path
+    };
     let mut is_memory = path == ":memory:";
     let mut cache_shared = false;
     if let Some(query) = query {
