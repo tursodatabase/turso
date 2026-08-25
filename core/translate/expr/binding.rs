@@ -71,6 +71,15 @@ pub(super) fn resolve_qualified_on_ref(
     Ok(None)
 }
 
+/// Whether `table`, referenced under `identifier`, exposes its single visible
+/// column under the alias name too (e.g. `unnest(...) x` → `x`). This is a
+/// PostgreSQL-specific resolution rule and must only be applied when compiling
+/// under a dialect whose `exposes_single_column_alias()` is true.
+fn single_visible_column_matches(table: &Table, identifier: &str, id: &str) -> bool {
+    table.columns().iter().filter(|c| !c.hidden()).count() == 1
+        && identifier.eq_ignore_ascii_case(&normalize_ident(id))
+}
+
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
 /// ones
@@ -145,6 +154,18 @@ pub fn bind_and_rewrite_expr<'a>(
                                     col.is_rowid_alias(),
                                 ));
                             }
+                        // PostgreSQL: a single-column relation aliased as `t` exposes that
+                        // column under the alias name too (e.g. `unnest(...) x` → `x`).
+                        } else if resolver.dialect.exposes_single_column_alias()
+                            && single_visible_column_matches(
+                                &joined_table.table,
+                                &joined_table.identifier,
+                                id.as_str(),
+                            )
+                        {
+                            if match_result.is_none() {
+                                match_result = Some((joined_table.internal_id, 0, false));
+                            }
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
                             if let Some(row_id_expr) =
@@ -209,6 +230,16 @@ pub fn bind_and_rewrite_expr<'a>(
                                 let col = outer_ref.table.columns().get(col_idx).unwrap();
                                 match_result =
                                     Some((outer_ref.internal_id, col_idx, col.is_rowid_alias()));
+                                matched_scope_depth = Some(outer_ref.scope_depth);
+                            } else if resolver.dialect.exposes_single_column_alias()
+                                && match_result.is_none()
+                                && single_visible_column_matches(
+                                    &outer_ref.table,
+                                    &outer_ref.identifier,
+                                    id.as_str(),
+                                )
+                            {
+                                match_result = Some((outer_ref.internal_id, 0, false));
                                 matched_scope_depth = Some(outer_ref.scope_depth);
                             }
                         }

@@ -29,6 +29,13 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
+    /// Whether a single-column relation referenced by its own alias also
+    /// resolves to that column (PostgreSQL's `unnest(...) x -> x` rule).
+    /// SQLite has no such rule, so the default is false.
+    fn exposes_single_column_alias(&self) -> bool {
+        false
+    }
+
     /// Parse the first statement in `sql` into the engine AST.
     ///
     /// Returns the parsed command, if any, and the number of input bytes

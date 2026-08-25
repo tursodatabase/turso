@@ -3516,3 +3516,41 @@ fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
     let rows = stmt.run_collect_rows().unwrap();
     assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
 }
+
+/// The single-column alias resolution rule (a single-column relation exposes
+/// that column under its own name, used by the PostgreSQL
+/// `unnest(...) x → x` shape) must NOT apply under the SQLite dialect. A plain
+/// SQLite query where a table name collides with a column name of another
+/// joined table must resolve as SQLite does (the column from the matching
+/// table), not error as "ambiguous column name".
+#[turso_macros::test]
+fn test_postgres_sqlite_dialect_table_name_column_collision_not_ambiguous(db: TempDatabase) {
+    // Open a database with the *SQLite* dialect (the regression only manifests
+    // when the binder sees the SQLite dialect; `connect_limbo` inherits the
+    // TempDatabase's PostgreSQL dialect, so we open a fresh SQLite instance).
+    use turso_core::{Database, OpenOptions, SqliteDialect};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("sqlite-regression.db");
+    let sqlite_db = Database::open(
+        db.io.clone(),
+        path.to_str().unwrap(),
+        OpenOptions::new(std::sync::Arc::new(SqliteDialect)),
+    )
+    .unwrap();
+    let conn = sqlite_db.connect().unwrap();
+
+    conn.execute("CREATE TABLE a(x)").unwrap();
+    conn.execute("CREATE TABLE b(a)").unwrap();
+    conn.execute("INSERT INTO a VALUES (111)").unwrap();
+    conn.execute("INSERT INTO b VALUES (222)").unwrap();
+
+    let mut rows = conn.query("SELECT a FROM a JOIN b ON 1").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected a row");
+    };
+    let Value::Numeric(Numeric::Integer(value)) = rows.row().unwrap().get_value(0) else {
+        panic!("expected integer value");
+    };
+    // SQLite resolves `a` to b.a here (the only real column named `a`), → 222.
+    assert_eq!(*value, 222);
+}

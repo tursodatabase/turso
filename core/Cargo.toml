@@ -51,6 +51,9 @@ codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
 percentile = []
+# PostgreSQL frontend support: fields and hooks the pg wire frontend needs on
+# core types. Off by default; the postgres/frontend crate enables it.
+pg_compat = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [

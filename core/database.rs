@@ -2367,6 +2367,8 @@ impl Database {
             mvcc_log_metadata: RwLock::new(HashMap::default()),
             capture_data_changes: RwLock::new(None),
             cdc_transaction_id: AtomicI64::new(-1),
+            #[cfg(feature = "pg_compat")]
+            pg_txid_counter: AtomicI64::new(1),
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),

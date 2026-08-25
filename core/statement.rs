@@ -168,7 +168,8 @@ pub enum ColumnTypeKind {
 
 /// Recursively infer the result primitive of a non-table-column expression
 /// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
-/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
+/// `"NUMERIC"`, `"BLOB"`, or `"INT8"` — the structurally-fixed result of
+/// `COUNT`) or `None` when no determination can be made.
 ///
 /// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
 /// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
@@ -249,6 +250,24 @@ fn infer_expression_primitive(
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
+        // Aggregate/scalar functions whose result type is fixed by the standard:
+        // `COUNT` always returns a non-null 64-bit integer (PostgreSQL's
+        // count is bigint/INT8, and the wire layer maps "INT8" accordingly).
+        // Everything else depends on its argument(s), so defer to the
+        // argument's affinity rather than guessing (e.g. `MAX(text)` stays
+        // text, `ABS(1.5)` stays REAL, `SUM(int)` stays INTEGER, `SUM(real)`
+        // becomes REAL).
+        Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => {
+            if name.as_str().eq_ignore_ascii_case("COUNT") {
+                Some("INT8")
+            } else {
+                affinity_to_primitive(translate::expr::get_expr_affinity(
+                    expr,
+                    referenced_tables,
+                    None,
+                ))
+            }
+        }
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(

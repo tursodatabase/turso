@@ -415,6 +415,11 @@ pub struct Connection {
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
     pub(crate) cdc_transaction_id: AtomicI64,
+    /// PostgreSQL frontend: `txid_current()` minting. Strictly increasing,
+    /// non-zero, per connection; not transaction-scoped and not globally
+    /// ordered across connections.
+    #[cfg(feature = "pg_compat")]
+    pub(crate) pg_txid_counter: AtomicI64,
     pub(super) closed: AtomicBool,
     /// Per-connection state for the `TEMP` schema (pager, last-committed
     /// snapshot, dirty-schema flag). See `TempDbContext`.
@@ -2700,6 +2705,11 @@ impl Connection {
     }
     pub fn set_cdc_transaction_id(&self, id: i64) {
         self.cdc_transaction_id.store(id, Ordering::SeqCst);
+    }
+    /// Mint the next `txid_current()` value for this connection.
+    #[cfg(feature = "pg_compat")]
+    pub fn next_pg_txid(&self) -> i64 {
+        self.pg_txid_counter.fetch_add(1, Ordering::SeqCst)
     }
     pub fn get_page_size(&self) -> PageSize {
         let value = self.page_size.load(Ordering::SeqCst);
