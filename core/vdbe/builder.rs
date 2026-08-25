@@ -1791,8 +1791,13 @@ impl ProgramBuilder {
 
     /// Set a cursor override for a table. When resolving a table cursor for this table,
     /// the override cursor will be used instead of the normal resolution.
-    pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
-        self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
+    /// Returns the previous override, if any.
+    pub fn set_cursor_override(
+        &mut self,
+        table_ref_id: TableInternalId,
+        cursor_id: CursorID,
+    ) -> Option<CursorID> {
+        self.cursor_overrides.insert(table_ref_id.into(), cursor_id)
     }
 
     /// Clear the cursor override for a table.
