@@ -17,7 +17,16 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-default = ["fs", "uuid", "time", "json", "series", "encryption", "percentile"]
+default = [
+    "fs",
+    "uuid",
+    "time",
+    "json",
+    "series",
+    "encryption",
+    "percentile",
+    "autovacuum",
+]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 # Harness-side observability: turns on aristo's instrument surface so the
@@ -32,7 +41,7 @@ io_uring = ["dep:io-uring", "rustix/io_uring"]
 experimental_win_iocp = []
 time = []
 fuzz = []
-omit_autovacuum = []
+autovacuum = []
 simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
 allocation_metric = []
 # Test only: exposed to testing/stress and the simulator, never to regular library users.

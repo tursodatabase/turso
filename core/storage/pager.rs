@@ -68,7 +68,7 @@ static PENDING_BYTE: AtomicU32 = AtomicU32::new(0x40000000);
 /// Byte offset that signifies the start of the ignored page - 1 GB mark
 const PENDING_BYTE: u32 = 0x40000000;
 
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(feature = "autovacuum")]
 use ptrmap::*;
 
 #[derive(Debug, Clone)]
@@ -1182,7 +1182,7 @@ const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(feature = "autovacuum")]
 enum PtrMapGetState {
     Start,
     Deserialize {
@@ -1192,7 +1192,7 @@ enum PtrMapGetState {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(feature = "autovacuum")]
 enum PtrMapPutState {
     Start,
     Deserialize {
@@ -1210,7 +1210,7 @@ enum HeaderRefState {
     },
 }
 
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(feature = "autovacuum")]
 #[derive(Debug, Clone, Copy)]
 enum BtreeCreateVacuumFullState {
     Start,
@@ -1395,7 +1395,7 @@ pub struct Pager {
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
     header_ref_state: RwLock<HeaderRefState>,
-    #[cfg(not(feature = "omit_autovacuum"))]
+    #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
@@ -1509,7 +1509,7 @@ impl SpillYieldHook {
     }
 }
 
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(feature = "autovacuum")]
 pub struct VacuumState {
     /// State machine for [Pager::ptrmap_get]
     ptrmap_get_state: PtrMapGetState,
@@ -1685,7 +1685,7 @@ impl Pager {
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             header_ref_state: RwLock::new(HeaderRefState::Start),
-            #[cfg(not(feature = "omit_autovacuum"))]
+            #[cfg(feature = "autovacuum")]
             vacuum_state: RwLock::new(VacuumState {
                 ptrmap_get_state: PtrMapGetState::Start,
                 ptrmap_put_state: PtrMapPutState::Start,
@@ -2406,7 +2406,7 @@ impl Pager {
     /// Retrieves the pointer map entry for a given database page.
     /// `target_page_num` (1-indexed) is the page whose entry is sought.
     /// Returns `Ok(None)` if the page is not supposed to have a ptrmap entry (e.g. header, or a ptrmap page itself).
-    #[cfg(not(feature = "omit_autovacuum"))]
+    #[cfg(feature = "autovacuum")]
     pub fn ptrmap_get(&self, target_page_num: u32) -> Result<IOResult<Option<PtrmapEntry>>> {
         loop {
             let ptrmap_get_state = {
@@ -2495,7 +2495,7 @@ impl Pager {
     /// Writes or updates the pointer map entry for a given database page.
     /// `db_page_no_to_update` (1-indexed) is the page whose entry is to be set.
     /// `entry_type` and `parent_page_no` define the new entry.
-    #[cfg(not(feature = "omit_autovacuum"))]
+    #[cfg(feature = "autovacuum")]
     pub fn ptrmap_put(
         &self,
         db_page_no_to_update: u32,
@@ -2601,14 +2601,14 @@ impl Pager {
             _ if flags.is_index() => PageType::IndexLeaf,
             _ => unreachable!("Invalid flags state"),
         };
-        #[cfg(feature = "omit_autovacuum")]
+        #[cfg(not(feature = "autovacuum"))]
         {
             let page = return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
             Ok(IOResult::Done(page.get().id as u32))
         }
 
         //  If autovacuum is enabled, we need to allocate a new page number that is greater than the largest root page number
-        #[cfg(not(feature = "omit_autovacuum"))]
+        #[cfg(feature = "autovacuum")]
         {
             let auto_vacuum_mode =
                 AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst));
@@ -5428,13 +5428,13 @@ impl Pager {
             match &mut *state {
                 AllocatePageState::Start => {
                     let old_db_size = header.database_size.get();
-                    #[cfg(not(feature = "omit_autovacuum"))]
+                    #[cfg(feature = "autovacuum")]
                     let mut new_db_size = old_db_size;
-                    #[cfg(feature = "omit_autovacuum")]
+                    #[cfg(not(feature = "autovacuum"))]
                     let new_db_size = old_db_size;
 
                     tracing::debug!("allocate_page(database_size={})", new_db_size);
-                    #[cfg(not(feature = "omit_autovacuum"))]
+                    #[cfg(feature = "autovacuum")]
                     {
                         //  If the following conditions are met, allocate a pointer map page, add to cache and increment the database size
                         //  - autovacuum is enabled
@@ -5748,7 +5748,7 @@ impl Pager {
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
         *self.spill_state.write() = SpillState::Idle;
-        #[cfg(not(feature = "omit_autovacuum"))]
+        #[cfg(feature = "autovacuum")]
         {
             let mut vacuum_state = self.vacuum_state.write();
             vacuum_state.ptrmap_get_state = PtrMapGetState::Start;
@@ -5994,7 +5994,7 @@ impl CreateBTreeFlags {
 ** PTRMAP_BTREE: The database page is a non-root btree page. The page number
 **               identifies the parent page in the btree.
 */
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(feature = "autovacuum")]
 pub(crate) mod ptrmap {
     #[allow(unused_imports)]
     use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
@@ -6319,7 +6319,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(feature = "autovacuum")]
 mod ptrmap_tests {
     use crate::sync::Arc;
 
