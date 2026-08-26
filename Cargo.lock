@@ -8653,20 +8653,14 @@ dependencies = [
 name = "write-throughput"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "console-subscriber",
  "futures",
+ "rusqlite",
  "tokio",
  "tracing-subscriber",
  "turso",
-]
-
-[[package]]
-name = "write-throughput-sqlite"
-version = "0.1.0"
-dependencies = [
- "clap",
- "rusqlite",
 ]
 
 [[package]]

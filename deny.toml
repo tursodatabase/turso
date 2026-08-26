@@ -8,7 +8,6 @@ all-features = true
 exclude = [
     "encryption-throughput",
     "write-throughput",
-    "write-throughput-sqlite",
 ]
 
 [licenses]
