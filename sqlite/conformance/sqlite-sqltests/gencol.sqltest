@@ -4261,6 +4261,21 @@ expect {
     3|30|3|30
 }
 
+# Regression test for https://github.com/tursodatabase/turso/issues/8472
+test gencol_autoindex_dependency {
+    CREATE TABLE measurements (
+        computed_value AS (base_value),
+        base_value
+    );
+    INSERT INTO measurements (base_value) VALUES (1);
+    SELECT measurements.base_value
+      FROM measurements, (SELECT 1) AS one_row
+     WHERE measurements.computed_value > 0;
+}
+expect {
+    1
+}
+
 # =============================================================================
 # Three-table INNER JOIN with virtual generated columns (#6151)
 # =============================================================================
