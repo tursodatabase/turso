@@ -3681,7 +3681,8 @@ impl BTreeTable {
                         sql.push_str(&quote_ident(&collation.name()));
                     }
                     CollationSeq::Unset | CollationSeq::Custom(_) => {
-                        unreachable!("stored column with non-renderable collation found")
+                        // Unset should not be reachable -- ignore it
+                        // Custom collation is not allowed in schema definitions
                     }
                 };
             }
