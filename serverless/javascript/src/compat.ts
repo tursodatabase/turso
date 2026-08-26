@@ -157,6 +157,7 @@ export interface Client {
   close(): void;
   closed: boolean;
   protocol: string;
+  reconnect(): void;
 }
 
 class LibSQLClient implements Client {
@@ -513,6 +514,14 @@ class LibSQLClient implements Client {
     this.session.close().catch(error => {
       console.error('Error closing session:', error);
     });
+  }
+
+  reconnect(): void {
+    this._closed = false;
+    this.session.close().catch(error => {
+      console.error('Error closing session during reconnect:', error);
+    });
+    this.session = new Session(this.sessionConfig);
   }
 }
 
