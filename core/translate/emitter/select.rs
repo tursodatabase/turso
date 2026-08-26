@@ -104,6 +104,13 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
+        emit_explain!(
+            program,
+            false,
+            crate::translate::eqp::EqpDetail::ConstantRow {
+                rows: plan.values.len(),
+            }
+        );
         init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);

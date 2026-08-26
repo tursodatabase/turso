@@ -114,7 +114,7 @@ test a-recursive-cte-reports-its-setup-and-step-phases {
     SELECT x FROM cnt;
 }
 expect {
-    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    WITH RECURSIVE cnt(x) AS (\n        SELECT 1\n        UNION ALL\n        SELECT x+1 FROM cnt WHERE x < 10\n    )\n    SELECT x FROM cnt;","result_columns":["x"],"nodes":[{"id":1,"parent":null,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","subquery":{"execution":"coroutine","cte_id":0,"recursive":true},"source":"subquery"}},{"id":5,"parent":1,"detail":"SETUP","op":{"type":"recursive_setup"}},{"id":6,"parent":5,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row"}},{"id":17,"parent":1,"detail":"RECURSIVE STEP","op":{"type":"recursive_step"}},{"id":18,"parent":17,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","source":"recursive_cte_input"}}]}
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    WITH RECURSIVE cnt(x) AS (\n        SELECT 1\n        UNION ALL\n        SELECT x+1 FROM cnt WHERE x < 10\n    )\n    SELECT x FROM cnt;","result_columns":["x"],"nodes":[{"id":1,"parent":null,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","subquery":{"execution":"coroutine","cte_id":0,"recursive":true},"source":"subquery"}},{"id":5,"parent":1,"detail":"SETUP","op":{"type":"recursive_setup"}},{"id":6,"parent":5,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row","rows":1}},{"id":17,"parent":1,"detail":"RECURSIVE STEP","op":{"type":"recursive_step"}},{"id":18,"parent":17,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","source":"recursive_cte_input"}}]}
 }
 
 @setup schema
@@ -176,7 +176,7 @@ test the-format-clause-is-case-insensitive {
     EXPLAIN QUERY PLAN FORMAT=json SELECT 1;
 }
 expect {
-    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=json SELECT 1;","result_columns":["1"],"nodes":[{"id":1,"parent":null,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row"}}]}
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=json SELECT 1;","result_columns":["1"],"nodes":[{"id":1,"parent":null,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row","rows":1}}]}
 }
 
 test an-unknown-format-is-a-parse-error {
@@ -196,4 +196,95 @@ test planning-a-write-does-not-run-it {
 expect {
     {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    INSERT INTO users(name) VALUES ('x');","result_columns":[],"nodes":[]}
     0
+}
+
+setup join_tables {
+    CREATE TABLE t1(a INT, b INT);
+    CREATE TABLE t2(a INT, b INT);
+    CREATE TABLE t3(a INT, b INT);
+    CREATE TABLE t4(a INT, b INT);
+}
+
+@setup join_tables
+test a-hash-join-names-its-build-side-and-nests-the-build-scan {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM t1 JOIN t2 ON t2.a = t1.a;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM t1 JOIN t2 ON t2.a = t1.a;","result_columns":["a","b","a","b"],"nodes":[{"id":1,"parent":null,"detail":"HASH JOIN t2","op":{"type":"hash_join","table":"t2","join":"inner","build_table":"t1","build_input":"scan"}},{"id":2,"parent":1,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}}]}
+}
+
+@setup join_tables
+test a-hash-join-chain-only-reports-the-tables-each-step-reads {
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM t1
+    JOIN t2 ON t2.a = t1.a
+    JOIN t3 ON t3.a = t2.a
+    JOIN t4 ON t4.a = t3.a;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT *
+    FROM t1
+    JOIN t2 ON t2.a = t1.a
+    JOIN t3 ON t3.a = t2.a
+    JOIN t4 ON t4.a = t3.a;
+}
+expect {
+    1|0|0|MATERIALIZE hash build input for t2
+    3|1|0|HASH JOIN t2
+    4|3|0|SCAN t1
+    51|0|0|MATERIALIZE hash build input for t3
+    53|51|0|HASH JOIN t3
+    104|0|0|HASH JOIN t4
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT *\n    FROM t1\n    JOIN t2 ON t2.a = t1.a\n    JOIN t3 ON t3.a = t2.a\n    JOIN t4 ON t4.a = t3.a;","result_columns":["a","b","a","b","a","b","a","b"],"nodes":[{"id":1,"parent":null,"detail":"MATERIALIZE hash build input for t2","op":{"type":"hash_build","table":"t2"}},{"id":3,"parent":1,"detail":"HASH JOIN t2","op":{"type":"hash_join","table":"t2","join":"inner","build_table":"t1","build_input":"scan"}},{"id":4,"parent":3,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}},{"id":51,"parent":null,"detail":"MATERIALIZE hash build input for t3","op":{"type":"hash_build","table":"t3"}},{"id":53,"parent":51,"detail":"HASH JOIN t3","op":{"type":"hash_join","table":"t3","join":"inner","build_table":"t2","build_input":"materialized"}},{"id":104,"parent":null,"detail":"HASH JOIN t4","op":{"type":"hash_join","table":"t4","join":"inner","build_table":"t3","build_input":"materialized"}}]}
+}
+
+@setup join_tables
+test a-left-hash-join-keeps-the-join-type-on-the-probe-side {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM t1 LEFT JOIN t2 ON t2.a = t1.a;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM t1 LEFT JOIN t2 ON t2.a = t1.a;","result_columns":["a","b","a","b"],"nodes":[{"id":1,"parent":null,"detail":"HASH JOIN t2","op":{"type":"hash_join","table":"t2","join":"left","build_table":"t1","build_input":"scan"}},{"id":2,"parent":1,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}}]}
+}
+
+@setup schema
+@setup join_tables
+test the-join-field-follows-the-optimized-join-order {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT u.name
+    FROM users u
+    JOIN t1 ON t1.a = u.id
+    JOIN orders o ON o.user_id = u.id;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name\n    FROM users u\n    JOIN t1 ON t1.a = u.id\n    JOIN orders o ON o.user_id = u.id;","result_columns":["name"],"nodes":[{"id":1,"parent":null,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}},{"id":2,"parent":null,"detail":"SEARCH u USING INTEGER PRIMARY KEY (rowid=?)","op":{"type":"search","table":"users","alias":"u","join":"inner","search_kind":"rowid_eq","integer_primary_key":true,"constraints":["rowid=?"]}},{"id":3,"parent":null,"detail":"SEARCH o USING COVERING INDEX idx_orders_user (user_id=?)","op":{"type":"search","table":"orders","alias":"o","join":"inner","search_kind":"seek","index":{"name":"idx_orders_user","covering":true,"ephemeral":false},"constraints":["user_id=?"]}}]}
+}
+
+test a-values-list-reports-how-many-constant-rows-it-scans {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    VALUES (1, 2), (3, 4), (5, 6);
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    VALUES (1, 2), (3, 4), (5, 6);","result_columns":["column1","column2"],"nodes":[{"id":1,"parent":null,"detail":"SCAN 3 CONSTANT ROWS","op":{"type":"constant_row","rows":3}}]}
+}
+
+@setup schema
+test an-exists-that-stays-a-subquery-is-a-correlated-scalar-subquery {
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM users u
+    WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > u.age);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT *
+    FROM users u
+    WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > u.age);
+}
+expect {
+    1|0|0|SCAN users AS u
+    4|0|0|CORRELATED SCALAR SUBQUERY 1
+    7|4|0|SEARCH o USING INDEX idx_orders_user (user_id=?)
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT *\n    FROM users u\n    WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > u.age);","result_columns":["id","name","age","city_id"],"nodes":[{"id":1,"parent":null,"detail":"SCAN users AS u","op":{"type":"scan","table":"users","alias":"u","source":"table"}},{"id":4,"parent":null,"detail":"CORRELATED SCALAR SUBQUERY 1","op":{"type":"scalar_subquery","subquery_id":1,"correlated":true}},{"id":7,"parent":4,"detail":"SEARCH o USING INDEX idx_orders_user (user_id=?)","op":{"type":"search","table":"orders","alias":"o","search_kind":"seek","index":{"name":"idx_orders_user","covering":false,"ephemeral":false},"constraints":["user_id=?"]}}]}
 }
