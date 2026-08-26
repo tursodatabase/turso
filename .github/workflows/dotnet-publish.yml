@@ -11,6 +11,8 @@ on:
       - "Cargo.lock"
       - "core/**"
       - "sdk-kit/**"
+      - "sync/engine/**"
+      - "sync/sdk-kit/**"
   # Manual trigger with dry-run / publish controls
   workflow_dispatch:
     inputs:
@@ -176,24 +178,24 @@ jobs:
                 export CFLAGS="-DSIMSIMD_TARGET_SIERRA=0 -DSIMSIMD_TARGET_TURIN=0 -DSIMSIMD_TARGET_SAPPHIRE=0 -DSIMSIMD_TARGET_GENOA=0 -DSIMSIMD_TARGET_ICE=0 -DSIMSIMD_TARGET_SKYLAKE=0 -DSIMSIMD_TARGET_HASWELL=0"
                 export CFLAGS_aarch64_unknown_linux_gnu="$CFLAGS"
               fi
-              make ${{ matrix.make-target }} RUST_RELEASE_OPT="--profile release-official"
+              make ${{ matrix.make-target }} RUST_RELEASE_OPT="--profile release-official" RUST_PROFILE_DIR="release-official"
             '
 
       - name: Build rust native library (macOS)
         if: contains(matrix.target, 'apple-darwin')
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos-deployment-target }}
-        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
 
       - name: Build rust native library (iOS)
         if: contains(matrix.target, 'apple-ios')
         env:
           IPHONEOS_DEPLOYMENT_TARGET: ${{ matrix.ios-deployment-target }}
-        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
 
       - name: Build rust native library
         if: ${{ !contains(matrix.target, 'unknown-linux-gnu') && !contains(matrix.target, 'apple-darwin') && !contains(matrix.target, 'apple-ios') }}
-        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
 
       - name: Collect Windows static native dependencies
         if: contains(matrix.target, 'pc-windows-msvc')
@@ -372,6 +374,8 @@ jobs:
             "runtimes/win-arm64/native/turso_sdk_kit.dll"
             "runtimes/linux-x64/native/libturso_sdk_kit.so"
             "runtimes/linux-arm64/native/libturso_sdk_kit.so"
+            "runtimes/osx-x64/native/libturso_sdk_kit.dylib"
+            "runtimes/osx-arm64/native/libturso_sdk_kit.dylib"
             "runtimes/android-arm64/native/libturso_sdk_kit.so"
             "runtimes/android-arm/native/libturso_sdk_kit.so"
             "runtimes/android-x64/native/libturso_sdk_kit.so"
