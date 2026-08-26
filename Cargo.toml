@@ -41,6 +41,7 @@ members = [
     "testing/concurrent-simulator",
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
+    "perf/latency",
     "perf/encryption",
     "perf/memory",
     "perf/memory/codspeed",
@@ -53,7 +54,6 @@ members = [
     "testing/differential-oracle/fuzzer",
     "testing/sqltest"
 ]
-exclude = ["perf/latency/limbo"]
 
 default-members = [
     "bindings/java",
