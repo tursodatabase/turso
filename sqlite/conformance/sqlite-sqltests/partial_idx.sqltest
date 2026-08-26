@@ -1207,6 +1207,64 @@ expect {
     1|0|0|SCAN samples USING INDEX samples_user_processed_idx
 }
 
+# Use the partial index when one side of its OR also constrains the index key.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-or-term-with-equality-search {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE b < 5 AND a = -3;
+    SELECT a FROM t WHERE b < 5 AND a = -3;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx (a=?)
+    -3
+}
+
+# Use the partial index when it provides the requested order.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-or-term-with-order {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE b < 5 ORDER BY a;
+    SELECT a FROM t WHERE b < 5 ORDER BY a;
+}
+expect {
+    1|0|0|SCAN t USING INDEX idx
+    -3
+    -1
+}
+
+# Use the partial index without table lookups when it contains the filtered column.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-or-term-with-covering-scan {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a, b) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE b < 5;
+    SELECT a FROM t WHERE b < 5 ORDER BY a;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+    -3
+    -1
+}
+
+# Use either side of the partial index OR to prove that the index is safe.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-or-right-term-with-range-search {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE a > 5;
+    SELECT a FROM t WHERE a > 5 ORDER BY a;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (a>?)
+    10
+}
+
 # Partial index must NOT be used when the query only satisfies a subset of the
 # index WHERE conjuncts — the partial index would skip rows the query needs.
 @skip-if sqlite "query plan explanation output is different in sqlite"
