@@ -38,20 +38,11 @@ def detect_x(rows: list[dict]) -> str:
     return "workers"
 
 
-def sql_threads(row: dict) -> int:
-    topology = row["topology"]
-    threads = int(row["threads"])
-    # threads-pump CSV `threads` counts the io.step helper. X is SQL threads.
-    if topology == "threads-pump":
-        return threads - 1
-    return threads
-
-
 def x_value(row: dict, x_axis: str) -> int:
     if x_axis == "workers":
         return int(row["workers"])
     if x_axis == "threads":
-        return sql_threads(row)
+        return int(row["threads"])
     raise ValueError(f"unknown x axis: {x_axis}")
 
 

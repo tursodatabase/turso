@@ -283,7 +283,7 @@ impl Engine {
                     } => (
                         TopologyLabel::ThreadsPump,
                         threads.get() * workers_per_thread.get(),
-                        threads.get() + 1,
+                        threads.get(),
                     ),
                 };
                 let (checkpoint, threshold) = match t.checkpoint {
@@ -474,6 +474,21 @@ mod tests {
         assert_eq!(workers, 8);
         assert_eq!(threads, 2);
         assert_eq!(threshold, Some(-1));
+    }
+
+    #[test]
+    fn threads_pump_labels_sql_thread_count() {
+        let engine = Engine::Turso(Turso {
+            checkpoint: CheckpointPolicy::Passive(LogThreshold::Disabled),
+            topology: Topology::ThreadsPump {
+                threads: NonZeroUsize::new(4).unwrap(),
+                workers_per_thread: NonZeroUsize::new(1).unwrap(),
+            },
+        });
+        let (_, topology, workers, threads, _, _) = engine.labels();
+        assert!(matches!(topology, TopologyLabel::ThreadsPump));
+        assert_eq!(workers, 4);
+        assert_eq!(threads, 4);
     }
 
     #[test]
