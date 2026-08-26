@@ -1,0 +1,68 @@
+#!/usr/bin/env bpftrace
+
+tracepoint:syscalls:sys_enter_fsync /comm == "mvcc-write-benc"/ {
+    @fsync_t[tid] = nsecs;
+}
+tracepoint:syscalls:sys_exit_fsync /comm == "mvcc-write-bench" && @fsync_t[tid]/ {
+    $d = nsecs - @fsync_t[tid];
+    @fsync_ns = sum($d);
+    @fsync_n = count();
+    @fsync_hist = hist($d);
+    delete(@fsync_t[tid]);
+}
+
+tracepoint:syscalls:sys_enter_fdatasync /comm == "mvcc-write-benc"/ {
+    @fdatasync_t[tid] = nsecs;
+}
+tracepoint:syscalls:sys_exit_fdatasync /comm == "mvcc-write-bench" && @fdatasync_t[tid]/ {
+    $d = nsecs - @fdatasync_t[tid];
+    @fdatasync_ns = sum($d);
+    @fdatasync_n = count();
+    @fdatasync_hist = hist($d);
+    delete(@fdatasync_t[tid]);
+}
+
+tracepoint:syscalls:sys_enter_sync_file_range /comm == "mvcc-write-benc"/ {
+    @sfr_t[tid] = nsecs;
+}
+tracepoint:syscalls:sys_exit_sync_file_range /comm == "mvcc-write-bench" && @sfr_t[tid]/ {
+    $d = nsecs - @sfr_t[tid];
+    @sync_file_range_ns = sum($d);
+    @sync_file_range_n = count();
+    delete(@sfr_t[tid]);
+}
+
+tracepoint:syscalls:sys_enter_io_uring_enter /comm == "mvcc-write-benc"/ {
+    @uring_t[tid] = nsecs;
+    @uring_submit = sum(args->to_submit);
+}
+tracepoint:syscalls:sys_exit_io_uring_enter /comm == "mvcc-write-bench" && @uring_t[tid]/ {
+    $d = nsecs - @uring_t[tid];
+    @io_uring_enter_ns = sum($d);
+    @io_uring_enter_n = count();
+    @io_uring_enter_hist = hist($d);
+    delete(@uring_t[tid]);
+}
+
+tracepoint:syscalls:sys_enter_pwrite64 /comm == "mvcc-write-benc"/ {
+    @pwrite64_n = count();
+    @pwrite64_bytes = sum(args->count);
+}
+tracepoint:syscalls:sys_enter_pwritev /comm == "mvcc-write-benc"/ {
+    @pwritev_n = count();
+}
+tracepoint:syscalls:sys_enter_write /comm == "mvcc-write-benc"/ {
+    @write_n = count();
+    @write_bytes = sum(args->count);
+}
+
+tracepoint:syscalls:sys_enter_futex /comm == "mvcc-write-benc"/ {
+    @futex_n = count();
+}
+tracepoint:syscalls:sys_enter_epoll_wait /comm == "mvcc-write-benc"/ {
+    @epoll_wait_n = count();
+}
+
+END {
+    printf("bpftrace done\n");
+}

@@ -1,0 +1,6 @@
+results/
+profile/
+*.db
+*.db-log
+*.db-wal
+*.db-shm

@@ -4026,6 +4026,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
+name = "mvcc-write-bench"
+version = "0.8.0-pre.7"
+dependencies = [
+ "clap",
+ "rusqlite",
+ "turso_core",
+]
+
+[[package]]
 name = "napi"
 version = "3.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
