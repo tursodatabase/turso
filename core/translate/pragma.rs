@@ -541,17 +541,9 @@ fn update_pragma(
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema(), &pager)?;
-            tracing::debug!(
-                "Checking if database is empty for auto_vacuum pragma: {}",
-                is_empty
-            );
-
-            if !is_empty {
-                // SQLite's behavior is to silently ignore this pragma if the database is not empty.
-                tracing::debug!(
-                    "Attempted to set auto_vacuum, database is not empty so we are ignoring pragma."
-                );
+            // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
+            // so the pragma is silently ignored after that.
+            if pager.db_initialized() {
                 return Ok(TransactionMode::None);
             }
 
@@ -1919,34 +1911,4 @@ fn update_cache_size(
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
     Ok(())
-}
-
-fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
-    if schema.tables.len() > 1 {
-        return Ok(false);
-    }
-    if let Some(table_arc) = schema.tables.values().next() {
-        let table_name = match table_arc.as_ref() {
-            Table::BTree(tbl) => &tbl.name,
-            Table::Virtual(tbl) => &tbl.name,
-            Table::FromClauseSubquery(tbl) => &tbl.name,
-            Table::RecursiveCteInput(_) => {
-                unreachable!("recursive CTE inputs are not stored in the schema")
-            }
-        };
-
-        if table_name != "sqlite_schema" {
-            return Ok(false);
-        }
-    }
-
-    let db_size_result = pager
-        .io
-        .block(|| pager.with_header(|header| header.database_size.get()));
-
-    match db_size_result {
-        Err(_) => Ok(true),
-        Ok(0 | 1) => Ok(true),
-        Ok(_) => Ok(false),
-    }
 }
