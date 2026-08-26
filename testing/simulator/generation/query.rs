@@ -16,7 +16,7 @@ use sql_generation::{
         query::{
             Create, CreateIndex, Delete, DropIndex, Insert, Select,
             alter_table::AlterTable,
-            pragma::{Pragma, VacuumMode},
+            pragma::{CheckpointMode, Pragma, VacuumMode},
             update::Update,
         },
         table::Table,
@@ -86,7 +86,28 @@ fn random_create_index<R: rand::Rng + ?Sized>(
     Query::CreateIndex(create_index)
 }
 
-fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_pragma<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+    allow_checkpoints: bool,
+) -> Query {
+    if allow_checkpoints && !conn_ctx.tables().is_empty() && rng.random_bool(0.35) {
+        let modes = [
+            CheckpointMode::Passive,
+            CheckpointMode::Full,
+            CheckpointMode::Restart,
+            CheckpointMode::Truncate,
+        ];
+        let table = conn_ctx.tables().choose(rng).unwrap();
+        let database = table
+            .name
+            .split_once('.')
+            .map(|(database, _)| database.to_string());
+        return Query::Pragma(Pragma::WalCheckpoint {
+            database,
+            mode: *modes.choose(rng).unwrap(),
+        });
+    }
     if !conn_ctx.tables().is_empty() && rng.random_bool(0.5) {
         let table = conn_ctx.tables().choose(rng).unwrap();
         return Query::Pragma(Pragma::ForeignKeyList(table.name.clone()));
@@ -203,7 +224,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::CreateIndex => Some(random_create_index),
             QueryDiscriminants::AlterTable => Some(random_alter_table),
             QueryDiscriminants::DropIndex => Some(random_drop_index),
-            QueryDiscriminants::Pragma => Some(random_pragma),
+            QueryDiscriminants::Pragma => None,
             // Sequence queries are handled specially in sample() since they need sequence_names
             QueryDiscriminants::CreateSequence
             | QueryDiscriminants::DropSequence
@@ -262,10 +283,15 @@ pub(super) struct QueryDistribution {
     query_weights: Vec<u32>,
     weights: WeightedIndex<u32>,
     sequence_info: Vec<(String, i64, i64)>,
+    allow_checkpoints: bool,
 }
 
 impl QueryDistribution {
-    pub fn new(queries: &'static [QueryDiscriminants], remaining: &Remaining) -> Self {
+    pub fn new(
+        queries: &'static [QueryDiscriminants],
+        remaining: &Remaining,
+        allow_checkpoints: bool,
+    ) -> Self {
         let query_weights = queries
             .iter()
             .map(|query| query.weight(remaining))
@@ -276,6 +302,7 @@ impl QueryDistribution {
             query_weights,
             weights,
             sequence_info: remaining.sequence_info.clone(),
+            allow_checkpoints,
         }
     }
 
@@ -328,6 +355,7 @@ impl WeightedDistribution for QueryDistribution {
                 random_drop_sequence(rng, &names)
             }
             QueryDiscriminants::Setval => random_setval(rng, &self.sequence_info),
+            QueryDiscriminants::Pragma => random_pragma(rng, ctx, self.allow_checkpoints),
             _ => {
                 let query_fn = discriminant
                     .gen_function()
@@ -345,5 +373,47 @@ impl ArbitraryFrom<&QueryDistribution> for Query {
         query_distr: &QueryDistribution,
     ) -> Self {
         query_distr.sample(rng, context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{SeedableRng, rngs::StdRng};
+    use sql_generation::generation::Opts;
+
+    struct Context {
+        tables: Vec<Table>,
+        opts: Opts,
+    }
+
+    impl GenerationContext for Context {
+        fn tables(&self) -> &Vec<Table> {
+            &self.tables
+        }
+
+        fn opts(&self) -> &Opts {
+            &self.opts
+        }
+    }
+
+    #[test]
+    fn checkpoint_generation_targets_an_attached_table() {
+        let mut table = Table::anonymous(Vec::new());
+        table.name = "aux.t".to_string();
+        let context = Context {
+            tables: vec![table],
+            opts: Opts::default(),
+        };
+
+        for seed in 0..100 {
+            let query = random_pragma(&mut StdRng::seed_from_u64(seed), &context, true);
+            if let Query::Pragma(Pragma::WalCheckpoint { database, .. }) = &query {
+                assert_eq!(database.as_deref(), Some("aux"));
+                assert!(query.to_string().starts_with("PRAGMA aux.wal_checkpoint("));
+                return;
+            }
+        }
+        panic!("checkpoint generation produced no checkpoint");
     }
 }

@@ -640,6 +640,9 @@ fn update_pragma(
         }
         PragmaName::Synchronous => {
             use crate::SyncMode;
+            if !connection.get_auto_commit() {
+                bail_parse_error!("Safety level may not be changed inside a transaction");
+            }
             let mode = if let Expr::Literal(Literal::Numeric(n)) = &value {
                 match n.as_str() {
                     "0" => SyncMode::Off,

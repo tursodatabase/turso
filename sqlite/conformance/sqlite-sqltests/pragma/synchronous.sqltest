@@ -1,0 +1,11 @@
+@database :memory:
+@skip-file-if mvcc "attach is not supported for mvcc"
+
+test synchronous-cannot-change-inside-transaction {
+    ATTACH ':memory:' AS aux;
+    BEGIN;
+    PRAGMA aux.synchronous=OFF;
+}
+expect error {
+    Safety level may not be changed inside a transaction
+}
