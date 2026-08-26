@@ -5,13 +5,15 @@ edition = "2021"
 
 [[bin]]
 name = "write-throughput"
-path = "src/main.rs"
+path = "main.rs"
 
 [features]
 console = ["dep:console-subscriber" ,"tokio/tracing"]
 
 [dependencies]
 turso = { workspace = true }
+rusqlite = { workspace = true }
+anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, default-features = true, features = ["full"] }
 futures = { workspace = true }
