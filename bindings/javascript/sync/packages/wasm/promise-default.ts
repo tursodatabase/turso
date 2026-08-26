@@ -49,20 +49,6 @@ function resolveUrl(url: string | (() => string | null)): string {
     return url;
 }
 
-function syncDatabaseFiles(path: string): string[] {
-    const lastSlash = path.lastIndexOf('/');
-    const lastDot = path.lastIndexOf('.');
-    const stem = lastDot > lastSlash + 1 ? path.slice(0, lastDot) : path;
-    return [
-        path,
-        `${path}-wal`,
-        `${stem}.db-log`,
-        `${path}-wal-revert`,
-        `${path}-info`,
-        `${path}-changes`,
-    ];
-}
-
 class Database extends DatabasePromise {
     #runner: Runner;
     #engine: any;
@@ -187,7 +173,7 @@ class Database extends DatabasePromise {
             if (!this.memory) {
                 const worker = await init();
                 this.#worker = worker;
-                await Promise.all(syncDatabaseFiles(this.name).map(path => registerFileAtWorker(worker, path)));
+                await Promise.all(this.#engine.filePaths().map((path: string) => registerFileAtWorker(worker, path)));
             }
             await run(this.#runner, this.#engine.connect(), this.execLock);
         }
@@ -356,7 +342,7 @@ class Database extends DatabasePromise {
         if (this.#engine != null) {
             if (this.name != null && this.#worker != null) {
                 const worker = this.#worker;
-                await Promise.all(syncDatabaseFiles(this.name).map(path => unregisterFileAtWorker(worker, path)));
+                await Promise.all(this.#engine.filePaths().map((path: string) => unregisterFileAtWorker(worker, path)));
             }
             this.#engine.close();
         }
