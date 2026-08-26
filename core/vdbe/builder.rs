@@ -7,12 +7,13 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
-    parameters::Parameters,
+    parameters::{ParameterSpelling, Parameters},
     schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
+        semantic::hir::{AggregateId, CteId, OutputId, QueryId, SourceId, WindowFunctionId},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -48,19 +49,64 @@ use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
 
+/// The resolved source that owns a cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorOwner {
+    /// Parser-AST identity used by the legacy translator.
+    TableReference(TableInternalId),
+    /// Document-local identity used by HIR lowering.
+    Source(SourceId),
+}
+
+/// Physical location used to read values from one resolved HIR source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceBinding {
+    BTree {
+        /// Cursor driving the current scan. This may be a table or index cursor.
+        scan_cursor: CursorID,
+        /// Table cursor used when the scan cursor cannot supply a column.
+        table_cursor: Option<CursorID>,
+    },
+    Virtual {
+        cursor: CursorID,
+    },
+    Registers {
+        start: usize,
+        rowid: Option<usize>,
+    },
+    /// Runtime value plus separately allocated arguments for a schema program.
+    SchemaInputs {
+        value: usize,
+        arguments_start: usize,
+    },
+}
+
+/// Physical location of one resolved HIR output value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputBinding {
+    pub(crate) register: usize,
+}
+
+/// Physical result produced by one non-FROM HIR subquery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubqueryBinding {
+    RowValue { start: usize, count: usize },
+    Exists { register: usize },
+    InIndex { cursor: CursorID },
+}
+
 /// A key that uniquely identifies a cursor.
-/// The key is a pair of table reference id and index.
+/// The key is a pair of source identity and index.
 /// The index is only provided when the cursor is an index cursor.
 #[derive(Debug, Clone)]
 pub struct CursorKey {
-    /// The table reference that the cursor is associated with.
+    /// The source that the cursor is associated with.
     /// We cannot use e.g. the table query identifier (e.g. 'users' or 'u')
     /// because it might be ambiguous, e.g. this silly example:
     /// `SELECT * FROM t WHERE EXISTS (SELECT * from t)` <-- two different cursors, which 't' should we use as key?
-    ///  TableInternalIds are unique within a program, since there is one id per table reference.
-    pub table_reference_id: TableInternalId,
+    pub owner: CursorOwner,
     /// The index, in case of an index cursor.
-    /// The combination of table internal id and index is enough to disambiguate.
+    /// The combination of source identity and index is enough to disambiguate.
     pub index: Option<Arc<Index>>,
     /// Whether this cursor is an special case build cursor.
     pub is_build: bool,
@@ -69,7 +115,7 @@ pub struct CursorKey {
 impl CursorKey {
     pub fn table(table_reference_id: TableInternalId) -> Self {
         Self {
-            table_reference_id,
+            owner: CursorOwner::TableReference(table_reference_id),
             index: None,
             is_build: false,
         }
@@ -77,7 +123,7 @@ impl CursorKey {
 
     pub fn index(table_reference_id: TableInternalId, index: Arc<Index>) -> Self {
         Self {
-            table_reference_id,
+            owner: CursorOwner::TableReference(table_reference_id),
             index: Some(index),
             is_build: false,
         }
@@ -87,14 +133,30 @@ impl CursorKey {
     /// This creates a separate cursor from the regular table cursor.
     pub fn hash_build(table_reference_id: TableInternalId) -> Self {
         Self {
-            table_reference_id,
+            owner: CursorOwner::TableReference(table_reference_id),
             index: None,
             is_build: true,
         }
     }
 
+    pub fn source(source: SourceId) -> Self {
+        Self {
+            owner: CursorOwner::Source(source),
+            index: None,
+            is_build: false,
+        }
+    }
+
+    pub fn source_index(source: SourceId, index: Arc<Index>) -> Self {
+        Self {
+            owner: CursorOwner::Source(source),
+            index: Some(index),
+            is_build: false,
+        }
+    }
+
     pub fn equals(&self, other: &CursorKey) -> bool {
-        if self.table_reference_id != other.table_reference_id {
+        if self.owner != other.owner {
             return false;
         }
         if self.is_build != other.is_build {
@@ -249,9 +311,9 @@ pub struct ProgramBuilder {
     pub result_columns: Vec<ResultSetColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
-    /// Registry of materialized CTEs, keyed by cte_id.
+    /// Registry of materialized CTEs, keyed by legacy or HIR identity.
     /// Used to share materialized data across multiple CTE references via OpenDup.
-    materialized_ctes: HashMap<usize, MaterializedCteInfo>,
+    materialized_ctes: HashMap<MaterializedCteKey, MaterializedCteInfo>,
     /// Stack of CTE names currently being planned. Used to detect circular
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
@@ -277,6 +339,16 @@ pub struct ProgramBuilder {
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
+    /// Physical value locations for resolved HIR sources.
+    source_bindings: HashMap<SourceId, SourceBinding>,
+    /// Registers containing already-evaluated resolved HIR outputs.
+    output_bindings: HashMap<OutputId, OutputBinding>,
+    /// Registers containing finalized aggregate results.
+    aggregate_result_registers: HashMap<AggregateId, usize>,
+    /// Registers containing results for the current window row.
+    window_result_registers: HashMap<WindowFunctionId, usize>,
+    /// Runtime results for resolved non-FROM subqueries.
+    subquery_bindings: HashMap<QueryId, SubqueryBinding>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -498,6 +570,12 @@ pub struct MaterializedCteInfo {
     pub num_columns: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MaterializedCteKey {
+    Legacy(usize),
+    Hir(CteId),
+}
+
 #[derive(Debug, Clone)]
 pub enum CursorType {
     BTreeTable(Arc<BTreeTable>),
@@ -626,21 +704,35 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
-    /// Register an `ast::Variable` in the parameter list. Returns the
-    /// `NonZeroUsize` index for use in `Insn::Variable`.
-    pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
-        let index = usize::try_from(variable.index.get())
+    /// Register a parameter whose index and spelling were fixed before
+    /// bytecode lowering.
+    pub fn register_parameter(
+        &mut self,
+        index: std::num::NonZeroU32,
+        spelling: &ParameterSpelling,
+    ) -> NonZeroUsize {
+        let index = usize::try_from(index.get())
             .expect("u32 variable index must fit into usize")
             .try_into()
             .expect("variable index must be non-zero");
-        if let Some(name) = variable.name.as_deref() {
-            self.parameters.push_named_at(name, index);
-        } else if variable.numbered {
-            self.parameters.push_numbered(index);
-        } else {
-            self.parameters.push_index(index);
+        match spelling {
+            ParameterSpelling::Anonymous => self.parameters.push_index(index),
+            ParameterSpelling::Numbered => self.parameters.push_numbered(index),
+            ParameterSpelling::Named(name) => self.parameters.push_named_at(name, index),
         }
-        index
+    }
+
+    /// Register an `ast::Variable` in the parameter list. Returns the
+    /// `NonZeroUsize` index for use in `Insn::Variable`.
+    pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
+        let spelling = if let Some(name) = variable.name.as_deref() {
+            ParameterSpelling::Named(name.to_owned())
+        } else if variable.numbered {
+            ParameterSpelling::Numbered
+        } else {
+            ParameterSpelling::Anonymous
+        };
+        self.register_parameter(variable.index, &spelling)
     }
 
     /// Run a nested emission scope without leaking its result-column register base
@@ -729,6 +821,11 @@ impl ProgramBuilder {
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
+            source_bindings: HashMap::default(),
+            output_bindings: HashMap::default(),
+            aggregate_result_registers: HashMap::default(),
+            window_result_registers: HashMap::default(),
+            subquery_bindings: HashMap::default(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -767,12 +864,23 @@ impl ProgramBuilder {
     /// Check if a CTE has already been materialized.
     /// Returns the materialization info if the CTE cursor can be shared via OpenDup.
     pub fn get_materialized_cte(&self, cte_id: usize) -> Option<&MaterializedCteInfo> {
-        self.materialized_ctes.get(&cte_id)
+        self.materialized_ctes
+            .get(&MaterializedCteKey::Legacy(cte_id))
     }
 
     /// Register a materialized CTE so that subsequent references can share it via OpenDup.
     pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
-        self.materialized_ctes.insert(cte_id, info);
+        self.materialized_ctes
+            .insert(MaterializedCteKey::Legacy(cte_id), info);
+    }
+
+    pub(crate) fn hir_materialized_cte(&self, cte: CteId) -> Option<&MaterializedCteInfo> {
+        self.materialized_ctes.get(&MaterializedCteKey::Hir(cte))
+    }
+
+    pub(crate) fn register_hir_materialized_cte(&mut self, cte: CteId, info: MaterializedCteInfo) {
+        self.materialized_ctes
+            .insert(MaterializedCteKey::Hir(cte), info);
     }
 
     /// Mark a CTE name as currently being planned. While on the stack,
@@ -892,6 +1000,47 @@ impl ProgramBuilder {
     /// Returns None if the subquery hasn't been emitted yet.
     pub fn get_subquery_result_reg(&self, internal_id: TableInternalId) -> Option<usize> {
         self.subquery_result_regs.get(&internal_id).copied()
+    }
+
+    pub(crate) fn bind_source(&mut self, source: SourceId, binding: SourceBinding) {
+        self.source_bindings.insert(source, binding);
+    }
+
+    pub(crate) fn source_binding(&self, source: SourceId) -> Option<&SourceBinding> {
+        self.source_bindings.get(&source)
+    }
+
+    pub(crate) fn bind_output(&mut self, output: OutputId, register: usize) {
+        self.output_bindings
+            .insert(output, OutputBinding { register });
+    }
+
+    pub(crate) fn output_binding(&self, output: OutputId) -> Option<OutputBinding> {
+        self.output_bindings.get(&output).copied()
+    }
+
+    pub(crate) fn bind_aggregate_result(&mut self, aggregate: AggregateId, register: usize) {
+        self.aggregate_result_registers.insert(aggregate, register);
+    }
+
+    pub(crate) fn aggregate_result_register(&self, aggregate: AggregateId) -> Option<usize> {
+        self.aggregate_result_registers.get(&aggregate).copied()
+    }
+
+    pub(crate) fn bind_window_result(&mut self, window: WindowFunctionId, register: usize) {
+        self.window_result_registers.insert(window, register);
+    }
+
+    pub(crate) fn window_result_register(&self, window: WindowFunctionId) -> Option<usize> {
+        self.window_result_registers.get(&window).copied()
+    }
+
+    pub(crate) fn bind_subquery(&mut self, query: QueryId, binding: SubqueryBinding) {
+        self.subquery_bindings.insert(query, binding);
+    }
+
+    pub(crate) fn subquery_binding(&self, query: QueryId) -> Option<SubqueryBinding> {
+        self.subquery_bindings.get(&query).copied()
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
@@ -1816,9 +1965,11 @@ impl ProgramBuilder {
         // Index cursor lookups are not overridden because when a cursor override is active,
         // the calling code (translate_expr) should skip index logic entirely.
         if key.index.is_none() && !key.is_build {
-            let table_id: usize = key.table_reference_id.into();
-            if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
-                return Some(cursor_id);
+            if let CursorOwner::TableReference(table_reference_id) = key.owner {
+                let table_id: usize = table_reference_id.into();
+                if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
+                    return Some(cursor_id);
+                }
             }
         }
         self.cursor_ref
@@ -1847,8 +1998,9 @@ impl ProgramBuilder {
         table_ref_id: TableInternalId,
     ) -> Option<CursorID> {
         self.cursor_ref.iter().position(|(k, _)| {
-            k.as_ref()
-                .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
+            k.as_ref().is_some_and(|k| {
+                k.owner == CursorOwner::TableReference(table_ref_id) && k.index.is_some()
+            })
         })
     }
 
@@ -2314,5 +2466,166 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Pseudo(_)
                 | CursorType::Sorter
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn program() -> ProgramBuilder {
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0))
+    }
+
+    #[test]
+    fn legacy_and_hir_cursor_owners_do_not_collide() {
+        let mut program = program();
+        let table = TableInternalId::from(0);
+        let source = SourceId::new(0);
+
+        let table_cursor =
+            program.alloc_cursor_id_keyed(CursorKey::table(table), CursorType::Sorter);
+        let source_cursor =
+            program.alloc_cursor_id_keyed(CursorKey::source(source), CursorType::Sorter);
+
+        assert_ne!(table_cursor, source_cursor);
+        assert_eq!(
+            program.resolve_cursor_id(&CursorKey::table(table)),
+            table_cursor
+        );
+        assert_eq!(
+            program.resolve_cursor_id(&CursorKey::source(source)),
+            source_cursor
+        );
+    }
+
+    #[test]
+    fn legacy_cursor_override_does_not_affect_hir_source() {
+        let mut program = program();
+        let table = TableInternalId::from(0);
+        let source = SourceId::new(0);
+        let source_cursor =
+            program.alloc_cursor_id_keyed(CursorKey::source(source), CursorType::Sorter);
+        let override_cursor = program.alloc_cursor_id(CursorType::Sorter);
+
+        program.set_cursor_override(table, override_cursor);
+
+        assert_eq!(
+            program.resolve_cursor_id(&CursorKey::table(table)),
+            override_cursor
+        );
+        assert_eq!(
+            program.resolve_cursor_id(&CursorKey::source(source)),
+            source_cursor
+        );
+    }
+
+    #[test]
+    fn hir_source_bindings_are_keyed_by_source_identity() {
+        let mut program = program();
+        let table_source = SourceId::new(0);
+        let register_source = SourceId::new(1);
+        let scan_cursor = program.alloc_cursor_id(CursorType::Sorter);
+        let table_cursor = program.alloc_cursor_id(CursorType::Sorter);
+
+        program.bind_source(
+            table_source,
+            SourceBinding::BTree {
+                scan_cursor,
+                table_cursor: Some(table_cursor),
+            },
+        );
+        program.bind_source(
+            register_source,
+            SourceBinding::Registers {
+                start: 7,
+                rowid: None,
+            },
+        );
+
+        assert_eq!(
+            program.source_binding(table_source),
+            Some(&SourceBinding::BTree {
+                scan_cursor,
+                table_cursor: Some(table_cursor),
+            })
+        );
+        assert_eq!(
+            program.source_binding(register_source),
+            Some(&SourceBinding::Registers {
+                start: 7,
+                rowid: None,
+            })
+        );
+        assert_eq!(program.source_binding(SourceId::new(2)), None);
+    }
+
+    #[test]
+    fn hir_output_bindings_are_keyed_by_output_identity() {
+        let mut program = program();
+        let block = crate::translate::semantic::hir::QueryBlockId::new(
+            crate::translate::semantic::hir::QueryId::new(0),
+            0,
+        );
+        let output = OutputId::query(block, 0);
+
+        program.bind_output(output, 7);
+
+        assert_eq!(
+            program.output_binding(output),
+            Some(OutputBinding { register: 7 })
+        );
+        assert_eq!(program.output_binding(OutputId::query(block, 1)), None);
+    }
+
+    #[test]
+    fn hir_function_results_are_keyed_by_semantic_identity() {
+        let mut program = program();
+        let block = crate::translate::semantic::hir::QueryBlockId::new(
+            crate::translate::semantic::hir::QueryId::new(0),
+            0,
+        );
+        let aggregate = AggregateId::new(block, 0);
+        let window = WindowFunctionId::new(block, 0);
+
+        program.bind_aggregate_result(aggregate, 7);
+        program.bind_window_result(window, 9);
+
+        assert_eq!(program.aggregate_result_register(aggregate), Some(7));
+        assert_eq!(
+            program.aggregate_result_register(AggregateId::new(block, 1)),
+            None
+        );
+        assert_eq!(program.window_result_register(window), Some(9));
+        assert_eq!(
+            program.window_result_register(WindowFunctionId::new(block, 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn hir_subquery_bindings_are_keyed_by_query_identity() {
+        let mut program = program();
+        let row_query = QueryId::new(0);
+        let exists_query = QueryId::new(1);
+
+        program.bind_subquery(row_query, SubqueryBinding::RowValue { start: 7, count: 2 });
+        program.bind_subquery(exists_query, SubqueryBinding::Exists { register: 9 });
+        let in_query = QueryId::new(2);
+        program.bind_subquery(in_query, SubqueryBinding::InIndex { cursor: 11 });
+
+        assert_eq!(
+            program.subquery_binding(row_query),
+            Some(SubqueryBinding::RowValue { start: 7, count: 2 })
+        );
+        assert_eq!(
+            program.subquery_binding(exists_query),
+            Some(SubqueryBinding::Exists { register: 9 })
+        );
+        assert_eq!(
+            program.subquery_binding(in_query),
+            Some(SubqueryBinding::InIndex { cursor: 11 })
+        );
+        assert_eq!(program.subquery_binding(QueryId::new(3)), None);
     }
 }

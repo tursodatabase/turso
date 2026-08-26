@@ -4,19 +4,18 @@ use crate::alloc::*;
 use turso_parser::ast::{self, SortOrder};
 
 use crate::{
-    emit_explain,
+    Result, emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
-        collate::{get_collseq_from_expr_with_symbols, CollationSeq},
+        collate::{CollationSeq, get_collseq_from_expr_with_symbols},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, IdxInsertFlags, Insn, SorterOpenData},
+        insn::{IdxInsertFlags, Insn, SorterOpenData, to_u32},
     },
-    Result,
 };
 
 use super::{
@@ -39,6 +38,24 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
         "array_lt" => Some(SortComparatorType::ArrayLt),
         _ => None,
     }
+}
+
+pub(crate) fn custom_type_comparator_from_type_fact(
+    type_fact: &crate::translate::semantic::hir::TypeFact,
+) -> Option<SortComparatorType> {
+    if type_fact.is_array() {
+        return Some(SortComparatorType::ArrayLt);
+    }
+    type_fact
+        .declared
+        .as_ref()?
+        .custom()?
+        .value()
+        .operators()
+        .iter()
+        .find(|operator| operator.op == "<")
+        .and_then(|operator| operator.func_name.as_deref())
+        .and_then(sort_comparator_from_func_name)
 }
 
 /// For an ORDER BY expression that is a column reference to a custom type,
@@ -176,10 +193,10 @@ impl EmitOrderBy {
                 {
                     let col_name = col.name.as_deref().unwrap_or("?");
                     crate::bail_parse_error!(
-                    "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
-                    col_name,
-                    type_def.name
-                );
+                        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
+                        col_name,
+                        type_def.name
+                    );
                 }
                 crate::bail_parse_error!(
                     "cannot ORDER BY a custom type column that does not declare OPERATOR '<'"

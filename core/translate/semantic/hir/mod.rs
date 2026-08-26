@@ -620,6 +620,12 @@ pub struct DatabaseSnapshot {
 }
 
 impl HirDocument {
+    pub fn database(&self, id: DatabaseId) -> Option<&DatabaseSnapshot> {
+        self.databases
+            .iter()
+            .find(|snapshot| snapshot.database == id)
+    }
+
     pub fn query(&self, id: QueryId) -> Option<&Query> {
         self.queries.get(id.index()).filter(|query| query.id == id)
     }

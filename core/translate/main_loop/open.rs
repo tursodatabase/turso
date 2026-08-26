@@ -1,7 +1,6 @@
 use super::*;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 use crate::translate::{
-    main_loop::close::AutoIndexBuild,
     plan::{self, SubqueryEvalPhase},
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
@@ -94,10 +93,7 @@ impl OpenLoop {
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
-                    program.emit_insn(Insn::Integer {
-                        value: 0,
-                        dest: lj_meta.reg_match_flag,
-                    });
+                    lj_meta.reset(program);
                 }
             }
 
@@ -329,15 +325,42 @@ impl OpenLoop {
                                             ),
                                             table_has_rowid,
                                             num_seek_keys,
+                                            has_null_matching_key: (0..num_seek_keys).any(|i| {
+                                                seek_def.is_null_matching_key_component(i)
+                                            }),
                                             seek_def,
                                             affinity_str: plan::synthesized_seek_affinity_str(
                                                 index, seek_def,
                                             )
                                             .as_ref(),
-                                            table_columns,
-                                            table_ref_id: table.internal_id,
-                                            table_references,
-                                            resolver: &t_ctx.resolver,
+                                        },
+                                        |program, column, target| {
+                                            if let Some(column_def) = table_columns
+                                                .and_then(|columns| columns.get(column))
+                                            {
+                                                if column_def.is_virtual_generated() {
+                                                    return crate::translate::expr::emit_table_column(
+                                                        program,
+                                                        table_cursor_id.expect(
+                                                            "an automatic index must have a source table cursor",
+                                                        ),
+                                                        table.internal_id,
+                                                        table_references,
+                                                        column_def,
+                                                        column,
+                                                        target,
+                                                        &t_ctx.resolver,
+                                                    );
+                                                }
+                                            }
+                                            program.emit_column_or_rowid(
+                                                table_cursor_id.expect(
+                                                    "an automatic index must have a source table cursor",
+                                                ),
+                                                column,
+                                                target,
+                                            );
+                                            Ok(())
                                         },
                                     )?;
                                     bloom_filter = use_bloom_filter;
@@ -415,7 +438,6 @@ impl OpenLoop {
                             }
                         }
                         Search::InSeek { index, source } => {
-                            let is_rowid = index.is_none();
                             let ephemeral_cursor_id = open_in_seek_source_cursor(
                                 program,
                                 table_references,
@@ -423,77 +445,22 @@ impl OpenLoop {
                                 index.as_ref(),
                                 source,
                             )?;
-
-                            program.emit_insn(Insn::NullRow {
-                                cursor_id: ephemeral_cursor_id,
-                            });
-                            program.emit_insn(Insn::Rewind {
-                                cursor_id: ephemeral_cursor_id,
-                                pc_if_empty: loop_end,
-                            });
-
-                            let outer_loop_start = program.allocate_label();
-                            program.preassign_label_to_next_insn(outer_loop_start);
-                            let seek_reg = program.alloc_register();
-                            // The emitted loop is:
-                            //   for each RHS key in the ephemeral cursor
-                            //     seek table/index to that key
-                            //     scan all matching rows for that key
-                            program.emit_insn(Insn::Column {
-                                cursor_id: ephemeral_cursor_id,
-                                column: 0,
-                                dest: seek_reg,
-                                default: None,
-                            });
-
-                            let next_val_label = program.allocate_label();
-                            program.emit_insn(Insn::IsNull {
-                                reg: seek_reg,
-                                target_pc: next_val_label,
-                            });
-
-                            if is_rowid {
-                                program.emit_insn(Insn::SeekRowid {
-                                    cursor_id: table_cursor_id
-                                        .expect("InSeek rowid requires table cursor"),
-                                    src_reg: seek_reg,
-                                    target_pc: next_val_label,
-                                });
+                            let index_backed = index.is_some();
+                            let scan_cursor = if index_backed {
+                                index_cursor_id.expect("InSeek with index requires index cursor")
                             } else {
-                                let idx_cursor = index_cursor_id
-                                    .expect("InSeek with index requires index cursor");
-                                program.emit_insn(Insn::SeekGE {
-                                    cursor_id: idx_cursor,
-                                    start_reg: seek_reg,
-                                    num_regs: 1,
-                                    target_pc: next_val_label,
-                                    is_index: true,
-                                    eq_only: false,
-                                    null_matching_mask: Default::default(),
-                                });
-                                program.preassign_label_to_next_insn(loop_start);
-                                program.emit_insn(Insn::IdxGT {
-                                    cursor_id: idx_cursor,
-                                    start_reg: seek_reg,
-                                    num_regs: 1,
-                                    target_pc: next_val_label,
-                                });
-                                if let Some(table_cursor_id) = table_cursor_id {
-                                    program.emit_insn(Insn::DeferredSeek {
-                                        index_cursor_id: idx_cursor,
-                                        table_cursor_id,
-                                    });
-                                }
-                            }
-
-                            // `close_loop` uses this metadata to stitch together the outer
-                            // ephemeral-value loop and the inner scan over matches for the
-                            // current value.
-                            t_ctx.meta_in_seeks[joined_table_index] = Some(InSeekMetadata {
+                                table_cursor_id.expect("InSeek rowid requires table cursor")
+                            };
+                            let state = emit_in_seek_start(
+                                program,
                                 ephemeral_cursor_id,
-                                outer_loop_start,
-                                next_val_label,
-                            });
+                                scan_cursor,
+                                if index_backed { table_cursor_id } else { None },
+                                index_backed,
+                                loop_start,
+                                loop_end,
+                            );
+                            t_ctx.meta_in_seeks[joined_table_index] = Some(state);
                         }
                     }
                 }
@@ -589,11 +556,7 @@ impl OpenLoop {
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() && !is_outer_hj_probe {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
-                    program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
-                    program.emit_insn(Insn::Integer {
-                        value: 1,
-                        dest: lj_meta.reg_match_flag,
-                    });
+                    lj_meta.mark_matched(program);
                 }
             }
 
@@ -611,11 +574,7 @@ impl OpenLoop {
                     if matches!(hj.join_type, HashJoinType::FullOuter) {
                         let probe_idx = hj.probe_table_idx;
                         if let Some(lj_meta) = t_ctx.meta_left_joins[probe_idx].as_ref() {
-                            program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
-                            program.emit_insn(Insn::Integer {
-                                value: 1,
-                                dest: lj_meta.reg_match_flag,
-                            });
+                            lj_meta.mark_matched(program);
                         }
                     }
                 }

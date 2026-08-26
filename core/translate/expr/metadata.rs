@@ -103,7 +103,7 @@ pub(super) fn build_between_terms(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub(super) fn emit_cond_jump(
+pub(crate) fn emit_cond_jump(
     program: &mut ProgramBuilder,
     cond_meta: ConditionMetadata,
     reg: usize,
@@ -123,7 +123,7 @@ pub(super) fn emit_cond_jump(
     }
 }
 
-pub(super) fn assert_register_range_allocated(
+pub(crate) fn assert_register_range_allocated(
     program: &mut ProgramBuilder,
     start_register: usize,
     count: usize,

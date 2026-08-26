@@ -594,7 +594,7 @@ impl Scope {
 
             let merged = hir::Expr::MergedColumn(hir::MergedColumn {
                 left: using.left.clone(),
-                right: using.right,
+                right: Box::new(hir::Expr::Column(using.right)),
                 value: using.value,
                 type_fact: using.type_fact.clone(),
                 affinity: using.affinity,
@@ -692,7 +692,7 @@ fn same_join_column(left: &hir::Expr, right: &hir::Expr) -> bool {
     match (left, right) {
         (hir::Expr::Column(left), hir::Expr::Column(right)) => left == right,
         (hir::Expr::MergedColumn(left), hir::Expr::MergedColumn(right)) => {
-            left.right == right.right
+            same_join_column(&left.right, &right.right)
                 && left.value == right.value
                 && same_join_column(&left.left, &right.left)
         }
@@ -1125,7 +1125,7 @@ mod tests {
                 panic!("USING produces a merged column");
             };
             assert!(matches!(*merged.left, Expr::Column(actual) if actual == left_ref));
-            assert_eq!(merged.right, right_ref);
+            assert!(matches!(*merged.right, Expr::Column(actual) if actual == right_ref));
             assert_eq!(merged.value, value);
 
             let qualified_left = scope
@@ -1161,7 +1161,7 @@ mod tests {
         let first = using_column(Expr::Column(left_ref), middle_ref, MergedColumnValue::Left);
         let first_expr = Expr::MergedColumn(hir::MergedColumn {
             left: first.left.clone(),
-            right: first.right,
+            right: Box::new(Expr::Column(first.right)),
             value: first.value,
             type_fact: first.type_fact.clone(),
             affinity: first.affinity,
@@ -1187,7 +1187,7 @@ mod tests {
         let Expr::MergedColumn(merged) = resolved.expr else {
             panic!("second USING produces a merged column");
         };
-        assert_eq!(merged.right, right_ref);
+        assert!(matches!(*merged.right, Expr::Column(actual) if actual == right_ref));
         assert_eq!(merged.value, MergedColumnValue::Coalesce);
         assert!(matches!(*merged.left, Expr::MergedColumn(_)));
     }

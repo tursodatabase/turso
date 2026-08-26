@@ -3,17 +3,21 @@ use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
 
-fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
+fn index_seek_affinities<E>(
+    seek_def: &SeekDef<E>,
+    seek_key: &SeekKey<E>,
+    lowering: &impl SeekExpressionLowering<E>,
+) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
     // not the indexed column's affinity.
     seek_def
         .iter(seek_key)
         .zip(seek_def.iter_affinity(seek_key))
-        .map(|(key_component, aff)| match key_component {
-            SeekKeyComponent::Expr(expr) if aff.expr_needs_no_affinity_change(expr) => {
-                affinity::SQLITE_AFF_BLOB
+        .map(|(key_component, affinity)| match key_component {
+            SeekKeyComponent::Expr(expression) => {
+                lowering.affinity(affinity, expression).aff_mask()
             }
-            _ => aff.aff_mask(),
+            _ => affinity.aff_mask(),
         })
         .collect()
 }
@@ -76,16 +80,115 @@ fn encode_seek_keys_for_custom_types(
     Ok(())
 }
 
+pub(crate) trait SeekExpressionLowering<E> {
+    fn emit_expression(
+        &mut self,
+        program: &mut ProgramBuilder,
+        expression: &E,
+        target: usize,
+    ) -> Result<()>;
+
+    fn is_nonnull(&self, expression: &E) -> bool;
+
+    fn is_null_matching(&self, operator: turso_parser::ast::Operator, expression: &E) -> bool;
+
+    fn affinity(&self, affinity: Affinity, expression: &E) -> Affinity;
+
+    fn encode_index_keys(
+        &mut self,
+        program: &mut ProgramBuilder,
+        index: &Arc<Index>,
+        start_reg: usize,
+        num_keys: usize,
+        index_column_offset: usize,
+    ) -> Result<()>;
+
+    fn rowid_affinity(&self) -> Affinity;
+}
+
+pub(super) struct LegacySeekExpressionLowering<'a, 'plan> {
+    tables: &'a TableReferences,
+    t_ctx: &'a mut TranslateCtx<'plan>,
+}
+
+impl SeekExpressionLowering<Expr> for LegacySeekExpressionLowering<'_, '_> {
+    fn emit_expression(
+        &mut self,
+        program: &mut ProgramBuilder,
+        expression: &Expr,
+        target: usize,
+    ) -> Result<()> {
+        translate_expr_no_constant_opt(
+            program,
+            Some(self.tables),
+            expression,
+            target,
+            &self.t_ctx.resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        Ok(())
+    }
+
+    fn is_nonnull(&self, expression: &Expr) -> bool {
+        expression.is_nonnull(self.tables)
+    }
+
+    fn is_null_matching(&self, operator: turso_parser::ast::Operator, expression: &Expr) -> bool {
+        operator == turso_parser::ast::Operator::Is
+            && !crate::translate::plan::is_non_null_literal(expression)
+    }
+
+    fn affinity(&self, affinity: Affinity, expression: &Expr) -> Affinity {
+        if affinity.expr_needs_no_affinity_change(expression) {
+            Affinity::Blob
+        } else {
+            affinity
+        }
+    }
+
+    fn encode_index_keys(
+        &mut self,
+        program: &mut ProgramBuilder,
+        index: &Arc<Index>,
+        start_reg: usize,
+        num_keys: usize,
+        index_column_offset: usize,
+    ) -> Result<()> {
+        encode_seek_keys_for_custom_types(
+            program,
+            self.tables,
+            index,
+            start_reg,
+            num_keys,
+            index_column_offset,
+            &self.t_ctx.resolver,
+        )
+    }
+
+    fn rowid_affinity(&self) -> Affinity {
+        self.tables
+            .joined_tables()
+            .iter()
+            .find_map(|table| {
+                table
+                    .columns()
+                    .iter()
+                    .find(|column| column.is_rowid_alias())
+                    .map(|column| column.affinity())
+            })
+            .unwrap_or(Affinity::Numeric)
+    }
+}
+
 /// Seek-based loop setup.
 ///
 /// A seek loop has a real two-phase contract:
 /// 1. Emit and position using the start bound.
 /// 2. Emit the termination bound and anchor `loop_start`.
-pub(super) struct SeekEmitter<'a, 'plan> {
+pub(crate) struct SeekEmitter<'a, E, L> {
     program: &'a mut ProgramBuilder,
-    tables: &'a TableReferences,
-    seek_def: &'a SeekDef,
-    t_ctx: &'a mut TranslateCtx<'plan>,
+    seek_def: &'a SeekDef<E>,
+    lowering: L,
     seek_cursor_id: usize,
     start_reg: usize,
     loop_end: BranchOffset,
@@ -93,7 +196,7 @@ pub(super) struct SeekEmitter<'a, 'plan> {
     is_index: bool,
 }
 
-impl<'a, 'plan> SeekEmitter<'a, 'plan> {
+impl<'a, 'plan> SeekEmitter<'a, Expr, LegacySeekExpressionLowering<'a, 'plan>> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         program: &'a mut ProgramBuilder,
@@ -107,15 +210,49 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
     ) -> Self {
         Self {
             program,
-            tables,
             seek_def,
-            t_ctx,
+            lowering: LegacySeekExpressionLowering { tables, t_ctx },
             seek_cursor_id,
             start_reg,
             loop_end,
             seek_index,
             is_index: seek_index.is_some(),
         }
+    }
+}
+
+impl<'a, E, L: SeekExpressionLowering<E>> SeekEmitter<'a, E, L> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_lowering(
+        program: &'a mut ProgramBuilder,
+        seek_def: &'a SeekDef<E>,
+        lowering: L,
+        seek_cursor_id: usize,
+        start_reg: usize,
+        loop_end: BranchOffset,
+        seek_index: Option<&'a Arc<Index>>,
+    ) -> Self {
+        Self {
+            program,
+            seek_def,
+            lowering,
+            seek_cursor_id,
+            start_reg,
+            loop_end,
+            seek_index,
+            is_index: seek_index.is_some(),
+        }
+    }
+
+    fn is_null_matching_key_component(&self, position: usize) -> bool {
+        self.seek_def.prefix.get(position).is_some_and(|component| {
+            component
+                .eq
+                .as_ref()
+                .is_some_and(|(operator, expression, _)| {
+                    self.lowering.is_null_matching(*operator, expression)
+                })
+        })
     }
 
     /// Emit the start bound and position the cursor at the first candidate row.
@@ -170,21 +307,12 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             let reg = self.start_reg + i;
             match key {
                 SeekKeyComponent::Expr(expr) => {
-                    translate_expr_no_constant_opt(
-                        self.program,
-                        Some(self.tables),
-                        expr,
-                        reg,
-                        &self.t_ctx.resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
+                    self.lowering.emit_expression(self.program, expr, reg)?;
                     // A NULL key can never satisfy `=`, so the loop is done as
                     // soon as one shows up. `IS` matches NULL instead: keep the
                     // NULL in the seek register and let the index comparison
                     // find the rows whose key component is NULL.
-                    if !expr.is_nonnull(self.tables)
-                        && !self.seek_def.is_null_matching_key_component(i)
-                    {
+                    if !self.lowering.is_nonnull(expr) && !self.is_null_matching_key_component(i) {
                         self.program.emit_insn(Insn::IsNull {
                             reg,
                             target_pc: self.loop_end,
@@ -203,23 +331,17 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         // shortcut for the rest.
         let mut null_matching_bits = BitSet::default();
         for i in 0..num_regs {
-            if self.seek_def.is_null_matching_key_component(i) {
+            if self.is_null_matching_key_component(i) {
                 null_matching_bits.set(i)?;
             }
         }
         let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
-            encode_seek_keys_for_custom_types(
-                self.program,
-                self.tables,
-                idx,
-                self.start_reg,
-                num_regs,
-                0,
-                &self.t_ctx.resolver,
-            )?;
-            let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
+            self.lowering
+                .encode_index_keys(self.program, idx, self.start_reg, num_regs, 0)?;
+            let affinities =
+                index_seek_affinities(self.seek_def, &self.seek_def.start, &self.lowering);
             if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                 self.program.emit_insn(Insn::Affinity {
                     start_reg: self.start_reg,
@@ -328,25 +450,18 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let last_reg = self.start_reg + self.seek_def.prefix.len();
         match &self.seek_def.end.last_component {
             SeekKeyComponent::Expr(expr) => {
-                translate_expr_no_constant_opt(
-                    self.program,
-                    Some(self.tables),
-                    expr,
-                    last_reg,
-                    &self.t_ctx.resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
+                self.lowering
+                    .emit_expression(self.program, expr, last_reg)?;
                 if let Some(idx) = self.seek_index {
-                    encode_seek_keys_for_custom_types(
+                    self.lowering.encode_index_keys(
                         self.program,
-                        self.tables,
                         idx,
                         last_reg,
                         1,
                         self.seek_def.prefix.len(),
-                        &self.t_ctx.resolver,
                     )?;
-                    let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
+                    let affinities =
+                        index_seek_affinities(self.seek_def, &self.seek_def.end, &self.lowering);
                     if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                         self.program.emit_insn(Insn::Affinity {
                             start_reg: self.start_reg,
@@ -355,7 +470,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         });
                     }
                 }
-                if !expr.is_nonnull(self.tables) {
+                if !self.lowering.is_nonnull(expr) {
                     self.program.emit_insn(Insn::IsNull {
                         reg: last_reg,
                         target_pc: self.loop_end,
@@ -376,22 +491,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 dest: rowid_reg.unwrap(),
             });
 
-            affinity = if let Some(table_ref) = self
-                .tables
-                .joined_tables()
-                .iter()
-                .find(|t| t.columns().iter().any(|c| c.is_rowid_alias()))
-            {
-                if let Some(rowid_col_idx) =
-                    table_ref.columns().iter().position(|c| c.is_rowid_alias())
-                {
-                    Some(table_ref.columns()[rowid_col_idx].affinity())
-                } else {
-                    Some(Affinity::Numeric)
-                }
-            } else {
-                Some(Affinity::Numeric)
-            };
+            affinity = Some(self.lowering.rowid_affinity());
         }
 
         match (self.is_index, self.seek_def.end.op) {
@@ -459,7 +559,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         Ok(())
     }
 
-    pub(super) fn emit(mut self, loop_start: BranchOffset, use_bloom_filter: bool) -> Result<()> {
+    pub(crate) fn emit(mut self, loop_start: BranchOffset, use_bloom_filter: bool) -> Result<()> {
         self.emit_start_bound(use_bloom_filter)?;
         self.emit_termination(loop_start)
     }

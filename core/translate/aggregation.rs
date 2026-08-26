@@ -1,16 +1,61 @@
 use turso_parser::ast;
 
 use crate::{
-    function::{AccumulatorFunc, AggFunc},
+    function::{AccumulatorFunc, AggFunc, Func},
     schema::Table,
     sync::Arc,
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{AggStepData, HashDistinctData, Insn},
+        insn::{AggStepData, CmpInsFlags, HashDistinctData, Insn},
     },
     LimboError, Result,
 };
+
+/// Emit the runtime range check shared by legacy and HIR percentile lowering.
+/// NULL is accepted here and propagated by aggregate finalization.
+pub(crate) fn emit_percentile_fraction_range_check(program: &mut ProgramBuilder, fraction: usize) {
+    // NULL skips the range check and propagates to a NULL result in finalize.
+    // Use one scratch register for both bounds: success falls through to `done`
+    // via `Le` on the upper bound; failure on either bound jumps to `bad: Halt`.
+    let done = program.allocate_label();
+    let bad = program.allocate_label();
+    let bound = program.alloc_register();
+    program.emit_insn(Insn::IsNull {
+        reg: fraction,
+        target_pc: done,
+    });
+    program.emit_insn(Insn::Real {
+        value: 0.0,
+        dest: bound,
+    });
+    program.emit_insn(Insn::Lt {
+        lhs: fraction,
+        rhs: bound,
+        target_pc: bad,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Real {
+        value: 1.0,
+        dest: bound,
+    });
+    program.emit_insn(Insn::Le {
+        lhs: fraction,
+        rhs: bound,
+        target_pc: done,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.preassign_label_to_next_insn(bad);
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: "percentile value is not between 0 and 1".to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(done);
+}
 
 use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
@@ -23,6 +68,7 @@ use super::{
         TableReferences,
     },
     result_row::emit_select_result,
+    semantic::hir::{self, HirDocument},
     subquery::emit_non_from_clause_subqueries_for_phase,
 };
 
@@ -271,6 +317,197 @@ pub enum AggArgumentSource<'a> {
     },
 }
 
+pub(crate) struct HirAggregateDistinct {
+    pub(crate) hash_table: usize,
+    pub(crate) collation: CollationSeq,
+    pub(crate) on_conflict: crate::vdbe::BranchOffset,
+}
+
+enum AggregationArguments<'a, 'resolver> {
+    Legacy {
+        source: AggArgumentSource<'a>,
+        referenced_tables: &'a TableReferences,
+        resolver: &'a Resolver<'resolver>,
+    },
+    Hir {
+        document: &'a HirDocument,
+        call: &'a hir::FunctionCall,
+        func: AggFunc,
+        distinct: Option<&'a HirAggregateDistinct>,
+    },
+}
+
+impl AggregationArguments<'_, '_> {
+    fn func(&self) -> &AggFunc {
+        match self {
+            Self::Legacy { source, .. } => source.agg_func(),
+            Self::Hir { func, .. } => func,
+        }
+    }
+
+    fn num_args(&self) -> usize {
+        match self {
+            Self::Legacy { source, .. } => source.num_args(),
+            Self::Hir { call, .. } => match &call.arguments {
+                hir::FunctionArguments::Star => 0,
+                hir::FunctionArguments::Expressions { values, .. } => values.len(),
+                hir::FunctionArguments::OrderedSet { direct, .. } => direct.len() + 1,
+            },
+        }
+    }
+
+    fn hir_argument(call: &hir::FunctionCall, index: usize) -> Option<&hir::Expr> {
+        match &call.arguments {
+            hir::FunctionArguments::Star => None,
+            hir::FunctionArguments::Expressions { values, .. } => values.get(index),
+            hir::FunctionArguments::OrderedSet { direct, order_by } => match index {
+                0 => Some(&order_by.expr),
+                _ => direct.get(index - 1),
+            },
+        }
+    }
+
+    fn translate(&self, program: &mut ProgramBuilder, index: usize) -> Result<usize> {
+        match self {
+            Self::Legacy {
+                source,
+                referenced_tables,
+                resolver,
+            } => source.translate(program, referenced_tables, resolver, index),
+            Self::Hir { document, call, .. } => {
+                let expression = Self::hir_argument(call, index).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "HIR aggregate argument {index} is outside its function arguments"
+                    ))
+                })?;
+                let register = program.alloc_register();
+                super::semantic_lowering::expr::translate_expr(
+                    program, document, expression, register,
+                )?;
+                Ok(register)
+            }
+        }
+    }
+
+    fn handle_distinct(&self, program: &mut ProgramBuilder, argument: usize) {
+        match self {
+            Self::Legacy { source, .. } => {
+                handle_distinct(program, source.distinctness(), argument)
+            }
+            Self::Hir {
+                distinct: Some(distinct),
+                ..
+            } => program.emit_insn(Insn::HashDistinct {
+                data: Box::new(HashDistinctData {
+                    hash_table_id: distinct.hash_table,
+                    key_start_reg: argument,
+                    num_keys: 1,
+                    collations: vec![distinct.collation],
+                    target_pc: distinct.on_conflict,
+                }),
+            }),
+            Self::Hir { distinct: None, .. } => {}
+        }
+    }
+
+    fn collation(&self, index: usize) -> CollationSeq {
+        match self {
+            Self::Legacy {
+                source,
+                referenced_tables,
+                resolver,
+            } => agg_arg_collation(referenced_tables, source.arg_at(index), resolver),
+            Self::Hir { call, .. } => match &call.arguments {
+                hir::FunctionArguments::Expressions { facts, .. } => facts
+                    .get(index)
+                    .and_then(|facts| facts.collation.as_ref())
+                    .map(|collation| *collation.value())
+                    .unwrap_or(CollationSeq::Binary),
+                hir::FunctionArguments::OrderedSet { order_by, .. } if index == 0 => order_by
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value())
+                    .unwrap_or(CollationSeq::Binary),
+                _ => CollationSeq::Binary,
+            },
+        }
+    }
+
+    fn comparator(&self, index: usize) -> Option<crate::vdbe::insn::SortComparatorType> {
+        match self {
+            Self::Legacy {
+                source,
+                referenced_tables,
+                resolver,
+            } => super::order_by::custom_type_comparator(
+                source.arg_at(index),
+                referenced_tables,
+                resolver.schema(),
+            ),
+            Self::Hir { call, .. } => match &call.arguments {
+                hir::FunctionArguments::Expressions { facts, .. } => {
+                    facts.get(index).and_then(|facts| {
+                        super::order_by::custom_type_comparator_from_type_fact(&facts.type_fact)
+                    })
+                }
+                hir::FunctionArguments::OrderedSet { order_by, .. } if index == 0 => {
+                    super::order_by::custom_type_comparator_from_type_fact(&order_by.type_fact)
+                }
+                _ => None,
+            },
+        }
+    }
+
+    fn translate_integer_one(&self, program: &mut ProgramBuilder) -> Result<usize> {
+        match self {
+            Self::Legacy {
+                referenced_tables,
+                resolver,
+                ..
+            } => {
+                let expression = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+                translate_const_arg(program, referenced_tables, resolver, &expression)
+            }
+            Self::Hir { .. } => {
+                let register = program.alloc_register();
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: register,
+                });
+                Ok(register)
+            }
+        }
+    }
+
+    fn translate_comma(&self, program: &mut ProgramBuilder) -> Result<usize> {
+        match self {
+            Self::Legacy {
+                referenced_tables,
+                resolver,
+                ..
+            } => {
+                let expression = ast::Expr::Literal(ast::Literal::String("\",\"".to_string()));
+                translate_const_arg(program, referenced_tables, resolver, &expression)
+            }
+            Self::Hir { .. } => {
+                let register = program.alloc_register();
+                program.emit_insn(Insn::String8 {
+                    value: ",".to_string(),
+                    dest: register,
+                });
+                Ok(register)
+            }
+        }
+    }
+
+    fn require_custom_types(&self) -> Result<()> {
+        match self {
+            Self::Legacy { resolver, .. } => resolver.require_custom_types("Array features"),
+            Self::Hir { .. } => Ok(()),
+        }
+    }
+}
+
 impl<'a> AggArgumentSource<'a> {
     pub fn new_from_registers(src_reg_start: usize, aggregate: &'a Aggregate) -> Self {
         Self::Register {
@@ -360,15 +597,76 @@ pub fn translate_aggregation_step(
     // `InitLoop::emit`. `None` for any other aggregate.
     fraction_reg: Option<usize>,
 ) -> Result<usize> {
+    emit_aggregation_step(
+        program,
+        AggregationArguments::Legacy {
+            source: agg_arg_source,
+            referenced_tables,
+            resolver,
+        },
+        target_register,
+        fraction_reg,
+    )
+}
+
+pub(crate) fn translate_hir_aggregation_step(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    call: &hir::FunctionCall,
+    target_register: usize,
+    distinct: Option<&HirAggregateDistinct>,
+    fraction_reg: Option<usize>,
+) -> Result<usize> {
+    if !call.arguments.order_terms().is_empty()
+        && !matches!(call.arguments, hir::FunctionArguments::OrderedSet { .. })
+    {
+        return Err(LimboError::InternalError(
+            "HIR aggregate argument ORDER BY is not lowered yet".to_string(),
+        ));
+    }
+    let func = hir_aggregate_function(call)?;
+    emit_aggregation_step(
+        program,
+        AggregationArguments::Hir {
+            document,
+            call,
+            func,
+            distinct,
+        },
+        target_register,
+        fraction_reg,
+    )
+}
+
+pub(crate) fn hir_aggregate_function(call: &hir::FunctionCall) -> Result<AggFunc> {
+    Ok(match call.function.value() {
+        Func::Agg(func) => func.clone(),
+        Func::External(external) if external.func.is_aggregate() => {
+            AggFunc::External(external.func.clone().into())
+        }
+        function => {
+            return Err(LimboError::InternalError(format!(
+                "HIR aggregate identity belongs to non-aggregate function {function}"
+            )))
+        }
+    })
+}
+
+fn emit_aggregation_step(
+    program: &mut ProgramBuilder,
+    agg_arg_source: AggregationArguments<'_, '_>,
+    target_register: usize,
+    fraction_reg: Option<usize>,
+) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
-    let func = agg_arg_source.agg_func();
+    let func = agg_arg_source.func();
     let dest = match func {
         AggFunc::Avg => {
             if num_args != 1 {
                 crate::bail_parse_error!("avg bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -382,9 +680,8 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::Count0 => {
-            let expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
-            let expr_reg = translate_const_arg(program, referenced_tables, resolver, &expr)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr_reg = agg_arg_source.translate_integer_one(program)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -401,8 +698,8 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("count bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -421,15 +718,13 @@ pub fn translate_aggregation_step(
             }
 
             let delimiter_reg = if num_args == 2 {
-                agg_arg_source.translate(program, referenced_tables, resolver, 1)?
+                agg_arg_source.translate(program, 1)?
             } else {
-                let delimiter_expr =
-                    ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
-                translate_const_arg(program, referenced_tables, resolver, &delimiter_expr)?
+                agg_arg_source.translate_comma(program)?
             };
 
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
@@ -448,12 +743,10 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("max bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
-            let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
+            let arg_collation = agg_arg_source.collation(0);
+            let comparator = agg_arg_source.comparator(0);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -470,12 +763,10 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("min bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
-            let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
+            let arg_collation = agg_arg_source.collation(0);
+            let comparator = agg_arg_source.comparator(0);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -493,9 +784,9 @@ pub fn translate_aggregation_step(
             if num_args != 2 {
                 crate::bail_parse_error!("max bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
-            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
+            let value_reg = agg_arg_source.translate(program, 1)?;
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
@@ -514,8 +805,8 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("max bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -533,9 +824,8 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("string_agg bad number of arguments");
             }
 
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            let delimiter_reg =
-                agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            let delimiter_reg = agg_arg_source.translate(program, 1)?;
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
@@ -554,8 +844,8 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("sum bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -572,8 +862,8 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("total bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -587,12 +877,12 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::ArrayAgg => {
-            resolver.require_custom_types("Array features")?;
+            agg_arg_source.require_custom_types()?;
             if num_args != 1 {
                 crate::bail_parse_error!("array_agg bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr_reg = agg_arg_source.translate(program, 0)?;
+            agg_arg_source.handle_distinct(program, expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -610,10 +900,9 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("mode bad number of arguments");
             }
-            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let value_reg = agg_arg_source.translate(program, 0)?;
             // Activate the value's collation so finalize can sort text correctly.
-            let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = agg_arg_source.collation(0);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -634,11 +923,10 @@ pub fn translate_aggregation_step(
             if num_args != 2 {
                 crate::bail_parse_error!("percentile bad number of arguments");
             }
-            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let value_reg = agg_arg_source.translate(program, 0)?;
             let fraction_reg =
                 fraction_reg.expect("percentile fraction register must be set by InitLoop::emit");
-            let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = agg_arg_source.collation(0);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -666,15 +954,15 @@ pub fn translate_aggregation_step(
             let expr_reg = if argc == 0 {
                 0
             } else {
-                agg_arg_source.translate(program, referenced_tables, resolver, 0)?
+                agg_arg_source.translate(program, 0)?
             };
             for i in 0..argc {
                 if i != 0 {
-                    let _ = agg_arg_source.translate(program, referenced_tables, resolver, i)?;
+                    let _ = agg_arg_source.translate(program, i)?;
                 }
                 // invariant: distinct aggregates are only supported for single-argument functions
                 if argc == 1 {
-                    handle_distinct(program, agg_arg_source.distinctness(), expr_reg + i);
+                    agg_arg_source.handle_distinct(program, expr_reg + i);
                 }
             }
             program.emit_insn(Insn::AggStep {

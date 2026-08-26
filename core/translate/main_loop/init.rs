@@ -135,11 +135,7 @@ impl InitLoop {
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {
-                    let lj_metadata = LeftJoinMetadata {
-                        reg_match_flag: program.alloc_register(),
-                        label_match_flag_set_true: program.allocate_label(),
-                        label_match_flag_check_value: program.allocate_label(),
-                    };
+                    let lj_metadata = LeftJoinMetadata::new(program);
                     t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
                 }
                 if join_info.is_semi_or_anti() {
@@ -572,46 +568,7 @@ fn emit_percentile_fraction_check(
     let fraction_reg = program.alloc_register();
     translate_expr(program, Some(tables), &agg.args[1], fraction_reg, resolver)?;
 
-    // NULL skips the range check and propagates to a NULL result in finalize.
-    // Use one scratch register for both bounds: success falls through to `done`
-    // via `Le` on the upper bound; failure on either bound jumps to `bad: Halt`.
-    let done = program.allocate_label();
-    let bad = program.allocate_label();
-    let bound_reg = program.alloc_register();
-    program.emit_insn(Insn::IsNull {
-        reg: fraction_reg,
-        target_pc: done,
-    });
-    program.emit_insn(Insn::Real {
-        value: 0.0,
-        dest: bound_reg,
-    });
-    program.emit_insn(Insn::Lt {
-        lhs: fraction_reg,
-        rhs: bound_reg,
-        target_pc: bad,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.emit_insn(Insn::Real {
-        value: 1.0,
-        dest: bound_reg,
-    });
-    program.emit_insn(Insn::Le {
-        lhs: fraction_reg,
-        rhs: bound_reg,
-        target_pc: done,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.preassign_label_to_next_insn(bad);
-    program.emit_insn(Insn::Halt {
-        err_code: crate::error::SQLITE_ERROR,
-        description: "percentile value is not between 0 and 1".to_string(),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(done);
+    crate::translate::aggregation::emit_percentile_fraction_range_check(program, fraction_reg);
     agg.fraction_reg = Some(fraction_reg);
     Ok(())
 }

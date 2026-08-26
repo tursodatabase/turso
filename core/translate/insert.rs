@@ -689,10 +689,21 @@ pub fn translate_insert(
                         ctx.table.name
                     ))
                 })?;
-            crate::translate::sequence::emit_disk_advance_past(
-                program,
+            let backing_table = crate::translate::sequence::resolve_sequence_backing_table(
                 resolver,
                 ctx.database_id,
+                &seq_name,
+            )?;
+            let sqlite_sequence = crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+                resolver,
+                ctx.database_id,
+                &seq_name,
+            );
+            crate::translate::sequence::emit_disk_advance_past(
+                program,
+                ctx.database_id,
+                backing_table,
+                sqlite_sequence,
                 &seq_name,
                 &seq,
                 insertion.key_register(),
@@ -1483,10 +1494,21 @@ fn emit_rowid_generation(
                     ctx.table.name
                 ))
             })?;
-        crate::translate::sequence::emit_disk_read_nextval(
-            program,
+        let backing_table = crate::translate::sequence::resolve_sequence_backing_table(
             resolver,
             ctx.database_id,
+            &seq_name,
+        )?;
+        let sqlite_sequence = crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+            resolver,
+            ctx.database_id,
+            &seq_name,
+        );
+        crate::translate::sequence::emit_disk_read_nextval(
+            program,
+            ctx.database_id,
+            backing_table,
+            sqlite_sequence,
             &seq_name,
             &seq,
             insertion.key_register(),

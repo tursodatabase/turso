@@ -68,6 +68,7 @@ use custom_types::*;
 use emission::*;
 #[allow(unused_imports)]
 use functions::*;
+pub(crate) use metadata::assert_register_range_allocated as assert_vector_register_range_allocated;
 #[allow(unused_imports)]
 use metadata::*;
 #[allow(unused_imports)]
@@ -100,6 +101,7 @@ pub(crate) use emission::{
     emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
     seed_returning_row_image_in_cache,
 };
+pub(crate) use metadata::emit_cond_jump;
 pub use metadata::ConditionMetadata;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,

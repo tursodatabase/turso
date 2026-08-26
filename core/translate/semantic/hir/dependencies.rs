@@ -61,7 +61,7 @@ impl HirDocument {
                 _ => {}
             },
             QueryPart::Expression(expression) => {
-                expression.walk(&mut |expression| {
+                expression.for_each(&mut |expression| {
                     let Expr::Subquery(subquery) = expression else {
                         return;
                     };
@@ -86,9 +86,8 @@ impl HirDocument {
     /// contribute their validated outer captures rather than their local
     /// sources.
     pub(crate) fn visit_expr_sources(&self, expression: &Expr, visit: &mut impl FnMut(SourceId)) {
-        expression.walk(&mut |expression| match expression {
+        expression.for_each(&mut |expression| match expression {
             Expr::Column(reference) => visit(reference.source),
-            Expr::MergedColumn(column) => visit(column.right.source),
             Expr::RowId(source) => visit(*source),
             Expr::Output(id) => {
                 let output = self
@@ -491,12 +490,9 @@ fn collect_source_argument_column_reads<'source>(
 }
 
 fn collect_expr_column_reads(expression: &Expr, reads: &mut ColumnUsageCollector) {
-    expression.walk(&mut |expression| match expression {
+    expression.for_each(&mut |expression| match expression {
         Expr::Column(reference) => {
             reads.record(*reference);
-        }
-        Expr::MergedColumn(column) => {
-            reads.record(column.right);
         }
         _ => {}
     });
@@ -589,14 +585,21 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
         Expr::Column(reference) => {
             references.insert(reference.source);
         }
-        Expr::MergedColumn(column) => {
-            collect_expr_references(&column.left, references);
-            references.insert(column.right.source);
-        }
+        Expr::MergedColumn(column) => match column.value {
+            MergedColumnValue::Left => collect_expr_references(&column.left, references),
+            MergedColumnValue::Right => collect_expr_references(&column.right, references),
+            MergedColumnValue::Coalesce => {
+                collect_expr_references(&column.left, references);
+                collect_expr_references(&column.right, references);
+            }
+        },
         Expr::RowId(source) => {
             references.insert(*source);
         }
-        Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::NotNull(expr) => {
+        Expr::Unary { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::TruthTest { expr, .. } => {
             collect_expr_references(expr, references);
         }
         Expr::Binary {

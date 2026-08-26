@@ -19,6 +19,9 @@ use crate::{
     LimboError, Result,
 };
 
+#[cfg(feature = "json")]
+use crate::function::JsonFunc;
+
 /// Clause rules that change expression name visibility.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExprPolicy {
@@ -590,14 +593,26 @@ impl FunctionInput {
                 distinctness,
                 values,
                 order_by,
-            } => hir::FunctionArguments::Expressions {
-                values: values.into_iter().map(|value| value.expr).collect(),
-                distinctness,
-                order_by: order_by
-                    .into_iter()
-                    .map(FunctionOrderTerm::into_hir)
-                    .collect(),
-            },
+            } => {
+                let mut expressions = Vec::with_capacity(values.len());
+                let mut facts = Vec::with_capacity(values.len());
+                for value in values {
+                    expressions.push(value.expr);
+                    facts.push(hir::FunctionArgumentFacts {
+                        type_fact: value.type_fact,
+                        collation: value.collation.value().cloned(),
+                    });
+                }
+                hir::FunctionArguments::Expressions {
+                    values: expressions,
+                    facts,
+                    distinctness,
+                    order_by: order_by
+                        .into_iter()
+                        .map(FunctionOrderTerm::into_hir)
+                        .collect(),
+                }
+            }
             Self::OrderedSet {
                 direct, order_by, ..
             } => hir::FunctionArguments::OrderedSet {
@@ -660,6 +675,218 @@ fn normalize_scalar_input(
         FunctionInput::OrderedSet { .. } => {
             unreachable!("ordered-set functions are aggregate functions")
         }
+    }
+}
+
+#[cfg(feature = "json")]
+fn validate_json_arguments(function: &JsonFunc, count: usize) -> Result<()> {
+    let require_exact = |expected| {
+        if count == 0 {
+            crate::bail_parse_error!("{} function with no arguments", function);
+        }
+        if count != expected {
+            crate::bail_parse_error!(
+                "{} function called with not exactly {} arguments",
+                function,
+                expected
+            );
+        }
+        Ok(())
+    };
+    let require_max = |maximum| {
+        if count == 0 {
+            crate::bail_parse_error!("{} function with no arguments", function);
+        }
+        if count > maximum {
+            crate::bail_parse_error!(
+                "{} function called with more than {} arguments",
+                function,
+                maximum
+            );
+        }
+        Ok(())
+    };
+
+    match function {
+        JsonFunc::Json | JsonFunc::Jsonb | JsonFunc::JsonValid | JsonFunc::JsonQuote => {
+            require_exact(1)
+        }
+        JsonFunc::JsonErrorPosition if count != 1 => {
+            crate::bail_parse_error!("{} function with not exactly 1 argument", function)
+        }
+        JsonFunc::JsonErrorPosition => Ok(()),
+        JsonFunc::JsonPatch | JsonFunc::JsonbPatch => require_exact(2),
+        JsonFunc::JsonArrayLength | JsonFunc::JsonType | JsonFunc::JsonPretty => require_max(2),
+        JsonFunc::JsonObject | JsonFunc::JsonbObject if count % 2 != 0 => {
+            crate::bail_parse_error!("{} function requires an even number of arguments", function)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn require_exact_arguments(function: &Func, count: usize, expected: usize) -> Result<()> {
+    if count == 0 {
+        crate::bail_parse_error!("{} function with no arguments", function);
+    }
+    if count != expected {
+        crate::bail_parse_error!(
+            "{} function called with not exactly {} arguments",
+            function,
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn require_at_most_arguments(function: &Func, count: usize, maximum: usize) -> Result<()> {
+    if count == 0 {
+        crate::bail_parse_error!("{} function with no arguments", function);
+    }
+    if count > maximum {
+        crate::bail_parse_error!(
+            "{} function called with more than {} arguments",
+            function,
+            maximum
+        );
+    }
+    Ok(())
+}
+
+fn require_at_least_arguments(function: &Func, count: usize, minimum: usize) -> Result<()> {
+    if count == 0 {
+        crate::bail_parse_error!("{} function with no arguments", function);
+    }
+    if count < minimum {
+        crate::bail_parse_error!("{} function with less than {} arguments", function, minimum);
+    }
+    Ok(())
+}
+
+fn validate_likelihood_arguments(input: &FunctionInput) -> Result<()> {
+    if input.argument_count() != 2 {
+        crate::bail_parse_error!("likelihood() function must have exactly 2 arguments");
+    }
+    let hir::Expr::Literal(ast::Literal::Numeric(value)) = &input.facts()[1].expr else {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0"
+        );
+    };
+    let Ok(probability) = value.parse::<f64>() else {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a floating point constant"
+        );
+    };
+    if !(0.0..=1.0).contains(&probability) {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0"
+        );
+    }
+    if !value.contains('.') {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a floating point number with decimal point"
+        );
+    }
+    Ok(())
+}
+
+fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
+    let count = input.argument_count();
+    match function {
+        Func::Scalar(
+            ScalarFunc::Abs
+            | ScalarFunc::Lower
+            | ScalarFunc::Upper
+            | ScalarFunc::Length
+            | ScalarFunc::OctetLength
+            | ScalarFunc::Typeof
+            | ScalarFunc::Unicode
+            | ScalarFunc::Unistr
+            | ScalarFunc::UnistrQuote
+            | ScalarFunc::Quote
+            | ScalarFunc::RandomBlob
+            | ScalarFunc::Sign
+            | ScalarFunc::Soundex
+            | ScalarFunc::ZeroBlob
+            | ScalarFunc::SequenceWatermark,
+        ) => require_exact_arguments(function, count, 1),
+        Func::Scalar(ScalarFunc::Hex) if count != 1 => {
+            crate::bail_parse_error!("hex function must have exactly 1 argument")
+        }
+        Func::Scalar(ScalarFunc::Instr) if count != 2 => {
+            crate::bail_parse_error!("{} function must have two argument", function)
+        }
+        Func::Scalar(ScalarFunc::Replace) if count != 3 => {
+            crate::bail_parse_error!("wrong number of arguments to function {}()", function)
+        }
+        Func::Scalar(ScalarFunc::IfNull) if count != 2 => {
+            crate::bail_parse_error!("{} function requires exactly 2 arguments", function)
+        }
+        Func::Scalar(ScalarFunc::Iif | ScalarFunc::Coalesce) => {
+            require_at_least_arguments(function, count, 2)
+        }
+        Func::Scalar(ScalarFunc::Like | ScalarFunc::Glob) if count < 2 => {
+            crate::bail_parse_error!("{} function with less than 2 arguments", function)
+        }
+        Func::Scalar(ScalarFunc::Likely) if count != 1 => {
+            crate::bail_parse_error!("likely function must have exactly 1 argument")
+        }
+        Func::Scalar(ScalarFunc::Unlikely) if count != 1 => {
+            crate::bail_parse_error!("Unlikely function must have exactly 1 argument")
+        }
+        Func::Scalar(ScalarFunc::Likelihood) => validate_likelihood_arguments(input),
+        Func::Scalar(ScalarFunc::TableColumnsJsonArray) if count != 1 => {
+            crate::bail_parse_error!(
+                "table_columns_json_array() function must have exactly 1 argument"
+            )
+        }
+        Func::Scalar(ScalarFunc::BinRecordJsonObject) if count != 2 => {
+            crate::bail_parse_error!(
+                "bin_record_json_object() function must have exactly 2 arguments"
+            )
+        }
+        Func::Scalar(ScalarFunc::Attach) => {
+            crate::bail_parse_error!(
+                "ATTACH should be handled at statement level, not as expression"
+            )
+        }
+        Func::Scalar(ScalarFunc::Detach) => {
+            crate::bail_parse_error!(
+                "DETACH should be handled at statement level, not as expression"
+            )
+        }
+        Func::Scalar(ScalarFunc::StatInit | ScalarFunc::StatPush | ScalarFunc::StatGet) => {
+            crate::bail_parse_error!("{} is an internal function used by ANALYZE", function)
+        }
+        Func::Scalar(ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit) => {
+            crate::bail_parse_error!("{} is an internal function used by CDC", function)
+        }
+        Func::Scalar(
+            ScalarFunc::Trim
+            | ScalarFunc::LTrim
+            | ScalarFunc::RTrim
+            | ScalarFunc::Round
+            | ScalarFunc::Unhex,
+        ) => require_at_most_arguments(function, count, 2),
+        Func::Scalar(ScalarFunc::Changes | ScalarFunc::TotalChanges) if count != 0 => {
+            crate::bail_parse_error!("{} function with more than 0 arguments", function)
+        }
+        Func::Scalar(ScalarFunc::Random) if count != 0 => {
+            crate::bail_parse_error!("{} function with arguments", function)
+        }
+        Func::Scalar(
+            ScalarFunc::SqliteVersion | ScalarFunc::TursoVersion | ScalarFunc::SqliteSourceId,
+        ) if count != 0 => {
+            crate::bail_parse_error!("sqlite_version function with arguments")
+        }
+        #[cfg(feature = "test_helper")]
+        Func::Scalar(ScalarFunc::TestNondetCounter) if count != 0 => {
+            crate::bail_parse_error!("{} function with arguments", function)
+        }
+        #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+        Func::Scalar(ScalarFunc::LoadExtension) => require_exact_arguments(function, count, 1),
+        #[cfg(feature = "json")]
+        Func::Json(function) => validate_json_arguments(function, count),
+        _ => Ok(()),
     }
 }
 
@@ -1725,6 +1952,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 operator == ast::Operator::Is,
             ));
         }
+        if matches!(operator, ast::Operator::Is | ast::Operator::IsNot) {
+            if let Some(is_true) = truth_test_rhs(rhs_syntax) {
+                let collation = expression_operands_collation([&lhs, &rhs]);
+                return Ok(truth_test_expr(
+                    take_scalar_operand(lhs)?,
+                    is_true,
+                    operator == ast::Operator::IsNot,
+                    collation,
+                ));
+            }
+        }
         if lhs.components.len() != rhs.components.len()
             || lhs.components.len() > 1 && !supports_row_value_binary_comparison(operator)
         {
@@ -1972,7 +2210,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 self.resolve_atomic_expr(
                     hir::Expr::Parameter(hir::Parameter {
                         index: variable.index,
-                        name: variable.name.as_deref().map(str::to_owned),
+                        spelling: match variable.name.as_deref() {
+                            Some(name) => {
+                                crate::parameters::ParameterSpelling::Named(name.to_owned())
+                            }
+                            None if variable.numbered => {
+                                crate::parameters::ParameterSpelling::Numbered
+                            }
+                            None => crate::parameters::ParameterSpelling::Anonymous,
+                        },
                         type_fact: hir::TypeFact::dynamic(),
                     }),
                     scope,
@@ -2468,6 +2714,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         } else {
             (input, filter)
         };
+        if matches!(binding, FunctionBinding::Scalar) {
+            validate_scalar_arguments(&function, &input)?;
+        }
         let special_operation =
             match self.resolve_custom_type_operation(&function, &input, expected_type)? {
                 Some((operation, result_type)) => {
@@ -3492,6 +3741,37 @@ fn null_test_expr(inner: ResolvedScopeExpr, is_null: bool) -> ResolvedScopeExpr 
     )
 }
 
+/// Return TRUE/FALSE only when SQLite treats this syntax as a truth-test
+/// keyword. Parentheses and COLLATE do not block recognition; unary `+` does.
+fn truth_test_rhs(expression: &ast::Expr) -> Option<bool> {
+    match expression {
+        ast::Expr::Literal(ast::Literal::True) => Some(true),
+        ast::Expr::Literal(ast::Literal::False) => Some(false),
+        ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+            truth_test_rhs(&expressions[0])
+        }
+        ast::Expr::Collate(inner, _) => truth_test_rhs(inner),
+        _ => None,
+    }
+}
+
+fn truth_test_expr(
+    inner: ResolvedScopeExpr,
+    is_true: bool,
+    negated: bool,
+    collation: ExprCollation,
+) -> ResolvedScopeExpr {
+    computed_expr(
+        hir::Expr::TruthTest {
+            expr: Box::new(inner.expr),
+            is_true,
+            negated,
+        },
+        hir::TypeFact::known(Type::Integer),
+        collation,
+    )
+}
+
 fn computed_expr(
     expr: hir::Expr,
     type_fact: hir::TypeFact,
@@ -3818,7 +4098,7 @@ fn nested_function_iter<'a>(
 
 fn nested_function_in_expr(expression: &hir::Expr) -> Option<NestedFunction> {
     let mut nested = None;
-    expression.walk(&mut |expression| {
+    expression.for_each(&mut |expression| {
         if nested.is_some() {
             return;
         }
@@ -4278,6 +4558,48 @@ mod tests {
     }
 
     #[test]
+    fn is_true_and_false_become_explicit_hir_truth_tests() {
+        for (sql, expected_is_true, expected_negated) in [
+            ("SELECT 2 IS TRUE", true, false),
+            ("SELECT 2 IS FALSE", false, false),
+            ("SELECT 2 IS NOT TRUE", true, true),
+            ("SELECT 2 IS NOT FALSE", false, true),
+            ("SELECT 2 IS (TRUE)", true, false),
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("truth test binds");
+            assert!(matches!(
+                analyzed,
+                Expr::TruthTest {
+                    expr,
+                    is_true,
+                    negated,
+                } if matches!(*expr, Expr::Literal(ast::Literal::Numeric(ref value)) if value == "2")
+                    && is_true == expected_is_true
+                    && negated == expected_negated
+            ));
+        }
+
+        let unary_true = analyze_expression(
+            &expression("SELECT 2 IS +TRUE"),
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect("unary plus blocks truth-test recognition");
+        assert!(matches!(
+            unary_true,
+            Expr::Binary {
+                operator: ast::Operator::Is,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn identifier_forms_become_hir_column_references() {
         let source = source();
         let mut scope = Scope::default();
@@ -4360,6 +4682,440 @@ mod tests {
             error.to_string(),
             "Parse error: misuse of aggregate function sum()"
         );
+    }
+
+    #[test]
+    fn statement_and_internal_functions_are_rejected_during_semantic_analysis() {
+        let input = FunctionInput::Expressions {
+            distinctness: None,
+            values: ExprChildren::new(),
+            order_by: Vec::new(),
+        };
+        for (function, expected) in [
+            (
+                ScalarFunc::Attach,
+                "ATTACH should be handled at statement level, not as expression",
+            ),
+            (
+                ScalarFunc::Detach,
+                "DETACH should be handled at statement level, not as expression",
+            ),
+            (
+                ScalarFunc::StatInit,
+                "stat_init is an internal function used by ANALYZE",
+            ),
+            (
+                ScalarFunc::StatPush,
+                "stat_push is an internal function used by ANALYZE",
+            ),
+            (
+                ScalarFunc::StatGet,
+                "stat_get is an internal function used by ANALYZE",
+            ),
+            (
+                ScalarFunc::ConnTxnId,
+                "conn_txn_id is an internal function used by CDC",
+            ),
+            (
+                ScalarFunc::IsAutocommit,
+                "is_autocommit is an internal function used by CDC",
+            ),
+        ] {
+            let error = validate_scalar_arguments(&Func::Scalar(function), &input)
+                .expect_err("statement-only or internal function is rejected");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
+
+        for (sql, expected) in [
+            (
+                "SELECT conn_txn_id()",
+                "Parse error: conn_txn_id is an internal function used by CDC",
+            ),
+            (
+                "SELECT is_autocommit()",
+                "Parse error: is_autocommit is an internal function used by CDC",
+            ),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("publicly resolvable internal function is rejected");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn fixed_unary_argument_rules_are_checked_during_semantic_analysis() {
+        for function in [
+            "abs",
+            "lower",
+            "upper",
+            "length",
+            "octet_length",
+            "typeof",
+            "unicode",
+            "unistr",
+            "unistr_quote",
+            "quote",
+            "randomblob",
+            "sign",
+            "soundex",
+            "zeroblob",
+            "sequence_watermark_experimental",
+        ] {
+            for (arguments, expected) in [
+                ("", format!("{function} function with no arguments")),
+                (
+                    "1, 2",
+                    format!("{function} function called with not exactly 1 arguments"),
+                ),
+            ] {
+                let error = analyze_expression(
+                    &expression(&format!("SELECT {function}({arguments})")),
+                    &Scope::default(),
+                    ExprPolicy::select(DoubleQuotedDml::Enabled),
+                )
+                .expect_err("invalid unary call fails during semantic analysis");
+                assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+            }
+        }
+
+        let analyzed = analyze_expression(
+            &expression("SELECT abs(1)"),
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect("valid unary call binds");
+        assert!(matches!(analyzed, Expr::Function(_)));
+    }
+
+    #[test]
+    fn fixed_ordinary_argument_rules_are_checked_during_semantic_analysis() {
+        for (sql, expected) in [
+            (
+                "SELECT timediff()",
+                "wrong number of arguments to function timediff()",
+            ),
+            (
+                "SELECT timediff(1)",
+                "wrong number of arguments to function timediff()",
+            ),
+            ("SELECT hex()", "hex function must have exactly 1 argument"),
+            ("SELECT nullif(1)", "no such function: nullif"),
+            (
+                "SELECT instr(1, 2, 3)",
+                "instr function must have two argument",
+            ),
+            (
+                "SELECT replace(1, 2)",
+                "wrong number of arguments to function replace()",
+            ),
+            (
+                "SELECT ifnull()",
+                "ifnull function requires exactly 2 arguments",
+            ),
+            (
+                "SELECT ifnull(1)",
+                "ifnull function requires exactly 2 arguments",
+            ),
+            (
+                "SELECT ifnull(1, 2, 3)",
+                "ifnull function requires exactly 2 arguments",
+            ),
+            (
+                "SELECT table_columns_json_array()",
+                "table_columns_json_array() function must have exactly 1 argument",
+            ),
+            (
+                "SELECT table_columns_json_array(1, 2)",
+                "table_columns_json_array() function must have exactly 1 argument",
+            ),
+            (
+                "SELECT bin_record_json_object(1)",
+                "bin_record_json_object() function must have exactly 2 arguments",
+            ),
+            (
+                "SELECT bin_record_json_object(1, 2, 3)",
+                "bin_record_json_object() function must have exactly 2 arguments",
+            ),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid fixed-arity call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
+
+        for sql in [
+            "SELECT timediff(1, 2)",
+            "SELECT hex(1)",
+            "SELECT nullif(1, 2)",
+            "SELECT instr(1, 2)",
+            "SELECT replace(1, 2, 3)",
+            "SELECT ifnull(1, 2)",
+            "SELECT table_columns_json_array(1)",
+            "SELECT bin_record_json_object(1, 2)",
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid fixed-arity call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+    }
+
+    #[test]
+    fn minimum_argument_rules_are_checked_during_semantic_analysis() {
+        for (sql, expected) in [
+            ("SELECT iif()", "iif function with no arguments"),
+            ("SELECT iif(1)", "iif function with less than 2 arguments"),
+            ("SELECT coalesce()", "coalesce function with no arguments"),
+            (
+                "SELECT coalesce(1)",
+                "coalesce function with less than 2 arguments",
+            ),
+            ("SELECT like()", "like function with less than 2 arguments"),
+            ("SELECT like(1)", "like function with less than 2 arguments"),
+            ("SELECT glob()", "glob function with less than 2 arguments"),
+            ("SELECT glob(1)", "glob function with less than 2 arguments"),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid minimum-arity call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
+
+        for sql in [
+            "SELECT iif(1, 2)",
+            "SELECT iif(1, 2, 3)",
+            "SELECT coalesce(1, 2)",
+            "SELECT coalesce(1, 2, 3)",
+            "SELECT like(1, 2)",
+            "SELECT like(1, 2, 3)",
+            "SELECT glob(1, 2)",
+            "SELECT glob(1, 2, 3)",
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid minimum-arity call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+    }
+
+    #[test]
+    fn planner_hint_rules_are_checked_during_semantic_analysis() {
+        for (sql, expected) in [
+            (
+                "SELECT likely()",
+                "likely function must have exactly 1 argument",
+            ),
+            (
+                "SELECT likely(1, 2)",
+                "likely function must have exactly 1 argument",
+            ),
+            (
+                "SELECT unlikely()",
+                "Unlikely function must have exactly 1 argument",
+            ),
+            (
+                "SELECT unlikely(1, 2)",
+                "Unlikely function must have exactly 1 argument",
+            ),
+            (
+                "SELECT likelihood(1)",
+                "likelihood() function must have exactly 2 arguments",
+            ),
+            (
+                "SELECT likelihood(1, 0.5, 2)",
+                "likelihood() function must have exactly 2 arguments",
+            ),
+            (
+                "SELECT likelihood(1, 0)",
+                "second argument to likelihood() must be a floating point number with decimal point",
+            ),
+            (
+                "SELECT likelihood(1, 1.5)",
+                "second argument to likelihood() must be a constant between 0.0 and 1.0",
+            ),
+            (
+                "SELECT likelihood(1, '0.5')",
+                "second argument to likelihood() must be a constant between 0.0 and 1.0",
+            ),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid planner hint fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
+
+        for sql in [
+            "SELECT likely(1)",
+            "SELECT unlikely(1)",
+            "SELECT likelihood(1, 0.5)",
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid planner hint binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+    }
+
+    #[test]
+    fn one_or_two_argument_rules_are_checked_during_semantic_analysis() {
+        for function in ["trim", "ltrim", "rtrim", "round", "unhex"] {
+            for (arguments, expected) in [
+                ("", format!("{function} function with no arguments")),
+                (
+                    "1, 2, 3",
+                    format!("{function} function called with more than 2 arguments"),
+                ),
+            ] {
+                let error = analyze_expression(
+                    &expression(&format!("SELECT {function}({arguments})")),
+                    &Scope::default(),
+                    ExprPolicy::select(DoubleQuotedDml::Enabled),
+                )
+                .expect_err("invalid one-or-two argument call fails during semantic analysis");
+                assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+            }
+
+            for arguments in ["1", "1, 2"] {
+                let analyzed = analyze_expression(
+                    &expression(&format!("SELECT {function}({arguments})")),
+                    &Scope::default(),
+                    ExprPolicy::select(DoubleQuotedDml::Enabled),
+                )
+                .expect("valid one-or-two argument call binds");
+                assert!(matches!(analyzed, Expr::Function(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn nullary_argument_rules_are_checked_during_semantic_analysis() {
+        for (function, expected) in [
+            ("changes", "changes function with more than 0 arguments"),
+            (
+                "total_changes",
+                "total_changes function with more than 0 arguments",
+            ),
+            ("random", "random function with arguments"),
+            ("sqlite_version", "sqlite_version function with arguments"),
+            ("turso_version", "sqlite_version function with arguments"),
+            ("sqlite_source_id", "sqlite_version function with arguments"),
+        ] {
+            let error = analyze_expression(
+                &expression(&format!("SELECT {function}(1)")),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid nullary call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+
+            let analyzed = analyze_expression(
+                &expression(&format!("SELECT {function}()")),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid nullary call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+
+        #[cfg(feature = "test_helper")]
+        {
+            let error = analyze_expression(
+                &expression("SELECT test_nondet_counter(1)"),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("test counter rejects arguments during semantic analysis");
+            assert_eq!(
+                error.to_string(),
+                "Parse error: test_nondet_counter function with arguments"
+            );
+
+            let analyzed = analyze_expression(
+                &expression("SELECT test_nondet_counter()"),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("nullary test counter binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_argument_rules_are_checked_during_semantic_analysis() {
+        for sql in [
+            "SELECT json_object()",
+            "SELECT json_object('key', 1)",
+            "SELECT json_pretty('{}')",
+            "SELECT json_pretty('{}', '  ')",
+            "SELECT json_array()",
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid JSON call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+
+        for (sql, expected) in [
+            ("SELECT json()", "json function with no arguments"),
+            (
+                "SELECT json(1, 2)",
+                "json function called with not exactly 1 arguments",
+            ),
+            (
+                "SELECT json_error_position()",
+                "json_error_position function with not exactly 1 argument",
+            ),
+            (
+                "SELECT json_patch(1)",
+                "json_patch function called with not exactly 2 arguments",
+            ),
+            (
+                "SELECT json_array_length()",
+                "json_array_length function with no arguments",
+            ),
+            (
+                "SELECT json_pretty(1, 2, 3)",
+                "json_pretty function called with more than 2 arguments",
+            ),
+            (
+                "SELECT json_object('key')",
+                "json_object function requires an even number of arguments",
+            ),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid JSON call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
     }
 
     #[test]

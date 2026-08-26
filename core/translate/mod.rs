@@ -37,6 +37,7 @@ pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod semantic;
+pub(crate) mod semantic_lowering;
 pub(crate) mod semantic_to_plan;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;

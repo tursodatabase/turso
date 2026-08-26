@@ -848,9 +848,10 @@ fn hir_partial_index_predicate_terms(
         |term: &HirWhereTerm| !full_join && (!outer_join || term.from_outer_join == Some(source));
     let mut matched_terms = SmallVec::new();
     for index_conjunct in predicate.conjuncts() {
-        let (term_position, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && index_conjunct.equivalent_for_index(&term.expr)
-        })?;
+        let (term_position, _) = query_where_clause
+            .iter()
+            .enumerate()
+            .find(|(_, term)| can_use_query_term(term) && index_conjunct.equivalent(&term.expr))?;
         if !matched_terms.contains(&term_position) {
             matched_terms.push(term_position);
         }
@@ -1130,6 +1131,14 @@ pub(crate) fn hir_constraints_for_source(
     };
     let mut candidates = Vec::new();
     for expressions in &source_definition.index_expressions {
+        if matches!(source_definition.index_hint, hir::IndexHint::NotIndexed)
+            || matches!(
+                &source_definition.index_hint,
+                hir::IndexHint::Indexed(index) if index != &expressions.index
+            )
+        {
+            continue;
+        }
         let index = expressions.index.value();
         if index.index_method.is_some() {
             continue;
@@ -1171,11 +1180,13 @@ pub(crate) fn hir_constraints_for_source(
         candidates,
         temporary_index_terms: SmallVec::new(),
     };
-    table_constraints.candidates.push(ConstraintUseCandidate {
-        index: None,
-        refs: Vec::new(),
-        partial_index: None,
-    });
+    if !matches!(source_definition.index_hint, hir::IndexHint::Indexed(_)) {
+        table_constraints.candidates.push(ConstraintUseCandidate {
+            index: None,
+            refs: Vec::new(),
+            partial_index: None,
+        });
+    }
 
     let rowid_alias_column = table
         .table
@@ -1200,18 +1211,18 @@ pub(crate) fn hir_constraints_for_source(
         if constraint.is_rowid
             || rowid_alias_column.is_some_and(|position| constraint.table_col_pos == Some(position))
         {
-            table_constraints
+            if let Some(candidate) = table_constraints
                 .candidates
                 .iter_mut()
                 .find(|candidate| candidate.index.is_none())
-                .expect("HIR table constraints contain a rowid candidate")
-                .refs
-                .push(ConstraintRef {
+            {
+                candidate.refs.push(ConstraintRef {
                     constraint_vec_pos: constraint_position,
                     index_col_pos: 0,
                     sort_order: SortOrder::Asc,
                     nulls_order: ast::NullsOrder::First,
                 });
+            }
         }
 
         for candidate in table_constraints
@@ -1237,9 +1248,9 @@ pub(crate) fn hir_constraints_for_source(
                     };
                     let constrained_expr = hir_constrained_expr(constraint, where_clause)?;
                     expressions.columns.iter().position(|indexed_expr| {
-                        indexed_expr.as_ref().is_some_and(|indexed_expr| {
-                            constrained_expr.equivalent_for_index(indexed_expr)
-                        })
+                        indexed_expr
+                            .as_ref()
+                            .is_some_and(|indexed_expr| constrained_expr.equivalent(indexed_expr))
                     })
                 }
                 None => None,

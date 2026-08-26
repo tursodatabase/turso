@@ -12,7 +12,7 @@ use super::{
         walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
-    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    main_loop::{InSeekLoop, LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
     order_by::SortMetadata,
     plan::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
@@ -1044,16 +1044,8 @@ pub struct TranslateCtx<'a> {
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
     /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
-    pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
+    pub meta_in_seeks: Vec<Option<InSeekLoop>>,
     pub unsafe_testing: bool,
-}
-
-/// Metadata for the two-level loop emitted by `Search::InSeek`.
-#[derive(Debug)]
-pub struct InSeekMetadata {
-    pub ephemeral_cursor_id: CursorID,
-    pub outer_loop_start: BranchOffset,
-    pub next_val_label: BranchOffset,
 }
 
 impl<'a> TranslateCtx<'a> {
@@ -1340,10 +1332,21 @@ fn emit_cdc_change_id(
                 "missing implicit AUTOINCREMENT sequence for CDC table \"{cdc_table}\""
             ))
         })?;
-    crate::translate::sequence::emit_disk_read_nextval(
-        program,
+    let backing_table = crate::translate::sequence::resolve_sequence_backing_table(
         resolver,
         crate::MAIN_DB_ID,
+        &seq_name,
+    )?;
+    let sqlite_sequence = crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+        resolver,
+        crate::MAIN_DB_ID,
+        &seq_name,
+    );
+    crate::translate::sequence::emit_disk_read_nextval(
+        program,
+        crate::MAIN_DB_ID,
+        backing_table,
+        sqlite_sequence,
         &seq_name,
         &seq,
         dest_reg,

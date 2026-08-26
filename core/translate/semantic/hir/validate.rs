@@ -1,6 +1,6 @@
 //! Independent structural validation for completed HIR documents.
 
-use std::{cell::Cell, collections::HashSet, fmt, sync::Arc};
+use std::{cell::Cell, collections::HashSet, fmt, ops::ControlFlow, sync::Arc};
 
 use super::*;
 
@@ -46,6 +46,44 @@ struct HirValidator<'document> {
     visited_ctes: Vec<Cell<bool>>,
     /// 0 is unseen, 1 is on the current validation stack, and 2 is complete.
     schema_program_states: Vec<Cell<u8>>,
+}
+
+struct ExprValidationVisitor<'validator, 'document> {
+    validator: &'validator HirValidator<'document>,
+}
+
+impl<'expr> ExprVisitor<'expr> for ExprValidationVisitor<'_, '_> {
+    type Context = ();
+    type Output = ();
+    type Error = HirValidationError;
+
+    fn child(&mut self, expression: &'expr Expr, index: usize) -> Option<&'expr Expr> {
+        if let Expr::MergedColumn(column) = expression {
+            return [column.left.as_ref(), column.right.as_ref()]
+                .get(index)
+                .copied();
+        }
+        expression.child(index)
+    }
+
+    fn pre_order(
+        &mut self,
+        _parent: &Expr,
+        _context: &mut (),
+        _child_index: usize,
+        _child: &Expr,
+    ) -> ValidationResult<ControlFlow<(), ()>> {
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &Expr,
+        _context: (),
+        _children: &[()],
+    ) -> ValidationResult {
+        self.validator.validate_expr_node(expression)
+    }
 }
 
 impl<'document> HirValidator<'document> {
@@ -1542,25 +1580,31 @@ impl<'document> HirValidator<'document> {
         Ok(())
     }
 
-    fn visit_cast_programs(&self, programs: &BoundCastPrograms) -> ValidationResult {
+    fn visit_cast_program_references(&self, programs: &BoundCastPrograms) -> ValidationResult {
         for call in &programs.encode {
-            self.visit_schema_call(call)?;
+            self.visit_schema_program(call.program)?;
         }
         if let Some(domain) = &programs.domain {
             for check in &domain.checks {
-                self.visit_schema_call(&check.call)?;
+                self.visit_schema_program(check.call.program)?;
             }
         }
         Ok(())
     }
 
     fn visit_expr(&self, expression: &Expr) -> ValidationResult {
+        expression.walk((), &mut ExprValidationVisitor { validator: self })
+    }
+
+    fn validate_expr_node(&self, expression: &Expr) -> ValidationResult {
         match expression {
             Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
             Expr::Column(reference) => self.visit_column_ref(*reference),
             Expr::MergedColumn(column) => {
-                self.visit_expr(&column.left)?;
-                self.visit_column_ref(column.right)?;
+                let Expr::Column(right) = column.right.as_ref() else {
+                    return self.invalid("merged-column right side is not a source column");
+                };
+                self.visit_column_ref(*right)?;
                 self.visit_type_fact(&column.type_fact)?;
                 self.visit_optional_catalog_object(
                     column.collation.as_ref(),
@@ -1575,8 +1619,8 @@ impl<'document> HirValidator<'document> {
                 )
             }
             Expr::Output(output) => self.visit_output_reference(*output),
-            Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::NotNull(expr) => {
-                self.visit_expr(expr)
+            Expr::Unary { .. } | Expr::IsNull(_) | Expr::NotNull(_) | Expr::TruthTest { .. } => {
+                Ok(())
             }
             Expr::Binary {
                 lhs,
@@ -1586,8 +1630,6 @@ impl<'document> HirValidator<'document> {
                 custom,
                 comparison,
             } => {
-                self.visit_expr(lhs)?;
-                self.visit_expr(rhs)?;
                 self.require(
                     operator.is_comparison() == comparison.is_some(),
                     "binary expression has incorrect comparison metadata",
@@ -1627,7 +1669,7 @@ impl<'document> HirValidator<'document> {
                             "custom operator literal encoding refers to a non-literal operand",
                         )?;
                         if let Some(encoder) = &encoding.encoder {
-                            self.visit_schema_call(encoder)?;
+                            self.visit_schema_program(encoder.program)?;
                         }
                     }
                     self.visit_catalog_object(&custom.function, "custom operator function")?;
@@ -1642,9 +1684,6 @@ impl<'document> HirValidator<'document> {
                 end_comparison,
                 ..
             } => {
-                self.visit_expr(expr)?;
-                self.visit_expr(start)?;
-                self.visit_expr(end)?;
                 self.visit_expression_comparison(
                     start_comparison,
                     expr,
@@ -1661,46 +1700,35 @@ impl<'document> HirValidator<'document> {
             Expr::Case {
                 base,
                 when_then,
-                else_expr,
                 base_comparisons,
-            } => {
-                self.visit_optional_expr(base.as_deref())?;
-                for (when, then) in when_then {
-                    self.visit_expr(when)?;
-                    self.visit_expr(then)?;
-                }
-                self.visit_optional_expr(else_expr.as_deref())?;
-                match base.as_deref() {
-                    None => self.require(
-                        base_comparisons.is_empty(),
-                        "searched CASE contains base-comparison metadata",
-                    ),
-                    Some(base) => {
-                        self.require(
-                            base_comparisons.len() == when_then.len(),
-                            "simple CASE comparison count does not match its WHEN count",
+                ..
+            } => match base.as_deref() {
+                None => self.require(
+                    base_comparisons.is_empty(),
+                    "searched CASE contains base-comparison metadata",
+                ),
+                Some(base) => {
+                    self.require(
+                        base_comparisons.len() == when_then.len(),
+                        "simple CASE comparison count does not match its WHEN count",
+                    )?;
+                    for ((when, _), comparison) in when_then.iter().zip(base_comparisons) {
+                        self.visit_expression_comparison(
+                            comparison,
+                            base,
+                            when,
+                            "simple CASE comparison",
                         )?;
-                        for ((when, _), comparison) in when_then.iter().zip(base_comparisons) {
-                            self.visit_expression_comparison(
-                                comparison,
-                                base,
-                                when,
-                                "simple CASE comparison",
-                            )?;
-                        }
-                        Ok(())
                     }
+                    Ok(())
                 }
-            }
-            Expr::Cast { expr, target } => {
-                self.visit_expr(expr)?;
-                self.visit_exprs(&target.parameters)?;
+            },
+            Expr::Cast { target, .. } => {
                 self.visit_type_fact(&target.type_fact)?;
-                self.visit_cast_programs(&target.programs)
+                self.visit_cast_program_references(&target.programs)
             }
-            Expr::Collate { expr, collation } => {
-                self.visit_catalog_object(collation, "COLLATE expression")?;
-                self.visit_expr(expr)
+            Expr::Collate { collation, .. } => {
+                self.visit_catalog_object(collation, "COLLATE expression")
             }
             Expr::Function(function) => {
                 self.visit_catalog_object(&function.function, "function call")?;
@@ -1715,10 +1743,7 @@ impl<'document> HirValidator<'document> {
                         self.visit_sequence_function(function, operation)?;
                     }
                 }
-                self.visit_exprs(function.arguments.expressions())?;
-                self.visit_order_terms(function.arguments.order_terms())?;
-                self.visit_optional_expr(function.evaluation.filter())?;
-                Ok(())
+                self.validate_order_term_metadata(function.arguments.order_terms())
             }
             Expr::InList {
                 lhs,
@@ -1726,8 +1751,6 @@ impl<'document> HirValidator<'document> {
                 comparisons,
                 ..
             } => {
-                self.visit_expr(lhs)?;
-                self.visit_exprs(values)?;
                 self.require(
                     comparisons.len() == values.len(),
                     "IN-list comparison count does not match its value count",
@@ -1740,7 +1763,6 @@ impl<'document> HirValidator<'document> {
             Expr::Subquery(subquery) => self.visit_subquery(subquery),
             Expr::Like {
                 lhs,
-                rhs,
                 escape,
                 function,
                 operator,
@@ -1761,22 +1783,15 @@ impl<'document> HirValidator<'document> {
                     *argument_count == lhs_width + 1 + usize::from(escape.is_some()),
                     "LIKE-family argument count does not match its expressions",
                 )?;
-                self.visit_expr(lhs)?;
-                self.visit_expr(rhs)?;
-                self.visit_optional_expr(escape.as_deref())
+                Ok(())
             }
-            Expr::Row(values) | Expr::Array(values) => self.visit_exprs(values),
-            Expr::Subscript { base, index } => {
-                self.visit_expr(base)?;
-                self.visit_expr(index)
-            }
+            Expr::Row(_) | Expr::Array(_) | Expr::Subscript { .. } => Ok(()),
             Expr::FieldAccess(access) => {
                 self.visit_catalog_object(&access.container_type, "field-access type")?;
                 self.visit_type_fact(&access.result_type)?;
-                self.visit_expr(&access.base)?;
                 self.visit_field_access(access)
             }
-            Expr::Raise { message, .. } => self.visit_optional_expr(message.as_deref()),
+            Expr::Raise { .. } => Ok(()),
         }
     }
 
@@ -1800,6 +1815,18 @@ impl<'document> HirValidator<'document> {
             call.arguments.order_terms().is_empty() || (aggregate && !window_evaluation),
             "argument ORDER BY belongs to a non-aggregate call",
         )?;
+        if let FunctionArguments::Expressions { values, facts, .. } = &call.arguments {
+            self.require(
+                values.len() == facts.len(),
+                "function argument facts do not match argument count",
+            )?;
+            for facts in facts {
+                self.visit_type_fact(&facts.type_fact)?;
+                if let Some(collation) = &facts.collation {
+                    self.visit_catalog_object(collation, "function argument collation")?;
+                }
+            }
+        }
         self.visit_ordered_set_arguments(call)?;
         match &call.evaluation {
             FunctionEvaluation::Scalar => self.require(
@@ -1889,7 +1916,6 @@ impl<'document> HirValidator<'document> {
                 comparison,
                 ..
             } => {
-                self.visit_expr(lhs)?;
                 self.visit_query(*query)?;
                 let lhs_width = self.expression_width(lhs)?;
                 let output_width = self.query(*query)?.output.len();
@@ -1973,6 +1999,12 @@ impl<'document> HirValidator<'document> {
     fn visit_order_terms(&self, terms: &[OrderTerm]) -> ValidationResult {
         for term in terms {
             self.visit_expr(&term.expr)?;
+        }
+        self.validate_order_term_metadata(terms)
+    }
+
+    fn validate_order_term_metadata(&self, terms: &[OrderTerm]) -> ValidationResult {
+        for term in terms {
             self.visit_type_fact(&term.type_fact)?;
             if let Some(collation) = &term.collation {
                 self.visit_catalog_object(collation, "ORDER BY collation")?;
@@ -2279,8 +2311,19 @@ impl<'document> HirValidator<'document> {
     fn visit_sequence_operation(&self, operation: &SequenceOperation) -> ValidationResult {
         self.visit_catalog_object(&operation.sequence, "sequence")?;
         self.visit_catalog_object(&operation.backing_table, "sequence backing table")?;
+        self.require(
+            matches!(
+                operation.backing_table.value(),
+                crate::schema::Table::BTree(_)
+            ),
+            "sequence backing table is not a B-tree table",
+        )?;
         if let Some(sqlite_sequence) = &operation.sqlite_sequence {
             self.visit_catalog_object(sqlite_sequence, "sqlite_sequence table")?;
+            self.require(
+                matches!(sqlite_sequence.value(), crate::schema::Table::BTree(_)),
+                "sqlite_sequence is not a B-tree table",
+            )?;
         }
         let database = operation
             .sequence
@@ -2543,5 +2586,119 @@ impl<'document> HirValidator<'document> {
 
     fn invalid<T>(&self, message: impl Into<String>) -> ValidationResult<T> {
         Err(HirValidationError::new(message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_document(databases: Vec<DatabaseSnapshot>) -> HirDocument {
+        HirDocument {
+            snapshot: CatalogSnapshot::from_id(1),
+            databases,
+            root: HirRoot::Query(QueryRoot {
+                query: QueryId::new(0),
+            }),
+            queries: Vec::new(),
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        }
+    }
+
+    #[test]
+    fn expression_validation_does_not_use_the_call_stack() {
+        let document = empty_document(Vec::new());
+        let validator = HirValidator::new(&document);
+        let mut expression = Expr::Literal(turso_parser::ast::Literal::Null);
+        for _ in 0..10_000 {
+            expression = Expr::Unary {
+                operator: turso_parser::ast::UnaryOperator::Negative,
+                expr: Box::new(expression),
+            };
+        }
+
+        validator
+            .visit_expr(&expression)
+            .expect("deep expression validates iteratively");
+
+        // Dropping this synthetic tree recursively would test Rust's drop
+        // stack instead of the HIR walker.
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn sequence_storage_validation_requires_btree_tables() {
+        let database = DatabaseId::new(2);
+        let document = empty_document(vec![DatabaseSnapshot {
+            database,
+            schema_version: 1,
+        }]);
+        let validator = HirValidator::new(&document);
+        let sequence = CatalogObject::new(
+            CatalogObjectId::new(1),
+            document.snapshot,
+            Some(database),
+            Arc::new(
+                crate::schema::Sequence::new("seq".to_string(), None, None, None, None, false)
+                    .unwrap(),
+            ),
+        );
+        let non_btree = |id, name: &str| {
+            CatalogObject::new(
+                CatalogObjectId::new(id),
+                document.snapshot,
+                Some(database),
+                Arc::new(crate::schema::Table::RecursiveCteInput(Arc::new(
+                    crate::schema::RecursiveCteInput {
+                        name: name.to_string(),
+                        columns: Vec::new(),
+                    },
+                ))),
+            )
+        };
+
+        let invalid_backing = SequenceOperation {
+            kind: SequenceOperationKind::NextValue,
+            user_name: "seq".to_string(),
+            normalized_name: "seq".to_string(),
+            sequence: sequence.clone(),
+            backing_table: non_btree(2, "__turso_internal_seq_seq"),
+            sqlite_sequence: None,
+        };
+        assert_eq!(
+            validator
+                .visit_sequence_operation(&invalid_backing)
+                .unwrap_err()
+                .message(),
+            "sequence backing table is not a B-tree table"
+        );
+
+        let backing_sql = crate::translate::sequence::sequence_backing_table_sql("seq");
+        let valid_backing = CatalogObject::new(
+            CatalogObjectId::new(3),
+            document.snapshot,
+            Some(database),
+            Arc::new(crate::schema::Table::BTree(Arc::new(
+                crate::schema::BTreeTable::from_sql(&backing_sql, 9).unwrap(),
+            ))),
+        );
+        let invalid_sqlite_sequence = SequenceOperation {
+            kind: SequenceOperationKind::NextValue,
+            user_name: "seq".to_string(),
+            normalized_name: "seq".to_string(),
+            sequence,
+            backing_table: valid_backing,
+            sqlite_sequence: Some(non_btree(4, crate::schema::SQLITE_SEQUENCE_TABLE_NAME)),
+        };
+        assert_eq!(
+            validator
+                .visit_sequence_operation(&invalid_sqlite_sequence)
+                .unwrap_err()
+                .message(),
+            "sqlite_sequence is not a B-tree table"
+        );
     }
 }

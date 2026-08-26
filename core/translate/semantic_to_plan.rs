@@ -7,8 +7,8 @@ use super::{
         cost::{Cost, RowCountEstimate},
         join::compute_hir_greedy_join_order,
         order::{
-            ColumnOrder, ColumnTarget, EliminatesSortBy, HirOrderTarget, OrderTarget,
-            OrderTargetPurpose,
+            hir_plan_satisfies_order_target, ColumnOrder, ColumnTarget, EliminatesSortBy,
+            HirOrderTarget, OrderTarget, OrderTargetPurpose,
         },
         CostModelParams, HirBtreeOperation, HirVirtualTableOperation,
     },
@@ -19,7 +19,7 @@ use super::{
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
 use crate::{
-    schema::{Schema, Table},
+    schema::{Index, Schema, Table},
     sync::Arc,
     LimboError, Result,
 };
@@ -114,7 +114,7 @@ impl HirPlan {
         })
     }
 
-    fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
+    pub(crate) fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
         self.queries.iter().find(|plan| plan.query == query)
     }
 }
@@ -129,16 +129,20 @@ pub(crate) struct HirQueryBlockPlanInput {
 /// Access choices for one resolved HIR query block.
 pub(crate) struct HirQueryBlockPlan {
     pub(crate) block: QueryBlockId,
+    pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    pub(crate) group_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
 
 /// Access choices and estimates shared by query blocks and DML scans.
 pub(crate) struct HirAccessPlan {
+    pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    pub(crate) group_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -151,9 +155,19 @@ pub(crate) struct HirPlannedLoop {
     pub(crate) access: HirSourceAccess,
 }
 
+/// Whether an index scan can supply every referenced value itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BtreeTableLookup {
+    ScanOnly,
+    TableRequired,
+}
+
 /// Selected access for one resolved HIR source.
 pub(crate) enum HirSourceAccess {
-    BTree(HirBtreeOperation),
+    BTree {
+        operation: HirBtreeOperation,
+        table_lookup: BtreeTableLookup,
+    },
     Virtual(HirVirtualTableOperation),
     Derived {
         query: QueryId,
@@ -833,18 +847,24 @@ impl<'a> HirPlanContext<'a> {
             };
             return Ok(HirQueryBlockPlan {
                 block: block.id,
+                groups: input.groups,
                 loops: Vec::new(),
                 predicates: input.predicates,
+                group_sort_elided: false,
                 output_cardinality,
                 cost: Cost(0.0),
             });
         }
 
         let input = self.query_block_input(block, order_by, &usage)?;
-        let order_target = self.order_target(
-            order_by,
-            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
-        );
+        let order_target = if order_by.is_empty() {
+            self.grouping_target(block)
+        } else {
+            self.order_target(
+                order_by,
+                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+            )
+        };
         let access = self
             .plan_source_access(
                 input,
@@ -861,8 +881,10 @@ impl<'a> HirPlanContext<'a> {
             })?;
         Ok(HirQueryBlockPlan {
             block: block.id,
+            groups: access.groups,
             loops: access.loops,
             predicates: access.predicates,
+            group_sort_elided: access.group_sort_elided,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
         })
@@ -945,19 +967,48 @@ impl<'a> HirPlanContext<'a> {
         let Some(result) = result else {
             return Ok(None);
         };
+        let group_sort_elided = if order_target.is_some_and(|target| {
+            matches!(
+                &target.purpose,
+                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group)
+            )
+        }) {
+            hir_plan_satisfies_order_target(
+                &result.best_plan,
+                &access_methods,
+                &input.sources,
+                self.document,
+                order_target.expect("GROUP BY order target exists"),
+                schema,
+            )?
+        } else {
+            false
+        };
         let mut prior_sources = crate::translate::planner::TableMask::default();
         let mut loops = Vec::with_capacity(input.sources.len());
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
             let access = match &input.sources[source_position] {
                 HirPlanSource::BTree(source) => match &source.table {
-                    Table::BTree(_) => HirSourceAccess::BTree(apply_hir_selected_btree_access(
-                        source,
-                        &constraints[source_position],
-                        &mut input.predicates,
-                        &mut access_methods[access_method_position],
-                        &prior_sources,
-                        source_position,
-                    )?),
+                    Table::BTree(_) => {
+                        let operation = apply_hir_selected_btree_access(
+                            source,
+                            &constraints[source_position],
+                            &mut input.predicates,
+                            &mut access_methods[access_method_position],
+                            &prior_sources,
+                            source_position,
+                        )?;
+                        let definition = self.definition(source.internal_id);
+                        let table_lookup = selected_btree_index(&operation)
+                            .filter(|index| !source.index_is_covering(definition, index))
+                            .map_or(BtreeTableLookup::ScanOnly, |_| {
+                                BtreeTableLookup::TableRequired
+                            });
+                        HirSourceAccess::BTree {
+                            operation,
+                            table_lookup,
+                        }
+                    }
                     Table::Virtual(_) => {
                         HirSourceAccess::Virtual(apply_hir_selected_virtual_access(
                             &constraints[source_position],
@@ -1036,8 +1087,10 @@ impl<'a> HirPlanContext<'a> {
         }
 
         Ok(Some(HirAccessPlan {
+            groups: input.groups,
             loops,
             predicates: input.predicates,
+            group_sort_elided,
             output_cardinality: result.best_plan.output_cardinality,
             cost: result.best_plan.cost,
         }))
@@ -1060,6 +1113,42 @@ impl<'a> HirPlanContext<'a> {
         (!columns.is_empty()).then_some(OrderTarget { columns, purpose })
     }
 
+    fn grouping_target<'term>(
+        &self,
+        block: &'term hir::QueryBlock,
+    ) -> Option<HirOrderTarget<'term>>
+    where
+        'a: 'term,
+    {
+        let hir::QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } = &block.body
+        else {
+            return None;
+        };
+        let columns = grouping
+            .keys
+            .iter()
+            .zip(&grouping.key_collations)
+            .map(|(expression, collation)| {
+                self.ordering_column(
+                    expression,
+                    turso_parser::ast::SortOrder::Asc,
+                    collation
+                        .as_ref()
+                        .map(|collation| *collation.value())
+                        .unwrap_or_default(),
+                    None,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!columns.is_empty()).then_some(OrderTarget {
+            columns,
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
+        })
+    }
+
     fn order_column<'term>(
         &self,
         term: &'term hir::OrderTerm,
@@ -1067,7 +1156,27 @@ impl<'a> HirPlanContext<'a> {
     where
         'a: 'term,
     {
-        let mut expression = &term.expr;
+        self.ordering_column(
+            &term.expr,
+            term.order,
+            term.collation
+                .as_ref()
+                .map(|collation| *collation.value())
+                .unwrap_or_default(),
+            term.nulls,
+        )
+    }
+
+    fn ordering_column<'term>(
+        &self,
+        mut expression: &'term hir::Expr,
+        order: turso_parser::ast::SortOrder,
+        collation: crate::translate::collate::CollationSeq,
+        nulls_order: Option<turso_parser::ast::NullsOrder>,
+    ) -> Option<ColumnOrder<SourceId, &'term hir::Expr>>
+    where
+        'a: 'term,
+    {
         while let hir::Expr::Output(output) = expression {
             expression = &self.document.output(*output)?.expr;
         }
@@ -1084,13 +1193,9 @@ impl<'a> HirPlanContext<'a> {
         Some(ColumnOrder {
             source,
             target,
-            order: term.order,
-            collation: term
-                .collation
-                .as_ref()
-                .map(|collation| *collation.value())
-                .unwrap_or_default(),
-            nulls_order: term.nulls,
+            order,
+            collation,
+            nulls_order,
         })
     }
 
@@ -1125,6 +1230,15 @@ impl<'a> HirPlanContext<'a> {
         }
         planned.register_expression_index_usage(expression.clone(), columns_mask);
         Ok(())
+    }
+}
+
+fn selected_btree_index(operation: &HirBtreeOperation) -> Option<&Index> {
+    match operation {
+        HirBtreeOperation::Scan { index, .. }
+        | HirBtreeOperation::Seek { index, .. }
+        | HirBtreeOperation::InSeek { index, .. } => index.as_deref(),
+        HirBtreeOperation::RowidEq { .. } => None,
     }
 }
 
@@ -1936,6 +2050,9 @@ mod tests {
         };
 
         assert_eq!(block_plan.loops.len(), 3);
+        assert_eq!(block_plan.groups.len(), 1);
+        assert_eq!(block_plan.groups[0].source, group);
+        assert_eq!(block_plan.groups[0].source_range, 1..3);
         assert_eq!(block_plan.loops[0].source, outer);
         assert!(block_plan.loops[1..]
             .iter()
@@ -2256,10 +2373,14 @@ mod tests {
         assert_eq!(left_loop.source_position, 0);
         assert_eq!(right_loop.source, right);
         assert_eq!(right_loop.source_position, 1);
-        let HirSourceAccess::BTree(HirBtreeOperation::Seek {
-            index: Some(index),
-            seek_def,
-        }) = &right_loop.access
+        let HirSourceAccess::BTree {
+            operation:
+                HirBtreeOperation::Seek {
+                    index: Some(index),
+                    seek_def,
+                },
+            ..
+        } = &right_loop.access
         else {
             panic!("right source uses its selected automatic-index seek");
         };
@@ -2808,7 +2929,7 @@ mod tests {
         assert_eq!(mixed_root.blocks[0].loops.len(), 2);
         assert!(mixed_root.blocks[0].loops.iter().any(|source_loop| {
             source_loop.source == table_source_id
-                && matches!(source_loop.access, HirSourceAccess::BTree(_))
+                && matches!(source_loop.access, HirSourceAccess::BTree { .. })
         }));
         assert!(mixed_root.blocks[0].loops.iter().any(|source_loop| {
             source_loop.source == source_id

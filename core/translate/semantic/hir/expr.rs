@@ -1,6 +1,8 @@
 //! Resolved expression trees.
 
+use std::convert::Infallible;
 use std::num::NonZeroU32;
+use std::ops::ControlFlow;
 
 use smallvec::SmallVec;
 use turso_parser::ast::{
@@ -13,6 +15,7 @@ use super::{
     ResolvedCollation, ResolvedFunction, ResolvedSequence, ResolvedTable, ResolvedType, SourceId,
     TypeFact, WindowId,
 };
+use crate::parameters::ParameterSpelling;
 use crate::sync::Arc;
 use crate::util::check_literal_equivalency;
 use crate::vdbe::affinity::Affinity;
@@ -20,7 +23,7 @@ use crate::vdbe::affinity::Affinity;
 #[derive(Clone, Debug)]
 pub struct Parameter {
     pub index: NonZeroU32,
-    pub name: Option<String>,
+    pub spelling: ParameterSpelling,
     pub type_fact: TypeFact,
 }
 
@@ -36,7 +39,7 @@ pub struct MergedColumn {
     /// The visible value produced by the joins to the left. This may itself
     /// be a merged column when USING/NATURAL joins are chained.
     pub left: Box<Expr>,
-    pub right: ColumnRef,
+    pub right: Box<Expr>,
     pub value: MergedColumnValue,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
@@ -203,6 +206,12 @@ pub struct FunctionCall {
     pub operation: FunctionOperation,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FunctionArgumentFacts {
+    pub type_fact: TypeFact,
+    pub collation: Option<ResolvedCollation>,
+}
+
 /// Resolved function argument shape. Star cannot coexist with expression
 /// arguments.
 #[derive(Clone, Debug)]
@@ -210,6 +219,7 @@ pub enum FunctionArguments {
     Star,
     Expressions {
         values: Vec<Expr>,
+        facts: Vec<FunctionArgumentFacts>,
         distinctness: Option<Distinctness>,
         order_by: Vec<OrderTerm>,
     },
@@ -375,6 +385,11 @@ pub enum Expr {
     Function(FunctionCall),
     IsNull(Box<Expr>),
     NotNull(Box<Expr>),
+    TruthTest {
+        expr: Box<Expr>,
+        is_true: bool,
+        negated: bool,
+    },
     InList {
         lhs: Box<Expr>,
         negated: bool,
@@ -404,25 +419,116 @@ pub enum Expr {
     },
 }
 
-struct ExprFrame<'expr, T> {
+struct ExprFrame<'expr, C, T> {
     expression: &'expr Expr,
+    context: C,
     next_child: usize,
     child_values: SmallVec<[T; 3]>,
 }
 
-impl<'expr, T> ExprFrame<'expr, T> {
-    fn new(expression: &'expr Expr) -> Self {
+pub(crate) trait ExprVisitor<'expr> {
+    type Context;
+    type Output;
+    type Error;
+
+    fn child(&mut self, expression: &'expr Expr, index: usize) -> Option<&'expr Expr> {
+        expression.child(index)
+    }
+
+    fn pre_order(
+        &mut self,
+        parent: &'expr Expr,
+        context: &mut Self::Context,
+        child_index: usize,
+        child: &'expr Expr,
+    ) -> Result<ControlFlow<(), Self::Context>, Self::Error>;
+
+    fn post_order(
+        &mut self,
+        expression: &'expr Expr,
+        context: Self::Context,
+        children: &[Self::Output],
+    ) -> Result<Self::Output, Self::Error>;
+}
+
+struct WalkVisitor<'a, F> {
+    visit: &'a mut F,
+}
+
+impl<'expr, F: FnMut(&Expr)> ExprVisitor<'expr> for WalkVisitor<'_, F> {
+    type Context = ();
+    type Output = ();
+    type Error = Infallible;
+
+    fn pre_order(
+        &mut self,
+        _parent: &Expr,
+        _context: &mut (),
+        _child_index: usize,
+        child: &Expr,
+    ) -> Result<ControlFlow<(), ()>, Infallible> {
+        (self.visit)(child);
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        _expression: &Expr,
+        _context: (),
+        _children: &[()],
+    ) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+struct FoldVisitor<'a, F, T> {
+    fold: &'a mut F,
+    output: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<'expr, T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor<'expr> for FoldVisitor<'_, F, T> {
+    type Context = ();
+    type Output = T;
+    type Error = Infallible;
+
+    fn pre_order(
+        &mut self,
+        _parent: &Expr,
+        _context: &mut (),
+        _child_index: usize,
+        _child: &Expr,
+    ) -> Result<ControlFlow<(), ()>, Infallible> {
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &Expr,
+        _context: (),
+        children: &[T],
+    ) -> Result<T, Infallible> {
+        Ok((self.fold)(expression, children))
+    }
+}
+
+impl<'expr, C, T> ExprFrame<'expr, C, T> {
+    fn new(expression: &'expr Expr, context: C) -> Self {
         Self {
             expression,
+            context,
             next_child: 0,
             child_values: SmallVec::new(),
         }
     }
 
-    fn next_child(&mut self) -> Option<&'expr Expr> {
-        let child = self.expression.child(self.next_child)?;
+    fn next_child<V: ExprVisitor<'expr>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Option<(usize, &'expr Expr)> {
+        let index = self.next_child;
+        let child = visitor.child(self.expression, index)?;
         self.next_child += 1;
-        Some(child)
+        Some((index, child))
     }
 }
 
@@ -439,7 +545,7 @@ impl Expr {
         Self::Output(output)
     }
 
-    fn child(&self, mut index: usize) -> Option<&Self> {
+    pub(crate) fn child(&self, mut index: usize) -> Option<&Self> {
         match self {
             Self::Literal(_)
             | Self::Parameter(_)
@@ -449,10 +555,17 @@ impl Expr {
             | Self::Subquery(
                 SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
             ) => None,
-            Self::MergedColumn(column) => (index == 0).then_some(column.left.as_ref()),
+            Self::MergedColumn(column) => match column.value {
+                MergedColumnValue::Left => (index == 0).then_some(column.left.as_ref()),
+                MergedColumnValue::Right => (index == 0).then_some(column.right.as_ref()),
+                MergedColumnValue::Coalesce => [column.left.as_ref(), column.right.as_ref()]
+                    .get(index)
+                    .copied(),
+            },
             Self::Unary { expr, .. }
             | Self::IsNull(expr)
             | Self::NotNull(expr)
+            | Self::TruthTest { expr, .. }
             | Self::Collate { expr, .. } => (index == 0).then_some(expr.as_ref()),
             Self::Binary {
                 lhs, rhs, custom, ..
@@ -548,12 +661,12 @@ impl Expr {
         }
     }
 
-    /// Compare resolved expression shapes for expression-index matching.
+    /// Compare resolved expression shapes.
     ///
-    /// Work stays on explicit stacks because index expressions can be deeply
-    /// nested. Commutative operators retain the existing planner rule that
+    /// Work stays on explicit stacks because expressions can be deeply
+    /// nested. Commutative operators retain the existing equivalence rule that
     /// permits their operands to appear in either order.
-    pub(crate) fn equivalent_for_index(&self, other: &Self) -> bool {
+    pub(crate) fn equivalent(&self, other: &Self) -> bool {
         let mut pending = vec![(self, other)];
         let mut alternatives = Vec::new();
 
@@ -563,8 +676,19 @@ impl Expr {
                     (Self::Literal(left), Self::Literal(right)) => {
                         check_literal_equivalency(left, right)
                     }
+                    (Self::Parameter(left), Self::Parameter(right)) => left.index == right.index,
                     (Self::Column(left), Self::Column(right)) => left == right,
+                    (Self::MergedColumn(left), Self::MergedColumn(right)) => {
+                        pending.push((&left.left, &right.left));
+                        pending.push((&left.right, &right.right));
+                        left.value == right.value
+                            && left.type_fact == right.type_fact
+                            && left.affinity == right.affinity
+                            && left.has_affinity == right.has_affinity
+                            && left.collation == right.collation
+                    }
                     (Self::RowId(left), Self::RowId(right)) => left == right,
+                    (Self::Output(left), Self::Output(right)) => left == right,
                     (
                         Self::Unary {
                             operator: left_operator,
@@ -716,6 +840,21 @@ impl Expr {
                         true
                     }
                     (
+                        Self::TruthTest {
+                            expr: left,
+                            is_true: left_is_true,
+                            negated: left_negated,
+                        },
+                        Self::TruthTest {
+                            expr: right,
+                            is_true: right_is_true,
+                            negated: right_negated,
+                        },
+                    ) => {
+                        pending.push((left, right));
+                        left_is_true == right_is_true && left_negated == right_negated
+                    }
+                    (
                         Self::InList {
                             lhs: left_lhs,
                             negated: left_negated,
@@ -790,6 +929,60 @@ impl Expr {
                             && left.container_type == right.container_type
                             && left.result_type == right.result_type
                     }
+                    (
+                        Self::Subquery(SubqueryExpr::Scalar {
+                            query: left_query,
+                            output: left_output,
+                        }),
+                        Self::Subquery(SubqueryExpr::Scalar {
+                            query: right_query,
+                            output: right_output,
+                        }),
+                    ) => left_query == right_query && left_output == right_output,
+                    (
+                        Self::Subquery(SubqueryExpr::Row { query: left }),
+                        Self::Subquery(SubqueryExpr::Row { query: right }),
+                    )
+                    | (
+                        Self::Subquery(SubqueryExpr::Exists(left)),
+                        Self::Subquery(SubqueryExpr::Exists(right)),
+                    ) => left == right,
+                    (
+                        Self::Subquery(SubqueryExpr::In {
+                            lhs: left_lhs,
+                            query: left_query,
+                            negated: left_negated,
+                            comparison: left_comparison,
+                        }),
+                        Self::Subquery(SubqueryExpr::In {
+                            lhs: right_lhs,
+                            query: right_query,
+                            negated: right_negated,
+                            comparison: right_comparison,
+                        }),
+                    ) => {
+                        pending.push((left_lhs, right_lhs));
+                        left_query == right_query
+                            && left_negated == right_negated
+                            && left_comparison == right_comparison
+                    }
+                    (
+                        Self::Raise {
+                            action: left_action,
+                            message: left_message,
+                        },
+                        Self::Raise {
+                            action: right_action,
+                            message: right_message,
+                        },
+                    ) => {
+                        left_action == right_action
+                            && push_optional_pair(
+                                &mut pending,
+                                left_message.as_deref(),
+                                right_message.as_deref(),
+                            )
+                    }
                     _ => false,
                 };
 
@@ -808,16 +1001,11 @@ impl Expr {
     /// Visit this expression and every expression it owns. References to
     /// outputs and subqueries remain references; their definitions are walked
     /// by the query that owns them.
-    pub(crate) fn walk<'expr>(&'expr self, visitor: &mut impl FnMut(&'expr Expr)) {
+    pub(crate) fn for_each(&self, visitor: &mut impl FnMut(&Expr)) {
         visitor(self);
-        let mut frames = vec![ExprFrame::<()>::new(self)];
-        while let Some(frame) = frames.last_mut() {
-            let Some(child) = frame.next_child() else {
-                frames.pop();
-                continue;
-            };
-            visitor(child);
-            frames.push(ExprFrame::new(child));
+        let result = self.walk((), &mut WalkVisitor { visit: visitor });
+        if let Err(error) = result {
+            match error {}
         }
     }
 
@@ -825,21 +1013,44 @@ impl Expr {
     /// Child values keep expression-child order, letting callers handle nodes
     /// whose result depends on more than one child.
     pub(crate) fn fold<T>(&self, folder: &mut impl FnMut(&Expr, &[T]) -> T) -> T {
-        let mut frames = vec![ExprFrame::new(self)];
+        match self.walk(
+            (),
+            &mut FoldVisitor {
+                fold: folder,
+                output: std::marker::PhantomData,
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => match error {},
+        }
+    }
+
+    /// Visit an expression iteratively with callbacks before each child and
+    /// after all selected children. The pre-order callback chooses the
+    /// context for a child or skips that child. The post-order callback
+    /// reduces completed child values into the current node's value.
+    pub(crate) fn walk<'expr, V: ExprVisitor<'expr>>(
+        &'expr self,
+        root_context: V::Context,
+        visitor: &mut V,
+    ) -> Result<V::Output, V::Error> {
+        let mut frames = vec![ExprFrame::new(self, root_context)];
         loop {
-            if let Some(child) = frames
-                .last_mut()
-                .expect("root expression frame exists")
-                .next_child()
-            {
-                frames.push(ExprFrame::new(child));
+            let frame = frames.last_mut().expect("root expression frame exists");
+            if let Some((index, child)) = frame.next_child(visitor) {
+                match visitor.pre_order(frame.expression, &mut frame.context, index, child)? {
+                    ControlFlow::Continue(context) => {
+                        frames.push(ExprFrame::new(child, context));
+                    }
+                    ControlFlow::Break(()) => {}
+                }
                 continue;
             }
 
             let frame = frames.pop().expect("completed expression frame exists");
-            let value = folder(frame.expression, &frame.child_values);
+            let value = visitor.post_order(frame.expression, frame.context, &frame.child_values)?;
             let Some(parent) = frames.last_mut() else {
-                return value;
+                return Ok(value);
             };
             parent.child_values.push(value);
         }
@@ -975,16 +1186,19 @@ fn function_arguments_match<'expr>(
         (
             FunctionArguments::Expressions {
                 values: left_values,
+                facts: left_facts,
                 distinctness: left_distinctness,
                 order_by: left_order,
             },
             FunctionArguments::Expressions {
                 values: right_values,
+                facts: right_facts,
                 distinctness: right_distinctness,
                 order_by: right_order,
             },
         ) => {
             push_pairs(pending, left_values, right_values)
+                && left_facts == right_facts
                 && left_distinctness == right_distinctness
                 && order_terms_match(left_order, right_order, pending)
         }
@@ -1099,7 +1313,7 @@ mod tests {
         };
 
         let mut visited = Vec::new();
-        expression.walk(&mut |expression| {
+        expression.for_each(&mut |expression| {
             visited.push(match expression {
                 Expr::Binary { .. } => "binary",
                 Expr::Unary { .. } => "unary",

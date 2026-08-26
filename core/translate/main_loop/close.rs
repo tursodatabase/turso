@@ -209,31 +209,13 @@ impl CloseLoop {
                             let meta = t_ctx.meta_in_seeks[table_index]
                                 .as_ref()
                                 .expect("InSeek must have metadata");
-                            let ephemeral_cursor_id = meta.ephemeral_cursor_id;
-                            let outer_loop_start = meta.outer_loop_start;
-                            let next_val_label = meta.next_val_label;
-
-                            let can_have_multiple_matches = index.is_some();
-                            if can_have_multiple_matches {
-                                // Rowid InSeek uses SeekRowid, so one RHS key can produce at
-                                // most one row. Index-backed InSeek can hit duplicates, so
-                                // keep scanning the current key's match range before advancing
-                                // the ephemeral cursor to the next IN value.
-                                program.emit_insn(Insn::Next {
-                                    cursor_id: iteration_cursor_id,
-                                    pc_if_next: loop_labels.loop_start,
-                                    fullscan: false,
-                                });
-                            }
-
-                            // Once the current key is exhausted (or a seek found nothing),
-                            // advance the outer ephemeral cursor and restart the equality seek.
-                            program.preassign_label_to_next_insn(next_val_label);
-                            program.emit_insn(Insn::Next {
-                                cursor_id: ephemeral_cursor_id,
-                                pc_if_next: outer_loop_start,
-                                fullscan: false,
-                            });
+                            emit_in_seek_advance(
+                                program,
+                                meta,
+                                iteration_cursor_id,
+                                index.is_some(),
+                                loop_labels.loop_start,
+                            );
                         }
                     }
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
@@ -381,13 +363,7 @@ impl CloseLoop {
                     // (e.g. SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a).
                     // If the left join match flag has been set to 1, we jump to the next row on the outer table,
                     // i.e. continue to the next row of t1 in our example.
-                    program.preassign_label_to_next_insn(lj_meta.label_match_flag_check_value);
-                    let label_when_right_table_notnull = program.allocate_label();
-                    program.emit_insn(Insn::IfPos {
-                        reg: lj_meta.reg_match_flag,
-                        target_pc: label_when_right_table_notnull,
-                        decrement_by: 0,
-                    });
+                    let label_when_right_table_notnull = lj_meta.begin_unmatched_row(program);
                     // If the left join match flag is still 0, it means there was no match on the right table,
                     // but since it's a LEFT JOIN, we still need to emit a row with NULLs for the right table.
                     // In that case, we now enter the routine that does exactly that.
@@ -418,10 +394,7 @@ impl CloseLoop {
                     }
                     // Re-enter the loop body at match-flag set so
                     // post-join predicates are re-evaluated with right-table NULLs.
-                    program.emit_insn(Insn::Goto {
-                        target_pc: lj_meta.label_match_flag_set_true,
-                    });
-                    program.preassign_label_to_next_insn(label_when_right_table_notnull);
+                    lj_meta.finish_unmatched_row(program, label_when_right_table_notnull);
                 }
             }
         }
@@ -455,31 +428,28 @@ impl CloseLoop {
     }
 }
 
-pub(super) struct AutoIndexResult {
-    pub(super) use_bloom_filter: bool,
+pub(crate) struct AutoIndexResult {
+    pub(crate) use_bloom_filter: bool,
 }
 
-pub(super) struct AutoIndexBuild<'a> {
-    pub(super) index: &'a Arc<Index>,
-    pub(super) table_cursor_id: CursorID,
-    pub(super) index_cursor_id: CursorID,
-    pub(super) table_has_rowid: bool,
-    pub(super) num_seek_keys: usize,
-    pub(super) seek_def: &'a SeekDef,
-    pub(super) affinity_str: Option<&'a Arc<String>>,
-    /// Table columns needed for transparent virtual column computation.
-    pub(super) table_columns: Option<&'a [crate::schema::Column]>,
-    pub(super) table_ref_id: turso_parser::ast::TableInternalId,
-    pub(super) table_references: &'a TableReferences,
-    pub(super) resolver: &'a Resolver<'a>,
+pub(crate) struct AutoIndexBuild<'a, E> {
+    pub(crate) index: &'a Arc<Index>,
+    pub(crate) table_cursor_id: CursorID,
+    pub(crate) index_cursor_id: CursorID,
+    pub(crate) table_has_rowid: bool,
+    pub(crate) num_seek_keys: usize,
+    pub(crate) has_null_matching_key: bool,
+    pub(crate) seek_def: &'a SeekDef<E>,
+    pub(crate) affinity_str: Option<&'a Arc<String>>,
 }
 
 /// Open an ephemeral index cursor and build an automatic index on a table.
 /// This is used as a last-resort to avoid a nested full table scan
-/// Returns the cursor id of the ephemeral index cursor.
-pub(super) fn emit_autoindex(
+/// Returns whether the matching seek may use the built-in bloom filter.
+pub(crate) fn emit_autoindex<E>(
     program: &mut ProgramBuilder,
-    build: AutoIndexBuild<'_>,
+    build: AutoIndexBuild<'_, E>,
+    mut emit_column: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
 ) -> Result<AutoIndexResult> {
     let AutoIndexBuild {
         index,
@@ -487,12 +457,9 @@ pub(super) fn emit_autoindex(
         index_cursor_id,
         table_has_rowid,
         num_seek_keys,
+        has_null_matching_key,
         seek_def,
         affinity_str,
-        table_columns,
-        table_ref_id,
-        table_references,
-        resolver,
     } = build;
     turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
     let label_ephemeral_build_end = program.allocate_label();
@@ -516,24 +483,7 @@ pub(super) fn emit_autoindex(
     let ephemeral_cols_start_reg = program.alloc_registers(num_regs_to_reserve);
     for (i, col) in index.columns.iter().enumerate() {
         let reg = ephemeral_cols_start_reg + i;
-        if let Some(columns) = table_columns {
-            if let Some(column_def) = columns.get(col.pos_in_table) {
-                if column_def.is_virtual_generated() {
-                    crate::translate::expr::emit_table_column(
-                        program,
-                        table_cursor_id,
-                        table_ref_id,
-                        table_references,
-                        column_def,
-                        col.pos_in_table,
-                        reg,
-                        resolver,
-                    )?;
-                    continue;
-                }
-            }
-        }
-        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
+        emit_column(program, col.pos_in_table, reg)?;
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {
@@ -558,7 +508,7 @@ pub(super) fn emit_autoindex(
         col.collation
             .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset))
     }) && seek_def.start.op.eq_only()
-        && (0..num_seek_keys).all(|i| !seek_def.is_null_matching_key_component(i));
+        && !has_null_matching_key;
     if use_bloom_filter {
         program.emit_insn(Insn::FilterAdd {
             cursor_id: index_cursor_id,

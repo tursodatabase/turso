@@ -52,7 +52,7 @@ pub fn where_node_steps(expr: &ast::Expr) -> usize {
 /// Count the operations needed to check one resolved `WHERE` expression.
 pub(super) fn hir_where_expr_steps(expr: &hir::Expr) -> usize {
     let mut steps = 0;
-    expr.walk(&mut |expr| steps += hir_where_node_steps(expr));
+    expr.for_each(&mut |expr| steps += hir_where_node_steps(expr));
     steps.max(1)
 }
 

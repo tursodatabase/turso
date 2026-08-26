@@ -1,7 +1,4 @@
 use super::*;
-use crate::translate::sequence::emit_sequence_descriptor_literals;
-use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
 
 /// The base logic for translating LIKE and GLOB expressions.
 /// The logic for handling "NOT LIKE" is different depending on whether the expression
@@ -146,7 +143,7 @@ pub(super) fn translate_function(
     Ok(target_register)
 }
 
-pub(super) fn wrap_eval_jump_expr(
+pub(crate) fn wrap_eval_jump_expr(
     program: &mut ProgramBuilder,
     insn: Insn,
     target_register: usize,
@@ -164,7 +161,7 @@ pub(super) fn wrap_eval_jump_expr(
     program.preassign_label_to_next_insn(if_true_label);
 }
 
-pub(super) fn wrap_eval_jump_expr_zero_or_null(
+pub(crate) fn wrap_eval_jump_expr_zero_or_null(
     program: &mut ProgramBuilder,
     insn: Insn,
     target_register: usize,
@@ -246,6 +243,12 @@ pub(super) fn translate_sequence_function(
     if backing_table.is_none() {
         crate::bail_parse_error!("sequence \"{}\" does not exist", seq_name_raw);
     }
+    let backing_table = backing_table.expect("sequence backing table was checked");
+    let sqlite_sequence = crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+        resolver,
+        database_id,
+        &normalized_name,
+    );
 
     // Fetch the immutable sequence descriptor — start/inc/min/max/cycle are
     // baked into the bytecode as literal Integers since they never change
@@ -273,108 +276,26 @@ pub(super) fn translate_sequence_function(
         // correct database id resolved here.
         crate::translate::sequence::emit_disk_read_nextval(
             program,
-            resolver,
             database_id,
+            backing_table,
+            sqlite_sequence,
             &normalized_name,
             &seq_arc,
             target_register,
             Some(start_reg),
         )?;
     } else {
-        // setval keeps its own cursor lifecycle: open the backing table,
-        // validate the user-supplied value via the Function handler,
-        // DELETE every existing row, then INSERT one at the requested
-        // value with the descriptor suffix.
-        let backing_table = backing_table.unwrap();
-        let root_page = backing_table.root_page;
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id,
-            root_page: RegisterOrLiteral::Literal(root_page),
-            db: database_id,
-        });
-
-        // Function instruction performs argument validation and writes the
-        // user-visible result into target_register. The handler no longer
-        // mutates any in-memory atomic.
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg,
-            dest: target_register,
-            func: func_ctx,
-        });
-
-        let empty_label = program.allocate_label();
-        let loop_label = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id,
-            pc_if_empty: empty_label,
-        });
-        program.preassign_label_to_next_insn(loop_label);
-        program.emit_insn(Insn::Delete {
-            cursor_id,
-            table_name: normalized_name.clone(),
-            // Sequence storage is internal bookkeeping, not a SQL row change.
-            is_part_of_update: true,
-        });
-        program.emit_insn(Insn::Next {
-            cursor_id,
-            pc_if_next: loop_label,
-            fullscan: false,
-        });
-        program.preassign_label_to_next_insn(empty_label);
-
-        let col_base = program.alloc_registers(7);
-        program.emit_insn(Insn::Copy {
-            src_reg: start_reg + 1,
-            dst_reg: col_base,
-            extra_amount: 0,
-        });
-        if args.len() > 2 {
-            program.emit_insn(Insn::Copy {
-                src_reg: start_reg + 2,
-                dst_reg: col_base + 1,
-                extra_amount: 0,
-            });
-        } else {
-            program.emit_insn(Insn::Integer {
-                dest: col_base + 1,
-                value: 1,
-            });
-        }
-        emit_sequence_descriptor_literals(program, &seq_arc, col_base + 2);
-
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(col_base),
-            count: 7,
-            dest_reg: to_u32(record_reg),
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: cursor_id,
-            key_reg: start_reg + 1,
-            record_reg,
-            flag: InsertFlags::new().require_seek().skip_all_change_counts(),
-            table_name: normalized_name.clone(),
-        });
-        program.emit_insn(Insn::SetSequenceCurrval {
-            seq_name_reg: start_reg,
-            value_reg: start_reg + 1,
-        });
-        program.emit_insn(Insn::Close { cursor_id });
-        // For AUTOINCREMENT-backing sequences, also mirror the new
-        // watermark into `sqlite_sequence` so the SQLite-compat row
-        // tracks `setval()` without waiting for a checkpoint. Matches
-        // the inline sync the nextval / advance_past paths emit; see
-        // `emit_autoincrement_sqlite_sequence_sync` for the rationale.
-        crate::translate::sequence::emit_autoincrement_sqlite_sequence_sync(
+        crate::translate::sequence::emit_disk_setval(
             program,
-            resolver,
             database_id,
+            backing_table,
+            sqlite_sequence,
             &normalized_name,
-            start_reg + 1,
+            &seq_arc,
+            start_reg,
+            args.len(),
+            target_register,
+            func_ctx,
         )?;
     }
 

@@ -520,9 +520,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .transpose()?;
 
             for expression in generated.iter().chain(default.iter()) {
-                expression.walk(&mut |expression| match expression {
+                expression.for_each(&mut |expression| match expression {
                     Expr::Column(dependency) => pending.push(*dependency),
-                    Expr::MergedColumn(column) => pending.push(column.right),
                     _ => {}
                 });
             }
@@ -1343,7 +1342,7 @@ fn reject_clause_alias_functions(
     allow_aggregates: bool,
 ) -> Result<()> {
     let mut error = None;
-    expression.walk(&mut |expression| {
+    expression.for_each(&mut |expression| {
         if error.is_some() {
             return;
         }
@@ -1363,7 +1362,7 @@ fn reject_clause_alias_functions(
             )));
             return;
         };
-        output.expr.walk(&mut |expression| {
+        output.expr.for_each(&mut |expression| {
             if error.is_some() {
                 return;
             }
@@ -1390,7 +1389,7 @@ fn reject_clause_alias_functions(
 
 fn reject_aliased_aggregates(having: &Expr, block: QueryBlockId, outputs: &[Output]) -> Result<()> {
     let mut error = None;
-    having.walk(&mut |expression| {
+    having.for_each(&mut |expression| {
         if error.is_some() {
             return;
         }
@@ -1401,7 +1400,7 @@ fn reject_aliased_aggregates(having: &Expr, block: QueryBlockId, outputs: &[Outp
             return;
         }
         for argument in call.arguments.expressions() {
-            argument.walk(&mut |expression| {
+            argument.for_each(&mut |expression| {
                 if error.is_some() {
                     return;
                 }
@@ -1526,7 +1525,7 @@ fn ordinal(number: usize) -> String {
 
 fn expression_contains_aggregate(expression: &Expr) -> bool {
     let mut found = false;
-    expression.walk(&mut |expression| {
+    expression.for_each(&mut |expression| {
         if let Expr::Function(call) = expression {
             found |= matches!(call.evaluation, FunctionEvaluation::Aggregate { .. });
         }
@@ -2389,20 +2388,22 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        use crate::parameters::ParameterSpelling;
+
         let expected = [
-            (1, None),
-            (3, None),
-            (4, Some(":named")),
-            (4, Some(":named")),
-            (5, Some("@other")),
+            (1, ParameterSpelling::Anonymous),
+            (3, ParameterSpelling::Numbered),
+            (4, ParameterSpelling::Named(":named".to_string())),
+            (4, ParameterSpelling::Named(":named".to_string())),
+            (5, ParameterSpelling::Named("@other".to_string())),
         ];
 
-        for (output, (index, name)) in outputs.iter().zip(expected) {
+        for (output, (index, spelling)) in outputs.iter().zip(expected) {
             let Expr::Parameter(parameter) = &output.expr else {
                 panic!("parser variable becomes HIR parameter");
             };
             assert_eq!(parameter.index.get(), index);
-            assert_eq!(parameter.name.as_deref(), name);
+            assert_eq!(parameter.spelling, spelling);
             assert!(parameter.type_fact.storage.is_none());
             assert!(parameter.type_fact.declared.is_none());
             assert!(!output.has_affinity);
@@ -2773,7 +2774,7 @@ mod tests {
             .chain(expression_index.predicate.iter())
             .all(|expression| {
                 let mut reads_only_source = true;
-                expression.walk(&mut |part| {
+                expression.for_each(&mut |part| {
                     if let Expr::Column(column) = part {
                         reads_only_source &= column.source == source.id;
                     }
@@ -3098,7 +3099,7 @@ mod tests {
         let source = block.from.as_ref().expect("query has FROM").first;
         let mut columns = Vec::new();
         let mut outputs = Vec::new();
-        filter.walk(&mut |expression| match expression {
+        filter.for_each(&mut |expression| match expression {
             Expr::Column(reference) => columns.push(*reference),
             Expr::Output(output) => outputs.push(*output),
             _ => {}
@@ -4821,7 +4822,7 @@ mod tests {
         assert_eq!(block.outputs.len(), 7);
         assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
         for output in &block.outputs {
-            output.expr.walk(&mut |expression| {
+            output.expr.for_each(&mut |expression| {
                 assert!(!matches!(
                     expression,
                     Expr::Column(reference) if reference.source == group_source.id
@@ -6222,7 +6223,7 @@ mod tests {
         ));
         let predicate = update.predicate.as_ref().expect("UPDATE has predicate");
         let mut reads = Vec::new();
-        predicate.walk(&mut |expression| {
+        predicate.for_each(&mut |expression| {
             if let Expr::Column(column) = expression {
                 reads.push(column.source);
             }
@@ -6315,7 +6316,7 @@ mod tests {
             .predicate
             .as_ref()
             .expect("DELETE has predicate")
-            .walk(&mut |expression| {
+            .for_each(&mut |expression| {
                 if let Expr::Column(column) = expression {
                     reads.push(column.source);
                 }
@@ -6349,7 +6350,7 @@ mod tests {
             .predicate
             .as_ref()
             .expect("DELETE has predicate")
-            .walk(&mut |expression| {
+            .for_each(&mut |expression| {
                 if let Expr::Subquery(hir::SubqueryExpr::In { query, .. }) = expression {
                     queries.push(*query);
                 }
@@ -6405,7 +6406,7 @@ mod tests {
             .predicate
             .as_ref()
             .expect("trigger has WHEN predicate")
-            .walk(&mut |expression| {
+            .for_each(&mut |expression| {
                 if let Expr::Column(column) = expression {
                     predicate_reads.push(column.source);
                 }
@@ -6445,7 +6446,7 @@ mod tests {
             .predicate
             .as_ref()
             .expect("DELETE has predicate")
-            .walk(&mut |expression| {
+            .for_each(&mut |expression| {
                 if let Expr::Column(column) = expression {
                     delete_reads.push(column.source);
                 }
@@ -6952,7 +6953,7 @@ mod tests {
         assert_eq!(constraints[1].catalog_position, 1);
         for constraint in constraints {
             let mut reads_target = false;
-            constraint.expression.walk(&mut |expression| {
+            constraint.expression.for_each(&mut |expression| {
                 if matches!(
                     expression,
                     Expr::Column(column) if column.source == insert.target
@@ -7093,9 +7094,12 @@ mod tests {
         assert_ne!(target_loop.source, new_source);
         assert!(matches!(
             &target_loop.access,
-            HirSourceAccess::BTree(SelectedBtreeOperation::RowidEq {
-                cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
-            }) if value == "1"
+            HirSourceAccess::BTree {
+                operation: SelectedBtreeOperation::RowidEq {
+                    cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
+                },
+                ..
+            } if value == "1"
         ));
 
         let schema = schema_with_join_tables();
@@ -7167,9 +7171,12 @@ mod tests {
         assert_eq!(target_loop.source_position, 0);
         assert!(matches!(
             &target_loop.access,
-            HirSourceAccess::BTree(SelectedBtreeOperation::RowidEq {
-                cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
-            }) if value == "1"
+            HirSourceAccess::BTree {
+                operation: SelectedBtreeOperation::RowidEq {
+                    cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
+                },
+                ..
+            } if value == "1"
         ));
         assert_eq!(access.predicates.len(), 1);
         assert!(access.predicates[0].consumed);
@@ -7188,7 +7195,10 @@ mod tests {
         assert!(access.predicates.is_empty());
         assert!(matches!(
             &access.loops[0].access,
-            HirSourceAccess::BTree(SelectedBtreeOperation::Scan { index: None, .. })
+            HirSourceAccess::BTree {
+                operation: SelectedBtreeOperation::Scan { index: None, .. },
+                ..
+            }
         ));
     }
 
@@ -9050,6 +9060,7 @@ mod tests {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } if values.len() == 1 && order_by.is_empty()
             ));
         }
@@ -9104,6 +9115,7 @@ mod tests {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } if values.len() == 1 && order_by.is_empty()
             ));
         }
@@ -9116,6 +9128,7 @@ mod tests {
                 values,
                 distinctness: None,
                 order_by,
+                ..
             } if values.is_empty() && order_by.is_empty()
         ));
 
@@ -9178,6 +9191,7 @@ mod tests {
             values,
             distinctness: None,
             order_by,
+            ..
         } = &call.arguments
         else {
             panic!("expanded star becomes expression arguments");
@@ -9579,6 +9593,7 @@ mod tests {
                             values,
                             distinctness: None,
                             order_by,
+                            ..
                         } if values.len() == 1 && order_by.is_empty()
                     )
             )
@@ -9599,6 +9614,7 @@ mod tests {
                 values,
                 distinctness: Some(ast::Distinctness::Distinct),
                 order_by,
+                ..
             } if values.len() == 1 && order_by.is_empty()
         ));
         let Expr::Function(ordered_concat) = &block.outputs[5].expr else {
@@ -9608,6 +9624,7 @@ mod tests {
             values,
             distinctness,
             order_by,
+            ..
         } = &ordered_concat.arguments
         else {
             panic!("ordered aggregate has expression arguments");
@@ -10657,7 +10674,7 @@ mod tests {
         );
         assert!(returning.outputs.iter().all(|output| {
             let mut uses_other_source = false;
-            output.expr.walk(&mut |expression| {
+            output.expr.for_each(&mut |expression| {
                 if matches!(expression, Expr::Column(column) if column.source != update.new_source)
                 {
                     uses_other_source = true;
@@ -10731,7 +10748,7 @@ mod tests {
             panic!("UPDATE produces UPDATE root");
         };
         let mut query_ids = Vec::new();
-        update.assignments[0].value.walk(&mut |expression| {
+        update.assignments[0].value.for_each(&mut |expression| {
             if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
                 query_ids.push(*query);
             }
@@ -10740,7 +10757,7 @@ mod tests {
             .predicate
             .as_ref()
             .expect("WHERE is preserved")
-            .walk(&mut |expression| {
+            .for_each(&mut |expression| {
                 if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
                     query_ids.push(*query);
                 }
@@ -10751,7 +10768,7 @@ mod tests {
             .expect("RETURNING is preserved")
             .outputs[0]
             .expr
-            .walk(&mut |expression| {
+            .for_each(&mut |expression| {
                 if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
                     query_ids.push(*query);
                 }
@@ -11071,7 +11088,7 @@ mod tests {
                     if matches!(lhs.as_ref(), Expr::RowId(source) if *source == delete.target))
         ));
         let mut query = None;
-        predicate.walk(&mut |expression| {
+        predicate.for_each(&mut |expression| {
             if let Expr::Subquery(SubqueryExpr::Exists(id)) = expression {
                 query = Some(*id);
             }
@@ -11251,7 +11268,7 @@ mod tests {
         );
         assert!(returning.outputs.iter().all(|output| {
             let mut uses_other_source = false;
-            output.expr.walk(&mut |expression| match expression {
+            output.expr.for_each(&mut |expression| match expression {
                 Expr::Column(column) if column.source != delete.target => {
                     uses_other_source = true;
                 }
@@ -11338,7 +11355,7 @@ mod tests {
             .predicate
             .as_ref()
             .expect("WHERE is preserved")
-            .walk(&mut |expression| {
+            .for_each(&mut |expression| {
                 if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
                     query_ids.push(*query);
                 }
@@ -11349,7 +11366,7 @@ mod tests {
             .expect("RETURNING is preserved")
             .outputs[0]
             .expr
-            .walk(&mut |expression| {
+            .for_each(&mut |expression| {
                 if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
                     query_ids.push(*query);
                 }

@@ -2361,10 +2361,22 @@ fn emit_update_insns<'a>(
                             target_table.identifier
                         ))
                     })?;
-                crate::translate::sequence::emit_disk_advance_past(
-                    program,
+                let backing_table = crate::translate::sequence::resolve_sequence_backing_table(
                     &t_ctx.resolver,
                     update_database_id,
+                    &seq_name,
+                )?;
+                let sqlite_sequence =
+                    crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+                        &t_ctx.resolver,
+                        update_database_id,
+                        &seq_name,
+                    );
+                crate::translate::sequence::emit_disk_advance_past(
+                    program,
+                    update_database_id,
+                    backing_table,
+                    sqlite_sequence,
                     &seq_name,
                     &seq,
                     effective_rowid_reg,

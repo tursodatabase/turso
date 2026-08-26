@@ -10,8 +10,8 @@ use crate::{
             usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
         },
         plan::{
-            GroupBy, HashJoinType, HirPlannedSource, IterationDirection, JoinedTable, Operation,
-            Plan, Scan, SimpleAggregate, TableReferences,
+            GroupBy, HashJoinType, HirPlanSource, HirPlannedSource, IterationDirection,
+            JoinedTable, Operation, Plan, Scan, SimpleAggregate, TableReferences,
         },
         planner::{table_mask_from_expr, TableMask},
         semantic::hir,
@@ -407,6 +407,59 @@ pub fn plan_satisfies_order_target(
             .expect("a plan cannot contain more than the table limit");
     }
     target_col_idx == num_cols_in_order_target
+}
+
+/// Prove that a selected HIR B-tree loop supplies the complete requested
+/// order. Multi-source and non-B-tree plans remain sorter-backed until their
+/// global row order can be proved from equally strong facts.
+pub(crate) fn hir_plan_satisfies_order_target(
+    plan: &JoinN,
+    access_methods: &[AccessMethod],
+    sources: &[HirPlanSource],
+    document: &hir::HirDocument,
+    order_target: &HirOrderTarget<'_>,
+    schema: &Schema,
+) -> Result<bool> {
+    let [(source_position, access_method_position)] = plan.data.as_slice() else {
+        return Ok(false);
+    };
+    let Some(HirPlanSource::BTree(source)) = sources.get(*source_position) else {
+        return Ok(false);
+    };
+    if source.join_info.is_some() {
+        return Ok(false);
+    }
+    let Some(definition) = document.source(source.internal_id) else {
+        return Err(LimboError::InternalError(format!(
+            "HIR order proof references missing source {}",
+            source.internal_id
+        )));
+    };
+    let Some(access_method) = access_methods.get(*access_method_position) else {
+        return Err(LimboError::InternalError(format!(
+            "HIR order proof references missing access method {access_method_position}"
+        )));
+    };
+    let AccessMethodParams::BTreeTable {
+        iter_dir,
+        index,
+        build_index: false,
+        constraint_refs,
+    } = &access_method.params
+    else {
+        return Ok(false);
+    };
+    let consumed = hir_btree_access_order_consumed(
+        &HirOrderSource::new(source, definition),
+        *iter_dir,
+        index.as_deref(),
+        constraint_refs,
+        order_target,
+        0,
+        schema,
+        EqualityPrefixScope::ConstantEquality,
+    )?;
+    Ok(consumed.consumed == order_target.columns.len())
 }
 
 fn access_method_emits_unique_order_prefix(
@@ -851,7 +904,7 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for HirOrderSource<'a> {
     }
 
     fn expressions_match(&self, target: &'a hir::Expr, indexed: &'a hir::Expr) -> bool {
-        target.equivalent_for_index(indexed)
+        target.equivalent(indexed)
     }
 }
 

@@ -1314,10 +1314,21 @@ pub fn emit_upsert(
                         table.get_name()
                     ))
                 })?;
-            crate::translate::sequence::emit_disk_advance_past(
-                program,
+            let backing_table = crate::translate::sequence::resolve_sequence_backing_table(
                 resolver,
                 upsert_database_id,
+                &seq_name,
+            )?;
+            let sqlite_sequence = crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+                resolver,
+                upsert_database_id,
+                &seq_name,
+            );
+            crate::translate::sequence::emit_disk_advance_past(
+                program,
+                upsert_database_id,
+                backing_table,
+                sqlite_sequence,
                 &seq_name,
                 &seq,
                 rnew,

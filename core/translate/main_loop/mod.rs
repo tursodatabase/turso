@@ -3,8 +3,8 @@ use turso_parser::ast::{Expr, SortOrder, TableInternalId};
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     emitter::{
-        InSeekMetadata, MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver,
-        TranslateCtx, UpdateRowSource,
+        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver, TranslateCtx,
+        UpdateRowSource,
     },
     expr::{
         expr_references_subquery_id, translate_condition_expr, translate_expr,
@@ -62,18 +62,68 @@ mod seek;
 use body::emit_unmatched_row_conditions_and_loop;
 pub(crate) use body::LoopBodyEmitter;
 pub(crate) use close::CloseLoop;
-use close::{emit_autoindex, AutoIndexResult};
+pub(crate) use close::{emit_autoindex, AutoIndexBuild, AutoIndexResult};
 use in_seek::open_in_seek_source_cursor;
+pub(crate) use in_seek::{
+    emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, InSeekLoop,
+};
 pub(crate) use init::{init_distinct, InitLoop};
 use multi_index::emit_multi_index_scan_loop;
 pub(crate) use open::OpenLoop;
-use seek::SeekEmitter;
+pub(crate) use seek::{SeekEmitter, SeekExpressionLowering};
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct LeftJoinMetadata {
     pub reg_match_flag: usize,
     pub label_match_flag_set_true: BranchOffset,
     pub label_match_flag_check_value: BranchOffset,
+}
+
+impl LeftJoinMetadata {
+    pub(crate) fn new(program: &mut ProgramBuilder) -> Self {
+        Self {
+            reg_match_flag: program.alloc_register(),
+            label_match_flag_set_true: program.allocate_label(),
+            label_match_flag_check_value: program.allocate_label(),
+        }
+    }
+
+    pub(crate) fn reset(&self, program: &mut ProgramBuilder) {
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: self.reg_match_flag,
+        });
+    }
+
+    pub(crate) fn mark_matched(&self, program: &mut ProgramBuilder) {
+        program.preassign_label_to_next_insn(self.label_match_flag_set_true);
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: self.reg_match_flag,
+        });
+    }
+
+    pub(crate) fn begin_unmatched_row(&self, program: &mut ProgramBuilder) -> BranchOffset {
+        program.preassign_label_to_next_insn(self.label_match_flag_check_value);
+        let finished = program.allocate_label();
+        program.emit_insn(Insn::IfPos {
+            reg: self.reg_match_flag,
+            target_pc: finished,
+            decrement_by: 0,
+        });
+        finished
+    }
+
+    pub(crate) fn finish_unmatched_row(
+        &self,
+        program: &mut ProgramBuilder,
+        finished: BranchOffset,
+    ) {
+        program.emit_insn(Insn::Goto {
+            target_pc: self.label_match_flag_set_true,
+        });
+        program.preassign_label_to_next_insn(finished);
+    }
 }
 
 #[derive(Debug)]

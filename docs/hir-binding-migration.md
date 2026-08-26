@@ -79,7 +79,7 @@ Deferred migration surfaces:
 
 | Surface | Why deferred |
 |---|---|
-| Production entry point and lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Preparation can capture that catalog from the same schema inputs used to create the legacy resolver, but does not call the semantic entry point yet. Switching execution to HIR remains a later step; physical lowering is explicitly out of scope for now. |
+| Production entry point and whole-query lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Standalone HIR expression lowering is now being ported in narrow checkpoints, but preparation still enters the legacy plan and emitter path. |
 
 ### Cutover deletion map
 
@@ -138,6 +138,29 @@ or by converting HIR expressions back into parser AST.
 
 Completed:
 
+- HIR output references now read an already-evaluated register bound by
+  `OutputId` in `ProgramBuilder`. Expression lowering never follows the output
+  expression or evaluates volatile output expressions again; whole-query
+  lowering will establish and clear these bindings around each query block.
+- Aggregate and window result reads now use their stable HIR identities to
+  find the result registers owned by `ProgramBuilder`. This replaces the
+  legacy structural expression cache while preserving its unconditional copy
+  and avoiding a second evaluation of arguments or filters.
+- Scalar, row-value, and EXISTS subqueries now read runtime results through a
+  `QueryId`-keyed binding in `ProgramBuilder`. Row widths are checked against
+  the validated HIR query output, and row copies reuse the legacy target-range
+  invariant instead of converting the subquery back into parser AST.
+- Standalone HIR expression lowering now consumes frozen custom-column,
+  custom-CAST, and custom-binary-operator programs directly. Custom binary
+  calls preserve legacy operand swapping, literal encoding, result negation,
+  and target-copy behavior while calling the exact function resolved by
+  semantic analysis. No resolver, parser expression, or `TableReferences`
+  lookup enters these paths.
+- Merged USING/NATURAL columns now own resolved expressions for both sides.
+  LEFT and RIGHT joins lower only the selected value; FULL joins short-circuit
+  the same target register across both values. Validation still checks both
+  owned expressions and requires the right side to retain a source-column
+  identity.
 - Trigger predicates and commands now have ordered HIR planner roots. SELECT
   commands retain their `QueryId`; UPDATE and DELETE commands reuse resolved
   target access planning without turning trigger OLD/NEW pseudo-sources into
@@ -682,6 +705,153 @@ The completed standalone SELECT expression checkpoints cover scalar
 expressions, row and row-subquery operands in comparisons and `BETWEEN`, list
 and query `IN`, and `MATCH`. `union_value` is resolved only in
 destination-aware DML expressions.
+
+Standalone HIR lowering now also covers query `IN` probes. `QueryId` maps to
+the ephemeral index cursor owned by query lowering; the probe uses the frozen
+comparison affinity and collation. Its true, false, and NULL branches retain
+the legacy opcode flow, including checking each row-value operand for NULL
+before evaluating the next operand.
+
+HIR subquery destination preparation now allocates the existing row-value,
+EXISTS, and ephemeral-index destinations directly from the resolved query and
+comparison metadata. Destination allocation installs the matching `QueryId`
+binding in `ProgramBuilder`, and correlation comes from the query's frozen
+capture set. Query-body emission remains the next lowering boundary.
+
+Prepared HIR subqueries now use the existing execution shell: uncorrelated
+queries receive `Once`, scalar and EXISTS results are initialized inside a
+subroutine, and query `IN` opens its prepared ephemeral index. Scalar/list EQP
+nodes and correlated re-execution retain the legacy opcode behavior. The shell
+accepts a HIR query-body emitter and does not depend on AST plans or a resolver.
+
+Constant SELECT and VALUES query bodies now lower directly from HIR into the
+existing query destinations. They bind resolved outputs to consecutive
+registers, preserve VALUES row order, stop scalar and EXISTS destinations after
+the first row, populate IN indexes for every row, skip unnecessary EXISTS
+output evaluation, and apply the existing array result decode step. FROM,
+grouping, compounds, and ordering remain later query-body checkpoints.
+No-FROM WHERE predicates use the shared iterative expression visitor to retain
+AND/OR short-circuiting. LIMIT and OFFSET use the existing counter opcode flow,
+including integer checks, early LIMIT-zero exit, offset skipping, and result-row
+decrement.
+
+Planned single-table B-tree scans now lower directly from HIR. Lowering opens
+the resolved catalog table or index, binds its `SourceId` to the scan cursor,
+evaluates the plan's unconsumed predicates, emits resolved outputs, and
+preserves forward or backward full-scan, LIMIT, OFFSET, scalar, EXISTS, and
+result destination control flow. The plan freezes whether an index is covering:
+covering scans open only the index, while non-covering scans also open the table
+and use `DeferredSeek`. HIR constraint planning now enforces its already-resolved
+`INDEXED BY` and `NOT INDEXED` choices just as the legacy planner does. Seeks,
+joins, and other source kinds remain later checkpoints.
+
+Single-table rowid equality plans now lower through the same HIR B-tree loop.
+The resolved comparison expression is evaluated by HIR expression lowering,
+`SeekRowid` performs the one-row lookup, and no scan advance is emitted. This
+also covers an `INTEGER PRIMARY KEY` rowid alias. Range seeks, joins, and other
+source kinds remain later checkpoints.
+
+Single-table range and equality-prefix seeks now share one generic seek emitter
+between legacy AST and HIR lowering. The HIR adapter evaluates resolved key
+expressions and uses frozen column type programs, while the common emitter keeps
+the existing affinity, NULL matching, forward/backward bound, covering-index,
+table lookup, and `DeferredSeek` behavior. Automatic-index seeks, `IN` seeks,
+and joins remain later checkpoints.
+
+Single-table `IN` seeks now lower from HIR through the same two-level loop as
+legacy plans. Literal values use resolved HIR expression lowering while the
+shared materializer keeps the unique ephemeral index, affinity, and duplicate
+handling. Query sources reuse their prepared `QueryId` index binding. Rowid
+lookups still use `SeekRowid`; index lookups still use `SeekGE`/`IdxGT`, scan
+duplicate keys, and defer table lookup only when the selected index is not
+covering. Joins and automatic indexes remain later checkpoints.
+
+Ordinary comma, inner, and cross joins now lower as nested HIR B-tree loops.
+All cursors open before entering the outer loop, each residual predicate runs
+at the first loop where all of its resolved `SourceId` inputs are positioned,
+and loop advances close from inner to outer. Later index seeks read outer HIR
+columns directly and retain covering and deferred-table behavior. Outer joins,
+automatic indexes, and non-B-tree sources remain later checkpoints.
+
+Automatic indexes for later ordinary-join sources now use one shared build
+emitter for legacy AST and HIR plans. HIR lowering opens the base table but
+creates the ephemeral cursor only through `OpenAutoindex`, builds covering
+payload and virtual generated-column keys from the resolved source, restores
+the index source binding before probing, and keeps the existing affinity,
+NULL-matching, bloom-filter, and seek behavior. Outer joins and non-B-tree
+sources remain later checkpoints.
+
+LEFT JOINs with a direct table or an ordinary parenthesized join group on the
+right now lower with the same match-flag control used by the
+legacy main loop. Shared metadata helpers reset and set the flag, check it at
+right-side exhaustion, null-extend every active index/table cursor, and re-enter
+after ON predicates so post-join WHERE predicates see the synthetic NULL row.
+The final HIR plan preserves FROM-group boundaries, so grouped ON predicates run
+only after the whole group is positioned and grouped WHERE terms run after the
+match flag. Downstream loops restart for the unmatched row. Indexed and
+automatic-index right sides use the same path. RIGHT/FULL joins and nested outer
+joins inside a parenthesized right side remain later checkpoints.
+
+Non-correlated derived `FROM` sources now lower directly from their prepared
+`QueryId`. Lowering materializes the child HIR query once into an ephemeral
+table, binds that cursor to the derived `SourceId`, and feeds it through the same
+nested-loop driver as ordinary B-tree scans. No parser expression or synthetic
+table reference is rebuilt. Non-correlated ordinary CTEs use that same path with
+their resolved `CteId` and prepared body `QueryId`. Shared and explicitly
+materialized CTEs register one ephemeral table in `ProgramBuilder`; later source
+references open duplicate cursors over that storage. Correlated query-backed
+sources remain a later checkpoint.
+
+Recursive CTE sources now use one queue runtime for legacy and HIR plans. The
+legacy adapter still exposes each dequeued row through its pseudo cursor; the
+HIR adapter binds each resolved recursive-input `SourceId` directly to the
+dequeued registers. UNION ALL, UNION seen-row filtering, queue ordering and
+collation, NULL ordering, LIMIT, and OFFSET keep the existing runtime behavior.
+No parser expression, resolver scope, or synthetic table reference is rebuilt.
+Compound seed queries now use compound HIR lowering. Correlated recursive
+bodies remain with the correlated-query checkpoint.
+
+Compound SELECT lowering now consumes prepared HIR blocks directly. UNION ALL
+shares one LIMIT/OFFSET state across its arms. UNION, EXCEPT, and INTERSECT use
+the existing ephemeral-index opcode flow with resolved output collations.
+Compound ORDER BY uses resolved output identities, HIR type facts, collations,
+sort direction, and NULL ordering; LIMIT/OFFSET is applied after sorting. This
+also permits compound recursive CTE seed queries without rebuilding AST nodes.
+Ordinary single-block DISTINCT and ORDER BY now use one HIR row-output path.
+DISTINCT hashes the resolved output registers with their frozen collations
+before applying OFFSET. ORDER BY inserts rows directly from the source loop,
+uses resolved type facts for custom comparators, and drains through the same
+sorter-output helper as compound ordering before applying LIMIT/OFFSET. Combined
+DISTINCT and ORDER BY deduplicates before sorter insertion. No parser expression
+or `TableReferences` sidecar is rebuilt. Aggregate argument ORDER BY and window
+output remain later SELECT checkpoints.
+
+Ungrouped aggregate SELECT now lowers from planned HIR. Stable `AggregateId`
+values own accumulator registers; aggregate arguments, filters, DISTINCT
+collations, custom comparators, and final calls use semantic HIR facts. HIR and
+legacy paths share one aggregate-step opcode switch, so this adds no second
+copy of function behavior. Bare columns and rowid reads capture only values
+needed after the scan, preserving SQLite first-row and empty-input behavior
+without forcing unused columns into covering-index plans. Ordered-set
+percentile aggregates evaluate their direct fraction once before opening the
+input scan, reject local-row and subquery dependencies with the legacy error,
+and reuse the same range-check and aggregate-step opcode helpers as legacy
+lowering. Sorter-backed GROUP BY now stores resolved key and source values,
+detects boundaries with HIR key collations, and reuses the same aggregate
+step/finalize state for each group. HAVING and output expressions read the
+captured group row directly from register-bound HIR sources. Aggregate-free and
+DISTINCT-aggregate groups use the same path. Single-source B-tree plans now
+reuse the shared HIR index-order proof to skip the GROUP BY sorter only when it
+consumes every resolved key with the required collation and custom comparator.
+Both sorted and input-ordered rows use one group-boundary and aggregate path.
+Multi-source and combined GROUP BY/ORDER BY proofs, aggregate argument ORDER BY,
+and windows remain later SELECT checkpoints.
+
+Virtual-table SELECT sources now use their planned HIR access directly.
+Lowering opens and binds a virtual cursor, evaluates the optimizer-selected HIR
+arguments into the `VFilter` argument registers, and advances with `VNext`.
+Column reads already use the shared HIR expression lowering through `VColumn`;
+no parser expression, resolver, or table-reference sidecar is rebuilt.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
