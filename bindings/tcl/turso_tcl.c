@@ -58,7 +58,53 @@ typedef struct TursoDb {
     int         n_sort;     /* SQLITE_STMTSTATUS_SORT */
     int         n_index;    /* SQLITE_STMTSTATUS_AUTOINDEX */
     int         n_vm_step;  /* SQLITE_STMTSTATUS_VM_STEP */
+    /* Set once [sqlite3_close_v2] turned the connection into a zombie;
+     * see zombie_dbs below. */
+    char           *zombie_name;
+    struct TursoDb *next_zombie;
 } TursoDb;
+
+/* Connections closed with [sqlite3_close_v2] while statements were still
+ * outstanding. The library keeps such a zombie alive until its last
+ * statement is finalized, and so must the handle command: upstream tests
+ * expect [sqlite3_prepare $DB ...] on a zombie to fail with SQLITE_MISUSE,
+ * not with "no such database". [sqlite3_finalize] deletes the command
+ * once the library has freed the connection. */
+static TursoDb *zombie_dbs = NULL;
+
+static void zombie_add(TursoDb *tdb, const char *name)
+{
+    tdb->zombie_name = strdup(name);
+    tdb->next_zombie = zombie_dbs;
+    zombie_dbs = tdb;
+}
+
+static void zombie_unlink(TursoDb *tdb)
+{
+    TursoDb **pp;
+    for (pp = &zombie_dbs; *pp; pp = &(*pp)->next_zombie) {
+        if (*pp == tdb) {
+            *pp = tdb->next_zombie;
+            return;
+        }
+    }
+}
+
+/* A statement of DB was just finalized. If DB was a zombie and that was
+ * its last statement, the library has freed it: drop the handle so no
+ * command can touch the dangling pointer. */
+static void zombie_stmt_finalized(sqlite3 *db, int was_last)
+{
+    TursoDb *tdb;
+    if (!was_last) return;
+    for (tdb = zombie_dbs; tdb; tdb = tdb->next_zombie) {
+        if (tdb->db == db) {
+            tdb->db = NULL;
+            Tcl_DeleteCommand(tdb->interp, tdb->zombie_name);
+            return;
+        }
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* TclFuncData — state for a Tcl-backed scalar SQL function            */
@@ -415,7 +461,14 @@ static void TursoDbFree(ClientData cd)
     TursoDb *tdb = (TursoDb *)cd;
     if (!tdb) return;
     cache_free(tdb);
-    if (tdb->db)       sqlite3_close(tdb->db);
+    if (tdb->zombie_name) {
+        /* The library frees a zombie itself when its last statement is
+         * finalized; closing it again would be misuse. */
+        zombie_unlink(tdb);
+        free(tdb->zombie_name);
+    } else if (tdb->db) {
+        sqlite3_close(tdb->db);
+    }
     if (tdb->null_obj) Tcl_DecrRefCount(tdb->null_obj);
     Tcl_Free((char *)tdb);
 }
@@ -1416,7 +1469,11 @@ static int TursoFinalizeCmd(ClientData cd, Tcl_Interp *interp,
     StmtHandle *h = find_stmt_handle(interp, objv[1]);
     if (!h) return TCL_ERROR;
 
+    sqlite3 *db = sqlite3_db_handle(h->stmt);
+    int was_last = sqlite3_next_stmt(db, NULL) == h->stmt &&
+                   sqlite3_next_stmt(db, h->stmt) == NULL;
     int rc = sqlite3_finalize(h->stmt);
+    zombie_stmt_finalized(db, was_last);
 
     /* The handle is spent even when finalize reports an error. */
     StmtHandle **pp;
@@ -2104,8 +2161,9 @@ static int TursoCApiCloseCmd(ClientData cd, Tcl_Interp *interp,
     return TCL_OK;
 }
 
-/* sqlite3_close_v2 DB — like sqlite3_close; turso's compat close_v2
- * has the same semantics. */
+/* sqlite3_close_v2 DB — like sqlite3_close, except that a connection
+ * with outstanding statements becomes a zombie instead of failing: the
+ * handle command then stays until the last statement is finalized. */
 static int TursoCApiCloseV2Cmd(ClientData cd, Tcl_Interp *interp,
                                int objc, Tcl_Obj *const objv[])
 {
@@ -2121,10 +2179,15 @@ static int TursoCApiCloseV2Cmd(ClientData cd, Tcl_Interp *interp,
         return TCL_ERROR;
     }
     cache_free(tdb);
+    int outstanding = sqlite3_next_stmt(tdb->db, NULL) != NULL;
     int rc = sqlite3_close_v2(tdb->db);
     if (rc == SQLITE_OK) {
-        tdb->db = NULL; /* TursoDbFree must not close it again */
-        Tcl_DeleteCommand(interp, Tcl_GetString(objv[1]));
+        if (outstanding) {
+            zombie_add(tdb, Tcl_GetString(objv[1]));
+        } else {
+            tdb->db = NULL; /* TursoDbFree must not close it again */
+            Tcl_DeleteCommand(interp, Tcl_GetString(objv[1]));
+        }
     }
     Tcl_SetResult(interp, (char *)turso_err_name(rc), TCL_STATIC);
     return TCL_OK;
@@ -2698,6 +2761,7 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
     }
 
     TursoDb *tdb = (TursoDb *)Tcl_Alloc(sizeof(TursoDb));
+    memset(tdb, 0, sizeof(TursoDb));
     tdb->db          = db;
     tdb->interp      = interp;
     tdb->null_obj    = NULL;
