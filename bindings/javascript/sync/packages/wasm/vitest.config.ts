@@ -1,12 +1,15 @@
 import { defineConfig } from 'vitest/config'
 
 const DEFAULT_LOCAL_SYNC_SERVER_URL = 'http://localhost:10001';
+const DEFAULT_LOCAL_MVCC_SYNC_SERVER_URL = 'http://localhost:10002';
 const tursoDbUrl = process.env.VITE_TURSO_DB_URL || DEFAULT_LOCAL_SYNC_SERVER_URL;
+const tursoMvccDbUrl = process.env.VITE_TURSO_MVCC_DB_URL || DEFAULT_LOCAL_MVCC_SYNC_SERVER_URL;
 
 export default defineConfig({
   define: {
     'process.env.NODE_DEBUG_NATIVE': 'false',
     'process.env.VITE_TURSO_DB_URL': JSON.stringify(tursoDbUrl),
+    'process.env.VITE_TURSO_MVCC_DB_URL': JSON.stringify(tursoMvccDbUrl),
   },
   server: {
     headers: {

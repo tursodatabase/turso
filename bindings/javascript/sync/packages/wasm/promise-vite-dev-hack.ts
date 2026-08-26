@@ -49,6 +49,20 @@ function resolveUrl(url: string | (() => string | null)): string {
     return url;
 }
 
+function syncDatabaseFiles(path: string): string[] {
+    const lastSlash = path.lastIndexOf('/');
+    const lastDot = path.lastIndexOf('.');
+    const stem = lastDot > lastSlash + 1 ? path.slice(0, lastDot) : path;
+    return [
+        path,
+        `${path}-wal`,
+        `${stem}.db-log`,
+        `${path}-wal-revert`,
+        `${path}-info`,
+        `${path}-changes`,
+    ];
+}
+
 class Database extends DatabasePromise {
     #runner: Runner;
     #engine: any;
@@ -171,14 +185,9 @@ class Database extends DatabasePromise {
             await super.connect();
         } else {
             if (!this.memory) {
-                this.#worker = await init();
-                await Promise.all([
-                    registerFileAtWorker(this.#worker, this.name),
-                    registerFileAtWorker(this.#worker, `${this.name}-wal`),
-                    registerFileAtWorker(this.#worker, `${this.name}-wal-revert`),
-                    registerFileAtWorker(this.#worker, `${this.name}-info`),
-                    registerFileAtWorker(this.#worker, `${this.name}-changes`),
-                ]);
+                const worker = await init();
+                this.#worker = worker;
+                await Promise.all(syncDatabaseFiles(this.name).map(path => registerFileAtWorker(worker, path)));
             }
             await run(this.#runner, this.#engine.connect(), this.execLock);
         }
@@ -346,13 +355,8 @@ class Database extends DatabasePromise {
         }
         if (this.#engine != null) {
             if (this.name != null && this.#worker != null) {
-                await Promise.all([
-                    unregisterFileAtWorker(this.#worker, this.name),
-                    unregisterFileAtWorker(this.#worker, `${this.name}-wal`),
-                    unregisterFileAtWorker(this.#worker, `${this.name}-wal-revert`),
-                    unregisterFileAtWorker(this.#worker, `${this.name}-info`),
-                    unregisterFileAtWorker(this.#worker, `${this.name}-changes`),
-                ]);
+                const worker = this.#worker;
+                await Promise.all(syncDatabaseFiles(this.name).map(path => unregisterFileAtWorker(worker, path)));
             }
             this.#engine.close();
         }
