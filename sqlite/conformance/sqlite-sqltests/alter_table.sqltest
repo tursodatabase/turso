@@ -3016,3 +3016,47 @@ test alter-table-add-column-nonconstant-default-nonempty-table-errors {
 expect error {
     Cannot add a column with non-constant default
 }
+
+# The following preserve-schema-collate tests ensure that alter table
+# preserve the original collation defined on table creation.
+# https://github.com/tursodatabase/turso/issues/8254
+@cross-check-integrity
+test alter-table-add-column-preserve-schema-collate-nocase {
+    CREATE TABLE tbl (c TEXT COLLATE NOCASE);
+    ALTER TABLE tbl ADD COLUMN d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tbl';
+}
+expect {
+    CREATE TABLE tbl (c TEXT COLLATE NOCASE, d)
+}
+
+@cross-check-integrity
+test alter-table-add-column-preserve-schema-collate-rtrim {
+    CREATE TABLE tbl (c TEXT COLLATE RTRIM);
+    ALTER TABLE tbl ADD COLUMN d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tbl';
+}
+expect {
+    CREATE TABLE tbl (c TEXT COLLATE RTRIM, d)
+}
+
+@cross-check-integrity
+test alter-table-add-column-preserve-schema-collate-binary {
+    CREATE TABLE tbl (c TEXT COLLATE BINARY);
+    ALTER TABLE tbl ADD COLUMN d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tbl';
+}
+expect {
+    CREATE TABLE tbl (c TEXT COLLATE BINARY, d)
+}
+
+@cross-check-integrity
+@skip-if sqlite "SQLite does not support locale-based collation"
+test alter-table-add-column-preserve-schema-collate-locale {
+    CREATE TABLE tbl (c TEXT COLLATE 'fr-FR');
+    ALTER TABLE tbl ADD COLUMN d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tbl';
+}
+expect {
+    CREATE TABLE tbl (c TEXT COLLATE "fr-FR", d)
+}
