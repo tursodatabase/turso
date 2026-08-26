@@ -2346,17 +2346,17 @@ pub fn translate_drop_table(
     // Clean up turso_cdc_version entry for the dropped table (if version table exists)
     if let Some(version_table) = resolver
         .schema()
-        .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
+        .get_table(crate::cdc::TURSO_CDC_VERSION_TABLE_NAME)
         .and_then(|t| t.btree())
     {
         let version_index_name = format!(
             "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1",
-            crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+            crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
         );
         let version_index = resolver
             .schema()
             .get_index(
-                crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME,
+                crate::cdc::TURSO_CDC_VERSION_TABLE_NAME,
                 &version_index_name,
             )
             .cloned();
@@ -2430,7 +2430,7 @@ pub fn translate_drop_table(
 
         program.emit_insn(Insn::Delete {
             cursor_id: ver_cursor_id,
-            table_name: crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME.to_string(),
+            table_name: crate::cdc::TURSO_CDC_VERSION_TABLE_NAME.to_string(),
             is_part_of_update: false,
         });
 
