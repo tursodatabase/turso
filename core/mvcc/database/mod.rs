@@ -6231,6 +6231,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 dep_set.is_empty(),
                 "remove_tx({tx_id}): commit_dep_set is not empty"
             );
+            // Invariant: a committed writer must be findable in
+            // `finalized_tx_states` before it leaves `txs`. Other transactions'
+            // commit validation (`check_version_conflicts`) and visibility
+            // checks (`is_end_visible`) look a tombstone's TxID marker up in
+            // `txs` first and `finalized_tx_states` second; a writer absent
+            // from both is treated as "no conflict" / "visible", so reordering
+            // the insert above after this remove would let a conflicting
+            // commit through instead of returning WriteWriteConflict.
+            turso_assert!(
+                !matches!(tx.state.load(), TransactionState::Committed(_))
+                    || tx.write_set.lock().is_empty()
+                    || lookup_finalized_tx_state(&self.finalized_tx_states, tx_id).is_some(),
+                "committed writer must be visible in finalized_tx_states before leaving txs",
+                { "tx_id": tx_id }
+            );
             self.txs.remove(&tx_id);
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
