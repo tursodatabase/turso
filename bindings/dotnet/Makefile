@@ -19,7 +19,7 @@ RUST_RELEASE_OPT ?=
 RUST_PROFILE_DIR ?= debug
 DOTNET_RELEASE_OPT ?=
 IOS_FRAMEWORK_NAME = libturso_sdk_kit
-IOS_DYLIB_FILE = libturso_sdk_kit.dylib
+IOS_DYLIB_FILE = libturso_sync_sdk_kit.dylib
 IOS_FRAMEWORK_BUILD_DIR = ./rs_compiled/ios-frameworks
 IOS_XCFRAMEWORK_DIR = ./rs_compiled/ios-universal/native/$(IOS_FRAMEWORK_NAME).xcframework
 
@@ -27,42 +27,60 @@ all:
 	echo "make [build|test|benchmark|build-production]"
 
 build-rust-windows64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
+	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
+	powershell -NoProfile -Command "Copy-Item -Force './rs_compiled/x86_64-pc-windows-msvc/$(RUST_PROFILE_DIR)/turso_sync_sdk_kit.dll' './rs_compiled/x86_64-pc-windows-msvc/$(RUST_PROFILE_DIR)/turso_sdk_kit.dll'"
+	powershell -NoProfile -Command "Copy-Item -Force './rs_compiled/x86_64-pc-windows-msvc/$(RUST_PROFILE_DIR)/turso_sync_sdk_kit.lib' './rs_compiled/x86_64-pc-windows-msvc/$(RUST_PROFILE_DIR)/turso_sdk_kit.lib'"
 
 build-rust-windowsarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-pc-windows-msvc $(RUST_RELEASE_OPT)
+	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-pc-windows-msvc $(RUST_RELEASE_OPT)
+	powershell -NoProfile -Command "Copy-Item -Force './rs_compiled/aarch64-pc-windows-msvc/$(RUST_PROFILE_DIR)/turso_sync_sdk_kit.dll' './rs_compiled/aarch64-pc-windows-msvc/$(RUST_PROFILE_DIR)/turso_sdk_kit.dll'"
+	powershell -NoProfile -Command "Copy-Item -Force './rs_compiled/aarch64-pc-windows-msvc/$(RUST_PROFILE_DIR)/turso_sync_sdk_kit.lib' './rs_compiled/aarch64-pc-windows-msvc/$(RUST_PROFILE_DIR)/turso_sdk_kit.lib'"
 
 build-rust-linux64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-unknown-linux-gnu $(RUST_RELEASE_OPT)
+	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target x86_64-unknown-linux-gnu $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/x86_64-unknown-linux-gnu/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.so ./rs_compiled/x86_64-unknown-linux-gnu/$(RUST_PROFILE_DIR)/libturso_sdk_kit.so
+	cp ./rs_compiled/x86_64-unknown-linux-gnu/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.a ./rs_compiled/x86_64-unknown-linux-gnu/$(RUST_PROFILE_DIR)/libturso_sdk_kit.a
 
 build-rust-linuxarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-unknown-linux-gnu $(RUST_RELEASE_OPT)
+	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-unknown-linux-gnu $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/aarch64-unknown-linux-gnu/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.so ./rs_compiled/aarch64-unknown-linux-gnu/$(RUST_PROFILE_DIR)/libturso_sdk_kit.so
+	cp ./rs_compiled/aarch64-unknown-linux-gnu/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.a ./rs_compiled/aarch64-unknown-linux-gnu/$(RUST_PROFILE_DIR)/libturso_sdk_kit.a
 
 build-rust-macos64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-apple-darwin $(RUST_RELEASE_OPT)
+	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target x86_64-apple-darwin $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/x86_64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.dylib ./rs_compiled/x86_64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sdk_kit.dylib
+	install_name_tool -id @rpath/libturso_sdk_kit.dylib ./rs_compiled/x86_64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sdk_kit.dylib
+	cp ./rs_compiled/x86_64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.a ./rs_compiled/x86_64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sdk_kit.a
 
 build-rust-macosarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-darwin $(RUST_RELEASE_OPT)
+	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-darwin $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/aarch64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.dylib ./rs_compiled/aarch64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sdk_kit.dylib
+	install_name_tool -id @rpath/libturso_sdk_kit.dylib ./rs_compiled/aarch64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sdk_kit.dylib
+	cp ./rs_compiled/aarch64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.a ./rs_compiled/aarch64-apple-darwin/$(RUST_PROFILE_DIR)/libturso_sdk_kit.a
 
 build-rust-androidarm64:
-	cargo ndk --target aarch64-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cargo ndk --target aarch64-linux-android --platform 31 build -p turso_sync_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/aarch64-linux-android/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.so ./rs_compiled/aarch64-linux-android/$(RUST_PROFILE_DIR)/libturso_sdk_kit.so
 
 build-rust-androidarm:
-	cargo ndk --target armv7-linux-androideabi --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cargo ndk --target armv7-linux-androideabi --platform 31 build -p turso_sync_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/armv7-linux-androideabi/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.so ./rs_compiled/armv7-linux-androideabi/$(RUST_PROFILE_DIR)/libturso_sdk_kit.so
 
 build-rust-androidx64:
-	cargo ndk --target x86_64-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cargo ndk --target x86_64-linux-android --platform 31 build -p turso_sync_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/x86_64-linux-android/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.so ./rs_compiled/x86_64-linux-android/$(RUST_PROFILE_DIR)/libturso_sdk_kit.so
 
 build-rust-androidx86:
-	cargo ndk --target i686-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cargo ndk --target i686-linux-android --platform 31 build -p turso_sync_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/i686-linux-android/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.so ./rs_compiled/i686-linux-android/$(RUST_PROFILE_DIR)/libturso_sdk_kit.so
 
 build-rust-android: build-rust-androidarm64 build-rust-androidarm build-rust-androidx64 build-rust-androidx86
 
 build-rust-iosarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios $(RUST_RELEASE_OPT)
+	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios $(RUST_RELEASE_OPT)
 
 build-rust-iossimulatorarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios-sim $(RUST_RELEASE_OPT)
+	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios-sim $(RUST_RELEASE_OPT)
 
 build-rust-ios: build-rust-iosarm64 build-rust-iossimulatorarm64
 
@@ -119,7 +137,7 @@ generate-platform-client:
 build: build-rust build-dotnet
 
 build-production:
-	$(MAKE) build RUST_RELEASE_OPT='--release' DOTNET_RELEASE_OPT='-c Release'
+	$(MAKE) build RUST_RELEASE_OPT='--release' RUST_PROFILE_DIR='release' DOTNET_RELEASE_OPT='-c Release'
 
 test: build
 	dotnet test ./src/Turso.Tests/Turso.Tests.csproj
