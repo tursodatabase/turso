@@ -119,7 +119,7 @@ set test_files {
   check                fail
   chunksize            fail
   cksumvfs             fail
-  close                fail
+  close                pass
   closure01            fail
   coalesce             pass
   collate1             fail
