@@ -3,8 +3,8 @@
 use shuttle::scheduler::{PctScheduler, RandomScheduler};
 use shuttle::sync::Barrier;
 use turso::Builder;
-use turso_stress::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use turso_stress::sync::Arc;
+use turso_stress::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 fn shuttle_config() -> shuttle::Config {
     turso_stress::shuttle_config()
@@ -736,4 +736,108 @@ async fn begin_publish_window_gc_scenario(num_readers: usize, rounds: i64) {
         !row_disappeared.load(Ordering::Acquire),
         "Observed a row, and then no row. This violates Snapshot Isolation"
     );
+}
+
+/// Issue #8467: MVCC pager panic under DELETE + INSERT interleaving with checkpoint.
+///
+/// One connection repeatedly runs DELETE FROM t (full-table, autocommit) while another
+/// runs INSERT ... RETURNING id. With checkpoint_threshold=0, checkpoints run frequently.
+/// The bug: a negative rootpage (MVCC table-id placeholder) can reach `Pager::read_page()`
+/// when `table_id_to_rootpage` lookup fails due to aliasing or entry removal during
+/// concurrent checkpoint/drop. This causes panic at pager.rs:3321.
+async fn delete_insert_checkpoint_interleaving_scenario(rounds: i64) {
+    let (db, _dir) = setup_mvcc_db(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+         INSERT INTO t VALUES(1, 'seed');",
+    )
+    .await;
+
+    // Trigger checkpoint on every commit to maximize interleaving with root-page flips
+    let setup_conn = db.connect().unwrap();
+    setup_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0", ())
+        .await
+        .unwrap();
+
+    let panic_detected = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+
+    // Deleter: repeatedly DELETE FROM t (full-table delete, autocommit)
+    {
+        let conn = db.connect().unwrap();
+        let barrier = barrier.clone();
+        let panic_detected = panic_detected.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            barrier.wait();
+            for _ in 0..rounds {
+                if panic_detected.load(Ordering::Acquire) {
+                    return;
+                }
+                // Full-table delete in autocommit mode
+                match conn.execute("DELETE FROM t", ()).await {
+                    Ok(_) => {}
+                    Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {}
+                    Err(e) => {
+                        let msg = format!("{e:?}");
+                        if msg.contains("negative") || msg.contains("pages in pager should be") {
+                            panic_detected.store(true, Ordering::Release);
+                            panic!("DELETE triggered negative rootpage panic: {e:?}");
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // Inserter: repeatedly INSERT ... RETURNING id
+    {
+        let conn = db.connect().unwrap();
+        let barrier = barrier.clone();
+        let panic_detected = panic_detected.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            barrier.wait();
+            for i in 0..rounds {
+                if panic_detected.load(Ordering::Acquire) {
+                    return;
+                }
+                let sql = format!("INSERT INTO t VALUES({}, 'val{}') RETURNING id", i + 100, i);
+                match conn.query(&sql, ()).await {
+                    Ok(mut rows) => while let Ok(Some(_)) = rows.next().await {},
+                    Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {}
+                    Err(e) => {
+                        let msg = format!("{e:?}");
+                        if msg.contains("negative") || msg.contains("pages in pager should be") {
+                            panic_detected.store(true, Ordering::Release);
+                            panic!("INSERT triggered negative rootpage panic: {e:?}");
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    // Verify database is still accessible after the stress test
+    let conn = db.connect().unwrap();
+    let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
+    // Count can be anything (deletes and inserts racing), but should not panic
+    assert!(count >= 0, "Table should be readable after stress test");
+}
+
+#[test]
+fn shuttle_test_delete_insert_checkpoint_interleaving() {
+    let scheduler = RandomScheduler::new(100);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(delete_insert_checkpoint_interleaving_scenario(20)));
+}
+
+#[test]
+fn shuttle_test_delete_insert_checkpoint_interleaving_pct() {
+    let scheduler = PctScheduler::new(5, 10000);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(delete_insert_checkpoint_interleaving_scenario(30)));
 }
