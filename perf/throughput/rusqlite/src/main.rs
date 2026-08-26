@@ -94,7 +94,6 @@ fn setup_database(db_path: &str) -> Result<Connection> {
 
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
-    conn.pragma_update(None, "fullfsync", "true")?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS test_table (
@@ -123,7 +122,6 @@ fn worker_thread(
         let conn = Connection::open(&db_path)?;
 
         conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.pragma_update(None, "fullfsync", "true")?;
 
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
 
@@ -147,8 +145,6 @@ fn worker_thread(
     Ok(total_inserts)
 }
 
-// Busy loop to simulate CPU or GPU bound computation (for example, parsing,
-// data aggregation or ML inference).
 fn perform_compute(thread_id: usize, usec: u64) -> u64 {
     if usec == 0 {
         return 0;
