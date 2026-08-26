@@ -138,6 +138,31 @@ OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Exa
 
 No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is.
 
+## Code flows from top to bottom
+
+A reader should be able to read a file from the top down without jumping
+ahead to find what a name means. The general rule: place a function after
+all of its call sites. Callers come first, callees follow.
+
+```text
+pub fn commit()         // entry point
+fn write_frames()       // called by commit
+fn sync_wal()           // called by write_frames
+```
+
+When adding a helper, put it below the functions that call it, not at the
+end of the file or wherever the cursor happened to be.
+
+## Use comments only when absolutely necessary
+
+Comments should explain *why*, not *what*. Do not narrate what the code
+already says: no `// Check if the page is dirty` above `if page.is_dirty()`,
+no `// Helper function for X`, no `// Step 1:`. If the code needs a comment
+to be understood, rename the function or variable instead. A comment earns
+its place when it says something the code cannot: an invariant the type
+system does not enforce, a SQLite compatibility quirk, or a workaround for a
+specific bug with a reference.
+
 ## CI Note
 
 Running in GitHub Action? Max-turns limit in `.github/workflows/claude.yml`. OK to push WIP and continue in another action. Stay focused, avoid rabbit holes.
