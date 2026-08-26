@@ -1492,8 +1492,21 @@ impl FtsCursor {
                         *rewound = true;
                     }
                     if !cursor.has_record() {
-                        // Genuinely empty store: a fresh v2 index with no
-                        // rows yet. (create() stages the control row.)
+                        // Empty store with no control row. `create()` always
+                        // stages the control row in the same transaction as
+                        // the table, so this only happens when the backing
+                        // table was recreated behind the index's back. A read
+                        // sees an empty index; a write must not append
+                        // segments the reader will later refuse for lacking
+                        // a control row.
+                        if self.opening_for_write {
+                            return Err(LimboError::Corrupt(format!(
+                                "FTS index {name} has a backing store with no control row \
+                                 and cannot be written; rebuild it with `DROP INDEX {name}` \
+                                 followed by `CREATE INDEX ... USING fts`",
+                                name = self.index_name
+                            )));
+                        }
                         self.segments.clear();
                         self.snapshot_loaded = true;
                         self.state = FtsState::BuildIndex;
@@ -1768,6 +1781,19 @@ impl FtsCursor {
                                 Ok(LoadedSegment::new(descriptor, data, deleted))
                             })
                             .collect::<Result<Vec<_>>>()?;
+                        if !tombs.is_empty() {
+                            // Tombstones whose segment has no registry row.
+                            // Under the merge lease a retiring merge deletes
+                            // the segment's tombstone rows with it, so these
+                            // only come from a bug or a damaged store. They
+                            // are harmless to skip (nothing references the
+                            // segment) but must not vanish silently.
+                            tracing::warn!(
+                                segments = tombs.len(),
+                                rows = tombs.values().map(BTreeSet::len).sum::<usize>(),
+                                "FTS store has tombstone rows for segments with no registry row"
+                            );
+                        }
                         self.snapshot_loaded = true;
                     }
                     self.ensure_searcher()?;
@@ -2238,7 +2264,12 @@ fn assemble_segment_data(
 }
 
 /// Concatenate one file's chunk rows (`chunk_no` → bytes) into whole bytes.
-fn assemble_chunks(path: &std::path::Path, chunks: HashMap<i64, Vec<u8>>) -> Result<Arc<[u8]>> {
+///
+/// The chunks are written straight into the shared allocation: building a
+/// `Vec` first and converting it with `Arc::from` would copy every byte a
+/// second time and hold both copies at once. Each chunk is dropped as soon
+/// as it has been copied, so peak memory is the file plus one chunk.
+fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) -> Result<Arc<[u8]>> {
     let max_chunk =
         chunks.keys().max().copied().ok_or_else(|| {
             LimboError::Corrupt(format!("FTS file {} has no chunks", path.display()))
@@ -2250,18 +2281,40 @@ fn assemble_chunks(path: &std::path::Path, chunks: HashMap<i64, Vec<u8>>) -> Res
         )));
     }
     let total: usize = chunks.values().map(Vec::len).sum();
-    let mut assembled = Vec::with_capacity(total);
+    let mut assembled = Arc::<[u8]>::new_uninit_slice(total);
+    let buffer = Arc::get_mut(&mut assembled).expect("a freshly allocated Arc is unique");
+    let mut offset = 0;
     for chunk_no in 0..=max_chunk {
-        let data = chunks.get(&chunk_no).ok_or_else(|| {
+        let data = chunks.remove(&chunk_no).ok_or_else(|| {
             LimboError::Corrupt(format!(
                 "FTS file {} is missing chunk {}",
                 path.display(),
                 chunk_no
             ))
         })?;
-        assembled.extend_from_slice(data);
+        for (slot, byte) in buffer[offset..offset + data.len()].iter_mut().zip(&data) {
+            slot.write(*byte);
+        }
+        offset += data.len();
     }
-    Ok(Arc::from(assembled))
+    if !chunks.is_empty() {
+        // Keys outside `0..=max_chunk` (a negative chunk number next to
+        // valid ones) were counted into `total` but never written.
+        return Err(LimboError::Corrupt(format!(
+            "FTS file {} has chunk numbers outside 0..={}",
+            path.display(),
+            max_chunk
+        )));
+    }
+    turso_assert!(
+        offset == total,
+        "FTS chunk assembly must write exactly the bytes it counted"
+    );
+    // SAFETY: `total` is the sum of every chunk's length and every chunk was
+    // consumed by the loop above exactly once, writing `total` bytes
+    // contiguously from offset 0 (asserted), so every byte of the slice is
+    // initialized.
+    Ok(unsafe { assembled.assume_init() })
 }
 
 /// Turn a built segment's captured files into a `LoadedSegment` plus its
@@ -2312,6 +2365,44 @@ fn segment_rows_from_files(
         BTreeSet::new(),
     );
     Ok((Some(segment), inserts))
+}
+
+/// Test helper: delete every row of an FTS index's backing store, leaving a
+/// store that exists but has no control row. Drive `step` to completion
+/// inside a write transaction. Only reachable state this simulates: the
+/// backing table recreated behind the index's back.
+#[cfg(feature = "test_helper")]
+pub struct FtsBackingRowWiper {
+    cursor: Box<dyn CursorTrait>,
+    deleter: RowDeleter,
+}
+
+#[cfg(feature = "test_helper")]
+impl FtsBackingRowWiper {
+    pub fn new(conn: &Arc<Connection>, database_id: usize, index_name: &str) -> Result<Self> {
+        let dir_table_name = format!(
+            "{}fts_dir_{}",
+            crate::schema::TURSO_INTERNAL_PREFIX,
+            index_name
+        );
+        let key_index_name = format!("{dir_table_name}_key");
+        let cursor = open_index_cursor(
+            conn,
+            database_id,
+            &dir_table_name,
+            &key_index_name,
+            [key_info(), key_info(), key_info()],
+        )?;
+        Ok(Self {
+            cursor,
+            // Every path is a prefix match for the empty string.
+            deleter: RowDeleter::new(vec![PathTarget::Prefix(String::new())]),
+        })
+    }
+
+    pub fn step(&mut self) -> Result<IOResult<()>> {
+        self.deleter.step(self.cursor.as_mut())
+    }
 }
 
 // ============================ trait impl ============================
@@ -2956,9 +3047,18 @@ impl IndexMethodCursor for FtsCursor {
         self.connection = Some(Arc::downgrade(&conn));
 
         // Resume a publication this opcode started before its last yield.
+        // Only a merge publication ends the opcode: the pre-merge flush of
+        // buffered work below also publishes, and after it completes the
+        // merge itself is still to do.
         if self.is_publishing() {
+            let is_merge = matches!(
+                self.publish.as_ref().map(|publish| &publish.apply),
+                Some(PublishApply::ReplaceSegments(_))
+            );
             return_if_io!(self.drive_publish());
-            return Ok(IOResult::Done(()));
+            if is_merge {
+                return Ok(IOResult::Done(()));
+            }
         }
 
         if !matches!(self.state, FtsState::Ready) {

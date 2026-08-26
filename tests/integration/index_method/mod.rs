@@ -5726,3 +5726,287 @@ fn fts_mvcc_stale_snapshot_deleter_refused_after_merge() {
         vec![vec![rusqlite::types::Value::Integer(1)]]
     );
 }
+
+// ============ MVCC merge lease vs. tombstone writers ============
+
+/// An uncommitted DELETE registers its transaction as a tombstone writer.
+/// A merge that starts while that deleter is still active must be refused
+/// (Busy): committing it would retire the segment the deleter's tombstone
+/// targets and resurrect the deleted posting in the merged segment.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_active_deleter_blocks_merge() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let deleter = tmp_db.connect_limbo();
+    let merger = tmp_db.connect_limbo();
+
+    deleter
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    deleter
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..4 {
+        deleter
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+            .unwrap();
+    }
+
+    deleter.execute("BEGIN CONCURRENT").unwrap();
+    deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
+
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    let refused = merger.execute("OPTIMIZE INDEX docs_fts");
+    assert!(
+        matches!(refused, Err(turso_core::LimboError::Busy)),
+        "merge overlapping an active deleter must be Busy, got: {refused:?}"
+    );
+    merger.execute("ROLLBACK").unwrap();
+
+    deleter.execute("COMMIT").unwrap();
+
+    // With the deleter committed, a fresh-snapshot merge succeeds and the
+    // deleted posting must not come back.
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(
+            &reader,
+            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(0)],
+            vec![rusqlite::types::Value::Integer(2)],
+            vec![rusqlite::types::Value::Integer(3)],
+        ],
+    );
+    assert_eq!(
+        fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+        Some(1)
+    );
+}
+
+/// The merger pins its snapshot (a read), then a deleter commits. The merge
+/// at the stale snapshot cannot see the tombstone; letting it commit would
+/// drop the tombstone with the retired segment. Must be refused.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_merge_at_stale_snapshot_refused_after_delete_commit() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let deleter = tmp_db.connect_limbo();
+    let merger = tmp_db.connect_limbo();
+
+    deleter
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    deleter
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..4 {
+        deleter
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+            .unwrap();
+    }
+
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        limbo_exec_rows(
+            &merger,
+            "SELECT id FROM docs WHERE fts_match(body, 'common')"
+        )
+        .len(),
+        4
+    );
+
+    deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
+
+    let refused = merger.execute("OPTIMIZE INDEX docs_fts");
+    let lost = refused.is_err() || merger.execute("COMMIT").is_err();
+    assert!(
+        lost,
+        "a merge whose snapshot predates a committed delete must be refused, got: {refused:?}"
+    );
+    let _ = merger.execute("ROLLBACK");
+
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(
+            &reader,
+            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(0)],
+            vec![rusqlite::types::Value::Integer(2)],
+            vec![rusqlite::types::Value::Integer(3)],
+        ],
+    );
+    // A fresh merge sees the tombstone and compacts it away.
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert_eq!(
+        limbo_exec_rows(
+            &reader,
+            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+        )
+        .len(),
+        3
+    );
+}
+
+/// A merge in flight holds the lease; a deleter arriving while it is held
+/// must be refused (Busy), and succeed once retried at a fresh snapshot.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_in_flight_merge_blocks_deleter() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let deleter = tmp_db.connect_limbo();
+    let merger = tmp_db.connect_limbo();
+
+    deleter
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    deleter
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..4 {
+        deleter
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+            .unwrap();
+    }
+
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+
+    deleter.execute("BEGIN CONCURRENT").unwrap();
+    let refused = deleter.execute("DELETE FROM docs WHERE id = 1");
+    assert!(
+        matches!(refused, Err(turso_core::LimboError::Busy)),
+        "delete overlapping an in-flight merge must be Busy, got: {refused:?}"
+    );
+    deleter.execute("ROLLBACK").unwrap();
+    merger.execute("COMMIT").unwrap();
+
+    deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(
+            &reader,
+            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+        )
+        .len(),
+        3
+    );
+}
+
+/// Two transactions each delete a different row from the same segment and
+/// commit concurrently: neither blocks the other and both tombstones land.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_concurrent_deleters_do_not_serialize() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let a = tmp_db.connect_limbo();
+    let b = tmp_db.connect_limbo();
+
+    a.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    a.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    a.execute("INSERT INTO docs VALUES (1, 'common one'), (2, 'common two'), (3, 'common three')")
+        .unwrap();
+
+    a.execute("BEGIN CONCURRENT").unwrap();
+    b.execute("BEGIN CONCURRENT").unwrap();
+    a.execute("DELETE FROM docs WHERE id = 1").unwrap();
+    b.execute("DELETE FROM docs WHERE id = 2").unwrap();
+    a.execute("COMMIT").unwrap();
+    b.execute("COMMIT").unwrap();
+
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(
+            &reader,
+            "SELECT id FROM docs WHERE fts_match(body, 'common')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(3)]],
+    );
+    reader.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert_eq!(
+        limbo_exec_rows(
+            &reader,
+            "SELECT id FROM docs WHERE fts_match(body, 'common')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(3)]],
+    );
+}
+
+/// A backing store that exists but holds no control row (the state left by
+/// recreating the internal table behind the index's back) reads as an empty
+/// index but must refuse writes: segments appended without a control row
+/// would make every later open fail with a corruption error.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_store_without_control_row_refuses_writes_and_reads_empty() {
+    for mvcc in [false, true] {
+        let tmp_db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(mvcc)
+            .build();
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (1, 'alpha')")
+            .unwrap();
+
+        conn.execute("CREATE TABLE touch(x)").unwrap();
+
+        // Under MVCC, BEGIN starts the transaction lazily; the wiper needs a
+        // live write transaction, so touch an unrelated table first.
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO touch VALUES (1)").unwrap();
+        let mut wiper =
+            turso_core::index_method::fts::FtsBackingRowWiper::new(&conn, MAIN_DB_ID, "docs_fts")
+                .unwrap();
+        run(&tmp_db, || wiper.step()).unwrap();
+        drop(wiper);
+        conn.execute("COMMIT").unwrap();
+
+        assert!(
+            limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'alpha')").is_empty(),
+            "a control-less store reads as an empty index (mvcc={mvcc})"
+        );
+        let refused = conn.execute("INSERT INTO docs VALUES (2, 'beta')");
+        assert!(
+            matches!(refused, Err(turso_core::LimboError::Corrupt(_))),
+            "a write to a control-less store must be refused, got: {refused:?} (mvcc={mvcc})"
+        );
+        // Nothing was appended, so the index still opens and reads as empty.
+        assert!(
+            limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'beta')").is_empty(),
+            "the refused write must leave the store readable (mvcc={mvcc})"
+        );
+
+        // The rebuild the error message asks for works.
+        conn.execute("DROP INDEX docs_fts").unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (2, 'beta')").unwrap();
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'beta')"),
+            vec![vec![rusqlite::types::Value::Integer(2)]],
+            "the rebuilt index is writable and searchable (mvcc={mvcc})"
+        );
+    }
+}

@@ -96,6 +96,35 @@ fn fts_cost_estimate_applies_literal_limit_to_output_rows() {
 }
 
 #[test]
+fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
+    let path = std::path::Path::new("x.term");
+    let mut chunks: HashMap<i64, Vec<u8>> = HashMap::default();
+    chunks.insert(0, vec![1, 2, 3]);
+    chunks.insert(1, vec![4, 5]);
+    assert_eq!(
+        &*assemble_chunks(path, chunks.clone()).unwrap(),
+        &[1, 2, 3, 4, 5]
+    );
+
+    // A negative chunk number next to valid ones: it is counted but never
+    // written, so assembly must error rather than hand out uninitialized
+    // bytes or trip an assert.
+    chunks.insert(-1, vec![9]);
+    assert!(matches!(
+        assemble_chunks(path, chunks.clone()),
+        Err(LimboError::Corrupt(_))
+    ));
+
+    // A hole is reported as the missing chunk.
+    chunks.remove(&-1);
+    chunks.remove(&0);
+    assert!(matches!(
+        assemble_chunks(path, chunks),
+        Err(LimboError::Corrupt(_))
+    ));
+}
+
+#[test]
 fn query_limit_is_exact_and_bounded_by_live_documents() {
     assert_eq!(bounded_query_limit(None, 1_500_000), 1_500_000);
     assert_eq!(bounded_query_limit(Some(-1), 1_500_000), 1_500_000);
