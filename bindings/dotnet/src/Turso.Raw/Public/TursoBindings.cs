@@ -180,6 +180,9 @@ public static class TursoBindings
     }
 
     public static bool Read(TursoStatementHandle statement)
+        => Read(statement, runExternalIo: null);
+
+    public static bool Read(TursoStatementHandle statement, Action? runExternalIo)
     {
         statement.ThrowIfInvalid();
 
@@ -192,6 +195,7 @@ public static class TursoBindings
                 return false;
             if (status == TursoStatusCode.Io)
             {
+                runExternalIo?.Invoke();
                 var ioStatus = TursoInterop.StatementRunIo(statement, out errorPtr);
                 ThrowIfError(ioStatus, errorPtr);
                 continue;
