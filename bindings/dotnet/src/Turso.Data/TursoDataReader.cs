@@ -15,13 +15,30 @@ public class TursoDataReader : DbDataReader
     private readonly TursoCommand _command;
     private readonly TursoStatementHandle _statement;
     private readonly CommandBehavior _behavior;
+    private IDisposable? _syncOperation;
+    private TursoConnection? _syncConnection;
     private bool _isClosed;
 
     public TursoDataReader(TursoCommand command, TursoStatementHandle statement, CommandBehavior behavior)
+        : this(command, statement, behavior, syncOperation: null)
+    {
+    }
+
+    public TursoDataReader(
+        TursoCommand command,
+        TursoStatementHandle statement,
+        CommandBehavior behavior,
+        IDisposable? syncOperation)
     {
         _command = command;
         _statement = statement;
         _behavior = behavior;
+        _syncOperation = syncOperation;
+        if (syncOperation is not null && command.Connection is TursoConnection connection)
+        {
+            _syncConnection = connection;
+            connection.RegisterSyncReader(this);
+        }
     }
 
     public override bool GetBoolean(int ordinal)
@@ -195,7 +212,7 @@ public class TursoDataReader : DbDataReader
     public override bool NextResult()
     {
         EnsureOpen();
-        while (TursoBindings.Read(_statement))
+        while (TursoBindings.Read(_statement, RunExternalIo))
         {
         }
 
@@ -207,6 +224,10 @@ public class TursoDataReader : DbDataReader
         if (disposing && !_isClosed)
         {
             _statement.Dispose();
+            _syncOperation?.Dispose();
+            _syncOperation = null;
+            _syncConnection?.UnregisterSyncReader(this);
+            _syncConnection = null;
             if ((_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
                 _command.Connection?.Close();
         }
@@ -218,7 +239,7 @@ public class TursoDataReader : DbDataReader
     public override bool Read()
     {
         EnsureOpen();
-        return TursoBindings.Read(_statement);
+        return TursoBindings.Read(_statement, RunExternalIo);
     }
 
     public override int Depth => 0;
@@ -267,5 +288,10 @@ public class TursoDataReader : DbDataReader
     {
         if (IsClosed)
             throw new InvalidOperationException("The data reader is closed.");
+    }
+
+    private void RunExternalIo()
+    {
+        _syncConnection?.RunExternalIo();
     }
 }

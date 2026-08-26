@@ -123,7 +123,24 @@ batch.BatchCommands.Add(select);
 await using var reader = await batch.ExecuteReaderAsync();
 ```
 
-Embedded replicas are not enabled yet in the .NET provider. `Replica Path` and `Sync Interval` are parsed so applications fail early with clear errors, and `TursoConnection.Sync()` / `SyncAsync(CancellationToken)` are reserved for that mode once `turso_sync_sdk_kit` is packaged and wired through .NET.
+Use `TursoSyncDatabase` when an application needs an embedded replica with explicit pull control:
+
+```C#
+var options = new TursoSyncDatabaseOptions(
+    "./replica.db",
+    new Uri("turso://example-org.turso.io"))
+{
+    AuthToken = authToken,
+};
+
+await using var database = await TursoSyncDatabase.CreateAsync(options);
+await using var local = await database.ConnectAsync();
+var changed = await database.PullAsync();
+```
+
+`PullAsync` never pushes local writes. Sync failures are `TursoSyncException` values carrying the operation, native status, sanitized endpoint, HTTP method/status, and original exception.
+
+Push, checkpoint, statistics, partial sync, remote encryption, connection-string replica integration, pooling, and automatic synchronization are not enabled yet. Use the explicit `TursoSyncDatabase` API for managed pull replicas.
 
 Provider factories are available through `TursoFactory.Instance`:
 
