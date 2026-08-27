@@ -112,7 +112,7 @@ def main():
 
     plt.rcParams.update(
         {
-            "font.family": ["Helvetica Neue", "Helvetica", "Arial", "Noto Sans",
+            "font.family": ["Helvetica Neue", "Helvetica", "Arial",
                             "Liberation Sans", "DejaVu Sans"],
             "font.size": 11,
         }
@@ -152,7 +152,7 @@ def main():
     ax.xaxis.set_minor_locator(NullLocator())
     ax.xaxis.set_major_formatter(FuncFormatter(fmt_tick))
 
-    ax.set_ylim(0, 107)
+    ax.set_ylim(0, 112)
     ax.set_yticks([0, 25, 50, 75, 100])
     ax.tick_params(colors=MUTED, labelcolor=MUTED, length=0, pad=8, labelsize=10.5)
     ax.tick_params(which="minor", length=0)
@@ -164,15 +164,12 @@ def main():
 
     LEFT = 0.105
 
-    # Label each p99 dot in place. The dots all sit at 99%, so the labels
-    # alternate sides: the fastest series goes above-left of its dot, the next
-    # below-right, and so on, so neighbouring labels never overprint.
-    for i, (p99, label) in enumerate(sorted(p99_points)):
-        above = i % 2 == 0
-        ax.annotate(f"{label}  p99 {fmt_ms(p99)}", xy=(p99, 99),
-                    xytext=(-10, 9) if above else (10, -16), textcoords="offset points",
-                    ha="right" if above else "left", va="bottom" if above else "top",
-                    color=INK, fontsize=11.5, zorder=5)
+    # Label each p99 dot in place, centred above it.
+    for p99, label in p99_points:
+        ax.annotate(f"{label}\n{fmt_ms(p99)}", xy=(p99, 99), xytext=(0, 11),
+                    textcoords="offset points", ha="center", va="bottom",
+                    linespacing=1.25, color=INK, fontsize=11.5, fontweight="bold",
+                    zorder=5)
 
     fig.subplots_adjust(left=LEFT, right=0.97, top=0.95, bottom=0.14)
     fig.savefig(args.output, facecolor=SURFACE)
