@@ -4178,10 +4178,14 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Table chains whose last current version a passive pass retired
     /// (`RowVersion::retired_at`). The passive checkpoint's finalize drains
     /// this and drops the retired versions once no reader can see them,
-    /// instead of sweeping every chain in the store to find them.
-    retired_table_chains: Mutex<Vec<RowID>>,
+    /// instead of sweeping every chain in the store to find them. Each entry
+    /// carries the chain itself so the drain pass skips the skiplist lookup;
+    /// the map entry is looked up only to unlink an emptied chain, guarded by
+    /// pointer identity against a removed-and-reinserted row.
+    retired_table_chains: Mutex<Vec<(RowID, RowVersions<A>)>>,
     /// Index counterpart of `retired_table_chains`.
-    retired_index_chains: Mutex<Vec<(MVTableId, Arc<SortableIndexKey>)>>,
+    #[allow(clippy::type_complexity)]
+    retired_index_chains: Mutex<Vec<(MVTableId, Arc<SortableIndexKey>, RowVersions<A>)>>,
     /// Allocator backing every skiplist in this store, including lazily
     /// created per-index maps in `index_rows`.
     alloc: A,
@@ -7521,16 +7525,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Queue table chains whose last current version was just retired, for
     /// the passive finalize's targeted drop pass (`drop_retired_chains`).
-    pub(crate) fn record_retired_table_chains(&self, retired: Vec<RowID>) {
+    pub(crate) fn record_retired_table_chains(&self, retired: Vec<(RowID, RowVersions<A>)>) {
         if !retired.is_empty() {
             self.retired_table_chains.lock().extend(retired);
         }
     }
 
     /// Index counterpart of [`Self::record_retired_table_chains`].
+    #[allow(clippy::type_complexity)]
     pub(crate) fn record_retired_index_chains(
         &self,
-        retired: Vec<(MVTableId, Arc<SortableIndexKey>)>,
+        retired: Vec<(MVTableId, Arc<SortableIndexKey>, RowVersions<A>)>,
     ) {
         if !retired.is_empty() {
             self.retired_index_chains.lock().extend(retired);
@@ -7556,17 +7561,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dropped = 0;
 
         let table_chains = std::mem::take(&mut *self.retired_table_chains.lock());
-        let mut requeue_tables: Vec<RowID> = Vec::new();
+        let mut requeue_tables: Vec<(RowID, RowVersions<A>)> = Vec::new();
         let mut nominated: Vec<RowVersions<A>> = Vec::new();
-        for row_id in table_chains {
-            let Some(entry) = self.rows.get(&row_id) else {
-                continue;
-            };
+        for (row_id, chain) in table_chains {
             if self.rootpage_gc_protected(&row_id.table_id, min_reader_mark) {
-                requeue_tables.push(row_id);
+                requeue_tables.push((row_id, chain));
                 continue;
             }
-            let mut versions = entry.value().write();
+            let mut versions = chain.write();
             let (chain_dropped, retire_candidate) = Self::gc_version_chain_with_retire(
                 &mut versions,
                 lwm,
@@ -7580,15 +7582,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let empty = versions.is_empty();
             drop(versions);
             if empty {
-                entry.remove();
+                // Unlink the emptied chain's map slot. This is the one place
+                // the drain needs a map lookup; pointer identity guards
+                // against unlinking a slot the row was re-inserted into.
+                if let Some(entry) = self.rows.get(&row_id) {
+                    if Arc::ptr_eq(entry.value(), &chain) {
+                        entry.remove();
+                    }
+                }
             } else {
                 if retire_candidate {
-                    nominated.push(entry.value().clone());
+                    nominated.push(chain.clone());
                 }
                 // A nominated chain holds a materialized current version, so
                 // `awaits_more` already covers it for requeueing.
                 if awaits_more {
-                    requeue_tables.push(row_id);
+                    requeue_tables.push((row_id, chain));
                 }
             }
         }
@@ -7598,20 +7607,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
 
         let index_chains = std::mem::take(&mut *self.retired_index_chains.lock());
-        let mut requeue_indexes: Vec<(MVTableId, Arc<SortableIndexKey>)> = Vec::new();
+        let mut requeue_indexes: Vec<(MVTableId, Arc<SortableIndexKey>, RowVersions<A>)> =
+            Vec::new();
         let mut nominated: Vec<RowVersions<A>> = Vec::new();
-        for (index_id, key) in index_chains {
-            let Some(outer_entry) = self.index_rows.get(&index_id) else {
-                continue;
-            };
+        for (index_id, key, chain) in index_chains {
             if self.rootpage_gc_protected(&index_id, min_reader_mark) {
-                requeue_indexes.push((index_id, key));
+                requeue_indexes.push((index_id, key, chain));
                 continue;
             }
-            let Some(inner_entry) = outer_entry.value().get(&key) else {
-                continue;
-            };
-            let mut versions = inner_entry.value().write();
+            let mut versions = chain.write();
             let (chain_dropped, retire_candidate) = Self::gc_version_chain_with_retire(
                 &mut versions,
                 lwm,
@@ -7625,15 +7629,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let empty = versions.is_empty();
             drop(versions);
             if empty {
-                self.bump_index_rows_epoch();
-                inner_entry.remove();
+                // Same as the table loop: map lookup only to unlink, guarded
+                // by pointer identity.
+                if let Some(outer_entry) = self.index_rows.get(&index_id) {
+                    if let Some(inner_entry) = outer_entry.value().get(&key) {
+                        if Arc::ptr_eq(inner_entry.value(), &chain) {
+                            self.bump_index_rows_epoch();
+                            inner_entry.remove();
+                        }
+                    }
+                }
             } else {
                 if retire_candidate {
-                    nominated.push(inner_entry.value().clone());
+                    nominated.push(chain.clone());
                 }
                 // Same as the table loop: nomination implies `awaits_more`.
                 if awaits_more {
-                    requeue_indexes.push((index_id, key));
+                    requeue_indexes.push((index_id, key, chain));
                 }
             }
         }
@@ -7735,7 +7747,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Retirements are applied clock-ordered in bounded batches (see
         // `retire_nominated_chains_clock_ordered`); the clock cost is paid
         // per batch of actual retirements, not per swept chain.
-        let mut retired: Vec<RowID> = Vec::new();
+        let mut retired: Vec<(RowID, RowVersions<A>)> = Vec::new();
         let mut nominated: Vec<RowVersions<A>> = Vec::new();
 
         // Resume strictly after the last key processed by the previous pass.
@@ -7769,7 +7781,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // so hand both retire candidates and emptied chains to
                     // its queue.
                     if retire_candidate || was_empty {
-                        retired.push(entry.key().clone());
+                        retired.push((entry.key().clone(), entry.value().clone()));
                     }
                 } else {
                     let mut versions = entry.value().write();
@@ -7858,7 +7870,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
         // Retirements are applied clock-ordered in bounded batches; see
         // `retire_nominated_chains_clock_ordered`.
-        let mut retired: Vec<(MVTableId, Arc<SortableIndexKey>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut retired: Vec<(MVTableId, Arc<SortableIndexKey>, RowVersions<A>)> = Vec::new();
         let mut nominated: Vec<RowVersions<A>> = Vec::new();
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
         // WAL frames — a db-file reader (present or future) needs the version-store copy.
@@ -7911,7 +7924,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // Same as the table sweep: retire candidates and emptied
                     // chains go to the finalize queue.
                     if retire_candidate || was_empty {
-                        retired.push((index_id, inner_entry.key().clone()));
+                        retired.push((
+                            index_id,
+                            inner_entry.key().clone(),
+                            inner_entry.value().clone(),
+                        ));
                     }
                 } else {
                     let mut versions = inner_entry.value().write();
@@ -8000,7 +8017,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
 
-        let mut retired: Vec<RowID> = Vec::new();
+        let mut retired: Vec<(RowID, RowVersions<A>)> = Vec::new();
         let mut nominated: Vec<RowVersions<A>> = Vec::new();
         for entry in self.rows.iter() {
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
@@ -8022,7 +8039,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             drop(versions);
             if retire_candidate {
                 nominated.push(entry.value().clone());
-                retired.push(entry.key().clone());
+                retired.push((entry.key().clone(), entry.value().clone()));
             }
             if remove_empty_slots && empty {
                 entry.remove();
@@ -8055,7 +8072,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
 
-        let mut retired: Vec<(MVTableId, Arc<SortableIndexKey>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut retired: Vec<(MVTableId, Arc<SortableIndexKey>, RowVersions<A>)> = Vec::new();
         let mut nominated: Vec<RowVersions<A>> = Vec::new();
         for outer_entry in self.index_rows.iter() {
             // GC floor: retain a freshly-materialized index not yet visible to all readers.
@@ -8080,7 +8098,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 drop(versions);
                 if retire_candidate {
                     nominated.push(inner_entry.value().clone());
-                    retired.push((*outer_entry.key(), inner_entry.key().clone()));
+                    retired.push((
+                        *outer_entry.key(),
+                        inner_entry.key().clone(),
+                        inner_entry.value().clone(),
+                    ));
                 }
                 if remove_empty_slots && empty {
                     self.bump_index_rows_epoch();

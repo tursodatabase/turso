@@ -1829,7 +1829,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // revisit them. Nomination implies a materialized current,
                 // so `awaits` covers the nominated chains too.
                 if awaits {
-                    retired.push(row_id.clone());
+                    retired.push((row_id.clone(), entry.value().clone()));
                 }
             } else {
                 // The MVCC metadata table row (persistent_tx_ts_max) is staged
@@ -1919,7 +1919,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Same as the table GC above: queue what a later targeted
                 // finalize can reclaim; nomination implies `awaits`.
                 if awaits {
-                    retired.push((index_id, sortable_key.clone()));
+                    retired.push((index_id, sortable_key.clone(), inner_entry.value().clone()));
                 }
             }
             processed += 1;
