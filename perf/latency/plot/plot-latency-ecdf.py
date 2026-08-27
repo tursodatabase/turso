@@ -12,7 +12,7 @@ below it up the y axis. A marker sits on each curve at p50 and p90, and a
 dashed vertical line labelled with the value marks its p99.9. A curve's
 right-hand end is its slowest transaction.
 
-Each connection count gets its own panel, two to a row with shared axes,
+Each connection count gets its own panel, side by side with shared axes,
 so the engines are compared within a panel and the effect of concurrency
 is read across panels. One file per engine and count, as `bench.sh`
 writes them, plain or gzipped.
@@ -32,14 +32,14 @@ from pathlib import Path
 
 import numpy as np
 
-# Paul Tol's "vibrant" cycle, which the SciencePlots style below installs:
-# colour-blind safe and legible in greyscale. `tikz_mark` is the pgfplots
-# name of the matplotlib `marker`.
+# The Okabe-Ito palette: colour-blind safe, legible in greyscale, and what
+# gnuplot draws with by default, so it looks like the systems papers a
+# reader knows. `tikz_mark` is the pgfplots name of the matplotlib `marker`.
 ENGINES = {
-    "sqlite": {"name": "SQLite", "color": "#CC3311", "marker": "s", "tikz_mark": "square*"},
-    "turso": {"name": "Turso", "color": "#0077BB", "marker": "o", "tikz_mark": "*"},
+    "sqlite": {"name": "SQLite", "color": "#E69F00", "marker": "s", "tikz_mark": "square*"},
+    "turso": {"name": "Turso", "color": "#0072B2", "marker": "o", "tikz_mark": "*"},
 }
-FALLBACK_COLORS = ["#009988", "#EE7733", "#33BBEE"]
+FALLBACK_COLORS = ["#009E73", "#D55E00", "#CC79A7"]
 FALLBACK_MARKERS = [("^", "triangle*"), ("D", "diamond*"), ("v", "triangle*")]
 
 # Percentiles that get a marker on the curve.
@@ -117,9 +117,9 @@ class Figure:
         # the top up to a decade can leave most of a panel empty.
         self.xmin = 10 ** np.floor(np.log10(max(lo, 1e-3)))
         self.xmax = hi * 1.5
-        # Panels go two to a row.
-        self.ncols = min(2, len(self.panels))
-        self.nrows = -(-len(self.panels) // self.ncols)
+        # Panels go in one row.
+        self.ncols = len(self.panels)
+        self.nrows = 1
 
     def legend_entries(self):
         """One (label, curve) per engine and mode, in first-seen order."""
@@ -138,10 +138,10 @@ class Figure:
         from matplotlib.lines import Line2D
         from matplotlib.ticker import FuncFormatter, LogLocator, NullLocator
 
-        plt.style.use(["science", "no-latex", "vibrant"])
+        plt.style.use(["science", "no-latex"])
 
         ncols, nrows = self.ncols, self.nrows
-        fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, 2.6 * nrows), dpi=300,
+        fig, axes = plt.subplots(nrows, ncols, figsize=(2.9 * ncols, 2.6 * nrows), dpi=300,
                                  sharex=True, sharey=True, squeeze=False)
         for ax, (connections, curves) in zip(axes.flat, self.panels):
             ax.set_xscale("log")
