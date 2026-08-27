@@ -53,8 +53,9 @@ struct Args {
     #[arg(
         short = 'c',
         long = "connections",
-        default_value = "4",
-        help = "Connections serving the arriving transactions"
+        default_value = "1",
+        help = "Connections serving the arriving transactions. One connection isolates \
+                what the engine does to a writer's latency; more adds lock contention"
     )]
     connections: usize,
 

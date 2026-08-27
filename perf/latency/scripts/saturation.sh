@@ -9,7 +9,7 @@ cargo build --release -p txn-latency
 RELEASE_DIR="$("$(git rev-parse --show-toplevel)/scripts/cargo-target-dir")/release"
 BIN="$RELEASE_DIR/txn-latency"
 
-CONNECTIONS=${CONNECTIONS:-4}
+CONNECTIONS=${CONNECTIONS:-1}
 BATCH_SIZE=${BATCH_SIZE:-10}
 DURATION=${DURATION:-20}
 WARMUP=${WARMUP:-3}

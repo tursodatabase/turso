@@ -3,9 +3,13 @@
 Measures how long a write transaction takes, from the moment it should have
 started to the moment it commits, for SQLite and Turso under the same load.
 
-A pool of connections runs small write transactions against one database.
+A single connection runs small write transactions against one database.
 Transactions arrive on a fixed schedule set by `--rate`, and that schedule does
-not slow down when the database does.
+not slow down when the database does. One connection keeps the comparison
+about what each engine does to its writer, such as checkpoints that stall
+SQLite's commit path but run in the background in Turso, instead of about
+writers contending with each other. `--connections` raises the count when
+contention is the question.
 
 ## Running
 
@@ -54,7 +58,7 @@ throughput benchmark wants and what a latency benchmark should not report.
 | `--engine` | `sqlite` or `turso` |
 | `--mode` | `immediate` (WAL, `BEGIN IMMEDIATE`) or `concurrent` (MVCC, `BEGIN CONCURRENT`, passive checkpointing). Turso defaults to `concurrent`, SQLite only has `immediate` |
 | `--rate` | Transactions offered per second |
-| `--connections` | Connections serving the arrivals |
+| `--connections` | Connections serving the arrivals, default 1 |
 | `--batch-size` | Rows inserted per transaction |
 | `--duration`, `--warmup` | Seconds measured and seconds discarded |
 | `--closed-loop` | Offer the next transaction only when the previous one finishes |
