@@ -16,7 +16,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter, LogLocator, NullLocator
 
 SURFACE = "#fcfcfb"
@@ -99,8 +98,6 @@ def main():
     parser.add_argument("csv_files", nargs="+", type=Path)
     parser.add_argument("--column", default="total_ns", choices=sorted(COLUMN_LABELS))
     parser.add_argument("-o", "--output", default="latency-ecdf.png", type=Path)
-    parser.add_argument("--title", default=None,
-                        help="chart title (default: built from the column name)")
     args = parser.parse_args()
 
     series = {}
@@ -121,7 +118,7 @@ def main():
         }
     )
 
-    fig, ax = plt.subplots(figsize=(9, 5.4), dpi=200)
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=200)
     fig.patch.set_facecolor(SURFACE)
     ax.set_facecolor(SURFACE)
 
@@ -131,9 +128,7 @@ def main():
     ax.set_axisbelow(True)
 
     lo, hi = np.inf, 0.0
-    counts = set()
-    connections_seen = set()
-    legend_handles = []
+    p99_points = []
     for index, ((engine, mode, connections), samples) in enumerate(sorted(series.items())):
         color = color_for(engine, index)
         label = label_for(engine, mode, modes_per_engine)
@@ -141,35 +136,24 @@ def main():
         ax.plot(x, y, color=color, linewidth=2.2, zorder=3, solid_capstyle="round",
                 solid_joinstyle="round")
 
-        # The p99 value goes in the legend rather than as text next to the
-        # marker: with several series the markers sit at the same height and
-        # their labels overlap.
         p99 = float(np.percentile(samples, 99))
         ax.plot([p99], [99], marker="o", markersize=8, color=color,
                 markeredgecolor=SURFACE, markeredgewidth=2, zorder=4)
-        legend_handles.append(Line2D([], [], color=color, linewidth=2.2, marker="o",
-                                     markersize=7, markeredgecolor=SURFACE,
-                                     markeredgewidth=1.5,
-                                     label=f"{label}   p99 {fmt_ms(p99)}"))
+        p99_points.append((p99, label))
 
         lo = min(lo, float(np.min(samples)))
         hi = max(hi, float(np.max(samples)))
-        counts.add(samples.size)
-        connections_seen.add(connections)
 
-    ax.set_ylabel("Transactions finished within this latency", color=INK,
-                  fontsize=11.5, labelpad=12)
+    ax.set_ylabel("Transactions (%)", color=INK, fontsize=12, labelpad=12)
 
     ax.set_xlim(10 ** np.floor(np.log10(max(lo, 1e-3))), 10 ** np.ceil(np.log10(hi)))
-    ax.set_xlabel(f"{COLUMN_LABELS[args.column]} in milliseconds (log scale)",
-                  color=INK, fontsize=12, labelpad=12)
+    ax.set_xlabel(f"{COLUMN_LABELS[args.column]} (ms)", color=INK, fontsize=12, labelpad=12)
     ax.xaxis.set_major_locator(LogLocator(base=10, numticks=12))
     ax.xaxis.set_minor_locator(NullLocator())
     ax.xaxis.set_major_formatter(FuncFormatter(fmt_tick))
 
-    ax.set_ylim(0, 104)
+    ax.set_ylim(0, 107)
     ax.set_yticks([0, 25, 50, 75, 100])
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}%"))
     ax.tick_params(colors=MUTED, labelcolor=MUTED, length=0, pad=8, labelsize=10.5)
     ax.tick_params(which="minor", length=0)
 
@@ -178,26 +162,19 @@ def main():
     ax.spines["bottom"].set_color(AXIS)
     ax.spines["bottom"].set_linewidth(1)
 
-    # Title and subtitle live in the figure, above the axes, flush with
-    # the plot's left edge.
     LEFT = 0.105
-    title = args.title or f"{COLUMN_LABELS[args.column]}: " + " vs ".join(
-        h.get_label().split("   ")[0] for h in legend_handles)
-    n = ", ".join(f"{c:,}" for c in sorted(counts))
-    conns = ", ".join(sorted(connections_seen, key=int))
-    subtitle = (f"{n} transactions per engine, {conns} concurrent connections. "
-                "Higher and further left is better.")
-    fig.text(LEFT, 0.955, title, ha="left", va="top", color=INK, fontsize=15,
-             fontweight="semibold")
-    fig.text(LEFT, 0.905, subtitle, ha="left", va="top", color=MUTED, fontsize=10.5)
 
-    legend = ax.legend(handles=legend_handles, loc="lower right", frameon=False,
-                       fontsize=11.5, handlelength=2.4, handletextpad=0.9,
-                       labelspacing=0.7, borderaxespad=0.6)
-    for text in legend.get_texts():
-        text.set_color(INK)
+    # Label each p99 dot in place. The dots all sit at 99%, so the labels
+    # alternate sides: the fastest series goes above-left of its dot, the next
+    # below-right, and so on, so neighbouring labels never overprint.
+    for i, (p99, label) in enumerate(sorted(p99_points)):
+        above = i % 2 == 0
+        ax.annotate(f"{label}  p99 {fmt_ms(p99)}", xy=(p99, 99),
+                    xytext=(-10, 9) if above else (10, -16), textcoords="offset points",
+                    ha="right" if above else "left", va="bottom" if above else "top",
+                    color=INK, fontsize=11.5, zorder=5)
 
-    fig.subplots_adjust(left=LEFT, right=0.97, top=0.82, bottom=0.14)
+    fig.subplots_adjust(left=LEFT, right=0.97, top=0.95, bottom=0.14)
     fig.savefig(args.output, facecolor=SURFACE)
     print(f"wrote {args.output}")
 
