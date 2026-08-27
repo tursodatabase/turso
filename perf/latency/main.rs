@@ -118,6 +118,13 @@ struct Args {
 
     #[arg(long = "db", help = "Database path")]
     db_path: Option<String>,
+
+    #[arg(
+        long = "io",
+        default_value = "syscall",
+        help = "Turso IO backend: syscall or io_uring (Linux only). SQLite ignores this"
+    )]
+    io: String,
 }
 
 /// One transaction's latency, split into the phases a writer goes through.
@@ -142,6 +149,8 @@ pub struct Config {
     pub duration: Duration,
     pub timeout: Duration,
     pub mode: TxnMode,
+    /// Turso IO backend name, as accepted by `turso::Builder::with_io`.
+    pub io: String,
     /// Time between arrivals, or `None` in closed-loop mode.
     pub period: Option<Duration>,
     pub max_overrun: f64,
@@ -293,6 +302,7 @@ fn main() {
         duration: Duration::from_secs(args.duration),
         timeout: Duration::from_millis(args.timeout),
         mode,
+        io: args.io,
         period: if args.closed_loop {
             None
         } else {
