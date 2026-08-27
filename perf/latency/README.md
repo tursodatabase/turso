@@ -64,6 +64,7 @@ throughput benchmark wants and what a latency benchmark should not report.
 | `--closed-loop` | Offer the next transaction only when the previous one finishes |
 | `--max-overrun` | Give up once the run takes this many times longer than planned |
 | `--io` | Turso IO backend, `syscall` (default) or `io_uring` (Linux only). SQLite ignores it |
+| `--checkpoint-mode` | Turso MVCC auto-checkpoint mode, `passive` (default) or `truncate`. SQLite ignores it |
 
 Both engines run with `synchronous = FULL`, so every commit pays for an fsync
 and the comparison is between the durability paths rather than between two

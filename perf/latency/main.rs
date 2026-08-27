@@ -43,6 +43,15 @@ impl TxnMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CheckpointMode {
+    /// Checkpoint without blocking other connections. Row versions already
+    /// written to the B-tree stay in memory until a later GC pass.
+    Passive,
+    /// Blocking checkpoint that drops row versions once they are in the B-tree.
+    Truncate,
+}
+
 #[derive(Parser)]
 #[command(name = "txn-latency")]
 #[command(about = "Write transaction latency benchmark for SQLite and Turso")]
@@ -121,6 +130,13 @@ struct Args {
     db_path: Option<String>,
 
     #[arg(
+        long = "checkpoint-mode",
+        default_value = "passive",
+        help = "Turso MVCC auto-checkpoint mode in concurrent mode. SQLite ignores this"
+    )]
+    checkpoint_mode: CheckpointMode,
+
+    #[arg(
         long = "io",
         default_value = "syscall",
         help = "Turso IO backend: syscall or io_uring (Linux only). SQLite ignores this"
@@ -152,6 +168,7 @@ pub struct Config {
     pub mode: TxnMode,
     /// Turso IO backend name, as accepted by `turso::Builder::with_io`.
     pub io: String,
+    pub checkpoint_mode: CheckpointMode,
     /// Time between arrivals, or `None` in closed-loop mode.
     pub period: Option<Duration>,
     pub max_overrun: f64,
@@ -304,6 +321,7 @@ fn main() {
         timeout: Duration::from_millis(args.timeout),
         mode,
         io: args.io,
+        checkpoint_mode: args.checkpoint_mode,
         period: if args.closed_loop {
             None
         } else {

@@ -1,4 +1,4 @@
-use crate::{Config, Pacer, Run, Sample, TxnMode};
+use crate::{CheckpointMode, Config, Pacer, Run, Sample, TxnMode};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -56,8 +56,9 @@ pub fn run(config: &Config) -> Run {
     let elapsed = pacer.elapsed();
 
     eprintln!(
-        "[turso] io backend {}, {} transaction restarts",
+        "[turso] io backend {}, checkpoint mode {:?}, {} transaction restarts",
         config.io,
+        config.checkpoint_mode,
         restarts.load(Ordering::Relaxed)
     );
 
@@ -176,9 +177,11 @@ async fn wait_until(deadline: Instant) {
 
 async fn setup(config: &Config) -> Database {
     let builder = Builder::new_local(&config.db_path).with_io(config.io.as_str());
-    let builder = match config.mode {
-        TxnMode::Concurrent => builder.experimental_mvcc_passive_checkpoint(true),
-        TxnMode::Immediate => builder,
+    let builder = match (config.mode, config.checkpoint_mode) {
+        (TxnMode::Concurrent, CheckpointMode::Passive) => {
+            builder.experimental_mvcc_passive_checkpoint(true)
+        }
+        (TxnMode::Concurrent, CheckpointMode::Truncate) | (TxnMode::Immediate, _) => builder,
     };
     let db = builder.build().await.unwrap();
 
