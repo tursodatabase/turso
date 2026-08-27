@@ -8,8 +8,8 @@ Usage: uv run plot-latency-ecdf.py sqlite-c*.csv turso-c*.csv [--column total_ns
 
 Latency along the x axis on a log scale, the share of transactions at or
 below it up the y axis. A marker sits on each curve at p50 and p90, and a
-dashed vertical line marks its p99.9. A curve's right-hand end is its
-slowest transaction.
+dashed vertical line labelled with the value marks its p99.9. A curve's
+right-hand end is its slowest transaction.
 
 Each connection count gets its own panel, laid out in a grid with shared
 axes, so the engines are compared within a panel and the effect of
@@ -107,6 +107,15 @@ def fmt_ms(value, _pos=None):
     return f"{value:g}"
 
 
+def fmt_value(value):
+    """A measured value with a sensible number of digits: 0.83, 9.1, 329."""
+    if value >= 100:
+        return f"{value:,.0f}"
+    if value >= 10:
+        return f"{value:.1f}"
+    return f"{value:.2g}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv_files", nargs="+", type=Path)
@@ -148,9 +157,16 @@ def main():
             ax.plot(np.percentile(samples, PERCENTILES), PERCENTILES, linestyle="none",
                     marker=look["marker"], markersize=4, color=look["color"],
                     markeredgewidth=1.0, zorder=4)
-            # The tail, as a vertical line at p99.9.
-            ax.axvline(float(np.percentile(samples, 99.9)), color=look["color"],
-                       linewidth=0.9, linestyle=TAIL_STYLE, zorder=2)
+            # The tail, as a vertical line at p99.9 with its value written
+            # along it. Each engine gets its own half of the height, so the
+            # labels stay apart when the lines fall on the same spot.
+            tail = float(np.percentile(samples, 99.9))
+            ax.axvline(tail, color=look["color"], linewidth=0.9, linestyle=TAIL_STYLE,
+                       zorder=2)
+            y, va = (45, "top") if index == 0 else (55, "bottom")
+            ax.annotate(f"p99.9 = {fmt_value(tail)} ms", xy=(tail, y), xytext=(-3, 0),
+                        textcoords="offset points", rotation=90, ha="right", va=va,
+                        color=look["color"], fontsize=6.5, zorder=5)
             label = label_for(look, mode, modes_per_engine[engine])
             handles.setdefault(label, Line2D(
                 [], [], color=look["color"], linewidth=1.3, marker=look["marker"],
@@ -174,10 +190,7 @@ def main():
     for ax in axes[:, 0]:
         ax.set_ylabel("Transactions (%)")
 
-    legend_handles = list(handles.values()) + [
-        Line2D([], [], color="0.35", linewidth=0.9, linestyle=TAIL_STYLE, label="p99.9"),
-    ]
-    ax0.legend(handles=legend_handles, loc="lower right", frameon=False,
+    ax0.legend(handles=list(handles.values()), loc="lower right", frameon=False,
                handlelength=2.4)
 
     fig.savefig(args.output, bbox_inches="tight")
