@@ -3156,11 +3156,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
     /// rows whose live-at-snapshot state is a delete.
     fn merge_mvcc_delta(&mut self) {
         let snapshot_ts = self.snapshot_ts;
-        for entry in self.mvstore.rows.iter() {
+        // Range over the sqlite_schema table's keys only. Iterating the whole
+        // row map to filter by table id made every checkpoint scan every row
+        // in the store just to find a handful of schema rows.
+        let schema_rows = RowID {
+            table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
+            row_id: RowKey::Int(i64::MIN),
+        }..=RowID {
+            table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
+            row_id: RowKey::Int(i64::MAX),
+        };
+        for entry in self.mvstore.rows.range(schema_rows) {
             let key = entry.key();
-            if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                continue;
-            }
             let rowid = key.row_id.to_int_or_panic();
             let versions = entry.value().read();
             let present = versions.iter().find(|version| {
