@@ -188,6 +188,11 @@ async fn setup(config: &Config) -> Database {
     let conn = db.connect().unwrap();
     if config.mode == TxnMode::Concurrent {
         conn.pragma_update("journal_mode", "mvcc").await.unwrap();
+        if let Some(threshold) = config.mvcc_checkpoint_threshold {
+            conn.pragma_update("mvcc_checkpoint_threshold", threshold)
+                .await
+                .unwrap();
+        }
     }
     conn.execute("PRAGMA synchronous = FULL", ()).await.unwrap();
     conn.execute(

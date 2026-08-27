@@ -137,6 +137,12 @@ struct Args {
     checkpoint_mode: CheckpointMode,
 
     #[arg(
+        long = "mvcc-checkpoint-threshold",
+        help = "Bytes of logical log between Turso MVCC auto-checkpoints (default 4120000). SQLite ignores this"
+    )]
+    mvcc_checkpoint_threshold: Option<i64>,
+
+    #[arg(
         long = "io",
         default_value = "syscall",
         help = "Turso IO backend: syscall or io_uring (Linux only). SQLite ignores this"
@@ -169,6 +175,7 @@ pub struct Config {
     /// Turso IO backend name, as accepted by `turso::Builder::with_io`.
     pub io: String,
     pub checkpoint_mode: CheckpointMode,
+    pub mvcc_checkpoint_threshold: Option<i64>,
     /// Time between arrivals, or `None` in closed-loop mode.
     pub period: Option<Duration>,
     pub max_overrun: f64,
@@ -322,6 +329,7 @@ fn main() {
         mode,
         io: args.io,
         checkpoint_mode: args.checkpoint_mode,
+        mvcc_checkpoint_threshold: args.mvcc_checkpoint_threshold,
         period: if args.closed_loop {
             None
         } else {
