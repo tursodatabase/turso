@@ -225,3 +225,41 @@ fn test_alter_add_generated_column_succeeds_with_flag() {
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_alter_table_add_column_preserves_collation_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join("alter_table_add_col_collate_reopen.db");
+
+    // Session 1: create table with collate nocase column, insert value, then add another column
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE tbl (col1 TEXT COLLATE NOCASE)")
+            .unwrap();
+        conn.execute("INSERT INTO tbl VALUES ('ABC')").unwrap();
+        conn.execute("ALTER TABLE tbl ADD COLUMN extra TEXT")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    // Session 2: reopen connection and check if collation property still holds
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let col_schema: Vec<(String,)> =
+            conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'tbl'");
+        assert_eq!(
+            col_schema,
+            vec![("CREATE TABLE tbl (col1 TEXT COLLATE NOCASE, extra TEXT)".to_string(),)]
+        );
+
+        let check_collate_res: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM tbl WHERE col1 = 'abc'");
+        assert_eq!(check_collate_res, vec![(1,)]);
+        conn.close().unwrap();
+    }
+}

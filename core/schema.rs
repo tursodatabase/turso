@@ -3649,6 +3649,7 @@ impl BTreeTable {
                     sql.push_str("[]");
                 }
             }
+
             if column.notnull()
                 && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
             {
@@ -3668,6 +3669,22 @@ impl BTreeTable {
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
                 sql.push_str(&default.to_string());
+            }
+
+            if let Some(collation) = column.collation_opt() {
+                match collation {
+                    CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
+                    CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
+                    CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
+                    CollationSeq::Locale(_) => {
+                        sql.push_str(" COLLATE ");
+                        sql.push_str(&quote_ident(&collation.name()));
+                    }
+                    CollationSeq::Unset | CollationSeq::Custom(_) => {
+                        // Unset should not be reachable -- ignore it
+                        // Custom collation is not allowed in schema definitions
+                    }
+                };
             }
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
