@@ -517,10 +517,15 @@ class LibSQLClient implements Client {
   }
 
   reconnect(): void {
+    const wasOpen = !this._closed;
     this._closed = false;
-    this.session.close().catch(error => {
-      console.error('Error closing session during reconnect:', error);
-    });
+
+    if (wasOpen) {
+      this.session.close().catch(error => {
+        console.error('Error closing session during reconnect:', error);
+      });
+    }
+
     this.session = new Session(this.sessionConfig);
   }
 }
