@@ -52,7 +52,7 @@ the tail's shape at two concurrency levels, and the trend across all of them.
 
 ```console
 cd plot
-uv run plot-latency-ecdf.py sqlite-c{1,2,4,8}.csv turso-c{1,2,4,8}.csv
+uv run plot-latency-ecdf.py sqlite-c{1,8}.csv turso-c{1,8}.csv
 uv run plot-latency-percentiles.py sqlite-c*.csv turso-c*.csv
 ```
 
