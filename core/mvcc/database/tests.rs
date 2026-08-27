@@ -609,9 +609,58 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     );
     assert_eq!(current.len(), 1);
 
+    // Passive with Rule 3 on retires the current version instead of dropping it:
+    // it stays in the chain for transactions that began at or before the retire
+    // timestamp, and is removed once the LWM has moved past that timestamp.
+    let mut current = stamped_insert();
+    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+        &mut current,
+        10,
+        10,
+        true,
+        frame(100),
+        true,
+        Some(40),
+    );
+    assert_eq!(dropped, 0, "Passive retires a materialized current version");
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].retired_at(), Some(40));
+    assert_eq!(
+        current[0].end(),
+        None,
+        "a retired version still reads as current"
+    );
+    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+        &mut current,
+        40,
+        10,
+        true,
+        frame(100),
+        true,
+        Some(41),
+    );
+    assert_eq!(
+        dropped, 0,
+        "a transaction with begin_ts == retire ts may still see the version"
+    );
+    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+        &mut current,
+        41,
+        10,
+        true,
+        frame(100),
+        true,
+        Some(42),
+    );
+    assert_eq!(
+        dropped, 1,
+        "retired version is removed once the LWM passes it"
+    );
+    assert!(current.is_empty());
+
     let mut current = stamped_insert();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), true);
+        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, false, frame(100), true);
     assert_eq!(
         dropped, 1,
         "Truncate may drop the current SkipMap version once it is in the B-tree"
@@ -929,9 +978,13 @@ fn passive_reader_snapshot_survives_later_write_after_row_versions_gc() {
     // blocking protocol regardless of `experimental_mvcc_passive_checkpoint`): this
     // materializes row 1 into the B-tree and runs Passive Finalize GC on it.
     conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
-    assert!(
-        mv.debug_gc_snapshot().rows_versions > 0,
-        "row 1's current version must survive Passive Finalize (Rule 3 off)"
+    // Passive GC retires row 1's version once the B-tree has it, and with no
+    // transaction open the Finalize sweep reclaims it right away (see
+    // `RowVersion::retired_at`). The reader below must not notice either way.
+    assert_eq!(
+        mv.debug_gc_snapshot().rows_versions,
+        0,
+        "with no reader open, Passive Finalize reclaims the materialized version"
     );
 
     // Reader opens a snapshot BEFORE any further write.
@@ -956,6 +1009,82 @@ fn passive_reader_snapshot_survives_later_write_after_row_versions_gc() {
     assert_eq!(
         after, before,
         "reader's snapshot must not change mid-transaction"
+    );
+}
+
+/// Passive GC retires a materialized current version instead of dropping it: a
+/// transaction that began before the retirement keeps reading it from the
+/// chain, a transaction that begins after reads the same value from the B-tree,
+/// and the version is reclaimed once the older transaction has ended, so the
+/// version store stops growing.
+#[test]
+fn passive_retired_version_serves_older_reader_and_is_reclaimed_after() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+        .unwrap();
+    // Passive auto-checkpoint on every commit.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    // Older reader: its snapshot predates the retirement below.
+    let older = db.connect();
+    older.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&older, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]]
+    );
+
+    // This commit's checkpoint materializes row 1 and retires its version. The
+    // retired version must stay while the older reader can still see it.
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert!(
+        mv.debug_gc_snapshot().rows_versions > 0,
+        "versions an open transaction can see are retired, not removed"
+    );
+
+    // A newer reader reads row 1 from the B-tree and sees the same value.
+    let newer = db.connect();
+    assert_eq!(
+        get_rows(&newer, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]]
+    );
+
+    // A newer write lands on top of the retired version; both readers keep
+    // their own view.
+    conn.execute("UPDATE t SET v = 11 WHERE id = 1").unwrap();
+    assert_eq!(
+        get_rows(&older, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]],
+        "older reader keeps seeing the retired version"
+    );
+    assert_eq!(
+        get_rows(&newer, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(11)]],
+        "newer reader sees the update"
+    );
+    older.execute("COMMIT").unwrap();
+
+    // With no open transaction left that can see them, the next checkpoints
+    // reclaim every retired version.
+    conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        mv.debug_gc_snapshot().rows_versions,
+        0,
+        "retired versions are reclaimed once nobody can see them"
+    );
+    assert_eq!(
+        get_rows(&newer, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(11)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
+            vec![Value::from_i64(3), Value::from_i64(30)],
+            vec![Value::from_i64(4), Value::from_i64(40)],
+        ],
+        "all rows are served from the B-tree after reclaim"
     );
 }
 
