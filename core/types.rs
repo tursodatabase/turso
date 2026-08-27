@@ -3443,6 +3443,11 @@ impl IOCompletions {
         self.0.is_explicit_yield()
     }
 
+    /// True for a parked wait; see [`Completion::is_wait`].
+    pub fn is_wait(&self) -> bool {
+        self.0.is_wait()
+    }
+
     /// Send abort signal to completions
     pub fn abort(&self) {
         self.0.abort()

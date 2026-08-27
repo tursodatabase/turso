@@ -527,6 +527,17 @@ impl Completion {
         self.inner.is_none()
     }
 
+    /// True for a parked wait (`Completion::new_wait`): no I/O behind it, it
+    /// finishes only when another connection fires the event it waits for.
+    /// Driving the event loop cannot finish it, so waiting on it with
+    /// `IO::step` would spin forever.
+    pub fn is_wait(&self) -> bool {
+        matches!(
+            &self.inner,
+            Some(inner) if matches!(inner.completion_type, CompletionType::Wait)
+        )
+    }
+
     pub fn complete(&self, result: i32) {
         let result = Ok(result);
         self.callback(result);

@@ -1483,12 +1483,21 @@ impl Statement {
         let mut reset_error: Option<LimboError> = None;
 
         if let Some(io) = self.state.io_completions.take() {
-            if let Err(err) = io.wait(self.pager.io.as_ref()) {
-                capture_reset_error(
-                    &mut reset_error,
-                    err,
-                    "Error while draining pending IO during statement reset",
-                );
+            // A parked wait (a commit parked on the commit lock or on the
+            // group fsync) has no I/O behind it: it finishes only when
+            // another connection fires the event, which may never happen
+            // once this statement is being abandoned. Waiting on it here
+            // would spin forever; dropping it is safe — whoever fires the
+            // event later completes a clone, and the abort path below rolls
+            // back or forward-completes the commit itself.
+            if !io.is_wait() {
+                if let Err(err) = io.wait(self.pager.io.as_ref()) {
+                    capture_reset_error(
+                        &mut reset_error,
+                        err,
+                        "Error while draining pending IO during statement reset",
+                    );
+                }
             }
         }
 
