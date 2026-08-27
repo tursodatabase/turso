@@ -184,8 +184,12 @@ struct GroupCommitInner {
     /// True while a group fsync is in flight; committers park instead of
     /// piling more fsyncs onto the device.
     sync_in_flight: bool,
-    /// Committers parked until the durable line or the written line moves.
-    waiters: Vec<Completion>,
+    /// Committers parked with the durability target each one waits for.
+    /// Waking is selective: waking everyone on every append completion made
+    /// 32 parked committers re-check and re-park thousands of times a
+    /// second, and the wakes plus the re-checks burned more CPU than the
+    /// commits themselves.
+    waiters: Vec<(u64, Completion)>,
 }
 
 impl GroupCommitState {
@@ -202,8 +206,10 @@ impl GroupCommitState {
     }
 
     /// Called from an append's pwrite completion. Advances the contiguous
-    /// written line and wakes parked committers so one of them can start the
-    /// next group fsync.
+    /// written line and, when no fsync is in flight, wakes the committers
+    /// the line now covers so one of them starts the next group fsync.
+    /// While an fsync IS in flight nobody is woken: its completion is the
+    /// next event, and it does the waking.
     pub fn append_finished(&self, epoch: u64, start: u64, end: u64) {
         let mut inner = self.inner.lock();
         if self.epoch.load(Ordering::Acquire) != epoch {
@@ -221,20 +227,49 @@ impl GroupCommitState {
         } else {
             inner.finished_above.insert(start, end);
         }
-        Self::wake_waiters(&mut inner);
+        if !inner.sync_in_flight {
+            Self::wake_leader_candidates(&mut inner);
+        }
     }
 
     /// Called from the group fsync's completion: everything written before
     /// the fsync was submitted is now on disk. `epoch` is from submission
     /// time, so a completion straddling a log reset cannot claim durability
-    /// for the new log.
+    /// for the new log. Wakes the committers the fsync covered, plus the
+    /// ones that can lead the next fsync.
     fn sync_finished(&self, epoch: u64, covers: u64) {
         let mut inner = self.inner.lock();
         if self.epoch.load(Ordering::Acquire) == epoch {
             self.durable.fetch_max(covers, Ordering::AcqRel);
         }
         inner.sync_in_flight = false;
-        Self::wake_waiters(&mut inner);
+        let durable = self.durable.load(Ordering::Acquire);
+        inner.waiters.retain(|(target, waiter)| {
+            if *target <= durable {
+                waiter.complete(0);
+                false
+            } else {
+                true
+            }
+        });
+        Self::wake_leader_candidates(&mut inner);
+    }
+
+    /// Wake every parked committer whose bytes the written line covers: each
+    /// can submit the next group fsync, one wins, the rest park again. A
+    /// waiter above the written line stays parked; the append completion
+    /// that advances the line past it wakes it. Callers hold the lock and
+    /// have already checked that no fsync is in flight.
+    fn wake_leader_candidates(inner: &mut GroupCommitInner) {
+        let written = inner.written;
+        inner.waiters.retain(|(target, waiter)| {
+            if *target <= written {
+                waiter.complete(0);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Mark the log tail untrustworthy and wake everyone so they observe it.
@@ -242,7 +277,7 @@ impl GroupCommitState {
         self.poisoned.store(true, Ordering::Release);
         let mut inner = self.inner.lock();
         inner.sync_in_flight = false;
-        Self::wake_waiters(&mut inner);
+        Self::wake_all_waiters(&mut inner);
     }
 
     /// Forget all progress after a truncate or reset. Stale completions from
@@ -254,11 +289,11 @@ impl GroupCommitState {
         inner.written = 0;
         inner.finished_above.clear();
         inner.sync_in_flight = false;
-        Self::wake_waiters(&mut inner);
+        Self::wake_all_waiters(&mut inner);
     }
 
-    fn wake_waiters(inner: &mut GroupCommitInner) {
-        for waiter in inner.waiters.drain(..) {
+    fn wake_all_waiters(inner: &mut GroupCommitInner) {
+        for (_, waiter) in inner.waiters.drain(..) {
             waiter.complete(0);
         }
     }
@@ -378,7 +413,7 @@ impl DurableStorage for Storage {
                 // Either the in-flight fsync's completion or an earlier
                 // append's pwrite completion will wake this waiter.
                 let waiter = Completion::new_wait();
-                inner.waiters.push(waiter.clone());
+                inner.waiters.push((target_offset, waiter.clone()));
                 return Ok(Some(waiter));
             }
             inner.sync_in_flight = true;
@@ -553,9 +588,11 @@ mod group_commit_tests {
             inner.sync_in_flight = true;
         }
         let waiter = Completion::new_wait();
-        group.inner.lock().waiters.push(waiter.clone());
+        group.inner.lock().waiters.push((20, waiter.clone()));
         assert!(!completion_finished(&waiter));
-        // The fsync was submitted when only [0,10) was written.
+        // The fsync was submitted when only [0,10) was written; the waiter's
+        // bytes are not durable yet, but it is a leader candidate for the
+        // next fsync, so it must wake.
         group.sync_finished(epoch, 10);
         assert!(
             completion_finished(&waiter),
@@ -569,7 +606,7 @@ mod group_commit_tests {
     fn poison_wakes_parked_committers() {
         let group = GroupCommitState::default();
         let waiter = Completion::new_wait();
-        group.inner.lock().waiters.push(waiter.clone());
+        group.inner.lock().waiters.push((20, waiter.clone()));
         group.poison();
         assert!(completion_finished(&waiter));
         assert!(group.is_poisoned());
