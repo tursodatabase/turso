@@ -165,7 +165,7 @@ def main():
     ax.grid(True, axis="x", which="major", color=GRID, linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
 
-    LABEL_HEIGHT = 12  # percent of axis per stacked p99 label
+    LABEL_HEIGHT = 6  # percent of axis per stacked p99 label
     lo, hi = np.inf, 0.0
     p99_points = []
     for index, ((engine, mode, connections), samples) in enumerate(sorted(series.items())):
@@ -174,25 +174,28 @@ def main():
         style = LINE_STYLES[connection_levels.index(connections)]
         x, y = ecdf_points(samples)
         ax.plot(x, y, color=color, linewidth=2.2, linestyle=style, zorder=3,
-                solid_capstyle="round", solid_joinstyle="round", dash_capstyle="round")
+                solid_capstyle="round", solid_joinstyle="round", dash_capstyle="round",
+                label=label)
 
         p99 = float(np.percentile(samples, 99))
         ax.plot([p99], [99], marker="o", markersize=8, color=color,
                 markeredgecolor=SURFACE, markeredgewidth=2, zorder=4)
         p99_points.append((p99, label))
 
-        # A faint vertical line marks the slowest transaction: where the tail ends.
+        # A faint vertical line marks the slowest transaction: where the tail
+        # ends. Its label hangs from the top, leaving the lower right corner
+        # to the legend.
         worst = float(np.max(samples))
         ax.axvline(worst, ymax=100 / 112, color=color, linewidth=1, alpha=0.45,
                    linestyle=(0, (4, 3)), zorder=2)
-        ax.annotate(fmt_ms(worst), xy=(worst, 0), xytext=(-4, 4),
-                    textcoords="offset points", ha="right", va="bottom", rotation=90,
+        ax.annotate(fmt_ms(worst), xy=(worst, 100), xytext=(-4, -6),
+                    textcoords="offset points", ha="right", va="top", rotation=90,
                     color=color, alpha=0.8, fontsize=9, zorder=5)
 
         lo = min(lo, float(np.min(samples)))
         hi = max(hi, worst)
 
-    placed, top_level = stagger(p99_points)
+    placed, top_level = stagger(p99_points, min_gap=0.2)
     Y_MAX = 112 + LABEL_HEIGHT * top_level  # headroom above 100% for the p99 labels
 
     ax.set_ylabel("Transactions (%)", color=INK, fontsize=12, labelpad=12)
@@ -215,16 +218,21 @@ def main():
 
     LEFT = 0.105
 
-    # Label each p99 dot in place, centred above it. Labels that would collide
-    # stack upwards, with a thin leader down to their dot.
-    for p99, label, level in placed:
-        offset = 11 + level * 30
-        ax.annotate(f"{label}\n{fmt_ms(p99)}", xy=(p99, 99), xytext=(0, offset),
+    # Put each p99 value above its dot. The legend says which line is which,
+    # so the label is just the number. Labels that would collide stack
+    # upwards, with a thin leader down to their dot.
+    for p99, _label, level in placed:
+        offset = 11 + level * 16
+        ax.annotate(fmt_ms(p99), xy=(p99, 99), xytext=(0, offset),
                     textcoords="offset points", ha="center", va="bottom",
-                    linespacing=1.25, color=INK, fontsize=11.5, fontweight="bold",
-                    zorder=5,
+                    color=INK, fontsize=11.5, fontweight="bold", zorder=5,
                     arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8,
                                     shrinkA=0, shrinkB=5) if level else None)
+
+    legend = ax.legend(loc="lower right", frameon=True, facecolor=SURFACE,
+                       edgecolor=AXIS, framealpha=1, fontsize=10.5, labelcolor=INK,
+                       handlelength=3.2, borderpad=0.9, labelspacing=0.6)
+    legend.set_zorder(6)
 
     fig.subplots_adjust(left=LEFT, right=0.97, top=0.95, bottom=0.14)
     fig.savefig(args.output, facecolor=SURFACE)

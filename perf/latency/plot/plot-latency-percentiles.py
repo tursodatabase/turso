@@ -6,9 +6,10 @@
 
 Usage: uv run plot-latency-percentiles.py plot/*-c*.csv
 
-Every file is one engine at one connection count. The chart has one panel per
-percentile, one line per engine, and connections along the x axis, so a sweep
-such as `CONNECTIONS="1 2 4 8 16" scripts/bench.sh` fits on one figure.
+Every file is one engine at one connection count. The chart has one line per
+engine and connections along the x axis, so a sweep such as
+`CONNECTIONS="1 2 4 8 16" scripts/bench.sh` fits on one figure. It shows p99.9;
+pass `--percentiles 99,99.9` for one panel per percentile.
 """
 
 import argparse
@@ -52,7 +53,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv_files", nargs="+", type=Path)
     parser.add_argument("--column", default="total_ns")
-    parser.add_argument("--percentiles", default="99,99.9",
+    parser.add_argument("--percentiles", default="99.9",
                         help="comma-separated, one panel each")
     parser.add_argument("-o", "--output", default="latency-percentiles.png", type=Path)
     args = parser.parse_args()
@@ -71,7 +72,7 @@ def main():
             "font.size": 11,
         }
     )
-    fig, axes = plt.subplots(1, len(percentiles), figsize=(4.5 * len(percentiles), 4.2),
+    fig, axes = plt.subplots(1, len(percentiles), figsize=(max(6.0, 4.5 * len(percentiles)), 4.2),
                              dpi=200, sharey=True)
     fig.patch.set_facecolor(SURFACE)
     axes = np.atleast_1d(axes)
@@ -93,8 +94,8 @@ def main():
             ax.annotate(NAMES.get(engine, engine), xy=(xs[-1], ys[-1]), xytext=(8, 0),
                         textcoords="offset points", ha="left", va="center",
                         color=color, fontsize=11, fontweight="bold")
-        label = f"{percentile:g}".rstrip("0").rstrip(".")
-        ax.set_title(f"p{label}", loc="left", color=INK, fontsize=12, pad=10)
+        if len(percentiles) > 1:
+            ax.set_title(f"p{percentile:g}", loc="left", color=INK, fontsize=12, pad=10)
         ax.set_xticks(levels)
         ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
         ax.xaxis.set_minor_locator(NullLocator())
@@ -109,8 +110,12 @@ def main():
         ax.spines["bottom"].set_color(AXIS)
         ax.spines["bottom"].set_linewidth(1)
 
-    axes[0].set_ylabel("Transaction latency (ms)", color=INK, fontsize=12, labelpad=12)
-    fig.subplots_adjust(left=0.1, right=0.97, top=0.88, bottom=0.16, wspace=0.12)
+    if len(percentiles) == 1:
+        ylabel = f"p{percentiles[0]:g} transaction latency (ms)"
+    else:
+        ylabel = "Transaction latency (ms)"
+    axes[0].set_ylabel(ylabel, color=INK, fontsize=12, labelpad=12)
+    fig.subplots_adjust(left=0.14, right=0.95, top=0.92, bottom=0.16, wspace=0.12)
     fig.savefig(args.output, facecolor=SURFACE)
     print(f"wrote {args.output}")
 
