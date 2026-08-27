@@ -1014,10 +1014,16 @@ impl WalCoordination for InProcessWalCoordination {
             snapshot.max_frame <= u32::MAX as u64,
             "max_frame exceeds u32 read mark range"
         );
-        if snapshot.max_frame == snapshot.nbackfills {
-            if !self.try_read_mark_shared(0) {
-                return None;
-            }
+        // A fully backfilled WAL can be ignored: read straight from the
+        // database file under read-mark 0. A checkpoint holds read-mark 0
+        // exclusively for as long as it runs, though, and that can be several
+        // milliseconds. Like SQLite, a reader that cannot get it does not
+        // wait for the checkpoint; it falls through and pins its snapshot
+        // with one of the read marks below, which the checkpoint does not
+        // touch. Every frame it could want is already in the database file,
+        // so the read mark only keeps a later checkpoint from restarting
+        // the WAL underneath it.
+        if snapshot.max_frame == snapshot.nbackfills && self.try_read_mark_shared(0) {
             if self.load_snapshot() != snapshot {
                 self.unlock_read_mark(0);
                 return None;
@@ -2031,10 +2037,9 @@ impl WalCoordination for ShmWalCoordination {
         let shared = self.shared.read();
         let read_locks = &shared.runtime.read_locks;
 
-        if snapshot.max_frame == snapshot.nbackfills {
-            if !read_locks[0].read() {
-                return None;
-            }
+        // See the in-process coordination: a checkpoint holding read-mark 0
+        // must not make readers wait, so fall through to the other marks.
+        if snapshot.max_frame == snapshot.nbackfills && read_locks[0].read() {
             if self.load_snapshot() != snapshot {
                 read_locks[0].unlock();
                 return None;
@@ -7635,6 +7640,55 @@ pub mod test {
         assert!(coordination.try_begin_write_tx());
         assert!(!coordination.try_begin_write_tx());
         coordination.end_write_tx();
+    }
+
+    #[test]
+    fn reader_does_not_wait_for_a_checkpoint_that_holds_read_mark_0() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+        let reader_wal = make_test_wal_from_shared(shared.clone());
+
+        // Everything in the WAL is already in the database file, so a reader
+        // would normally take read-mark 0 and ignore the WAL.
+        let backfilled = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 5,
+            last_checksum: (0, 0),
+            checkpoint_seq: 0,
+            transaction_count: 1,
+        };
+        set_shared_snapshot(&shared, backfilled);
+
+        // A passive checkpoint holds read-mark 0 exclusively while it runs.
+        let checkpoint_guard = coordination
+            .acquire_checkpoint_guard(CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+        assert_eq!(
+            checkpoint_guard,
+            super::CoordinationCheckpointGuardKind::Read0
+        );
+
+        // The reader must start anyway, pinned by another read mark.
+        let read_guard = coordination
+            .try_begin_read_tx(backfilled)
+            .expect("reader should not wait for the checkpoint");
+        let ReadGuardKind::ReadMark(slot) = read_guard else {
+            panic!("expected a read mark, got {read_guard:?}");
+        };
+        assert_eq!(coordination.read_mark_value(slot.get()), 5);
+        coordination.end_read_tx(read_guard);
+
+        // Same through the WAL front door: no Retry, so no backoff sleeps.
+        assert!(
+            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Ok(_)),
+            "reader should start while the checkpoint holds read-mark 0"
+        );
+        assert_eq!(reader_wal.get_max_frame(), 5);
+        reader_wal.end_read_tx();
+
+        coordination.release_checkpoint_guard(checkpoint_guard);
     }
 
     #[cfg(host_shared_wal)]
