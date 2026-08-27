@@ -44,16 +44,15 @@ while holding the offered rate fixed, so more connections means more
 transactions in flight at once rather than more load:
 
 ```console
-RATE=1000 CONNECTIONS="1 2 4 8 16" ./scripts/bench.sh
+RATE=1000 CONNECTIONS="1 2 4 8 16 32" ./scripts/bench.sh
 ```
 
-That writes one file per engine and connection count. Two figures show it:
-the tail's shape at two concurrency levels, and the trend across all of them.
+That writes one file per engine and connection count, and the plot takes
+one panel per count:
 
 ```console
 cd plot
-uv run plot-latency-ecdf.py sqlite-c{1,8}.csv turso-c{1,8}.csv
-uv run plot-latency-percentiles.py sqlite-c*.csv turso-c*.csv
+uv run plot-latency-ecdf.py sqlite-c{1,8,16,32}.csv turso-c{1,8,16,32}.csv
 ```
 
 The benchmark warns on stderr when an engine could not keep up with the offered

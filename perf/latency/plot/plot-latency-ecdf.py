@@ -4,18 +4,17 @@
 # ///
 """Plot transaction latency as an eCDF from txn-latency CSV output.
 
-Usage: uv run plot-latency-ecdf.py sqlite-c{1,8}.csv turso-c{1,8}.csv [--column total_ns]
+Usage: uv run plot-latency-ecdf.py sqlite-c{1,8,16,32}.csv turso-c{1,8,16,32}.csv
 
 Latency along the x axis on a log scale, the share of transactions at or
 below it up the y axis. A marker sits on each curve at p50 and p90, and a
 dashed vertical line labelled with the value marks its p99.9. A curve's
 right-hand end is its slowest transaction.
 
-Each connection count gets its own panel, side by side with shared axes,
+Each connection count gets its own panel, two to a row with shared axes,
 so the engines are compared within a panel and the effect of concurrency
 is read across panels. One file per engine and count, as `bench.sh`
-writes them. Two counts make a figure the width of a page column pair;
-the full sweep belongs in plot-latency-percentiles.py.
+writes them.
 """
 
 import argparse
@@ -126,9 +125,10 @@ def main():
         modes_per_engine.setdefault(engine, set()).add(mode)
     connection_levels = sorted({connections for _, _, connections in series})
 
-    # One panel per connection count, in a row.
-    ncols = len(connection_levels)
-    fig, axes = plt.subplots(1, ncols, figsize=(3.3 * ncols, 2.6), dpi=300,
+    # One panel per connection count, two to a row.
+    ncols = min(2, len(connection_levels))
+    nrows = -(-len(connection_levels) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, 2.6 * nrows), dpi=300,
                              sharex=True, sharey=True, squeeze=False)
     lo = min(float(np.min(v)) for v in series.values())
     hi = max(float(np.max(v)) for v in series.values())
@@ -185,7 +185,7 @@ def main():
     # One legend for the figure, centred below the panels.
     fig.legend(handles=list(handles.values()), loc="lower center", ncol=len(handles),
                frameon=False, handlelength=2.4, columnspacing=2.0,
-               bbox_to_anchor=(0.5, -0.2))
+               bbox_to_anchor=(0.5, -0.2 / nrows))
 
     fig.savefig(args.output, bbox_inches="tight")
     print(f"wrote {args.output}")
