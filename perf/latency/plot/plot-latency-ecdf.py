@@ -2,16 +2,13 @@
 # /// script
 # dependencies = ["matplotlib", "numpy", "scienceplots"]
 # ///
-"""Plot the transaction latency distribution from txn-latency CSV output.
+"""Plot transaction latency as an eCDF from txn-latency CSV output.
 
 Usage: uv run plot-latency-ecdf.py sqlite-c1.csv turso-c1.csv [--column total_ns]
 
-This is the eCDF with the axes swapped and the tail stretched: percentile
-along the x axis on a log scale of 1/(1-p), so 50, 90, 99, 99.9 and 99.99
-are evenly spaced, and latency up the y axis. That is the HdrHistogram
-percentile plot, and the tail, which is where engines differ, fills the
-chart instead of the top few percent of it. A line's right-hand end is its
-slowest transaction.
+Latency along the x axis on a log scale, the share of transactions at or
+below it up the y axis. A marker sits on each curve at p50, p90 and p99,
+and a line's right-hand end is its slowest transaction.
 
 Pass files from more than one connection count to compare concurrency
 levels: colour and marker shape say which engine, line style and marker
@@ -30,7 +27,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scienceplots  # noqa: F401  (registers the styles)
 from matplotlib.lines import Line2D
-from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator, NullLocator
+from matplotlib.ticker import FuncFormatter, LogLocator, NullLocator
 
 plt.style.use(["science", "no-latex", "vibrant"])
 
@@ -46,8 +43,8 @@ FALLBACK_MARKERS = ["^", "D", "v"]
 # whether the markers are filled.
 LEVEL_STYLES = [("solid", True), ((0, (4, 2)), False), ((0, (1, 1.5)), True)]
 
-# Percentiles that get a tick and a marker.
-PERCENTILES = [0, 50, 90, 99, 99.9, 99.99]
+# Percentiles that get a marker on the curve.
+PERCENTILES = [50, 90, 99]
 
 COLUMN_LABELS = {
     "total_ns": "Transaction latency",
@@ -87,26 +84,19 @@ def label_for(look, mode, connections, modes_per_engine, connection_levels):
     return name
 
 
-def stretch(percentile):
-    """Map a percentile to the log-stretched x axis: 1 / (1 - p)."""
-    return 1.0 / (1.0 - np.asarray(percentile) / 100.0)
+def ecdf_points(samples, max_points=2000):
+    """Sorted samples and their cumulative percentage, thinned for plotting.
 
-
-def percentile_curve(samples, max_points=2000):
-    """Latency against percentile, thinned for plotting.
-
-    Sample i of n sits at percentile (i + 0.5) / n, so the slowest sample lands
-    at a finite spot just short of 100. Points are picked on an even grid and
-    on a log grid running back from the slowest sample, so the last handful
-    of transactions still show up individually.
+    Points are picked on an even grid and on a log grid running back from the
+    slowest sample, so the last handful of transactions still show up
+    individually.
     """
     x = np.sort(samples)
     n = x.size
     even = np.linspace(0, n - 1, min(max_points, n))
     tail = n - 1 - np.logspace(0, np.log10(n), min(max_points, n))
     idx = np.unique(np.clip(np.concatenate([even, tail]), 0, n - 1).astype(int))
-    p = (idx + 0.5) / n * 100.0
-    return stretch(p), x[idx]
+    return x[idx], (idx + 1) / n * 100.0
 
 
 def fmt_ms(value, _pos=None):
@@ -140,22 +130,20 @@ def main():
 
     fig, ax = plt.subplots(figsize=(4.6, 3.2), dpi=300)
     ax.set_xscale("log")
-    ax.set_yscale("log")
     ax.grid(True, which="major", linewidth=0.4, alpha=0.6)
     ax.set_axisbelow(True)
 
     handles = []
-    most = 0.0
+    lo, hi = np.inf, 0.0
     for index, ((engine, mode, connections), samples) in enumerate(sorted(series.items())):
         look = engine_look(engine, index)
         linestyle, filled = LEVEL_STYLES[connection_levels.index(connections)]
         face = look["color"] if filled else "white"
-        x, y = percentile_curve(samples)
+        x, y = ecdf_points(samples)
         ax.plot(x, y, color=look["color"], linewidth=1.3, linestyle=linestyle, zorder=3)
-        # A marker at each labelled percentile, so the values can be read
-        # against the grid and the series told apart even where lines cross.
-        marks = [p for p in PERCENTILES if p > 0]
-        ax.plot(stretch(marks), np.percentile(samples, marks), linestyle="none",
+        # A marker at p50, p90 and p99, so the values can be read against
+        # the grid and the series told apart even where lines overlap.
+        ax.plot(np.percentile(samples, PERCENTILES), PERCENTILES, linestyle="none",
                 marker=look["marker"], markersize=4.5, color=look["color"],
                 markerfacecolor=face, markeredgewidth=1.0, zorder=4)
         handles.append(Line2D(
@@ -165,19 +153,18 @@ def main():
             label=label_for(look, mode, connections, modes_per_engine[engine],
                             connection_levels),
         ))
-        most = max(most, x[-1])
+        lo = min(lo, float(x[0]))
+        hi = max(hi, float(x[-1]))
 
-    ax.set_xlim(1, most * 1.5)
-    ax.xaxis.set_major_locator(FixedLocator(stretch(PERCENTILES)))
-    ax.xaxis.set_major_formatter(FuncFormatter(
-        lambda v, _: f"{100 - 100 / v:g}" if v > 1 else "0"))
+    ax.set_xlim(10 ** np.floor(np.log10(max(lo, 1e-3))), 10 ** np.ceil(np.log10(hi)))
+    ax.xaxis.set_major_locator(LogLocator(base=10, numticks=12))
     ax.xaxis.set_minor_locator(NullLocator())
-    ax.set_xlabel("Percentile")
+    ax.xaxis.set_major_formatter(FuncFormatter(fmt_ms))
+    ax.set_xlabel(f"{COLUMN_LABELS[args.column]} (ms)")
 
-    ax.yaxis.set_major_locator(LogLocator(base=10, numticks=10))
-    ax.yaxis.set_minor_locator(NullLocator())
-    ax.yaxis.set_major_formatter(FuncFormatter(fmt_ms))
-    ax.set_ylabel(f"{COLUMN_LABELS[args.column]} (ms)")
+    ax.set_ylim(0, 103)
+    ax.set_yticks([0, 25, 50, 75, 100])
+    ax.set_ylabel("Transactions (%)")
 
     ax.legend(handles=handles, loc="lower right", frameon=False, handlelength=2.8,
               labelspacing=0.5)
