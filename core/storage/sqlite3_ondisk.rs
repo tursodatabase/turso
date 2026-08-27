@@ -403,7 +403,9 @@ impl Default for DatabaseHeader {
             incremental_vacuum_enabled: U32BE::new(0),
             application_id: I32BE::new(0),
             _padding: [0; 20],
-            version_valid_for: U32BE::new(3047000),
+            // Must equal change_counter: SQLite only trusts database_size
+            // when the two match (btree.c lockBtree).
+            version_valid_for: U32BE::new(1),
             version_number: U32BE::new(3047000),
         }
     }
