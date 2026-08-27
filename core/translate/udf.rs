@@ -29,7 +29,7 @@ use crate::udf::{collect_assigned_names, UdfBinOp, UdfExpr, UdfStmt, UdfUnOp};
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, HashMap, LimboError, Result, MAIN_DB_ID};
 use turso_parser::ast;
@@ -216,6 +216,7 @@ fn persist_function_definition(
             where_clause: Some(format!(
                 "tbl_name = '{TURSO_FUNCTIONS_TABLE_NAME}' AND type != 'trigger'"
             )),
+            trigger_target_database_id: None,
         });
     }
 
@@ -240,9 +241,9 @@ fn persist_function_definition(
     program.emit_string8_new_reg(sql.clone());
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(name_reg),
-        count: to_u16(2),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(name_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -312,6 +313,7 @@ fn emit_delete_function_row(
     program.emit_insn(Insn::Next {
         cursor_id: functions_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(end_loop_label);
 }

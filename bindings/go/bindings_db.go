@@ -145,6 +145,8 @@ type turso_database_config_t struct {
 	vfs                   uintptr // const char* or null
 	encryption_cipher     uintptr // const char* or null
 	encryption_hexkey     uintptr // const char* or null
+	page_codec            uintptr // const turso_page_codec_v1_t* or null
+	open_flags            uint32
 }
 
 // C extern method types

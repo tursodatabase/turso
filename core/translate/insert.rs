@@ -48,7 +48,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
-        insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
@@ -267,7 +267,10 @@ pub fn translate_insert(
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
+        None => crate::bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        ),
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
@@ -295,7 +298,10 @@ pub fn translate_insert(
     }
 
     let Some(btree_table) = table.btree() else {
-        crate::bail_parse_error!("no such table: {}", table_name);
+        crate::bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        );
     };
 
     let BoundInsertResult {
@@ -1247,6 +1253,7 @@ fn emit_epilogue(
             program.emit_insn(Insn::Next {
                 cursor_id: temp_table_ctx.cursor_id,
                 pc_if_next: temp_table_ctx.loop_start_label,
+                fullscan: false,
             });
             program.preassign_label_to_next_insn(temp_table_ctx.loop_end_label);
 
@@ -1395,9 +1402,9 @@ fn emit_commit_phase(
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(idx_start_reg),
-            count: to_u16(num_cols + 1),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(idx_start_reg),
+            count: to_u32(num_cols + 1),
+            dest_reg: to_u32(record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
@@ -1405,7 +1412,7 @@ fn emit_commit_phase(
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(idx_start_reg),
-            unpacked_count: Some((num_cols + 1) as u16),
+            unpacked_count: Some((num_cols + 1) as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -1750,6 +1757,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
     program.emit_insn(Insn::Next {
         cursor_id: seq_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(loop_end_label);
 }
@@ -2279,9 +2287,9 @@ fn init_source_emission<'a>(
                     };
 
                     program.emit_insn(Insn::MakeRecord {
-                        start_reg: to_u16(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
-                        count: to_u16(num_result_cols),
-                        dest_reg: to_u16(record_reg),
+                        start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+                        count: to_u32(num_result_cols),
+                        dest_reg: to_u32(record_reg),
                         index_name: None,
                         affinity_str: Some(affinity_str),
                     });
@@ -3037,9 +3045,9 @@ fn emit_index_uniqueness_check(
         if preflight.on_replace {
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(idx_start_reg),
-                count: to_u16(num_cols + 1),
-                dest_reg: to_u16(record_reg),
+                start_reg: to_u32(idx_start_reg),
+                count: to_u32(num_cols + 1),
+                dest_reg: to_u32(record_reg),
                 index_name: Some(index.name.clone()),
                 affinity_str: None,
             });
@@ -3047,7 +3055,7 @@ fn emit_index_uniqueness_check(
                 cursor_id: idx_cursor_id,
                 record_reg,
                 unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u16),
+                unpacked_count: Some((num_cols + 1) as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
         }
@@ -3189,9 +3197,9 @@ fn emit_unique_index_check(
             // IdxDelete repositions the cursor, so we must NOT use USE_SEEK.
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(idx_start_reg),
-                count: to_u16(num_cols + 1),
-                dest_reg: to_u16(record_reg),
+                start_reg: to_u32(idx_start_reg),
+                count: to_u32(num_cols + 1),
+                dest_reg: to_u32(record_reg),
                 index_name: Some(index.name.clone()),
                 affinity_str: None,
             });
@@ -3199,7 +3207,7 @@ fn emit_unique_index_check(
                 cursor_id: idx_cursor_id,
                 record_reg,
                 unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u16),
+                unpacked_count: Some((num_cols + 1) as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
         }
@@ -3410,6 +3418,7 @@ fn ensure_sequence_initialized(
     program.emit_insn(Insn::Next {
         cursor_id: seq_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(insert_new_label);
@@ -3442,9 +3451,9 @@ fn ensure_sequence_initialized(
         .collect();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(record_start_reg),
-        count: to_u16(2),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(record_start_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -3488,7 +3497,7 @@ pub(crate) fn halt_desc_and_on_error(
     }
     match effective {
         ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {raw_desc} (19)"),
+            format!("UNIQUE constraint failed: {raw_desc}"),
             Some(effective),
         ),
         _ => (raw_desc.to_string(), None),
@@ -3732,9 +3741,9 @@ fn emit_update_sqlite_sequence(
         .map(|col| col.affinity().aff_mask())
         .collect::<String>();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(record_start_reg),
-        count: to_u16(2),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(record_start_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -3827,8 +3836,8 @@ fn emit_replace_delete_conflicting_row(
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index
-                .bind_where_expr(Some(table_references), resolver)
-                .expect("where clause to exist");
+                .bind_where_expr(Some(table_references), resolver)?
+                .expect("index.where_clause was checked to be Some above");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
             translate_expr_no_constant_opt(
@@ -4321,6 +4330,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             program.emit_insn(Insn::Next {
                 cursor_id: ccur,
                 pc_if_next: loop_top,
+                fullscan: false,
             });
             program.preassign_label_to_next_insn(done);
             program.emit_insn(Insn::Close { cursor_id: ccur });

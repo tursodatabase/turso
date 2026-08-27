@@ -15,6 +15,16 @@ pub struct ParameterInfo {
     pub names: Vec<String>,
 }
 
+/// Output format of an `EXPLAIN QUERY PLAN` statement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EqpFormat {
+    /// `FORMAT=TEXT`
+    #[default]
+    Text,
+    /// `FORMAT=JSON`
+    Json,
+}
+
 /// Statement or Explain statement
 // https://sqlite.org/syntax/sql-stmt.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,7 +32,7 @@ pub enum Cmd {
     /// `EXPLAIN` statement
     Explain(Stmt),
     /// `EXPLAIN QUERY PLAN` statement
-    ExplainQueryPlan(Stmt),
+    ExplainQueryPlan { stmt: Stmt, format: EqpFormat },
     /// statement
     Stmt(Stmt),
 }
@@ -59,10 +69,6 @@ pub struct Update {
     pub where_clause: Option<Box<Expr>>,
     /// `RETURNING`
     pub returning: Vec<ResultColumn>,
-    /// `ORDER BY`
-    pub order_by: Vec<SortedColumn>,
-    /// `LIMIT`
-    pub limit: Option<Limit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,10 +227,6 @@ pub enum Stmt {
         where_clause: Option<Box<Expr>>,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
-        /// `ORDER BY`
-        order_by: Vec<SortedColumn>,
-        /// `LIMIT`
-        limit: Option<Limit>,
     },
     /// `DETACH DATABASE`: db name
     Detach {
@@ -654,6 +656,10 @@ pub struct Variable {
     pub name: Option<Box<str>>,
     /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
     pub col_type: Option<Box<str>>,
+    /// True for an explicit `?N` marker. Numbered markers carry no allocated
+    /// name; their "?N" spelling is derived from the index on demand.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub numbered: bool,
 }
 
 impl Variable {
@@ -662,6 +668,17 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            numbered: false,
+        }
+    }
+
+    /// An explicit `?N` marker.
+    pub fn numbered(index: NonZeroU32) -> Self {
+        Self {
+            index,
+            name: None,
+            col_type: None,
+            numbered: true,
         }
     }
 
@@ -674,6 +691,7 @@ impl Variable {
             } else {
                 Some(col_type.into())
             },
+            numbered: false,
         }
     }
 
@@ -682,7 +700,15 @@ impl Variable {
             index,
             name: Some(name.into()),
             col_type: None,
+            numbered: false,
         }
+    }
+
+    /// True for positional parameters — a bare `?` or an explicit `?N` —
+    /// and false for named ones (`:x`, `@x`, `$x`). Positional markers
+    /// carry no allocated name.
+    pub fn is_positional(&self) -> bool {
+        self.name.is_none()
     }
 }
 
@@ -1233,6 +1259,14 @@ impl Name {
             quote: None,
         }
     }
+    /// Create a name parsed from a bracket-quoted identifier (`[name]`),
+    /// remembering the bracket quoting so the name renders back as written.
+    pub const fn bracketed(s: String) -> Self {
+        Self {
+            value: s,
+            quote: Some('['),
+        }
+    }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
     pub fn from_string(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
@@ -1258,7 +1292,7 @@ impl Name {
         } else if bytes[0] == b'[' {
             assert!(s.len() >= 2);
             assert!(bytes[bytes.len() - 1] == b']');
-            Name::exact(s[1..s.len() - 1].to_string())
+            Name::bracketed(s[1..s.len() - 1].to_string())
         } else {
             Name::exact(s.to_string())
         }
@@ -1278,6 +1312,14 @@ impl Name {
     pub fn as_ident(&self) -> String {
         // let's keep original quotes if they were set
         // (parser.rs tests validates that behaviour)
+        if self.quote == Some('[') {
+            // A `]` cannot be escaped inside a bracket-quoted identifier, so
+            // fall back to double quotes when the name contains one.
+            if !self.value.contains(']') {
+                return format!("[{}]", self.value);
+            }
+            return format!("\"{}\"", self.value.replace('"', "\"\""));
+        }
         if let Some(quote) = self.quote {
             let single = quote.to_string();
             let double = single.clone() + &single;
@@ -1512,7 +1554,17 @@ pub enum ColumnConstraint {
     /// `UNIQUE`
     Unique(Option<ResolveType>),
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the constraint did not come from this
+        /// parser — the PostgreSQL frontend's translator builds these nodes
+        /// from its own AST — or after an ALTER TABLE rewrite changed the
+        /// expression out from under the captured text.
+        source: Option<String>,
+    },
     /// `DEFAULT`
     Default(Box<Expr>),
     /// `COLLATE`
@@ -1579,7 +1631,17 @@ pub enum TableConstraint {
         conflict_clause: Option<ResolveType>,
     },
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the constraint did not come from this
+        /// parser — the PostgreSQL frontend's translator builds these nodes
+        /// from its own AST — or after an ALTER TABLE rewrite changed the
+        /// expression out from under the captured text.
+        source: Option<String>,
+    },
     /// `FOREIGN KEY`
     ForeignKey {
         /// columns
@@ -1647,13 +1709,29 @@ pub enum SortOrder {
 }
 
 /// `NULLS FIRST` or `NULLS LAST`
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NullsOrder {
     /// `NULLS FIRST`
     First,
     /// `NULLS LAST`
     Last,
+}
+
+impl NullsOrder {
+    pub fn reverse(&self) -> Self {
+        match self {
+            NullsOrder::First => NullsOrder::Last,
+            NullsOrder::Last => NullsOrder::First,
+        }
+    }
+
+    pub fn default_for(order: SortOrder) -> Self {
+        match order {
+            SortOrder::Asc => NullsOrder::First,
+            SortOrder::Desc => NullsOrder::Last,
+        }
+    }
 }
 
 /// `REFERENCES` clause
@@ -1818,6 +1896,9 @@ pub enum PragmaName {
     CacheSize,
     /// set the cache spill behavior
     CacheSpill,
+    /// When ON, each INSERT, UPDATE and DELETE returns one row with the
+    /// number of rows it changed.
+    CountChanges,
     /// encryption cipher algorithm name for encrypted databases
     #[strum(serialize = "cipher")]
     #[cfg_attr(feature = "serde", serde(rename = "cipher"))]

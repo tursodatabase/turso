@@ -12,9 +12,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::index::{
-    reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
-};
+use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -156,14 +154,15 @@ use crate::util::{
 use crate::Result;
 use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
 use bitflags::bitflags;
+use column_info::{ColumnInfo, NewColumnInfoParams};
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TableInternalId, TypeOperator,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
+    SortOrder, TableInternalId, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -717,7 +716,9 @@ pub fn is_system_table(table_name: &str) -> bool {
 pub fn allow_user_dml(table_name: &str) -> bool {
     const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
     !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))
-        || table_name.starts_with(TURSO_INTERNAL_PREFIX)) // internal name wouldn't be uppercase
+        || table_name
+            .get(..TURSO_INTERNAL_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX)))
 }
 
 // Sequence persistence design
@@ -1318,7 +1319,7 @@ impl Schema {
 
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) -> Result<()> {
-        self.check_object_name_conflict(&view.name)?;
+        self.check_object_name_conflict(&view.name, SchemaObjectType::View)?;
         let name = normalize_ident(&view.name);
         self.views.insert(name, Arc::new(view));
         Ok(())
@@ -1371,6 +1372,26 @@ impl Schema {
     pub fn remove_triggers_for_table(&mut self, table_name: &str) {
         let table_name = normalize_ident(table_name);
         self.triggers.remove(&table_name);
+    }
+
+    pub fn set_trigger_target_database_id(
+        &mut self,
+        trigger_name: &str,
+        target_database_id: usize,
+    ) -> Result<()> {
+        let trigger_name = normalize_ident(trigger_name);
+        let trigger = self
+            .triggers
+            .values_mut()
+            .flatten()
+            .find(|trigger| normalize_ident(&trigger.name) == trigger_name)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "new trigger {trigger_name} was not loaded into the schema"
+                ))
+            })?;
+        Arc::make_mut(trigger).target_database_id = Some(target_database_id);
+        Ok(())
     }
 
     /// Like [`remove_triggers_for_table`] but only removes triggers whose
@@ -1431,7 +1452,7 @@ impl Schema {
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name)?;
+        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         #[cfg(feature = "conn_raw_api")]
         self.table_names_by_root_page
@@ -1441,7 +1462,7 @@ impl Schema {
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name)?;
+        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
         Ok(())
@@ -1505,7 +1526,7 @@ impl Schema {
     }
 
     pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
-        self.check_object_name_conflict(&index.name)?;
+        self.check_object_name_conflict(&index.name, SchemaObjectType::Index)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -1856,9 +1877,6 @@ impl Schema {
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
             )?;
-            if mvcc_enabled && index.index_method.is_some() {
-                crate::bail_parse_error!("Custom index modules are not supported with MVCC");
-            }
             self.add_index(Arc::new(index))?;
         }
 
@@ -1896,7 +1914,7 @@ impl Schema {
                     pk_index_added = true;
 
                     if unique_set.columns.len() == 1 {
-                        let col_name = &unique_set.columns.first().unwrap().0;
+                        let col_name = &unique_set.columns.first().unwrap().name;
                         let Some((_, column)) = table.get_column(col_name) else {
                             return Err(LimboError::ParseError(format!(
                                 "Column {col_name} not found in table {}",
@@ -1915,7 +1933,7 @@ impl Schema {
                             index_entry,
                             unique_set.columns.len(),
                             unique_set.conflict_clause,
-                            &unique_set.collations,
+                            &unique_set.columns,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -1931,15 +1949,15 @@ impl Schema {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
                         Vec::try_with_capacity_ext(unique_set.columns.len())?;
-                    for (col_name, sort_order) in unique_set.columns.iter() {
-                        let Some((pos_in_table, _)) = table.get_column(col_name) else {
+                    for unique_column in unique_set.columns.iter() {
+                        let Some((pos_in_table, _)) = table.get_column(&unique_column.name) else {
                             return Err(crate::LimboError::ParseError(format!(
                                 "Column {} not found in table {}",
-                                col_name, table.name
+                                unique_column.name, table.name
                             )));
                         };
                         column_indices_and_sort_orders
-                            .push_within_capacity((pos_in_table, *sort_order))
+                            .push_within_capacity((pos_in_table, unique_column.sort_order))
                             .expect("unique columns vector was preallocated to its input length");
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
@@ -1948,7 +1966,7 @@ impl Schema {
                             index_entry,
                             column_indices_and_sort_orders,
                             unique_set.conflict_clause,
-                            &unique_set.collations,
+                            &unique_set.columns,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -2642,16 +2660,23 @@ impl Schema {
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
-    fn check_object_name_conflict(&self, name: &str) -> Result<()> {
-        if let Some(object_type) = self.get_object_type(name) {
-            let type_str = match object_type {
-                SchemaObjectType::Table => "table",
-                SchemaObjectType::View => "view",
-                SchemaObjectType::Index => "index",
+    fn check_object_name_conflict(&self, name: &str, creating: SchemaObjectType) -> Result<()> {
+        if let Some(existing) = self.get_object_type(name) {
+            // Match SQLite's message shapes: indexes and tables/views live in
+            // different namespaces, so a cross-namespace clash names the other
+            // side ("there is already a ...") instead of "already exists".
+            let msg = match (creating, existing) {
+                (SchemaObjectType::Index, SchemaObjectType::Index) => {
+                    format!("index {name} already exists")
+                }
+                (SchemaObjectType::Index, _) => format!("there is already a table named {name}"),
+                (_, SchemaObjectType::Index) => {
+                    format!("there is already an index named {name}")
+                }
+                (_, SchemaObjectType::Table) => format!("table {name} already exists"),
+                (_, SchemaObjectType::View) => format!("view {name} already exists"),
             };
-            return Err(crate::LimboError::ParseError(format!(
-                "{type_str} \"{name}\" already exists"
-            )));
+            return Err(crate::LimboError::ParseError(msg));
         }
         Ok(())
     }
@@ -2747,7 +2772,6 @@ impl TryClone for UniqueSet {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
             columns: self.columns.try_clone()?,
-            collations: self.collations.try_clone()?,
             is_primary_key: self.is_primary_key,
             conflict_clause: self.conflict_clause,
         })
@@ -2764,7 +2788,7 @@ crate::alloc::impl_try_clone_via_clone!(
 // std global allocator (Strings, `std::vec::Vec`, boxed parser AST), so
 // forwarding to `Clone` is correct today. TODO(alloc): give these real
 // fallible impls when their fields become allocator-aware.
-crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint);
+crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint, UniqueSetColumn);
 
 impl Schema {
     #[turso_macros::allocation_site(crate::alloc::SchemaAllocationSite::MakeMut)]
@@ -2844,6 +2868,17 @@ impl TryClone for FromClauseSubquery {
     }
 }
 
+impl TryClone for RecursiveCteInput {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: self.name.clone(),
+            columns: self.columns.try_clone()?,
+        })
+    }
+}
+
 impl TryClone for Table {
     type Error = TryReserveError;
 
@@ -2853,6 +2888,9 @@ impl TryClone for Table {
             Table::Virtual(table) => Table::Virtual(Arc::new(table.as_ref().try_clone()?)),
             Table::FromClauseSubquery(from_clause_subquery) => {
                 Table::FromClauseSubquery(Arc::new(from_clause_subquery.as_ref().try_clone()?))
+            }
+            Table::RecursiveCteInput(input) => {
+                Table::RecursiveCteInput(Arc::new(input.as_ref().try_clone()?))
             }
         })
     }
@@ -2981,6 +3019,9 @@ impl ColumnLayout {
             Table::FromClauseSubquery(subquery) => Ok(Self::Identity {
                 column_count: subquery.columns.len(),
             }),
+            Table::RecursiveCteInput(input) => Ok(Self::Identity {
+                column_count: input.columns.len(),
+            }),
         }
     }
 
@@ -3088,6 +3129,7 @@ pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
     FromClauseSubquery(Arc<FromClauseSubquery>),
+    RecursiveCteInput(Arc<RecursiveCteInput>),
 }
 
 impl Table {
@@ -3100,6 +3142,9 @@ impl Table {
             Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
                 "FROM clause subqueries do not have a root page".to_string(),
             )),
+            Table::RecursiveCteInput(_) => Err(crate::LimboError::InternalError(
+                "recursive CTE inputs do not have a root page".to_string(),
+            )),
         }
     }
 
@@ -3108,6 +3153,7 @@ impl Table {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
+            Self::RecursiveCteInput(input) => &input.name,
         }
     }
 
@@ -3118,6 +3164,7 @@ impl Table {
             Self::FromClauseSubquery(from_clause_subquery) => {
                 from_clause_subquery.columns.get(index)
             }
+            Self::RecursiveCteInput(input) => input.columns.get(index),
         }
     }
 
@@ -3139,6 +3186,11 @@ impl Table {
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(name))
                 }),
+            Self::RecursiveCteInput(input) => input.columns.iter().enumerate().find(|(_, col)| {
+                col.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            }),
         }
     }
 
@@ -3147,6 +3199,7 @@ impl Table {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
+            Self::RecursiveCteInput(input) => &input.columns,
         }
     }
 
@@ -3155,6 +3208,7 @@ impl Table {
             Self::BTree(table) => table.is_strict,
             Self::Virtual(_) => false,
             Self::FromClauseSubquery(_) => false,
+            Self::RecursiveCteInput(_) => false,
         }
     }
 
@@ -3163,6 +3217,7 @@ impl Table {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3180,6 +3235,7 @@ impl Table {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3201,15 +3257,20 @@ impl PartialEq for Table {
     }
 }
 
+/// UniqueSet describes a column or set of columns for which rows are unique (PRIMARY KEY, UNIQUE)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UniqueSet {
-    pub columns: Vec<(String, SortOrder)>,
-    /// Per-column collation overrides from the constraint definition,
-    /// e.g. `PRIMARY KEY(a COLLATE NOCASE)`. Parallel to `columns`; `None`
-    /// falls back to the column definition's collation.
-    pub collations: Vec<Option<CollationSeq>>,
+    pub columns: Vec<UniqueSetColumn>,
     pub is_primary_key: bool,
     pub conflict_clause: Option<ResolveType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UniqueSetColumn {
+    pub name: String,
+    pub sort_order: SortOrder,
+    pub collation: Option<CollationSeq>,
+    pub nulls_order: Option<NullsOrder>,
 }
 
 #[derive(Clone, Debug)]
@@ -3218,23 +3279,42 @@ pub struct CheckConstraint {
     pub name: Option<String>,
     /// CHECK expression
     pub expr: ast::Expr,
+    /// The expression's source text exactly as the user wrote it between the
+    /// CHECK parens (whitespace-trimmed). SQLite reports an unnamed failed
+    /// constraint with this text, not a re-rendering of the expression.
+    pub source: Option<String>,
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
     pub column: Option<String>,
 }
 
 impl CheckConstraint {
-    pub fn new(name: Option<&ast::Name>, expr: &ast::Expr, column: Option<&str>) -> Self {
+    pub fn new(
+        name: Option<&ast::Name>,
+        expr: &ast::Expr,
+        source: Option<&str>,
+        column: Option<&str>,
+    ) -> Self {
         Self {
             name: name.map(|n| n.as_str().to_string()),
             expr: expr.clone(),
+            source: source.map(|s| s.to_string()),
             column: column.map(|s| s.to_string()),
         }
     }
 
     /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
     pub fn sql(&self) -> String {
-        format!("CHECK({})", self.expr)
+        match &self.source {
+            // Keep the user's spelling when rebuilding SQL. Put the closing
+            // paren on a new line when a line comment might otherwise swallow
+            // it. Closed block comments are safe as-is.
+            Some(source) if !source.is_empty() => {
+                let newline = if source.contains("--") { "\n" } else { "" };
+                format!("CHECK({source}{newline})")
+            }
+            _ => format!("CHECK({})", self.expr),
+        }
     }
 }
 
@@ -3467,8 +3547,10 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
                 col.ty_str = "BLOB".to_string();
+                col.override_affinity(Affinity::Blob);
             } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
                 col.ty_str = resolved.primitive.to_uppercase();
+                col.override_affinity(Affinity::None);
             }
         }
         Arc::new(modified)
@@ -3520,6 +3602,7 @@ impl BTreeTable {
             if let Some(only) = effective_only {
                 if !only.get(i) {
                     col.ty_str = "ANY".to_string();
+                    col.override_affinity(Affinity::Blob);
                     continue;
                 }
             }
@@ -3527,6 +3610,7 @@ impl BTreeTable {
                 // Pre-encode: user input can be text ('[1,2]') or blob (ARRAY[]),
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
+                col.override_affinity(Affinity::Blob);
             } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
@@ -3546,13 +3630,13 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs regardless of element type.
                 col.set_ty(Type::Blob);
-                col.set_base_affinity(Affinity::Blob);
+                col.override_affinity(Affinity::Blob);
                 continue;
             }
             if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
                 let (base_ty, _) = type_from_name(&resolved.primitive);
                 col.set_ty(base_ty);
-                col.set_base_affinity(Affinity::affinity(&resolved.primitive));
+                col.override_affinity(Affinity::affinity(&resolved.primitive));
             }
         }
     }
@@ -3591,6 +3675,7 @@ impl BTreeTable {
                     new_checks.try_push(CheckConstraint {
                         name: Some(name),
                         expr: *rewritten,
+                        source: None,
                         column: Some(col_name.clone()),
                     })?;
                 }
@@ -3685,6 +3770,7 @@ impl BTreeTable {
                     sql.push_str("[]");
                 }
             }
+
             if column.notnull()
                 && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
             {
@@ -3704,6 +3790,22 @@ impl BTreeTable {
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
                 sql.push_str(&default.to_string());
+            }
+
+            if let Some(collation) = column.collation_opt() {
+                match collation {
+                    CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
+                    CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
+                    CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
+                    CollationSeq::Locale(_) => {
+                        sql.push_str(" COLLATE ");
+                        sql.push_str(&quote_ident(&collation.name()));
+                    }
+                    CollationSeq::Unset | CollationSeq::Custom(_) => {
+                        // Unset should not be reachable -- ignore it
+                        // Custom collation is not allowed in schema definitions
+                    }
+                };
             }
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
@@ -3806,7 +3908,7 @@ impl BTreeTable {
             }
             // Skip single-column unique constraints that were already emitted inline
             if unique_set.columns.len() == 1 {
-                let col_name = &unique_set.columns[0].0;
+                let col_name = &unique_set.columns[0].name;
                 if let Some((_, col)) = self.get_column(col_name) {
                     if col.unique() {
                         continue;
@@ -3814,11 +3916,11 @@ impl BTreeTable {
                 }
             }
             sql.push_str(", UNIQUE (");
-            for (i, (col_name, _)) in unique_set.columns.iter().enumerate() {
+            for (i, unique_column) in unique_set.columns.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&quote_ident(col_name));
+                sql.push_str(&quote_ident(&unique_column.name));
             }
             sql.push(')');
         }
@@ -4078,6 +4180,13 @@ pub struct FromClauseSubquery {
     /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
     /// reference rather than an inline derived table.
     pub cte: Option<FromClauseSubqueryCteMetadata>,
+}
+
+/// The one-row table read by the recursive part of a recursive CTE.
+#[derive(Debug, Clone)]
+pub struct RecursiveCteInput {
+    pub name: String,
+    pub columns: Vec<Column>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4526,9 +4635,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     if *auto_increment {
                         has_autoincrement = true;
                     }
-                    reject_explicit_nulls(columns)?;
-
-                    let mut pk_collations = Vec::try_with_capacity_ext(columns.len())?;
+                    let mut pk_unique_set_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
                         let col_name = match expr {
@@ -4540,13 +4647,17 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 bail_parse_error!("unsupported primary key expression: {}", expr)
                             }
                         };
-                        primary_key_columns
-                            .try_push((col_name, column.order.unwrap_or(SortOrder::Asc)))?;
-                        pk_collations.try_push(collation)?;
+                        let sort_order = column.order.unwrap_or(SortOrder::Asc);
+                        pk_unique_set_columns.try_push(UniqueSetColumn {
+                            name: col_name.clone(),
+                            sort_order,
+                            collation,
+                            nulls_order: column.nulls,
+                        })?;
+                        primary_key_columns.try_push((col_name, sort_order))?;
                     }
                     unique_sets_constraints.try_push(UniqueSet {
-                        columns: primary_key_columns.try_clone()?,
-                        collations: pk_collations,
+                        columns: pk_unique_set_columns,
                         is_primary_key: true,
                         conflict_clause: *conflict_clause,
                     })?;
@@ -4555,29 +4666,27 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    reject_explicit_nulls(columns)?;
                     let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
-                    let mut unique_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
-                        match expr {
-                            Expr::Id(id) => unique_columns.try_push((
-                                id.as_str().to_string(),
-                                column.order.unwrap_or(SortOrder::Asc),
-                            ))?,
-                            Expr::Literal(Literal::String(value)) => unique_columns.try_push((
-                                value.trim_matches('\'').to_owned(),
-                                column.order.unwrap_or(SortOrder::Asc),
-                            ))?,
+                        let col_name = match expr {
+                            Expr::Id(id) => id.as_str().to_string(),
+                            Expr::Literal(Literal::String(value)) => {
+                                value.trim_matches('\'').to_owned()
+                            }
                             expr => {
                                 bail_parse_error!("unsupported unique key expression: {}", expr)
                             }
-                        }
-                        unique_collations.try_push(collation)?;
+                        };
+                        unique_columns.try_push(UniqueSetColumn {
+                            name: col_name,
+                            sort_order: column.order.unwrap_or(SortOrder::Asc),
+                            collation,
+                            nulls_order: column.nulls,
+                        })?;
                     }
                     let unique_set = UniqueSet {
                         columns: unique_columns,
-                        collations: unique_collations,
                         is_primary_key: false,
                         conflict_clause: *conflict_clause,
                     };
@@ -4651,10 +4760,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     };
                     foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
-                } else if let ast::TableConstraint::Check(expr) = &c.constraint {
+                } else if let ast::TableConstraint::Check { expr, source } = &c.constraint {
                     check_constraints.try_push(CheckConstraint::new(
                         c.name.as_ref(),
                         expr,
+                        source.as_deref(),
                         None,
                     ))?;
                 }
@@ -4720,10 +4830,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
-                        ast::ColumnConstraint::Check(expr) => {
+                        ast::ColumnConstraint::Check { expr, source } => {
                             check_constraints.try_push(CheckConstraint::new(
                                 c_def.name.as_ref(),
                                 expr,
+                                source.as_deref(),
                                 Some(&name),
                             ))?;
                         }
@@ -4757,8 +4868,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 order = *o;
                             }
                             unique_sets_columns.try_push(UniqueSet {
-                                columns: try_vec![(name.clone(), order)]?,
-                                collations: try_vec![None]?,
+                                columns: try_vec![UniqueSetColumn {
+                                    name: name.clone(),
+                                    sort_order: order,
+                                    collation: None,
+                                    nulls_order: None,
+                                }]?,
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
                             })?;
@@ -4781,8 +4896,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
                             unique_sets_columns.try_push(UniqueSet {
-                                columns: try_vec![(name.clone(), order)]?,
-                                collations: try_vec![None]?,
+                                columns: try_vec![UniqueSetColumn {
+                                    name: name.clone(),
+                                    sort_order: order,
+                                    collation: None,
+                                    nulls_order: None,
+                                }]?,
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
                             })?;
@@ -4977,7 +5096,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .columns
                         .first()
                         .unwrap()
-                        .0
+                        .name
                         .eq_ignore_ascii_case(col.name.as_ref().unwrap())
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
@@ -5013,7 +5132,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             .columns
                             .iter()
                             .zip(unique_sets[j].columns.iter())
-                            .all(|((a_name, _), (b_name, _))| a_name.eq_ignore_ascii_case(b_name))
+                            .all(|(a, b)| a.name.eq_ignore_ascii_case(&b.name))
                     {
                         // SQLite rejects duplicate constraints on the same columns when both
                         // specify ON CONFLICT with different resolve types.
@@ -5218,7 +5337,7 @@ pub struct Column {
     pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
-    raw: u32,
+    info: ColumnInfo,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -5248,58 +5367,13 @@ pub enum GeneratedType {
     NotGenerated,
 }
 
-// flags
-const F_PRIMARY_KEY: u32 = 1;
-const F_ROWID_ALIAS: u32 = 2;
-const F_NOTNULL: u32 = 4;
-const F_UNIQUE: u32 = 8;
-const F_HIDDEN: u32 = 16;
-
-// pack Type and Collation in the remaining bits
-const TYPE_SHIFT: u32 = 5;
-const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
-const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
-const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
-
-// Bits 20-22: base type affinity override for custom type columns.
-// 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1
-const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
-const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
-
-// Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
-const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
-const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
-
 impl Column {
     pub fn affinity(&self) -> Affinity {
-        let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
-        if v > 0 {
-            // Custom type column: use the base type's affinity
-            match v {
-                1 => Affinity::Integer,
-                2 => Affinity::Text,
-                3 => Affinity::Blob,
-                4 => Affinity::Real,
-                _ => Affinity::Numeric,
-            }
-        } else {
-            Affinity::affinity(&self.ty_str)
-        }
+        self.info
+            .affinity()
+            .unwrap_or_else(|| Affinity::affinity(&self.ty_str))
     }
 
-    /// Set the base type affinity override for a custom type column.
-    /// This ensures affinity rules use the custom type's BASE type
-    /// rather than applying SQLite name-based rules to the type name.
-    pub fn set_base_affinity(&mut self, affinity: Affinity) {
-        let v: u32 = match affinity {
-            Affinity::Integer => 1,
-            Affinity::Text => 2,
-            Affinity::Blob => 3,
-            Affinity::Real => 4,
-            Affinity::Numeric => 5,
-        };
-        self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
-    }
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob
@@ -5354,50 +5428,27 @@ impl Column {
             }
             None => GeneratedType::NotGenerated,
         };
-        let mut raw = 0u32;
-        raw |= (ty as u32) << TYPE_SHIFT;
-        if let Some(c) = col {
-            raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
-        }
-        if coldef.primary_key {
-            raw |= F_PRIMARY_KEY
-        }
-        if coldef.rowid_alias {
-            raw |= F_ROWID_ALIAS
-        }
-        if coldef.notnull {
-            raw |= F_NOTNULL
-        }
-        if coldef.unique {
-            raw |= F_UNIQUE
-        }
-        if coldef.hidden {
-            raw |= F_HIDDEN
-        }
+        let mut info = ColumnInfo::new(NewColumnInfoParams {
+            ty,
+            collation: col,
+            coldef: &coldef,
+        });
+        info.override_affinity(Affinity::affinity(&ty_str));
+
         Self {
             name,
             ty_str,
             ty_params: std::vec::Vec::new(),
             default,
             generated_type,
-            raw,
+            info,
             explicit_notnull: coldef.explicit_notnull,
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
     }
-    #[inline]
-    pub const fn ty(&self) -> Type {
-        let v = ((self.raw & TYPE_MASK) >> TYPE_SHIFT) as u8;
-        Type::from_bits(v)
-    }
 
     #[inline]
-    pub const fn set_ty(&mut self, ty: Type) {
-        self.raw = (self.raw & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
-    }
-
-    #[inline]
-    pub const fn collation_opt(&self) -> Option<CollationSeq> {
+    pub fn collation_opt(&self) -> Option<CollationSeq> {
         if self.has_explicit_collation() {
             Some(self.collation())
         } else {
@@ -5406,51 +5457,8 @@ impl Column {
     }
 
     #[inline]
-    pub const fn collation(&self) -> CollationSeq {
-        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
-        if v == CollationSeq::Unset.to_bits() {
-            CollationSeq::Binary
-        } else {
-            CollationSeq::from_storage_bits(v)
-        }
-    }
-
-    #[inline]
-    pub const fn has_explicit_collation(&self) -> bool {
-        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
-        v != CollationSeq::Unset.to_bits()
-    }
-
-    #[inline]
-    pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
-        if let Some(c) = c {
-            self.raw = (self.raw & !COLL_MASK) | (((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK);
-        }
-    }
-
-    #[inline]
-    pub fn primary_key(&self) -> bool {
-        self.raw & F_PRIMARY_KEY != 0
-    }
-    #[inline]
-    pub const fn is_rowid_alias(&self) -> bool {
-        self.raw & F_ROWID_ALIAS != 0
-    }
-    #[inline]
-    pub const fn notnull(&self) -> bool {
-        self.raw & F_NOTNULL != 0
-    }
-    #[inline]
-    pub const fn explicit_notnull(&self) -> bool {
+    pub fn explicit_notnull(&self) -> bool {
         self.explicit_notnull
-    }
-    #[inline]
-    pub const fn unique(&self) -> bool {
-        self.raw & F_UNIQUE != 0
-    }
-    #[inline]
-    pub const fn hidden(&self) -> bool {
-        self.raw & F_HIDDEN != 0
     }
 
     /// Returns an error if this column is a generated column.
@@ -5468,12 +5476,12 @@ impl Column {
     }
 
     #[inline]
-    pub const fn is_generated(&self) -> bool {
+    pub fn is_generated(&self) -> bool {
         !matches!(self.generated_type, GeneratedType::NotGenerated)
     }
 
     #[inline]
-    pub const fn is_virtual_generated(&self) -> bool {
+    pub fn is_virtual_generated(&self) -> bool {
         matches!(self.generated_type, GeneratedType::Virtual { .. })
     }
 
@@ -5505,50 +5513,77 @@ impl Column {
     }
 
     #[inline]
-    pub const fn set_primary_key(&mut self, v: bool) {
-        self.set_flag(F_PRIMARY_KEY, v);
+    pub fn override_affinity(&mut self, affinity: Affinity) {
+        self.info.override_affinity(affinity)
     }
     #[inline]
-    pub const fn set_rowid_alias(&mut self, v: bool) {
-        self.set_flag(F_ROWID_ALIAS, v);
+    pub fn ty(&self) -> Type {
+        self.info.ty()
     }
     #[inline]
-    pub const fn set_notnull(&mut self, v: bool) {
-        self.set_flag(F_NOTNULL, v);
+    pub fn set_ty(&mut self, ty: Type) {
+        self.info.set_ty(ty)
     }
     #[inline]
-    pub const fn set_unique(&mut self, v: bool) {
-        self.set_flag(F_UNIQUE, v);
+    pub fn collation(&self) -> CollationSeq {
+        self.info.collation()
     }
     #[inline]
-    pub const fn set_hidden(&mut self, v: bool) {
-        self.set_flag(F_HIDDEN, v);
+    pub fn has_explicit_collation(&self) -> bool {
+        self.info.has_explicit_collation()
     }
-
     #[inline]
-    pub const fn is_array(&self) -> bool {
-        (self.raw & ARRAY_DIM_MASK) != 0
+    pub fn set_collation(&mut self, c: Option<CollationSeq>) {
+        self.info.set_collation(c)
     }
-
+    #[inline]
+    pub fn primary_key(&self) -> bool {
+        self.info.primary_key()
+    }
+    #[inline]
+    pub fn is_rowid_alias(&self) -> bool {
+        self.info.is_rowid_alias()
+    }
+    #[inline]
+    pub fn notnull(&self) -> bool {
+        self.info.notnull()
+    }
+    #[inline]
+    pub fn set_notnull(&mut self, v: bool) {
+        self.info.set_notnull(v)
+    }
+    #[inline]
+    pub fn unique(&self) -> bool {
+        self.info.unique()
+    }
+    #[inline]
+    pub fn hidden(&self) -> bool {
+        self.info.hidden()
+    }
+    #[inline]
+    pub fn set_rowid_alias(&mut self, v: bool) {
+        self.info.set_rowid_alias(v)
+    }
+    #[inline]
+    pub fn set_unique(&mut self, v: bool) {
+        self.info.set_unique(v)
+    }
+    #[inline]
+    pub fn set_hidden(&mut self, v: bool) {
+        self.info.set_hidden(v)
+    }
+    #[inline]
+    pub fn is_array(&self) -> bool {
+        self.info.is_array()
+    }
     /// Number of array dimensions (0 = scalar, 1 = `[]`, 2 = `[][]`, etc.)
     #[inline]
-    pub const fn array_dimensions(&self) -> u32 {
-        (self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT
+    pub fn array_dimensions(&self) -> u32 {
+        self.info.array_dimensions()
     }
-
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
-        assert!(dims <= 7, "array dimensions must be <= 7");
-        self.raw = (self.raw & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
-    }
-
-    #[inline]
-    const fn set_flag(&mut self, mask: u32, val: bool) {
-        if val {
-            self.raw |= mask
-        } else {
-            self.raw &= !mask
-        }
+        self.info.set_array_dimensions(dims)
     }
 }
 
@@ -5746,6 +5781,7 @@ pub struct Index {
 pub struct IndexColumn {
     pub name: String,
     pub order: SortOrder,
+    pub nulls_order: Option<NullsOrder>,
     /// the position of the column in the source table.
     /// for example:
     /// CREATE TABLE t (a,b,c)
@@ -5758,12 +5794,42 @@ pub struct IndexColumn {
     pub expr: Option<Box<Expr>>,
 }
 
+macro_rules! impl_effective_nulls_order {
+    ($ty:ty) => {
+        impl $ty {
+            pub fn effective_nulls_order_when_iterated(
+                &self,
+                iter_dir: $crate::translate::plan::IterationDirection,
+            ) -> turso_parser::ast::NullsOrder {
+                match iter_dir {
+                    $crate::translate::plan::IterationDirection::Forwards => {
+                        self.effective_nulls_order()
+                    }
+                    $crate::translate::plan::IterationDirection::Backwards => {
+                        self.effective_nulls_order().reverse()
+                    }
+                }
+            }
+
+            pub fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
+                self.nulls_order
+                    .unwrap_or_else(|| turso_parser::ast::NullsOrder::default_for(self.order))
+            }
+        }
+    };
+}
+
+pub(crate) use impl_effective_nulls_order;
+
+impl_effective_nulls_order!(IndexColumn);
+
 impl IndexColumn {
     /// Returns a default column with the given name and position.
     pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
+            nulls_order: None,
             pos_in_table,
             collation: None,
             default: None,
@@ -5784,6 +5850,7 @@ impl IndexColumn {
             .map(|(i, name)| Self {
                 name: name.to_string(),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table: i,
                 collation: None,
                 default: None,
@@ -5878,12 +5945,17 @@ impl Index {
             .is_some_and(|x| x.definition().backing_btree)
     }
 
+    /// Whether this schema index owns a B-tree root page.
+    pub fn is_btree_backed(&self) -> bool {
+        self.index_method.is_none() || self.is_backing_btree_index()
+    }
+
     pub fn automatic_from_primary_key(
         table: &BTreeTable,
         auto_index: (String, i64), // name, root_page
         column_count: usize,
         conflict_clause: Option<ResolveType>,
-        collation_overrides: &[Option<CollationSeq>],
+        constraint_columns: &[UniqueSetColumn],
     ) -> Result<Index> {
         let has_primary_key_index =
             table.get_rowid_alias_column().is_none() && !table.primary_key_columns.is_empty();
@@ -5903,11 +5975,11 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
+                    nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: collation_overrides
+                    collation: constraint_columns
                         .get(i)
-                        .copied()
-                        .flatten()
+                        .and_then(|c| c.collation)
                         .or_else(|| column.collation_opt()),
                     default: column.default.clone(),
                     expr: None,
@@ -5936,7 +6008,7 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
         conflict_clause: Option<ResolveType>,
-        collation_overrides: &[Option<CollationSeq>],
+        constraint_columns: &[UniqueSetColumn],
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
@@ -5957,11 +6029,11 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
+                    nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: collation_overrides
+                    collation: constraint_columns
                         .get(i)
-                        .copied()
-                        .flatten()
+                        .and_then(|c| c.collation)
                         .or_else(|| col.collation_opt()),
                     default: col.default.clone(),
                     expr: None,
@@ -6105,24 +6177,70 @@ impl Index {
         ok
     }
 
+    /// Bind a copy of this index's WHERE clause against the given table references.
+    ///
+    /// Returns `Ok(None)` when the index has no WHERE clause. Binding errors are
+    /// propagated, never swallowed: callers must not treat `None` as "binding failed".
+    ///
+    /// The predicate may qualify columns with the table's real name
+    /// (e.g. `CREATE INDEX i ON t(a) WHERE t.b > 0`), while the DML statement
+    /// may refer to that table only under an alias (e.g. `UPDATE t AS z ...`).
+    /// Rewrite such qualifiers to the identifier the statement uses, so the
+    /// predicate always resolves against the index's own table, like in SQLite.
     pub fn bind_where_expr(
         &self,
         table_refs: Option<&mut TableReferences>,
         resolver: &Resolver,
-    ) -> Option<ast::Expr> {
+    ) -> crate::Result<Option<ast::Expr>> {
         let Some(where_clause) = &self.where_clause else {
-            return None;
+            return Ok(None);
         };
         let mut expr = where_clause.clone();
+        let target_identifier = table_refs.as_deref().and_then(|refs| {
+            // Only a real b-tree table can be the DML target that owns this index.
+            // A CTE or subquery sharing the table's name (e.g. `WITH t AS ...
+            // UPDATE t ...`) must not be picked, so match on b-tree identity.
+            let mut matches = refs
+                .joined_tables()
+                .iter()
+                .map(|jt| (&jt.identifier, &jt.table))
+                .chain(
+                    refs.outer_query_refs()
+                        .iter()
+                        .map(|r| (&r.identifier, &r.table)),
+                )
+                .filter(|(_, table)| {
+                    table
+                        .btree()
+                        .is_some_and(|bt| normalize_ident(&bt.name) == self.table_name)
+                })
+                .map(|(identifier, _)| identifier);
+            let target = matches.next().cloned();
+            assert!(
+                matches.next().is_none(),
+                "multiple table references match the table of partial index {}",
+                self.name
+            );
+            target
+        });
+        if let Some(identifier) = target_identifier {
+            walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
+                if let Expr::Qualified(ns, _) | Expr::DoublyQualified(_, ns, _) = e {
+                    if normalize_ident(ns.as_str()) == self.table_name {
+                        *ns = Name::exact(identifier.clone());
+                    }
+                }
+                Ok(WalkControl::Continue)
+            })?;
+        }
         bind_and_rewrite_expr(
             &mut expr,
             table_refs,
             None,
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .ok()?;
-        Some(*expr)
+        )?;
+        Ok(Some(*expr))
     }
 }
 
@@ -6451,6 +6569,30 @@ mod tests {
         let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
         let actual = sqlite_schema_table()?.to_sql();
         assert_eq!(expected, actual);
+        Ok(())
+    }
+
+    #[test]
+    fn check_constraint_comments_survive_table_reconstruction() -> Result<()> {
+        for (sql, comment) in [
+            (
+                "CREATE TABLE t (x CHECK(x /* block comment */ > 0))",
+                "/* block comment */",
+            ),
+            (
+                "CREATE TABLE t (x CHECK(x > 0 -- line comment\n))",
+                "-- line comment",
+            ),
+        ] {
+            let reconstructed = BTreeTable::from_sql(sql, 0)?.to_sql();
+
+            assert!(
+                reconstructed.contains(comment),
+                "reconstructed SQL: {reconstructed}"
+            );
+            BTreeTable::from_sql(&reconstructed, 0)?;
+        }
+
         Ok(())
     }
 
@@ -7323,5 +7465,218 @@ mod tests {
             !schema.sequences.contains_key("broken_seq"),
             "rejected descriptor must not land in the sequences map",
         );
+    }
+
+    #[test]
+    fn set_base_affinity_is_consistent_with_accessor() {
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            let mut col = Column::new(
+                Some("x".to_string()),
+                "BLOB".to_string(),
+                None,
+                None,
+                Type::Blob,
+                None,
+                ColDef::default(),
+            );
+            col.override_affinity(affinity);
+            assert_eq!(
+                col.affinity(),
+                affinity,
+                "stored {affinity:?} but read back {:?}",
+                col.affinity(),
+            );
+        }
+    }
+}
+
+mod column_info {
+    use crate::schema::{ColDef, Type};
+    use crate::vdbe::affinity::Affinity;
+    use crate::vdbe::CollationSeq;
+
+    // flags
+    const F_PRIMARY_KEY: u32 = 1;
+    const F_ROWID_ALIAS: u32 = 2;
+    const F_NOTNULL: u32 = 4;
+    const F_UNIQUE: u32 = 8;
+    const F_HIDDEN: u32 = 16;
+
+    // pack Type and Collation in the remaining bits
+    const TYPE_SHIFT: u32 = 5;
+    const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
+    const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
+    const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
+
+    // Bits 20-22: base type affinity. Column affinity will resolve to this
+    // value only if it is > 0, else it uses ty_str.
+    const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+    const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
+
+    // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+    const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
+    const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
+
+    /// ColumnInfo packs information on a [Column] into a single `u32`.
+    #[derive(Clone, Debug)]
+    pub struct ColumnInfo(u32);
+
+    pub struct NewColumnInfoParams<'a> {
+        pub ty: Type,
+        pub collation: Option<CollationSeq>,
+        pub coldef: &'a ColDef,
+    }
+
+    impl ColumnInfo {
+        #[inline]
+        pub fn new(params: NewColumnInfoParams) -> Self {
+            let mut raw: u32 = 0;
+
+            raw |= (params.ty as u32) << TYPE_SHIFT;
+            if let Some(c) = params.collation {
+                raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
+            }
+            if params.coldef.primary_key {
+                raw |= F_PRIMARY_KEY
+            }
+            if params.coldef.rowid_alias {
+                raw |= F_ROWID_ALIAS
+            }
+            if params.coldef.notnull {
+                raw |= F_NOTNULL
+            }
+            if params.coldef.unique {
+                raw |= F_UNIQUE
+            }
+            if params.coldef.hidden {
+                raw |= F_HIDDEN
+            }
+
+            Self(raw)
+        }
+
+        #[inline]
+        pub fn primary_key(&self) -> bool {
+            self.0 & F_PRIMARY_KEY != 0
+        }
+
+        #[inline]
+        pub fn is_rowid_alias(&self) -> bool {
+            self.0 & F_ROWID_ALIAS != 0
+        }
+
+        #[inline]
+        pub fn set_rowid_alias(&mut self, v: bool) {
+            self.set_flag(F_ROWID_ALIAS, v);
+        }
+
+        #[inline]
+        pub fn notnull(&self) -> bool {
+            self.0 & F_NOTNULL != 0
+        }
+
+        #[inline]
+        pub fn set_notnull(&mut self, v: bool) {
+            self.set_flag(F_NOTNULL, v);
+        }
+
+        #[inline]
+        pub fn unique(&self) -> bool {
+            self.0 & F_UNIQUE != 0
+        }
+
+        #[inline]
+        pub fn set_unique(&mut self, v: bool) {
+            self.set_flag(F_UNIQUE, v);
+        }
+
+        #[inline]
+        fn set_flag(&mut self, mask: u32, val: bool) {
+            if val {
+                self.0 |= mask
+            } else {
+                self.0 &= !mask
+            }
+        }
+
+        #[inline]
+        pub fn hidden(&self) -> bool {
+            self.0 & F_HIDDEN != 0
+        }
+
+        #[inline]
+        pub fn set_hidden(&mut self, v: bool) {
+            self.set_flag(F_HIDDEN, v);
+        }
+
+        #[inline]
+        pub fn is_array(&self) -> bool {
+            (self.0 & ARRAY_DIM_MASK) != 0
+        }
+
+        #[inline]
+        pub fn array_dimensions(&self) -> u32 {
+            (self.0 & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT
+        }
+
+        #[inline]
+        pub fn set_array_dimensions(&mut self, dims: u32) {
+            assert!(dims <= 7, "array dimensions must be <= 7");
+            self.0 = (self.0 & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
+        }
+
+        #[inline]
+        pub fn ty(&self) -> Type {
+            let v = ((self.0 & TYPE_MASK) >> TYPE_SHIFT) as u8;
+            Type::from_bits(v)
+        }
+
+        #[inline]
+        pub fn set_ty(&mut self, ty: Type) {
+            self.0 = (self.0 & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
+        }
+
+        #[inline]
+        pub fn collation(&self) -> CollationSeq {
+            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
+            if v == CollationSeq::Unset.to_bits() {
+                CollationSeq::Binary
+            } else {
+                CollationSeq::from_storage_bits(v)
+            }
+        }
+
+        #[inline]
+        pub fn has_explicit_collation(&self) -> bool {
+            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
+            v != CollationSeq::Unset.to_bits()
+        }
+
+        #[inline]
+        pub fn set_collation(&mut self, c: Option<CollationSeq>) {
+            self.0 &= !COLL_MASK;
+            if let Some(c) = c {
+                self.0 |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
+            }
+        }
+
+        #[inline]
+        pub fn affinity(&self) -> Option<Affinity> {
+            let v = (self.0 & BASE_AFF_MASK) >> BASE_AFF_SHIFT;
+            Affinity::from_repr(v)
+        }
+
+        #[inline]
+        pub fn override_affinity(&mut self, affinity: Affinity) {
+            let v: u32 = affinity as u32;
+            self.0 = (self.0 & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
+        }
     }
 }

@@ -416,7 +416,14 @@ test window-function-without-over {
     SELECT row_number() FROM products;
 }
 expect error {
-    misuse of window function
+    misuse of window function row_number\(\)$
+}
+
+test window-function-star-without-over {
+    SELECT row_number(*) FROM products;
+}
+expect error {
+    misuse of window function row_number\(\)$
 }
 
 test window-scalar-function-star {

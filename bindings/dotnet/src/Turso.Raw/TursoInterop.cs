@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.Runtime.InteropServices;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
@@ -43,6 +42,8 @@ internal struct TursoDatabaseConfig
     public IntPtr Vfs;
     public IntPtr EncryptionCipher;
     public IntPtr EncryptionHexKey;
+    public IntPtr PageCodec;
+    public uint OpenFlags;
 }
 
 internal static class TursoInterop
@@ -51,20 +52,7 @@ internal static class TursoInterop
 
     static TursoInterop()
     {
-        if (OperatingSystem.IsIOS())
-        {
-            NativeLibrary.SetDllImportResolver(typeof(TursoInterop).Assembly, ResolveDllImport);
-        }
-    }
-
-    private static IntPtr ResolveDllImport(
-        string libraryName,
-        Assembly assembly,
-        DllImportSearchPath? searchPath)
-    {
-        return libraryName == DllName
-            ? NativeLibrary.Load($"Frameworks/lib{libraryName}.framework/lib{libraryName}", assembly, searchPath)
-            : IntPtr.Zero;
+        TursoNativeLibraryResolver.EnsureInitialized();
     }
 
     [DllImport(DllName, EntryPoint = "turso_database_new", CallingConvention = CallingConvention.Cdecl)]

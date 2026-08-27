@@ -23,6 +23,8 @@ use crate::generate::GeneratedStatement;
 pub enum OracleResult {
     /// The oracle check passed.
     Pass,
+    /// EXPLAIN failed in at least one engine, so neither engine ran the statement.
+    Skipped(String),
     /// The oracle check passed but with a warning (e.g., LIMIT without ORDER BY).
     Warning(String),
     /// The oracle check failed with a reason.
@@ -32,6 +34,10 @@ pub enum OracleResult {
 impl OracleResult {
     pub fn is_pass(&self) -> bool {
         matches!(self, OracleResult::Pass)
+    }
+
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, OracleResult::Skipped(_))
     }
 
     pub fn is_warning(&self) -> bool {
@@ -188,6 +194,27 @@ fn short_sql(sql: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn format_skipped_statement(
+    stmt: &GeneratedStatement,
+    turso_error: Option<&str>,
+    sqlite_error: Option<&str>,
+) -> String {
+    let error_prefix = |error: &str| {
+        let error = error
+            .find(&stmt.sql)
+            .map(|sql_start| error[..sql_start].trim_end_matches(" in ").trim())
+            .unwrap_or(error);
+        short_sql(error, 240)
+    };
+    let turso_error = turso_error.map(error_prefix);
+    let sqlite_error = sqlite_error.map(error_prefix);
+    format!(
+        "Statement skipped because EXPLAIN failed: sql_hash={:016x} Turso error={turso_error:?} SQLite error={sqlite_error:?}\n  SQL: {}",
+        sql_hash(&stmt.sql),
+        short_sql(&stmt.sql, 240),
+    )
 }
 
 fn format_nondet_limit_warning(
@@ -378,6 +405,32 @@ pub fn check_differential(
     schema: &Schema,
     stmt: &GeneratedStatement,
 ) -> OracleResult {
+    // Generated SQL can contain an error in a branch that never runs. SQLite
+    // may remove that branch before checking it, while Turso may reject it.
+    // If the accepted statement writes data, running it in only one database
+    // would spoil every comparison that follows. EXPLAIN asks each engine to
+    // prepare the statement without changing data. Run it only if both agree
+    // that it can run.
+    let explain_sql = format!("EXPLAIN {}", stmt.sql);
+    let turso_explain = DifferentialOracle::execute_turso(turso_conn, &explain_sql);
+    let sqlite_explain = DifferentialOracle::execute_sqlite(sqlite_conn, &explain_sql);
+    match (&turso_explain, &sqlite_explain) {
+        (QueryResult::Error(turso_error), QueryResult::Error(sqlite_error)) => {
+            return OracleResult::Skipped(format_skipped_statement(
+                stmt,
+                Some(turso_error),
+                Some(sqlite_error),
+            ));
+        }
+        (QueryResult::Error(turso_error), _) => {
+            return OracleResult::Skipped(format_skipped_statement(stmt, Some(turso_error), None));
+        }
+        (_, QueryResult::Error(sqlite_error)) => {
+            return OracleResult::Skipped(format_skipped_statement(stmt, None, Some(sqlite_error)));
+        }
+        _ => {}
+    }
+
     let turso_result = DifferentialOracle::execute_turso(turso_conn, &stmt.sql);
     let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &stmt.sql);
 
@@ -421,7 +474,13 @@ mod tests {
     fn test_oracle_result() {
         assert!(OracleResult::Pass.is_pass());
         assert!(!OracleResult::Pass.is_fail());
+        assert!(!OracleResult::Pass.is_skipped());
         assert!(!OracleResult::Pass.is_warning());
+
+        assert!(OracleResult::Skipped("test".into()).is_skipped());
+        assert!(!OracleResult::Skipped("test".into()).is_pass());
+        assert!(!OracleResult::Skipped("test".into()).is_fail());
+        assert!(!OracleResult::Skipped("test".into()).is_warning());
 
         assert!(OracleResult::Warning("test".into()).is_warning());
         assert!(!OracleResult::Warning("test".into()).is_pass());
@@ -515,5 +574,58 @@ mod tests {
             result.is_fail(),
             "post-DML state verification should catch hidden row mismatches"
         );
+    }
+
+    #[test]
+    fn statement_rejected_by_one_engine_is_skipped() {
+        let io = Arc::new(MemorySimIO::new(456));
+        let turso_db = Database::open_file_with_flags(
+            io,
+            "oracle-validation-skip.db",
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let turso_conn = turso_db.connect().unwrap();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![ColumnDef::new("a", DataType::Integer)],
+            ))
+            .build();
+
+        for sql in ["CREATE TABLE t(a)", "INSERT INTO t VALUES (1)"] {
+            assert!(matches!(
+                DifferentialOracle::execute_turso(&turso_conn, sql),
+                QueryResult::Ok
+            ));
+            assert!(matches!(
+                DifferentialOracle::execute_sqlite(&sqlite_conn, sql),
+                QueryResult::Ok
+            ));
+        }
+
+        let stmt = GeneratedStatement {
+            sql: "WITH cte(x) AS (SELECT 1, 2) \
+                  UPDATE t SET a = 2 WHERE 0 AND EXISTS (SELECT * FROM cte)"
+                .to_string(),
+            is_ddl: false,
+            mutates_data: true,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+        };
+
+        let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);
+        match result {
+            OracleResult::Skipped(reason) => {
+                assert!(reason.contains("Statement skipped because EXPLAIN failed"));
+                assert!(reason.contains("Turso error=Some"));
+                assert!(reason.contains("SQLite error=None"));
+            }
+            other => panic!("expected skipped statement, got {other:?}"),
+        }
     }
 }

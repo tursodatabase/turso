@@ -1,16 +1,53 @@
-use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
+use crate::vdbe::{
+    builder::CursorType,
+    insn::{IntegrityCkData, RegisterOrLiteral, SorterOpenData},
+};
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
+use crate::translate::eqp::EqpCteMaterialization;
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
 pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
     "INTEGER", "TEXT", "INTEGER", "INTEGER", "INTEGER", "TEXT", "INTEGER", "TEXT",
 ];
+
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
+
+pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS: [&str; 1] = ["plan_json"];
+pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE: [&str; 1] = ["TEXT"];
+
+#[derive(Debug, Clone, Default)]
+pub struct ExplainInfo {
+    /// map of instruction index to manual comment
+    pub comments: Vec<(InsnReference, &'static str)>,
+    /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
+    /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
+    pub cte_materializations: Vec<EqpCteMaterialization>,
+}
+
+impl ExplainInfo {
+    pub fn comment_at(&self, insn_index: InsnReference) -> Option<&'static str> {
+        self.comments
+            .iter()
+            .find(|(offset, _)| *offset == insn_index)
+            .map(|(_, comment)| *comment)
+    }
+
+    pub(crate) fn remap_insn_indices(&mut self, old_to_new: &[usize]) {
+        for (offset, _) in self.comments.iter_mut() {
+            *offset = old_to_new[*offset as usize] as InsnReference;
+        }
+        for cte in self.cte_materializations.iter_mut() {
+            for node_id in cte.node_ids.iter_mut() {
+                *node_id = old_to_new[*node_id];
+            }
+        }
+    }
+}
 
 pub fn insn_to_row(
     program: &PreparedProgram,
@@ -614,6 +651,43 @@ pub fn insn_to_row(
                     ),
                 )
             }
+            Insn::ColumnRange {
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+            } => {
+                let count = defaults.len();
+                let cursor_type = &program.cursor_ref[*cursor_id].1;
+                let column_name = |column: usize| -> String {
+                    let name: Option<&String> = match cursor_type {
+                        CursorType::BTreeTable(table) => {
+                            table.columns().get(column).and_then(|v| v.name.as_ref())
+                        }
+                        CursorType::BTreeIndex(index) => index.columns.get(column).map(|c| &c.name),
+                        _ => {
+                            None
+                        }
+                    };
+                    name.map_or_else(|| format!("column {column}"), |name| name.to_string())
+                };
+                (
+                    "ColumnRange",
+                    *cursor_id as i64,
+                    *start_column as i64,
+                    *dest as i64,
+                    Value::from_i64(count as i64),
+                    0,
+                    format!(
+                        "r[{}..{}]={}.{}..{}",
+                        dest,
+                        dest + count - 1,
+                        get_table_or_index_name(*cursor_id),
+                        column_name(*start_column),
+                        column_name(*start_column + count - 1),
+                    ),
+                )
+            }
             Insn::ColumnHasField {
                 cursor_id,
                 column,
@@ -644,20 +718,17 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
-            Insn::ArrayEncode {
-                reg,
-                element_type,
-                table_name,
-                col_name,
-                ..
-            } => (
+            Insn::ArrayEncode { data } => (
                 "ArrayEncode",
-                *reg as i64,
+                data.reg as i64,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("{table_name}.{col_name} ({element_type})"),
+                format!(
+                    "{}.{} ({})",
+                    data.table_name, data.col_name, data.element_type
+                ),
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",
@@ -901,13 +972,16 @@ pub fn insn_to_row(
             Insn::Next {
                 cursor_id,
                 pc_if_next,
+                fullscan,
             } => (
                 "Next",
                 *cursor_id as i64,
                 pc_if_next.as_debug_int() as i64,
                 0,
                 Value::build_text(""),
-                0,
+                // SQLite sets P5 to SQLITE_STMTSTATUS_FULLSCAN_STEP (1) on
+                // full-table-scan steps
+                *fullscan as i64,
                 "".to_string(),
             ),
             Insn::Halt {
@@ -1031,6 +1105,15 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 "".to_string(),
+            ),
+            Insn::ChangeCount { dest } => (
+                "ChangeCount",
+                0,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!("r[{dest}]=changes"),
             ),
             Insn::Real { value, dest } => (
                 "Real",
@@ -1258,24 +1341,17 @@ pub fn insn_to_row(
                 0,
                 format!("if (--r[{}]==0) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::AggStep {
-                func,
-                acc_reg,
-                delimiter: _,
-                col,
-                comparator: _,
-                collation,
-            } => (
+            Insn::AggStep { data } => (
                 "AggStep",
                 0,
-                *col as i64,
-                *acc_reg as i64,
-                Value::build_text(match collation {
-                    Some(collation) => format!("{}({collation})", func.as_str()),
-                    None => func.as_str().to_string(),
+                data.col as i64,
+                data.acc_reg as i64,
+                Value::build_text(match &data.collation {
+                    Some(collation) => format!("{}({collation})", data.func.as_str()),
+                    None => data.func.as_str().to_string(),
                 }),
                 0,
-                format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
+                format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
             ),
             Insn::AggInverse {
                 func,
@@ -1314,12 +1390,13 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
             ),
-            Insn::SorterOpen {
-                cursor_id,
-                columns,
-                order_collations_nulls,
-                ..
-            } => {
+            Insn::SorterOpen { data } => {
+                let SorterOpenData {
+                    cursor_id,
+                    columns,
+                    order_collations_nulls,
+                    ..
+                } = data.as_ref();
                 let to_print: Vec<String> = order_collations_nulls
                     .iter()
                     .map(|(order, collation, nulls)| {
@@ -1780,14 +1857,14 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TYPE {type_name}"),
             ),
-            Insn::AddSequence { db, name, .. } => (
+            Insn::AddSequence { data } => (
                 "AddSequence",
-                *db as i64,
+                data.db as i64,
                 0,
                 0,
-                Value::build_text(name.clone()),
+                Value::build_text(data.name.clone()),
                 0,
-                format!("ADD SEQUENCE {name}"),
+                format!("ADD SEQUENCE {}", data.name),
             ),
             Insn::DropSequence { db, seq_name } => (
                 "DropSequence",
@@ -1964,7 +2041,9 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::ParseSchema { db, where_clause } => (
+            Insn::ParseSchema {
+                db, where_clause, ..
+            } => (
                 "ParseSchema",
                 *db as i64,
                 0,
@@ -1985,13 +2064,16 @@ pub fn insn_to_row(
             Insn::Prev {
                 cursor_id,
                 pc_if_prev,
+                fullscan,
             } => (
                 "Prev",
                 *cursor_id as i64,
                 pc_if_prev.as_debug_int() as i64,
                 0,
                 Value::build_text(""),
-                0,
+                // SQLite sets P5 to SQLITE_STMTSTATUS_FULLSCAN_STEP (1) on
+                // full-table-scan steps
+                *fullscan as i64,
                 "".to_string(),
             ),
             Insn::ShiftRight { lhs, rhs, dest } => (
@@ -2203,6 +2285,15 @@ pub fn insn_to_row(
                 0,
                 format!("goto {}", target_pc_when_reentered.as_debug_int()),
             ),
+            Insn::ResetOnce { region_end } => (
+                "ResetOnce",
+                region_end.as_debug_int() as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("clear once flags before {}", region_end.as_debug_int()),
+            ),
             Insn::BeginSubrtn { dest, dest_end } => (
                 "BeginSubrtn",
                 *dest as i64,
@@ -2295,21 +2386,24 @@ pub fn insn_to_row(
                 0,
                 format!("r[{}]={}", *out_reg, *value),
             ),
-            Insn::IntegrityCk {
-                db,
-                max_errors,
-                roots,
-                dropped_roots,
-                message_register,
-            } => (
-                "IntegrityCk",
-                *max_errors as i64,
-                0,
-                0,
-                Value::build_text(""),
-                0,
-                format!("db={db} roots={roots:?} dropped_roots={dropped_roots:?} message_register={message_register}"),
-            ),
+            Insn::IntegrityCk { data } => {
+                let IntegrityCkData {
+                    db,
+                    max_errors,
+                    roots,
+                    dropped_roots,
+                    message_register,
+                } = data.as_ref();
+                (
+                    "IntegrityCk",
+                    *max_errors as i64,
+                    0,
+                    0,
+                    Value::build_text(""),
+                    0,
+                    format!("db={db} roots={roots:?} dropped_roots={dropped_roots:?} message_register={message_register}"),
+                )
+            }
             Insn::RowData { cursor_id, dest } => (
                 "RowData",
                 *cursor_id as i64,
@@ -2346,14 +2440,14 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
-            Insn::AddColumn { db: _, table, column, .. } => (
+            Insn::AddColumn { data } => (
                 "AddColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("add_column({table}, {column:?})"),
+                format!("add_column({}, {:?})", data.table, data.column),
             ),
             Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
                 "AlterColumn",
@@ -2397,7 +2491,7 @@ pub fn insn_to_row(
                 *p1 as i64,
                 p2.as_ref().map(|p| *p).unwrap_or(0) as i64,
                 0,
-                Value::build_text(detail.clone()),
+                Value::build_text(detail.to_string()),
                 0,
                 String::new(),
             ),

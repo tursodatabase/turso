@@ -30,25 +30,23 @@ use crate::{
             CollationSeq,
         },
         emitter::{prepare_cdc_if_necessary, HashCtx},
-        expr::comparison_affinity,
         planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
     },
     turso_assert, turso_assert_eq,
     types::SeekOp,
-    util::expr_tables_subset_of,
     vdbe::{
         affinity::{self, Affinity},
         builder::{
             CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
             ProgramBuilder,
         },
-        insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
+        insn::{to_u32, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
 };
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, ops::Range, sync::Arc};
 use turso_macros::turso_assert_some;
 
 mod body;

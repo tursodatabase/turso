@@ -17,7 +17,7 @@ info:
 QUERY PLAN
 |--LIST SUBQUERY 1
 |  `--SCAN users
-`--SEARCH orders USING INDEX idx_orders_user_id (user_id=?)
+`--SEARCH orders USING COVERING INDEX idx_orders_user_id (user_id=?)
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4            p5  comment
@@ -35,7 +35,7 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   11    RowId            4   2   0                 0  r[2]=users.rowid
   12    MakeRecord       2   1   6                 0  r[6]=mkrec(r[2..2]); for ephemeral_index_where_sub_t2
   13    IdxInsert        0   6   0                 8  key=r[6]
-  14  Next               4   9   0                 0
+  14  Next               4   9   0                 1
   15  OpenRead           3  12   0  k(2,B)         0  index=idx_orders_user_id, root=12, iDb=0
   16  NullRow            0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
   17  Rewind             0  27   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t2)

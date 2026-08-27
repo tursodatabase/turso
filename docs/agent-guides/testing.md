@@ -67,7 +67,9 @@ fn test_something() {
 - Every functional change needs a test
 - Test must fail without change, pass with it
 - Prefer in-memory DBs: `:memory:` (sqltest) or `{:memory:}` (TCL)
-- Don't invent new test formats. Follow existing patterns
+- Don't invent new test formats. Follow existing patterns.
+- Use minimal tests, i.e. the bare minimum that triggers the behaviour. No types, no PKs, etc. unless necessary.
+- Use column names a, b, c... table names t1, t2, t3... view names v1, v2, v3... 
 - Write tests first when possible
 - If tasked with identifying a reproducer for a bug, strongly prefer using only user-facing APIs. Manipulating DB internals to artificially trigger a condition, or asserting internal state, is a bad reproducer.
 - A reproducer must serve as a regression test once the bug is fixed.

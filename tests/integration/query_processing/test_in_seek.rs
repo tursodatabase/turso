@@ -39,7 +39,7 @@ fn large_indexed_in_list_uses_seek_loop() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        plan.contains("SEARCH t USING INDEX t_x (x=?)"),
+        plan.contains("SEARCH t USING COVERING INDEX t_x (x=?)"),
         "expected IN-list to drive indexed seeks, got:\n{plan}"
     );
     assert!(

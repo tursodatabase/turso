@@ -12,6 +12,9 @@ from typing import Any, Optional
 
 from .protocol import ProtocolError, ServerError, build_batch_step, decode_value
 
+# HTTP header carrying the remote encryption key (section 3.1).
+ENCRYPTION_KEY_HEADER = "x-turso-encryption-key"
+
 
 def normalize_url(url: str) -> str:
     """Rewrite libsql:// and turso:// URLs to https:// and strip any
@@ -137,8 +140,14 @@ class Session:
     """Manages one server-side stream: the baton, the base URL, and the
     server-reported transaction state."""
 
-    def __init__(self, url: str, auth_token: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        auth_token: Optional[str] = None,
+        remote_encryption_key: Optional[str] = None,
+    ) -> None:
         self._auth_token = auth_token
+        self._remote_encryption_key = remote_encryption_key
         self._base_url = normalize_url(url)
         self._baton: Optional[str] = None
         # Whether the connection is in autocommit mode, from the server's
@@ -162,6 +171,8 @@ class Session:
         headers = {"Content-Type": "application/json"}
         if self._auth_token:
             headers["Authorization"] = f"Bearer {self._auth_token}"
+        if self._remote_encryption_key:
+            headers[ENCRYPTION_KEY_HEADER] = self._remote_encryption_key
         return headers
 
     def _post(self, path: str, body: dict) -> bytes:

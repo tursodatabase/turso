@@ -15,7 +15,7 @@ use crate::{
     session::{Session, SharedState},
     statement::Statement,
     transaction::{DropBehavior, Transaction, TransactionBehavior},
-    Column, Error, Result,
+    AuthTokenFn, Column, Error, Result,
 };
 
 /// A connection to a remote database.
@@ -48,8 +48,12 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
-    pub fn new(url: &str, auth_token: Option<String>) -> Self {
-        let (session, shared) = Session::new(url, auth_token);
+    pub fn new(
+        url: &str,
+        auth_token: Option<AuthTokenFn>,
+        remote_encryption_key: Option<String>,
+    ) -> Self {
+        let (session, shared) = Session::new(url, auth_token, remote_encryption_key);
         Self {
             session: Arc::new(Mutex::new(session)),
             shared,

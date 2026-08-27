@@ -46,7 +46,9 @@ fn canonicalize_schema_sql(sql: &str) -> String {
         return normalize_sql_whitespace(sql);
     }
     match cmd {
-        Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt) => stmt.to_string(),
+        Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. } => {
+            stmt.to_string()
+        }
     }
 }
 
@@ -356,6 +358,72 @@ fn assert_plain_vacuum_preserves_content_hash(
         normalized_schema_snapshot(conn),
         before_schema,
         "plain VACUUM should preserve normalized sqlite_schema entries"
+    );
+    Ok(())
+}
+
+/// `PRAGMA auto_vacuum=1` on a brand-new database must turn autovacuum on.
+/// The emptiness check used to count the built-in virtual tables
+/// (pragma_*, json_each, ...) as user tables, so it thought every fresh
+/// database was non-empty and silently ignored the pragma.
+#[test]
+fn test_auto_vacuum_pragma_applies_to_fresh_database() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum = 1")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+    // Page 2 is the first pointer-map page, so the table root lands on page 3.
+    assert_eq!(
+        scalar_i64(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'"),
+        3
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
+    Ok(())
+}
+
+/// SQLite fixes the auto-vacuum mode as soon as page 1 exists, even when the
+/// database has no tables yet. `PRAGMA user_version` writes page 1, so a
+/// later `PRAGMA auto_vacuum=1` must be silently ignored, just like it is
+/// once a table exists. The emptiness check used to look at the schema and
+/// the page count instead, and treated a one-page database as still empty.
+#[test]
+fn test_auto_vacuum_pragma_ignored_once_page_one_exists() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA user_version = 5")?;
+    conn.execute("PRAGMA auto_vacuum = 1")?;
+    conn.execute("CREATE TABLE t(x)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 0);
+    // No pointer-map page was reserved, so the table root is page 2.
+    assert_eq!(
+        scalar_i64(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'"),
+        2
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    // SQLite agrees: the same statements leave auto-vacuum off.
+    let sqlite_conn = SqliteConnection::open_in_memory()?;
+    sqlite_conn
+        .execute_batch("PRAGMA user_version = 5; PRAGMA auto_vacuum = 1; CREATE TABLE t(x);")?;
+    assert_eq!(sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"), 0);
+    assert_eq!(
+        sqlite_scalar_i64(
+            &sqlite_conn,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 't'"
+        ),
+        2
     );
     Ok(())
 }
@@ -688,7 +756,9 @@ fn test_vacuum_into_rejects_active_select_on_same_connection(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                select_stmt.get_pager().io.step()?
+            }
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -748,7 +818,9 @@ fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                select_stmt.get_pager().io.step()?
+            }
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -790,7 +862,9 @@ fn test_same_connection_select_then_write_then_continue_select(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                select_stmt.get_pager().io.step()?
+            }
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -6114,7 +6188,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
             StepResult::Busy | StepResult::Interrupt => {
                 anyhow::bail!("unexpected non-IO result while staging checkpoint cleanup test")
             }
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 while let Some(event) = io.step_one()? {
                     if event.path == source_wal_path && event.kind == QueuedIoOpKind::Pwritev {
                         saw_source_wal_batch_write = true;

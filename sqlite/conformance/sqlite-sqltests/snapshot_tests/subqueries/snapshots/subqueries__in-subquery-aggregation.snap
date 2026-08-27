@@ -49,7 +49,7 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   21            If               3  23   0                 0  if r[3] goto 23; don't emit group columns if continuing existing group
   22            Column           2   0   6                 0  r[6]=idx_orders_customer.customer_id
   23            Integer          1   3   0                 0  r[3]=1; indicate data in accumulator
-  24          Next               2  10   0                 0
+  24          Next               2  10   0                 1
   25          Gosub              2  29   0                 0  ; emit row for final group
   26          Goto               0  42   0                 0  ; group by finished
   27          Integer            1   4   0                 0  r[4]=1

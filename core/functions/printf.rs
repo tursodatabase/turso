@@ -90,7 +90,7 @@ const MAX_WIDTH: usize = 1_000_000;
 /// May consume arguments from `values` for `*` width/precision.
 fn parse_format_spec(
     chars: &mut Peekable<Chars>,
-    values: &[Register],
+    values: &[&Value],
     args_index: &mut usize,
 ) -> FormatSpec {
     let mut flags = parse_flags(chars);
@@ -150,11 +150,11 @@ fn parse_format_spec(
 // ── Coercion helpers ────────────────────────────────────────────
 
 /// Get the next argument as i64 (for * width/precision), advancing args_index.
-fn get_arg_i64(values: &[Register], args_index: &mut usize) -> i64 {
-    if *args_index >= values.len() {
+fn get_arg_i64(args: &[&Value], args_index: &mut usize) -> i64 {
+    if *args_index >= args.len() {
         return 0;
     }
-    let val = coerce_to_i64(values[*args_index].get_value());
+    let val = coerce_to_i64(args[*args_index]);
     *args_index += 1;
     val
 }
@@ -233,8 +233,16 @@ fn apply_width(
     flags: &FormatFlags,
     zero_overrides_left: bool,
 ) {
-    // Use character count, not byte count, for width — SQLite counts characters.
-    let total_len = sign_prefix.chars().count() + content.chars().count();
+    // Width counts bytes by default and characters with the ! flag, as
+    // SQLite measures it.
+    let measure = |t: &str| {
+        if flags.alt_form_2 {
+            t.chars().count()
+        } else {
+            t.len()
+        }
+    };
+    let total_len = measure(sign_prefix) + measure(content);
     let w = width.unwrap_or(0);
     if total_len >= w {
         output.push_str(sign_prefix);
@@ -1051,18 +1059,7 @@ fn format_string(output: &mut String, value: &Value, spec: &FormatSpec) {
         }
         _ => coerce_to_string(value),
     };
-    let truncated = if let Some(prec) = spec.precision {
-        // Truncate by character count (not bytes). SQLite uses bytes by default
-        // and chars with !, but since blobs are already lossy-converted to UTF-8,
-        // character-based truncation avoids mid-char splits.
-        if let Some((byte_idx, _)) = s.char_indices().nth(prec) {
-            &s[..byte_idx]
-        } else {
-            &s
-        }
-    } else {
-        &s
-    };
+    let truncated = truncate_to_precision(&s, spec.precision, &spec.flags);
 
     // Zero-pad flag is ignored for string specifiers
     let mut flags = spec.flags.clone();
@@ -1117,12 +1114,12 @@ fn format_sql_quote(output: &mut String, value: &Value, spec: &FormatSpec) {
     flags.zero_pad = false;
     match value {
         Value::Null => {
-            let truncated = truncate_to_precision("(NULL)", spec.precision);
+            let truncated = truncate_to_precision("(NULL)", spec.precision, &spec.flags);
             apply_width(output, "", truncated, spec.width, &flags, false);
         }
         _ => {
             let s = coerce_to_string(value);
-            let truncated = truncate_to_precision(&s, spec.precision);
+            let truncated = truncate_to_precision(&s, spec.precision, &spec.flags);
             let mut escaped = truncated.replace('\'', "''");
             if spec.flags.alternate {
                 escaped = escape_control_chars(&escaped);
@@ -1139,12 +1136,12 @@ fn format_sql_quote_wrap(output: &mut String, value: &Value, spec: &FormatSpec) 
     flags.zero_pad = false;
     match value {
         Value::Null => {
-            let truncated = truncate_to_precision("NULL", spec.precision);
+            let truncated = truncate_to_precision("NULL", spec.precision, &spec.flags);
             apply_width(output, "", truncated, spec.width, &flags, false);
         }
         _ => {
             let s = coerce_to_string(value);
-            let truncated = truncate_to_precision(&s, spec.precision);
+            let truncated = truncate_to_precision(&s, spec.precision, &spec.flags);
             let mut escaped = truncated.replace('\'', "''");
             // %#Q: escape control chars and wrap with unistr('...') if any are present.
             let use_unistr = if spec.flags.alternate {
@@ -1181,12 +1178,12 @@ fn format_sql_identifier(output: &mut String, value: &Value, spec: &FormatSpec) 
     flags.zero_pad = false;
     match value {
         Value::Null => {
-            let truncated = truncate_to_precision("(NULL)", spec.precision);
+            let truncated = truncate_to_precision("(NULL)", spec.precision, &spec.flags);
             apply_width(output, "", truncated, spec.width, &flags, false);
         }
         _ => {
             let s = coerce_to_string(value);
-            let truncated = truncate_to_precision(&s, spec.precision);
+            let truncated = truncate_to_precision(&s, spec.precision, &spec.flags);
             let escaped = truncated.replace('"', "\"\"");
             apply_width(output, "", &escaped, spec.width, &flags, false);
         }
@@ -1227,20 +1224,29 @@ fn format_ordinal(output: &mut String, value: &Value, spec: &FormatSpec) {
     }
 }
 
-/// Truncate a string to at most `precision` characters.
-fn truncate_to_precision(s: &str, precision: Option<usize>) -> &str {
-    match precision {
-        Some(prec) => {
-            // Truncate by character count. SQLite uses byte count by default
-            // and character count with the ! flag, but since Turso is UTF-8 only,
-            // character-based truncation is always correct for our strings.
-            if let Some((byte_idx, _)) = s.char_indices().nth(prec) {
-                &s[..byte_idx]
-            } else {
-                s
-            }
+/// Truncate a string to at most `precision` units: bytes by default,
+/// characters with the ! flag, as SQLite counts them. Byte truncation
+/// floors to a character boundary — Text values are UTF-8 strings, so the
+/// partial code point SQLite emits when precision splits one cannot be
+/// represented.
+fn truncate_to_precision<'a>(s: &'a str, precision: Option<usize>, flags: &FormatFlags) -> &'a str {
+    let Some(prec) = precision else {
+        return s;
+    };
+    if flags.alt_form_2 {
+        if let Some((byte_idx, _)) = s.char_indices().nth(prec) {
+            &s[..byte_idx]
+        } else {
+            s
         }
-        _ => s,
+    } else if prec >= s.len() {
+        s
+    } else {
+        let mut end = prec;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
@@ -1250,11 +1256,97 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     if values.is_empty() {
         return Ok(Value::Null);
     }
+    let args: Vec<&Value> = values[1..].iter().map(|r| r.get_value()).collect();
+    exec_printf_values(values[0].get_value(), &args)
+}
 
+/// The C type a sqlite3_mprintf-style caller passes for one argument slot,
+/// in order. Derived from the same specifier grammar the engine formats
+/// with, so the C API's va_list walk cannot drift from the formatter:
+/// varargs.c pulls exactly these types and the bridge feeds the values back
+/// into exec_printf_values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintfCArg {
+    Int32,
+    /// u/o/x/X without a length modifier: an unsigned int, zero-extended.
+    Uint32,
+    Int64,
+    Double,
+    Text,
+    /// %z: text whose pointer the caller yields; freed after use.
+    OwnedText,
+    /// %c: a character code in the C API, rendered as that character.
+    CharCode,
+}
+
+/// The sequence of C argument types `format` consumes: for each conversion,
+/// an Int32 for a `*` width, an Int32 for a `.*` precision, then the
+/// conversion's own argument. Stops at an unknown conversion, where the
+/// engine stops formatting too.
+pub fn printf_c_arg_plan(format: &str) -> Vec<PrintfCArg> {
+    let mut plan = Vec::new();
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            continue;
+        }
+        parse_flags(&mut chars);
+        if chars.peek() == Some(&'*') {
+            chars.next();
+            plan.push(PrintfCArg::Int32);
+        } else {
+            parse_number(&mut chars);
+        }
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            if chars.peek() == Some(&'*') {
+                chars.next();
+                plan.push(PrintfCArg::Int32);
+            } else {
+                parse_number(&mut chars);
+            }
+        }
+        let mut longs = 0;
+        while matches!(chars.peek(), Some(&'l') | Some(&'h')) {
+            if chars.peek() == Some(&'l') {
+                longs += 1;
+            }
+            chars.next();
+        }
+        match chars.next() {
+            Some('d' | 'i' | 'r') => plan.push(if longs >= 1 {
+                PrintfCArg::Int64
+            } else {
+                PrintfCArg::Int32
+            }),
+            Some('u' | 'o' | 'x' | 'X') => plan.push(if longs >= 1 {
+                PrintfCArg::Int64
+            } else {
+                PrintfCArg::Uint32
+            }),
+            Some('f' | 'e' | 'E' | 'g' | 'G') => plan.push(PrintfCArg::Double),
+            Some('s' | 'q' | 'Q' | 'w') => plan.push(PrintfCArg::Text),
+            Some('z') => plan.push(PrintfCArg::OwnedText),
+            Some('c') => plan.push(PrintfCArg::CharCode),
+            Some('p') => plan.push(PrintfCArg::Int64),
+            Some('n') | None => {}
+            _ => break,
+        }
+    }
+    plan
+}
+
+/// Value-level entry point, shared by the SQL printf()/format() functions
+/// and the C API's sqlite3_mprintf/sqlite3_snprintf bridge so there is a
+/// single formatting implementation.
+pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Value> {
     // SQLite converts the format argument to text if not already text.
-    let format_value = values[0].get_value();
     let fmt_owned: String;
-    let format_str = match &format_value {
+    let format_str = match format {
         Value::Text(t) => t.as_str(),
         Value::Null => return Ok(Value::Null),
         Value::Numeric(Numeric::Integer(i)) => {
@@ -1272,7 +1364,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     };
 
     let mut result = String::new();
-    let mut args_index = 1;
+    let mut args_index = 0;
     let mut chars = format_str.chars().peekable();
     if format_str.is_empty() {
         return Ok(Value::Null);
@@ -1307,14 +1399,14 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
         }
 
         // Parse the full format specifier
-        let spec = parse_format_spec(&mut chars, values, &mut args_index);
+        let spec = parse_format_spec(&mut chars, args, &mut args_index);
 
         // Get the argument value (or use NULL if missing)
         let needs_arg = !matches!(spec.spec_type, 'n' | '\0');
         let null_val = Value::Null;
         let arg = if needs_arg {
-            if args_index < values.len() {
-                let v = values[args_index].get_value();
+            if args_index < args.len() {
+                let v = args[args_index];
                 args_index += 1;
                 v
             } else {

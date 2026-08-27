@@ -248,7 +248,7 @@ fn test_newrowid_mvcc_concurrent(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 'retry: loop {
                     loop {
                         match stmt.step()? {
-                            StepResult::IO | StepResult::Yield => {
+                            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                                 stmt._io().step()?;
                             }
                             StepResult::Done => {
@@ -1627,4 +1627,41 @@ fn test_issue_7638_gc_after_abandoned_checkpoint_does_not_resurrect_row() {
     assert_eq!(table_rows, Vec::<Vec<turso_core::Value>>::new());
     assert_eq!(index_rows, Vec::<Vec<turso_core::Value>>::new());
     assert_eq!(integrity, vec![vec![turso_core::Value::build_text("ok")]]);
+}
+
+#[test]
+fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true))
+        .with_mvcc(true)
+        .build();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    setup
+        .execute("INSERT INTO docs VALUES (2, 'first')")
+        .unwrap();
+
+    let writer = tmp_db.connect_limbo();
+    let pinned = tmp_db.connect_limbo();
+
+    pinned.execute("BEGIN CONCURRENT").unwrap();
+    let before: Vec<(i64,)> = pinned.exec_rows("SELECT id FROM docs ORDER BY id");
+    assert_eq!(before, vec![(2,)]);
+
+    // Commits and is immediately checkpointed (threshold 0, passive mode).
+    writer
+        .execute("INSERT INTO docs VALUES (13, 'second')")
+        .unwrap();
+
+    let after: Vec<(i64,)> = pinned.exec_rows("SELECT id FROM docs ORDER BY id");
+    assert_eq!(
+        after,
+        vec![(2,)],
+        "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
+    );
 }

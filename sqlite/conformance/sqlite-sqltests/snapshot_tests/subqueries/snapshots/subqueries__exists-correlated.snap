@@ -42,7 +42,7 @@ addr  opcode             p1  p2  p3  p4            p5  comment
   15      Goto            0  18   0                 0  ; semi-join: early out after first match
   16    Next              2   7   0                 0
   17    Goto              0  18   0                 0  ; semi-join: no match, skip outer row
-  18  Next                0   5   0                 0
+  18  Next                0   5   0                 1
   19  Halt                0   0   0                 0
   20  Transaction         0   1  11                 0  iDb=0 tx_mode=Read
   21  Integer           500   7   0                 0  r[7]=500

@@ -20,19 +20,8 @@ pub fn json_patch(
     cache: &JsonCacheCell,
 ) -> crate::Result<Value> {
     let (target, patch) = (target.as_value_ref(), patch.as_value_ref());
-    match (target, patch) {
-        (ValueRef::Null, _) | (_, ValueRef::Null) => return Ok(Value::Null),
-        (ValueRef::Blob(_), _) | (_, ValueRef::Blob(_)) => {
-            crate::bail_constraint_error!("blob is not supported!");
-        }
-        // Explicit handling for the case json_path('{}', 'null') case. If the patch value is
-        // the text null, the result will also be the text null. No extra parsing required.
-        (_, ValueRef::Text(t)) => {
-            if t.value == "null" {
-                return Ok(Value::Text(Text::new("null")));
-            }
-        }
-        _ => (),
+    if matches!(target, ValueRef::Null) || matches!(patch, ValueRef::Null) {
+        return Ok(Value::Null);
     }
     let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut target = cache.get_or_insert_with(target, make_jsonb)?;
@@ -49,6 +38,13 @@ pub fn json_patch(
     }
 
     let element_type = target.element_type()?;
+
+    // A JSON null patch result stays JSON here: SQLite returns the
+    // text 'null', while json_string_to_db_type would map it to SQL
+    // NULL the way extraction does.
+    if element_type == super::jsonb::ElementType::NULL {
+        return Ok(Value::Text(Text::json("null".to_string())));
+    }
 
     json_string_to_db_type(target, element_type, OutputVariant::String)
 }
@@ -59,12 +55,8 @@ pub fn jsonb_patch(
     cache: &JsonCacheCell,
 ) -> crate::Result<Value> {
     let (target, patch) = (target.as_value_ref(), patch.as_value_ref());
-    match (target, patch) {
-        (ValueRef::Null, _) | (_, ValueRef::Null) => return Ok(Value::Null),
-        (ValueRef::Blob(_), _) | (_, ValueRef::Blob(_)) => {
-            crate::bail_constraint_error!("blob is not supported!");
-        }
-        _ => (),
+    if matches!(target, ValueRef::Null) || matches!(patch, ValueRef::Null) {
+        return Ok(Value::Null);
     }
     let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut target = cache.get_or_insert_with(target, make_jsonb)?;
@@ -81,6 +73,13 @@ pub fn jsonb_patch(
     }
 
     let element_type = target.element_type()?;
+
+    // A JSON null patch result stays JSON here: SQLite returns the
+    // JSONB null blob, while json_string_to_db_type would map it to
+    // SQL NULL the way extraction does.
+    if element_type == super::jsonb::ElementType::NULL {
+        return Ok(Value::Blob(target.data()));
+    }
 
     json_string_to_db_type(target, element_type, OutputVariant::Binary)
 }
@@ -365,13 +364,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "blob is not supported!")]
-    fn test_blob_not_supported() {
-        let target = Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG);
+    fn test_blob_target_parses_as_document() {
+        // x'313233' is the text "123": a blob that is not JSONB is read
+        // as JSON text, like SQLite does.
+        let target = Value::from_slice(b"123").expect(crate::alloc::ALLOC_ERR_MSG);
         let patch = create_text("{}");
         let cache = JsonCacheCell::new();
 
-        json_patch(&target, &patch, &cache).unwrap();
+        let result = json_patch(&target, &patch, &cache).unwrap();
+        assert_eq!(result, create_json("{}"));
     }
 
     #[test]

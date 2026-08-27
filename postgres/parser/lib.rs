@@ -46,6 +46,38 @@ pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
         .map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
+/// Quote an identifier following PostgreSQL's server-side quote_identifier()
+/// rules: return it bare only when it is all lower-case ASCII letters,
+/// digits, and underscores, does not start with a digit, and is not a
+/// keyword outside the unreserved category; otherwise wrap it in double
+/// quotes with embedded quotes doubled.
+pub fn quote_identifier(ident: &str) -> String {
+    let safe_chars = !ident.is_empty()
+        && !ident.starts_with(|c: char| c.is_ascii_digit())
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if safe_chars && !keyword_requires_quoting(ident) {
+        return ident.to_string();
+    }
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// pg_query's scanner is the same lexer the PostgreSQL server uses, so its
+/// keyword classification matches server-side quote_identifier().
+fn keyword_requires_quoting(ident: &str) -> bool {
+    use pg_query::protobuf::KeywordKind;
+    let scan =
+        pg_query::scan(ident).expect("scanning a bare lower-case ASCII identifier cannot fail");
+    match scan.tokens.as_slice() {
+        [token] => !matches!(
+            token.keyword_kind(),
+            KeywordKind::NoKeyword | KeywordKind::UnreservedKeyword
+        ),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

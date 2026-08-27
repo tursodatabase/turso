@@ -8,7 +8,6 @@ on:
       - 'serverless/javascript/**'
       - '.github/workflows/turso-serverless.yml'
   pull_request:
-    branches: [ main ]
     paths:
       - 'serverless/javascript/**'
       - '.github/workflows/turso-serverless.yml'

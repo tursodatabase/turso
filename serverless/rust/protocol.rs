@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, Value};
 
+/// HTTP header carrying the remote encryption key (section 3.1).
+pub const ENCRYPTION_KEY_HEADER: &str = "x-turso-encryption-key";
+
 /// A SQL value on the wire (section 8.2).
 ///
 /// Integers are transported as decimal strings because JSON numbers cannot

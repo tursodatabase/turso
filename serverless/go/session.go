@@ -14,6 +14,10 @@ import (
 	"strings"
 )
 
+// EncryptionKeyHeader is the HTTP header that carries the customer-managed
+// encryption key for an encrypted database.
+const EncryptionKeyHeader = "x-turso-encryption-key"
+
 // normalizeURL rewrites libsql:// and turso:// URLs to https:// and strips
 // any trailing slashes, since endpoint paths are appended with a leading
 // slash.
@@ -39,8 +43,12 @@ type stmtOutput struct {
 type session struct {
 	client    *http.Client
 	authToken string
-	baseURL   string
-	baton     *string
+	// remoteEncryptionKey is the customer-managed key for an encrypted
+	// database, sent as the EncryptionKeyHeader header on every request
+	// (section 3.1). Empty when the database is not encrypted.
+	remoteEncryptionKey string
+	baseURL             string
+	baton               *string
 	// autocommit is whether the connection is in autocommit mode, from the
 	// server's most recent authoritative answer. A non-null baton does NOT
 	// imply a transaction (section 4.3), so this is tracked explicitly:
@@ -50,12 +58,13 @@ type session struct {
 	lastInsertRowid int64
 }
 
-func newSession(url, authToken string) *session {
+func newSession(url, authToken, remoteEncryptionKey string) *session {
 	return &session{
-		client:     &http.Client{},
-		authToken:  authToken,
-		baseURL:    normalizeURL(url),
-		autocommit: true,
+		client:              &http.Client{},
+		authToken:           authToken,
+		remoteEncryptionKey: remoteEncryptionKey,
+		baseURL:             normalizeURL(url),
+		autocommit:          true,
 	}
 }
 
@@ -108,6 +117,9 @@ func (s *session) post(ctx context.Context, path string, body []byte) (*http.Res
 	req.Header.Set("Content-Type", "application/json")
 	if s.authToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.authToken)
+	}
+	if s.remoteEncryptionKey != "" {
+		req.Header.Set(EncryptionKeyHeader, s.remoteEncryptionKey)
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {

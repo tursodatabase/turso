@@ -139,3 +139,39 @@ expect {
 snapshot-eqp composite-index-preferred-over-intersection-eqp {
     SELECT id FROM t WHERE a = 10 AND b = 100;
 }
+
+setup multi_index_and_setup {
+    CREATE TABLE t(
+      a, b,
+      c0, c1, c2, c3, c4, c5, c6, c7, c8
+    );
+
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b);
+
+    WITH RECURSIVE n(x) AS (
+      VALUES(0)
+      UNION ALL
+      SELECT x + 1 FROM n WHERE x < 9999
+    )
+    INSERT INTO t
+    SELECT
+      x % 10,
+      (x / 10) % 10,
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+    FROM n;
+
+    ANALYZE;
+}
+
+@setup multi_index_and_setup
+@skip-if mvcc "root page numbers are negative under mvcc"
+snapshot-eqp multi_index_and_eqp {
+    SELECT * FROM t WHERE a = 1 AND b = 2;
+}
+
+@skip-if mvcc "root page numbers are negative under mvcc"
+@setup multi_index_and_setup
+snapshot multi_index_and {
+    SELECT * FROM t WHERE a = 1 AND b = 2;
+}

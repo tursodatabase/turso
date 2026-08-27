@@ -657,6 +657,191 @@ expect {
     5|15|5
 }
 
+# Named-window chaining (sqlite3WindowChain, window.c:1276): a window
+# definition or inline OVER spec that names a base window inherits the
+# base's PARTITION BY, and its ORDER BY when it doesn't add one.
+
+setup named_window_chain_data {
+    CREATE TABLE t_ch (g INTEGER, v INTEGER);
+    INSERT INTO t_ch VALUES (1,1),(1,2),(2,3),(2,4);
+}
+
+@setup named_window_chain_data
+test named-window-chain-inherits-partition {
+    SELECT sum(v) OVER w2 FROM t_ch
+    WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY v);
+}
+expect {
+    1
+    3
+    3
+    7
+}
+
+@setup named_window_chain_data
+test named-window-chain-inline-over {
+    SELECT sum(v) OVER (w1 ORDER BY v) FROM t_ch
+    WINDOW w1 AS (PARTITION BY g);
+}
+expect {
+    1
+    3
+    3
+    7
+}
+
+# A bare parenthesized base inherits both PARTITION BY and ORDER BY.
+@setup named_window_chain_data
+test named-window-chain-bare-base-inline {
+    SELECT sum(v) OVER (w1) FROM t_ch
+    WINDOW w1 AS (PARTITION BY g ORDER BY v);
+}
+expect {
+    1
+    3
+    3
+    7
+}
+
+# w2 AS (w1) with no additions inherits the base's ORDER BY too.
+@setup named_window_chain_data
+test named-window-chain-inherits-order-by {
+    SELECT sum(v) OVER w2 FROM t_ch
+    WINDOW w1 AS (PARTITION BY g ORDER BY v), w2 AS (w1);
+}
+expect {
+    1
+    3
+    3
+    7
+}
+
+# Chains resolve transitively: w3 -> w2 -> w1.
+@setup named_window_chain_data
+test named-window-chain-of-chain {
+    SELECT sum(v) OVER w3 FROM t_ch
+    WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY v), w3 AS (w2);
+}
+expect {
+    1
+    3
+    3
+    7
+}
+
+# The chained window may add its own frame clause on top of the
+# inherited clauses.
+@setup named_window_chain_data
+test named-window-chain-inline-adds-frame {
+    SELECT sum(v) OVER
+        (w1 ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    FROM t_ch
+    WINDOW w1 AS (PARTITION BY g);
+}
+expect {
+    1
+    3
+    3
+    7
+}
+
+# Multiple functions sharing one chained window, and mixing a chained
+# window with direct use of its base.
+@setup named_window_chain_data
+test named-window-chain-shared-and-mixed {
+    SELECT sum(v) OVER w1, sum(v) OVER w2, count(*) OVER w2 FROM t_ch
+    WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY v);
+}
+expect {
+    3|1|1
+    3|3|2
+    7|3|1
+    7|7|2
+}
+
+# When the same name is defined twice, chaining binds to the latest
+# definition (SQLite's windowFind walks newest-first).
+@setup named_window_chain_data
+test named-window-chain-latest-definition-wins {
+    SELECT sum(v) OVER (w1 ORDER BY v) FROM t_ch
+    WINDOW w1 AS (PARTITION BY g), w1 AS (PARTITION BY v);
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+# SQLite's grammar only chains a WINDOW-clause definition against
+# EARLIER definitions in the same clause (windowdefn_list COMMA rule),
+# and never chains the first definition at all — so a forward
+# reference (or a dangling base on the first definition) is silently
+# ignored, not an error: w2 behaves as if defined without w3.
+@setup named_window_chain_data
+test named-window-chain-forward-ref-silently-ignored {
+    SELECT sum(v) OVER w2 FROM t_ch
+    WINDOW w2 AS (w3 ORDER BY v), w3 AS (PARTITION BY g);
+}
+expect {
+    1
+    3
+    6
+    10
+}
+
+# ...but a later definition's dangling base IS an error, even when the
+# window is never used (the chain resolves at definition time).
+@setup named_window_chain_data
+test named-window-chain-missing-base-errors {
+    SELECT v FROM t_ch
+    WINDOW w1 AS (PARTITION BY g), w2 AS (nope ORDER BY v);
+}
+expect error {
+    no such window: nope
+}
+
+# An inline OVER spec chains against the full WINDOW clause, and a
+# missing base is always an error there.
+@setup named_window_chain_data
+test named-window-chain-inline-missing-base-errors {
+    SELECT sum(v) OVER (nope ORDER BY v) FROM t_ch;
+}
+expect error {
+    no such window: nope
+}
+
+# The chained window may not specify its own PARTITION BY.
+@setup named_window_chain_data
+test named-window-chain-cannot-override-partition {
+    SELECT sum(v) OVER w2 FROM t_ch
+    WINDOW w1 AS (PARTITION BY g), w2 AS (w1 PARTITION BY v ORDER BY v);
+}
+expect error {
+    cannot override PARTITION clause of window: w1
+}
+
+# The chained window may not add ORDER BY when the base has one.
+@setup named_window_chain_data
+test named-window-chain-cannot-override-order-by {
+    SELECT sum(v) OVER w2 FROM t_ch
+    WINDOW w1 AS (PARTITION BY g ORDER BY v), w2 AS (w1 ORDER BY v DESC);
+}
+expect error {
+    cannot override ORDER BY clause of window: w1
+}
+
+# The base window may not carry an explicit frame specification.
+@setup named_window_chain_data
+test named-window-chain-base-frame-errors {
+    SELECT sum(v) OVER w2 FROM t_ch
+    WINDOW w1 AS (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+           w2 AS (w1);
+}
+expect error {
+    cannot override frame specification of window: w1
+}
+
 # Regression test for #5763: a window function expression that appears multiple
 # times (here `SUM(amount) OVER ()` in two result columns) used to leave the
 # second occurrence un-rewritten, panicking the translator.

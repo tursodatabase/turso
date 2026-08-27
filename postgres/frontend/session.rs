@@ -1,22 +1,39 @@
 use std::num::NonZero;
 use std::str;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
-use turso_core::{Connection, LimboError, Result, Statement, Value};
-use turso_parser::ast;
+use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
+use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
     try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PostgreSQLTranslator,
+    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
 
 #[derive(Clone)]
 pub struct PgConnection {
+    inner: Arc<PgConnectionInner>,
+}
+
+struct PgConnectionInner {
     conn: Arc<Connection>,
+    session_state: Mutex<SessionState>,
+}
+
+impl PgConnectionInner {
+    fn set_search_path(&self, path: Vec<String>) {
+        let mut state = self.session_state.lock().unwrap();
+        state.search_path = path;
+    }
+}
+
+#[derive(Default)]
+struct SessionState {
+    search_path: Vec<String>,
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -58,15 +75,20 @@ pub fn open_database_with_io(
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
         aliases::install(&conn);
-        Self { conn }
+        Self {
+            inner: Arc::new(PgConnectionInner {
+                conn,
+                session_state: Mutex::new(SessionState::default()),
+            }),
+        }
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
-        &self.conn
+        &self.inner.conn
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
-        prepare_statement(&self.conn, sql.as_ref())
+        prepare_statement(&self.inner, sql.as_ref())
     }
 
     pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
@@ -87,28 +109,28 @@ impl PgConnection {
     }
 
     pub fn close(&self) -> Result<()> {
-        self.conn.close()
+        self.inner.conn.close()
     }
 
     pub fn pragma_update(&self, name: &str, value: impl std::fmt::Display) -> Result<()> {
         let sql = format!("PRAGMA {name} = {value}");
-        let mut stmt = self.conn.prepare_internal(sql)?;
+        let mut stmt = self.inner.conn.prepare_internal(sql)?;
         stmt.run_ignore_rows()
     }
 
     pub fn query_runner<'a>(&'a self, sql: &'a [u8]) -> PgQueryRunner<'a> {
-        PgQueryRunner::new(&self.conn, sql)
+        PgQueryRunner::new(&self.inner, sql)
     }
 }
 
 pub struct PgQueryRunner<'a> {
-    conn: &'a Arc<Connection>,
+    conn: &'a Arc<PgConnectionInner>,
     stmts: Vec<String>,
     index: usize,
 }
 
 impl<'a> PgQueryRunner<'a> {
-    fn new(conn: &'a Arc<Connection>, sql: &'a [u8]) -> Self {
+    fn new(conn: &'a Arc<PgConnectionInner>, sql: &'a [u8]) -> Self {
         let sql = str::from_utf8(sql).unwrap_or("");
         Self {
             conn,
@@ -144,7 +166,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
     }
 }
 
-fn prepare_statement(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
+fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Statement> {
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
@@ -154,7 +176,7 @@ fn prepare_statement(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
 
     reject_sqlite_catalog_access(sql)?;
 
-    if let Some(stmt) = try_prepare_special(conn, sql)? {
+    if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
         return Ok(stmt);
     }
 
@@ -164,15 +186,26 @@ fn prepare_statement(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
-    reject_catalog_dml(&translated.stmt)?;
+    reject_catalog_dml(translated.cmd.stmt())?;
 
+    let options = {
+        let state = pg_conn.session_state.lock().unwrap();
+        let path = state.search_path.clone();
+        PrepareOptions {
+            unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
+        }
+    };
     for prereq in translated.prereqs {
         let input = prereq.to_string();
-        let mut stmt = conn.prepare_translated_stmt(prereq, &input)?;
+        let mut stmt = pg_conn
+            .conn
+            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
         stmt.run_ignore_rows()?;
     }
 
-    conn.prepare_translated_stmt(translated.stmt, sql)
+    pg_conn
+        .conn
+        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -214,43 +247,43 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     Ok(())
 }
 
-fn try_prepare_special(conn: &Arc<Connection>, sql: &str) -> Result<Option<Statement>> {
+fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Option<Statement>> {
     let parse_result = match turso_pg_parser::parse(sql) {
         Ok(result) => result,
         Err(_) => return Ok(None),
     };
 
     if let Some(set_stmt) = try_extract_set(&parse_result) {
-        let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, set_stmt.value);
-        return Ok(Some(conn.prepare(&pragma_sql)?));
+        let stmt = handle_pg_set(pg_conn, &set_stmt)?;
+        return Ok(Some(stmt));
     }
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
         let pragma_sql = format!("PRAGMA {}", show_stmt.name);
-        return Ok(Some(conn.prepare(&pragma_sql)?));
+        return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
-        handle_pg_create_schema(conn, &stmt)?;
-        return Ok(Some(noop_statement(conn)?));
+        handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
-        handle_pg_drop_schema(conn, &stmt)?;
-        return Ok(Some(noop_statement(conn)?));
+        handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if is_refresh_matview(&parse_result) {
-        return Ok(Some(noop_statement(conn)?));
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if is_comment_on(&parse_result) {
-        return Ok(Some(noop_statement(conn)?));
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) = try_extract_copy_from(&parse_result) {
-        let rows_inserted = handle_pg_copy_from(conn, &stmt)?;
-        let stmt = noop_statement(conn)?;
+        let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
+        let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
         return Ok(Some(stmt));
     }
@@ -265,6 +298,24 @@ fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
 fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
     let mut stmt = conn.prepare_internal(sql)?;
     stmt.run_ignore_rows()
+}
+
+fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
+    if set_stmt.name == "search_path" {
+        let path = set_stmt
+            .values
+            .iter()
+            .map(|value| value.as_search_path_name().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
+        pg_conn.set_search_path(path);
+        return noop_statement(&pg_conn.conn);
+    }
+    let value = set_stmt.values.first().ok_or_else(|| {
+        LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
+    })?;
+    let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
+    pg_conn.conn.prepare(&pragma_sql)
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
@@ -340,7 +391,7 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
     }
 
     for table_name in table_names {
-        let mut stmt = prepare_statement(conn, &format!("DROP TABLE \"{table_name}\""))?;
+        let mut stmt = conn.prepare(format!("DROP TABLE \"{table_name}\""))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())
@@ -348,10 +399,7 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
 
 fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Result<()> {
     for table_name in list_user_tables(conn, Some(schema_name))? {
-        let mut stmt = prepare_statement(
-            conn,
-            &format!("DROP TABLE \"{schema_name}\".\"{table_name}\""),
-        )?;
+        let mut stmt = conn.prepare(format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())

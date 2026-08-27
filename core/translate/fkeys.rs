@@ -389,6 +389,7 @@ where
         num_regs,
         target_pc: done,
         eq_only: true,
+        null_matching_mask: Default::default(),
     });
 
     let loop_top = program.allocate_label();
@@ -422,6 +423,7 @@ where
     program.emit_insn(Insn::Next {
         cursor_id: icur,
         pc_if_next: loop_top,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(done);
@@ -530,6 +532,7 @@ where
     program.emit_insn(Insn::Next {
         cursor_id: ccur,
         pc_if_next: loop_top,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(done);
@@ -1785,8 +1788,6 @@ fn generate_cascade_delete_stmt(
         indexed: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
         returning: vec![],
-        order_by: vec![],
-        limit: None,
     }
 }
 
@@ -1815,8 +1816,6 @@ fn generate_set_null_stmt(
         from: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
         returning: vec![],
-        order_by: vec![],
-        limit: None,
     })
 }
 
@@ -1853,8 +1852,6 @@ fn generate_set_default_stmt(
         from: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
         returning: vec![],
-        order_by: vec![],
-        limit: None,
     })
 }
 
@@ -1896,8 +1893,6 @@ fn generate_cascade_update_stmt(
         from: None,
         where_clause: Some(Box::new(where_clause)),
         returning: vec![],
-        order_by: vec![],
-        limit: None,
     })
 }
 
@@ -2449,6 +2444,7 @@ pub fn emit_fk_drop_table_check(
     program.emit_insn(Insn::Next {
         cursor_id: parent_cur,
         pc_if_next: collect_loop,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(collect_done);
@@ -2595,6 +2591,7 @@ pub fn emit_fk_drop_table_check(
         program.emit_insn(Insn::Next {
             cursor_id: child_cur,
             pc_if_next: child_loop,
+            fullscan: false,
         });
 
         program.preassign_label_to_next_insn(child_done);

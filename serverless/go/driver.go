@@ -58,29 +58,38 @@ var (
 type serverlessDriver struct{}
 
 func (d *serverlessDriver) Open(dsn string) (driver.Conn, error) {
-	u, token, err := parseDSN(dsn)
+	u, token, encryptionKey, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	return newConn(u, token), nil
+	return newConn(u, token, encryptionKey), nil
 }
 
-// parseDSN parses "<url>[?auth_token=<token>]" into a base URL and an auth
-// token. The URL can use the turso://, libsql://, https://, or http://
-// scheme; other query parameters are preserved.
-func parseDSN(dsn string) (string, string, error) {
+// parseDSN parses "<url>[?auth_token=<token>&remote_encryption_key=<key>]"
+// into a base URL, an auth token, and a remote encryption key. The URL can
+// use the turso://, libsql://, https://, or http:// scheme; other query
+// parameters are preserved.
+func parseDSN(dsn string) (baseURL, authToken, encryptionKey string, err error) {
 	if dsn == "" {
-		return "", "", errors.New("turso: empty DSN")
+		return "", "", "", errors.New("turso: empty DSN")
 	}
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return "", "", fmt.Errorf("turso: invalid DSN: %w", err)
+		// A url.Error echoes the full DSN, which can carry the auth token
+		// and encryption key; report only the underlying reason.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return "", "", "", fmt.Errorf("turso: invalid DSN: %w", err)
 	}
 	q := u.Query()
-	token := q.Get("auth_token")
+	authToken = q.Get("auth_token")
 	q.Del("auth_token")
+	encryptionKey = q.Get("remote_encryption_key")
+	q.Del("remote_encryption_key")
 	u.RawQuery = q.Encode()
-	return normalizeURL(u.String()), token, nil
+	return normalizeURL(u.String()), authToken, encryptionKey, nil
 }
 
 // --- driver.Connector ---
@@ -89,8 +98,9 @@ func parseDSN(dsn string) (string, string, error) {
 // it with sql.OpenDB when the auth token should not appear in a connection
 // string.
 type Connector struct {
-	url       string
-	authToken string
+	url                 string
+	authToken           string
+	remoteEncryptionKey string
 }
 
 // NewConnector creates a connector for the given database URL (turso://,
@@ -99,8 +109,17 @@ func NewConnector(url, authToken string) *Connector {
 	return &Connector{url: normalizeURL(url), authToken: authToken}
 }
 
+// WithRemoteEncryptionKey sets the customer-managed encryption key for an
+// encrypted database and returns the connector for chaining:
+//
+//	db := sql.OpenDB(turso.NewConnector(url, token).WithRemoteEncryptionKey(key))
+func (c *Connector) WithRemoteEncryptionKey(key string) *Connector {
+	c.remoteEncryptionKey = key
+	return c
+}
+
 func (c *Connector) Connect(context.Context) (driver.Conn, error) {
-	return newConn(c.url, c.authToken), nil
+	return newConn(c.url, c.authToken, c.remoteEncryptionKey), nil
 }
 
 func (c *Connector) Driver() driver.Driver {
@@ -115,8 +134,8 @@ type conn struct {
 	closed bool
 }
 
-func newConn(url, authToken string) *conn {
-	return &conn{sess: newSession(url, authToken)}
+func newConn(url, authToken, remoteEncryptionKey string) *conn {
+	return &conn{sess: newSession(url, authToken, remoteEncryptionKey)}
 }
 
 func (c *conn) Close() error {

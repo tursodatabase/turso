@@ -74,7 +74,7 @@ pub(crate) async fn run_stmt_once<'a, Ctx>(
 ) -> Result<Option<&'a turso_core::Row>> {
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
@@ -121,7 +121,7 @@ pub(crate) async fn exec_stmt<Ctx>(
 ) -> Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
@@ -582,7 +582,7 @@ pub(crate) struct CachedStmt {
 
 pub struct DatabaseReplaySession {
     pub(crate) conn: Arc<turso_core::Connection>,
-    pub(crate) cached_delete_stmt: HashMap<String, CachedStmt>,
+    pub(crate) cached_delete_stmt: HashMap<(String, bool), CachedStmt>,
     pub(crate) cached_insert_stmt: HashMap<(String, usize), CachedStmt>,
     pub(crate) cached_update_stmt: HashMap<(String, Vec<bool>), CachedStmt>,
     pub(crate) in_txn: bool,
@@ -702,21 +702,26 @@ impl DatabaseReplaySession {
                     }
                 } else {
                     match change.change {
-                        DatabaseTapeRowChangeType::Delete { before } => {
-                            let key = self.populate_delete_stmt(coro, table).await?;
+                        DatabaseTapeRowChangeType::Delete {
+                            before,
+                            key: primary_key,
+                        } => {
+                            let use_rowid = self
+                                .generator
+                                .delete_uses_rowid(&before, primary_key.as_deref())?;
+                            let cache_key =
+                                self.populate_delete_stmt(coro, table, use_rowid).await?;
                             tracing::trace!(
-                                "ready to use prepared delete statement for replay: key={}",
-                                key
+                                "ready to use prepared delete statement for replay: key={cache_key:?}"
                             );
-                            let cached = self.cached_delete_stmt.get_mut(key).unwrap();
+                            let cached = self.cached_delete_stmt.get_mut(&cache_key).unwrap();
                             cached.stmt.reset()?;
-                            let values = self.generator.replay_values(
+                            let values = self.generator.replay_delete_values(
                                 &cached.info,
-                                change_type,
                                 change.id,
                                 before,
-                                None,
-                            );
+                                primary_key,
+                            )?;
                             replay_stmt(coro, &mut cached.stmt, values).await?;
                         }
                         DatabaseTapeRowChangeType::Insert { after } => {
@@ -725,6 +730,27 @@ impl DatabaseReplaySession {
                                 "ready to use prepared insert statement for replay: key={:?}",
                                 key
                             );
+                            let needs_predelete = {
+                                let cached = self.cached_insert_stmt.get(&key).unwrap();
+                                self.generator
+                                    .upsert_needs_null_safe_predelete(&cached.info, &after)
+                            };
+                            if needs_predelete {
+                                // ON CONFLICT cannot resolve a key with a NULL
+                                // component, so remove the row by its NULL-safe
+                                // identity before inserting the new image.
+                                let delete_key =
+                                    self.populate_delete_stmt(coro, table, false).await?;
+                                let cached = self.cached_delete_stmt.get_mut(&delete_key).unwrap();
+                                cached.stmt.reset()?;
+                                let values = self.generator.replay_delete_values(
+                                    &cached.info,
+                                    change.id,
+                                    after.clone(),
+                                    None,
+                                )?;
+                                replay_stmt(coro, &mut cached.stmt, values).await?;
+                            }
                             let cached = self.cached_insert_stmt.get_mut(&key).unwrap();
                             cached.stmt.reset()?;
                             let values = self.generator.replay_values(
@@ -733,13 +759,14 @@ impl DatabaseReplaySession {
                                 change.id,
                                 after,
                                 None,
+                                None,
                             );
                             replay_stmt(coro, &mut cached.stmt, values).await?;
                         }
                         DatabaseTapeRowChangeType::Update {
+                            before,
                             after,
                             updates: Some(updates),
-                            ..
                         } => {
                             assert!(updates.len() % 2 == 0);
                             let columns_cnt = updates.len() / 2;
@@ -763,6 +790,7 @@ impl DatabaseReplaySession {
                                 change.id,
                                 after,
                                 Some(updates),
+                                Some(before),
                             );
                             replay_stmt(coro, &mut cached.stmt, values).await?;
                         }
@@ -771,20 +799,20 @@ impl DatabaseReplaySession {
                             after,
                             updates: None,
                         } => {
-                            let key = self.populate_delete_stmt(coro, table).await?;
+                            let use_rowid = self.generator.delete_uses_rowid(&before, None)?;
+                            let key = self.populate_delete_stmt(coro, table, use_rowid).await?;
                             tracing::trace!(
                                 "ready to use prepared delete statement for replay of update: key={:?}",
                                 key
                             );
-                            let cached = self.cached_delete_stmt.get_mut(key).unwrap();
+                            let cached = self.cached_delete_stmt.get_mut(&key).unwrap();
                             cached.stmt.reset()?;
-                            let values = self.generator.replay_values(
+                            let values = self.generator.replay_delete_values(
                                 &cached.info,
-                                DatabaseChangeType::Delete,
                                 change.id,
                                 before,
                                 None,
-                            );
+                            )?;
                             replay_stmt(coro, &mut cached.stmt, values).await?;
 
                             let key = self.populate_insert_stmt(coro, table, after.len()).await?;
@@ -800,6 +828,7 @@ impl DatabaseReplaySession {
                                 change.id,
                                 after,
                                 None,
+                                None,
                             );
                             replay_stmt(coro, &mut cached.stmt, values).await?;
                         }
@@ -809,20 +838,22 @@ impl DatabaseReplaySession {
         }
         Ok(())
     }
-    async fn populate_delete_stmt<'a, Ctx>(
+    async fn populate_delete_stmt<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
-        table: &'a str,
-    ) -> Result<&'a str> {
-        if self.cached_delete_stmt.contains_key(table) {
-            return Ok(table);
+        table: &str,
+        use_rowid: bool,
+    ) -> Result<(String, bool)> {
+        let key = (table.to_string(), use_rowid);
+        if self.cached_delete_stmt.contains_key(&key) {
+            return Ok(key);
         }
         tracing::trace!("prepare delete statement for replay: table={}", table);
-        let info = self.generator.delete_query(coro, table).await?;
+        let info = self.generator.delete_query(coro, table, use_rowid).await?;
         let stmt = self.conn.prepare(&info.query)?;
         self.cached_delete_stmt
-            .insert(table.to_string(), CachedStmt { stmt, info });
-        Ok(table)
+            .insert(key.clone(), CachedStmt { stmt, info });
+        Ok(key)
     }
     async fn populate_insert_stmt<Ctx>(
         &mut self,
@@ -1173,6 +1204,250 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    pub fn test_database_tape_replay_composite_primary_key() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE z(x TEXT, y TEXT, payload TEXT, PRIMARY KEY(y, x))")
+                    .unwrap();
+                conn.execute("INSERT INTO z VALUES ('1', '2', 'old'), ('4', '2', 'untouched')")
+                    .unwrap();
+
+                let opts = DatabaseReplaySessionOpts {
+                    use_implicit_rowid: false,
+                };
+                let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 1,
+                            change_time: 1,
+                            table_name: "z".to_string(),
+                            id: 1,
+                            change: DatabaseTapeRowChangeType::Insert {
+                                after: crate::alloc::vec![
+                                    turso_core::Value::build_text("1"),
+                                    turso_core::Value::build_text("2"),
+                                    turso_core::Value::build_text("inserted"),
+                                ],
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 2,
+                            change_time: 2,
+                            table_name: "z".to_string(),
+                            id: 1,
+                            change: DatabaseTapeRowChangeType::Update {
+                                before: crate::alloc::vec![
+                                    turso_core::Value::build_text("1"),
+                                    turso_core::Value::build_text("2"),
+                                    turso_core::Value::build_text("inserted"),
+                                ],
+                                after: crate::alloc::vec![
+                                    turso_core::Value::build_text("1"),
+                                    turso_core::Value::build_text("2"),
+                                    turso_core::Value::build_text("updated"),
+                                ],
+                                updates: Some(crate::alloc::vec![
+                                    turso_core::Value::from_i64(0),
+                                    turso_core::Value::from_i64(0),
+                                    turso_core::Value::from_i64(1),
+                                    turso_core::Value::Null,
+                                    turso_core::Value::Null,
+                                    turso_core::Value::build_text("updated"),
+                                ]),
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 3,
+                            change_time: 3,
+                            table_name: "z".to_string(),
+                            id: 1,
+                            change: DatabaseTapeRowChangeType::Delete {
+                                before: crate::alloc::vec![
+                                    turso_core::Value::build_text("1"),
+                                    turso_core::Value::build_text("2"),
+                                    turso_core::Value::build_text("updated"),
+                                ],
+                                key: None,
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(&coro, DatabaseTapeOperation::Commit)
+                    .await
+                    .unwrap();
+
+                let mut stmt = conn
+                    .prepare("SELECT x, y, payload FROM z ORDER BY x")
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::build_text("4"),
+                turso_core::Value::build_text("2"),
+                turso_core::Value::build_text("untouched"),
+            ]]
+        );
+    }
+
+    #[test]
+    pub fn test_database_tape_replay_delete_key_rules() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE q(x TEXT PRIMARY KEY, y TEXT UNIQUE, z TEXT UNIQUE)")
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO q(rowid, x, y, z) VALUES
+                        (7, '1', '2', '3'),
+                        (8, '4', '5', '6')",
+                )
+                .unwrap();
+                conn.execute("CREATE TABLE nopk(a TEXT, b TEXT)").unwrap();
+                conn.execute("INSERT INTO nopk(rowid, a, b) VALUES (3, 'r3', 'v3')")
+                    .unwrap();
+
+                let opts = DatabaseReplaySessionOpts {
+                    use_implicit_rowid: true,
+                };
+                let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 1,
+                            change_time: 1,
+                            table_name: "q".to_string(),
+                            // The remote rowid can differ after an earlier PK upsert.
+                            // The portable primary-key projection must win.
+                            id: 99,
+                            change: DatabaseTapeRowChangeType::Delete {
+                                before: crate::alloc::vec![],
+                                key: Some(crate::alloc::vec![turso_core::Value::build_text("1")]),
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                // A delete without projection or before image on a table whose
+                // PRIMARY KEY is not the rowid must be refused: the local
+                // rowid may not match the remote's, so a rowid-based delete
+                // could remove the wrong row.
+                let refused = session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 2,
+                            change_time: 2,
+                            table_name: "q".to_string(),
+                            id: 8,
+                            change: DatabaseTapeRowChangeType::Delete {
+                                before: crate::alloc::vec![],
+                                key: None,
+                            },
+                        }),
+                    )
+                    .await;
+                let err = format!("{:?}", refused.expect_err("rowid fallback must be refused"));
+                assert!(
+                    err.contains("refusing rowid-based replay"),
+                    "unexpected error for refused rowid fallback: {err}"
+                );
+                // Tables with no PRIMARY KEY have the rowid as their only
+                // identity: the fallback is exact and stays allowed.
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 3,
+                            change_time: 3,
+                            table_name: "nopk".to_string(),
+                            id: 3,
+                            change: DatabaseTapeRowChangeType::Delete {
+                                before: crate::alloc::vec![],
+                                key: None,
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(&coro, DatabaseTapeOperation::Commit)
+                    .await
+                    .unwrap();
+
+                let mut stmt = conn.prepare("SELECT x FROM q ORDER BY x").unwrap();
+                let mut q_rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    q_rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                let mut stmt = conn.prepare("SELECT a FROM nopk").unwrap();
+                let nopk_empty = run_stmt_once(&coro, &mut stmt).await.unwrap().is_none();
+                (q_rows, nopk_empty)
+            }
+        });
+        let (q_rows, nopk_empty) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        // The key-based delete removed x='1'; the refused rowid delete left
+        // x='4' in place; the no-PK rowid delete emptied nopk.
+        assert_eq!(q_rows, vec![vec![turso_core::Value::build_text("4")]]);
+        assert!(nopk_empty);
     }
 
     #[test]
@@ -3020,5 +3295,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// End state of a primary-key swap replayed as one logical transaction.
+    ///
+    /// The remote needed three statements and a temporary key to swap the keys of
+    /// two rows; the logical stream carries the coalesced result as a delete of
+    /// each row's old key plus an upsert of its new image. Replaying every delete
+    /// before every upsert is what keeps both rows: interleaved per-row order
+    /// would have the second delete remove the row the first upsert wrote.
+    #[test]
+    pub fn test_pk_swap_in_one_txn_replays_both_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x, y, z, PRIMARY KEY (x, y))")
+                    .unwrap();
+                conn.execute("INSERT INTO t VALUES ('a', '1', 'left'), ('b', '2', 'right')")
+                    .unwrap();
+
+                fn text(value: &str) -> turso_core::Value {
+                    turso_core::Value::Text(turso_core::types::Text::new(value.to_string()))
+                }
+                let key = |x: &str, y: &str| Some(turso_core::alloc::vec![text(x), text(y)]);
+                let image =
+                    |x: &str, y: &str, z: &str| turso_core::alloc::vec![text(x), text(y), text(z)];
+                let change = |id: i64, change: DatabaseTapeRowChangeType| DatabaseTapeRowChange {
+                    change_id: 0,
+                    change_time: 0,
+                    change,
+                    table_name: "t".to_string(),
+                    id,
+                };
+
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: true,
+                    };
+                    let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                    // Deletes first, then upserts — the order the decoder emits.
+                    for operation in [
+                        change(
+                            1,
+                            DatabaseTapeRowChangeType::Delete {
+                                before: turso_core::alloc::vec![],
+                                key: key("a", "1"),
+                            },
+                        ),
+                        change(
+                            2,
+                            DatabaseTapeRowChangeType::Delete {
+                                before: turso_core::alloc::vec![],
+                                key: key("b", "2"),
+                            },
+                        ),
+                        change(
+                            1,
+                            DatabaseTapeRowChangeType::Insert {
+                                after: image("b", "2", "left"),
+                            },
+                        ),
+                        change(
+                            2,
+                            DatabaseTapeRowChangeType::Insert {
+                                after: image("a", "1", "right"),
+                            },
+                        ),
+                    ] {
+                        session
+                            .replay(&coro, DatabaseTapeOperation::RowChange(operation))
+                            .await
+                            .unwrap();
+                    }
+                    session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+                }
+
+                let mut stmt = conn.prepare("SELECT x, y, z FROM t ORDER BY x, y").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(
+                        row.get_values()
+                            .map(|value| format!("{value}"))
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    );
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+
+        assert_eq!(
+            rows,
+            vec!["a|1|right".to_string(), "b|2|left".to_string()],
+            "the swap must keep both rows"
+        );
     }
 }

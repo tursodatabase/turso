@@ -1,0 +1,50 @@
+@database :memory:
+
+# `x IS TRUE` / `x IS FALSE` (and the IS NOT forms) test the truth of x; they
+# do not compare x with 1 or 0. SQLite still applies the truth test when the
+# TRUE/FALSE keyword sits inside parentheses or under COLLATE, because it
+# resolves the keyword after skipping those wrappers (resolve.c, and the
+# grammar collapses parentheses). `2 IS TRUE` is 1, so `2 IS (TRUE)` must be
+# 1 too.
+
+test is-true-through-parentheses {
+    SELECT 2 IS (TRUE), 2 IS ((TRUE)), 0 IS (FALSE), NULL IS (TRUE);
+}
+expect {
+    1|1|1|0
+}
+
+test is-not-through-parentheses {
+    SELECT 2 IS NOT (FALSE), NULL IS NOT (FALSE), 0 IS NOT (TRUE);
+}
+expect {
+    1|1|1
+}
+
+test is-true-through-collate {
+    SELECT 2 IS TRUE COLLATE NOCASE, 2 IS (TRUE) COLLATE NOCASE;
+}
+expect {
+    1|1
+}
+
+test indexed-is-parenthesized-true-is-a-truth-test {
+    CREATE TABLE t(x);
+    CREATE INDEX ti ON t(x);
+    INSERT INTO t VALUES (0), (1), (2), (NULL);
+    SELECT x FROM t WHERE x IS (TRUE) ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+test indexed-is-parenthesized-false-is-a-truth-test {
+    CREATE TABLE u(x);
+    CREATE INDEX ui ON u(x);
+    INSERT INTO u VALUES (0), (1), (2), (NULL);
+    SELECT x FROM u WHERE x IS (FALSE) ORDER BY x;
+}
+expect {
+    0
+}

@@ -2,6 +2,7 @@
 mod app;
 mod commands;
 mod config;
+mod dot_command;
 mod helper;
 mod input;
 mod manual;

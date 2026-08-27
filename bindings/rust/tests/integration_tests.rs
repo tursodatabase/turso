@@ -1,6 +1,230 @@
 use tokio::fs;
 use turso::{Builder, EncryptionOpts, Error, Value};
 
+#[derive(Debug, PartialEq, Eq)]
+struct DirectorySnapshot {
+    modified: std::time::SystemTime,
+    files: Vec<FileSnapshot>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileSnapshot {
+    name: std::ffi::OsString,
+    contents: Vec<u8>,
+    modified: std::time::SystemTime,
+    read_only: bool,
+}
+
+fn snapshot_directory(path: &std::path::Path) -> DirectorySnapshot {
+    let mut files = std::fs::read_dir(path)
+        .expect("database directory must be readable")
+        .map(|entry| {
+            let entry = entry.expect("database directory entry must be readable");
+            let metadata = entry
+                .metadata()
+                .expect("database directory entry metadata must be readable");
+            assert!(
+                metadata.is_file(),
+                "database directory must contain only files: {:?}",
+                entry.path()
+            );
+            FileSnapshot {
+                name: entry.file_name(),
+                contents: std::fs::read(entry.path())
+                    .expect("database directory entry must be readable"),
+                modified: metadata
+                    .modified()
+                    .expect("database file modification time must be available"),
+                read_only: metadata.permissions().readonly(),
+            }
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+
+    DirectorySnapshot {
+        modified: std::fs::metadata(path)
+            .expect("database directory metadata must be readable")
+            .modified()
+            .expect("database directory modification time must be available"),
+        files,
+    }
+}
+
+#[tokio::test]
+async fn test_builder_read_only_rejects_writes_without_modifying_files() {
+    let dir = tempfile::tempdir().expect("temporary directory must be created");
+    let db_path = dir.path().join("read-only.db");
+    let db_path = db_path.to_str().expect("database path must be valid UTF-8");
+
+    {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .expect("writable database must open");
+        let conn = db.connect().expect("writable connection must open");
+        conn.execute("CREATE TABLE test (value INTEGER)", ())
+            .await
+            .expect("table must be created");
+        conn.execute("INSERT INTO test VALUES (1)", ())
+            .await
+            .expect("writable control insert must succeed");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
+            .expect("database must be owner-readable and owner-writable");
+    }
+    let before = snapshot_directory(dir.path());
+
+    let db = Builder::new_local(db_path)
+        .read_only(true)
+        .build()
+        .await
+        .expect("read-only database must open");
+    let conn = db.connect().expect("read-only connection must open");
+    let mut rows = conn
+        .query("SELECT value FROM test", ())
+        .await
+        .expect("read-only query must succeed");
+    let row = rows
+        .next()
+        .await
+        .expect("read-only query must execute")
+        .expect("seed row must exist");
+    assert_eq!(
+        row.get_value(0).expect("seed value must be readable"),
+        1.into()
+    );
+    assert!(
+        rows.next()
+            .await
+            .expect("read-only query must finish")
+            .is_none(),
+        "only the seed row must exist"
+    );
+    drop(rows);
+
+    let error = conn
+        .execute("INSERT INTO test VALUES (2)", ())
+        .await
+        .expect_err("write through a read-only database must fail");
+    assert!(matches!(error, Error::Readonly(_)), "{error}");
+
+    drop(conn);
+    drop(db);
+    assert_eq!(
+        snapshot_directory(dir.path()),
+        before,
+        "read-only use must not change the database, sidecars, or directory entries"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_builder_read_only_opens_os_read_only_database() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions {
+        directory: std::path::PathBuf,
+        database: std::path::PathBuf,
+    }
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ =
+                std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700));
+            let _ =
+                std::fs::set_permissions(&self.database, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("temporary directory must be created");
+    let db_path = dir.path().join("permissions.db");
+    let db_path_str = db_path.to_str().expect("database path must be valid UTF-8");
+
+    {
+        let db = Builder::new_local(db_path_str)
+            .build()
+            .await
+            .expect("writable database must open");
+        let conn = db.connect().expect("writable connection must open");
+        conn.execute("CREATE TABLE test (value TEXT)", ())
+            .await
+            .expect("table must be created");
+        conn.execute("INSERT INTO test VALUES ('readable')", ())
+            .await
+            .expect("seed row must be inserted");
+    }
+
+    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o400))
+        .expect("database must be made read-only");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
+        .expect("database directory must be made read-only");
+    let _restore_permissions = RestorePermissions {
+        directory: dir.path().to_path_buf(),
+        database: db_path.clone(),
+    };
+
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db_path)
+        .is_ok()
+    {
+        // Privileged users can bypass Unix mode bits, so this fixture cannot
+        // prove which access mode the database requested in that environment.
+        return;
+    }
+
+    let before = snapshot_directory(dir.path());
+    let read_write_result = Builder::new_local(db_path_str).build().await;
+    let Err(error) = read_write_result else {
+        panic!("read-write open of a mode-0400 database must fail");
+    };
+    assert!(
+        matches!(
+            error,
+            Error::IoError(std::io::ErrorKind::PermissionDenied, "open")
+        ),
+        "unexpected read-write open error: {error:?}"
+    );
+    assert_eq!(
+        snapshot_directory(dir.path()),
+        before,
+        "failed read-write open must not change database files"
+    );
+
+    let db = Builder::new_local(db_path_str)
+        .read_only(true)
+        .build()
+        .await
+        .expect("read-only open of a mode-0400 database must succeed");
+    let conn = db.connect().expect("read-only connection must open");
+    let mut rows = conn
+        .query("SELECT value FROM test", ())
+        .await
+        .expect("read-only query must succeed");
+    let row = rows
+        .next()
+        .await
+        .expect("read-only query must execute")
+        .expect("seed row must exist");
+    assert_eq!(
+        row.get_value(0).expect("seed value must be readable"),
+        Value::Text("readable".to_string())
+    );
+    drop(rows);
+    drop(conn);
+    drop(db);
+
+    assert_eq!(
+        snapshot_directory(dir.path()),
+        before,
+        "read-only open must not change the mode-0400 database or create sidecars"
+    );
+}
+
 #[tokio::test]
 async fn test_rows_next() {
     let builder = Builder::new_local(":memory:");
@@ -1936,33 +2160,33 @@ async fn test_typed_numeric_row_conversions() {
     assert!(matches!(
         row.get::<i32>(0),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
     assert_eq!(row.get::<i32>(1).unwrap(), i32::MIN);
     assert_eq!(row.get::<i32>(2).unwrap(), i32::MAX);
     assert!(matches!(
         row.get::<i32>(3),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
 
     assert!(matches!(
         row.get::<u32>(4),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
     assert_eq!(row.get::<u32>(5).unwrap(), 0);
     assert_eq!(row.get::<u32>(6).unwrap(), u32::MAX);
     assert!(matches!(
         row.get::<u32>(7),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
 
     assert!(matches!(
         row.get::<u64>(4),
         Err(Error::ConversionFailure(message))
-            if message == "Runtime error: integer overflow"
+            if message == "integer overflow"
     ));
     assert_eq!(row.get::<u64>(8).unwrap(), i64::MAX as u64);
 

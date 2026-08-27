@@ -430,7 +430,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     key,
                     jsonb,
                     self.path_to_current_value.string.clone(),
-                    parent_id,
+                    None,
                     self.path_to_current_value
                         .read(traversal_state.innermost_container_cursor)
                         .to_owned(),
@@ -779,7 +779,8 @@ impl InPlaceJsonPath {
     fn element_length(element: &PathElement) -> usize {
         match element {
             PathElement::Root() => 1,
-            PathElement::Key(key, _) => key.len() + 1,
+            PathElement::Key(key, true) => key.len() + 3,
+            PathElement::Key(key, false) => key.len() + 1,
             PathElement::ArrayLocator(idx) => {
                 let digit_count = successors(*idx, |&n| (n >= 10).then_some(n / 10)).count();
                 let bracket_count = 2; // []

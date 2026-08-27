@@ -303,13 +303,9 @@ impl JsonFunc {
 
     pub fn arities(&self) -> &'static [i32] {
         match self {
-            Self::Json
-            | Self::Jsonb
-            | Self::JsonQuote
-            | Self::JsonErrorPosition
-            | Self::JsonValid => &[1],
+            Self::Json | Self::Jsonb | Self::JsonQuote | Self::JsonErrorPosition => &[1],
             Self::JsonPatch | Self::JsonbPatch => &[2],
-            Self::JsonArrayLength | Self::JsonType => &[1, 2],
+            Self::JsonArrayLength | Self::JsonType | Self::JsonValid => &[1, 2],
             // Operators — filtered out, arity doesn't matter
             Self::JsonArrowExtract | Self::JsonArrowShiftExtract => &[2],
             // Variable-arg
@@ -529,6 +525,8 @@ impl WindowFunc {
                 | Self::Lag
                 | Self::Lead
                 | Self::Ntile
+                | Self::PercentRank
+                | Self::CumeDist
         )
     }
 
@@ -551,16 +549,19 @@ impl WindowFunc {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::CurrentRow,
+                exclude: None,
             }),
             Self::Rank | Self::DenseRank => Some(Frame {
                 mode: FrameMode::Range,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::CurrentRow,
+                exclude: None,
             }),
             Self::PercentRank => Some(Frame {
                 mode: FrameMode::Groups,
                 start: FrameBoundary::CurrentRow,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::CumeDist => Some(Frame {
                 mode: FrameMode::Groups,
@@ -568,16 +569,19 @@ impl WindowFunc {
                     "1".to_string(),
                 )))),
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::Ntile => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::CurrentRow,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::Lead => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::FirstValue | Self::LastValue | Self::NthValue => None,
             Self::External(_) => unreachable!(
@@ -816,6 +820,7 @@ pub enum ScalarFunc {
     Time,
     TotalChanges,
     DateTime,
+    Subtype,
     Typeof,
     Unicode,
     Unistr,
@@ -951,6 +956,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Time => false,
             ScalarFunc::TotalChanges => false,
             ScalarFunc::DateTime => false,
+            ScalarFunc::Subtype => true,
             ScalarFunc::Typeof => true,
             ScalarFunc::Unicode => true,
             ScalarFunc::Unistr => true,
@@ -1097,6 +1103,7 @@ impl Display for ScalarFunc {
             Self::Date => "date",
             Self::Time => "time",
             Self::TotalChanges => "total_changes",
+            Self::Subtype => "subtype",
             Self::Typeof => "typeof",
             Self::Unicode => "unicode",
             Self::Unistr => "unistr",
@@ -1236,6 +1243,7 @@ impl ScalarFunc {
             | Self::RandomBlob
             | Self::Sign
             | Self::Soundex
+            | Self::Subtype
             | Self::Typeof
             | Self::Unicode
             | Self::Unistr

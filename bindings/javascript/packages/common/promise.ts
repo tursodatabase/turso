@@ -1,7 +1,7 @@
 import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
-import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
+import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP, DatabaseOpts } from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
@@ -24,6 +24,15 @@ function createErrorByName(name, message) {
   }
 
   return new ErrorConstructor(message);
+}
+
+// The engine returned STEP_SLEEP: it wants the statement stepped again after a
+// delay (busy-handler backoff, or a yield with no pending I/O). Park the step
+// loop on a timer promise — unlike STEP_IO
+// there is no I/O completion coming to wake us up, so waiting on the IO
+// notifier would hang (WASM) or spin (native).
+function sleepBeforeRetry(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isQueryOptions(value) {
@@ -600,9 +609,13 @@ class Database {
     const exec = this.db.executor(sql, queryOptions);
     try {
       while (true) {
-        const stepResult = exec.stepSync();
+        const [stepResult, sleepMs] = exec.stepSync();
         if (stepResult === STEP_IO) {
           await this.io();
+          continue;
+        }
+        if (stepResult === STEP_SLEEP) {
+          await sleepBeforeRetry(sleepMs);
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -666,9 +679,13 @@ async function executeBatch(
     const exec = native.executor(sql);
     try {
       while (true) {
-        const stepResult = exec.stepSync();
+        const [stepResult, sleepMs] = exec.stepSync();
         if (stepResult === STEP_IO) {
           await io();
+          continue;
+        }
+        if (stepResult === STEP_SLEEP) {
+          await sleepBeforeRetry(sleepMs);
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -713,9 +730,13 @@ async function executeBatch(
         const rows: any[] = [];
         try {
           while (true) {
-            const stepResult = await nativeStmt.stepSync();
+            const [stepResult, sleepMs] = await nativeStmt.stepSync();
             if (stepResult === STEP_IO) {
               await io();
+              continue;
+            }
+            if (stepResult === STEP_SLEEP) {
+              await sleepBeforeRetry(sleepMs);
               continue;
             }
             if (stepResult === STEP_DONE) {
@@ -810,9 +831,13 @@ class Transaction {
       const exec = this.db.executor(sql, queryOptions);
       try {
         while (true) {
-          const stepResult = exec.stepSync();
+          const [stepResult, sleepMs] = exec.stepSync();
           if (stepResult === STEP_IO) {
             await this.ioStep();
+            continue;
+          }
+          if (stepResult === STEP_SLEEP) {
+            await sleepBeforeRetry(sleepMs);
             continue;
           }
           if (stepResult === STEP_DONE) {
@@ -1062,9 +1087,13 @@ class Statement {
     await this.execLock.acquire();
     try {
       while (true) {
-        const stepResult = await stmt.stepSync();
+        const [stepResult, sleepMs] = await stmt.stepSync();
         if (stepResult === STEP_IO) {
           await this.io();
+          continue;
+        }
+        if (stepResult === STEP_SLEEP) {
+          await sleepBeforeRetry(sleepMs);
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -1102,9 +1131,13 @@ class Statement {
     let row = undefined;
     try {
       while (true) {
-        const stepResult = await stmt.stepSync();
+        const [stepResult, sleepMs] = await stmt.stepSync();
         if (stepResult === STEP_IO) {
           await this.io();
+          continue;
+        }
+        if (stepResult === STEP_SLEEP) {
+          await sleepBeforeRetry(sleepMs);
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -1137,9 +1170,13 @@ class Statement {
     await this.execLock.acquire();
     try {
       while (true) {
-        const stepResult = await stmt.stepSync();
+        const [stepResult, sleepMs] = await stmt.stepSync();
         if (stepResult === STEP_IO) {
           await this.io();
+          continue;
+        }
+        if (stepResult === STEP_SLEEP) {
+          await sleepBeforeRetry(sleepMs);
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -1171,9 +1208,13 @@ class Statement {
     await this.execLock.acquire();
     try {
       while (true) {
-        const stepResult = await stmt.stepSync();
+        const [stepResult, sleepMs] = await stmt.stepSync();
         if (stepResult === STEP_IO) {
           await this.io();
+          continue;
+        }
+        if (stepResult === STEP_SLEEP) {
+          await sleepBeforeRetry(sleepMs);
           continue;
         }
         if (stepResult === STEP_DONE) {

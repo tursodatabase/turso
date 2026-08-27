@@ -1,6 +1,3 @@
--- LIMBO_SKIP: subquery in HAVING clausenot supported
-
-
 select
 	ps_partkey,
 	sum(ps_supplycost * ps_availqty) as value

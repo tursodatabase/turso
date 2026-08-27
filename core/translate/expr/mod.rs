@@ -80,9 +80,8 @@ use vectors::*;
 use walk::*;
 
 pub(crate) use affinity::{
-    compare_affinity, expr_data_type, get_expr_affinity_info, ExprAffinityInfo, StorageClassMask,
+    comparison_affinity, expr_data_type, get_expr_affinity, StorageClassMask,
 };
-pub use affinity::{comparison_affinity, get_expr_affinity};
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
@@ -106,7 +105,8 @@ pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };
 pub use utils::{
-    as_binary_components, maybe_apply_affinity, sanitize_string, unwrap_parens, unwrap_parens_owned,
+    as_binary_components, maybe_apply_affinity, sanitize_string, truth_test_rhs, unwrap_parens,
+    unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
 pub use walk::{

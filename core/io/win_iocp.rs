@@ -37,17 +37,17 @@
 // - in Sync, IO Pakcet should not be touched, it should be handled in -and only in-
 //  `process_packet_from_iocp`
 
+use super::windows_lock::{
+    acquire_process_file_lock, release_shared_wal_locks_on_drop, shared_wal_lock_byte,
+    shared_wal_probe_exclusive_byte, shared_wal_try_lock_byte, shared_wal_unlock_byte,
+    stable_lock_path_for_handle, ProcessFileLockGuard, SharedWalLockState,
+};
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
-use super::windows_lock::{
-    acquire_process_file_lock, release_shared_wal_locks_on_drop, shared_wal_lock_byte,
-    shared_wal_probe_exclusive_byte, shared_wal_try_lock_byte, shared_wal_unlock_byte,
-    stable_lock_path_for_handle, ProcessFileLockGuard, SharedWalLockState,
-};
 
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
@@ -94,6 +94,13 @@ use windows_sys::Win32::System::IO::{
 // Constants
 
 const CACHING_CAPACITY: usize = 128;
+/// How long a single `GetQueuedCompletionStatus` call inside [`IO::step`] waits
+/// for the next packet. `step()` loops until every outstanding operation has
+/// been reaped, so this only bounds how often the loop re-checks the tracking
+/// table; it is not a deadline for the operation itself.
+const IOCP_STEP_TIMEOUT_MS: u32 = 10;
+/// Non-blocking poll, used when we only want packets that are already queued.
+const IOCP_NO_WAIT_MS: u32 = 0;
 //TODO: enable this or remove when direct IO stabilized
 const ENABLE_DIRECT_IO: bool = false;
 const ENABLE_LOCK_ON_OPEN: bool = true;
@@ -413,19 +420,28 @@ impl IO for WindowsIOCP {
         Ok(())
     }
 
+    /// Reap completion packets until nothing submitted is still outstanding.
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         trace!("I/O Step..");
 
-        match self.instance.process_packet_from_iocp() {
-            Err(GetIOCPPacketError::SystemError(code)) => {
-                Err(get_generic_limboerror_from_os_err(code))
+        while self.instance.has_tracked_io() {
+            match self.instance.process_packet_from_iocp(IOCP_STEP_TIMEOUT_MS) {
+                Err(GetIOCPPacketError::SystemError(code)) => {
+                    return Err(get_generic_limboerror_from_os_err(code));
+                }
+                // Empty is a timeout: re-check the table and keep waiting.
+                // InvalidIO still untracked the packet, so the loop makes
+                // progress. Aborted means a packet arrived without an
+                // OVERLAPPED, which only PostQueuedCompletionStatus can
+                // produce and we never call it.
+                Err(GetIOCPPacketError::Aborted)
+                | Err(GetIOCPPacketError::Empty)
+                | Err(GetIOCPPacketError::InvalidIO)
+                | Ok(()) => {}
             }
-            Err(GetIOCPPacketError::Aborted)
-            | Err(GetIOCPPacketError::Empty)
-            | Err(GetIOCPPacketError::InvalidIO)
-            | Ok(()) => Ok(()),
         }
+        Ok(())
     }
 }
 
@@ -571,7 +587,15 @@ impl InnerWindowsIOCP {
         None
     }
 
-    fn process_packet_from_iocp(&self) -> Result<(), GetIOCPPacketError> {
+    /// True while at least one submitted operation has not had its packet
+    /// reaped yet. Packets are inserted before the operation is started and
+    /// removed by `forget_io_packet`, so this is the IOCP equivalent of
+    /// io_uring's `pending_ops`.
+    fn has_tracked_io(&self) -> bool {
+        !self.tracked_io_packets.lock().is_empty()
+    }
+
+    fn process_packet_from_iocp(&self, timeout_ms: u32) -> Result<(), GetIOCPPacketError> {
         let mut overlapped_ptr = ptr::null_mut();
         let mut bytes_received = 0;
         let mut iocp_key = 0;
@@ -582,7 +606,7 @@ impl InnerWindowsIOCP {
                 &raw mut bytes_received,
                 &raw mut iocp_key,
                 &raw mut overlapped_ptr,
-                0,
+                timeout_ms,
             )
         };
 
@@ -654,7 +678,7 @@ impl InnerWindowsIOCP {
 
     fn drain(&self) -> Result<()> {
         loop {
-            match self.process_packet_from_iocp() {
+            match self.process_packet_from_iocp(IOCP_NO_WAIT_MS) {
                 Err(GetIOCPPacketError::Empty | GetIOCPPacketError::Aborted) => {
                     break;
                 }
@@ -1169,7 +1193,11 @@ impl Drop for WindowsFile {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::task::{Wake, Waker};
 
     use crate::{
         io::{common, win_iocp::get_generic_limboerror_from_os_err, OpenFlags, TempFile},
@@ -1177,6 +1205,73 @@ mod tests {
     };
 
     use super::WindowsIOCP;
+
+    #[derive(Default)]
+    struct FlagWaker(AtomicBool);
+
+    impl Wake for FlagWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A single `step()` must leave nothing outstanding and must have fired
+    /// every registered waker. Futures in the bindings call `step()` exactly
+    /// once and then return `Poll::Pending`, so a `step()` that reaps only one
+    /// packet (or none) loses the wakeup and hangs the caller forever.
+    #[test]
+    fn test_step_completes_all_outstanding_io_and_wakes_wakers() {
+        const WRITE: &[u8] = b"wake";
+        // More than one operation, so a `step()` that reaps a single packet
+        // fails deterministically rather than depending on IO timing.
+        const OPERATIONS: u64 = 64;
+
+        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
+        let file = TempFile::new(&iocp).unwrap();
+
+        let mut completions = Vec::new();
+        let mut wakers = Vec::new();
+        for n in 0..OPERATIONS {
+            let buffer = Arc::new(Buffer::new_temporary(WRITE.len()));
+            buffer.as_mut_slice().copy_from_slice(WRITE);
+            let completion = file
+                .pwrite(
+                    n * WRITE.len() as u64,
+                    buffer,
+                    Completion::new_write(|res| assert_eq!(res, Ok(4))),
+                )
+                .unwrap();
+
+            let flag = Arc::new(FlagWaker::default());
+            completion.set_waker(&Waker::from(flag.clone()));
+            completions.push(completion);
+            wakers.push(flag);
+        }
+
+        iocp.step().unwrap();
+
+        for (n, completion) in completions.iter().enumerate() {
+            assert!(
+                completion.finished(),
+                "completion {n} still outstanding after step()"
+            );
+            assert!(completion.succeeded(), "completion {n} failed");
+        }
+        for (n, flag) in wakers.iter().enumerate() {
+            assert!(
+                flag.0.load(Ordering::SeqCst),
+                "waker for completion {n} was never fired"
+            );
+        }
+    }
+
+    /// `step()` must not block when the backend has no work queued.
+    #[test]
+    fn test_step_returns_immediately_when_idle() {
+        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
+        iocp.step().unwrap();
+        iocp.step().unwrap();
+    }
 
     #[test]
     fn test_file_read_write() {

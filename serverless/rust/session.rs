@@ -15,9 +15,10 @@ use crate::{
     protocol::{
         decode_value, Batch, BatchCond, BatchStep, CursorEntry, CursorRequest, CursorResponse,
         PipelineRequest, PipelineResponse, Stmt, StreamRequest, StreamResponse, StreamResult,
+        ENCRYPTION_KEY_HEADER,
     },
     rows::Row,
-    Column, Error, Result,
+    AuthTokenFn, Column, Error, Result,
 };
 
 /// Rewrite `libsql://` and `turso://` URLs to `https://` and strip any
@@ -55,7 +56,8 @@ pub struct StmtOutput {
 
 pub struct Session {
     client: reqwest::Client,
-    auth_token: Option<String>,
+    auth_token: Option<AuthTokenFn>,
+    remote_encryption_key: Option<String>,
     base_url: String,
     baton: Option<String>,
     pub shared: Arc<SharedState>,
@@ -123,7 +125,11 @@ impl LineReader {
 }
 
 impl Session {
-    pub fn new(url: &str, auth_token: Option<String>) -> (Self, Arc<SharedState>) {
+    pub fn new(
+        url: &str,
+        auth_token: Option<AuthTokenFn>,
+        remote_encryption_key: Option<String>,
+    ) -> (Self, Arc<SharedState>) {
         let shared = Arc::new(SharedState {
             autocommit: AtomicBool::new(true),
             last_insert_rowid: AtomicI64::new(0),
@@ -131,6 +137,7 @@ impl Session {
         let session = Self {
             client: reqwest::Client::new(),
             auth_token,
+            remote_encryption_key,
             base_url: normalize_url(url),
             baton: None,
             shared: shared.clone(),
@@ -151,8 +158,14 @@ impl Session {
             .client
             .post(&url)
             .header("Content-Type", "application/json");
-        if let Some(token) = &self.auth_token {
+        // Resolved here rather than once at construction so dynamic providers
+        // can rotate the token between requests.
+        if let Some(provider) = &self.auth_token {
+            let token = provider().await?;
             request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        if let Some(key) = &self.remote_encryption_key {
+            request = request.header(ENCRYPTION_KEY_HEADER, key);
         }
         request
             .body(body)

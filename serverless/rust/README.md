@@ -35,6 +35,24 @@ async fn main() -> turso_serverless::Result<()> {
 }
 ```
 
+For a database encrypted with a customer-managed key, pass the
+base64-encoded key with `Builder::with_remote_encryption_key`.
+
+For short-lived tokens, `Builder::with_auth_token_fn` takes an async
+callback invoked before every HTTP request, so the token can be rotated
+(e.g. refreshed from a secrets manager) without rebuilding the database
+handle:
+
+```rust
+# async fn run() -> turso_serverless::Result<()> {
+let db = turso_serverless::Builder::new_remote("libsql://my-db.turso.io")
+    .with_auth_token_fn(|| async { fetch_fresh_token().await })
+    .build()
+    .await?;
+# Ok(())
+# }
+```
+
 Interactive transactions span multiple HTTP requests; the server keeps the
 connection state alive between them:
 

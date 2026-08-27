@@ -25,7 +25,9 @@ use crate::translate::plan::BitSet;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
+use crate::{
+    bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value, CDC_VERSION_CURRENT,
+};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -507,58 +509,50 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
-            // Check if autovacuum is enabled in database opts
-            if !connection.db.opts.enable_autovacuum {
+            // SQLite spells the three modes either by name or by number, and
+            // treats the two spellings as the same thing.
+            let requested_mode = match &value {
+                Expr::Name(name) => {
+                    let name = name.as_str().as_bytes();
+                    match_ignore_ascii_case!(match name {
+                        b"none" => Some(AutoVacuumMode::None),
+                        b"full" => Some(AutoVacuumMode::Full),
+                        b"incremental" => Some(AutoVacuumMode::Incremental),
+                        _ => None,
+                    })
+                }
+                _ => match parse_signed_number(&value) {
+                    Ok(Value::Numeric(Numeric::Integer(n @ 0..=2))) => {
+                        Some(AutoVacuumMode::from(n as u8))
+                    }
+                    _ => None,
+                },
+            };
+
+            // Auto-vacuum is off unless the experimental flag turns it on, so
+            // asking for NONE only restates the state the database is already
+            // in. Requiring the flag to switch the feature off would make every
+            // `PRAGMA auto_vacuum=NONE` in portable SQL fail for no reason.
+            if requested_mode != Some(AutoVacuumMode::None) && !connection.db.opts.enable_autovacuum
+            {
                 return Err(LimboError::InvalidArgument(
                     "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
                         .to_string(),
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema(), &pager)?;
-            tracing::debug!(
-                "Checking if database is empty for auto_vacuum pragma: {}",
-                is_empty
-            );
-
-            if !is_empty {
-                // SQLite's behavior is to silently ignore this pragma if the database is not empty.
-                tracing::debug!(
-                    "Attempted to set auto_vacuum, database is not empty so we are ignoring pragma."
-                );
+            // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
+            // so the pragma is silently ignored after that.
+            if pager.db_initialized() {
                 return Ok(TransactionMode::None);
             }
 
-            let auto_vacuum_mode = match value {
-                Expr::Name(name) => {
-                    let name = name.as_str().as_bytes();
-                    match_ignore_ascii_case!(match name {
-                        b"none" => 0,
-                        b"full" => 1,
-                        b"incremental" => 2,
-                        _ => {
-                            return Err(LimboError::InvalidArgument(
-                                "invalid auto vacuum mode".to_string(),
-                            ));
-                        }
-                    })
-                }
-                _ => {
-                    return Err(LimboError::InvalidArgument(
-                        "invalid auto vacuum mode".to_string(),
-                    ));
-                }
+            let Some(auto_vacuum_mode) = requested_mode else {
+                return Err(LimboError::InvalidArgument(
+                    "invalid auto vacuum mode".to_string(),
+                ));
             };
-            match auto_vacuum_mode {
-                0 => pager.persist_auto_vacuum_mode(AutoVacuumMode::None)?,
-                1 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Full)?,
-                2 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Incremental)?,
-                _ => {
-                    return Err(LimboError::InvalidArgument(
-                        "invalid auto vacuum mode".to_string(),
-                    ));
-                }
-            }
+            pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
@@ -581,7 +575,7 @@ fn update_pragma(
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::IncrementalVacuum,
-                value: auto_vacuum_mode - 1,
+                value: i32::from(u8::from(auto_vacuum_mode)) - 1,
                 p5: 0,
             });
             Ok(TransactionMode::None)
@@ -706,6 +700,11 @@ fn update_pragma(
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_dml_require_where(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CountChanges => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_count_changes(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::IgnoreCheckConstraints => {
@@ -1459,6 +1458,7 @@ fn query_pragma(
                 value: auto_vacuum_mode_i64,
             });
             program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => {
@@ -1638,6 +1638,14 @@ fn query_pragma(
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
             let register = program.alloc_register();
             let enabled = connection.get_dml_require_where();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CountChanges => {
+            let register = program.alloc_register();
+            let enabled = connection.get_count_changes();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
@@ -1900,39 +1908,7 @@ fn update_cache_size(
     Ok(())
 }
 
-pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
-pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-
-pub use crate::CDC_VERSION_CURRENT;
-
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
     Ok(())
-}
-
-fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
-    if schema.tables.len() > 1 {
-        return Ok(false);
-    }
-    if let Some(table_arc) = schema.tables.values().next() {
-        let table_name = match table_arc.as_ref() {
-            Table::BTree(tbl) => &tbl.name,
-            Table::Virtual(tbl) => &tbl.name,
-            Table::FromClauseSubquery(tbl) => &tbl.name,
-        };
-
-        if table_name != "sqlite_schema" {
-            return Ok(false);
-        }
-    }
-
-    let db_size_result = pager
-        .io
-        .block(|| pager.with_header(|header| header.database_size.get()));
-
-    match db_size_result {
-        Err(_) => Ok(true),
-        Ok(0 | 1) => Ok(true),
-        Ok(_) => Ok(false),
-    }
 }

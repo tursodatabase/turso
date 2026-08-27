@@ -9,7 +9,7 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl,
+        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -29,11 +29,11 @@ use crate::schema::{
     EXPR_INDEX_SENTINEL,
 };
 use crate::translate::fkeys::FkActionCompileStack;
-use crate::translate::plan::ColumnMask;
+use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u16, InsertFlags, Insn},
+    insn::{to_u32, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{
@@ -160,10 +160,20 @@ pub struct Resolver<'a> {
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
-    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, ExprAffinityInfo>>,
+    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, Affinity>>,
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
+    /// One list per enclosing query, mirroring SQLite's NameContext chain
+    /// (resolve.c `resolveExprStep`). An aggregate whose argument columns
+    /// belong to an enclosing query is computed by that query, not by the
+    /// subquery it is written in. When a subquery resolves such an aggregate it
+    /// adds it to the enclosing query's list here (the last entry) instead of
+    /// keeping it, so the outer query never has to reach in and take it out
+    /// later. Each query adds an empty list before planning its subqueries and
+    /// removes it — folding the collected aggregates into its own aggregate
+    /// list — afterwards.
+    enclosing_query_aggregates: RefCell<Vec<Vec<Aggregate>>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
@@ -195,6 +205,7 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    unqualified_database_search_path: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -285,6 +296,7 @@ impl<'a> Resolver<'a> {
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
+        unqualified_database_search_path: &Option<Vec<String>>,
     ) -> Self {
         let has_temp_schema = temp_database.read().is_some();
         Self {
@@ -300,12 +312,14 @@ impl<'a> Resolver<'a> {
             register_collations: HashMap::default(),
             subquery_affinities: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
+            enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
             dqs_dml,
             dialect,
             trigger_context: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            unqualified_database_search_path: unqualified_database_search_path.clone(),
         }
     }
 
@@ -331,12 +345,14 @@ impl<'a> Resolver<'a> {
             register_collations: HashMap::default(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
     }
 
@@ -354,12 +370,14 @@ impl<'a> Resolver<'a> {
             register_collations: self.register_collations.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
     }
 
@@ -495,6 +513,37 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
+    /// Start collecting aggregates that this query's subqueries find to belong
+    /// to this query, before planning those subqueries.
+    /// [`Self::take_aggregates_from_subqueries`] retrieves them afterwards.
+    pub(crate) fn begin_collecting_aggregates_from_subqueries(&self) {
+        self.enclosing_query_aggregates
+            .borrow_mut()
+            .push(Vec::new());
+    }
+
+    /// Stop collecting and return the aggregates this query's subqueries moved
+    /// up to it.
+    pub(crate) fn take_aggregates_from_subqueries(&self) -> Vec<Aggregate> {
+        self.enclosing_query_aggregates
+            .borrow_mut()
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Move an aggregate up to the innermost enclosing query that is
+    /// collecting. Returns false when there is none — the aggregate then stays
+    /// with the query that resolved it.
+    pub(crate) fn move_aggregate_to_enclosing_query(&self, agg: Aggregate) -> bool {
+        match self.enclosing_query_aggregates.borrow_mut().last_mut() {
+            Some(collected) => {
+                collected.push(agg);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn cache_expr_reg(
         &mut self,
         expr: Cow<'a, ast::Expr>,
@@ -592,6 +641,22 @@ impl<'a> Resolver<'a> {
             return Ok(crate::TEMP_DB_ID);
         }
 
+        if let Some(search_path) = &self.unqualified_database_search_path {
+            for schema_name in search_path {
+                let Some(database_id) = self.resolve_search_path_database_id(schema_name) else {
+                    continue;
+                };
+                if self.with_schema(database_id, |schema| {
+                    schema_contains_object(schema, object_name)
+                }) {
+                    return Ok(database_id);
+                }
+            }
+            return Err(LimboError::ParseError(format!(
+                "no such object: {object_name}"
+            )));
+        }
+
         if self.with_schema(crate::MAIN_DB_ID, |schema| {
             schema_contains_object(schema, object_name)
         }) {
@@ -607,6 +672,13 @@ impl<'a> Resolver<'a> {
         }
 
         Ok(crate::MAIN_DB_ID)
+    }
+
+    fn resolve_search_path_database_id(&self, schema_name: &str) -> Option<usize> {
+        if schema_name.eq_ignore_ascii_case("public") {
+            return Some(crate::MAIN_DB_ID);
+        }
+        self.get_attached_database(schema_name).map(|x| x.0)
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -1068,8 +1140,12 @@ pub fn emit_program(
         Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
         Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
         Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
-        Plan::CompoundSelect { .. } => {
-            emit_program_for_compound_select(program, resolver, plan).map(|_| ())
+        mut plan @ Plan::CompoundSelect { .. } => {
+            emit_program_for_compound_select(program, resolver, &mut plan).map(|_| ())
+        }
+        Plan::RecursiveCte(mut recursive_cte) => {
+            super::recursive_cte::emit_recursive_cte(program, resolver, &mut recursive_cte)
+                .map(|_| ())
         }
     }
 }
@@ -1094,7 +1170,7 @@ pub fn prepare_cdc_if_necessary(
     // gets the cursor.
     if let Some(changed_table_name) = changed_table_name {
         if changed_table_name == cdc_table
-            || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+            || changed_table_name == crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
         {
             return Ok(None);
         }
@@ -1140,9 +1216,9 @@ pub fn emit_cdc_patch_record(
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(columns_reg),
-            count: to_u16(storable_count),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(columns_reg),
+            count: to_u32(storable_count),
+            dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str),
         });
@@ -1171,9 +1247,9 @@ pub(super) fn emit_make_record<'a>(
         .collect();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(start_reg),
-        count: to_u16(storable_count),
-        dest_reg: to_u16(dest_reg),
+        start_reg: to_u32(start_reg),
+        count: to_u32(storable_count),
+        dest_reg: to_u32(dest_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -1211,9 +1287,9 @@ pub fn emit_cdc_full_record(
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(columns_reg + 1),
-        count: to_u16(storable_count),
-        dest_reg: to_u16(columns_reg),
+        start_reg: to_u32(columns_reg + 1),
+        count: to_u32(storable_count),
+        dest_reg: to_u32(columns_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -1406,9 +1482,9 @@ fn emit_cdc_insns_v1(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(turso_cdc_registers),
-        count: to_u16(8),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(turso_cdc_registers),
+        count: to_u32(8),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -1533,9 +1609,9 @@ fn emit_cdc_insns_v2(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(turso_cdc_registers),
-        count: to_u16(9),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(turso_cdc_registers),
+        count: to_u32(9),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -1614,9 +1690,9 @@ pub fn emit_cdc_commit_insns(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(regs),
-        count: to_u16(9),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(regs),
+        count: to_u32(9),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -1715,6 +1791,13 @@ pub fn emit_cdc_explicit_commit_insns(
         target_pc: skip_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
         collation: None,
+    });
+
+    // The CDC record write needs a transaction; joins the open one (keeping its mode) if any.
+    program.emit_insn(Insn::Transaction {
+        db: crate::MAIN_DB_ID,
+        tx_mode: TransactionMode::Write,
+        schema_cookie: schema.schema_version,
     });
 
     // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
@@ -2138,9 +2221,12 @@ fn emit_check_constraint_bytecode(
             jump_if_null: false,
         });
 
-        let constraint_name = match &check_constraint.name {
-            Some(name) => name.clone(),
-            None => format!("{}", check_constraint.expr),
+        // SQLite reports a failed CHECK by its constraint name, or by the
+        // expression's source text exactly as the user wrote it.
+        let constraint_name = match (&check_constraint.name, &check_constraint.source) {
+            (Some(name), _) => name.clone(),
+            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, None) => format!("{}", check_constraint.expr),
         };
 
         match or_conflict {

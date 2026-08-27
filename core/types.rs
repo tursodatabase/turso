@@ -139,6 +139,39 @@ pub trait Extendable<T> {
     fn do_extend(&mut self, other: &T) -> Result<()>;
 }
 
+/// Copies non-overlapping bytes while keeping common small lengths visible to the optimizer.
+///
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes and must not overlap.
+#[inline(always)]
+unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
+    // Record decoding frequently reuses registers for short values. Fixed-size
+    // copies compile inline instead of calling the platform memcpy routine.
+    unsafe {
+        match len {
+            0 => {}
+            1 => std::ptr::copy_nonoverlapping(src, dst, 1),
+            2 => std::ptr::copy_nonoverlapping(src, dst, 2),
+            3 => std::ptr::copy_nonoverlapping(src, dst, 3),
+            4 => std::ptr::copy_nonoverlapping(src, dst, 4),
+            5 => std::ptr::copy_nonoverlapping(src, dst, 5),
+            6 => std::ptr::copy_nonoverlapping(src, dst, 6),
+            7 => std::ptr::copy_nonoverlapping(src, dst, 7),
+            8 => std::ptr::copy_nonoverlapping(src, dst, 8),
+            9 => std::ptr::copy_nonoverlapping(src, dst, 9),
+            10 => std::ptr::copy_nonoverlapping(src, dst, 10),
+            11 => std::ptr::copy_nonoverlapping(src, dst, 11),
+            12 => std::ptr::copy_nonoverlapping(src, dst, 12),
+            13 => std::ptr::copy_nonoverlapping(src, dst, 13),
+            14 => std::ptr::copy_nonoverlapping(src, dst, 14),
+            15 => std::ptr::copy_nonoverlapping(src, dst, 15),
+            16 => std::ptr::copy_nonoverlapping(src, dst, 16),
+            _ => std::ptr::copy_nonoverlapping(src, dst, len),
+        }
+    }
+}
+
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
@@ -154,7 +187,7 @@ impl<T: AnyText> Extendable<T> for Text {
                         "source and destination ranges must not overlap"
                     );
                     unsafe {
-                        std::ptr::copy_nonoverlapping(other_str.as_ptr(), s.as_mut_ptr(), needed);
+                        copy_nonoverlapping_inline(other_str.as_ptr(), s.as_mut_ptr(), needed);
                         s.as_mut_vec().set_len(needed);
                     }
                 } else {
@@ -183,7 +216,7 @@ impl<T: AnyBlob> Extendable<T> for ValueBlob {
                 "source and destination ranges must not overlap"
             );
             unsafe {
-                std::ptr::copy_nonoverlapping(other_slice.as_ptr(), self.as_mut_ptr(), needed);
+                copy_nonoverlapping_inline(other_slice.as_ptr(), self.as_mut_ptr(), needed);
                 self.set_len(needed);
             }
         } else {
@@ -2388,23 +2421,29 @@ impl IndexInfo {
         index: &Index,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
+        // A backing_btree stores the index method's complete opaque key. Unlike
+        // an ordinary secondary index, it must not append the base-table rowid.
+        // MVCC's commit-time conflict validation handles these
+        // `has_rowid == false` records by treating the whole key as the
+        // uniqueness prefix (see `check_index_for_conflicts`).
+        let has_rowid = index.has_rowid && !index.is_backing_btree_index();
         let key_info = index
             .columns
             .iter()
             .map(|c| KeyInfo {
                 sort_order: c.order,
                 collation: c.collation.unwrap_or_default(),
-                nulls_order: None,
+                nulls_order: c.nulls_order,
             })
-            .chain(index.has_rowid.then_some(KeyInfo {
+            .chain(has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::Binary,
                 nulls_order: None,
             }));
         Self::new_in(
             key_info,
-            index.has_rowid,
-            index.columns.len() + (index.has_rowid as usize),
+            has_rowid,
+            index.columns.len() + (has_rowid as usize),
             index.unique,
             alloc,
         )
@@ -2439,14 +2478,9 @@ where
     );
     let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
     for (i, (l, r)) in l.zip(r).enumerate() {
-        let column_order = column_info[i].sort_order;
-        let collation = column_info[i].collation;
-        let cmp = compare_immutable_single(l, r, collation);
+        let cmp = cmp_in_column(&l.as_value_ref(), &r.as_value_ref(), &column_info[i]);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
+            return cmp;
         }
     }
     std::cmp::Ordering::Equal
@@ -2471,14 +2505,9 @@ where
             Some(v) => v,
             None => break,
         };
-        let column_order = col_info.sort_order;
-        let collation = col_info.collation;
-        let cmp = compare_immutable_single(l?, r?, collation);
+        let cmp = cmp_in_column(&l?.as_value_ref(), &r?.as_value_ref(), col_info);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => Ok(cmp),
-                SortOrder::Desc => Ok(cmp.reverse()),
-            };
+            return Ok(cmp);
         }
     }
     Ok(std::cmp::Ordering::Equal)
@@ -2828,7 +2857,6 @@ where
 /// * `serialized` - The left-hand side record in serialized format
 /// * `unpacked` - The right-hand side record as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
-/// * `collations` - Array of collation sequences for string comparisons
 /// * `skip` - Number of initial fields to skip (assumes caller verified equality)
 /// * `tie_breaker` - Result to return when all compared fields are equal
 ///
@@ -2909,18 +2937,15 @@ where
             }
         };
 
+        let key_info = &index_info.key_info[field_idx];
         let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => index_info.key_info[field_idx]
-                .collation
-                .compare_strings(lhs_text, rhs_text),
-
+            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => {
+                key_info.collation.compare_strings(lhs_text, rhs_text)
+            }
             _ => lhs_value.cmp(rhs_value),
         };
 
-        let final_comparison = match index_info.key_info[field_idx].sort_order {
-            SortOrder::Asc => comparison,
-            SortOrder::Desc => comparison.reverse(),
-        };
+        let final_comparison = cmp_with_sort(comparison, &lhs_value, rhs_value, key_info);
 
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
@@ -3238,6 +3263,9 @@ pub enum Cursor {
     Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),
     MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
+    /// Permanently-null placeholder installed by `NullRow` on a
+    /// never-opened cursor slot; all reads yield NULL.
+    NullRow,
 }
 
 impl Debug for Cursor {
@@ -3249,6 +3277,7 @@ impl Debug for Cursor {
             Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
             Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
             Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
+            Self::NullRow => f.debug_tuple("NullRow").finish(),
         }
     }
 }
@@ -3341,6 +3370,18 @@ impl Cursor {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            // A pseudo cursor always decodes columns from its content
+            // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
+            // column reads untouched: nullRow is the steady state for pseudo
+            // cursors there, and OP_Column keeps routing to the register.
+            Self::Pseudo(_) => {}
+            // Permanently null; the flag is a no-op.
+            Self::NullRow => {}
+            // The FTS side of an outer join: columns are decoded from the
+            // base-table cursor (which receives its own NullRow), never from
+            // the index-method cursor, so there is no column state to null
+            // out here.
+            Self::IndexMethod(_) => {}
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");

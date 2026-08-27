@@ -356,6 +356,7 @@ def connect(
     url: str,
     *,
     auth_token: Optional[str] = None,
+    remote_encryption_key: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
 ) -> Connection:
     """Open a remote connection to a Turso database.
@@ -363,7 +364,9 @@ def connect(
     Parameters:
     - url: Database URL (turso://, https://, http://, or libsql://)
     - auth_token: Authentication token
+    - remote_encryption_key: base64-encoded key for a database encrypted
+      with a customer-managed key
     - isolation_level: Transaction isolation level (default: DEFERRED)
     """
-    session = Session(url, auth_token=auth_token)
+    session = Session(url, auth_token=auth_token, remote_encryption_key=remote_encryption_key)
     return Connection(session, isolation_level=isolation_level)

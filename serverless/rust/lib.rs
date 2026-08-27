@@ -24,6 +24,8 @@
 //! # }
 //! ```
 
+use std::{future::Future, pin::Pin, sync::Arc};
+
 mod column;
 pub mod connection;
 mod error;
@@ -39,15 +41,27 @@ pub use column::Column;
 pub use connection::Connection;
 pub use error::{BoxError, Error, Result};
 pub use params::{params_from_iter, IntoParams, IntoValue, Params};
+pub use protocol::ENCRYPTION_KEY_HEADER;
 pub use rows::{Row, Rows};
 pub use statement::Statement;
 pub use transaction::{Transaction, TransactionBehavior};
 pub use value::{FromValue, Value};
 
+/// Future returned by an auth token provider. Resolves to a bearer token
+/// string (without the `Bearer ` prefix — that prefix is added when building
+/// the header).
+pub type AuthTokenFut = Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>>;
+
+/// Async callback that produces an auth token on demand. Invoked before every
+/// HTTP request, so it can return a freshly-rotated token (e.g. fetched from
+/// a secrets manager or refreshed via OAuth).
+pub type AuthTokenFn = Arc<dyn Fn() -> AuthTokenFut + Send + Sync + 'static>;
+
 /// A builder for [`Database`].
 pub struct Builder {
     url: String,
-    auth_token: Option<String>,
+    auth_token: Option<AuthTokenFn>,
+    remote_encryption_key: Option<String>,
 }
 
 impl Builder {
@@ -58,13 +72,44 @@ impl Builder {
         Self {
             url: url.into(),
             auth_token: None,
+            remote_encryption_key: None,
         }
     }
 
     /// Set the authentication token, sent as a bearer token with every
     /// request.
+    ///
+    /// Calling this overrides any previously configured token callback.
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
+        let token = token.into();
+        self.auth_token = Some(Arc::new(move || {
+            let token = token.clone();
+            Box::pin(async move { Ok(token) })
+        }));
+        self
+    }
+
+    /// Set an async callback that produces an auth token on demand.
+    ///
+    /// The callback is invoked before every HTTP request, so it can return a
+    /// freshly rotated token (e.g. fetched from a secrets manager or
+    /// refreshed via OAuth). If the callback returns an error, the in-flight
+    /// operation fails with that error.
+    ///
+    /// Calling this overrides any previously configured static token.
+    pub fn with_auth_token_fn<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String>> + Send + 'static,
+    {
+        self.auth_token = Some(Arc::new(move || Box::pin(f())));
+        self
+    }
+
+    /// Set the customer-managed encryption key (base64-encoded) for an
+    /// encrypted database.
+    pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
+        self.remote_encryption_key = Some(base64_key.into());
         self
     }
 
@@ -73,6 +118,7 @@ impl Builder {
         Ok(Database {
             url: self.url,
             auth_token: self.auth_token,
+            remote_encryption_key: self.remote_encryption_key,
         })
     }
 }
@@ -84,7 +130,8 @@ impl Builder {
 #[derive(Clone)]
 pub struct Database {
     url: String,
-    auth_token: Option<String>,
+    auth_token: Option<AuthTokenFn>,
+    remote_encryption_key: Option<String>,
 }
 
 impl std::fmt::Debug for Database {
@@ -96,6 +143,10 @@ impl std::fmt::Debug for Database {
 impl Database {
     /// Create a new connection to the database.
     pub fn connect(&self) -> Result<Connection> {
-        Ok(Connection::new(&self.url, self.auth_token.clone()))
+        Ok(Connection::new(
+            &self.url,
+            self.auth_token.clone(),
+            self.remote_encryption_key.clone(),
+        ))
     }
 }

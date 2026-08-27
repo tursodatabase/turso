@@ -241,6 +241,7 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             ValueBlobAllocationSite::CloneFrom => 29,
             ValueBlobAllocationSite::RecordBuild => 30,
             ValueBlobAllocationSite::RecordCopy => 31,
+            ValueBlobAllocationSite::AggAccumulate => 32,
         },
         AllocationSite::Vector(site) => match site {
             VectorAllocationSite::Parse => 15,
@@ -341,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn btree_overflow_read_site_is_fault_injectable() {
+    fn btree_allocation_sites_are_fault_injectable() {
         static INJECTOR: SimulatorAllocationFaultInjector = SimulatorAllocationFaultInjector {
             enabled: AtomicBool::new(true),
             seed: AtomicU64::new(13),
@@ -354,11 +355,23 @@ mod tests {
             fiber_idx: 8,
             execution_id: 9,
         });
-        let _site = turso_core::alloc::enter_allocation_site(BTreeAllocationSite::OverflowRead);
         let layout = Layout::from_size_align(16, 8).unwrap();
+        let sites = [
+            BTreeAllocationSite::CellPayload,
+            BTreeAllocationSite::OverflowRead,
+            BTreeAllocationSite::Balance,
+            BTreeAllocationSite::BlobRecordHeader,
+            BTreeAllocationSite::IntegrityCheck,
+            BTreeAllocationSite::OverflowCell,
+            BTreeAllocationSite::RecordPayload,
+            BTreeAllocationSite::SavedCursorRecord,
+        ];
 
-        assert!(INJECTOR.allocate(layout).is_err());
-        assert_eq!(INJECTOR.injected_faults(), 1);
+        for (index, site) in sites.into_iter().enumerate() {
+            let _site = turso_core::alloc::enter_allocation_site(site);
+            assert!(INJECTOR.allocate(layout).is_err(), "site {site:?}");
+            assert_eq!(INJECTOR.injected_faults(), index as u64 + 1);
+        }
     }
 
     #[test]
@@ -514,6 +527,7 @@ mod tests {
         );
         assert!(insert_closure_called.get());
 
+        let flags = turso_core::Value::from_i64(turso_core::json::JSON_VALID_FLAG_TEXT_STRICT);
         let before = injector.injected_faults();
         {
             let _context = injector.enter_context(AllocationFaultContext {
@@ -521,11 +535,13 @@ mod tests {
                 fiber_idx: 26,
                 execution_id: 27,
             });
-            assert!(turso_core::json::is_json_valid(&json).is_err());
+            assert!(turso_core::json::is_json_valid(&json, &flags).is_err());
         }
         assert_eq!(injector.injected_faults(), before + 1);
         assert_eq!(
-            turso_core::json::is_json_valid(&json).unwrap().as_int(),
+            turso_core::json::is_json_valid(&json, &flags)
+                .unwrap()
+                .as_int(),
             Some(1)
         );
     }

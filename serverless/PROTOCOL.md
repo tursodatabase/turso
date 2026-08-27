@@ -78,6 +78,20 @@ missing or invalid token fail with HTTP status `401 Unauthorized`. The format
 and provisioning of tokens are deployment specific and outside the scope of
 this document.
 
+### 3.1 Remote encryption key
+
+Databases encrypted with a customer-managed key require the key on every
+request, carried in the `x-turso-encryption-key` header:
+
+```
+x-turso-encryption-key: <base64-encoded key>
+```
+
+A client configured with a remote encryption key MUST attach this header to
+every request it sends, on both the pipeline and the cursor endpoint. A
+client with no key configured MUST NOT send the header. Key provisioning is
+deployment specific and outside the scope of this document.
+
 ## 4. Streams
 
 ### 4.1 Opening a stream

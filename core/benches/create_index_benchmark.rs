@@ -3,7 +3,9 @@
 //! Reproduces a production pain point where running `CREATE INDEX` against an
 //! already-large table makes the surrounding transaction commit "giga slow".
 //! The user-reported scenario is a 2M-row table; we exercise a range of sizes
-//! to surface scaling behavior and compare against SQLite.
+//! to surface scaling behavior and compare against SQLite. The 2M-row size is
+//! off by default because it adds ~12 minutes to the run (see `row_counts`);
+//! set `CREATE_INDEX_BENCH_LARGE=1` to include it.
 //!
 //! tursodb runs in MVCC mode (`PRAGMA journal_mode = 'mvcc'`) since that is
 //! the production deployment. SQLite stays on WAL — the comparison is not
@@ -12,7 +14,11 @@
 //! Each sample:
 //!   1. Pre-populated table is reused (insertion is one-time setup).
 //!   2. `CREATE INDEX` is timed end-to-end, including the implicit commit.
-//!   3. `DROP INDEX` runs untimed to restore the starting state.
+//!   3. `DROP INDEX` and a checkpoint run untimed to restore the starting
+//!      state. The checkpoint is what lets the MVCC store free the dropped
+//!      index's row versions; without it every sample keeps another full copy
+//!      of the index in memory (~500 bytes per row), which OOM-killed the
+//!      8 GB nightly benchmark runner.
 //!
 //! Run with:
 //!   cargo bench --bench create_index_benchmark --profile bench-profile
@@ -66,7 +72,7 @@ fn run_to_completion(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield => db.io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step()?,
             StepResult::Done => break,
             StepResult::Row => {}
             StepResult::Interrupt | StepResult::Busy => {
@@ -82,11 +88,28 @@ fn exec_turso(conn: &Arc<turso_core::Connection>, db: &Arc<Database>, sql: &str)
     run_to_completion(&mut stmt, db).unwrap();
 }
 
+/// Restore the un-indexed state between samples. Runs outside the timed
+/// region. The checkpoint releases the dropped index's MVCC row versions,
+/// which would otherwise pile up sample after sample since auto-checkpoint
+/// is off.
+///
+/// Under CodSpeed the whole closure is what gets measured, so the checkpoint
+/// is skipped there to keep that series comparable; CodSpeed only runs the
+/// 100k-row size for a handful of iterations, so memory is not a concern.
+fn drop_index_untimed(conn: &Arc<turso_core::Connection>, db: &Arc<Database>) {
+    exec_turso(conn, db, "DROP INDEX idx_val");
+    if !cfg!(feature = "codspeed") {
+        exec_turso(conn, db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+}
+
 /// Open a fresh turso db in MVCC mode (the production deployment target).
 /// `PRAGMA journal_mode = 'mvcc'` must be set before any other DML.
 /// Auto-checkpoint is disabled (`mvcc_checkpoint_threshold = -1`) so the
 /// timed CREATE INDEX work doesn't get interleaved with checkpoint flushes;
-/// this isolates the index-build cost from the checkpoint cost.
+/// this isolates the index-build cost from the checkpoint cost. The bench
+/// loops checkpoint explicitly, outside the timed region, after each
+/// DROP INDEX (see `drop_index_untimed`).
 fn open_turso(temp_dir: &TempDir) -> (Arc<Database>, Arc<turso_core::Connection>) {
     let db_path = temp_dir.path().join("create_index_bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
@@ -173,12 +196,16 @@ fn populate_rusqlite(conn: &rusqlite::Connection, row_count: usize) {
     conn.execute("COMMIT", []).unwrap();
 }
 
-/// Sizes to bench. Huge sizes are gated behind env vars because each sample
-/// can take many seconds.
+/// Sizes to bench.
+///
+/// The 2M-row size only runs when `CREATE_INDEX_BENCH_LARGE` is set: one
+/// turso sample takes ~25 s, so the size adds ~12 minutes to the run, which
+/// the nightly benchmark job cannot afford. It peaks at ~3.4 GB of RSS.
 fn row_counts() -> Vec<usize> {
-    let mut v = vec![100_000];
-    v.push(500_000);
-    v.push(2_000_000);
+    let mut v = vec![100_000, 500_000];
+    if std::env::var_os("CREATE_INDEX_BENCH_LARGE").is_some() {
+        v.push(2_000_000);
+    }
     v
 }
 
@@ -245,8 +272,7 @@ fn bench_create_index(criterion: &mut Criterion) {
                             exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
                             exec_turso(&conn, &db, "COMMIT");
                             total += start.elapsed();
-                            // Restore the un-indexed state for the next sample.
-                            exec_turso(&conn, &db, "DROP INDEX idx_val");
+                            drop_index_untimed(&conn, &db);
                         }
                         total
                     });
@@ -268,7 +294,7 @@ fn bench_create_index(criterion: &mut Criterion) {
                             let start = std::time::Instant::now();
                             exec_turso(&conn, &db, "COMMIT");
                             total += start.elapsed();
-                            exec_turso(&conn, &db, "DROP INDEX idx_val");
+                            drop_index_untimed(&conn, &db);
                         }
                         total
                     });
@@ -358,7 +384,7 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
                             exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
                             exec_turso(&conn, &db, "COMMIT");
                             total += start.elapsed();
-                            exec_turso(&conn, &db, "DROP INDEX idx_val");
+                            drop_index_untimed(&conn, &db);
                         }
                         total
                     });

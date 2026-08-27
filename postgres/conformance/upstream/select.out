@@ -1,0 +1,971 @@
+--
+-- SELECT
+--
+-- btree index
+-- awk '{if($1<10){print;}else{next;}}' onek.data | sort +0n -1
+--
+SELECT * FROM onek
+   WHERE onek.unique1 < 10
+   ORDER BY onek.unique1;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+       0 |     998 |   0 |    0 |   0 |      0 |       0 |        0 |           0 |         0 |        0 |   0 |    1 | AAAAAA   | KMBAAA   | OOOOxx
+       1 |     214 |   1 |    1 |   1 |      1 |       1 |        1 |           1 |         1 |        1 |   2 |    3 | BAAAAA   | GIAAAA   | OOOOxx
+       2 |     326 |   0 |    2 |   2 |      2 |       2 |        2 |           2 |         2 |        2 |   4 |    5 | CAAAAA   | OMAAAA   | OOOOxx
+       3 |     431 |   1 |    3 |   3 |      3 |       3 |        3 |           3 |         3 |        3 |   6 |    7 | DAAAAA   | PQAAAA   | VVVVxx
+       4 |     833 |   0 |    0 |   4 |      4 |       4 |        4 |           4 |         4 |        4 |   8 |    9 | EAAAAA   | BGBAAA   | HHHHxx
+       5 |     541 |   1 |    1 |   5 |      5 |       5 |        5 |           5 |         5 |        5 |  10 |   11 | FAAAAA   | VUAAAA   | HHHHxx
+       6 |     978 |   0 |    2 |   6 |      6 |       6 |        6 |           6 |         6 |        6 |  12 |   13 | GAAAAA   | QLBAAA   | OOOOxx
+       7 |     647 |   1 |    3 |   7 |      7 |       7 |        7 |           7 |         7 |        7 |  14 |   15 | HAAAAA   | XYAAAA   | VVVVxx
+       8 |     653 |   0 |    0 |   8 |      8 |       8 |        8 |           8 |         8 |        8 |  16 |   17 | IAAAAA   | DZAAAA   | HHHHxx
+       9 |      49 |   1 |    1 |   9 |      9 |       9 |        9 |           9 |         9 |        9 |  18 |   19 | JAAAAA   | XBAAAA   | HHHHxx
+(10 rows)
+
+--
+-- awk '{if($1<20){print $1,$14;}else{next;}}' onek.data | sort +0nr -1
+--
+SELECT onek.unique1, onek.stringu1 FROM onek
+   WHERE onek.unique1 < 20
+   ORDER BY unique1 using >;
+ unique1 | stringu1 
+---------+----------
+      19 | TAAAAA
+      18 | SAAAAA
+      17 | RAAAAA
+      16 | QAAAAA
+      15 | PAAAAA
+      14 | OAAAAA
+      13 | NAAAAA
+      12 | MAAAAA
+      11 | LAAAAA
+      10 | KAAAAA
+       9 | JAAAAA
+       8 | IAAAAA
+       7 | HAAAAA
+       6 | GAAAAA
+       5 | FAAAAA
+       4 | EAAAAA
+       3 | DAAAAA
+       2 | CAAAAA
+       1 | BAAAAA
+       0 | AAAAAA
+(20 rows)
+
+--
+-- awk '{if($1>980){print $1,$14;}else{next;}}' onek.data | sort +1d -2
+--
+SELECT onek.unique1, onek.stringu1 FROM onek
+   WHERE onek.unique1 > 980
+   ORDER BY stringu1 using <;
+ unique1 | stringu1 
+---------+----------
+     988 | AMAAAA
+     989 | BMAAAA
+     990 | CMAAAA
+     991 | DMAAAA
+     992 | EMAAAA
+     993 | FMAAAA
+     994 | GMAAAA
+     995 | HMAAAA
+     996 | IMAAAA
+     997 | JMAAAA
+     998 | KMAAAA
+     999 | LMAAAA
+     981 | TLAAAA
+     982 | ULAAAA
+     983 | VLAAAA
+     984 | WLAAAA
+     985 | XLAAAA
+     986 | YLAAAA
+     987 | ZLAAAA
+(19 rows)
+
+--
+-- awk '{if($1>980){print $1,$16;}else{next;}}' onek.data |
+-- sort +1d -2 +0nr -1
+--
+SELECT onek.unique1, onek.string4 FROM onek
+   WHERE onek.unique1 > 980
+   ORDER BY string4 using <, unique1 using >;
+ unique1 | string4 
+---------+---------
+     999 | AAAAxx
+     995 | AAAAxx
+     983 | AAAAxx
+     982 | AAAAxx
+     981 | AAAAxx
+     998 | HHHHxx
+     997 | HHHHxx
+     993 | HHHHxx
+     990 | HHHHxx
+     986 | HHHHxx
+     996 | OOOOxx
+     991 | OOOOxx
+     988 | OOOOxx
+     987 | OOOOxx
+     985 | OOOOxx
+     994 | VVVVxx
+     992 | VVVVxx
+     989 | VVVVxx
+     984 | VVVVxx
+(19 rows)
+
+--
+-- awk '{if($1>980){print $1,$16;}else{next;}}' onek.data |
+-- sort +1dr -2 +0n -1
+--
+SELECT onek.unique1, onek.string4 FROM onek
+   WHERE onek.unique1 > 980
+   ORDER BY string4 using >, unique1 using <;
+ unique1 | string4 
+---------+---------
+     984 | VVVVxx
+     989 | VVVVxx
+     992 | VVVVxx
+     994 | VVVVxx
+     985 | OOOOxx
+     987 | OOOOxx
+     988 | OOOOxx
+     991 | OOOOxx
+     996 | OOOOxx
+     986 | HHHHxx
+     990 | HHHHxx
+     993 | HHHHxx
+     997 | HHHHxx
+     998 | HHHHxx
+     981 | AAAAxx
+     982 | AAAAxx
+     983 | AAAAxx
+     995 | AAAAxx
+     999 | AAAAxx
+(19 rows)
+
+--
+-- awk '{if($1<20){print $1,$16;}else{next;}}' onek.data |
+-- sort +0nr -1 +1d -2
+--
+SELECT onek.unique1, onek.string4 FROM onek
+   WHERE onek.unique1 < 20
+   ORDER BY unique1 using >, string4 using <;
+ unique1 | string4 
+---------+---------
+      19 | OOOOxx
+      18 | VVVVxx
+      17 | HHHHxx
+      16 | OOOOxx
+      15 | VVVVxx
+      14 | AAAAxx
+      13 | OOOOxx
+      12 | AAAAxx
+      11 | OOOOxx
+      10 | AAAAxx
+       9 | HHHHxx
+       8 | HHHHxx
+       7 | VVVVxx
+       6 | OOOOxx
+       5 | HHHHxx
+       4 | HHHHxx
+       3 | VVVVxx
+       2 | OOOOxx
+       1 | OOOOxx
+       0 | OOOOxx
+(20 rows)
+
+--
+-- awk '{if($1<20){print $1,$16;}else{next;}}' onek.data |
+-- sort +0n -1 +1dr -2
+--
+SELECT onek.unique1, onek.string4 FROM onek
+   WHERE onek.unique1 < 20
+   ORDER BY unique1 using <, string4 using >;
+ unique1 | string4 
+---------+---------
+       0 | OOOOxx
+       1 | OOOOxx
+       2 | OOOOxx
+       3 | VVVVxx
+       4 | HHHHxx
+       5 | HHHHxx
+       6 | OOOOxx
+       7 | VVVVxx
+       8 | HHHHxx
+       9 | HHHHxx
+      10 | AAAAxx
+      11 | OOOOxx
+      12 | AAAAxx
+      13 | OOOOxx
+      14 | AAAAxx
+      15 | VVVVxx
+      16 | OOOOxx
+      17 | HHHHxx
+      18 | VVVVxx
+      19 | OOOOxx
+(20 rows)
+
+--
+-- test partial btree indexes
+--
+-- As of 7.2, planner probably won't pick an indexscan without stats,
+-- so ANALYZE first.  Also, we want to prevent it from picking a bitmapscan
+-- followed by sort, because that could hide index ordering problems.
+--
+ANALYZE onek2;
+SET enable_seqscan TO off;
+SET enable_bitmapscan TO off;
+SET enable_sort TO off;
+--
+-- awk '{if($1<10){print $0;}else{next;}}' onek.data | sort +0n -1
+--
+SELECT onek2.* FROM onek2 WHERE onek2.unique1 < 10;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+       0 |     998 |   0 |    0 |   0 |      0 |       0 |        0 |           0 |         0 |        0 |   0 |    1 | AAAAAA   | KMBAAA   | OOOOxx
+       1 |     214 |   1 |    1 |   1 |      1 |       1 |        1 |           1 |         1 |        1 |   2 |    3 | BAAAAA   | GIAAAA   | OOOOxx
+       2 |     326 |   0 |    2 |   2 |      2 |       2 |        2 |           2 |         2 |        2 |   4 |    5 | CAAAAA   | OMAAAA   | OOOOxx
+       3 |     431 |   1 |    3 |   3 |      3 |       3 |        3 |           3 |         3 |        3 |   6 |    7 | DAAAAA   | PQAAAA   | VVVVxx
+       4 |     833 |   0 |    0 |   4 |      4 |       4 |        4 |           4 |         4 |        4 |   8 |    9 | EAAAAA   | BGBAAA   | HHHHxx
+       5 |     541 |   1 |    1 |   5 |      5 |       5 |        5 |           5 |         5 |        5 |  10 |   11 | FAAAAA   | VUAAAA   | HHHHxx
+       6 |     978 |   0 |    2 |   6 |      6 |       6 |        6 |           6 |         6 |        6 |  12 |   13 | GAAAAA   | QLBAAA   | OOOOxx
+       7 |     647 |   1 |    3 |   7 |      7 |       7 |        7 |           7 |         7 |        7 |  14 |   15 | HAAAAA   | XYAAAA   | VVVVxx
+       8 |     653 |   0 |    0 |   8 |      8 |       8 |        8 |           8 |         8 |        8 |  16 |   17 | IAAAAA   | DZAAAA   | HHHHxx
+       9 |      49 |   1 |    1 |   9 |      9 |       9 |        9 |           9 |         9 |        9 |  18 |   19 | JAAAAA   | XBAAAA   | HHHHxx
+(10 rows)
+
+--
+-- awk '{if($1<20){print $1,$14;}else{next;}}' onek.data | sort +0nr -1
+--
+SELECT onek2.unique1, onek2.stringu1 FROM onek2
+    WHERE onek2.unique1 < 20
+    ORDER BY unique1 using >;
+ unique1 | stringu1 
+---------+----------
+      19 | TAAAAA
+      18 | SAAAAA
+      17 | RAAAAA
+      16 | QAAAAA
+      15 | PAAAAA
+      14 | OAAAAA
+      13 | NAAAAA
+      12 | MAAAAA
+      11 | LAAAAA
+      10 | KAAAAA
+       9 | JAAAAA
+       8 | IAAAAA
+       7 | HAAAAA
+       6 | GAAAAA
+       5 | FAAAAA
+       4 | EAAAAA
+       3 | DAAAAA
+       2 | CAAAAA
+       1 | BAAAAA
+       0 | AAAAAA
+(20 rows)
+
+--
+-- awk '{if($1>980){print $1,$14;}else{next;}}' onek.data | sort +1d -2
+--
+SELECT onek2.unique1, onek2.stringu1 FROM onek2
+   WHERE onek2.unique1 > 980;
+ unique1 | stringu1 
+---------+----------
+     981 | TLAAAA
+     982 | ULAAAA
+     983 | VLAAAA
+     984 | WLAAAA
+     985 | XLAAAA
+     986 | YLAAAA
+     987 | ZLAAAA
+     988 | AMAAAA
+     989 | BMAAAA
+     990 | CMAAAA
+     991 | DMAAAA
+     992 | EMAAAA
+     993 | FMAAAA
+     994 | GMAAAA
+     995 | HMAAAA
+     996 | IMAAAA
+     997 | JMAAAA
+     998 | KMAAAA
+     999 | LMAAAA
+(19 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_sort;
+--
+-- awk '{print $1,$2;}' person.data |
+-- awk '{if(NF!=2){print $3,$2;}else{print;}}' - emp.data |
+-- awk '{if(NF!=2){print $3,$2;}else{print;}}' - student.data |
+-- awk 'BEGIN{FS="      ";}{if(NF!=2){print $4,$5;}else{print;}}' - stud_emp.data
+--
+-- SELECT name, age FROM person*; ??? check if different
+SELECT p.name, p.age FROM person* p;
+  name   | age 
+---------+-----
+ mike    |  40
+ joe     |  20
+ sally   |  34
+ sandra  |  19
+ alex    |  30
+ sue     |  50
+ denise  |  24
+ sarah   |  88
+ teresa  |  38
+ nan     |  28
+ leah    |  68
+ wendy   |  78
+ melissa |  28
+ joan    |  18
+ mary    |   8
+ jane    |  58
+ liza    |  38
+ jean    |  28
+ jenifer |  38
+ juanita |  58
+ susan   |  78
+ zena    |  98
+ martie  |  88
+ chris   |  78
+ pat     |  18
+ zola    |  58
+ louise  |  98
+ edna    |  18
+ bertha  |  88
+ sumi    |  38
+ koko    |  88
+ gina    |  18
+ rean    |  48
+ sharon  |  78
+ paula   |  68
+ julie   |  68
+ belinda |  38
+ karen   |  48
+ carina  |  58
+ diane   |  18
+ esther  |  98
+ trudy   |  88
+ fanny   |   8
+ carmen  |  78
+ lita    |  25
+ pamela  |  48
+ sandy   |  38
+ trisha  |  88
+ uma     |  78
+ velma   |  68
+ sharon  |  25
+ sam     |  30
+ bill    |  20
+ fred    |  28
+ larry   |  60
+ jeff    |  23
+ cim     |  30
+ linda   |  19
+(58 rows)
+
+--
+-- awk '{print $1,$2;}' person.data |
+-- awk '{if(NF!=2){print $3,$2;}else{print;}}' - emp.data |
+-- awk '{if(NF!=2){print $3,$2;}else{print;}}' - student.data |
+-- awk 'BEGIN{FS="      ";}{if(NF!=1){print $4,$5;}else{print;}}' - stud_emp.data |
+-- sort +1nr -2
+--
+SELECT p.name, p.age FROM person* p ORDER BY age using >, name;
+  name   | age 
+---------+-----
+ esther  |  98
+ louise  |  98
+ zena    |  98
+ bertha  |  88
+ koko    |  88
+ martie  |  88
+ sarah   |  88
+ trisha  |  88
+ trudy   |  88
+ carmen  |  78
+ chris   |  78
+ sharon  |  78
+ susan   |  78
+ uma     |  78
+ wendy   |  78
+ julie   |  68
+ leah    |  68
+ paula   |  68
+ velma   |  68
+ larry   |  60
+ carina  |  58
+ jane    |  58
+ juanita |  58
+ zola    |  58
+ sue     |  50
+ karen   |  48
+ pamela  |  48
+ rean    |  48
+ mike    |  40
+ belinda |  38
+ jenifer |  38
+ liza    |  38
+ sandy   |  38
+ sumi    |  38
+ teresa  |  38
+ sally   |  34
+ alex    |  30
+ cim     |  30
+ sam     |  30
+ fred    |  28
+ jean    |  28
+ melissa |  28
+ nan     |  28
+ lita    |  25
+ sharon  |  25
+ denise  |  24
+ jeff    |  23
+ bill    |  20
+ joe     |  20
+ linda   |  19
+ sandra  |  19
+ diane   |  18
+ edna    |  18
+ gina    |  18
+ joan    |  18
+ pat     |  18
+ fanny   |   8
+ mary    |   8
+(58 rows)
+
+--
+-- Test some cases involving whole-row Var referencing a subquery
+--
+select foo from (select 1 offset 0) as foo;
+ foo 
+-----
+ (1)
+(1 row)
+
+select foo from (select null offset 0) as foo;
+ foo 
+-----
+ ()
+(1 row)
+
+select foo from (select 'xyzzy',1,null offset 0) as foo;
+    foo     
+------------
+ (xyzzy,1,)
+(1 row)
+
+--
+-- Test VALUES lists
+--
+select * from onek, (values(147, 'RFAAAA'), (931, 'VJAAAA')) as v (i, j)
+    WHERE onek.unique1 = v.i and onek.stringu1 = v.j;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 |  i  |   j    
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------+-----+--------
+     147 |       0 |   1 |    3 |   7 |      7 |       7 |       47 |         147 |       147 |      147 |  14 |   15 | RFAAAA   | AAAAAA   | AAAAxx  | 147 | RFAAAA
+     931 |       1 |   1 |    3 |   1 |     11 |       1 |       31 |         131 |       431 |      931 |   2 |    3 | VJAAAA   | BAAAAA   | HHHHxx  | 931 | VJAAAA
+(2 rows)
+
+-- a more complex case
+-- looks like we're coding lisp :-)
+select * from onek,
+  (values ((select i from
+    (values(10000), (2), (389), (1000), (2000), ((select 10029))) as foo(i)
+    order by i asc limit 1))) bar (i)
+  where onek.unique1 = bar.i;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 | i 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------+---
+       2 |     326 |   0 |    2 |   2 |      2 |       2 |        2 |           2 |         2 |        2 |   4 |    5 | CAAAAA   | OMAAAA   | OOOOxx  | 2
+(1 row)
+
+-- try VALUES in a subquery
+select * from onek
+    where (unique1,ten) in (values (1,1), (20,0), (99,9), (17,99))
+    order by unique1;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+       1 |     214 |   1 |    1 |   1 |      1 |       1 |        1 |           1 |         1 |        1 |   2 |    3 | BAAAAA   | GIAAAA   | OOOOxx
+      20 |     306 |   0 |    0 |   0 |      0 |       0 |       20 |          20 |        20 |       20 |   0 |    1 | UAAAAA   | ULAAAA   | OOOOxx
+      99 |     101 |   1 |    3 |   9 |     19 |       9 |       99 |          99 |        99 |       99 |  18 |   19 | VDAAAA   | XDAAAA   | HHHHxx
+(3 rows)
+
+-- VALUES is also legal as a standalone query or a set-operation member
+VALUES (1,2), (3,4+4), (7,77.7);
+ column1 | column2 
+---------+---------
+       1 |       2
+       3 |       8
+       7 |    77.7
+(3 rows)
+
+VALUES (1,2), (3,4+4), (7,77.7)
+UNION ALL
+SELECT 2+2, 57
+UNION ALL
+TABLE int8_tbl;
+     column1      |      column2      
+------------------+-------------------
+                1 |                 2
+                3 |                 8
+                7 |              77.7
+                4 |                57
+              123 |               456
+              123 |  4567890123456789
+ 4567890123456789 |               123
+ 4567890123456789 |  4567890123456789
+ 4567890123456789 | -4567890123456789
+(9 rows)
+
+-- corner case: VALUES with no columns
+CREATE TEMP TABLE nocols();
+INSERT INTO nocols DEFAULT VALUES;
+SELECT * FROM nocols n, LATERAL (VALUES(n.*)) v;
+--
+(1 row)
+
+--
+-- Test ORDER BY options
+--
+CREATE TEMP TABLE foo (f1 int);
+INSERT INTO foo VALUES (42),(3),(10),(7),(null),(null),(1);
+SELECT * FROM foo ORDER BY f1;
+ f1 
+----
+  1
+  3
+  7
+ 10
+ 42
+   
+   
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 ASC;	-- same thing
+ f1 
+----
+  1
+  3
+  7
+ 10
+ 42
+   
+   
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 NULLS FIRST;
+ f1 
+----
+   
+   
+  1
+  3
+  7
+ 10
+ 42
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 DESC;
+ f1 
+----
+   
+   
+ 42
+ 10
+  7
+  3
+  1
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+ f1 
+----
+ 42
+ 10
+  7
+  3
+  1
+   
+   
+(7 rows)
+
+-- check if indexscans do the right things
+CREATE INDEX fooi ON foo (f1);
+SET enable_sort = false;
+SELECT * FROM foo ORDER BY f1;
+ f1 
+----
+  1
+  3
+  7
+ 10
+ 42
+   
+   
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 NULLS FIRST;
+ f1 
+----
+   
+   
+  1
+  3
+  7
+ 10
+ 42
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 DESC;
+ f1 
+----
+   
+   
+ 42
+ 10
+  7
+  3
+  1
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+ f1 
+----
+ 42
+ 10
+  7
+  3
+  1
+   
+   
+(7 rows)
+
+DROP INDEX fooi;
+CREATE INDEX fooi ON foo (f1 DESC);
+SELECT * FROM foo ORDER BY f1;
+ f1 
+----
+  1
+  3
+  7
+ 10
+ 42
+   
+   
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 NULLS FIRST;
+ f1 
+----
+   
+   
+  1
+  3
+  7
+ 10
+ 42
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 DESC;
+ f1 
+----
+   
+   
+ 42
+ 10
+  7
+  3
+  1
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+ f1 
+----
+ 42
+ 10
+  7
+  3
+  1
+   
+   
+(7 rows)
+
+DROP INDEX fooi;
+CREATE INDEX fooi ON foo (f1 DESC NULLS LAST);
+SELECT * FROM foo ORDER BY f1;
+ f1 
+----
+  1
+  3
+  7
+ 10
+ 42
+   
+   
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 NULLS FIRST;
+ f1 
+----
+   
+   
+  1
+  3
+  7
+ 10
+ 42
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 DESC;
+ f1 
+----
+   
+   
+ 42
+ 10
+  7
+  3
+  1
+(7 rows)
+
+SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+ f1 
+----
+ 42
+ 10
+  7
+  3
+  1
+   
+   
+(7 rows)
+
+--
+-- Test planning of some cases with partial indexes
+--
+-- partial index is usable
+explain (costs off)
+select * from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+               QUERY PLAN                
+-----------------------------------------
+ Index Scan using onek2_u2_prtl on onek2
+   Index Cond: (unique2 = 11)
+   Filter: (stringu1 = 'ATAAAA'::name)
+(3 rows)
+
+select * from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+     494 |      11 |   0 |    2 |   4 |     14 |       4 |       94 |          94 |       494 |      494 |   8 |    9 | ATAAAA   | LAAAAA   | VVVVxx
+(1 row)
+
+-- actually run the query with an analyze to use the partial index
+explain (costs off, analyze on, timing off, summary off, buffers off)
+select * from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Index Scan using onek2_u2_prtl on onek2 (actual rows=1.00 loops=1)
+   Index Cond: (unique2 = 11)
+   Filter: (stringu1 = 'ATAAAA'::name)
+   Index Searches: 1
+(4 rows)
+
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+               QUERY PLAN                
+-----------------------------------------
+ Index Scan using onek2_u2_prtl on onek2
+   Index Cond: (unique2 = 11)
+   Filter: (stringu1 = 'ATAAAA'::name)
+(3 rows)
+
+select unique2 from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+ unique2 
+---------
+      11
+(1 row)
+
+-- partial index predicate implies clause, so no need for retest
+explain (costs off)
+select * from onek2 where unique2 = 11 and stringu1 < 'B';
+               QUERY PLAN                
+-----------------------------------------
+ Index Scan using onek2_u2_prtl on onek2
+   Index Cond: (unique2 = 11)
+(2 rows)
+
+select * from onek2 where unique2 = 11 and stringu1 < 'B';
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+     494 |      11 |   0 |    2 |   4 |     14 |       4 |       94 |          94 |       494 |      494 |   8 |    9 | ATAAAA   | LAAAAA   | VVVVxx
+(1 row)
+
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+                  QUERY PLAN                  
+----------------------------------------------
+ Index Only Scan using onek2_u2_prtl on onek2
+   Index Cond: (unique2 = 11)
+(2 rows)
+
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+ unique2 
+---------
+      11
+(1 row)
+
+-- but if it's an update target, must retest anyway
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B' for update;
+                  QUERY PLAN                   
+-----------------------------------------------
+ LockRows
+   ->  Index Scan using onek2_u2_prtl on onek2
+         Index Cond: (unique2 = 11)
+         Filter: (stringu1 < 'B'::name)
+(4 rows)
+
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B' for update;
+ unique2 
+---------
+      11
+(1 row)
+
+-- partial index is not applicable
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'C';
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Seq Scan on onek2
+   Filter: ((stringu1 < 'C'::name) AND (unique2 = 11))
+(2 rows)
+
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'C';
+ unique2 
+---------
+      11
+(1 row)
+
+-- partial index implies clause, but bitmap scan must recheck predicate anyway
+SET enable_indexscan TO off;
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Bitmap Heap Scan on onek2
+   Recheck Cond: ((unique2 = 11) AND (stringu1 < 'B'::name))
+   ->  Bitmap Index Scan on onek2_u2_prtl
+         Index Cond: (unique2 = 11)
+(4 rows)
+
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+ unique2 
+---------
+      11
+(1 row)
+
+RESET enable_indexscan;
+-- check multi-index cases too
+explain (costs off)
+select unique1, unique2 from onek2
+  where (unique2 = 11 or unique1 = 0) and stringu1 < 'B';
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Bitmap Heap Scan on onek2
+   Recheck Cond: (((unique2 = 11) AND (stringu1 < 'B'::name)) OR (unique1 = 0))
+   Filter: (stringu1 < 'B'::name)
+   ->  BitmapOr
+         ->  Bitmap Index Scan on onek2_u2_prtl
+               Index Cond: (unique2 = 11)
+         ->  Bitmap Index Scan on onek2_u1_prtl
+               Index Cond: (unique1 = 0)
+(8 rows)
+
+select unique1, unique2 from onek2
+  where (unique2 = 11 or unique1 = 0) and stringu1 < 'B';
+ unique1 | unique2 
+---------+---------
+     494 |      11
+       0 |     998
+(2 rows)
+
+explain (costs off)
+select unique1, unique2 from onek2
+  where (unique2 = 11 and stringu1 < 'B') or unique1 = 0;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Bitmap Heap Scan on onek2
+   Recheck Cond: (((unique2 = 11) AND (stringu1 < 'B'::name)) OR (unique1 = 0))
+   ->  BitmapOr
+         ->  Bitmap Index Scan on onek2_u2_prtl
+               Index Cond: (unique2 = 11)
+         ->  Bitmap Index Scan on onek2_u1_prtl
+               Index Cond: (unique1 = 0)
+(7 rows)
+
+select unique1, unique2 from onek2
+  where (unique2 = 11 and stringu1 < 'B') or unique1 = 0;
+ unique1 | unique2 
+---------+---------
+     494 |      11
+       0 |     998
+(2 rows)
+
+--
+-- Test some corner cases that have been known to confuse the planner
+--
+-- ORDER BY on a constant doesn't really need any sorting
+SELECT 1 AS x ORDER BY x;
+ x 
+---
+ 1
+(1 row)
+
+-- But ORDER BY on a set-valued expression does
+create function sillysrf(int) returns setof int as
+  'values (1),(10),(2),($1)' language sql immutable;
+select sillysrf(42);
+ sillysrf 
+----------
+        1
+       10
+        2
+       42
+(4 rows)
+
+select sillysrf(-1) order by 1;
+ sillysrf 
+----------
+       -1
+        1
+        2
+       10
+(4 rows)
+
+drop function sillysrf(int);
+-- X = X isn't a no-op, it's effectively X IS NOT NULL assuming = is strict
+-- (see bug #5084)
+select * from (values (2),(null),(1)) v(k) where k = k order by k;
+ k 
+---
+ 1
+ 2
+(2 rows)
+
+select * from (values (2),(null),(1)) v(k) where k = k;
+ k 
+---
+ 2
+ 1
+(2 rows)
+
+-- Test partitioned tables with no partitions, which should be handled the
+-- same as the non-inheritance case when expanding its RTE.
+create table list_parted_tbl (a int,b int) partition by list (a);
+create table list_parted_tbl1 partition of list_parted_tbl
+  for values in (1) partition by list(b);
+explain (costs off) select * from list_parted_tbl;
+        QUERY PLAN        
+--------------------------
+ Result
+   One-Time Filter: false
+(2 rows)
+
+drop table list_parted_tbl;

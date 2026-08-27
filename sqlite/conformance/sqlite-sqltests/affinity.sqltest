@@ -467,6 +467,41 @@ expect {
     text|3
 }
 
+# ============================================
+# Vertical tab (0x0B) is whitespace to SQLite's ctype table (0x09-0x0D)
+# even though it is not "ASCII whitespace" per Rust's is_ascii_whitespace().
+# https://github.com/tursodatabase/turso/issues/8454
+# ============================================
+@cross-check-integrity
+test affinity-vertical-tab-leading {
+    CREATE TABLE t1(i INTEGER);
+    INSERT INTO t1 VALUES (CHAR(11) || '12');
+    SELECT TYPEOF(i), i = 12 FROM t1;
+}
+expect {
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-vertical-tab-trailing {
+    CREATE TABLE t1(i INTEGER);
+    INSERT INTO t1 VALUES ('12' || CHAR(11));
+    SELECT TYPEOF(i), i = 12 FROM t1;
+}
+expect {
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-vertical-tab-integer-primary-key {
+    CREATE TABLE t1(i INTEGER PRIMARY KEY);
+    INSERT INTO t1 VALUES (CHAR(11) || '12');
+    SELECT COUNT(*), TYPEOF(i), i FROM t1;
+}
+expect {
+    1|integer|12
+}
+
 
 # ============================================
 # REAL affinity with leading + sign
@@ -572,6 +607,18 @@ expect @js {
     2251799813685248|real
 }
 
+@cross-check-integrity
+test cast-text-to-numeric-vertical-tab {
+    SELECT CAST(CHAR(11) || '12' AS NUMERIC);
+    SELECT CAST('12' || CHAR(11) AS NUMERIC);
+    SELECT CAST(CHAR(9) || '12' AS NUMERIC);
+}
+expect {
+    12
+    12
+    12
+}
+
 # Regression tests for https://github.com/tursodatabase/turso/issues/4927
 # A compound (UNION/UNION ALL) subquery column's affinity must be combined
 # across all arms, not taken from the leftmost arm alone. Scanning left to
@@ -667,4 +714,71 @@ expect {
     integer|0
     integer|0
     text|1
+}
+
+# ============================================
+# INTEGER/NUMERIC affinity at the i64 boundaries. The magnitude of i64::MIN is
+# one past i64::MAX, so the range check applied to the parsed digits has to be
+# sign-dependent.
+# ============================================
+@cross-check-integrity
+test affinity-text-i64-min-integer-column {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('-9223372036854775808');
+    INSERT INTO t1 VALUES (' -9223372036854775808 ');
+    INSERT INTO t1 VALUES ('-009223372036854775808');
+    SELECT typeof(c), c FROM t1 ORDER BY rowid;
+}
+expect {
+    integer|-9223372036854775808
+    integer|-9223372036854775808
+    integer|-9223372036854775808
+}
+
+@cross-check-integrity
+test affinity-text-i64-min-numeric-column {
+    CREATE TABLE t1 (c NUMERIC);
+    INSERT INTO t1 VALUES ('-9223372036854775808');
+    SELECT typeof(c), c FROM t1;
+}
+expect {
+    integer|-9223372036854775808
+}
+
+@cross-check-integrity
+test affinity-text-i64-limits-stay-integer {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('-9223372036854775807');
+    INSERT INTO t1 VALUES ('9223372036854775807');
+    INSERT INTO t1 VALUES ('+9223372036854775807');
+    SELECT typeof(c), c FROM t1 ORDER BY rowid;
+}
+expect {
+    integer|-9223372036854775807
+    integer|9223372036854775807
+    integer|9223372036854775807
+}
+
+@cross-check-integrity
+test affinity-text-past-i64-limits-become-real {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('9223372036854775808');
+    INSERT INTO t1 VALUES ('-9223372036854775809');
+    INSERT INTO t1 VALUES ('-9223372036854775808.0');
+    INSERT INTO t1 VALUES ('-9.223372036854775808e18');
+    SELECT typeof(c) FROM t1 ORDER BY rowid;
+}
+expect {
+    real
+    real
+    real
+    real
+}
+
+@cross-check-integrity
+test affinity-sum-of-text-i64-min {
+    SELECT typeof(sum(v)), sum(v) FROM (SELECT '-9223372036854775808' AS v);
+}
+expect {
+    integer|-9223372036854775808
 }

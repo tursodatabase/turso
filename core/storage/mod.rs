@@ -17,6 +17,7 @@ pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
 pub(crate) mod page_cache;
+pub(crate) mod page_transform;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
 #[cfg(host_shared_wal)]

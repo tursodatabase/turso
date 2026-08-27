@@ -16,6 +16,7 @@ mod compound_select;
 pub(crate) mod delete;
 pub(crate) mod display;
 pub(crate) mod emitter;
+pub mod eqp;
 pub(crate) mod expr;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
@@ -30,6 +31,7 @@ pub(crate) mod order_by;
 pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
+pub(crate) mod recursive_cte;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
@@ -48,6 +50,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+use crate::connection::PrepareOptions;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -81,6 +84,7 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
     origin: crate::statement::StatementOrigin,
+    prepare_options: &PrepareOptions,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -122,6 +126,7 @@ pub fn translate(
         } else {
             connection.dialect()
         },
+        &prepare_options.unqualified_database_search_path,
     );
 
     match stmt {
@@ -192,6 +197,27 @@ pub fn translate_inner(
     }
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
+    let is_dml = matches!(
+        stmt,
+        ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
+    );
+
+    // PRAGMA count_changes: top-level INSERT/UPDATE/DELETE statements return one row
+    // with the number of rows they changed. Trigger bodies, foreign key actions and
+    // engine-internal nested statements never return count rows, matching SQLite.
+    let count_changes_column = if connection.get_count_changes()
+        && !connection.is_nested_stmt()
+        && !program.flags.is_subprogram()
+    {
+        match &stmt {
+            ast::Stmt::Insert { .. } => Some("rows inserted"),
+            ast::Stmt::Update { .. } => Some("rows updated"),
+            ast::Stmt::Delete { .. } => Some("rows deleted"),
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {
@@ -264,12 +290,13 @@ pub fn translate_inner(
             select,
             columns,
             if_not_exists,
-            ..
+            temporary,
         } => view::translate_create_view(
             &view_name,
             resolver,
             &select,
             &columns,
+            temporary,
             if_not_exists,
             program,
         )?,
@@ -292,15 +319,10 @@ pub fn translate_inner(
         ast::Stmt::Delete {
             tbl_name,
             where_clause,
-            limit,
             returning,
             indexed,
-            order_by,
             with,
         } => {
-            if !order_by.is_empty() {
-                bail_parse_error!("ORDER BY clause is not supported in DELETE");
-            }
             if where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
                     "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
@@ -310,7 +332,6 @@ pub fn translate_inner(
                 &tbl_name,
                 resolver,
                 where_clause,
-                limit,
                 returning,
                 indexed,
                 with,
@@ -498,14 +519,32 @@ pub fn translate_inner(
         }
     };
 
-    // Indicate write operations so that in the epilogue we can emit the correct type of transaction
     if is_write {
-        program.begin_write_operation()?;
+        if is_dml {
+            // DML translators register their actual write database. Keep a
+            // main read transaction to coordinate connection-level autocommit,
+            // without upgrading an unrelated main snapshot for attached-only
+            // writes.
+            program.begin_read_operation()?;
+        } else {
+            program.begin_write_operation()?;
+        }
     }
 
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
     if is_select && !program.table_references.is_empty() {
         program.begin_read_operation()?;
+    }
+
+    // A statement with RETURNING already produces rows, so it never also returns
+    // a count row (same as SQLite).
+    if let Some(column_name) = count_changes_column {
+        if program.result_columns.is_empty() {
+            let reg = program.alloc_register();
+            program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
+            program.emit_result_row(reg, 1);
+            program.add_pragma_result_column(column_name.to_string());
+        }
     }
 
     Ok(())
@@ -588,6 +627,7 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
+            &crate::connection::PrepareOptions::default(),
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -671,6 +711,7 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
+            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -714,6 +755,7 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
+            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {

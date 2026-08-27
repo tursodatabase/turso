@@ -57,6 +57,7 @@ export interface NativeDatabase {
 export const STEP_ROW = 1;
 export const STEP_DONE = 2;
 export const STEP_IO = 3;
+export const STEP_SLEEP = 4;
 
 export interface TableColumn {
     name: string,
@@ -66,14 +67,17 @@ export interface TableColumn {
     database: null
 }
 
+/** [step constant, milliseconds to wait before stepping again (nonzero only for STEP_SLEEP)] */
+export type StepResult = [number, number];
+
 export interface NativeExecutor {
-    stepSync(): number;
+    stepSync(): StepResult;
     reset();
 }
 export interface NativeStatement {
     setQueryTimeout(queryOptions?: QueryOptions): void;
-    stepAsync(): Promise<number>;
-    stepSync(): number;
+    stepAsync(): Promise<StepResult>;
+    stepSync(): StepResult;
 
     pluck(pluckMode: boolean);
     safeIntegers(toggle: boolean);

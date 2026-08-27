@@ -311,6 +311,39 @@ snapshot-eqp compound-or-benchmark-shape-eqp {
     WHERE n.type = 'entity';
 }
 
+# ANALYZE must not make a temporary type index win when it leaves the full
+# join condition to run for every matching pair.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+@setup benchmark_shape_schema
+test compound-or-analyzed-benchmark-shape-eqp {
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('node', 'sqlite_autoindex_node_1', '2286 1'),
+        ('edge', 'sqlite_autoindex_edge_1', '2787 1'),
+        ('edge', 'idx_edge_label', '2787 200'),
+        ('edge', 'idx_edge_fromId', '2787 3'),
+        ('edge', 'idx_edge_toId', '2787 2');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT DISTINCT n.id
+    FROM node n
+    JOIN edge e
+      ON (
+        (e.fromId = 'uuid' AND e.toId = n.id AND e.label = 'requires')
+        OR
+        (e.toId = 'uuid' AND e.fromId = n.id AND e.label = 'requires')
+      )
+    WHERE n.type = 'course';
+}
+expect {
+    1|0|0|SEARCH e USING INDEX idx_edge_label (label=?)
+    2|0|0|MULTI-INDEX OR n (sqlite_autoindex_node_1, sqlite_autoindex_node_1)
+    4|0|0|USE HASH TABLE FOR DISTINCT
+}
+
 # Snapshot EQP: correlated subquery residuals should fall back to a regular scan
 @setup correlated_subquery_schema
 snapshot-eqp compound-or-correlated-subquery-eqp {

@@ -64,6 +64,11 @@ struct Args {
     /// Enable the experimental non-blocking (passive) MVCC checkpoint (requires --enable-mvcc)
     #[arg(long)]
     enable_experimental_mvcc_passive_checkpoint: bool,
+    /// Override the MVCC auto-checkpoint threshold in bytes of logical log (requires --enable-mvcc).
+    /// Elle runs write the logical log slowly, so a small value here makes checkpoints actually
+    /// fire during the run.
+    #[arg(long)]
+    mvcc_checkpoint_threshold: Option<i64>,
     /// Enable database encryption
     #[arg(long)]
     enable_encryption: bool,
@@ -88,6 +93,10 @@ struct Args {
     /// Probability of failing a scoped Turso allocation while stepping a statement.
     #[arg(long, default_value_t = 0.05)]
     allocation_fault_probability: f64,
+    /// Probability of probing a same-connection checkpoint while a statement
+    /// is suspended (the checkpoint must be rejected).
+    #[arg(long)]
+    checkpoint_probe_probability: Option<f64>,
     /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
     #[arg(long)]
     history_output: Option<PathBuf>,
@@ -150,6 +159,12 @@ fn main() -> anyhow::Result<()> {
     if args.enable_experimental_mvcc_passive_checkpoint && !args.enable_mvcc {
         return Err(anyhow::anyhow!(
             "--enable-experimental-mvcc-passive-checkpoint requires --enable-mvcc"
+        ));
+    }
+
+    if args.mvcc_checkpoint_threshold.is_some() && !args.enable_mvcc {
+        return Err(anyhow::anyhow!(
+            "--mvcc-checkpoint-threshold requires --enable-mvcc"
         ));
     }
 
@@ -335,6 +350,13 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         println!("\n{allocation_faults} allocation faults injected");
     }
 
+    if whopper.stats.checkpoint_probes > 0 {
+        println!(
+            "\n{} checkpoint probes fired against suspended statements (all rejected)",
+            whopper.stats.checkpoint_probes
+        );
+    }
+
     if args.elle.is_some() {
         println!("\nElle history exported to: {}", args.elle_output);
     }
@@ -507,12 +529,17 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc || is_schema_clone_fault_mode(&args.mode))
         .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
+        .with_mvcc_checkpoint_threshold(args.mvcc_checkpoint_threshold)
         .with_enable_encryption(args.enable_encryption)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties)
         .with_chaotic_profiles(chaotic_profiles)
         .with_allocation_fault_probability(args.allocation_fault_probability);
+    let opts = match args.checkpoint_probe_probability {
+        Some(probability) => opts.with_checkpoint_probe_probability(probability),
+        None => opts,
+    };
 
     Ok(opts)
 }

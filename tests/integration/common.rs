@@ -2,10 +2,28 @@ use rand::{rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{Clock, Connection, Database, FromValueRow, Row, SqliteDialect, IO};
+
+/// Temp directories holding test databases, deleted when the test process exits.
+///
+/// A directory cannot be owned by the `TempDatabase` that created it: plenty of
+/// tests clone the path, drop the database to close it, and then reopen the file
+/// to check what was written. Deleting on drop would pull the file out from
+/// under them, so the directories are parked here for the life of the process
+/// instead.
+static TEMP_DIRS: Mutex<Vec<TempDir>> = Mutex::new(Vec::new());
+
+fn delete_at_process_exit(dir: TempDir) {
+    TEMP_DIRS.lock().unwrap().push(dir);
+}
+
+#[ctor::dtor]
+fn delete_temp_dirs() {
+    TEMP_DIRS.lock().unwrap().clear();
+}
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -184,8 +202,9 @@ impl TempDatabaseBuilder {
                 let db_name = self
                     .db_name
                     .unwrap_or_else(|| format!("test-{}.db", rng().next_u32()));
-                let mut db_path = TempDir::new().unwrap().keep();
-                db_path.push(db_name);
+                let temp_dir = TempDir::new().unwrap();
+                let db_path = temp_dir.path().join(db_name);
+                delete_at_process_exit(temp_dir);
                 db_path
             }
         };
@@ -677,7 +696,7 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, vec};
-    use tempfile::{NamedTempFile, TempDir};
+    use tempfile::TempDir;
     use turso_core::SqliteDialect;
     use turso_core::{Database, StepResult, IO};
 
@@ -725,7 +744,8 @@ mod tests {
 
     #[test]
     fn test_limbo_open_read_only() -> anyhow::Result<()> {
-        let path = TempDir::new().unwrap().keep().join("temp_read_only");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_read_only");
         {
             let db =
                 TempDatabase::new_with_existent_with_flags(&path, turso_core::OpenFlags::default());
@@ -790,7 +810,8 @@ mod tests {
 
     #[test]
     fn test_large_unique_blobs() -> anyhow::Result<()> {
-        let path = TempDir::new().unwrap().keep().join("temp_read_only");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_read_only");
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
@@ -813,10 +834,8 @@ mod tests {
     #[test]
     /// Test that a transaction cannot read uncommitted changes of another transaction (no: READ UNCOMMITTED)
     fn test_tx_isolation_no_dirty_reads() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_transaction_isolation");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_transaction_isolation");
         let db = TempDatabase::new_with_existent(&path);
 
         // Create two separate connections
@@ -844,10 +863,8 @@ mod tests {
     #[test]
     /// Test that a transaction cannot read committed changes that were committed after the transaction started (no: READ COMMITTED)
     fn test_tx_isolation_no_read_committed() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_transaction_isolation");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_transaction_isolation");
         let db = TempDatabase::new_with_existent(&path);
 
         // Create two separate connections
@@ -881,10 +898,8 @@ mod tests {
     /// Test that a txn can write a row, flush to WAL without committing, then rollback, and finally commit a second row.
     /// Reopening database should show only the second row.
     fn test_tx_isolation_cacheflush_rollback_commit() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_transaction_isolation");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_transaction_isolation");
         let db = TempDatabase::new_with_existent(&path);
 
         let conn = db.connect_limbo();
@@ -917,10 +932,8 @@ mod tests {
     #[test]
     /// Test that a txn can write a row and flush to WAL without committing, then reopen DB and not see the row
     fn test_tx_isolation_cacheflush_reopen() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_transaction_isolation");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_transaction_isolation");
         let db = TempDatabase::new_with_existent(&path);
 
         let conn = db.connect_limbo();
@@ -948,9 +961,14 @@ mod tests {
 
     #[test]
     fn test_multi_connection_table_drop_persistence() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a temporary database file
-        let temp_file = NamedTempFile::new()?;
-        let db_path = temp_file.path().to_string_lossy().to_string();
+        // Create a temporary database file. It lives inside a temp directory so
+        // the WAL sidecar the engine creates next to it is cleaned up too.
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir
+            .path()
+            .join("test.db")
+            .to_string_lossy()
+            .to_string();
 
         // Open database
         #[allow(clippy::arc_with_non_send_sync)]
@@ -1092,10 +1110,8 @@ mod tests {
     /// (same pattern as DROP TABLE).
     #[test]
     fn test_drop_sequence_with_existing_tables() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_drop_seq_with_tables");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_drop_seq_with_tables");
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
@@ -1122,10 +1138,8 @@ mod tests {
 
     #[test]
     fn test_currval_per_connection_isolation() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_currval_isolation");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_currval_isolation");
         let db = TempDatabase::new_with_existent(&path);
         let conn1 = db.connect_limbo();
         conn1.execute("CREATE SEQUENCE iso_seq")?;
@@ -1167,7 +1181,8 @@ mod tests {
     /// (nextval, currval, setval) work correctly on the reopened database.
     #[test]
     fn test_sequence_file_persistence() -> anyhow::Result<()> {
-        let path = TempDir::new().unwrap().keep().join("temp_seq_persist");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_seq_persist");
 
         // Phase 1: create sequences and advance them
         {
@@ -1242,7 +1257,8 @@ mod tests {
     /// watermark.
     #[test]
     fn test_sequence_nextval_persists_after_drop() -> anyhow::Result<()> {
-        let path = TempDir::new().unwrap().keep().join("temp_seq_crash");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_seq_crash");
 
         // Phase 1: create sequence, call nextval, then DROP everything (no close).
         {
@@ -1279,7 +1295,8 @@ mod tests {
     /// behavioral regression guard.
     #[test]
     fn test_setval_rollback_does_not_leak_to_nextval() -> anyhow::Result<()> {
-        let path = TempDir::new().unwrap().keep().join("temp_setval_rollback");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_setval_rollback");
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
@@ -1307,10 +1324,8 @@ mod tests {
 
     #[test]
     fn test_sequence_cross_connection_visibility() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_sequence_cross_conn");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_sequence_cross_conn");
         let db = TempDatabase::new_with_existent(&path);
         let conn1 = db.connect_limbo();
 
@@ -1338,10 +1353,8 @@ mod tests {
     /// the same value.
     #[test]
     fn test_sequence_cross_connection_shared_counter() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_sequence_shared_counter");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_sequence_shared_counter");
         let db = TempDatabase::new_with_existent(&path);
         let conn1 = db.connect_limbo();
 
@@ -1403,10 +1416,8 @@ mod tests {
     /// to compact mid-call.
     #[test]
     fn test_mvcc_concurrent_nextval_no_conflict() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_concurrent_nextval");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_concurrent_nextval");
         let db = TempDatabase::builder()
             .with_db_path(&path)
             .with_mvcc(true)
@@ -1444,10 +1455,8 @@ mod tests {
     /// not un-burn it).
     #[test]
     fn test_mvcc_setval_persists_with_two_connections() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_setval_two_conn_mvcc");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_setval_two_conn_mvcc");
 
         {
             let db = TempDatabase::builder()
@@ -1502,10 +1511,8 @@ mod tests {
     /// durability gap in MVCC commit_txn.
     #[test]
     fn test_setval_persists_across_reopen_mvcc() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_setval_crash_mvcc");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_setval_crash_mvcc");
 
         {
             let db = TempDatabase::builder()
@@ -1550,7 +1557,8 @@ mod tests {
     /// nextval must return 51, not regress to the pre-setval watermark.
     #[test]
     fn test_setval_persists_across_reopen() -> anyhow::Result<()> {
-        let path = TempDir::new().unwrap().keep().join("temp_setval_crash");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_setval_crash");
 
         {
             let db = TempDatabase::new_with_existent(&path);
@@ -1606,10 +1614,8 @@ mod tests {
         // backing-table keys) or hit a WriteWriteConflict that surfaces as
         // the standard Busy/conflict error — the outer tx decides what to
         // do. setval inside a solo BEGIN CONCURRENT therefore succeeds.
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_setval_concurrent_ok");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_setval_concurrent_ok");
         let db = TempDatabase::builder()
             .with_db_path(&path)
             .with_mvcc(true)
@@ -1672,10 +1678,8 @@ mod tests {
     /// acceptance is sound under contention.
     #[test]
     fn test_setval_vs_nextval_concurrent_tx_mvcc_no_corruption() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_setval_vs_nextval_concurrent");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_setval_vs_nextval_concurrent");
         let db = TempDatabase::builder()
             .with_db_path(&path)
             .with_mvcc(true)
@@ -1776,10 +1780,8 @@ mod tests {
     #[cfg_attr(feature = "checksum", ignore)]
     #[test]
     fn test_descending_sequence_recovery() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_desc_seq_recovery");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_desc_seq_recovery");
 
         {
             let db = TempDatabase::new_with_existent(&path);
@@ -1835,10 +1837,8 @@ mod tests {
     /// transaction and ROLLBACK reverts the backing-table row.
     #[test]
     fn test_wal_nextval_rolled_back_re_emits_value() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_wal_nextval_rollback");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_wal_nextval_rollback");
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
@@ -1871,10 +1871,8 @@ mod tests {
     /// this test will need to update its expectation.
     #[test]
     fn test_mvcc_nextval_rolled_back_re_emits_value_today() -> anyhow::Result<()> {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("temp_mvcc_nextval_rollback");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("temp_mvcc_nextval_rollback");
         let db = TempDatabase::builder()
             .with_db_path(&path)
             .with_mvcc(true)
@@ -1977,7 +1975,8 @@ mod tests {
         const THREADS: usize = 8;
         const PER_THREAD: usize = 50;
 
-        let path = TempDir::new().unwrap().keep().join("stress_nextval_wal");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("stress_nextval_wal");
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
         conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
@@ -2045,7 +2044,8 @@ mod tests {
         const THREADS: usize = 8;
         const PER_THREAD: usize = 50;
 
-        let path = TempDir::new().unwrap().keep().join("stress_nextval_mvcc");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("stress_nextval_mvcc");
         let db = TempDatabase::builder()
             .with_db_path(&path)
             .with_mvcc(true)
@@ -2111,7 +2111,8 @@ mod tests {
         const NEXTVAL_THREADS: usize = 4;
         const NEXTVAL_PER_THREAD: usize = 100;
 
-        let path = TempDir::new().unwrap().keep().join("stress_mixed_mvcc");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("stress_mixed_mvcc");
         let db = TempDatabase::builder()
             .with_db_path(&path)
             .with_mvcc(true)

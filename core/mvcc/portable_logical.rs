@@ -1,4 +1,5 @@
 use crate::alloc::{TursoVecExt, Vec};
+use crate::cdc::{TURSO_CDC_DEFAULT_TABLE_NAME, TURSO_CDC_VERSION_TABLE_NAME};
 use crate::mvcc::persistent_storage::logical_log::{
     log_write, LogSerializer, ProtoKey, ProtoSint64, ProtoVarint, PROTO_WIRE_LENGTH_DELIMITED,
     PROTO_WIRE_VARINT,
@@ -20,14 +21,12 @@ const META_FIELD_VALUE_REF: u64 = 2;
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 const TURSO_SYNC_PREFIX: &str = "turso_sync_";
-const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
-const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 
 pub(crate) fn is_portable_logical_name(name: &str) -> bool {
     !name.starts_with(SQLITE_INTERNAL_PREFIX)
         && !name.starts_with(TURSO_INTERNAL_PREFIX)
         && !name.starts_with(TURSO_SYNC_PREFIX)
-        && name != TURSO_CDC_TABLE_NAME
+        && name != TURSO_CDC_DEFAULT_TABLE_NAME
         && name != TURSO_CDC_VERSION_TABLE_NAME
 }
 

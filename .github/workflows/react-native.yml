@@ -8,8 +8,6 @@ on:
     tags:
       - v*
   pull_request:
-    branches:
-      - main
 
 env:
   CARGO_INCREMENTAL: "0"

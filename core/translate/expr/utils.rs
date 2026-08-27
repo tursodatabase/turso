@@ -69,6 +69,27 @@ pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
     }
 }
 
+/// If the right-hand side of `IS` / `IS NOT` is the TRUE or FALSE keyword —
+/// possibly inside parentheses or under COLLATE — return its boolean value.
+/// `x IS TRUE` and friends then test the truth of x instead of comparing
+/// values. SQLite behaves the same way: it resolves the keyword after
+/// skipping COLLATE, and its grammar collapses parentheses (resolve.c,
+/// `sqlite3ExprSkipCollateAndLikely`). A unary `+` blocks the keyword there
+/// too, so `x IS +TRUE` stays an ordinary comparison with 1.
+///
+/// Every place that decides "is this a truth test?" — the expression
+/// evaluator, the condition emitter, and the index-seek guard in the
+/// optimizer — must call this one function, so they cannot drift apart.
+pub fn truth_test_rhs(expr: &ast::Expr) -> Option<bool> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::True) => Some(true),
+        ast::Expr::Literal(ast::Literal::False) => Some(false),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => truth_test_rhs(&exprs[0]),
+        ast::Expr::Collate(inner, _) => truth_test_rhs(inner),
+        _ => None,
+    }
+}
+
 /// Recursively unwrap parentheses from an owned Expr.
 /// Returns how many pairs of parentheses were removed.
 pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {

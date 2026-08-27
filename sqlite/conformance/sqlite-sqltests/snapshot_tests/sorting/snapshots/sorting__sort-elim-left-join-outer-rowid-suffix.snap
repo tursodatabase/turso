@@ -18,5 +18,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH o USING INDEX idx_lhs_customer (customer_id=?)
+|--SEARCH o USING COVERING INDEX idx_lhs_customer (customer_id=?)
 `--SEARCH i USING INDEX idx_rhs_product_qty (product=?) LEFT-JOIN

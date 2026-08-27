@@ -29,7 +29,7 @@ addr  opcode           p1  p2  p3  p4           p5  comment
    6    MakeRecord      2   1   3                0  r[3]=mkrec(r[2..2]); for
    7    NewRowid        0   4   0                0  r[4]=rowid
    8    Insert          0   3   4                4  intkey=r[4] data=r[3]
-   9  Next              1   4   0                0
+   9  Next              1   4   0                1
   10  Null              0   6   0                0  r[6]=NULL
   11  Last              0  19   0                0
   12    Column          0   0   1                0  r[1]=ephemeral().price

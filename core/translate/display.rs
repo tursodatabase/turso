@@ -9,11 +9,7 @@ use turso_parser::{
     token::TokenType,
 };
 
-use crate::{
-    schema::Table,
-    translate::plan::{SeekKeyComponent, TableReferences},
-    types::SeekOp,
-};
+use crate::{schema::Table, translate::plan::TableReferences};
 
 use super::plan::{
     Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SeekDef,
@@ -39,145 +35,13 @@ fn fmt_order_by_item(
     }
 }
 
-/// Format the EXPLAIN QUERY PLAN detail string for a table operation.
-/// Used by DELETE/UPDATE emitters to emit EQP annotations.
-pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
-    match &table.op {
-        Operation::Scan(scan) => {
-            let table_name = if table.table.get_name() == table.identifier {
-                table.identifier.clone()
-            } else {
-                format!("{} AS {}", table.table.get_name(), table.identifier)
-            };
-            match scan {
-                Scan::BTreeTable { index, .. } => {
-                    if let Some(index) = index {
-                        if table.utilizes_covering_index() {
-                            format!("SCAN {table_name} USING COVERING INDEX {}", index.name)
-                        } else {
-                            format!("SCAN {table_name} USING INDEX {}", index.name)
-                        }
-                    } else {
-                        format!("SCAN {table_name}")
-                    }
-                }
-                Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
-                    format!("SCAN {table_name}")
-                }
-            }
-        }
-        Operation::Search(search) => match search {
-            Search::RowidEq { .. }
-            | Search::Seek { index: None, .. }
-            | Search::InSeek { index: None, .. } => {
-                format!(
-                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                    table.identifier
-                )
-            }
-            Search::Seek {
-                index: Some(index),
-                seek_def,
-            } => {
-                let constraints = seek_constraint_annotation(index, seek_def);
-                format!(
-                    "SEARCH {} USING INDEX {}{}",
-                    table.identifier, index.name, constraints
-                )
-            }
-            Search::InSeek {
-                index: Some(index), ..
-            } => {
-                let constraint = if let Some(col) = index.columns.first() {
-                    format!(" ({}=?)", col.name)
-                } else {
-                    String::new()
-                };
-                format!(
-                    "SEARCH {} USING INDEX {}{}",
-                    table.identifier, index.name, constraint
-                )
-            }
-        },
-        Operation::MultiIndexScan(multi_idx) => {
-            let index_names: Vec<&str> = multi_idx
-                .branches
-                .iter()
-                .map(|b| {
-                    b.index
-                        .as_ref()
-                        .map(|i| i.name.as_str())
-                        .unwrap_or("PRIMARY KEY")
-                })
-                .collect();
-            format!(
-                "MULTI-INDEX {} {} ({})",
-                match multi_idx.set_op {
-                    SetOperation::Union => "OR",
-                    SetOperation::Intersection { .. } => "AND",
-                },
-                table.identifier,
-                index_names.join(", ")
-            )
-        }
-        Operation::IndexMethodQuery(query) => {
-            let index_method = query.index.index_method.as_ref().unwrap();
-            format!(
-                "QUERY INDEX METHOD {}",
-                index_method.definition().method_name
-            )
-        }
-        Operation::HashJoin(_) => {
-            let table_name = if table.table.get_name() == table.identifier {
-                table.identifier.clone()
-            } else {
-                format!("{} AS {}", table.table.get_name(), table.identifier)
-            };
-            format!("HASH JOIN {table_name}")
-        }
-    }
-}
-
 /// Build SQLite-style constraint annotation string for an index seek.
 /// e.g. "(label=? AND fromId>?)"
 pub(crate) fn seek_constraint_annotation(
     index: &crate::schema::Index,
     seek_def: &SeekDef,
 ) -> String {
-    let mut parts = Vec::new();
-    // Equality prefix constraints
-    for (i, _constraint) in seek_def.prefix.iter().enumerate() {
-        if let Some(col) = index.columns.get(i) {
-            parts.push(format!("{}=?", col.name));
-        }
-    }
-    // Range constraint from start key
-    let range_col_idx = seek_def.prefix.len();
-    if let SeekKeyComponent::Expr(_) = &seek_def.start.last_component {
-        if let Some(col) = index.columns.get(range_col_idx) {
-            let op_str = match seek_def.start.op {
-                SeekOp::GE { .. } => ">=",
-                SeekOp::GT => ">",
-                SeekOp::LE { .. } => "<=",
-                SeekOp::LT => "<",
-            };
-            parts.push(format!("{}{op_str}?", col.name));
-        }
-    }
-    // Range constraint from end key.
-    // The end key's SeekOp is the B-tree termination condition (the negation of the
-    // user-facing SQL operator), so we reverse it for display.
-    if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
-        if let Some(col) = index.columns.get(range_col_idx) {
-            let op_str = match seek_def.end.op {
-                SeekOp::GE { .. } => "<",
-                SeekOp::GT => "<=",
-                SeekOp::LE { .. } => ">",
-                SeekOp::LT => ">=",
-            };
-            parts.push(format!("{}{op_str}?", col.name));
-        }
-    }
+    let parts = super::eqp::seek_constraint_parts(index, seek_def);
     if parts.is_empty() {
         String::new()
     } else {
@@ -227,6 +91,13 @@ impl Display for Plan {
                     }
                 }
                 Ok(())
+            }
+            Self::RecursiveCte(plan) => {
+                writeln!(f, "RECURSIVE CTE {}", plan.name)?;
+                writeln!(f, "INITIAL QUERY:")?;
+                plan.initial_query.fmt(f)?;
+                writeln!(f, "RECURSIVE QUERY:")?;
+                plan.recursive_query.fmt(f)
             }
             Self::Delete(delete_plan) => delete_plan.fmt(f),
             Self::Update(update_plan) => update_plan.fmt(f),
@@ -280,7 +151,9 @@ impl Display for SelectPlan {
                                 writeln!(f, "{indent}SCAN {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             writeln!(f, "{indent}SCAN {table_name}")?;
                         }
                     }
@@ -302,9 +175,14 @@ impl Display for SelectPlan {
                             seek_def,
                         } => {
                             let constraints = seek_constraint_annotation(index, seek_def);
+                            let covering = if reference.utilizes_covering_index() {
+                                "COVERING "
+                            } else {
+                                ""
+                            };
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                                "{indent}SEARCH {} USING {covering}INDEX {}{constraints}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }
@@ -316,9 +194,14 @@ impl Display for SelectPlan {
                             } else {
                                 String::new()
                             };
+                            let covering = if reference.utilizes_covering_index() {
+                                "COVERING "
+                            } else {
+                                ""
+                            };
                             writeln!(
                                 f,
-                                "{indent}SEARCH {} USING INDEX {}{constraint}{left_join_suffix}",
+                                "{indent}SEARCH {} USING {covering}INDEX {}{constraint}{left_join_suffix}",
                                 reference.identifier, index.name
                             )?;
                         }
@@ -403,7 +286,9 @@ impl Display for DeletePlan {
                                 writeln!(f, "{indent}DELETE FROM {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             writeln!(f, "{indent}DELETE FROM {table_name}")?;
                         }
                     }
@@ -529,7 +414,9 @@ impl fmt::Display for UpdatePlan {
                                 writeln!(f, "{indent}{action} {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             if i == 0 {
                                 writeln!(f, "{indent}UPDATE {table_name}")?;
                             } else {
@@ -588,9 +475,6 @@ impl fmt::Display for UpdatePlan {
                     unreachable!("Update plan should not have multi-index scans");
                 }
             }
-        }
-        if let Some(limit) = self.limit.as_ref() {
-            writeln!(f, "LIMIT: {limit}")?;
         }
         if let Some(ret) = &self.returning {
             writeln!(f, "RETURNING:")?;
@@ -692,6 +576,15 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
                 }
             }
+            Self::RecursiveCte(plan) => {
+                plan.initial_query.to_tokens(s, context)?;
+                if plan.union_all {
+                    ast::CompoundOperator::UnionAll.to_tokens(s, context)?;
+                } else {
+                    ast::CompoundOperator::Union.to_tokens(s, context)?;
+                }
+                plan.recursive_query.to_tokens(s, context)?;
+            }
             Self::Delete(delete) => delete.to_tokens(s, context)?,
             Self::Update(update) => update.to_tokens(s, context)?,
         }
@@ -713,7 +606,7 @@ impl ToTokens for JoinedTable {
         _context: &C,
     ) -> Result<(), S::Error> {
         match &self.table {
-            Table::BTree(..) | Table::Virtual(..) => {
+            Table::BTree(..) | Table::Virtual(..) | Table::RecursiveCteInput(..) => {
                 let name = self.table.get_name();
                 s.append(TokenType::TK_ID, Some(name))?;
                 if self.identifier != name {
@@ -918,32 +811,6 @@ impl ToTokens for DeletePlan {
             }
         }
 
-        if !self.order_by.is_empty() {
-            s.append(TokenType::TK_ORDER, None)?;
-            s.append(TokenType::TK_BY, None)?;
-
-            s.comma(
-                self.order_by
-                    .iter()
-                    .map(|(expr, order, nulls)| ast::SortedColumn {
-                        expr: expr.clone(),
-                        order: Some(*order),
-                        nulls: *nulls,
-                    }),
-                context,
-            )?;
-        }
-
-        if let Some(limit) = &self.limit {
-            s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
-        }
-
-        if let Some(offset) = &self.offset {
-            s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
-        }
-
         Ok(())
     }
 }
@@ -996,15 +863,6 @@ impl ToTokens for UpdatePlan {
                 s.append(TokenType::TK_AND, None)?;
                 expr.to_tokens(s, context)?;
             }
-        }
-
-        if let Some(limit) = &self.limit {
-            s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
-        }
-        if let Some(offset) = &self.offset {
-            s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
         }
 
         Ok(())

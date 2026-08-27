@@ -13,14 +13,25 @@ struct sqlite3_stmt {
     _private: [u8; 0],
 }
 
-// Windows: This entire compat test is excluded because Windows has no system SQLite library
-// (unlike Linux which has libsqlite3-dev pre-installed). The sqlite3 feature links against
-// native libsqlite3 for comparison testing, which isn't available on Windows without complex
-// setup (generating .lib from .def using VS tooling). Since SQLite behavior is platform-
-// independent, running these tests on Linux/macOS provides sufficient coverage.
-#[cfg(not(target_os = "windows"))]
-#[cfg_attr(not(feature = "sqlite3"), link(name = "turso_sqlite3"))]
-#[cfg_attr(feature = "sqlite3", link(name = "sqlite3"))]
+#[cfg_attr(
+    all(not(feature = "sqlite3"), not(target_os = "windows")),
+    link(name = "turso_sqlite3")
+)]
+#[cfg_attr(
+    all(
+        feature = "sqlite3",
+        not(all(target_os = "windows", target_env = "msvc"))
+    ),
+    link(name = "sqlite3")
+)]
+#[cfg_attr(
+    all(feature = "sqlite3", target_os = "windows", target_env = "msvc"),
+    link(name = "sqlite3", kind = "static")
+)]
+#[cfg_attr(
+    all(not(feature = "sqlite3"), target_os = "windows"),
+    link(name = "turso_sqlite3", kind = "raw-dylib")
+)]
 extern "C" {
     fn sqlite3_libversion() -> *const libc::c_char;
     fn sqlite3_libversion_number() -> i32;
@@ -204,7 +215,6 @@ const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
 const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
 
-#[cfg(not(target_os = "windows"))]
 mod tests {
     use super::*;
 
@@ -213,6 +223,8 @@ mod tests {
         unsafe {
             let version = sqlite3_libversion();
             assert!(!version.is_null());
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(std::ffi::CStr::from_ptr(version), c"3.50.4");
         }
     }
 
@@ -220,7 +232,10 @@ mod tests {
     fn test_libversion_number() {
         unsafe {
             let version_num = sqlite3_libversion_number();
-            assert!(version_num >= 3042000);
+            #[cfg(feature = "sqlite3")]
+            assert!(version_num > 0);
+            #[cfg(not(feature = "sqlite3"))]
+            assert_eq!(version_num, 3050004);
         }
     }
 

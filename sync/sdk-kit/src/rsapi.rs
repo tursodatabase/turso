@@ -37,10 +37,11 @@ pub struct TursoDatabaseSyncConfig {
     /// `None` => single-request bootstrap. No-op when partial-sync uses the
     /// query bootstrap strategy.
     pub pull_bytes_threshold: Option<usize>,
-    /// Use the MVCC logical-log stream for incremental V1 pulls. This is
-    /// required when syncing against an MVCC-mode remote; legacy page/WAL sync
-    /// keeps the default `false` value.
-    pub logical_mvcc_pull: bool,
+    /// Sync-protocol override for incremental V1 pulls. `None` (default)
+    /// auto-detects the remote protocol from the first pull-updates response
+    /// and persists it in the sync metadata; `Some(true)` forces MVCC
+    /// logical-log streams; `Some(false)` forces page streams.
+    pub logical_mvcc_pull: Option<bool>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -122,7 +123,14 @@ impl TursoDatabaseSyncConfig {
             } else {
                 Some(config.pull_bytes_threshold)
             },
-            logical_mvcc_pull: config.logical_mvcc_pull,
+            // The C ABI has no tri-state: `true` forces MVCC logical pulls,
+            // `false` means auto-detect (which behaves identically to page
+            // pulls against page-protocol remotes).
+            logical_mvcc_pull: if config.logical_mvcc_pull {
+                Some(true)
+            } else {
+                None
+            },
         })
     }
 }
@@ -357,6 +365,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         sync_engine_opts.partial_sync_opts.is_some()
                     })?,
                 };
+                let fresh_bootstrap = metadata.is_none() && sync_engine_opts.bootstrap_if_empty;
                 let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
                     &coro,
                     io.clone(),
@@ -390,6 +399,15 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_opts,
                 )
                 .await?;
+                // A fresh MVCC bootstrap only carries the last durable
+                // generation base; catch up to the retained logical log so
+                // the database is current at connect time (no-op for
+                // page-protocol replicas).
+                if fresh_bootstrap {
+                    sync_engine_opened
+                        .catch_up_after_fresh_bootstrap(&coro)
+                        .await?;
+                }
                 *sync_engine.lock() = Some(sync_engine_opened);
                 Ok(None)
             })

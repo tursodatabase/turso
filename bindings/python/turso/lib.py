@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -53,8 +54,9 @@ def _get_sqlite_version() -> tuple[str, tuple[int, int, int]]:
             parts = (*parts, 0)
         return version_str, parts[:3]
     except Exception:
-        # Fallback to a known compatible version
-        return "3.45.0", (3, 45, 0)
+        # Fallback to the SQLite version Turso tracks
+        # (SQLITE_VERSION in core/dialect/sqlite.rs)
+        return "3.50.4", (3, 50, 4)
 
 
 sqlite_version, sqlite_version_info = _get_sqlite_version()
@@ -204,6 +206,14 @@ def _step_once_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], N
                 extra_io()
             continue
         return status
+
+
+def _reject_stdlib_row_factory(rf: Any) -> None:
+    stdlib_sqlite3 = sys.modules.get("sqlite3")
+    if stdlib_sqlite3 is None:
+        return
+    if isinstance(rf, type) and issubclass(rf, stdlib_sqlite3.Row):
+        raise TypeError("sqlite3.Row is not supported as a row_factory on turso connections; use turso.Row instead")
 
 
 @dataclass
@@ -847,7 +857,11 @@ class Cursor:
         if isinstance(rf, type) and issubclass(rf, Row):
             return rf(self, Row(self, row_values))  # type: ignore[call-arg]
         if callable(rf):
-            return rf(self, Row(self, row_values))  # type: ignore[misc]
+            try:
+                return rf(self, Row(self, row_values))  # type: ignore[misc]
+            except TypeError:
+                _reject_stdlib_row_factory(rf)
+                raise
         # Fallback: return tuple
         return row_values
 

@@ -1460,6 +1460,69 @@ mod tests {
     }
 
     #[test]
+    fn spilled_sort_places_nulls_last_across_chunks() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, SortOrder::Asc],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, Some(turso_parser::ast::NullsOrder::Last)].unwrap(),
+            try_vec![None, None].unwrap(),
+            256,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        let n = 200;
+        for x in 0..n {
+            let second = if x % 2 == 0 {
+                Value::Null
+            } else {
+                Value::from_i64(x)
+            };
+            let values = try_vec![Value::from_i64(1), second].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record)).unwrap();
+        }
+
+        io.block(|| sorter.sort()).unwrap();
+        assert!(
+            !sorter.chunks.is_empty(),
+            "test requires the sorter to have spilled to chunks"
+        );
+
+        let mut idx = 0;
+        let mut prev = None;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                match vals[1] {
+                    ValueRef::Null => {
+                        assert!(idx >= n / 2, "NULL emitted before all non-NULL values");
+                    }
+                    v => {
+                        assert!(idx < n / 2, "non-NULL value {v:?} emitted after NULL block");
+                        let current = match v {
+                            ValueRef::Numeric(crate::numeric::Numeric::Integer(i)) => i,
+                            other => panic!("unexpected value {other:?}"),
+                        };
+                        if let Some(prev) = prev {
+                            assert!(current > prev);
+                        }
+                        prev = Some(current);
+                    }
+                }
+            }
+            idx += 1;
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(idx, n);
+    }
+
+    #[test]
     fn in_memory_sort_applies_desc_on_secondary_key() {
         let seconds = try_vec![
             Value::from_i64(10),

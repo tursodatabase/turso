@@ -856,9 +856,9 @@ fn test_wal_api_insert_exec_mix(db: TempDatabase) {
 // TODO: see later how this test should work with mvcc
 #[test]
 fn test_db_share_same_file() {
-    let mut path = TempDir::new().unwrap().keep();
+    let temp_dir = TempDir::new().unwrap();
     let (mut rng, _) = rng_from_time();
-    path.push(format!("test-{}.db", rng.next_u32()));
+    let path = temp_dir.path().join(format!("test-{}.db", rng.next_u32()));
 
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
     let db_file = io

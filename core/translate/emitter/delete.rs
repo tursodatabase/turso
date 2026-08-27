@@ -4,13 +4,12 @@ use crate::{
     schema::{BTreeTable, ColumnLayout},
     sync::Arc,
     translate::{
-        display::format_eqp_detail,
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_program_for_select,
-            get_triggers_including_temp, has_triggers_including_temp, init_limit, OperationMode,
-            TriggerTime,
+            get_triggers_including_temp, has_triggers_including_temp, OperationMode, TriggerTime,
         },
+        eqp::eqp_detail_for_table_op,
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
@@ -74,8 +73,6 @@ pub fn emit_program_for_delete(
     } else {
         None
     };
-
-    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -225,7 +222,11 @@ pub fn emit_program_for_delete(
             .joined_tables()
             .first()
             .expect("DELETE always has one joined table");
-        emit_explain!(program, true, format_eqp_detail(table_ref));
+        emit_explain!(
+            program,
+            true,
+            eqp_detail_for_table_op(table_ref, None, None)
+        );
 
         // Set up main query execution loop
         OpenLoop::emit(
@@ -482,19 +483,6 @@ fn emit_delete_insns<'a>(
         false
     };
 
-    // Apply OFFSET: skip the first N matching rows before deleting
-    if let Some(offset) = t_ctx.reg_offset {
-        let loop_labels = *t_ctx
-            .labels_main_loop
-            .first()
-            .expect("loop labels to exist");
-        program.emit_insn(Insn::IfPos {
-            reg: offset,
-            target_pc: loop_labels.next,
-            decrement_by: 1,
-        });
-    }
-
     let cols_len = unsafe { &*table_reference }.columns().len();
     let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
         // Get rowid for RETURNING
@@ -593,13 +581,6 @@ fn emit_delete_insns<'a>(
             raise_error_if_no_matching_entry: index.where_clause.is_none(),
         });
     }
-    if let Some(limit_ctx) = t_ctx.limit_ctx {
-        program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
-        })
-    }
-
     Ok(())
 }
 
@@ -709,8 +690,8 @@ fn emit_delete_row_common(
         for (index, index_cursor_id) in indexes_to_delete {
             let skip_delete_label = if index.where_clause.is_some() {
                 let where_copy = index
-                    .bind_where_expr(Some(table_references), resolver)
-                    .expect("where clause to exist");
+                    .bind_where_expr(Some(table_references), resolver)?
+                    .expect("index.where_clause was checked to be Some above");
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
                 translate_expr_no_constant_opt(
@@ -948,21 +929,17 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            // If the program has a trigger_conflict_override, propagate it to the trigger context.
-            let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
-                TriggerContext::new_with_override_conflict(
-                    btree_table,
-                    None, // No NEW for DELETE
-                    Some(old_registers),
-                    override_conflict,
-                )
-            } else {
-                TriggerContext::new(
-                    btree_table,
-                    None, // No NEW for DELETE
-                    Some(old_registers),
-                )
-            };
+            // A DELETE always fires its triggers with the default conflict
+            // resolution, never the enclosing statement's OR clause: SQLite
+            // codes row-delete triggers with OE_Default (delete.c). So a plain
+            // INSERT inside such a trigger aborts on a constraint violation
+            // even when an outer UPDATE/INSERT OR REPLACE is what ultimately
+            // fired this DELETE.
+            let trigger_ctx = TriggerContext::new(
+                btree_table,
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
 
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1019,22 +996,14 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            // If the program has a trigger_conflict_override, propagate it to the trigger context.
-            let trigger_ctx_after =
-                if let Some(override_conflict) = program.trigger_conflict_override {
-                    TriggerContext::new_with_override_conflict(
-                        btree_table,
-                        None, // No NEW for DELETE
-                        Some(old_registers),
-                        override_conflict,
-                    )
-                } else {
-                    TriggerContext::new(
-                        btree_table,
-                        None, // No NEW for DELETE
-                        Some(old_registers),
-                    )
-                };
+            // A DELETE always fires its triggers with the default conflict
+            // resolution, never the enclosing statement's OR clause (see the
+            // BEFORE-trigger case above and SQLite's delete.c).
+            let trigger_ctx_after = TriggerContext::new(
+                btree_table,
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
 
             for trigger in relevant_triggers {
                 fire_trigger(

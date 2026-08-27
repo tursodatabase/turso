@@ -99,28 +99,28 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.8.0-pre.2"
+version = "0.8.0-pre.7"
 authors = ["the Turso authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.8.0-pre.2" }
-turso_node = { path = "bindings/javascript", version = "0.8.0-pre.2" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.8.0-pre.2" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.8.0-pre.2" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.8.0-pre.2" }
-limbo_completion = { path = "extensions/completion", version = "0.8.0-pre.2" }
-turso_core = { path = "core", version = "0.8.0-pre.2" }
-turso_sync_engine = { path = "sync/engine", version = "0.8.0-pre.2" }
-turso_ext = { path = "extensions/core", version = "0.8.0-pre.2" }
-turso_macros = { path = "macros", version = "0.8.0-pre.2" }
-turso_parser = { path = "sqlite/parser", version = "0.8.0-pre.2" }
-turso_pg = { path = "postgres/frontend", version = "0.8.0-pre.2" }
-turso_pg_client = { path = "postgres/client", version = "0.8.0-pre.2" }
-turso_pg_parser = { path = "postgres/parser", version = "0.8.0-pre.2" }
-turso_pg_server = { path = "postgres/server", version = "0.8.0-pre.2" }
+turso = { path = "bindings/rust", version = "0.8.0-pre.7" }
+turso_node = { path = "bindings/javascript", version = "0.8.0-pre.7" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.8.0-pre.7" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.8.0-pre.7" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.8.0-pre.7" }
+limbo_completion = { path = "extensions/completion", version = "0.8.0-pre.7" }
+turso_core = { path = "core", version = "0.8.0-pre.7" }
+turso_sync_engine = { path = "sync/engine", version = "0.8.0-pre.7" }
+turso_ext = { path = "extensions/core", version = "0.8.0-pre.7" }
+turso_macros = { path = "macros", version = "0.8.0-pre.7" }
+turso_parser = { path = "sqlite/parser", version = "0.8.0-pre.7" }
+turso_pg = { path = "postgres/frontend", version = "0.8.0-pre.7" }
+turso_pg_client = { path = "postgres/client", version = "0.8.0-pre.7" }
+turso_pg_parser = { path = "postgres/parser", version = "0.8.0-pre.7" }
+turso_pg_server = { path = "postgres/server", version = "0.8.0-pre.7" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
@@ -149,6 +149,7 @@ miette = "7.6.0"
 bitflags = "2.9.4"
 fallible-iterator = "0.3.0"
 allocator-api2 = "0.4"
+getrandom = "0.4.2"
 
 criterion = "0.5.0"
 codspeed-criterion-compat = "4.2.1"
@@ -167,6 +168,7 @@ similar-asserts = { version = "1.7.0" }
 bitmaps = { version = "3.2.1", default-features = false }
 console-subscriber = { version = "0.4.1" }
 either = { version = "1.15" }
+windows-sys = "0.61.2"
 
 # Multi threading testing
 loom = { version = "0.7" }

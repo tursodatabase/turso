@@ -1,4 +1,5 @@
 use rand::Rng;
+mod checkpoint;
 mod conn;
 mod counter;
 mod logging;
@@ -675,16 +676,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
 
+    let mut batch_idx: u64 = 0;
     while !stop && !stress_counter.all_done() {
         let mut handles = Vec::with_capacity(opts.nr_threads);
         let reopen_requested = Arc::new(AtomicBool::new(false));
         let all_threads_ready = Arc::new(Barrier::new(stress_counter.incomplete_threads()));
 
-        for (iteration_idx, ((thread_idx, thread), mut progress_bar)) in threads
-            .iter()
-            .cloned()
-            .zip(progress_bars.iter().cloned())
-            .enumerate()
+        for ((thread_idx, thread), mut progress_bar) in
+            threads.iter().cloned().zip(progress_bars.iter().cloned())
         {
             if stress_counter.done(thread_idx) {
                 continue;
@@ -704,7 +703,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 let mut rng = ThreadRng::new(
                     global_seed
                         .wrapping_add(thread_idx as u64)
-                        .wrapping_add(iteration_idx as u64 * 1000),
+                        .wrapping_add(batch_idx.wrapping_mul(1000)),
                 );
                 let mut iteration_count_this_batch = 0;
 
@@ -765,6 +764,21 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         let _ = conn.execute(end_tx, ()).await;
                     }
 
+                    // Occasionally checkpoint the WAL so backfills, full
+                    // drains, and WAL restarts race the other threads'
+                    // commits instead of only happening on autocheckpoint.
+                    if rng.random_ratio(1, 20) {
+                        let mode = checkpoint::pick_mode(&mut rng, opts.tx_mode);
+                        checkpoint::run_wal_checkpoint(
+                            &conn,
+                            &sql_logger,
+                            &thread,
+                            mode,
+                            opts.tx_mode,
+                        )
+                        .await;
+                    }
+
                     const INTEGRITY_CHECK_INTERVAL: usize = 100;
                     if interaction_idx % INTEGRITY_CHECK_INTERVAL == 0 {
                         let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
@@ -789,6 +803,13 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                             Ok(None) => {
                                 sql_logger.log(&thread, "PRAGMA integrity_check", "ERROR: no rows");
                                 turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
+                            }
+                            Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
+                                sql_logger.log(
+                                    &thread,
+                                    "PRAGMA integrity_check",
+                                    "SKIPPED: database busy",
+                                );
                             }
                             Err(e) => {
                                 sql_logger.log(
@@ -831,6 +852,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         // This is what triggers MVCC recovery
         db.lock().await.reset();
         clear_database_registry();
+        batch_idx += 1;
     }
 
     progress_bars

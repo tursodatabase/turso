@@ -10,8 +10,12 @@ public class TursoConnection : DbConnection
 {
     private TursoDatabaseHandle? _turso;
     private TursoRemoteClient? _remoteClient;
+    private TursoSyncDatabase? _syncDatabase;
+    private readonly HashSet<TursoDataReader> _syncReaders = [];
+    private readonly object _syncReadersLock = new();
     private TursoConnectionOptions _connectionOptions;
     private bool _disposed;
+    private bool _closing;
     private bool _readUncommitted;
     private bool _remoteTransactionActive;
 
@@ -93,15 +97,30 @@ public class TursoConnection : DbConnection
 
     public override void Close()
     {
-        if (_remoteClient is not null)
-        {
-            CloseRemote();
+        if (_closing)
             return;
-        }
 
-        _turso?.Dispose();
-        _turso = null;
-        _readUncommitted = false;
+        _syncDatabase?.ThrowIfIoReentrant();
+        _closing = true;
+        try
+        {
+            if (_remoteClient is not null)
+            {
+                CloseRemote();
+                return;
+            }
+
+            CloseSyncReaders();
+            using (_syncDatabase?.EnterConnectionOperation())
+                _turso?.Dispose();
+            _turso = null;
+            ReleaseSyncDatabase();
+            _readUncommitted = false;
+        }
+        finally
+        {
+            _closing = false;
+        }
     }
 
     protected override void Dispose(bool disposing)
@@ -178,6 +197,41 @@ public class TursoConnection : DbConnection
     }
 
     internal TursoDatabaseHandle Turso => _turso ?? throw new InvalidOperationException("Turso database is closed.");
+
+    internal static TursoConnection CreateSyncConnection(
+        TursoDatabaseHandle connectionHandle,
+        TursoSyncDatabase syncDatabase)
+    {
+        ArgumentNullException.ThrowIfNull(connectionHandle);
+        ArgumentNullException.ThrowIfNull(syncDatabase);
+        return new TursoConnection
+        {
+            _turso = connectionHandle,
+            _syncDatabase = syncDatabase,
+        };
+    }
+
+    internal void RunExternalIo()
+    {
+        _syncDatabase?.ProcessOneIo();
+    }
+
+    internal IDisposable? EnterSyncOperation()
+    {
+        return _syncDatabase?.EnterConnectionOperation();
+    }
+
+    internal void RegisterSyncReader(TursoDataReader reader)
+    {
+        lock (_syncReadersLock)
+            _syncReaders.Add(reader);
+    }
+
+    internal void UnregisterSyncReader(TursoDataReader reader)
+    {
+        lock (_syncReadersLock)
+            _syncReaders.Remove(reader);
+    }
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
         string sql,
@@ -386,5 +440,25 @@ public class TursoConnection : DbConnection
         _remoteClient = null;
         _remoteTransactionActive = false;
         _readUncommitted = false;
+    }
+
+    private void ReleaseSyncDatabase()
+    {
+        var syncDatabase = _syncDatabase;
+        if (syncDatabase is null)
+            return;
+
+        _syncDatabase = null;
+        syncDatabase.ReleaseConnection();
+    }
+
+    private void CloseSyncReaders()
+    {
+        TursoDataReader[] readers;
+        lock (_syncReadersLock)
+            readers = [.. _syncReaders];
+
+        foreach (var reader in readers)
+            reader.Dispose();
     }
 }

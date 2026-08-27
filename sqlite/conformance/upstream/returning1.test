@@ -1,0 +1,547 @@
+# 2021-01-28
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# This file implements regression tests for SQLite library.  The
+# focus of this file is the new RETURNING clause
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix returning1
+
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a INTEGER PRIMARY KEY,b,c DEFAULT 'pax');
+  INSERT INTO t1(b) VALUES(10),('happy'),(NULL) RETURNING a,b,c;
+} {1 10 pax 2 happy pax 3 {} pax}
+do_execsql_test 1.1 {
+  SELECT * FROM t1;
+} {1 10 pax 2 happy pax 3 {} pax}
+do_execsql_test 1.2 {
+  INSERT INTO t1(b,c) VALUES(5,99) RETURNING b,c,a,rowid;
+} {5 99 4 4}
+do_execsql_test 1.3 {
+  SELECT * FROM t1;
+} {1 10 pax 2 happy pax 3 {} pax 4 5 99}
+do_execsql_test 1.4 {
+  INSERT INTO t1 DEFAULT VALUES RETURNING *;
+} {5 {} pax}
+do_execsql_test 1.5 {
+  SELECT * FROM t1;
+} {1 10 pax 2 happy pax 3 {} pax 4 5 99 5 {} pax}
+do_execsql_test 1.6 {
+  CREATE TABLE t2(x,y,z);
+  INSERT INTO t2 VALUES(11,12,13),(21,'b','c'),(31,'b-value',4.75);
+}
+do_execsql_test 1.7 {
+  INSERT INTO t1 SELECT * FROM t2 RETURNING *;
+} {11 12 13 21 b c 31 b-value 4.75}
+do_execsql_test 1.8 {
+  SELECT *, '|' FROM t1;
+} {1 10 pax | 2 happy pax | 3 {} pax | 4 5 99 | 5 {} pax | 11 12 13 | 21 b c | 31 b-value 4.75 |}
+
+do_execsql_test 2.1 {
+  UPDATE t1 SET c='bellum' WHERE c='pax' RETURNING rowid, b, '|';
+} {1 10 | 2 happy | 3 {} | 5 {} |}
+do_execsql_test 2.2 {
+  SELECT *, '|' FROM t1;
+} {1 10 bellum | 2 happy bellum | 3 {} bellum | 4 5 99 | 5 {} bellum | 11 12 13 | 21 b c | 31 b-value 4.75 |}
+
+do_execsql_test 3.1 {
+  DELETE FROM t1 WHERE c='bellum' RETURNING rowid, *, '|';
+} {1 1 10 bellum | 2 2 happy bellum | 3 3 {} bellum | 5 5 {} bellum |}
+do_execsql_test 3.2 {
+  SELECT *, '|' FROM t1;
+} {4 5 99 | 11 12 13 | 21 b c | 31 b-value 4.75 |}
+
+do_execsql_test 4.1 {
+  CREATE TABLE t4(a INT, b INT DEFAULT 1234, c INT DEFAULT -16);
+  CREATE UNIQUE INDEX t4a ON t4(a);
+  INSERT INTO t4(a,b,c) VALUES(1,2,3);
+} {}
+do_execsql_test 4.2 {
+  INSERT INTO t4(a,b,c) VALUES(1,22,33)
+  ON CONFLICT(a) DO UPDATE SET b=44
+  RETURNING *;
+} {1 44 3}
+do_execsql_test 4.3 {
+  SELECT * FROM t4;
+} {1 44 3}
+do_execsql_test 4.4 {
+  DELETE FROM t4;
+  INSERT INTO t4 VALUES(1,2,3),(4,5,6),(7,8,9);
+} {}
+do_execsql_test 4.5 {
+  INSERT INTO t4(a,b,c) VALUES(2,3,4),(4,5,6),(5,6,7)
+  ON CONFLICT(a) DO UPDATE SET b=100
+  RETURNING *, '|';
+} {2 3 4 | 4 100 6 | 5 6 7 |}
+
+#-------------------------------------------------------------------------
+# Test RETURNING on a table with virtual columns.
+#
+reset_db
+do_execsql_test 5.0 {
+  CREATE TABLE t1(xyz);
+  CREATE TABLE t2(a as (1+1), b);
+}
+
+do_execsql_test 5.1 {
+  UPDATE t2 SET b='123' WHERE b='abc' RETURNING (SELECT b FROM t1);
+} {}
+
+do_execsql_test 5.2 {
+  INSERT INTO t2(b) VALUES('abc');
+}
+
+do_execsql_test 5.3 {
+  UPDATE t2 SET b='123' WHERE b='abc' RETURNING (SELECT b FROM t1);
+} {{}}
+
+do_execsql_test 5.4 {
+  INSERT INTO t2(b) VALUES('abc');
+  INSERT INTO t1(xyz) VALUES(1);
+  UPDATE t2 SET b='123' WHERE b='abc' RETURNING b;
+} {123}
+
+do_execsql_test 5.5 {
+  INSERT INTO t2(b) VALUES('abc');
+  UPDATE t2 SET b='123' WHERE b='abc' RETURNING (SELECT b FROM t1);
+} {123}
+
+# Ticket 132994c8b1063bfb
+reset_db
+do_catchsql_test 6.0 {
+  CREATE TABLE t1(id INTEGER PRIMARY KEY);
+  CREATE TABLE t2(x INT, y INT);
+  INSERT INTO t1 VALUES(1),(2),(4),(9);
+  INSERT INTO t2 VALUES(3,7), (4,25), (5,99);
+  UPDATE t1 SET id=id+y FROM t2 WHERE t1.id=t2.x RETURNING t2.*;
+} {1 {RETURNING may not use "TABLE.*" wildcards}}
+do_catchsql_test 6.1 {
+  UPDATE t1 SET id=id+y FROM t2 WHERE t1.id=t2.x RETURNING *, '|';
+  SELECT * FROM t1 ORDER BY id;
+} {0 {29 | 1 2 9 29}}
+
+# Forum https://sqlite.org/forum/forumpost/85aef8bc01
+# Do not silently ignore nonsense table names in the RETURNING clause.
+# Raise an error.
+#
+reset_db
+do_execsql_test 7.1 {
+  CREATE TABLE t1(a INT, b INT);
+  CREATE TABLE t2(x INT, y INT);
+  INSERT INTO t1(a,b) VALUES(1,2);
+  INSERT INTO t2(x,y) VALUES(1,30);
+} {}
+do_catchsql_test 7.2 {
+  UPDATE t1 SET b=b+1 RETURNING new.b;
+} {1 {no such column: new.b}}
+do_catchsql_test 7.3 {
+  UPDATE t1 SET b=b+1 RETURNING old.b;
+} {1 {no such column: old.b}}
+do_catchsql_test 7.4 {
+  UPDATE t1 SET b=b+1 RETURNING another.b;
+} {1 {no such column: another.b}}
+do_catchsql_test 7.5 {
+  UPDATE t1 SET b=b+y FROM t2 WHERE t2.x=t1.a RETURNING t2.x;
+} {1 {no such column: t2.x}}
+do_catchsql_test 7.6 {
+  UPDATE t1 SET b=b+y FROM t2 WHERE t2.x=t1.a RETURNING t1.b;
+} {0 32}
+
+# This is goofy:  The RETURNING clause does not honor the alias
+# for the table being modified.  This might change in the future.
+#
+do_catchsql_test 7.7 {
+  UPDATE t1 AS alias SET b=123 RETURNING alias.b;
+} {1 {no such column: alias.b}}
+do_catchsql_test 7.8 {
+  UPDATE t1 AS alias SET b=alias.b+1000 RETURNING t1.b;
+} {0 1032}
+
+# Forum: https://sqlite.org/forum/info/34c81d83c9177f46
+reset_db
+do_execsql_test 8.1 {
+  CREATE TABLE t1(a);
+  CREATE TABLE t2(b,c);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t2 VALUES(3,40);
+} {}
+do_catchsql_test 8.2 {
+  INSERT INTO t1 VALUES(3) RETURNING a, (SELECT c FROM t2 WHERE new.a=t2.b) AS x;
+} {1 {no such column: new.a}}
+do_catchsql_test 8.3 {
+  INSERT INTO t1 VALUES(3) RETURNING a, (SELECT c FROM t2 WHERE old.a=t2.b) AS x;
+} {1 {no such column: old.a}}
+do_catchsql_test 8.4 {
+  INSERT INTO t1 VALUES(3) RETURNING a, (SELECT c FROM t2 WHERE t1.a=t2.b) AS x;
+} {0 {3 40}}
+
+ifcapable vtab {
+# dbsqlfuzz finds/crash-486f791cbe2dc45839310073e71367a1d8ad22dd
+do_catchsql_test 9.1 {
+  UPDATE pragma_encoding SET encoding='UTF-8' RETURNING a, b, *;
+} {1 {table pragma_encoding may not be modified}}
+} ;# ifcapable vtab
+
+# dbsqlfuzz crash-0081f863d7b2002045ac2361879fc80dfebb98f1
+reset_db
+do_execsql_test 10.1 {
+  CREATE TABLE t1_a(a, b);
+  CREATE VIEW t1 AS SELECT a, b FROM t1_a;
+
+  INSERT INTO t1_a VALUES('x', 'y');
+  INSERT INTO t1_a VALUES('x', 'y');
+  INSERT INTO t1_a VALUES('x', 'y');
+
+  CREATE TABLE log(op, r, a, b);
+}
+do_execsql_test 10.2 {
+  CREATE TRIGGER tr1 INSTEAD OF INSERT ON t1 BEGIN
+    INSERT INTO log VALUES('insert', new.rowid, new.a, new.b);
+  END;
+  CREATE TRIGGER tr2 INSTEAD OF UPDATE ON t1 BEGIN
+    INSERT INTO log VALUES('update', new.rowid, new.a, new.b);
+  END;
+}
+
+ifcapable !allow_rowid_in_view {
+  do_catchsql_test 10.3a {
+    INSERT INTO t1(a, b) VALUES(1234, 5678) RETURNING rowid;
+  } {1 {no such column: new.rowid}}
+  
+  do_catchsql_test 10.3b {
+    UPDATE t1 SET a='z' WHERE b='y' RETURNING rowid;
+  } {1 {no such column: new.rowid}}
+  
+  do_execsql_test 10.4 {
+    SELECT * FROM log;
+  } {}
+} else {
+  # Note: The values returned by the RETURNING clauses of the following
+  # two statements are the rowid columns of views. These values are not
+  # well defined, so the INSERT returns -1, and the UPDATE returns NULL.
+  # These match the values used for new.rowid expressions, but not much 
+  # else.
+  do_catchsql_test 10.3a {
+    INSERT INTO t1(a, b) VALUES(1234, 5678) RETURNING rowid;
+  } {0 -1}
+  
+  do_catchsql_test 10.3b {
+    UPDATE t1 SET a='z' WHERE b='y' RETURNING rowid;
+  } {0 {{} {} {}}}
+  
+  do_execsql_test 10.4 {
+    SELECT * FROM log;
+  } {
+    insert -1 1234 5678 update {} z y update {} z y update {} z y
+  }
+}
+
+# 2021-04-27 dbsqlfuzz 78b9400770ef8cc7d9427dfba26f4fcf46ea7dc2
+# Returning clauses on TEMP tables with triggers.
+#
+reset_db
+do_execsql_test 11.1 {
+  CREATE TEMP TABLE t1(a,b);
+  CREATE TEMP TABLE t2(c,d);
+  CREATE TEMP TABLE t3(e,f);
+  CREATE TEMP TABLE log(op,x,y);
+  CREATE TEMP TRIGGER t1r1 AFTER INSERT ON t1 BEGIN
+     INSERT INTO log(op,x,y) VALUES('I1',new.a,new.b);
+  END;
+  CREATE TEMP TRIGGER t1r2 BEFORE DELETE ON t1 BEGIN
+     INSERT INTO log(op,x,y) VALUES('D1',old.a,old.b);
+  END;
+  CREATE TEMP TRIGGER t2r3 AFTER UPDATE ON t1 BEGIN
+     INSERT INTO log(op,x,y) VALUES('U1',new.a,new.b);
+  END;
+  CREATE TEMP TRIGGER t2r1 BEFORE INSERT ON t2 BEGIN
+     INSERT INTO log(op,x,y) VALUES('I2',new.c,new.d);
+  END;
+  CREATE TEMP TRIGGER t3r1 AFTER DELETE ON t3 BEGIN
+     INSERT INTO log(op,x,y) VALUES('D3',old.e,old.f);
+  END;
+  CREATE TEMP TRIGGER t3r2 BEFORE UPDATE ON t3 BEGIN
+     INSERT INTO log(op,x,y) VALUES('U3',new.e,new.f);
+  END;
+  INSERT INTO t1(a,b) VALUES(1,2),('happy','glad') RETURNING a, b, '|';
+} {1 2 | happy glad |}
+do_execsql_test 11.2 {
+  UPDATE t1 SET b=9 WHERE a=1 RETURNING a, b, 'x';
+} {1 9 x}
+do_execsql_test 11.3 {
+  DELETE FROM t1 WHERE a<>'xray' RETURNING a, b, '@';
+} {1 9 @ happy glad @}
+do_execsql_test 11.4 {
+  SELECT * FROM log;
+  DELETE FROM log;
+} {I1 1 2 I1 happy glad U1 1 9 D1 1 9 D1 happy glad}
+do_execsql_test 11.5 {
+  INSERT INTO t2 VALUES('bravo','charlie') RETURNING d, c, 'z';
+} {charlie bravo z}
+do_execsql_test 11.6 {
+  SELECT * FROM log;
+  DELETE FROM log;
+} {I2 bravo charlie}
+do_execsql_test 11.7 {
+  INSERT INTO t3(e) VALUES(1),(2),(3) RETURNING 'I', e;
+  UPDATE t3 SET f=e+100 RETURNING 'U', e, f;
+  DELETE FROM t3 WHERE f>100 RETURNING 'D', e, f;
+} {I 1 I 2 I 3 U 1 101 U 2 102 U 3 103 D 1 101 D 2 102 D 3 103}
+do_execsql_test 11.6 {
+  SELECT * FROM log;
+  DELETE FROM log;
+} {U3 1 101 U3 2 102 U3 3 103 D3 1 101 D3 2 102 D3 3 103}
+
+reset_db
+do_execsql_test 11.11 {
+  CREATE TEMP TABLE t1(a,b);
+  CREATE TRIGGER r1 BEFORE INSERT ON t1 BEGIN SELECT 1; END;
+  DELETE FROM t1 RETURNING *;
+  DROP TRIGGER r1;
+  INSERT INTO t1 VALUES(5,30);
+} {}
+do_execsql_test 11.12 {
+  SELECT * FROM t1;
+} {5 30}
+
+# RETURNING column names are dequoted.
+# https://sqlite.org/forum/forumpost/033daf0b32
+#
+reset_db
+do_test 12.1 {
+  db eval {CREATE TABLE t1(x INT, y INT)}
+  unset -nocomplain cname
+  db eval {INSERT INTO t1(x) VALUES(1) RETURNING "x";} cname {}
+  lsort [array names cname]
+} {* x}
+do_test 12.2 {
+  unset -nocomplain cname
+  db eval {INSERT INTO t1(x) VALUES(2) RETURNING [x];} cname {}
+  lsort [array names cname]
+} {* x} 
+do_test 12.3 {
+  unset -nocomplain cname
+  db eval {INSERT INTO t1(x) VALUES(3) RETURNING x AS [xyz];} cname {}
+  lsort [array names cname]
+} {* xyz}
+do_test 12.4 {
+  unset -nocomplain cname
+  db eval {INSERT INTO t1(x,y) VALUES(4,5) RETURNING "x"+"y";} cname {}
+  lsort [array names cname]
+} {{"x"+"y"} *}
+
+ifcapable rtree {
+#-------------------------------------------------------------------------
+# Based on dbsqlfuzz find crash-ffbba524cac354b2a61bfd677cec9d2a4333f49a
+reset_db
+do_execsql_test 13.0 {
+  CREATE VIRTUAL TABLE t1 USING rtree(a, b, c);
+  CREATE TABLE t2(x);
+}
+
+do_execsql_test 13.1 {
+  INSERT INTO t1(a,b,c) VALUES(1,2,3) 
+  RETURNING (SELECT b FROM t2);
+} {{}}
+} ;# end ifcapable rtree
+
+# 2021-12-01 Forum post https://sqlite.org/forum/forumpost/793beaf322
+# Need to report foreign key constraint errors prior to RETURNING
+#
+reset_db
+do_execsql_test 14.0 {
+  PRAGMA foreign_keys(1);
+  CREATE TABLE Parent(id INTEGER PRIMARY KEY);
+  CREATE TABLE Child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES Parent(id));
+} {}
+do_catchsql_test 14.1 {
+  INSERT INTO child(parent_id) VALUES(123) RETURNING id;
+} {1 {FOREIGN KEY constraint failed}}
+
+# 2021-12-28 Forum post https://sqlite.org/forum/forumpost/e0c7574ab2
+# Incorrect affinity for REAL values that can be represented as integers.
+#
+reset_db
+sqlite3_test_control SQLITE_TESTCTRL_INTERNAL_FUNCTIONS db
+do_execsql_test 15.0 {
+  CREATE TABLE t1(x REAL);
+  INSERT INTO t1(x) VALUES(5.0) RETURNING x, affinity(x);
+} {5.0 real}
+do_execsql_test 15.1 {
+  UPDATE t1 SET x=x+1 RETURNING x, affinity(x);
+} {6.0 real}
+do_execsql_test 15.2 {
+  DELETE FROM t1 RETURNING x, affinity(x);
+} {6.0 real}
+
+# 2022-02-28 Forum post https://sqlite.org/forum/forumpost/595e132f71
+# RETURNING with the xfer optimization
+#
+reset_db
+do_execsql_test 16.0 {
+  CREATE TABLE t1(a,b,c);
+  INSERT INTO t1 VALUES(1,2,3),('a','b','c');
+  CREATE TEMP TABLE t2(x,y,z);
+  INSERT INTO t2 SELECT * FROM t1 RETURNING *;
+} {1 2 3 a b c}
+do_execsql_test 16.1 {
+  SELECT * FROM t2;
+} {1 2 3 a b c}
+
+
+foreach {tn temp} {
+  1 ""
+  2 TEMP
+} {
+  reset_db
+  do_execsql_test 17.$tn.0 "
+    CREATE $temp TABLE foo (
+      fooid INTEGER PRIMARY KEY,
+      fooval INTEGER NOT NULL UNIQUE,
+      refcnt INTEGER NOT NULL DEFAULT 1
+    );
+  "
+  do_execsql_test 17.$tn.1 {
+    INSERT INTO foo (fooval) VALUES (17), (4711), (17)
+      ON CONFLICT DO
+      UPDATE SET refcnt = refcnt+1
+    RETURNING fooid;
+  } {
+    1 2 1
+  }
+}
+
+# 2022-01-13 https://sqlite.org/forum/forumpost/d010a26798
+#
+reset_db
+do_execsql_test 17.0 {
+  CREATE TABLE bug(id INTEGER PRIMARY KEY NOT NULL, x);
+  INSERT INTO bug(id,x) VALUES(20, NULL);
+  UPDATE bug SET x=NULL WHERE id = 20 RETURNING quote(x), x IS NULL;
+} {NULL 1}
+
+# 2023-03-08 https://sqlite.org/forum/forumpost/f5a2b1db87
+# NULL pointer dereference following an error.
+#
+do_execsql_test 18.0 {
+  CREATE TABLE v0(c1 INT);
+  CREATE VIEW view_2(c1) AS SELECT CASE WHEN c1 COLLATE TRUE THEN TRUE ELSE TRUE END FROM v0;
+  CREATE TRIGGER x1 INSTEAD OF INSERT ON view_2 BEGIN SELECT true; END;
+}
+do_catchsql_test 18.1 {
+  INSERT INTO view_2 DEFAULT VALUES RETURNING *;
+} {1 {no such collation sequence: TRUE}}
+
+# 2023-03-16 
+# https://sqlite.org/forum/forumpost/c99d6e0329
+# ticket d15b3a4ea901ef0d
+# ticket 89d259d45b855a0d
+#
+# A RETURNING clause on an IF NOT EXISTS trigger does not generate
+# an error if the trigger already exists.
+#
+do_execsql_test 19.0 {
+  DROP TABLE IF EXISTS t1;CREATE TABLE t1(a);
+  CREATE TRIGGER r1 AFTER UPDATE ON t1 BEGIN VALUES(0); END;
+} {}
+do_catchsql_test 19.1 {
+  CREATE TRIGGER IF NOT EXISTS r1 AFTER DELETE ON t1 BEGIN
+    INSERT  INTO t1(a) VALUES (1) RETURNING FALSE;
+    INSERT  INTO t1(a) VALUES (2) RETURNING TRUE;
+  END;
+} {0 {}}
+
+# 2024-04-24
+# https://sqlite.org/forum/forumpost/2c83569ce8945d39
+#
+# If the RETURNING clause includes subqueries that reference the
+# table being modified, make sure that the subqueries are identified
+# as correlated so that the results are recomputed after each step
+# instead of being computed once and reused.
+#
+reset_db
+db null N
+do_execsql_test 20.1 {
+  CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+  INSERT INTO t1 VALUES(1,10),(2,20),(3,30),(4,40),(6,60),(8,80);
+  BEGIN;
+  DELETE FROM t1 WHERE a<>3
+    RETURNING a,
+              (SELECT min(a) FROM t1),
+              (SELECT max(a) FROM t1),
+              (SELECT round(avg(a),2) FROM t1);
+  ROLLBACK;
+} {
+  1 2 8 4.6
+  2 3 8 5.25
+  4 3 8 5.67
+  6 3 8 5.5
+  8 3 3 3.0
+}
+do_execsql_test 20.2 {
+  BEGIN;
+  DELETE FROM t1
+    RETURNING a,
+              (SELECT min(a) FROM t1),
+              (SELECT max(a) FROM t1),
+              (SELECT round(avg(a),2) FROM t1);
+  ROLLBACK;
+} {
+  1 2 8 4.6
+  2 3 8 5.25
+  3 4 8 6.0
+  4 6 8 7.0
+  6 8 8 8.0
+  8 N N N
+}
+do_execsql_test 20.3 {
+  BEGIN;
+  DELETE FROM t1
+    RETURNING a,
+              (SELECT min(t2.a)+t1.a*100 FROM t1 AS t2),
+              (SELECT max(t2.a)+t1.a*100 FROM t1 AS t2),
+              (SELECT round(avg(t2.a),2)+t1.a*100 FROM t1 AS t2);
+  ROLLBACK;
+} {
+  1 102 108 104.6
+  2 203 208 205.25
+  3 304 308 306.0
+  4 406 408 407.0
+  6 608 608 608.0
+  8 N N N
+}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 21.0 {
+  PRAGMA writable_schema=ON;
+  INSERT INTO sqlite_schema DEFAULT VALUES RETURNING sqlite_schema.name;
+} {{}}
+
+do_execsql_test 21.1 {
+  INSERT INTO sqlite_temp_schema DEFAULT VALUES RETURNING sqlite_temp_schema.name;
+} {{}}
+
+#-------------------------------------------------------------------------
+reset_db 
+do_execsql_test 22.0 {
+  PRAGMA writable_schema=ON;
+  CREATE TABLE xyz (a);
+}
+do_catchsql_test 22.1 {
+  INSERT INTO sqlite_temp_schema DEFAULT VALUES 
+    RETURNING
+    (SELECT * FROM xyz AS sqlite_master WHERE a=sqlite_master.name);
+} {1 {no such column: sqlite_master.name}}
+
+
+finish_test

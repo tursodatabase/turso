@@ -52,7 +52,7 @@ fn pump_step(stmt: &mut Statement, pager: &Pager) -> Result<StepOutcome> {
         match stmt.step()? {
             StepResult::Row => return Ok(StepOutcome::Row),
             StepResult::Done => return Ok(StepOutcome::Done),
-            StepResult::IO | StepResult::Yield => pager.io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => pager.io.step()?,
             StepResult::Interrupt | StepResult::Busy => return Err(LimboError::Busy),
         }
     }
@@ -238,7 +238,7 @@ fn check_column_writable(
         || table.unique_sets.iter().any(|set| {
             set.columns
                 .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case(col_name))
+                .any(|c| c.name.eq_ignore_ascii_case(col_name))
         });
     if indexed {
         return Err(LimboError::InternalError(
@@ -340,6 +340,10 @@ impl Connection {
         let program = build_blob_program(self, table_ref, root, record_column, rowid, read_write)?;
         let pager = self.get_pager();
         let mut stmt = Statement::new(program, pager.clone(), QueryMode::Normal, 0);
+        // Excluded from the explicit-checkpoint guard's active-statement
+        // count: the handle parks at its row for its whole lifetime, and an
+        // open blob handle must not block checkpointing until it is closed.
+        stmt.mark_as_blob_handle();
         // Step to the "ready" row: the cursor is open and positioned on the row, and
         // the row carries the value's byte length (BlobLen), which also validated
         // that the value is byte-addressable (TEXT or BLOB, not null/integer/real).

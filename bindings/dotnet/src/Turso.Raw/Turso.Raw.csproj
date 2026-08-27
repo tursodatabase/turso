@@ -6,19 +6,32 @@
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
-        <Title>Turso Native Interop</Title>
-        <Description>Native interop and runtime assets used by the Turso ADO.NET provider.</Description>
+        <PackageId>Turso.Data.Native</PackageId>
+        <Title>Turso Native Runtime</Title>
+        <Description>Precompiled native runtime libraries and build support shared by Turso .NET providers.</Description>
         <Authors>Turso authors</Authors>
-        <PackageTags>turso;sqlite;database;native;interop</PackageTags>
+        <PackageTags>turso;database;native;runtime</PackageTags>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
         <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
         <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
         <RepositoryType>git</RepositoryType>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <NoWarn>$(NoWarn);1591</NoWarn>
         <RequireNativeAssetsForPack>true</RequireNativeAssetsForPack>
-        <IsPackable>false</IsPackable>
+        <IncludeBuildOutput>false</IncludeBuildOutput>
+        <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+        <IsPackable>true</IsPackable>
     </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="README.md"
+              Pack="true"
+              PackagePath="README.md" />
+        <None Include="buildTransitive\Turso.Data.Native.targets"
+              Pack="true"
+              PackagePath="buildTransitive\Turso.Data.Native.targets" />
+    </ItemGroup>
 
     <ItemGroup Condition="'$(Configuration)'=='Debug'">
         <None Include="..\..\rs_compiled\x86_64-pc-windows-msvc\debug\turso_sdk_kit.dll"
@@ -338,26 +351,26 @@
     <Target Name="ValidateNativeAssetsForPack" BeforeTargets="Pack"
             Condition="'$(Configuration)'=='Release' and '$(RequireNativeAssetsForPack)'=='true'">
         <Error Condition="!Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_sdk_kit.dll') and !Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.dll')"
-               Text="Missing win-x64 native asset. Build turso_sdk_kit.dll before packing Turso.Raw." />
+               Text="Missing win-x64 native asset. Build turso_sdk_kit.dll before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release\turso_sdk_kit.dll') and !Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\turso_sdk_kit.dll')"
-               Text="Missing win-arm64 native asset. Build turso_sdk_kit.dll before packing Turso.Raw." />
+               Text="Missing win-arm64 native asset. Build turso_sdk_kit.dll before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.so')"
-               Text="Missing linux-x64 native asset. Build libturso_sdk_kit.so before packing Turso.Raw." />
+               Text="Missing linux-x64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release-official\libturso_sdk_kit.so')"
-               Text="Missing linux-arm64 native asset. Build libturso_sdk_kit.so before packing Turso.Raw." />
+               Text="Missing linux-arm64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\aarch64-linux-android\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\aarch64-linux-android\release-official\libturso_sdk_kit.so')"
-               Text="Missing android-arm64 native asset. Build libturso_sdk_kit.so before packing Turso.Raw." />
+               Text="Missing android-arm64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\armv7-linux-androideabi\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\armv7-linux-androideabi\release-official\libturso_sdk_kit.so')"
-               Text="Missing android-arm native asset. Build libturso_sdk_kit.so before packing Turso.Raw." />
+               Text="Missing android-arm native asset. Build libturso_sdk_kit.so before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\x86_64-linux-android\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\x86_64-linux-android\release-official\libturso_sdk_kit.so')"
-               Text="Missing android-x64 native asset. Build libturso_sdk_kit.so before packing Turso.Raw." />
+               Text="Missing android-x64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\i686-linux-android\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\i686-linux-android\release-official\libturso_sdk_kit.so')"
-               Text="Missing android-x86 native asset. Build libturso_sdk_kit.so before packing Turso.Raw." />
+               Text="Missing android-x86 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\x86_64-apple-darwin\release\libturso_sdk_kit.dylib') and !Exists('..\..\rs_compiled\x86_64-apple-darwin\release-official\libturso_sdk_kit.dylib')"
-               Text="Missing osx-x64 native asset. Build libturso_sdk_kit.dylib before packing Turso.Raw." />
+               Text="Missing osx-x64 native asset. Build libturso_sdk_kit.dylib before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\aarch64-apple-darwin\release\libturso_sdk_kit.dylib') and !Exists('..\..\rs_compiled\aarch64-apple-darwin\release-official\libturso_sdk_kit.dylib')"
-               Text="Missing osx-arm64 native asset. Build libturso_sdk_kit.dylib before packing Turso.Raw." />
+               Text="Missing osx-arm64 native asset. Build libturso_sdk_kit.dylib before packing Turso.Data.Native." />
         <Error Condition="!Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\Info.plist')"
-               Text="Missing iOS framework asset. Build libturso_sdk_kit.xcframework before packing Turso.Raw." />
+               Text="Missing iOS framework asset. Build libturso_sdk_kit.xcframework before packing Turso.Data.Native." />
     </Target>
 </Project>

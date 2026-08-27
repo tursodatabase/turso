@@ -1,6 +1,7 @@
-use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
+use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
+use std::ops::Range;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -40,9 +41,10 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
-    PreparedProgram, Program,
+    affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
+    PrepareContext, PreparedProgram, Program,
 };
+use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
 
@@ -190,6 +192,42 @@ impl DmlColumnContext {
     }
 }
 
+enum BuilderQueryMode {
+    Normal,
+    Explain,
+    ExplainQueryPlan {
+        format: ast::EqpFormat,
+        current_parent_idx: Option<usize>,
+    },
+}
+
+impl BuilderQueryMode {
+    const fn new(query_mode: QueryMode) -> Self {
+        match query_mode {
+            QueryMode::Normal => Self::Normal,
+            QueryMode::Explain => Self::Explain,
+            QueryMode::ExplainQueryPlan { format } => Self::ExplainQueryPlan {
+                format,
+                current_parent_idx: None,
+            },
+        }
+    }
+
+    const fn query_mode(&self) -> QueryMode {
+        match self {
+            Self::Normal => QueryMode::Normal,
+            Self::Explain => QueryMode::Explain,
+            Self::ExplainQueryPlan { format, .. } => {
+                QueryMode::ExplainQueryPlan { format: *format }
+            }
+        }
+    }
+
+    const fn is_explain_query_plan(&self) -> bool {
+        matches!(self, Self::ExplainQueryPlan { .. })
+    }
+}
+
 pub struct ProgramBuilder {
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
@@ -206,8 +244,7 @@ pub struct ProgramBuilder {
     /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
     /// position, even after `emit_constant_insns` reorders the program.
     label_to_resolved_offset: Vec<Option<InsnReference>>,
-    // map of instruction index to manual comment (used in EXPLAIN only)
-    comments: Vec<(InsnReference, &'static str)>,
+    explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
@@ -255,20 +292,20 @@ pub struct ProgramBuilder {
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
     /// The mode in which the query is being executed.
-    query_mode: QueryMode,
+    mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
     /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
+    free_register_ranges: Vec<Range<usize>>,
     next_free_cursor_id: usize,
+    free_cursor_ids: Vec<usize>,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
     start_offset: BranchOffset,
-    /// Current parent explain address, if any.
-    current_parent_explain_idx: Option<usize>,
     pub(crate) reg_result_cols_start: Option<usize>,
     pub resolve_type: ResolveType,
     /// When set, all triggers fired from this program should use this conflict resolution.
@@ -544,13 +581,15 @@ impl CursorType {
 pub enum QueryMode {
     Normal,
     Explain,
-    ExplainQueryPlan,
+    ExplainQueryPlan { format: ast::EqpFormat },
 }
 
 impl QueryMode {
     pub const fn new(cmd: &ast::Cmd) -> Self {
         match cmd {
-            ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
+            ast::Cmd::ExplainQueryPlan { format, .. } => {
+                QueryMode::ExplainQueryPlan { format: *format }
+            }
             ast::Cmd::Explain(_) => QueryMode::Explain,
             ast::Cmd::Stmt(_) => QueryMode::Normal,
         }
@@ -579,12 +618,12 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid allocating a String if we are not in explain mode.
+/// because we want to avoid building the [EqpDetail] if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
-        if let $crate::QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
-            $builder.emit_explain($push, $detail);
+        if let $crate::QueryMode::ExplainQueryPlan { .. } = $builder.get_query_mode() {
+            $builder.emit_explain_should_not_be_called_directly($push, $detail);
         }
     };
 }
@@ -599,6 +638,8 @@ impl ProgramBuilder {
             .expect("variable index must be non-zero");
         if let Some(name) = variable.name.as_deref() {
             self.parameters.push_named_at(name, index);
+        } else if variable.numbered {
+            self.parameters.push_numbered(index);
         } else {
             self.parameters.push_index(index);
         }
@@ -659,13 +700,15 @@ impl ProgramBuilder {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
+            free_register_ranges: Vec::new(),
             next_free_cursor_id: 0,
+            free_cursor_ids: Vec::new(),
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
-            comments: Vec::new(),
+            explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
@@ -681,8 +724,7 @@ impl ProgramBuilder {
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
-            query_mode,
-            current_parent_explain_idx: None,
+            mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
@@ -752,6 +794,30 @@ impl ProgramBuilder {
     /// Check whether a name refers to a CTE currently being planned.
     pub fn is_cte_being_defined(&self, name: &str) -> bool {
         self.ctes_being_defined.iter().any(|n| n == name)
+    }
+
+    /// Hide CTEs being defined whose names an inner WITH clause redefines:
+    /// the inner definitions shadow the outer names for that lexical scope,
+    /// so references to them are not circular. Returns the hidden names for
+    /// [Self::unmask_shadowed_ctes_being_defined].
+    pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
+        let mut masked = Vec::new();
+        self.ctes_being_defined.retain(|name| {
+            if shadowing_names.contains(name) {
+                masked.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        masked
+    }
+
+    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
+    /// their shadowing scope ends. Membership is all that matters for the
+    /// circular-reference check, so restore order is irrelevant.
+    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
+        self.ctes_being_defined.extend(masked);
     }
 
     /// Temporarily take the CTE-being-defined stack (e.g. during view
@@ -923,16 +989,66 @@ impl ProgramBuilder {
         self.constant_spans.truncate(idx);
     }
 
-    pub const fn alloc_register(&mut self) -> usize {
-        let reg = self.next_free_register;
-        self.next_free_register += 1;
-        reg
+    pub fn alloc_register(&mut self) -> usize {
+        self.alloc_registers(1)
     }
 
-    pub const fn alloc_registers(&mut self, amount: usize) -> usize {
+    pub fn alloc_registers(&mut self, amount: usize) -> usize {
+        if amount == 0 {
+            return self.next_free_register;
+        }
+        if let Some(index) = self
+            .free_register_ranges
+            .iter()
+            .position(|range| range.len() >= amount)
+        {
+            let reg = self.free_register_ranges[index].start;
+            self.free_register_ranges[index].start += amount;
+            if self.free_register_ranges[index].is_empty() {
+                self.free_register_ranges.remove(index);
+            }
+            return reg;
+        }
         let reg = self.next_free_register;
         self.next_free_register += amount;
         reg
+    }
+
+    /// Allow later code to use registers that a removed plan had reserved.
+    pub(crate) fn release_registers(&mut self, start: usize, amount: usize) {
+        if amount == 0 {
+            return;
+        }
+        let end = start.checked_add(amount).expect("register range overflow");
+        turso_assert!(start > 0 && end <= self.next_free_register);
+        self.free_register_ranges.push(start..end);
+        self.free_register_ranges
+            .sort_unstable_by_key(|range| range.start);
+
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(self.free_register_ranges.len());
+        for range in self.free_register_ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                turso_assert!(last.end <= range.start, "register range released twice");
+                if last.end == range.start {
+                    last.end = range.end;
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        self.free_register_ranges = merged;
+
+        while self
+            .free_register_ranges
+            .last()
+            .is_some_and(|range| range.end == self.next_free_register)
+        {
+            let range = self
+                .free_register_ranges
+                .pop()
+                .expect("last register range was present");
+            self.next_free_register = range.start;
+        }
     }
 
     /// Returns the next register that will be allocated by alloc_register/alloc_registers.
@@ -1009,11 +1125,40 @@ impl ProgramBuilder {
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
+        if let Some(cursor) = self.free_cursor_ids.pop() {
+            self.cursor_ref[cursor] = (key, cursor_type);
+            return cursor;
+        }
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
         turso_assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
+    }
+
+    /// Allow later code to use a cursor that a removed plan had reserved.
+    pub(crate) fn release_cursor_id(&mut self, cursor_id: usize) {
+        turso_assert!(cursor_id < self.next_free_cursor_id);
+        turso_assert!(!self.free_cursor_ids.contains(&cursor_id));
+
+        if cursor_id + 1 == self.next_free_cursor_id {
+            self.cursor_ref.pop();
+            self.next_free_cursor_id -= 1;
+            while let Some(index) = self
+                .free_cursor_ids
+                .iter()
+                .position(|id| *id + 1 == self.next_free_cursor_id)
+            {
+                self.free_cursor_ids.remove(index);
+                self.cursor_ref.pop();
+                self.next_free_cursor_id -= 1;
+            }
+            return;
+        }
+
+        self.free_cursor_ids.push(cursor_id);
+        self.free_cursor_ids
+            .sort_unstable_by(|left, right| right.cmp(left));
     }
 
     pub fn add_pragma_result_column(&mut self, col_name: String) {
@@ -1038,7 +1183,91 @@ impl ProgramBuilder {
         if matches!(insn, Insn::Function { .. }) {
             self.emitted_function_call = true;
         }
+        if let Insn::Column {
+            cursor_id,
+            column,
+            dest,
+            default,
+        } = insn
+        {
+            self.emit_column_maybe_fused(cursor_id, column, dest, default);
+            return;
+        }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
+    /// or `ColumnRange` on the same cursor when both the column index and the destination register
+    /// are exactly consecutive and no label is set to target the current opcode.
+    fn emit_column_maybe_fused(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+        default: Option<Value>,
+    ) {
+        if self.column_run_fusable(cursor_id) && !self.label_targets_next_insn() {
+            if let Some((prev_insn, _)) = self.insns.last_mut() {
+                match prev_insn {
+                    Insn::Column {
+                        cursor_id: prev_cursor,
+                        column: prev_column,
+                        dest: prev_dest,
+                        default: prev_default,
+                    } if *prev_cursor == cursor_id
+                        && column == *prev_column + 1
+                        && dest == *prev_dest + 1 =>
+                    {
+                        let defaults = vec![prev_default.take(), default];
+                        *prev_insn = Insn::ColumnRange {
+                            cursor_id,
+                            start_column: *prev_column,
+                            dest: *prev_dest,
+                            defaults,
+                        };
+                        return;
+                    }
+                    Insn::ColumnRange {
+                        cursor_id: prev_cursor,
+                        start_column,
+                        dest: prev_dest,
+                        defaults,
+                    } if *prev_cursor == cursor_id
+                        && column == *start_column + defaults.len()
+                        && dest == *prev_dest + defaults.len() =>
+                    {
+                        defaults.push(default);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.insns.push((
+            Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                default,
+            },
+            self.insns.len(),
+        ));
+    }
+
+    fn column_run_fusable(&self, cursor_id: CursorID) -> bool {
+        self.cursor_ref
+            .get(cursor_id)
+            .map(|(_, cursor_type)| cursor_type.accepts_column_range_fusing())
+            .unwrap_or(false)
+    }
+
+    fn label_targets_next_insn(&self) -> bool {
+        let Some(last) = self.insns.len().checked_sub(1) else {
+            return false;
+        };
+        let last = last as u32;
+        self.label_to_resolved_offset.contains(&Some(last))
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -1114,40 +1343,85 @@ impl ProgramBuilder {
     }
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
-        if let QueryMode::Explain | QueryMode::ExplainQueryPlan = self.query_mode {
-            self.comments.push((insn_index.as_offset_int(), comment));
+        if let BuilderQueryMode::Explain | BuilderQueryMode::ExplainQueryPlan { .. } = self.mode {
+            self.explain
+                .comments
+                .push((insn_index.as_offset_int(), comment));
         }
     }
 
     pub const fn get_query_mode(&self) -> QueryMode {
-        self.query_mode
+        self.mode.query_mode()
     }
 
-    /// use emit_explain macro instead, because we don't want to allocate
-    /// String if we are not in explain mode
-    pub fn emit_explain(&mut self, push: bool, detail: String) {
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            self.emit_insn(Insn::Explain {
-                p1: self.insns.len(),
-                p2: self.current_parent_explain_idx,
-                detail,
-            });
-            if push {
-                self.current_parent_explain_idx = Some(self.insns.len() - 1);
-            }
+    /// Prefer calling the emit_explain! macro instead.
+    pub fn emit_explain_should_not_be_called_directly(&mut self, push: bool, detail: EqpDetail) {
+        let BuilderQueryMode::ExplainQueryPlan {
+            current_parent_idx, ..
+        } = self.mode
+        else {
+            return;
+        };
+        self.emit_insn(Insn::Explain {
+            p1: self.insns.len(),
+            p2: current_parent_idx,
+            detail: Box::new(detail),
+        });
+        if push {
+            let emitted = self.insns.len() - 1;
+            *self.current_parent_idx_mut() = Some(emitted);
         }
     }
 
-    pub fn pop_current_parent_explain(&mut self) {
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            if let Some(current) = self.current_parent_explain_idx {
-                let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
-                    unreachable!("current_parent_explain_idx must point to an Explain insn");
-                };
-                self.current_parent_explain_idx = *p2;
+    pub fn with_cte_materialization_eqp<T>(
+        &mut self,
+        cte_id: usize,
+        name: &str,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let insns_start = self.insns.len();
+        let emitted = emit(self)?;
+        if self.mode.is_explain_query_plan() {
+            let node_ids: Vec<usize> = (insns_start..self.insns.len())
+                .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
+                .collect();
+            if !node_ids.is_empty() {
+                self.explain
+                    .cte_materializations
+                    .push(EqpCteMaterialization {
+                        cte_id,
+                        name: name.to_string(),
+                        node_ids,
+                    });
             }
-        } else {
-            turso_debug_assert!(self.current_parent_explain_idx.is_none());
+        }
+        Ok(emitted)
+    }
+
+    pub fn pop_current_parent_explain(&mut self) {
+        let BuilderQueryMode::ExplainQueryPlan {
+            current_parent_idx: Some(current),
+            ..
+        } = self.mode
+        else {
+            return;
+        };
+        let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
+            unreachable!("current_parent_idx must point to an Explain insn");
+        };
+        let grandparent = *p2;
+        *self.current_parent_idx_mut() = grandparent;
+    }
+
+    /// Panics if `self.mode` is not `ExplainQueryPlan`.
+    fn current_parent_idx_mut(&mut self) -> &mut Option<usize> {
+        match &mut self.mode {
+            BuilderQueryMode::ExplainQueryPlan {
+                current_parent_idx, ..
+            } => current_parent_idx,
+            BuilderQueryMode::Normal | BuilderQueryMode::Explain => {
+                unreachable!("caller must check EXPLAIN QUERY PLAN mode first")
+            }
         }
     }
 
@@ -1207,14 +1481,9 @@ impl ProgramBuilder {
             }
         }
 
-        for (offset, _) in self.comments.iter_mut() {
-            *offset = old_to_new[*offset as usize] as u32;
-        }
+        self.explain.remap_insn_indices(&old_to_new);
 
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            self.current_parent_explain_idx =
-                self.current_parent_explain_idx.map(|old| old_to_new[old]);
-
+        if self.mode.is_explain_query_plan() {
             for i in 0..self.insns.len() {
                 let (Insn::Explain { p2, .. }, _) = &self.insns[i] else {
                     continue;
@@ -1229,6 +1498,9 @@ impl ProgramBuilder {
                 *p1 = i;
                 *p2 = new_p2;
             }
+
+            let current_parent_idx = self.current_parent_idx_mut();
+            *current_parent_idx = current_parent_idx.map(|old| old_to_new[old]);
         }
     }
 
@@ -1420,6 +1692,9 @@ impl ProgramBuilder {
                     ..
                 } => {
                     resolve(target_pc_when_reentered, "Once")?;
+                }
+                Insn::ResetOnce { region_end, .. } => {
+                    resolve(region_end, "ResetOnce")?;
                 }
                 Insn::Prev { pc_if_prev, .. } => {
                     resolve(pc_if_prev, "Prev")?;
@@ -1835,6 +2110,7 @@ impl ProgramBuilder {
         self.emit_insn(Insn::Next {
             cursor_id,
             pc_if_next: loop_start,
+            fullscan: false,
         });
         self.preassign_label_to_next_insn(loop_end);
     }
@@ -1996,7 +2272,7 @@ impl ProgramBuilder {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
-            comments: self.comments,
+            explain: self.explain,
             parameters: self.parameters,
             change_cnt_on,
             readonly: self.flags.readonly(),
@@ -2026,5 +2302,21 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+}
+
+pub(crate) trait CursorTypeExt {
+    fn accepts_column_range_fusing(&self) -> bool;
+}
+
+impl CursorTypeExt for CursorType {
+    fn accepts_column_range_fusing(&self) -> bool {
+        matches!(
+            self,
+            CursorType::BTreeTable(_)
+                | CursorType::BTreeIndex(_)
+                | CursorType::Pseudo(_)
+                | CursorType::Sorter
+        )
     }
 }

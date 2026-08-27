@@ -16,7 +16,6 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
-    use tempfile::TempDir;
     use turso_core::{ColumnTypeInfo, ColumnTypeKind, Statement};
 
     /// Helper: open a fresh DB with custom types + STRICT support enabled.
@@ -25,9 +24,11 @@ mod tests {
     /// same opt — every test that exercises the rich type-info path uses
     /// this constructor.
     fn fresh_db_with_custom_types(name: &str) -> TempDatabase {
-        let path = TempDir::new().unwrap().keep().join(name);
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
-        TempDatabase::new_with_existent_with_opts(&path, opts)
+        TempDatabase::builder()
+            .with_db_name(name)
+            .with_opts(opts)
+            .build()
     }
 
     /// Unwrap `Result<Option<ColumnTypeInfo>>` down to `ColumnTypeInfo`,
@@ -299,6 +300,78 @@ mod tests {
         // Concat is always TEXT.
         let concat = conn.prepare("SELECT 'hello' || ' world'").unwrap();
         assert_eq!(expect_info(&concat, 0).declared_name, "TEXT");
+    }
+
+    /// Each unary operator, checked against what SQLite's `typeof()` actually
+    /// reports. The three behaviours are distinct and none of them is "return
+    /// the operand's type unchanged":
+    ///
+    /// * `NOT` / `~` are INTEGER for every operand — `OP_Not` and `OP_BitNot`
+    ///   unconditionally write an integer register.
+    /// * `-` is always numeric: SQLite compiles it to `0 - x` (`OP_Subtract`),
+    ///   so a TEXT operand comes back numeric, not TEXT. INTEGER and REAL
+    ///   operands keep their type; anything else is numeric but not statically
+    ///   resolvable to one or the other (`typeof(-'abc')` is `integer` while
+    ///   `typeof(-'1.5')` is `real`), so NUMERIC is the honest answer.
+    /// * `+` alone is a true no-op — `typeof(+'abc')` is `text`.
+    #[test]
+    fn type_info_for_unary_operators() {
+        let db = fresh_db_with_custom_types("type_info_unary.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT, ratio REAL) STRICT")
+            .unwrap();
+
+        // Every assertion below is `(expression, expected primitive)` with the
+        // SQLite `typeof()` it mirrors noted alongside.
+        let cases: &[(&str, &str)] = &[
+            // NOT is INTEGER regardless of operand type.
+            ("NOT ('a' || 'b')", "INTEGER"), // typeof -> integer
+            ("NOT 1.5", "INTEGER"),          // typeof -> integer
+            ("NOT id", "INTEGER"),           // typeof -> integer
+            ("NOT label", "INTEGER"),        // typeof -> integer
+            // Bitwise NOT is INTEGER regardless of operand type.
+            ("~1.5", "INTEGER"),          // typeof -> integer
+            ("~label", "INTEGER"),        // typeof -> integer
+            ("~('a' || 'b')", "INTEGER"), // typeof -> integer
+            // Unary minus is numeric, never the operand's non-numeric type.
+            ("-42", "INTEGER"),           // typeof -> integer
+            ("-1.5", "REAL"),             // typeof -> real
+            ("-id", "INTEGER"),           // typeof -> integer
+            ("-ratio", "REAL"),           // typeof -> real
+            ("-label", "NUMERIC"),        // typeof -> integer or real, by value
+            ("-('a' || 'b')", "NUMERIC"), // typeof -> integer
+            // Unary plus preserves the operand exactly.
+            ("+id", "INTEGER"),        // typeof -> integer
+            ("+1.5", "REAL"),          // typeof -> real
+            ("+label", "TEXT"),        // typeof -> text
+            ("+('a' || 'b')", "TEXT"), // typeof -> text
+            // Nesting composes the rules above.
+            ("- -1.5", "REAL"),           // typeof -> real
+            ("NOT NOT label", "INTEGER"), // typeof -> integer
+            ("-(~1.5)", "INTEGER"),       // typeof -> integer
+        ];
+
+        // Collect every mismatch rather than tripping on the first, so a
+        // regression reports the full picture in one run.
+        let mut mismatches = Vec::new();
+        for (expr, expected) in cases {
+            let stmt = conn
+                .prepare(format!("SELECT {expr} FROM t"))
+                .unwrap_or_else(|e| panic!("failed to prepare `SELECT {expr} FROM t`: {e}"));
+            let info = expect_info(&stmt, 0);
+            if info.declared_name != *expected {
+                mismatches.push(format!(
+                    "  {expr:<16} expected {expected}, got {}",
+                    info.declared_name
+                ));
+            }
+            assert_eq!(info.kind, ColumnTypeKind::Builtin, "`{expr}` kind");
+        }
+        assert!(
+            mismatches.is_empty(),
+            "unary operator inference diverges from SQLite:\n{}",
+            mismatches.join("\n")
+        );
     }
 
     /// Expressions whose primitive can't be determined statically — function

@@ -84,15 +84,23 @@ impl CloseLoop {
                                     )
                                 })
                             };
+                            // An unconstrained scan is a full scan no matter
+                            // what it steps: the table, a covering index, or
+                            // the prebuilt ephemeral copy an UPDATE scans.
+                            // SQLite tags any WHERE loop without a constraint;
+                            // constrained loops go through Operation::Search.
+                            let fullscan = true;
                             if *iter_dir == IterationDirection::Backwards {
                                 program.emit_insn(Insn::Prev {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_prev: loop_labels.loop_start,
+                                    fullscan,
                                 });
                             } else {
                                 program.emit_insn(Insn::Next {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
+                                    fullscan,
                                 });
                             }
                         }
@@ -114,11 +122,13 @@ impl CloseLoop {
                                         program.emit_insn(Insn::Prev {
                                             cursor_id: *cursor_id,
                                             pc_if_prev: loop_labels.loop_start,
+                                            fullscan: false,
                                         });
                                     } else {
                                         program.emit_insn(Insn::Next {
                                             cursor_id: *cursor_id,
                                             pc_if_next: loop_labels.loop_start,
+                                            fullscan: false,
                                         });
                                     }
                                 } else {
@@ -141,6 +151,7 @@ impl CloseLoop {
                                 });
                             }
                         }
+                        Scan::RecursiveCteInput => {}
                     }
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
                 }
@@ -184,11 +195,13 @@ impl CloseLoop {
                                 program.emit_insn(Insn::Prev {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_prev: loop_labels.loop_start,
+                                    fullscan: false,
                                 });
                             } else {
                                 program.emit_insn(Insn::Next {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
+                                    fullscan: false,
                                 });
                             }
                         }
@@ -209,6 +222,7 @@ impl CloseLoop {
                                 program.emit_insn(Insn::Next {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
+                                    fullscan: false,
                                 });
                             }
 
@@ -218,6 +232,7 @@ impl CloseLoop {
                             program.emit_insn(Insn::Next {
                                 cursor_id: ephemeral_cursor_id,
                                 pc_if_next: outer_loop_start,
+                                fullscan: false,
                             });
                         }
                     }
@@ -228,6 +243,7 @@ impl CloseLoop {
                     program.emit_insn(Insn::Next {
                         cursor_id: index_cursor_id.unwrap(),
                         pc_if_next: loop_labels.loop_start,
+                        fullscan: false,
                     });
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
                 }
@@ -256,6 +272,7 @@ impl CloseLoop {
                     program.emit_insn(Insn::Next {
                         cursor_id: probe_cursor_id,
                         pc_if_next: loop_labels.loop_start,
+                        fullscan: false,
                     });
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
 
@@ -502,7 +519,10 @@ pub(super) fn emit_autoindex(
         if let Some(columns) = table_columns {
             if let Some(column_def) = columns.get(col.pos_in_table) {
                 if column_def.is_virtual_generated() {
-                    crate::translate::expr::emit_table_column(
+                    // Override the table cursor to the base table, because generated
+                    // columns may need to read from it to compute their expression.
+                    program.set_cursor_override(table_ref_id, table_cursor_id);
+                    let result = crate::translate::expr::emit_table_column(
                         program,
                         table_cursor_id,
                         table_ref_id,
@@ -511,7 +531,9 @@ pub(super) fn emit_autoindex(
                         col.pos_in_table,
                         reg,
                         resolver,
-                    )?;
+                    );
+                    program.clear_cursor_override(table_ref_id);
+                    result?;
                     continue;
                 }
             }
@@ -526,17 +548,22 @@ pub(super) fn emit_autoindex(
     }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(ephemeral_cols_start_reg),
-        count: to_u16(num_regs_to_reserve),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(ephemeral_cols_start_reg),
+        count: to_u32(num_regs_to_reserve),
+        dest_reg: to_u32(record_reg),
         index_name: Some(index.name.clone()),
         affinity_str: affinity_str.map(|s| (**s).clone()),
     });
     // Skip bloom filter for non-binary collations since it uses binary hashing.
+    // Also skip it when any seek key component comes from a NULL-matching `IS`:
+    // the probe treats a NULL key as "definitely absent", which would skip rows
+    // whose key IS NULL, so such a seek never probes — and then building the
+    // filter would be wasted work on every row.
     let use_bloom_filter = index.columns.iter().take(num_seek_keys).all(|col| {
         col.collation
             .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset))
-    }) && seek_def.start.op.eq_only();
+    }) && seek_def.start.op.eq_only()
+        && (0..num_seek_keys).all(|i| !seek_def.is_null_matching_key_component(i));
     if use_bloom_filter {
         program.emit_insn(Insn::FilterAdd {
             cursor_id: index_cursor_id,
@@ -548,12 +575,13 @@ pub(super) fn emit_autoindex(
         cursor_id: index_cursor_id,
         record_reg,
         unpacked_start: Some(ephemeral_cols_start_reg),
-        unpacked_count: Some(num_regs_to_reserve as u16),
+        unpacked_count: Some(num_regs_to_reserve as u32),
         flags: IdxInsertFlags::new().use_seek(false),
     });
     program.emit_insn(Insn::Next {
         cursor_id: table_cursor_id,
         pc_if_next: label_ephemeral_build_loop_start,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_end);
     Ok(AutoIndexResult { use_bloom_filter })

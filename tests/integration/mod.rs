@@ -2,6 +2,7 @@ mod abandoned_create_index;
 mod abandoned_statement_pager;
 mod assert_details;
 mod attach;
+mod checkpoint_crash_atomicity;
 mod common;
 mod conflict_resolution;
 mod custom_types;
@@ -23,7 +24,9 @@ mod statement_reset;
 mod stmt_journal;
 mod stmt_readonly;
 mod storage;
+mod suspended_statement_checkpoint;
 mod trigger;
+mod unreliable_io;
 mod wal;
 
 #[cfg(test)]
