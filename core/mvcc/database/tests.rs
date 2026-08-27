@@ -12723,15 +12723,17 @@ fn test_mvcc_unique_constraint() {
         .expect_err("duplicate unique - first committer wins");
 }
 
-/// Regression test for MVCC concurrent commit yield-spin deadlock.
+/// Regression test for MVCC concurrent commit spinning on a contended
+/// commit lock.
 ///
-/// When the VDBE encounters a yield completion (pager_commit_lock contention),
-/// it must return StepResult::Yield to yield control. Previously, it checked
-/// `finished()` which is always true for yield completions, causing an infinite
-/// spin inside a single step() call — deadlocking cooperative schedulers.
+/// A commit that cannot take pager_commit_lock parks on a wait completion.
+/// step() must hand control back to the caller (StepResult::IO with the
+/// parked completion, or Yield) instead of spinning inside one step() call —
+/// spinning would deadlock cooperative schedulers.
 ///
 /// We simulate lock contention by pre-acquiring pager_commit_lock before
-/// calling COMMIT, then verify step() returns Yield instead of hanging.
+/// calling COMMIT, then verify step() returns without the lock, and that
+/// releasing the lock through the coordinator wakes the parked commit.
 #[test]
 fn test_concurrent_commit_yield_spin() {
     let db = MvccTestDbNoConn::new();
@@ -12749,13 +12751,14 @@ fn test_concurrent_commit_yield_spin() {
     let lock = &mv_store.commit_coordinator.pager_commit_lock;
     assert!(lock.write(), "should acquire lock");
 
-    // Prepare COMMIT — step() should yield (return IO), not spin forever.
+    // COMMIT — step() must return control (parked on the lock), not finish
+    // and not spin forever inside the call.
     let mut stmt = conn.prepare("COMMIT").unwrap();
-    let mut returned_io = false;
+    let mut returned_control = false;
     for _ in 0..100 {
         match stmt.step().unwrap() {
-            crate::StepResult::Yield => {
-                returned_io = true;
+            crate::StepResult::Yield | crate::StepResult::IO => {
+                returned_control = true;
                 break;
             }
             crate::StepResult::Done => break,
@@ -12763,16 +12766,16 @@ fn test_concurrent_commit_yield_spin() {
         }
     }
     assert!(
-        returned_io,
-        "step() should return IO when pager_commit_lock is contended"
+        returned_control,
+        "step() should return control while pager_commit_lock is contended"
     );
 
-    // Release the lock and let the commit finish
-    lock.unlock();
+    // Release the lock through the coordinator so the parked commit wakes.
+    mv_store.commit_coordinator.unlock();
     loop {
         match stmt.step().unwrap() {
             crate::StepResult::Done => break,
-            crate::StepResult::IO => {}
+            crate::StepResult::IO | crate::StepResult::Yield => {}
             _ => {}
         }
     }
@@ -12788,12 +12791,17 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::M
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::Yield),
-        "COMMIT should yield while the commit lock is held",
+        matches!(
+            stmt.step().unwrap(),
+            crate::StepResult::Yield | crate::StepResult::IO
+        ),
+        "COMMIT should return control while the commit lock is held",
     );
 
+    // Dropping the parked commit must not wait for the parked completion
+    // (nobody would ever finish it) and must roll the transaction back.
     drop(stmt);
-    lock.unlock();
+    mv_store.commit_coordinator.unlock();
     conn.close().unwrap();
 }
 
@@ -12825,6 +12833,54 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
         rows.is_empty(),
         "row from abandoned INSERT commit remained visible: {rows:?}",
     );
+    observer.close().unwrap();
+}
+
+/// A commit abandoned after its log record was appended cannot roll back:
+/// later commits chain their CRCs behind the record and a crash would replay
+/// it. The abandonment path must complete the commit in memory instead, so
+/// the in-memory state matches what recovery would rebuild.
+#[test]
+fn test_abandoned_commit_after_log_append_completes_forward() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'appended')")
+        .unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordAppended.point(),
+    ])));
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(stmt.step().unwrap(), crate::StepResult::Yield),
+        "MVCC commit should yield right after the log append",
+    );
+
+    drop(stmt);
+    conn.close().unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(
+        rows.len(),
+        1,
+        "commit abandoned after its log append must still commit",
+    );
+    assert_eq!(rows[0][0].to_string(), "appended");
+
+    // The store must be reusable afterwards: no leaked commit lock, no
+    // stranded Preparing transaction.
+    observer.execute("BEGIN CONCURRENT").unwrap();
+    observer
+        .execute("INSERT INTO t VALUES (2, 'after')")
+        .unwrap();
+    observer.execute("COMMIT").unwrap();
+    let rows = get_rows(&observer, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
     observer.close().unwrap();
 }
 
@@ -18470,11 +18526,21 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
             &self,
             m: LogRecord,
             c: OnSerializationComplete<'_>,
-        ) -> Result<(Completion, u64)> {
+        ) -> Result<crate::mvcc::persistent_storage::LogAppend> {
             if self.arm_log_tx_busy.swap(false, Ordering::AcqRel) {
                 return Err(LimboError::Busy);
             }
             self.inner.log_tx(m, c)
+        }
+        fn log_group_sync(
+            &self,
+            target_offset: u64,
+            sync_type: FileSyncType,
+        ) -> Result<Option<Completion>> {
+            self.inner.log_group_sync(target_offset, sync_type)
+        }
+        fn log_is_poisoned(&self) -> bool {
+            self.inner.log_is_poisoned()
         }
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
@@ -18511,12 +18577,6 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         }
         fn checkpoint_threshold(&self) -> i64 {
             self.inner.checkpoint_threshold()
-        }
-        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
-            self.inner.advance_logical_log_offset_after_success(b)
-        }
-        fn discard_pending_log_write(&self) -> Result<()> {
-            self.inner.discard_pending_log_write()
         }
         fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
             self.inner.restore_logical_log_state_after_recovery(o, c)
@@ -20509,8 +20569,18 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
             &self,
             m: LogRecord,
             c: OnSerializationComplete<'_>,
-        ) -> Result<(Completion, u64)> {
+        ) -> Result<crate::mvcc::persistent_storage::LogAppend> {
             self.inner.log_tx(m, c)
+        }
+        fn log_group_sync(
+            &self,
+            target_offset: u64,
+            sync_type: FileSyncType,
+        ) -> Result<Option<Completion>> {
+            self.inner.log_group_sync(target_offset, sync_type)
+        }
+        fn log_is_poisoned(&self) -> bool {
+            self.inner.log_is_poisoned()
         }
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
@@ -20547,12 +20617,6 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         }
         fn checkpoint_threshold(&self) -> i64 {
             self.inner.checkpoint_threshold()
-        }
-        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
-            self.inner.advance_logical_log_offset_after_success(b)
-        }
-        fn discard_pending_log_write(&self) -> Result<()> {
-            self.inner.discard_pending_log_write()
         }
         fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
             self.inner.restore_logical_log_state_after_recovery(o, c)

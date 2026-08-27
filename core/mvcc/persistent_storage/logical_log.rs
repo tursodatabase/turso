@@ -270,11 +270,8 @@ pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 /// Chain state of a serialized logical-log frame, delivered to
 /// [`OnSerializationComplete`] observers.
 ///
-/// `start_crc32c` is the committed running CRC immediately before this frame
-/// (the chain seed for the frame), and `end_crc32c` is the running CRC after
-/// it. For a deferred write these describe the *pending* chain position: the
-/// log's own running CRC only advances to `end_crc32c` once the commit is
-/// accepted via `advance_offset_after_success`.
+/// `start_crc32c` is the running CRC immediately before this frame (the
+/// chain seed for the frame), and `end_crc32c` is the running CRC after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogTxFrameInfo {
     /// Writer offset of the frame's first byte (the log's `offset` before this
@@ -586,11 +583,9 @@ pub struct LogicalLog {
     /// updated after each committed frame. The next frame's CRC is computed as
     /// `crc32c_append(running_crc, frame_bytes)`.
     pub running_crc: u32,
-    /// Pending CRC from a deferred-offset write. Applied by
-    /// `advance_offset_after_success` so that an abandoned write
-    /// doesn't corrupt the chain.
-    #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
-    pending_running_crc: Option<u32>,
+    /// Group-commit durability bookkeeping; each append's pwrite completion
+    /// reports into it, and committers share fsyncs through it.
+    group_commit: Arc<super::GroupCommitState>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -622,11 +617,16 @@ impl LogicalLog {
             offset: 0,
             header: None,
             running_crc: 0,
-            pending_running_crc: None,
+            group_commit: Arc::new(super::GroupCommitState::default()),
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
         }
+    }
+
+    /// The group-commit state shared with [`super::Storage`].
+    pub(crate) fn group_commit(&self) -> Arc<super::GroupCommitState> {
+        Arc::clone(&self.group_commit)
     }
 
     pub fn new(
@@ -664,13 +664,14 @@ impl LogicalLog {
     /// — optional log header, TX header, optional chunked encryption, CRC
     /// trailer — and pwrites the resulting frame to disk.
     ///
-    /// `advance_offset_immediately`: when true, the writer offset advances right
-    /// after the pwrite (checkpoint path). When false, the offset stays behind
-    /// until `advance_offset_after_success` is called (MVCC commit path).
+    /// The writer offset and CRC chain advance before this returns, so the
+    /// next append can be framed behind this one while its pwrite is still in
+    /// flight. The pwrite's completion reports into the group-commit state,
+    /// which is how committers learn their record is written and a shared
+    /// fsync can cover it.
     fn frame_and_pwrite_tx(
         &mut self,
         mut tx: LogRecord,
-        advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         let op_count = tx.op_count;
@@ -871,30 +872,37 @@ impl LogicalLog {
         // disk: a single pwrite, no shift.
         let buffer = Arc::new(Buffer::new_shared_data(shared));
         let buffer_len = buffer.len();
+        let group = Arc::clone(&self.group_commit);
+        let epoch = group.epoch();
+        let append_start = self.offset;
+        let append_end = self.offset + buffer_len as u64;
         let c = Completion::new_write(move |res: Result<i32, CompletionError>| {
-            let Ok(bytes_written) = res else {
-                return;
+            let bytes_written = match res {
+                Ok(bytes_written) => bytes_written,
+                Err(err) => {
+                    tracing::error!("logical log pwrite failed: {err}");
+                    group.poison();
+                    return;
+                }
             };
             turso_assert!(
                 bytes_written == buffer_len as i32,
                 "wrote({bytes_written}) != expected({buffer_len})"
             );
+            group.append_finished(epoch, append_start, append_end);
         });
 
         let c = self.file.pwrite(self.offset, buffer, c)?;
-        if advance_offset_immediately {
-            self.offset += buffer_len as u64;
-            self.running_crc = crc;
-        } else {
-            self.pending_running_crc = Some(crc);
-        }
+        self.offset = append_end;
+        self.running_crc = crc;
         Ok((c, buffer_len as u64))
     }
 
-    /// Writes a transaction to the log and immediately advances the writer offset.
-    /// Used for checkpoint-initiated writes where no two-phase commit is needed.
+    /// Appends a transaction to the log. Test-only convenience over
+    /// [`LogicalLog::log_tx_append`].
+    #[cfg(test)]
     pub fn log_tx(&mut self, tx: LogRecord) -> Result<Completion> {
-        let (c, _) = self.frame_and_pwrite_tx(tx, true, None)?;
+        let (c, _) = self.frame_and_pwrite_tx(tx, None)?;
         Ok(c)
     }
 
@@ -928,46 +936,40 @@ impl LogicalLog {
         Ok(Some(self.write_header(upgraded_header)?))
     }
 
-    /// Writes a transaction to the log but does NOT advance the writer offset.
-    /// Returns `(completion, bytes_written)`. The caller must call
-    /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
+    /// Appends a transaction to the log; the writer offset advances before
+    /// this returns so the next committer can append behind it.
     ///
     /// If `on_serialization_complete` is provided, it is called with shared
     /// ownership of the framed bytes and the frame's [`LogTxFrameInfo`] chain
     /// state after framing but before the disk write.
-    pub fn log_tx_deferred_offset(
+    pub fn log_tx_append(
         &mut self,
         tx: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
-    ) -> Result<(Completion, u64)> {
-        self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
-    }
-
-    #[aristo::intent("the in-memory log offset advances only after the corresponding frame pwrite has completed durably", id = "aristos:logical_log_inmemory_offset_advances_after_durable_write", verify = "full")]
-    pub fn advance_offset_after_success(&mut self, bytes: u64) {
-        self.offset = self
-            .offset
-            .checked_add(bytes)
-            .expect("logical log offset overflow");
-        self.running_crc = self
-            .pending_running_crc
-            .take()
-            .expect("advance_offset_after_success called without pending deferred write");
-    }
-
-    /// Discard the pending running CRC staged by a deferred write whose
-    /// two-phase commit aborted before the offset advanced.
-    ///
-    /// This must be called on the abort path so no later write chains its
-    /// running CRC from a value staged for a write that never confirmed.
-    pub fn discard_pending_write(&mut self) {
-        self.pending_running_crc = None;
+    ) -> Result<super::LogAppend> {
+        let (completion, bytes) = self.frame_and_pwrite_tx(tx, on_serialization_complete)?;
+        Ok(super::LogAppend {
+            completion,
+            bytes,
+            end_offset: self.offset,
+        })
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("logical_log_sync finish");
         });
+        let c = self.file.sync(completion, sync_type)?;
+        Ok(c)
+    }
+
+    /// `sync` with a caller-provided completion; the group fsync uses this to
+    /// run its bookkeeping when the fsync finishes.
+    pub fn sync_with_completion(
+        &mut self,
+        completion: Completion,
+        sync_type: FileSyncType,
+    ) -> Result<Completion> {
         let c = self.file.sync(completion, sync_type)?;
         Ok(c)
     }
@@ -1024,7 +1026,6 @@ impl LogicalLog {
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
-        self.pending_running_crc = None;
         self.header = Some(header);
 
         let completion = Completion::new_trunc(move |result| {
@@ -1035,6 +1036,7 @@ impl LogicalLog {
         let c = self.file.truncate(0, completion)?;
         self.offset = 0;
         self.max_appended_commit_ts = 0;
+        self.group_commit.reset();
         Ok(c)
     }
 
@@ -1068,7 +1070,6 @@ impl LogicalLog {
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
-        self.pending_running_crc = None;
         self.header = Some(header.clone());
 
         let header_c = self.write_header(header)?;
@@ -1081,6 +1082,7 @@ impl LogicalLog {
             }),
         )?;
         self.offset = 0;
+        self.group_commit.reset();
 
         let mut group = CompletionGroup::new(|_| {});
         group.add(&header_c);
@@ -4805,12 +4807,11 @@ mod tests {
     }
 
     /// What this test checks: Rowid varint encoding/decoding is consistent for negative i64-style
-    /// values, and the deferred-offset write path (log_tx_deferred_offset) does not advance the
-    /// writer offset until advance_offset_after_success is called, after which all frames are
-    /// readable with a valid CRC chain.
+    /// values, and an append (log_tx_append) advances the writer offset before its pwrite
+    /// finishes, after which all frames are readable with a valid CRC chain.
     /// Why this matters: Rowid decoding mismatches would replay to the wrong keys.
-    ///   The MVCC commit path uses deferred writes so an aborted commit can be silently overwritten;
-    ///   the offset must not advance before confirmation.
+    ///   The MVCC commit path appends behind in-flight records (group commit), so the offset
+    ///   must advance at append time.
     #[test]
     fn test_logical_log_rowid_negative_varint_roundtrip() {
         init_tracing();
@@ -4828,8 +4829,9 @@ mod tests {
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 2, true, false, "neg");
         let offset_after_frame2 = log.offset;
 
-        // Frame 3: deferred path — offset must not advance until confirmed.
-        let row3 = generate_simple_string_row((-2).into(), 3, "deferred");
+        // Frame 3: the append advances the offset before its pwrite finishes,
+        // so the next committer can append behind it (group commit).
+        let row3 = generate_simple_string_row((-2).into(), 3, "appended");
         let tx3 = crate::mvcc::database::LogRecord::for_test(
             3,
             &[crate::mvcc::database::RowVersion {
@@ -4844,19 +4846,14 @@ mod tests {
             }],
             None,
         );
-        let (c, bytes_written) = log.log_tx_deferred_offset(tx3, None).unwrap();
-        io.wait_for_completion(c).unwrap();
-
-        assert_eq!(
-            log.offset, offset_after_frame2,
-            "deferred write must not advance offset before advance_offset_after_success"
-        );
-        log.advance_offset_after_success(bytes_written);
+        let append = log.log_tx_append(tx3, None).unwrap();
         assert_eq!(
             log.offset,
-            offset_after_frame2 + bytes_written,
-            "offset must advance by exactly bytes_written after confirmation"
+            offset_after_frame2 + append.bytes,
+            "append must advance the offset by the frame length before the pwrite finishes"
         );
+        assert_eq!(append.end_offset, log.offset);
+        io.wait_for_completion(append.completion).unwrap();
 
         let read_back = read_table_ops(file, &io);
         assert_eq!(read_back.len(), 3);
@@ -4906,9 +4903,9 @@ mod tests {
             }],
             None,
         );
-        let (c, first_len) = log.log_tx_deferred_offset(tx1, Some(&callback)).unwrap();
-        io.wait_for_completion(c).unwrap();
-        log.advance_offset_after_success(first_len);
+        let append = log.log_tx_append(tx1, Some(&callback)).unwrap();
+        let first_len = append.bytes;
+        io.wait_for_completion(append.completion).unwrap();
 
         let tx2 = crate::mvcc::database::LogRecord::for_test(
             2,
@@ -4924,9 +4921,9 @@ mod tests {
             }],
             None,
         );
-        let (c, second_len) = log.log_tx_deferred_offset(tx2, Some(&callback)).unwrap();
-        io.wait_for_completion(c).unwrap();
-        log.advance_offset_after_success(second_len);
+        let append = log.log_tx_append(tx2, Some(&callback)).unwrap();
+        let second_len = append.bytes;
+        io.wait_for_completion(append.completion).unwrap();
 
         let captured = captured.borrow();
         assert_eq!(captured.len(), 2);

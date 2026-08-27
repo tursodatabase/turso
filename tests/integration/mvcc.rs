@@ -71,10 +71,22 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         on_serialization_complete: Option<
             &dyn Fn(turso_core::SharedBufferData, LogTxFrameInfo) -> turso_core::Result<()>,
         >,
-    ) -> turso_core::Result<(turso_core::Completion, u64)> {
+    ) -> turso_core::Result<turso_core::mvcc::persistent_storage::LogAppend> {
         self.used_log_tx
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.inner.log_tx(m, on_serialization_complete)
+    }
+
+    fn log_group_sync(
+        &self,
+        target_offset: u64,
+        sync_type: turso_core::io::FileSyncType,
+    ) -> turso_core::Result<Option<turso_core::Completion>> {
+        self.inner.log_group_sync(target_offset, sync_type)
+    }
+
+    fn log_is_poisoned(&self) -> bool {
+        self.inner.log_is_poisoned()
     }
 
     fn sync(
@@ -127,14 +139,6 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         m: &turso_core::mvcc::database::LogRecord,
     ) -> turso_core::Result<Option<turso_core::Completion>> {
         self.inner.upgrade_header_for_log_tx(m)
-    }
-
-    fn advance_logical_log_offset_after_success(&self, bytes: u64) -> turso_core::Result<()> {
-        self.inner.advance_logical_log_offset_after_success(bytes)
-    }
-
-    fn discard_pending_log_write(&self) -> turso_core::Result<()> {
-        self.inner.discard_pending_log_write()
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
