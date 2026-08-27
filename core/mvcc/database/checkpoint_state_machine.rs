@@ -1772,9 +1772,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         let mut index = next_index;
         let mut processed = 0;
-        // Drop current SkipMap versions only when B-trees are stable (blocking Truncate).
-        let drop_current_if_in_btree = self.lock_states.blocking_checkpoint_lock_held
-            || !self.mvstore.experimental_mvcc_passive_checkpoint;
+        // Rule 3 runs in both modes. Truncate drops a materialized current version
+        // under its blocking lock; Passive retires it instead (see
+        // `RowVersion::retired_at`), which needs one clock timestamp taken before
+        // any version in this batch is retired.
+        let drop_current_if_in_btree = true;
+        let retire_ts = self
+            .mvstore
+            .experimental_mvcc_passive_checkpoint
+            .then(|| self.mvstore.take_retire_ts());
         while index < self.write_set.len() {
             let current = index;
             index += 1;
@@ -1791,13 +1797,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     materialized_frame,
                     snapshot_ts,
                 );
-                let dropped = MvStore::<Clock, A>::gc_version_chain(
+                let dropped = MvStore::<Clock, A>::gc_version_chain_with_retire(
                     &mut versions,
                     lwm,
                     ckpt_max,
                     self.mvstore.experimental_mvcc_passive_checkpoint,
                     min_reader_mark,
                     drop_current_if_in_btree,
+                    retire_ts,
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
             } else {
@@ -1839,8 +1846,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         let mut index = next_index;
         let mut processed = 0;
-        let drop_current_if_in_btree = self.lock_states.blocking_checkpoint_lock_held
-            || !self.mvstore.experimental_mvcc_passive_checkpoint;
+        // Same as the table GC: Rule 3 on, Passive retires (see above).
+        let drop_current_if_in_btree = true;
+        let retire_ts = self
+            .mvstore
+            .experimental_mvcc_passive_checkpoint
+            .then(|| self.mvstore.take_retire_ts());
         while index < self.index_write_set.len() {
             let current = index;
             index += 1;
@@ -1865,13 +1876,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     materialized_frame,
                     snapshot_ts,
                 );
-                let dropped = MvStore::<Clock, A>::gc_version_chain(
+                let dropped = MvStore::<Clock, A>::gc_version_chain_with_retire(
                     &mut versions,
                     lwm,
                     ckpt_max,
                     self.mvstore.experimental_mvcc_passive_checkpoint,
                     min_reader_mark,
                     drop_current_if_in_btree,
+                    retire_ts,
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
             }

@@ -106,11 +106,37 @@ A current version is redundant with the B-tree when `b ≤ ckpt_max` and
 `b < lwm`. We only remove it when it is the **last** version in the chain —
 otherwise superseded versions would hide the B-tree row without providing data.
 
-`drop_current_if_in_btree` controls whether Rule 3 runs:
-- **true** on Truncate Finalize / Truncate incremental
-- **false** on all Passive paths (Finalize `unlink_empty`, mid-Passive write-set
-  GC, incremental) — currents stay as SkipMap cover; write-buffer reads still
-  prefer B-tree for sole materialized currents after publish
+`drop_current_if_in_btree` controls whether Rule 3 runs. It is on for every GC
+path, but the two checkpoint modes act differently when it fires:
+
+- **Truncate** removes the version. Its blocking lock excludes every MVCC
+  transaction during the write phase, so no cursor can be positioned on it.
+- **Passive** cannot remove it: a transaction may have a cursor positioned on
+  that version, and the cursor re-reads the chain on every column fetch — if the
+  version vanished it would return an empty row (that was the "total balance
+  changed" corruption). Passive therefore **retires** the version instead: it
+  stamps it with a fresh clock timestamp (`RowVersion::retired_at`, stored in
+  the spare tag bits of the packed `end`). The version still reads as current
+  (`end() == None`) and stays in the chain. Passive fires Rule 3 only when the
+  version is materialized and every reader's WAL mark can reach it
+  (`materialized_for_readers`) and `b < lwm`.
+
+A retired version is then handled by the visibility predicates
+(`is_visible_to`, `is_btree_invalidating_version`):
+
+- a transaction with `begin_ts <= retired_at` sees it exactly as before, so an
+  already-positioned cursor keeps its row;
+- a transaction with `begin_ts > retired_at` treats it as absent: it neither
+  shows it nor hides the B-tree row, so the row is read from the B-tree, which
+  holds the same state at that transaction's pinned WAL mark.
+
+**Rule 3b** removes a retired version once `retired_at < lwm`, i.e. once every
+transaction that could still see it has ended. With no transaction open this
+happens in the same checkpoint (write-set GC retires, Finalize sweep reclaims),
+so a single writer's version store stays flat across checkpoints. The retire
+timestamp comes from the clock (`MvStore::take_retire_ts`, or the
+`get_timestamp` callback on the inline path), which is what guarantees every
+later `begin_ts` is larger.
 
 Rule 3 also guards recovery versions: `b=0` versions are protected by
 requiring `ckpt_max > 0` (see Recovery below).
@@ -136,10 +162,10 @@ The recovery transaction itself is removed from `txs` at the end of
 ## SkipMap Entry Removal
 
 Truncate Finalize uses `_and_slots` (Rule 3 + unlink). Passive Finalize uses
-`unlink_empty` (history + empty slots, keep currents). Mid-Passive write-set GC
-and incremental leave currents and empty slots so write-set row ids still
-resolve. Writers retry via `*_still_mapped` if an Arc was unlinked; index unlink
-bumps `index_rows_epoch`.
+`unlink_empty` (history + retire currents + unlink empty slots). Mid-Passive
+write-set GC and incremental retire currents but leave empty slots so write-set
+row ids still resolve. Writers retry via `*_still_mapped` if an Arc was
+unlinked; index unlink bumps `index_rows_epoch`.
 
 ### Passive `backfill_floor` publication
 
@@ -148,9 +174,10 @@ Passive Rule 2 needs `materialized_at <= backfill_floor` (`nbackfills`). After
 checkpoint guard until Finalize. On Passive `Busy`, finish without advancing
 `nbackfills`.
 
-Rule 3 is on for Truncate; off for all Passive GC paths. Truncate write-buffer
-reads provide B-tree fallthrough for sole materialized currents; Passive does not
-fall through while currents remain.
+Rule 3 is on for both modes; Passive retires rather than removes (see Rule 3
+above). Truncate write-buffer reads provide B-tree fallthrough for sole
+materialized currents; under Passive a transaction falls through only for
+versions retired before it began.
 
 ## Non-blocking Checkpoint Readiness
 
@@ -166,28 +193,31 @@ guard, under-lock empty-slot drain with writer retry, write-buffer read filter.
 - More soak / concurrent-simulator coverage of Passive GC racing writers on
   empty-slot drain.
 
-### Why Rule 3 cannot simply be turned on for Passive
+### Why Passive retires instead of dropping (history)
 
-This was investigated directly: forcing `drop_current_if_in_btree = true` on
-Passive Finalize (keeping the empty-slot unlink) reproduces real corruption —
-`test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive`
-("row missing from index") and `test_passive_concurrent_transfer_preserves_sum_and_count`
-("total balance changed") both fail. The cause is **not** table/index publish
-skew; it reproduces with one table and no index at all
-(`passive_reader_snapshot_survives_later_write_after_row_versions_gc`). Once
-Rule 3 empties a chain's SkipMap slot, the slot is unlinked entirely. A later,
-unrelated write to that same row inserts a *new* chain with only its own
-(future, invisible) version — a reader whose snapshot predates that write now
-finds "no visible SkipMap version" and falls through to the physical B-tree,
-which the later Passive auto-checkpoint has already overwritten: a
-snapshot-isolation violation. Passive has no equivalent of Truncate's
-`blocking_checkpoint_lock`, which excludes all MVCC transactions for the
-duration of the write phase, so it cannot inherit that guarantee. Making Rule
-3 safe for Passive needs either real page-level MVCC (so B-tree fallthrough is
-isolated per reader) or serializing Passive's physical writes against readers
-for rows whose chain is currently empty — both bigger than a GC-only change.
-See the `gc_version_chain` doc comment in `core/mvcc/database/mod.rs` for the
-full argument.
+Before retirement existed, Passive kept every row's last version forever: the
+version store grew without bound under a single writer, and each checkpoint's
+GC sweep walked a larger store than the last. Simply turning Rule 3 on for
+Passive was tried and corrupted data
+(`test_passive_concurrent_transfer_preserves_sum_and_count`, "total balance
+changed"; `test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive`,
+"row missing from index"). Two separate things had to be true for it to work:
+
+1. **B-tree reads must be snapshot-isolated.** An MVCC transaction takes a WAL
+   read mark at `BEGIN`, and `mvcc_refresh_if_db_changed` must not advance the
+   connection's WAL view while that mark is held; the checkpoint's backfill
+   stops at the lowest reader mark (`determine_max_safe_checkpoint_frame`).
+   With that in place a transaction that falls through to the B-tree reads the
+   page as of its own mark, whatever a later Passive checkpoint wrote.
+2. **A positioned cursor must not lose its version.** The dual cursor re-reads
+   the chain on every column fetch (`read_visible_into_record`); a version
+   removed between positioning and fetch yields an empty row. That is why the
+   version is retired rather than removed: transactions that could have
+   positioned on it still see it, and only transactions that begin afterwards
+   — which never sourced it from the chain — read the B-tree instead.
+
+Rule 3b's `retired_at < lwm` is exactly "no transaction that could see it is
+open", which is the condition under which physical removal is safe.
 
 ## Key Files
 
