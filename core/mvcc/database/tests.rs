@@ -20697,3 +20697,23 @@ fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
     // Now that the reader is gone, Truncate can proceed.
     writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
+
+#[test]
+fn commit_lock_waiter_parks_until_the_holder_releases() {
+    let coordinator = CommitCoordinator::new();
+
+    // First committer takes the lock outright.
+    assert!(coordinator.lock_or_wait().is_none());
+
+    // Second one gets a completion to park on, unfinished while the lock is held.
+    let waiter = coordinator
+        .lock_or_wait()
+        .expect("lock is held, so the caller must be told to wait");
+    assert!(!waiter.finished());
+
+    // Releasing finishes it, and the lock is free again.
+    coordinator.unlock();
+    assert!(waiter.finished());
+    assert!(coordinator.lock_or_wait().is_none());
+    coordinator.unlock();
+}

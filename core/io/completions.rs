@@ -294,7 +294,7 @@ impl Debug for CompletionType {
             Self::Sync(..) => f.debug_tuple("Sync").finish(),
             Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
             Self::Group(..) => f.debug_tuple("Group").finish(),
-            Self::Yield => f.debug_tuple("Yield").finish(),
+            Self::Wait => f.debug_tuple("Wait").finish(),
         }
     }
 }
@@ -305,7 +305,9 @@ pub enum CompletionType {
     Sync(SyncCompletion),
     Truncate(TruncateCompletion),
     Group(GroupCompletion),
-    Yield,
+    /// No I/O behind it: whoever the waiter is waiting for finishes it by
+    /// hand. Used to park on a lock held by another connection.
+    Wait,
 }
 
 impl CompletionInner {
@@ -425,6 +427,14 @@ impl Completion {
     /// allocating memory.
     pub fn new_yield() -> Self {
         Self { inner: None }
+    }
+
+    /// A completion with no I/O behind it. It stays unfinished until someone
+    /// calls `complete` on it, and a waker set on it fires then. This is how
+    /// a transaction parks on a lock another connection holds, instead of
+    /// yielding and being re-polled at once.
+    pub fn new_wait() -> Self {
+        Self::new(CompletionType::Wait)
     }
 
     pub fn wake(&self) {
@@ -554,7 +564,7 @@ impl Completion {
                     g.callback(result);
                     None
                 }
-                CompletionType::Yield => None,
+                CompletionType::Wait => None,
             };
 
             // Use callback error if present, otherwise use the original IO error

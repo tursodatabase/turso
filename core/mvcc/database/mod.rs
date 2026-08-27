@@ -1548,12 +1548,46 @@ pub enum WriteRowState {
 #[derive(Debug)]
 struct CommitCoordinator {
     pager_commit_lock: Arc<TursoRwLock>,
+    /// Transactions parked until the commit lock is released. Yielding
+    /// instead would have each of them re-polled at once, and with more
+    /// committers than cores that spinning starves the thread that drives
+    /// the holder's I/O.
+    commit_lock_waiters: Mutex<Vec<Completion>>,
 }
 
 impl CommitCoordinator {
     fn new() -> Self {
         Self {
             pager_commit_lock: Arc::new(TursoRwLock::new()),
+            commit_lock_waiters: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take the commit lock, or hand back a completion that finishes when
+    /// the holder releases it, so the caller can park on it.
+    fn lock_or_wait(&self) -> Option<Completion> {
+        if self.pager_commit_lock.write() {
+            return None;
+        }
+        let waiter = Completion::new_wait();
+        self.commit_lock_waiters.lock().push(waiter.clone());
+        // The holder may have released between the failed attempt and the
+        // push. Try once more so that release cannot be missed. The entry
+        // left in the list is finished by the next release, which is
+        // harmless.
+        if self.pager_commit_lock.write() {
+            return None;
+        }
+        Some(waiter)
+    }
+
+    /// Release the commit lock and wake everyone parked on it. They all
+    /// retry and one of them wins; the rest park again.
+    fn unlock(&self) {
+        self.pager_commit_lock.unlock();
+        let waiters = std::mem::take(&mut *self.commit_lock_waiters.lock());
+        for waiter in waiters {
+            waiter.complete(0);
         }
     }
 }
@@ -3076,7 +3110,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
-                        self.commit_coordinator.pager_commit_lock.unlock();
+                        self.commit_coordinator.unlock();
                     }
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
@@ -3115,9 +3149,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         .txs
                         .get(&self.tx_id)
                         .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
-                    let locked = self.commit_coordinator.pager_commit_lock.write();
-                    if !locked {
-                        return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+                    if let Some(waiter) = self.commit_coordinator.lock_or_wait() {
+                        return Ok(TransitionResult::Io(IOCompletions(waiter)));
                     }
                     tx.value()
                         .pager_commit_lock_held
@@ -6097,7 +6130,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         let handle_err = || {
             if !already_holds_commit_lock {
-                self.commit_coordinator.pager_commit_lock.unlock();
+                self.commit_coordinator.unlock();
             }
             if !already_exclusive {
                 self.release_exclusive_tx(&tx_id);
@@ -6742,7 +6775,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn unlock_commit_lock_if_held(&self, tx: &Transaction<A>) {
         if tx.pager_commit_lock_held.swap(false, Ordering::AcqRel) {
-            self.commit_coordinator.pager_commit_lock.unlock();
+            self.commit_coordinator.unlock();
         }
     }
 
