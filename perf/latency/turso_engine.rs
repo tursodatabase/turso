@@ -1,5 +1,5 @@
 use crate::{CheckpointMode, Config, Pacer, Run, Sample, TxnMode};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +24,19 @@ pub fn run(config: &Config) -> Run {
     let pacer = Arc::new(Pacer::new(config));
     let restarts = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let checkpointer = config.checkpointer.map(|interval| {
+        let db = db.clone();
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(checkpointer(db, interval, stop))
+        })
+    });
 
     for _ in 0..config.connections {
         let db = db.clone();
@@ -55,6 +68,11 @@ pub fn run(config: &Config) -> Run {
         .collect();
     let elapsed = pacer.elapsed();
 
+    stop.store(true, Ordering::Relaxed);
+    let checkpoints = checkpointer
+        .map(|h| h.join().expect("checkpointer thread panicked"))
+        .unwrap_or_default();
+
     eprintln!(
         "[turso] io backend {}, checkpoint mode {:?}, {} transaction restarts",
         config.io,
@@ -66,7 +84,27 @@ pub fn run(config: &Config) -> Run {
         per_thread,
         overran: pacer.overran(),
         elapsed,
+        checkpoints,
     }
+}
+
+/// Runs a passive checkpoint every `interval` until told to stop, and returns
+/// how long each one took. The writer's auto-checkpoint is turned off in
+/// `setup` when this runs, so this connection is the only one checkpointing.
+async fn checkpointer(db: Database, interval: Duration, stop: Arc<AtomicBool>) -> Vec<Duration> {
+    let conn = db.connect().unwrap();
+    let mut durations = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(interval).await;
+        let started = Instant::now();
+        // Drain the pragma's result row. An error (typically Busy) means this
+        // round could not checkpoint; the next round tries again.
+        if let Ok(mut rows) = conn.query("PRAGMA wal_checkpoint(PASSIVE)", ()).await {
+            while let Ok(Some(_)) = rows.next().await {}
+        }
+        durations.push(started.elapsed());
+    }
+    durations
 }
 
 async fn writer(
@@ -190,6 +228,13 @@ async fn setup(config: &Config) -> Database {
         conn.pragma_update("journal_mode", "mvcc").await.unwrap();
         if let Some(threshold) = config.mvcc_checkpoint_threshold {
             conn.pragma_update("mvcc_checkpoint_threshold", threshold)
+                .await
+                .unwrap();
+        }
+        if config.checkpointer.is_some() {
+            // -1 turns the writer's auto-checkpoint off; the checkpointer
+            // connection does it instead.
+            conn.pragma_update("mvcc_checkpoint_threshold", -1)
                 .await
                 .unwrap();
         }

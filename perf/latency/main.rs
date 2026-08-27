@@ -143,6 +143,15 @@ struct Args {
     mvcc_checkpoint_threshold: Option<i64>,
 
     #[arg(
+        long = "checkpointer",
+        value_name = "MS",
+        help = "Take checkpointing off the writer: turn off its auto-checkpoint and run \
+                PRAGMA wal_checkpoint(PASSIVE) from a separate connection every MS milliseconds. \
+                Applies to both engines"
+    )]
+    checkpointer: Option<u64>,
+
+    #[arg(
         long = "io",
         default_value = "syscall",
         help = "Turso IO backend: syscall or io_uring (Linux only). SQLite ignores this"
@@ -176,6 +185,9 @@ pub struct Config {
     pub io: String,
     pub checkpoint_mode: CheckpointMode,
     pub mvcc_checkpoint_threshold: Option<i64>,
+    /// Interval of the separate checkpointer connection, or `None` to let
+    /// the writer auto-checkpoint on its commit path.
+    pub checkpointer: Option<Duration>,
     /// Time between arrivals, or `None` in closed-loop mode.
     pub period: Option<Duration>,
     pub max_overrun: f64,
@@ -194,6 +206,9 @@ pub struct Run {
     pub overran: bool,
     /// Wall time from the first scheduled arrival to the last commit.
     pub elapsed: Duration,
+    /// How long each run of the separate checkpointer took. Empty without
+    /// `--checkpointer`.
+    pub checkpoints: Vec<Duration>,
 }
 
 /// Hands out transaction slots on a fixed schedule shared by every connection.
@@ -330,6 +345,7 @@ fn main() {
         io: args.io,
         checkpoint_mode: args.checkpoint_mode,
         mvcc_checkpoint_threshold: args.mvcc_checkpoint_threshold,
+        checkpointer: args.checkpointer.map(Duration::from_millis),
         period: if args.closed_loop {
             None
         } else {
@@ -400,6 +416,21 @@ fn report(engine_label: &str, config: &Config, totals: &mut [u64], run: &Run, ta
         quantile(0.999),
         quantile(1.0)
     );
+    if !run.checkpoints.is_empty() {
+        let mut ms: Vec<f64> = run
+            .checkpoints
+            .iter()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .collect();
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[{tag}] checkpointer: {} checkpoints, p50 {:.1}ms  max {:.1}ms  total {:.0}ms",
+            ms.len(),
+            ms[ms.len() / 2],
+            ms[ms.len() - 1],
+            ms.iter().sum::<f64>()
+        );
+    }
     if config.period.is_some() {
         if run.overran {
             eprintln!(
