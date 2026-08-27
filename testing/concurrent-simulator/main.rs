@@ -563,12 +563,13 @@ fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {
         format!("{}/{}", stats.elle_writes, stats.elle_reads)
     } else {
         format!(
-            "{}/{}/{}/{}/{}",
+            "{}/{}/{}/{}/{}/{}",
             stats.inserts,
             stats.updates,
             stats.deletes,
             stats.integrity_checks,
-            stats.sequence_nextvals
+            stats.sequence_nextvals,
+            stats.fts_checks
         )
     }
 }
@@ -578,7 +579,7 @@ fn progress_art(elle_mode: bool) -> [&'static str; 11] {
         if elle_mode {
             "       .             W/R"
         } else {
-            "       .             I/U/D/C/S"
+            "       .             I/U/D/C/S/F"
         },
         "       .             ",
         "       .             ",

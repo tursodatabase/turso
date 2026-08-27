@@ -156,8 +156,10 @@ pub enum Operation {
     AutoincDelete { id: i64 },
     /// Self-differential FTS check: within one statement (one snapshot),
     /// compare the ids `fts_match` returns against a base-table token scan.
-    /// The result must be 0 (empty symmetric difference); the
-    /// `FtsSelfDifferentialProperty` asserts it.
+    /// Returns one row `(symmetric difference size, index present)`; the
+    /// `FtsSelfDifferentialProperty` requires `(0, 1)`. The second column
+    /// matters because `fts_match` has a scalar fallback: without the index
+    /// both sides are table scans and the difference is trivially 0.
     FtsMatchDifferential { token: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
@@ -309,6 +311,7 @@ impl Operation {
                 // is an exact token match — an FTS-free oracle in the same
                 // snapshot as the fts_match probe.
                 let table = crate::workloads::FTS_SIM_TABLE;
+                let index = crate::workloads::FTS_SIM_INDEX;
                 format!(
                     "SELECT \
                        (SELECT count(*) FROM (\
@@ -318,7 +321,9 @@ impl Operation {
                      + (SELECT count(*) FROM (\
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
                           EXCEPT \
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}'))), \
+                       (SELECT count(*) FROM sqlite_schema \
+                          WHERE type = 'index' AND name = '{index}')"
                 )
             }
         }
@@ -452,6 +457,9 @@ impl Operation {
             }
             Operation::AutoincDelete { .. } => {
                 stats.deletes += 1;
+            }
+            Operation::FtsMatchDifferential { .. } => {
+                stats.fts_checks += 1;
             }
             _ => {}
         }

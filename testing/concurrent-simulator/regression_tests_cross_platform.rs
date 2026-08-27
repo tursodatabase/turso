@@ -239,3 +239,119 @@ fn test_dropped_failed_statement_keeps_suspended_sibling_commit_intact() {
         }
     }
 }
+
+/// The FTS workloads must exercise the index, not `fts_match`'s scalar
+/// fallback, and a seeded run must replay: segment ids and index
+/// incarnations are drawn from the seeded IO, so two runs of one seed end
+/// with byte-identical database files. Before the fix the MVCC log of two
+/// same-seed runs differed in every `fts2/chunk/<uuid>` path.
+#[test]
+fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
+    use turso_whopper::operations::Operation;
+    use turso_whopper::properties::{
+        FtsSelfDifferentialProperty, IntegrityCheckProperty, Property,
+    };
+    use turso_whopper::workloads::{
+        BeginWorkload, CommitWorkload, FtsDeleteWorkload, FtsInsertWorkload, FtsMatchWorkload,
+        FtsOptimizeWorkload, FtsUpdateWorkload, RollbackWorkload, Workload, fts_sim_schema,
+    };
+    use turso_whopper::{Stats, Whopper, WhopperOpts};
+
+    fn run(seed: u64) -> (Stats, Vec<(String, Vec<u8>)>) {
+        let workloads: Vec<(u32, Box<dyn Workload>)> = vec![
+            (20, Box::new(FtsInsertWorkload)),
+            (8, Box::new(FtsUpdateWorkload)),
+            (6, Box::new(FtsDeleteWorkload)),
+            (12, Box::new(FtsMatchWorkload)),
+            (2, Box::new(FtsOptimizeWorkload)),
+            (10, Box::new(BeginWorkload)),
+            (8, Box::new(CommitWorkload)),
+            (3, Box::new(RollbackWorkload)),
+        ];
+        let properties: Vec<Box<dyn Property>> = vec![
+            Box::new(IntegrityCheckProperty),
+            Box::new(FtsSelfDifferentialProperty),
+        ];
+        let opts = WhopperOpts {
+            seed: Some(seed),
+            max_connections: 3,
+            max_steps: 4_000,
+            enable_mvcc: true,
+            elle_tables: fts_sim_schema(),
+            workloads,
+            properties,
+            ..WhopperOpts::default()
+        };
+        let mut whopper = Whopper::new(opts).expect("create whopper");
+        whopper
+            .run()
+            .expect("FTS workloads must not violate a property");
+        (whopper.stats.clone(), whopper.db_file_bytes())
+    }
+
+    let (first_stats, first_files) = run(0xF75);
+    assert!(
+        first_stats.fts_checks > 0,
+        "no FTS differential completed, so the workloads tested nothing"
+    );
+
+    let (second_stats, second_files) = run(0xF75);
+    assert_eq!(first_stats.fts_checks, second_stats.fts_checks);
+    assert!(!first_files.is_empty());
+    assert_eq!(first_files.len(), second_files.len());
+    for ((name, first), (other_name, second)) in first_files.iter().zip(&second_files) {
+        assert_eq!(name, other_name);
+        assert!(
+            first == second,
+            "{name} differs between two runs of one seed: something (FTS segment ids, index \
+             incarnations) is not drawn from the seeded IO, so seeds do not replay"
+        );
+    }
+
+    // The differential's `fts_match` side must be planned through the
+    // index method; the scalar fallback would make the comparison vacuous.
+    let io = Arc::new(SimulatorIO::new(
+        false,
+        ChaCha8Rng::seed_from_u64(7),
+        IOFaultConfig {
+            cosmic_ray_probability: 0.0,
+        },
+    ));
+    let db_path = format!("test-fts-plan-{}.db", std::process::id());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("open db");
+    let conn = db.connect().expect("connect");
+    for (_, sql) in fts_sim_schema() {
+        conn.execute(&sql).expect("bootstrap FTS schema");
+    }
+    let differential = Operation::FtsMatchDifferential {
+        token: "alpha".to_string(),
+    }
+    .sql();
+    let mut stmt = conn
+        .prepare(format!("EXPLAIN {differential}"))
+        .expect("prepare explain");
+    let mut opcodes = Vec::new();
+    loop {
+        match stmt.step().expect("step explain") {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().expect("explain row");
+                opcodes.push(row.get::<&str>(1).expect("opcode column").to_string());
+            }
+            turso_core::StepResult::IO => io.step().expect("io step"),
+            turso_core::StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    assert!(
+        opcodes.iter().any(|opcode| opcode == "IndexMethodQuery"),
+        "the FTS differential is not planned through the index method: {opcodes:?}"
+    );
+}

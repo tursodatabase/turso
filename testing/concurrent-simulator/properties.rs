@@ -307,7 +307,9 @@ impl Property for IntegrityCheckProperty {
 
 /// The FTS self-differential: `fts_match` and a base-table token scan run
 /// inside one statement (one snapshot), so their id sets must be equal —
-/// the operation's SQL reports the size of the symmetric difference.
+/// the operation's SQL reports the size of the symmetric difference, plus
+/// whether the FTS index still exists (without it `fts_match` silently
+/// falls back to a scalar scan and the comparison proves nothing).
 pub struct FtsSelfDifferentialProperty;
 
 impl Property for FtsSelfDifferentialProperty {
@@ -324,17 +326,37 @@ impl Property for FtsSelfDifferentialProperty {
         let Operation::FtsMatchDifferential { token } = op else {
             return Ok(());
         };
-        let Ok(rows) = result else {
-            // Contention errors are the driver's business; nothing to check.
-            return Ok(());
-        };
-        match rows.first().and_then(|row| row.first()) {
-            Some(value) if value.as_int() == Some(0) => Ok(()),
-            other => bail!(
-                "step {step} fiber {fiber_id}: fts_match and the base-table \
-                 scan disagree for token {token:?}: symmetric difference {other:?}"
+        let rows = match result {
+            Ok(rows) => rows,
+            // The statement is fixed and valid, so a parse or argument
+            // rejection means the table, the index, or `fts_match` itself
+            // regressed; the driver would otherwise retry it forever.
+            Err(err @ (LimboError::ParseError(_) | LimboError::InvalidArgument(_))) => bail!(
+                "step {step} fiber {fiber_id}: the FTS differential statement was rejected: {err}"
             ),
+            // Contention errors are the driver's business; nothing to check.
+            Err(_) => return Ok(()),
+        };
+        let Some(row) = rows.first() else {
+            bail!("step {step} fiber {fiber_id}: the FTS differential returned no row");
+        };
+        let symmetric_difference = row.first().and_then(Value::as_int);
+        let index_present = row.get(1).and_then(Value::as_int);
+        if index_present != Some(1) {
+            bail!(
+                "step {step} fiber {fiber_id}: FTS index {} is missing from sqlite_schema \
+                 (count {index_present:?}); fts_match would fall back to a scalar scan and \
+                 the differential would prove nothing",
+                crate::workloads::FTS_SIM_INDEX
+            );
         }
+        if symmetric_difference != Some(0) {
+            bail!(
+                "step {step} fiber {fiber_id}: fts_match and the base-table scan disagree \
+                 for token {token:?}: symmetric difference {symmetric_difference:?}"
+            );
+        }
+        Ok(())
     }
 }
 
