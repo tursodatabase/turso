@@ -4,16 +4,16 @@
 # ///
 """Plot transaction latency as an eCDF from txn-latency CSV output.
 
-Usage: uv run plot-latency-ecdf.py sqlite-c1.csv turso-c1.csv [--column total_ns]
+Usage: uv run plot-latency-ecdf.py sqlite-c*.csv turso-c*.csv [--column total_ns]
 
 Latency along the x axis on a log scale, the share of transactions at or
 below it up the y axis. A marker sits on each curve at p50, p90 and p99,
 and a line's right-hand end is its slowest transaction.
 
-Pass files from more than one connection count to compare concurrency
-levels: colour and marker shape say which engine, line style and marker
-fill say how many connections. Two levels read well; the full sweep belongs
-in plot-latency-percentiles.py instead.
+Each connection count gets its own panel, laid out in a grid with shared
+axes, so the engines are compared within a panel and the effect of
+concurrency is read across panels. One file per engine and count, as
+`bench.sh` writes them.
 """
 
 import argparse
@@ -39,9 +39,6 @@ ENGINES = {
 }
 FALLBACK_COLORS = ["#009988", "#EE7733", "#33BBEE"]
 FALLBACK_MARKERS = ["^", "D", "v"]
-# One entry per connection count, in ascending order: line style and
-# whether the markers are filled.
-LEVEL_STYLES = [("solid", True), ((0, (4, 2)), False), ((0, (1, 1.5)), True)]
 
 # Percentiles that get a marker on the curve.
 PERCENTILES = [50, 90, 99]
@@ -75,13 +72,15 @@ def engine_look(engine, index):
     }
 
 
-def label_for(look, mode, connections, modes_per_engine, connection_levels):
+def label_for(look, mode, modes_per_engine):
     name = look["name"]
     if len(modes_per_engine) > 1:
         name = f"{name} ({mode})"
-    if len(connection_levels) > 1:
-        name = f"{name}, {connections} conn."
     return name
+
+
+def panel_title(connections):
+    return "1 connection" if connections == 1 else f"{connections} connections"
 
 
 def ecdf_points(samples, max_points=2000):
@@ -122,52 +121,55 @@ def main():
     for engine, mode, _ in series:
         modes_per_engine.setdefault(engine, set()).add(mode)
     connection_levels = sorted({connections for _, _, connections in series})
-    if len(connection_levels) > len(LEVEL_STYLES):
-        raise SystemExit(
-            f"{len(connection_levels)} connection counts is too many for one chart; "
-            "plot the sweep with plot-latency-percentiles.py"
-        )
 
-    fig, ax = plt.subplots(figsize=(4.6, 3.2), dpi=300)
-    ax.set_xscale("log")
-    ax.grid(True, which="major", linewidth=0.4, alpha=0.6)
-    ax.set_axisbelow(True)
+    # One panel per connection count, two to a row.
+    ncols = min(2, len(connection_levels))
+    nrows = -(-len(connection_levels) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, 2.5 * nrows), dpi=300,
+                             sharex=True, sharey=True, squeeze=False)
+    lo = min(float(np.min(v)) for v in series.values())
+    hi = max(float(np.max(v)) for v in series.values())
 
-    handles = []
-    lo, hi = np.inf, 0.0
-    for index, ((engine, mode, connections), samples) in enumerate(sorted(series.items())):
-        look = engine_look(engine, index)
-        linestyle, filled = LEVEL_STYLES[connection_levels.index(connections)]
-        face = look["color"] if filled else "white"
-        x, y = ecdf_points(samples)
-        ax.plot(x, y, color=look["color"], linewidth=1.3, linestyle=linestyle, zorder=3)
-        # A marker at p50, p90 and p99, so the values can be read against
-        # the grid and the series told apart even where lines overlap.
-        ax.plot(np.percentile(samples, PERCENTILES), PERCENTILES, linestyle="none",
-                marker=look["marker"], markersize=4.5, color=look["color"],
-                markerfacecolor=face, markeredgewidth=1.0, zorder=4)
-        handles.append(Line2D(
-            [], [], color=look["color"], linewidth=1.3, linestyle=linestyle,
-            marker=look["marker"], markersize=4.5, markerfacecolor=face,
-            markeredgewidth=1.0,
-            label=label_for(look, mode, connections, modes_per_engine[engine],
-                            connection_levels),
-        ))
-        lo = min(lo, float(x[0]))
-        hi = max(hi, float(x[-1]))
+    handles = {}
+    for ax, connections in zip(axes.flat, connection_levels):
+        ax.set_xscale("log")
+        ax.grid(True, which="major", linewidth=0.4, alpha=0.6)
+        ax.set_axisbelow(True)
+        panel = {k: v for k, v in series.items() if k[2] == connections}
+        for index, ((engine, mode, _), samples) in enumerate(sorted(panel.items())):
+            look = engine_look(engine, index)
+            x, y = ecdf_points(samples)
+            ax.plot(x, y, color=look["color"], linewidth=1.3, zorder=3)
+            # A marker at p50, p90 and p99, so the values can be read against
+            # the grid and the series told apart even where lines overlap.
+            ax.plot(np.percentile(samples, PERCENTILES), PERCENTILES, linestyle="none",
+                    marker=look["marker"], markersize=4, color=look["color"],
+                    markeredgewidth=1.0, zorder=4)
+            label = label_for(look, mode, modes_per_engine[engine])
+            handles.setdefault(label, Line2D(
+                [], [], color=look["color"], linewidth=1.3, marker=look["marker"],
+                markersize=4, label=label))
+        ax.set_title(panel_title(connections), loc="left", fontsize=plt.rcParams["font.size"])
 
-    ax.set_xlim(10 ** np.floor(np.log10(max(lo, 1e-3))), 10 ** np.ceil(np.log10(hi)))
-    ax.xaxis.set_major_locator(LogLocator(base=10, numticks=12))
-    ax.xaxis.set_minor_locator(NullLocator())
-    ax.xaxis.set_major_formatter(FuncFormatter(fmt_ms))
-    ax.set_xlabel(f"{COLUMN_LABELS[args.column]} (ms)")
+    for ax in axes.flat[len(connection_levels):]:
+        ax.set_visible(False)
 
-    ax.set_ylim(0, 103)
-    ax.set_yticks([0, 25, 50, 75, 100])
-    ax.set_ylabel("Transactions (%)")
+    ax0 = axes[0, 0]
+    # Start at a decade, end just past the slowest transaction: rounding the
+    # top up to a decade can leave most of a panel empty.
+    ax0.set_xlim(10 ** np.floor(np.log10(max(lo, 1e-3))), hi * 1.5)
+    ax0.xaxis.set_major_locator(LogLocator(base=10, numticks=12))
+    ax0.xaxis.set_minor_locator(NullLocator())
+    ax0.xaxis.set_major_formatter(FuncFormatter(fmt_ms))
+    ax0.set_ylim(0, 103)
+    ax0.set_yticks([0, 25, 50, 75, 100])
+    for ax in axes[-1, :]:
+        ax.set_xlabel(f"{COLUMN_LABELS[args.column]} (ms)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Transactions (%)")
 
-    ax.legend(handles=handles, loc="lower right", frameon=False, handlelength=2.8,
-              labelspacing=0.5)
+    ax0.legend(handles=list(handles.values()), loc="lower right", frameon=False,
+               handlelength=2.4)
 
     fig.savefig(args.output, bbox_inches="tight")
     print(f"wrote {args.output}")
