@@ -609,45 +609,54 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     );
     assert_eq!(current.len(), 1);
 
-    // Passive with Rule 3 on retires the current version instead of dropping it:
-    // it stays in the chain for transactions that began at or before the retire
-    // timestamp, and is removed once the LWM has moved past that timestamp.
+    // Passive with Rule 3 on nominates the current version for retirement
+    // instead of dropping it. The caller applies the retirement clock-ordered
+    // (`retire_current_version_clock_ordered`); the version then stays in the
+    // chain for transactions that began at or before the retire timestamp, and
+    // is removed once the LWM has moved past that timestamp.
     let mut current = stamped_insert();
-    let (dropped, retired_now) = MvStore::<MvccClock>::gc_version_chain_with_retire(
+    let (dropped, retire_candidate) = MvStore::<MvccClock>::gc_version_chain_with_retire(
         &mut current,
         10,
         10,
         true,
         frame(100),
         true,
-        Some(40),
     );
-    assert_eq!(dropped, 0, "Passive retires a materialized current version");
+    assert_eq!(
+        dropped, 0,
+        "Passive keeps a materialized current version in the chain"
+    );
     assert!(
-        retired_now,
-        "the retire must be reported so the chain can be queued for the targeted drop pass"
+        retire_candidate,
+        "the retire must be nominated so the caller can apply it clock-ordered"
     );
     assert_eq!(current.len(), 1);
-    assert_eq!(current[0].retired_at(), Some(40));
+    assert_eq!(current[0].retired_at(), None, "nomination does not retire");
+    // Caller-side apply (normally done by retire_current_version_clock_ordered
+    // with a timestamp allocated inside the clock lock).
+    current[0].set_retired_at(40);
     assert_eq!(
         current[0].end(),
         None,
         "a retired version still reads as current"
     );
-    let (dropped, retired_now) = MvStore::<MvccClock>::gc_version_chain_with_retire(
+    let (dropped, retire_candidate) = MvStore::<MvccClock>::gc_version_chain_with_retire(
         &mut current,
         40,
         10,
         true,
         frame(100),
         true,
-        Some(41),
     );
     assert_eq!(
         dropped, 0,
         "a transaction with begin_ts == retire ts may still see the version"
     );
-    assert!(!retired_now, "an already-retired version is not re-retired");
+    assert!(
+        !retire_candidate,
+        "an already-retired version is not re-nominated"
+    );
     let (dropped, _) = MvStore::<MvccClock>::gc_version_chain_with_retire(
         &mut current,
         41,
@@ -655,7 +664,6 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
         true,
         frame(100),
         true,
-        Some(42),
     );
     assert_eq!(
         dropped, 1,
@@ -10560,7 +10568,7 @@ fn test_gc_integration_insert_commit_gc() {
     // Row should be in the MvStore.
     assert!(!db.mvcc_store.rows.is_empty());
 
-    // No active transactions → LWM = u64::MAX.
+    // No active transactions → LWM is the clock bound (above every commit).
     // ckpt_max = 0 (no checkpoint yet), so rule 3 won't fire (b > ckpt_max).
     let dropped = db.mvcc_store.drop_unused_row_versions();
     assert_eq!(dropped, 0);
@@ -10791,8 +10799,10 @@ fn test_gc_active_reader_pins_lwm() {
     // Close the reader transaction.
     db.mvcc_store.remove_tx(tx2).unwrap();
 
-    // LWM should now be u64::MAX.
-    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+    // With no active transactions the LWM is the pre-scan clock bound: above
+    // every committed timestamp (everything superseded is reclaimable), and
+    // below u64::MAX so mid-pass beginners always land above it.
+    assert!(db.mvcc_store.compute_lwm() < u64::MAX);
 
     // GC should now remove the superseded version.
     let dropped = db.mvcc_store.drop_unused_row_versions();
@@ -10957,7 +10967,10 @@ fn test_gc_incremental_reclaims_like_full_sweep() {
     }
 
     // No active readers -> every superseded version is reclaimable.
-    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+    // With no active transactions the LWM is the pre-scan clock bound: above
+    // every committed timestamp (everything superseded is reclaimable), and
+    // below u64::MAX so mid-pass beginners always land above it.
+    assert!(db.mvcc_store.compute_lwm() < u64::MAX);
 
     // Drive GC in tiny chunks (3 chains/pass) until it converges: no versions
     // reclaimed AND the cursor has wrapped back to the start.
@@ -11030,7 +11043,10 @@ fn test_gc_incremental_concurrent_is_safe() {
             .unwrap();
         commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
     }
-    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+    // With no active transactions the LWM is the pre-scan clock bound: above
+    // every committed timestamp (everything superseded is reclaimable), and
+    // below u64::MAX so mid-pass beginners always land above it.
+    assert!(db.mvcc_store.compute_lwm() < u64::MAX);
 
     // 8 threads each run many small bounded passes concurrently.
     let mut handles = Vec::new();
@@ -11138,7 +11154,10 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
         before > 8,
         "expected accumulated index garbage chains, got {before}"
     );
-    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+    // With no active transactions the LWM is the pre-scan clock bound: above
+    // every committed timestamp (everything superseded is reclaimable), and
+    // below u64::MAX so mid-pass beginners always land above it.
+    assert!(db.mvcc_store.compute_lwm() < u64::MAX);
 
     // A single tiny pass is bounded and leaves the index sweep mid-flight —
     // the cursor is parked partway through (there are far more than 4 chains).
@@ -11208,7 +11227,10 @@ fn test_gc_incremental_skips_while_checkpoint_holds_write_lock() {
         .unwrap();
     commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
     // No active txns -> all reader read-locks released, LWM = MAX.
-    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+    // With no active transactions the LWM is the pre-scan clock bound: above
+    // every committed timestamp (everything superseded is reclaimable), and
+    // below u64::MAX so mid-pass beginners always land above it.
+    assert!(db.mvcc_store.compute_lwm() < u64::MAX);
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
 
@@ -20785,4 +20807,173 @@ fn commit_lock_waiter_parks_until_the_holder_releases() {
     assert!(waiter.finished());
     assert!(coordinator.lock_or_wait().is_none());
     coordinator.unlock();
+}
+
+/// A transaction that begins after `compute_lwm` was sampled must sit strictly
+/// above the sampled LWM. Without the pre-scan clock bound an idle store
+/// returned `u64::MAX`, so a GC pass that sampled its LWM before a reader
+/// began could reclaim (Rule 2/3b) a version that reader was positioned on
+/// mid-scan — the row then read as NULL columns and `SUM` dropped by that
+/// row's value while `COUNT(*)` stayed intact.
+#[test]
+fn lwm_stays_below_transactions_that_begin_after_it() {
+    let db = MvccTestDb::new();
+    let lwm = db.mvcc_store.compute_lwm();
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let begin_ts = db.mvcc_store.txs.get(&tx).unwrap().value().begin_ts;
+    assert!(
+        begin_ts > lwm,
+        "a transaction beginning after an LWM sample must be above it (begin_ts={begin_ts}, lwm={lwm})"
+    );
+    db.mvcc_store
+        .rollback_tx(tx, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
+/// A reader positioned on a row's version chain must keep seeing that version
+/// while a passive checkpoint retires it and tries to reclaim it mid-scan.
+///
+/// Regression test for the `test_passive_concurrent_transfer_*` "total
+/// balance changed" corruption. The schedule recreates it exactly: a passive
+/// checkpoint samples its pass LWM (TruncateWal) while no transactions are
+/// active, then a reader begins and positions its cursor on the row's current
+/// version, then the version is retired, and then the checkpoint's GC states
+/// run with the pass-start LWM. Before the fixes the pass LWM was `u64::MAX`
+/// (no active transactions at sampling time), so Rule 3b reclaimed the
+/// just-retired version under the positioned cursor and the row read back as
+/// NULL columns; the retire timestamp taken at pass start (below the reader's
+/// begin_ts) caused the same tear on its own. With the retire timestamp
+/// allocated clock-ordered at apply time and the LWM bounded by a pre-scan
+/// clock timestamp, the retired version stays until the reader is gone.
+#[test]
+fn positioned_reader_survives_passive_retire_and_reclaim_mid_pass() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    // Materialize the seed row so the update below is the only pending work.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = 200 WHERE x = 1").unwrap();
+
+    let root_page = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let mv = db.get_mvcc_store();
+    let table_id = mv.get_table_id_from_root_page(root_page);
+    let pager = conn.pager.load().clone();
+
+    // Drive a passive checkpoint up to the step that publishes the backfill
+    // floor (TruncateWal). That same step samples the pass-wide LWM and
+    // transitions to the GC states, which have not run yet.
+    let mut sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mv.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    let floor_before = *mv.backfill_floor.read();
+    let mut paused = false;
+    for _ in 0..10_000 {
+        match sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => break,
+        }
+        if *mv.backfill_floor.read() != floor_before {
+            paused = true;
+            break;
+        }
+    }
+    assert!(
+        paused,
+        "checkpoint never published a new backfill floor; the pause point moved"
+    );
+
+    // The reader begins inside the pass and positions its cursor on the
+    // updated row's chain version (visible: committed before the reader,
+    // not yet retired).
+    let reader_tx = mv.begin_tx(pager.clone()).unwrap();
+    let mut cursor = MvccLazyCursor::new(
+        mv.clone(),
+        &conn,
+        reader_tx,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(pager.clone(), root_page.abs(), 2)),
+    )
+    .unwrap();
+    while let IOResult::IO(io) = cursor.next().unwrap() {
+        io.wait(pager.io.as_ref()).unwrap();
+    }
+    let rowid = loop {
+        match cursor.rowid().unwrap() {
+            IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+            IOResult::Done(r) => break r,
+        }
+    };
+    assert_eq!(rowid, Some(1), "cursor must be positioned on rowid 1");
+
+    // Resume the checkpoint: its GC states stamp the chain, retire the
+    // current version under the positioned reader (clock-ordered, so the
+    // retire timestamp lands above the reader's begin_ts), and the pass and
+    // its wake-up reclaims run with the pass-start LWM — they must NOT
+    // remove the version the positioned reader still sees.
+    for _ in 0..10_000 {
+        match sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => break,
+        }
+    }
+    assert!(sm.is_finalized(), "checkpoint must run to completion");
+    // Run the sweep and the targeted drain too: every reclaim path must
+    // decline while the positioned reader is alive.
+    mv.drop_unused_row_versions();
+    mv.drop_retired_chains(WalPos::STAGED);
+
+    // The version must have been retired but not removed...
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    let has_retired = mv
+        .rows
+        .get(&row_id)
+        .map(|e| e.value().read().iter().any(|rv| rv.retired_at().is_some()))
+        .unwrap_or(false);
+    assert!(
+        has_retired,
+        "the checkpoint must retire the row's materialized current version"
+    );
+    // ...and the positioned reader must still read its row from the chain.
+    let row = cursor
+        .read_mvcc_current_row()
+        .expect("chain read must not error");
+    assert!(
+        row.is_some(),
+        "positioned reader lost its row version to a mid-pass retire/reclaim"
+    );
+
+    // Cleanup: end the reader; afterwards the retired version is reclaimable.
+    drop(cursor);
+    mv.rollback_tx(reader_tx, pager, conn.as_ref(), 0);
+    mv.drop_retired_chains(WalPos::STAGED);
+    mv.drop_unused_row_versions();
+    let remaining = mv
+        .rows
+        .get(&row_id)
+        .map(|entry| entry.value().read().len())
+        .unwrap_or(0);
+    assert_eq!(
+        remaining, 0,
+        "with the reader gone the retired version must be reclaimable"
+    );
 }

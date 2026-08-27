@@ -4634,8 +4634,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Drop closed (retired) bindings no transaction can still see (dropped, with
-    /// `end <= lwm`). Live bindings have `end == u64::MAX` and are never reclaimed — important
-    /// because `compute_lwm()` is `u64::MAX` when no transactions are active. Returns count.
+    /// `end <= lwm`). Live bindings have `end == u64::MAX` and are never reclaimed:
+    /// `compute_lwm()` is bounded by a pre-scan clock timestamp, so it is always
+    /// below `u64::MAX`. Returns count.
     pub fn gc_rootpage_entries(&self, lwm: u64) -> usize {
         let stale: Vec<MVTableId> = self
             .table_id_to_rootpage
@@ -7335,9 +7336,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Compute the low-water mark: the minimum begin_ts of all active or
-    /// preparing transactions. Returns u64::MAX if no transactions are active.
-    /// Used by GC to determine which row versions are safe to reclaim.
+    /// preparing transactions, bounded above by a fresh clock timestamp taken
+    /// BEFORE scanning `txs`. Used by GC to determine which row versions are
+    /// safe to reclaim.
+    ///
+    /// The bound is what makes a pass-wide LWM safe to hold across a GC pass:
+    /// with no (or only later) active transactions the scan alone would return
+    /// u64::MAX, and a reader that begins while the caller's pass is still
+    /// running would sit ABOVE that stale LWM — Rule 2/3b would then reclaim a
+    /// version that reader is positioned on mid-scan, which reads as a row
+    /// with NULL columns (the `test_passive_concurrent_transfer_*` "total
+    /// balance changed" corruption). Every transaction beginning after the
+    /// pre-scan timestamp gets a strictly larger begin_ts, so it can never
+    /// need a version the returned LWM lets a pass reclaim.
     pub fn compute_lwm(&self) -> u64 {
+        // Take the bound BEFORE the scan: a transaction that begins after this
+        // timestamp is above the bound even if the scan misses it.
+        let now = self.clock.get_timestamp(|_| {});
         self.txs
             .iter()
             .filter_map(|entry| {
@@ -7349,6 +7364,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             })
             .min()
             .unwrap_or(u64::MAX)
+            .min(now)
     }
 
     /// Default `mvcc_gc_threshold`: run an incremental GC pass roughly every
@@ -7462,13 +7478,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         current.saturating_sub(at_last) >= threshold as usize
     }
 
-    /// A fresh clock timestamp for retiring versions (`RowVersion::retired_at`).
-    /// Taking it from the clock guarantees every transaction that begins
-    /// afterwards gets a larger `begin_ts`, so it reads the B-tree instead.
-    pub(crate) fn take_retire_ts(&self) -> u64 {
-        self.clock.get_timestamp(|_| {})
-    }
-
     /// Garbage-collects row versions that are invisible to all active transactions.
     /// Uses the low-water mark (LWM) to determine reclaimability in O(1) per version.
     /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
@@ -7536,17 +7545,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// (`drop_unused_row_versions_unlink_empty_at`) walks every chain in the
     /// store.
     pub fn drop_retired_chains(&self, reader_mark_floor: WalPos) -> usize {
-        let lwm = {
-            let mut sampled = u64::MAX;
-            self.clock.get_timestamp(|_| sampled = self.compute_lwm());
-            sampled
-        };
+        // `compute_lwm` bounds itself by a pre-scan clock timestamp, so a
+        // transaction beginning mid-pass is always above this LWM.
+        let lwm = self.compute_lwm();
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let min_reader_mark = self
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
-        let retire_ts = Some(self.take_retire_ts());
         let mut dropped = 0;
 
         let table_chains = std::mem::take(&mut *self.retired_table_chains.lock());
@@ -7560,14 +7566,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 continue;
             }
             let mut versions = entry.value().write();
-            let (chain_dropped, _) = Self::gc_version_chain_with_retire(
+            let (chain_dropped, retire_candidate) = Self::gc_version_chain_with_retire(
                 &mut versions,
                 lwm,
                 ckpt_max,
                 true,
                 min_reader_mark,
                 true,
-                retire_ts,
             );
             dropped += chain_dropped;
             let awaits_more = Self::chain_awaits_reclaim(&versions);
@@ -7575,8 +7580,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             drop(versions);
             if empty {
                 entry.remove();
-            } else if awaits_more {
-                requeue_tables.push(row_id);
+            } else {
+                let retired_now = retire_candidate
+                    && self.retire_current_version_clock_ordered(
+                        entry.value(),
+                        lwm,
+                        min_reader_mark,
+                    );
+                if awaits_more || retired_now {
+                    requeue_tables.push(row_id);
+                }
             }
         }
         if !requeue_tables.is_empty() {
@@ -7597,14 +7610,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 continue;
             };
             let mut versions = inner_entry.value().write();
-            let (chain_dropped, _) = Self::gc_version_chain_with_retire(
+            let (chain_dropped, retire_candidate) = Self::gc_version_chain_with_retire(
                 &mut versions,
                 lwm,
                 ckpt_max,
                 true,
                 min_reader_mark,
                 true,
-                retire_ts,
             );
             dropped += chain_dropped;
             let awaits_more = Self::chain_awaits_reclaim(&versions);
@@ -7613,8 +7625,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if empty {
                 self.bump_index_rows_epoch();
                 inner_entry.remove();
-            } else if awaits_more {
-                requeue_indexes.push((index_id, key));
+            } else {
+                let retired_now = retire_candidate
+                    && self.retire_current_version_clock_ordered(
+                        inner_entry.value(),
+                        lwm,
+                        min_reader_mark,
+                    );
+                if awaits_more || retired_now {
+                    requeue_indexes.push((index_id, key));
+                }
             }
         }
         if !requeue_indexes.is_empty() {
@@ -7681,13 +7701,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Blocking Truncate: safe to drop it once the B-tree already has the row.
         // Rule 3 on in both modes: Truncate drops, Passive retires (`RowVersion::retired_at`).
         let drop_current_if_in_btree = true;
-        let lwm = if passive {
-            let mut sampled = u64::MAX;
-            self.clock.get_timestamp(|_| sampled = self.compute_lwm());
-            sampled
-        } else {
-            self.compute_lwm()
-        };
+        // `compute_lwm` bounds itself by a pre-scan clock timestamp, so a
+        // transaction beginning mid-pass is always above this LWM.
+        let lwm = self.compute_lwm();
 
         // Short-circuit when a long-running transaction has pinned the LWM at
         // the same value since the last pass: nothing newly reclaimable can
@@ -7715,12 +7731,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dropped = 0;
         let mut processed = 0;
         let mut last_key: Option<RowID> = None;
-        // One retire timestamp for the whole pass: taking the clock (and
-        // recomputing the LWM under it) per chain made this pass mostly
-        // clock-lock traffic. A pass-wide retire_ts is safe for the same
-        // reason the full sweep's is: every transaction that begins after it
-        // gets a larger begin_ts, and the pass-start LWM only under-reclaims.
-        let retire_ts = passive.then(|| self.take_retire_ts());
+        // Retirements are applied clock-ordered per retired version (see
+        // `retire_current_version_clock_ordered`); the clock cost is paid only
+        // for actual retirements, not per swept chain.
         let mut retired: Vec<RowID> = Vec::new();
 
         // Resume strictly after the last key processed by the previous pass.
@@ -7736,19 +7749,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
                 if passive {
                     let mut versions = entry.value().write();
-                    let (chain_dropped, retired_now) = Self::gc_version_chain_with_retire(
+                    let (chain_dropped, retire_candidate) = Self::gc_version_chain_with_retire(
                         &mut versions,
                         lwm,
                         ckpt_max,
                         true,
                         min_reader_mark,
                         drop_current_if_in_btree,
-                        retire_ts,
                     );
                     dropped += chain_dropped;
+                    let was_empty = versions.is_empty();
+                    drop(versions);
+                    let retired_now = retire_candidate
+                        && self.retire_current_version_clock_ordered(
+                            entry.value(),
+                            lwm,
+                            min_reader_mark,
+                        );
                     // Passive leaves empty slots for the finalize to unlink,
                     // so hand both retirees and emptied chains to its queue.
-                    if retired_now || versions.is_empty() {
+                    if retired_now || was_empty {
                         retired.push(entry.key().clone());
                     }
                 } else {
@@ -7835,8 +7855,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dropped = 0;
         let mut processed = 0;
         let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
-        // One retire timestamp for the whole pass; see `gc_incremental_with_floor`.
-        let retire_ts = passive.then(|| self.take_retire_ts());
+        // Retirements are applied clock-ordered per retired version; see
+        // `retire_current_version_clock_ordered`.
         let mut retired: Vec<(MVTableId, Arc<SortableIndexKey>)> = Vec::new();
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
         // WAL frames — a db-file reader (present or future) needs the version-store copy.
@@ -7872,19 +7892,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
                 if passive {
                     let mut versions = inner_entry.value().write();
-                    let (chain_dropped, retired_now) = Self::gc_version_chain_with_retire(
+                    let (chain_dropped, retire_candidate) = Self::gc_version_chain_with_retire(
                         &mut versions,
                         lwm,
                         ckpt_max,
                         true,
                         min_reader_mark,
                         drop_current_if_in_btree,
-                        retire_ts,
                     );
                     dropped += chain_dropped;
+                    let was_empty = versions.is_empty();
+                    drop(versions);
+                    let retired_now = retire_candidate
+                        && self.retire_current_version_clock_ordered(
+                            inner_entry.value(),
+                            lwm,
+                            min_reader_mark,
+                        );
                     // Same as the table sweep: emptied chains go to the
                     // finalize queue for unlinking.
-                    if retired_now || versions.is_empty() {
+                    if retired_now || was_empty {
                         retired.push((index_id, inner_entry.key().clone()));
                     }
                 } else {
@@ -7925,11 +7952,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let lwm = self.compute_lwm();
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let mut referenced_tx_ids = HashSet::default();
-        // Passive retires materialized current versions (Rule 3) at one
-        // timestamp for the whole sweep.
-        let retire_ts = self
-            .experimental_mvcc_passive_checkpoint
-            .then(|| self.take_retire_ts());
 
         let dropped = self.gc_table_row_versions(
             lwm,
@@ -7938,7 +7960,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             remove_empty_slots,
             drop_current_if_in_btree,
             reader_mark_floor,
-            retire_ts,
         ) + self.gc_index_row_versions(
             lwm,
             ckpt_max,
@@ -7946,7 +7967,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             remove_empty_slots,
             drop_current_if_in_btree,
             reader_mark_floor,
-            retire_ts,
         );
         self.dec_live_version_count_approx(dropped);
         let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
@@ -7969,7 +7989,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
         drop_current_if_in_btree: bool,
         reader_mark_floor: WalPos,
-        retire_ts: Option<u64>,
     ) -> usize {
         let mut dropped = 0;
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
@@ -7988,21 +8007,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 continue;
             }
             let mut versions = entry.value().write();
-            let (chain_dropped, retired_now) = Self::gc_version_chain_with_retire(
+            let (chain_dropped, retire_candidate) = Self::gc_version_chain_with_retire(
                 &mut versions,
                 lwm,
                 ckpt_max,
                 self.experimental_mvcc_passive_checkpoint,
                 min_reader_mark,
                 drop_current_if_in_btree,
-                retire_ts,
             );
             dropped += chain_dropped;
-            if retired_now {
+            Self::collect_referenced_txids(&versions, referenced_tx_ids);
+            let empty = versions.is_empty();
+            drop(versions);
+            if retire_candidate
+                && self.retire_current_version_clock_ordered(entry.value(), lwm, min_reader_mark)
+            {
                 retired.push(entry.key().clone());
             }
-            Self::collect_referenced_txids(&versions, referenced_tx_ids);
-            if remove_empty_slots && versions.is_empty() {
+            if remove_empty_slots && empty {
                 entry.remove();
             }
         }
@@ -8021,7 +8043,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
         drop_current_if_in_btree: bool,
         reader_mark_floor: WalPos,
-        retire_ts: Option<u64>,
     ) -> usize {
         let mut dropped = 0;
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
@@ -8043,21 +8064,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
             for inner_entry in inner_map.iter() {
                 let mut versions = inner_entry.value().write();
-                let (chain_dropped, retired_now) = Self::gc_version_chain_with_retire(
+                let (chain_dropped, retire_candidate) = Self::gc_version_chain_with_retire(
                     &mut versions,
                     lwm,
                     ckpt_max,
                     self.experimental_mvcc_passive_checkpoint,
                     min_reader_mark,
                     drop_current_if_in_btree,
-                    retire_ts,
                 );
                 dropped += chain_dropped;
-                if retired_now {
+                Self::collect_referenced_txids(&versions, referenced_tx_ids);
+                let empty = versions.is_empty();
+                drop(versions);
+                if retire_candidate
+                    && self.retire_current_version_clock_ordered(
+                        inner_entry.value(),
+                        lwm,
+                        min_reader_mark,
+                    )
+                {
                     retired.push((*outer_entry.key(), inner_entry.key().clone()));
                 }
-                Self::collect_referenced_txids(&versions, referenced_tx_ids);
-                if remove_empty_slots && versions.is_empty() {
+                if remove_empty_slots && empty {
                     self.bump_index_rows_epoch();
                     // Inner key only — the outer per-index map stays (bounded by index count).
                     inner_entry.remove();
@@ -8131,9 +8159,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Passive gates Rule 2 on `materialized_at` + `min_reader_mark`. Blocking
     /// Truncate uses `ckpt_max` instead.
     ///
-    /// `retire_ts` must be `Some` for Passive callers that enable Rule 3, and be a
-    /// timestamp taken from the clock so that every transaction beginning after
-    /// the retirement gets a larger `begin_ts`.
+    /// Passive Rule 3 does not retire inside this call: the retire timestamp
+    /// must be allocated at the moment the retirement is applied, inside the
+    /// clock lock (see [`Self::retire_current_version_clock_ordered`]), so
+    /// this function only nominates the chain and the caller applies.
     fn gc_version_chain(
         versions: &mut RowVersionChain<A>,
         lwm: u64,
@@ -8149,16 +8178,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             passive,
             min_reader_mark,
             drop_current_if_in_btree,
-            None,
         );
         dropped
     }
 
-    /// [`Self::gc_version_chain`] with the retire timestamp Passive Rule 3 needs.
-    /// Returns `(dropped, retired_now)`: `retired_now` is true when this call
-    /// retired the chain's last current version, so the caller can queue the
-    /// chain for the targeted drop pass instead of a full-store sweep finding
-    /// it later.
+    /// [`Self::gc_version_chain`] plus Passive Rule 3 nomination. Returns
+    /// `(dropped, retire_candidate)`: `retire_candidate` is true when the
+    /// chain's last current version is ready to retire. The caller must then
+    /// apply the retirement with
+    /// [`Self::retire_current_version_clock_ordered`] after releasing the
+    /// chain lock, and may queue the chain for the targeted drop pass.
     fn gc_version_chain_with_retire(
         versions: &mut RowVersionChain<A>,
         lwm: u64,
@@ -8166,7 +8195,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         passive: bool,
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
-        retire_ts: Option<u64>,
     ) -> (usize, bool) {
         let before = versions.len();
 
@@ -8206,18 +8234,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         });
 
         // Rule 3: optionally drop the last current version when the B-tree already has it.
-        // Passive retires it instead of dropping it (Rule 3b removes it later).
-        let mut retired_now = false;
+        // Passive retires it instead of dropping it (Rule 3b removes it later). The
+        // retirement itself is NOT applied here: it needs a timestamp allocated at
+        // apply time inside the clock lock, so this only nominates the chain (see
+        // `retire_current_version_clock_ordered`).
+        let mut retire_candidate = false;
         if drop_current_if_in_btree && versions.len() == 1 && versions[0].retired_at().is_none() {
             if let (Some(TxTimestampOrID::Timestamp(b)), None) =
                 (&versions[0].begin(), &versions[0].end())
             {
                 if passive {
                     if materialized_for_readers(&versions[0]) && *b < lwm {
-                        let retire_ts = retire_ts
-                            .expect("passive GC with Rule 3 enabled needs a retire timestamp");
-                        versions[0].set_retired_at(retire_ts);
-                        retired_now = true;
+                        retire_candidate = true;
                     }
                 } else if *b <= ckpt_max && *b < lwm {
                     versions.clear();
@@ -8227,7 +8255,58 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         Self::shrink_version_chain_allocation(versions);
 
-        (before - versions.len(), retired_now)
+        (before - versions.len(), retire_candidate)
+    }
+
+    /// Apply the Rule 3 retirement [`Self::gc_version_chain_with_retire`]
+    /// nominated, with the retire timestamp allocated at the moment the
+    /// retirement is applied, inside the clock lock. `begin_tx` publishes new
+    /// transactions under the same clock, so a transaction ordered after this
+    /// retirement starts with `begin_ts > retired_at` and never sees the
+    /// version, while every transaction that could already hold a cursor
+    /// positioned on it has `begin_ts <= retired_at` and keeps seeing it.
+    ///
+    /// A timestamp taken before a sweep and applied later is NOT safe: a
+    /// reader beginning between the take and the apply gets a begin_ts above
+    /// the stale timestamp, can position its cursor on the still-visible
+    /// version, and then reads an empty row (NULL columns) when the version
+    /// flips invisible — or is reclaimed by Rule 3b — under the cursor
+    /// mid-statement. That was the `test_passive_concurrent_transfer_*`
+    /// "total balance changed" corruption.
+    ///
+    /// The chain lock was released between nomination and this call, so the
+    /// Rule 3 shape is re-validated under the chain write lock inside the
+    /// clock callback (clock -> chain lock order, same as the passive publish
+    /// window). Returns true when the retirement was applied.
+    fn retire_current_version_clock_ordered(
+        &self,
+        chain: &RowVersions<A>,
+        lwm: u64,
+        min_reader_mark: WalPos,
+    ) -> bool {
+        let mut retired = false;
+        self.clock.get_timestamp(|ts| {
+            let mut versions = chain.write();
+            if versions.len() != 1 {
+                return;
+            }
+            let rv = &mut versions[0];
+            if rv.retired_at().is_some() || rv.end().is_some() {
+                return;
+            }
+            let Some(TxTimestampOrID::Timestamp(b)) = rv.begin() else {
+                return;
+            };
+            if b >= lwm {
+                return;
+            }
+            if rv.materialized_at() == WalPos::ORIGIN || min_reader_mark < rv.materialized_at() {
+                return;
+            }
+            rv.set_retired_at(ts);
+            retired = true;
+        });
+        retired
     }
 
     /// Stamp each version this checkpoint materialized with the WAL `frame` it became durable at.

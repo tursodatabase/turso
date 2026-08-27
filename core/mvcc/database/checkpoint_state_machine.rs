@@ -1780,13 +1780,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let mut processed = 0;
         // Rule 3 runs in both modes. Truncate drops a materialized current version
         // under its blocking lock; Passive retires it instead (see
-        // `RowVersion::retired_at`), which needs one clock timestamp taken before
-        // any version in this batch is retired.
+        // `RowVersion::retired_at`), with the retire timestamp allocated at
+        // apply time inside the clock lock (`retire_current_version_clock_ordered`).
         let drop_current_if_in_btree = true;
-        let retire_ts = self
-            .mvstore
-            .experimental_mvcc_passive_checkpoint
-            .then(|| self.mvstore.take_retire_ts());
         let mut retired = Vec::new();
         while index < self.write_set.len() {
             let current = index;
@@ -1804,24 +1800,30 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     materialized_frame,
                     snapshot_ts,
                 );
-                let (dropped, _) = MvStore::<Clock, A>::gc_version_chain_with_retire(
+                let (dropped, retire_candidate) = MvStore::<Clock, A>::gc_version_chain_with_retire(
                     &mut versions,
                     lwm,
                     ckpt_max,
                     self.mvstore.experimental_mvcc_passive_checkpoint,
                     min_reader_mark,
                     drop_current_if_in_btree,
-                    retire_ts,
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
+                let awaits = self.mvstore.experimental_mvcc_passive_checkpoint
+                    && MvStore::<Clock, A>::chain_awaits_reclaim(&versions);
+                drop(versions);
+                let retired_now = retire_candidate
+                    && self.mvstore.retire_current_version_clock_ordered(
+                        entry.value(),
+                        lwm,
+                        min_reader_mark,
+                    );
                 // Materialized versions this pass could not reclaim yet (an
                 // open reader pins them, retired or not) go to the targeted
                 // drop queue; a later finalize reclaims them once the pin
                 // lifts. Without this only a full-store sweep would ever
                 // revisit them.
-                if self.mvstore.experimental_mvcc_passive_checkpoint
-                    && MvStore::<Clock, A>::chain_awaits_reclaim(&versions)
-                {
+                if awaits || retired_now {
                     retired.push(row_id.clone());
                 }
             } else {
@@ -1864,12 +1866,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         let mut index = next_index;
         let mut processed = 0;
-        // Same as the table GC: Rule 3 on, Passive retires (see above).
+        // Same as the table GC: Rule 3 on, Passive retires clock-ordered (see above).
         let drop_current_if_in_btree = true;
-        let retire_ts = self
-            .mvstore
-            .experimental_mvcc_passive_checkpoint
-            .then(|| self.mvstore.take_retire_ts());
         let mut retired = Vec::new();
         while index < self.index_write_set.len() {
             let current = index;
@@ -1895,21 +1893,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     materialized_frame,
                     snapshot_ts,
                 );
-                let (dropped, _) = MvStore::<Clock, A>::gc_version_chain_with_retire(
+                let (dropped, retire_candidate) = MvStore::<Clock, A>::gc_version_chain_with_retire(
                     &mut versions,
                     lwm,
                     ckpt_max,
                     self.mvstore.experimental_mvcc_passive_checkpoint,
                     min_reader_mark,
                     drop_current_if_in_btree,
-                    retire_ts,
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
+                let awaits = self.mvstore.experimental_mvcc_passive_checkpoint
+                    && MvStore::<Clock, A>::chain_awaits_reclaim(&versions);
+                drop(versions);
+                let retired_now = retire_candidate
+                    && self.mvstore.retire_current_version_clock_ordered(
+                        inner_entry.value(),
+                        lwm,
+                        min_reader_mark,
+                    );
                 // Same as the table GC above: queue what a later targeted
                 // finalize can reclaim.
-                if self.mvstore.experimental_mvcc_passive_checkpoint
-                    && MvStore::<Clock, A>::chain_awaits_reclaim(&versions)
-                {
+                if awaits || retired_now {
                     retired.push((index_id, sortable_key.clone()));
                 }
             }
