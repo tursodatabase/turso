@@ -7,9 +7,9 @@
 Usage: uv run plot-latency-ecdf.py sqlite-c*.csv turso-c*.csv [--column total_ns]
 
 Latency along the x axis on a log scale, the share of transactions at or
-below it up the y axis. A marker sits on each curve at p50 and p90, a
-dashed vertical line marks its p99.9 and a dotted one its slowest
-transaction.
+below it up the y axis. A marker sits on each curve at p50 and p90, and a
+dashed vertical line marks its p99.9. A curve's right-hand end is its
+slowest transaction.
 
 Each connection count gets its own panel, laid out in a grid with shared
 axes, so the engines are compared within a panel and the effect of
@@ -43,9 +43,8 @@ FALLBACK_MARKERS = ["^", "D", "v"]
 
 # Percentiles that get a marker on the curve.
 PERCENTILES = [50, 90]
-# Vertical lines: the tail percentile and the slowest transaction.
+# Vertical line at the tail percentile.
 TAIL_STYLE = (0, (4, 2))
-MAX_STYLE = (0, (1, 1.5))
 
 COLUMN_LABELS = {
     "total_ns": "Transaction latency",
@@ -149,11 +148,9 @@ def main():
             ax.plot(np.percentile(samples, PERCENTILES), PERCENTILES, linestyle="none",
                     marker=look["marker"], markersize=4, color=look["color"],
                     markeredgewidth=1.0, zorder=4)
-            # The tail, as vertical lines: p99.9 and the slowest transaction.
+            # The tail, as a vertical line at p99.9.
             ax.axvline(float(np.percentile(samples, 99.9)), color=look["color"],
                        linewidth=0.9, linestyle=TAIL_STYLE, zorder=2)
-            ax.axvline(float(np.max(samples)), color=look["color"], linewidth=0.9,
-                       linestyle=MAX_STYLE, zorder=2)
             label = label_for(look, mode, modes_per_engine[engine])
             handles.setdefault(label, Line2D(
                 [], [], color=look["color"], linewidth=1.3, marker=look["marker"],
@@ -179,7 +176,6 @@ def main():
 
     legend_handles = list(handles.values()) + [
         Line2D([], [], color="0.35", linewidth=0.9, linestyle=TAIL_STYLE, label="p99.9"),
-        Line2D([], [], color="0.35", linewidth=0.9, linestyle=MAX_STYLE, label="max"),
     ]
     ax0.legend(handles=legend_handles, loc="lower right", frameon=False,
                handlelength=2.4)
