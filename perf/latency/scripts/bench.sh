@@ -3,6 +3,12 @@ set -eu
 
 cargo build --release -p txn-latency
 
+# The build above leaves gigabytes of dirty pages behind, and every fsync in
+# the run would wait for that writeback. Flush it, then drop the page cache
+# so both engines start cold. The redirect has to run as root too.
+sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+
 # Ask cargo where build artefacts live (honours CARGO_TARGET_DIR)
 RELEASE_DIR="$("$(git rev-parse --show-toplevel)/scripts/cargo-target-dir")/release"
 BIN="$RELEASE_DIR/txn-latency"
