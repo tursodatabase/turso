@@ -133,6 +133,12 @@ fn checkpoint_yield_key() -> u64 {
     CHECKPOINT_SELECTION_TAG
 }
 
+/// Run the passive finalize's full-store sweep (instead of the targeted
+/// retired-chain pass) once this many finalized transaction states are
+/// waiting to be pruned. Entries are small, so this bounds that map to a few
+/// megabytes while keeping the expensive sweep rare.
+const FINALIZED_TX_STATES_FULL_SWEEP_THRESHOLD: usize = 100_000;
+
 /// Root-map mutation staged during collection; applied in the publish window.
 enum RootMapOp {
     /// Insert a new (checkpointed) root binding for `id` at `root` (STAGED → published).
@@ -1781,6 +1787,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             .mvstore
             .experimental_mvcc_passive_checkpoint
             .then(|| self.mvstore.take_retire_ts());
+        let mut retired = Vec::new();
         while index < self.write_set.len() {
             let current = index;
             index += 1;
@@ -1797,7 +1804,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     materialized_frame,
                     snapshot_ts,
                 );
-                let dropped = MvStore::<Clock, A>::gc_version_chain_with_retire(
+                let (dropped, _) = MvStore::<Clock, A>::gc_version_chain_with_retire(
                     &mut versions,
                     lwm,
                     ckpt_max,
@@ -1807,6 +1814,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     retire_ts,
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
+                // Materialized versions this pass could not reclaim yet (an
+                // open reader pins them, retired or not) go to the targeted
+                // drop queue; a later finalize reclaims them once the pin
+                // lifts. Without this only a full-store sweep would ever
+                // revisit them.
+                if self.mvstore.experimental_mvcc_passive_checkpoint
+                    && MvStore::<Clock, A>::chain_awaits_reclaim(&versions)
+                {
+                    retired.push(row_id.clone());
+                }
             } else {
                 // The MVCC metadata table row (persistent_tx_ts_max) is staged
                 // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
@@ -1822,6 +1839,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 break;
             }
         }
+        self.mvstore.record_retired_table_chains(retired);
         if index < self.write_set.len() {
             let CheckpointState::GcTableRows { next_index, .. } = &mut self.state else {
                 unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
@@ -1852,6 +1870,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             .mvstore
             .experimental_mvcc_passive_checkpoint
             .then(|| self.mvstore.take_retire_ts());
+        let mut retired = Vec::new();
         while index < self.index_write_set.len() {
             let current = index;
             index += 1;
@@ -1876,7 +1895,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     materialized_frame,
                     snapshot_ts,
                 );
-                let dropped = MvStore::<Clock, A>::gc_version_chain_with_retire(
+                let (dropped, _) = MvStore::<Clock, A>::gc_version_chain_with_retire(
                     &mut versions,
                     lwm,
                     ckpt_max,
@@ -1886,12 +1905,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     retire_ts,
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
+                // Same as the table GC above: queue what a later targeted
+                // finalize can reclaim.
+                if self.mvstore.experimental_mvcc_passive_checkpoint
+                    && MvStore::<Clock, A>::chain_awaits_reclaim(&versions)
+                {
+                    retired.push((index_id, sortable_key.clone()));
+                }
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {
                 break;
             }
         }
+        self.mvstore.record_retired_index_chains(retired);
         if index < self.index_write_set.len() {
             let CheckpointState::GcIndexRows { next_index, .. } = &mut self.state else {
                 unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
@@ -3007,14 +3034,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     // Truncate: under the blocking lock, drop last SkipMap copies and empty slots.
                     // That lock waits out open MVCC txs, so no old reader can see a later rewrite.
                     self.mvstore.drop_unused_row_versions_and_slots();
-                } else {
-                    // Passive: drop old versions and empty slots, but keep the latest SkipMap
-                    // copy of each row. Without it, an older reader can fall through to a
-                    // B-tree page that a later checkpoint already rewrote.
-                    // Also use the pager reader mark so we don't GC versions a brand-new
-                    // reader still needs before its MVCC tx is registered.
+                } else if self.mvstore.finalized_tx_states_len_approx()
+                    >= FINALIZED_TX_STATES_FULL_SWEEP_THRESHOLD
+                {
+                    // Passive, occasionally: sweep every chain in the store. Only
+                    // this sweep can prune `finalized_tx_states` (pruning needs
+                    // proof that no chain references a transaction id), so run it
+                    // once enough finalized states have piled up. It also
+                    // reclaims any chain the targeted pass below missed.
                     self.mvstore
                         .drop_unused_row_versions_unlink_empty_at(self.gc_floor_reader_mark());
+                } else {
+                    // Passive: drop the retired versions recorded by earlier GC
+                    // passes and unlink the chains that became empty, visiting
+                    // only those chains. The full-store sweep this replaces grew
+                    // with the whole store, and at a few thousand commits/s it
+                    // was most of the checkpoint's time.
+                    // The pager reader mark keeps versions a brand-new reader
+                    // still needs before its MVCC tx is registered.
+                    self.mvstore
+                        .drop_retired_chains(self.gc_floor_reader_mark());
                 }
                 // Locks stay held until `step()` runs `on_checkpoint_end`, then
                 // `release_checkpoint_locks_if_needed`.

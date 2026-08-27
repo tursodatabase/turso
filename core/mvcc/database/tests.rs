@@ -613,7 +613,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     // it stays in the chain for transactions that began at or before the retire
     // timestamp, and is removed once the LWM has moved past that timestamp.
     let mut current = stamped_insert();
-    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+    let (dropped, retired_now) = MvStore::<MvccClock>::gc_version_chain_with_retire(
         &mut current,
         10,
         10,
@@ -623,6 +623,10 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
         Some(40),
     );
     assert_eq!(dropped, 0, "Passive retires a materialized current version");
+    assert!(
+        retired_now,
+        "the retire must be reported so the chain can be queued for the targeted drop pass"
+    );
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].retired_at(), Some(40));
     assert_eq!(
@@ -630,7 +634,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
         None,
         "a retired version still reads as current"
     );
-    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+    let (dropped, retired_now) = MvStore::<MvccClock>::gc_version_chain_with_retire(
         &mut current,
         40,
         10,
@@ -643,7 +647,8 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
         dropped, 0,
         "a transaction with begin_ts == retire ts may still see the version"
     );
-    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+    assert!(!retired_now, "an already-retired version is not re-retired");
+    let (dropped, _) = MvStore::<MvccClock>::gc_version_chain_with_retire(
         &mut current,
         41,
         10,

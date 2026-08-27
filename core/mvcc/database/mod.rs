@@ -4171,6 +4171,17 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
+    /// Approximate entry count of `finalized_tx_states`, maintained at insert
+    /// and prune. The passive checkpoint's finalize reads it to decide when a
+    /// full-store sweep (the only place that prunes the map) is due.
+    finalized_tx_states_len: AtomicUsize,
+    /// Table chains whose last current version a passive pass retired
+    /// (`RowVersion::retired_at`). The passive checkpoint's finalize drains
+    /// this and drops the retired versions once no reader can see them,
+    /// instead of sweeping every chain in the store to find them.
+    retired_table_chains: Mutex<Vec<RowID>>,
+    /// Index counterpart of `retired_table_chains`.
+    retired_index_chains: Mutex<Vec<(MVTableId, Arc<SortableIndexKey>)>>,
     /// Allocator backing every skiplist in this store, including lazily
     /// created per-index maps in `index_rows`.
     alloc: A,
@@ -4409,6 +4420,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             index_rows_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
+            finalized_tx_states_len: AtomicUsize::new(0),
+            retired_table_chains: Mutex::new(Vec::new()),
+            retired_index_chains: Mutex::new(Vec::new()),
             alloc,
             logical_log_alloc,
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
@@ -6464,6 +6478,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<(), TryReserveError> {
         self.finalized_tx_states
             .try_insert(tx_id, TransactionState::Committed(commit_ts))?;
+        self.finalized_tx_states_len.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -7476,6 +7491,140 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.drop_unused_row_versions_inner(true, true, reader_mark_floor)
     }
 
+    /// How many finalized transaction states are waiting for the pruning
+    /// only a full-store sweep performs. Approximate; see
+    /// `finalized_tx_states_len`.
+    pub(crate) fn finalized_tx_states_len_approx(&self) -> usize {
+        self.finalized_tx_states_len.load(Ordering::Relaxed)
+    }
+
+    /// True when a future GC pass could reclaim something from this chain:
+    /// it holds a version that is already in the B-tree (retired or not),
+    /// kept only because some reader may still need the chain copy. Once
+    /// readers move past it, dropping it needs another visit — chains
+    /// matching this go on the targeted drop queue so the passive finalize
+    /// finds them without sweeping the whole store.
+    pub(crate) fn chain_awaits_reclaim(versions: &[RowVersion]) -> bool {
+        versions
+            .iter()
+            .any(|rv| rv.materialized_at() != WalPos::ORIGIN || rv.retired_at().is_some())
+    }
+
+    /// Queue table chains whose last current version was just retired, for
+    /// the passive finalize's targeted drop pass (`drop_retired_chains`).
+    pub(crate) fn record_retired_table_chains(&self, retired: Vec<RowID>) {
+        if !retired.is_empty() {
+            self.retired_table_chains.lock().extend(retired);
+        }
+    }
+
+    /// Index counterpart of [`Self::record_retired_table_chains`].
+    pub(crate) fn record_retired_index_chains(
+        &self,
+        retired: Vec<(MVTableId, Arc<SortableIndexKey>)>,
+    ) {
+        if !retired.is_empty() {
+            self.retired_index_chains.lock().extend(retired);
+        }
+    }
+
+    /// Drop retired versions from the chains recorded in the retired-chain
+    /// queues, unlinking chains that become empty. Chains whose retired
+    /// version is still visible to someone go back on the queue for the next
+    /// pass. This is the passive checkpoint's finalize path: it visits only
+    /// the chains that have something to reclaim, where the full sweep
+    /// (`drop_unused_row_versions_unlink_empty_at`) walks every chain in the
+    /// store.
+    pub fn drop_retired_chains(&self, reader_mark_floor: WalPos) -> usize {
+        let lwm = {
+            let mut sampled = u64::MAX;
+            self.clock.get_timestamp(|_| sampled = self.compute_lwm());
+            sampled
+        };
+        let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
+        let min_reader_mark = self
+            .compute_min_reader_mark()
+            .min(*self.backfill_floor.read())
+            .min(reader_mark_floor);
+        let retire_ts = Some(self.take_retire_ts());
+        let mut dropped = 0;
+
+        let table_chains = std::mem::take(&mut *self.retired_table_chains.lock());
+        let mut requeue_tables: Vec<RowID> = Vec::new();
+        for row_id in table_chains {
+            let Some(entry) = self.rows.get(&row_id) else {
+                continue;
+            };
+            if self.rootpage_gc_protected(&row_id.table_id, min_reader_mark) {
+                requeue_tables.push(row_id);
+                continue;
+            }
+            let mut versions = entry.value().write();
+            let (chain_dropped, _) = Self::gc_version_chain_with_retire(
+                &mut versions,
+                lwm,
+                ckpt_max,
+                true,
+                min_reader_mark,
+                true,
+                retire_ts,
+            );
+            dropped += chain_dropped;
+            let awaits_more = Self::chain_awaits_reclaim(&versions);
+            let empty = versions.is_empty();
+            drop(versions);
+            if empty {
+                entry.remove();
+            } else if awaits_more {
+                requeue_tables.push(row_id);
+            }
+        }
+        if !requeue_tables.is_empty() {
+            self.retired_table_chains.lock().extend(requeue_tables);
+        }
+
+        let index_chains = std::mem::take(&mut *self.retired_index_chains.lock());
+        let mut requeue_indexes: Vec<(MVTableId, Arc<SortableIndexKey>)> = Vec::new();
+        for (index_id, key) in index_chains {
+            let Some(outer_entry) = self.index_rows.get(&index_id) else {
+                continue;
+            };
+            if self.rootpage_gc_protected(&index_id, min_reader_mark) {
+                requeue_indexes.push((index_id, key));
+                continue;
+            }
+            let Some(inner_entry) = outer_entry.value().get(&key) else {
+                continue;
+            };
+            let mut versions = inner_entry.value().write();
+            let (chain_dropped, _) = Self::gc_version_chain_with_retire(
+                &mut versions,
+                lwm,
+                ckpt_max,
+                true,
+                min_reader_mark,
+                true,
+                retire_ts,
+            );
+            dropped += chain_dropped;
+            let awaits_more = Self::chain_awaits_reclaim(&versions);
+            let empty = versions.is_empty();
+            drop(versions);
+            if empty {
+                self.bump_index_rows_epoch();
+                inner_entry.remove();
+            } else if awaits_more {
+                requeue_indexes.push((index_id, key));
+            }
+        }
+        if !requeue_indexes.is_empty() {
+            self.retired_index_chains.lock().extend(requeue_indexes);
+        }
+
+        self.dec_live_version_count_approx(dropped);
+        dropped
+    }
+
     /// Incremental GC on the commit path: reclaim up to `max_chains` table chains
     /// (resuming via `gc_table_cursor`). Truncate mode unlinks empty SkipMap slots;
     /// Passive leaves them for Finalize `unlink_empty`. Skips `finalized_tx_states`
@@ -7566,6 +7715,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dropped = 0;
         let mut processed = 0;
         let mut last_key: Option<RowID> = None;
+        // One retire timestamp for the whole pass: taking the clock (and
+        // recomputing the LWM under it) per chain made this pass mostly
+        // clock-lock traffic. A pass-wide retire_ts is safe for the same
+        // reason the full sweep's is: every transaction that begins after it
+        // gets a larger begin_ts, and the pass-start LWM only under-reclaims.
+        let retire_ts = passive.then(|| self.take_retire_ts());
+        let mut retired: Vec<RowID> = Vec::new();
 
         // Resume strictly after the last key processed by the previous pass.
         let start_bound = match self.gc_table_cursor.lock().clone() {
@@ -7579,21 +7735,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
             if !self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
                 if passive {
-                    // The clock callback serializes this against transaction
-                    // begins, so `retire_ts` orders before every later `begin_ts`.
-                    self.clock.get_timestamp(|retire_ts| {
-                        let lwm = self.compute_lwm();
-                        let mut versions = entry.value().write();
-                        dropped += Self::gc_version_chain_with_retire(
-                            &mut versions,
-                            lwm,
-                            ckpt_max,
-                            true,
-                            min_reader_mark,
-                            drop_current_if_in_btree,
-                            Some(retire_ts),
-                        );
-                    });
+                    let mut versions = entry.value().write();
+                    let (chain_dropped, retired_now) = Self::gc_version_chain_with_retire(
+                        &mut versions,
+                        lwm,
+                        ckpt_max,
+                        true,
+                        min_reader_mark,
+                        drop_current_if_in_btree,
+                        retire_ts,
+                    );
+                    dropped += chain_dropped;
+                    // Passive leaves empty slots for the finalize to unlink,
+                    // so hand both retirees and emptied chains to its queue.
+                    if retired_now || versions.is_empty() {
+                        retired.push(entry.key().clone());
+                    }
                 } else {
                     let mut versions = entry.value().write();
                     dropped += Self::gc_version_chain(
@@ -7611,6 +7768,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             last_key = Some(entry.key().clone());
             processed += 1;
+        }
+        if !retired.is_empty() {
+            self.retired_table_chains.lock().extend(retired);
         }
 
         // If we processed fewer chains than the budget, the range was
@@ -7675,6 +7835,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dropped = 0;
         let mut processed = 0;
         let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
+        // One retire timestamp for the whole pass; see `gc_incremental_with_floor`.
+        let retire_ts = passive.then(|| self.take_retire_ts());
+        let mut retired: Vec<(MVTableId, Arc<SortableIndexKey>)> = Vec::new();
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
         // WAL frames — a db-file reader (present or future) needs the version-store copy.
         let min_reader_mark = self
@@ -7708,19 +7871,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     break 'outer;
                 }
                 if passive {
-                    self.clock.get_timestamp(|retire_ts| {
-                        let lwm = self.compute_lwm();
-                        let mut versions = inner_entry.value().write();
-                        dropped += Self::gc_version_chain_with_retire(
-                            &mut versions,
-                            lwm,
-                            ckpt_max,
-                            true,
-                            min_reader_mark,
-                            drop_current_if_in_btree,
-                            Some(retire_ts),
-                        );
-                    });
+                    let mut versions = inner_entry.value().write();
+                    let (chain_dropped, retired_now) = Self::gc_version_chain_with_retire(
+                        &mut versions,
+                        lwm,
+                        ckpt_max,
+                        true,
+                        min_reader_mark,
+                        drop_current_if_in_btree,
+                        retire_ts,
+                    );
+                    dropped += chain_dropped;
+                    // Same as the table sweep: emptied chains go to the
+                    // finalize queue for unlinking.
+                    if retired_now || versions.is_empty() {
+                        retired.push((index_id, inner_entry.key().clone()));
+                    }
                 } else {
                     let mut versions = inner_entry.value().write();
                     dropped += Self::gc_version_chain(
@@ -7739,6 +7905,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 last = Some((index_id, inner_entry.key().clone()));
                 processed += 1;
             }
+        }
+        if !retired.is_empty() {
+            self.retired_index_chains.lock().extend(retired);
         }
 
         // Fewer chains than the budget => nested maps exhausted; wrap to start.
@@ -7812,13 +7981,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
 
+        let mut retired: Vec<RowID> = Vec::new();
         for entry in self.rows.iter() {
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
             if self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
                 continue;
             }
             let mut versions = entry.value().write();
-            dropped += Self::gc_version_chain_with_retire(
+            let (chain_dropped, retired_now) = Self::gc_version_chain_with_retire(
                 &mut versions,
                 lwm,
                 ckpt_max,
@@ -7827,10 +7997,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 drop_current_if_in_btree,
                 retire_ts,
             );
+            dropped += chain_dropped;
+            if retired_now {
+                retired.push(entry.key().clone());
+            }
             Self::collect_referenced_txids(&versions, referenced_tx_ids);
             if remove_empty_slots && versions.is_empty() {
                 entry.remove();
             }
+        }
+        if !retired.is_empty() {
+            self.retired_table_chains.lock().extend(retired);
         }
         dropped
     }
@@ -7856,6 +8033,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
 
+        let mut retired: Vec<(MVTableId, Arc<SortableIndexKey>)> = Vec::new();
         for outer_entry in self.index_rows.iter() {
             // GC floor: retain a freshly-materialized index not yet visible to all readers.
             if self.rootpage_gc_protected(outer_entry.key(), min_reader_mark) {
@@ -7865,7 +8043,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
             for inner_entry in inner_map.iter() {
                 let mut versions = inner_entry.value().write();
-                dropped += Self::gc_version_chain_with_retire(
+                let (chain_dropped, retired_now) = Self::gc_version_chain_with_retire(
                     &mut versions,
                     lwm,
                     ckpt_max,
@@ -7874,6 +8052,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     drop_current_if_in_btree,
                     retire_ts,
                 );
+                dropped += chain_dropped;
+                if retired_now {
+                    retired.push((*outer_entry.key(), inner_entry.key().clone()));
+                }
                 Self::collect_referenced_txids(&versions, referenced_tx_ids);
                 if remove_empty_slots && versions.is_empty() {
                     self.bump_index_rows_epoch();
@@ -7881,6 +8063,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     inner_entry.remove();
                 }
             }
+        }
+        if !retired.is_empty() {
+            self.retired_index_chains.lock().extend(retired);
         }
         dropped
     }
@@ -7913,8 +8098,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         for tx_id in &to_remove {
             self.finalized_tx_states.remove(tx_id);
         }
+        // Approximate: concurrent inserts between the collect and here drift
+        // the counter, and the next prune corrects it. It only gates when a
+        // full sweep is worth running, so drift is harmless.
+        let removed = to_remove.len();
+        let _ = self.finalized_tx_states_len.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |len| Some(len.saturating_sub(removed)),
+        );
 
-        to_remove.len()
+        removed
     }
 
     /// Apply GC rules to a single version chain. Returns the number removed.
@@ -7948,7 +8142,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
     ) -> usize {
-        Self::gc_version_chain_with_retire(
+        let (dropped, _) = Self::gc_version_chain_with_retire(
             versions,
             lwm,
             ckpt_max,
@@ -7956,10 +8150,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             min_reader_mark,
             drop_current_if_in_btree,
             None,
-        )
+        );
+        dropped
     }
 
     /// [`Self::gc_version_chain`] with the retire timestamp Passive Rule 3 needs.
+    /// Returns `(dropped, retired_now)`: `retired_now` is true when this call
+    /// retired the chain's last current version, so the caller can queue the
+    /// chain for the targeted drop pass instead of a full-store sweep finding
+    /// it later.
     fn gc_version_chain_with_retire(
         versions: &mut RowVersionChain<A>,
         lwm: u64,
@@ -7968,7 +8167,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
         retire_ts: Option<u64>,
-    ) -> usize {
+    ) -> (usize, bool) {
         let before = versions.len();
 
         // Rule 1: aborted garbage
@@ -8008,6 +8207,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         // Rule 3: optionally drop the last current version when the B-tree already has it.
         // Passive retires it instead of dropping it (Rule 3b removes it later).
+        let mut retired_now = false;
         if drop_current_if_in_btree && versions.len() == 1 && versions[0].retired_at().is_none() {
             if let (Some(TxTimestampOrID::Timestamp(b)), None) =
                 (&versions[0].begin(), &versions[0].end())
@@ -8017,6 +8217,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         let retire_ts = retire_ts
                             .expect("passive GC with Rule 3 enabled needs a retire timestamp");
                         versions[0].set_retired_at(retire_ts);
+                        retired_now = true;
                     }
                 } else if *b <= ckpt_max && *b < lwm {
                     versions.clear();
@@ -8026,7 +8227,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         Self::shrink_version_chain_allocation(versions);
 
-        before - versions.len()
+        (before - versions.len(), retired_now)
     }
 
     /// Stamp each version this checkpoint materialized with the WAL `frame` it became durable at.
