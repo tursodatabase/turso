@@ -107,15 +107,6 @@ def fmt_ms(value, _pos=None):
     return f"{value:g}"
 
 
-def fmt_value(value):
-    """A measured value with a sensible number of digits: 0.83, 9.1, 329."""
-    if value >= 100:
-        return f"{value:,.0f}"
-    if value >= 10:
-        return f"{value:.1f}"
-    return f"{value:.2g}"
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv_files", nargs="+", type=Path)
@@ -157,14 +148,15 @@ def main():
             ax.plot(np.percentile(samples, PERCENTILES), PERCENTILES, linestyle="none",
                     marker=look["marker"], markersize=4, color=look["color"],
                     markeredgewidth=1.0, zorder=4)
-            # The tail, as a vertical line at p99.9 with its value written
-            # along it. Each engine gets its own half of the height, so the
-            # labels stay apart when the lines fall on the same spot.
+            # The tail, as a vertical line at p99.9 with the engine and the
+            # value written along it. Each engine gets its own half of the
+            # height, so the labels stay apart when the lines fall on the
+            # same spot.
             tail = float(np.percentile(samples, 99.9))
             ax.axvline(tail, color=look["color"], linewidth=0.9, linestyle=TAIL_STYLE,
                        zorder=2)
             y, va = (45, "top") if index == 0 else (55, "bottom")
-            ax.annotate(f"p99.9 = {fmt_value(tail)} ms", xy=(tail, y), xytext=(-3, 0),
+            ax.annotate(f"{look['name']} {fmt_ms(tail)} ms", xy=(tail, y), xytext=(-3, 0),
                         textcoords="offset points", rotation=90, ha="right", va=va,
                         color=look["color"], fontsize=6.5, zorder=5)
             label = label_for(look, mode, modes_per_engine[engine])
