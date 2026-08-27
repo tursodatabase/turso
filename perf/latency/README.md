@@ -31,7 +31,29 @@ Then plot:
 
 ```console
 cd plot
-uv run plot-latency-ecdf.py sqlite.csv turso.csv
+uv run plot-latency-ecdf.py sqlite-c1.csv turso-c1.csv
+```
+
+## Concurrency
+
+SQLite lets one connection write at a time, so with several connections in
+flight every writer waits for whoever holds the write lock, and its busy
+handler waits by sleeping. Turso's `BEGIN CONCURRENT` only serializes on the
+commit itself. To see what that does to the tail, sweep the connection count
+while holding the offered rate fixed, so more connections means more
+transactions in flight at once rather than more load:
+
+```console
+RATE=1000 CONNECTIONS="1 2 4 8 16" ./scripts/bench.sh
+```
+
+That writes one file per engine and connection count. Two figures show it:
+the tail's shape at two concurrency levels, and the trend across all of them.
+
+```console
+cd plot
+uv run plot-latency-ecdf.py sqlite-c1.csv turso-c1.csv sqlite-c8.csv turso-c8.csv
+uv run plot-latency-percentiles.py sqlite-c*.csv turso-c*.csv
 ```
 
 The benchmark warns on stderr when an engine could not keep up with the offered
@@ -58,7 +80,7 @@ throughput benchmark wants and what a latency benchmark should not report.
 | `--engine` | `sqlite` or `turso` |
 | `--mode` | `immediate` (WAL, `BEGIN IMMEDIATE`) or `concurrent` (MVCC, `BEGIN CONCURRENT`, passive checkpointing). Turso defaults to `concurrent`, SQLite only has `immediate` |
 | `--rate` | Transactions offered per second |
-| `--connections` | Connections serving the arrivals, default 1 |
+| `--connections` | Connections serving the arrivals, default 1. `bench.sh` takes a space-separated list in `CONNECTIONS` and runs each |
 | `--batch-size` | Rows inserted per transaction |
 | `--duration`, `--warmup` | Seconds measured and seconds discarded |
 | `--closed-loop` | Offer the next transaction only when the previous one finishes |

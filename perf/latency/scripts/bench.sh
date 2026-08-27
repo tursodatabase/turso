@@ -17,6 +17,8 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 OUT=${OUT:-"$HERE/plot"}
 
 RATE=${RATE:-200}
+# Space-separated list. The offered rate is the total across connections, so
+# more connections means more transactions in flight at once, not more load.
 CONNECTIONS=${CONNECTIONS:-1}
 CHECKPOINTER=${CHECKPOINTER:-1000}
 BATCH_SIZE=${BATCH_SIZE:-10}
@@ -25,11 +27,14 @@ WARMUP=${WARMUP:-5}
 
 mkdir -p "$OUT"
 
-for engine in sqlite turso; do
-  echo "running $engine at $RATE transactions/s" >&2
-  "$BIN" --engine "$engine" --rate "$RATE" --connections "$CONNECTIONS" --checkpointer "$CHECKPOINTER" \
-      --batch-size "$BATCH_SIZE" --duration "$DURATION" --warmup "$WARMUP" \
-      > "$OUT/$engine.csv"
+for connections in $CONNECTIONS; do
+  for engine in sqlite turso; do
+    echo "running $engine at $RATE transactions/s over $connections connection(s)" >&2
+    "$BIN" --engine "$engine" --rate "$RATE" --connections "$connections" \
+        --checkpointer "$CHECKPOINTER" --batch-size "$BATCH_SIZE" \
+        --duration "$DURATION" --warmup "$WARMUP" \
+        > "$OUT/$engine-c$connections.csv"
+  done
 done
 
-echo "wrote $OUT/sqlite.csv and $OUT/turso.csv" >&2
+echo "wrote $OUT/{sqlite,turso}-c{$(echo $CONNECTIONS | tr ' ' ',')}.csv" >&2
