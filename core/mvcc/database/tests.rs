@@ -611,7 +611,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     // Passive with Rule 3 on nominates the current version for retirement
     // instead of dropping it. The caller applies the retirement clock-ordered
-    // (`retire_current_version_clock_ordered`); the version then stays in the
+    // (`retire_nominated_chains_clock_ordered`); the version then stays in the
     // chain for transactions that began at or before the retire timestamp, and
     // is removed once the LWM has moved past that timestamp.
     let mut current = stamped_insert();
@@ -633,7 +633,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     );
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].retired_at(), None, "nomination does not retire");
-    // Caller-side apply (normally done by retire_current_version_clock_ordered
+    // Caller-side apply (normally done by retire_nominated_chains_clock_ordered
     // with a timestamp allocated inside the clock lock).
     current[0].set_retired_at(40);
     assert_eq!(

@@ -1781,9 +1781,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // Rule 3 runs in both modes. Truncate drops a materialized current version
         // under its blocking lock; Passive retires it instead (see
         // `RowVersion::retired_at`), with the retire timestamp allocated at
-        // apply time inside the clock lock (`retire_current_version_clock_ordered`).
+        // apply time inside the clock lock (`retire_nominated_chains_clock_ordered`).
         let drop_current_if_in_btree = true;
         let mut retired = Vec::new();
+        let mut nominated = Vec::new();
         while index < self.write_set.len() {
             let current = index;
             index += 1;
@@ -1812,18 +1813,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 let awaits = self.mvstore.experimental_mvcc_passive_checkpoint
                     && MvStore::<Clock, A>::chain_awaits_reclaim(&versions);
                 drop(versions);
-                let retired_now = retire_candidate
-                    && self.mvstore.retire_current_version_clock_ordered(
-                        entry.value(),
-                        lwm,
-                        min_reader_mark,
-                    );
+                if retire_candidate {
+                    nominated.push(entry.value().clone());
+                }
                 // Materialized versions this pass could not reclaim yet (an
                 // open reader pins them, retired or not) go to the targeted
                 // drop queue; a later finalize reclaims them once the pin
                 // lifts. Without this only a full-store sweep would ever
-                // revisit them.
-                if awaits || retired_now {
+                // revisit them. Nomination implies a materialized current,
+                // so `awaits` covers the nominated chains too.
+                if awaits {
                     retired.push(row_id.clone());
                 }
             } else {
@@ -1841,6 +1840,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 break;
             }
         }
+        self.mvstore
+            .retire_nominated_chains_clock_ordered(nominated, lwm, min_reader_mark);
         self.mvstore.record_retired_table_chains(retired);
         if index < self.write_set.len() {
             let CheckpointState::GcTableRows { next_index, .. } = &mut self.state else {
@@ -1869,6 +1870,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // Same as the table GC: Rule 3 on, Passive retires clock-ordered (see above).
         let drop_current_if_in_btree = true;
         let mut retired = Vec::new();
+        let mut nominated = Vec::new();
         while index < self.index_write_set.len() {
             let current = index;
             index += 1;
@@ -1905,15 +1907,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 let awaits = self.mvstore.experimental_mvcc_passive_checkpoint
                     && MvStore::<Clock, A>::chain_awaits_reclaim(&versions);
                 drop(versions);
-                let retired_now = retire_candidate
-                    && self.mvstore.retire_current_version_clock_ordered(
-                        inner_entry.value(),
-                        lwm,
-                        min_reader_mark,
-                    );
+                if retire_candidate {
+                    nominated.push(inner_entry.value().clone());
+                }
                 // Same as the table GC above: queue what a later targeted
-                // finalize can reclaim.
-                if awaits || retired_now {
+                // finalize can reclaim; nomination implies `awaits`.
+                if awaits {
                     retired.push((index_id, sortable_key.clone()));
                 }
             }
@@ -1922,6 +1921,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 break;
             }
         }
+        self.mvstore
+            .retire_nominated_chains_clock_ordered(nominated, lwm, min_reader_mark);
         self.mvstore.record_retired_index_chains(retired);
         if index < self.index_write_set.len() {
             let CheckpointState::GcIndexRows { next_index, .. } = &mut self.state else {
