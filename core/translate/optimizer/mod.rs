@@ -21,6 +21,7 @@ use crate::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
         ROWID_SENTINEL,
     },
+    translate::expr::as_binary_components,
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
@@ -53,7 +54,7 @@ use crate::{
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     can_use_partial_index, constraints_from_where_clause, partial_index,
-    partial_index_predicate_terms, Constraint,
+    partial_index_predicate_terms, Constraint, ConstraintOperator,
 };
 use cost::Cost;
 use join::{
@@ -3109,6 +3110,7 @@ fn build_vtab_scan_op(
     }
 
     let mut constraints = vec![None; constraint_usages.len()];
+    let mut in_args: Vec<(usize, InSeekSource)> = Vec::new();
     let mut arg_count = 0;
 
     for (i, vtab_constraint) in vtab_constraints.iter().enumerate() {
@@ -3136,8 +3138,11 @@ fn build_vtab_scan_op(
         if usage.omit {
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
-        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables, None);
-        constraints[zero_based_argv_index] = Some(expr);
+        constraints[zero_based_argv_index] =
+            Some(vtab_argv_expr(constraint, where_clause, referenced_tables));
+        if let Some(source) = vtab_in_loop_source(constraint, where_clause) {
+            in_args.push((zero_based_argv_index, source));
+        }
         arg_count += 1;
     }
 
@@ -3160,7 +3165,56 @@ fn build_vtab_scan_op(
         idx_num: *idx_num,
         idx_str: idx_str.clone(),
         constraints,
+        in_args,
     }))
+}
+
+/// IN lists with more than one value, and IN subqueries, need a per-value xFilter loop.
+fn vtab_in_loop_source(
+    constraint: &Constraint,
+    where_clause: &[WhereTerm],
+) -> Option<InSeekSource> {
+    let ConstraintOperator::In { not: false, .. } = constraint.operator else {
+        return None;
+    };
+    match &where_clause[constraint.where_clause_pos.0].expr {
+        Expr::InList { rhs, .. } if rhs.len() != 1 => Some(InSeekSource::LiteralList {
+            values: rhs.iter().map(|e| *e.clone()).collect(),
+            affinity: constraint.comparison_affinity.unwrap_or(Affinity::Blob),
+        }),
+        Expr::SubqueryResult {
+            query_type: SubqueryType::In { cursor_id, .. },
+            ..
+        } => Some(InSeekSource::Subquery {
+            cursor_id: *cursor_id,
+        }),
+        _ => None,
+    }
+}
+
+fn vtab_argv_expr(
+    constraint: &Constraint,
+    where_clause: &[WhereTerm],
+    referenced_tables: Option<&TableReferences>,
+) -> Expr {
+    match &constraint.operator {
+        ConstraintOperator::In { .. } => match &where_clause[constraint.where_clause_pos.0].expr {
+            Expr::InList { rhs, .. } if rhs.len() == 1 => *rhs[0].clone(),
+            _ => Expr::Literal(ast::Literal::Null),
+        },
+        ConstraintOperator::Like { .. } => {
+            let term = &where_clause[constraint.where_clause_pos.0].expr;
+            let Ok(Some((_, _, rhs))) = as_binary_components(term) else {
+                panic!("LIKE constraint where term is not a LIKE expression");
+            };
+            rhs.clone()
+        }
+        _ => {
+            constraint
+                .get_constraining_expr(where_clause, referenced_tables, None)
+                .1
+        }
+    }
 }
 
 /// Mark WHERE clause terms as consumed when they are covered by a seek

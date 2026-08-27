@@ -14,9 +14,9 @@ use crate::{
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         order_by::EmitOrderBy,
         plan::{
-            BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate,
+            BitSet, Distinctness, EphemeralRowidMode, EvalAt, InSeekSource, IndexMethodQuery,
+            JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
+            SelectPlan, SimpleAggregate,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -875,7 +875,11 @@ fn build_materialized_build_input_plan(
                     }
                 }
             }
-            Operation::Scan(Scan::VirtualTable { constraints, .. }) => {
+            Operation::Scan(Scan::VirtualTable {
+                constraints,
+                in_args,
+                ..
+            }) => {
                 // Virtual table constraints are evaluated against expressions.
                 // If any constraint depends on non-prefix tables, drop the scan
                 // specialization and fall back to a full scan.
@@ -883,6 +887,18 @@ fn build_materialized_build_input_plan(
                     if expr_depends_outside_prefix(expr)? {
                         reset_op = true;
                         break;
+                    }
+                }
+                if !reset_op {
+                    'in_args: for (_, source) in in_args {
+                        if let InSeekSource::LiteralList { values, .. } = source {
+                            for expr in values {
+                                if expr_depends_outside_prefix(expr)? {
+                                    reset_op = true;
+                                    break 'in_args;
+                                }
+                            }
+                        }
                     }
                 }
             }

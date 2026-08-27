@@ -1,0 +1,54 @@
+@database :memory:
+
+# IN on a TVF hidden argument was dropped before xBestIndex, so json_each
+# returned 0 rows and generate_series scanned to u32::MAX. SQLite presents
+# IN as EQ and re-invokes xFilter once per value.
+
+test json-each-eq-control {
+    SELECT count(*) FROM json_each WHERE json = '[1,2,3]';
+}
+expect {
+    3
+}
+
+test json-each-in-list {
+    SELECT count(*) FROM json_each WHERE json IN ('[1,2,3]');
+}
+expect {
+    3
+}
+
+test json-each-in-two-documents {
+    SELECT count(*) FROM json_each WHERE json IN ('[1,2,3]', '[4,5]');
+}
+expect {
+    5
+}
+
+test json-each-in-subquery {
+    SELECT count(*) FROM json_each WHERE json IN (SELECT '[1,2,3]');
+}
+expect {
+    3
+}
+
+test json-tree-in-list {
+    SELECT count(*) FROM json_tree WHERE json IN ('[1,2,3]');
+}
+expect {
+    4
+}
+
+test generate-series-eq-control {
+    SELECT count(*) FROM generate_series WHERE start = 1 AND stop = 5;
+}
+expect {
+    5
+}
+
+test generate-series-in-stop {
+    SELECT count(*) FROM generate_series WHERE start = 1 AND stop IN (5);
+}
+expect {
+    5
+}

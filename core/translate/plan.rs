@@ -2343,6 +2343,7 @@ impl Operation {
                 idx_num: -1,
                 idx_str: None,
                 constraints: Vec::new(),
+                in_args: Vec::new(),
             }),
             Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
                 iter_dir: IterationDirection::Forwards,
@@ -3146,6 +3147,9 @@ pub enum Scan {
         /// Constraining expressions to be passed to the table’s `filter` method.
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
+        /// IN-driven argv slots. SQLite presents IN as EQ to xBestIndex, then
+        /// re-invokes xFilter once per RHS value.
+        in_args: Vec<(usize, InSeekSource)>,
     },
     /// A scan of a subquery in the `FROM` clause.
     Subquery {

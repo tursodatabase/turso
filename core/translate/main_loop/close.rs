@@ -110,6 +110,14 @@ impl CloseLoop {
                                     .expect("Virtual tables do not support covering indexes"),
                                 pc_if_next: loop_labels.loop_start,
                             });
+                            for meta in t_ctx.meta_vtab_in[table_index].iter().rev() {
+                                program.preassign_label_to_next_insn(meta.next_val_label);
+                                program.emit_insn(Insn::Next {
+                                    cursor_id: meta.ephemeral_cursor_id,
+                                    pc_if_next: meta.outer_loop_start,
+                                    fullscan: false,
+                                });
+                            }
                         }
                         Scan::Subquery { iter_dir } => {
                             // Check if this is a materialized CTE (EphemeralTable) or coroutine

@@ -807,3 +807,72 @@ impl InPlaceJsonPath {
         &self.last_element
     }
 }
+
+#[cfg(test)]
+mod in_constraint_tests {
+    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, Value};
+    use std::sync::Arc;
+
+    fn count(sql: &str) -> i64 {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            crate::util::MEMORY_PATH,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        match rows.as_slice() {
+            [cols] => match cols.as_slice() {
+                [Value::Numeric(crate::Numeric::Integer(n))] => *n,
+                other => panic!("expected integer count from `{sql}`, got {other:?}"),
+            },
+            other => panic!("expected one row from `{sql}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_each_in_list_is_not_dropped() {
+        assert_eq!(
+            count("SELECT count(*) FROM json_each WHERE json = '[1,2,3]'"),
+            3
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM json_each WHERE json IN ('[1,2,3]')"),
+            3
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM json_each WHERE json IN ('[1,2,3]', '[4,5]')"),
+            5
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM json_each WHERE json IN (SELECT '[1,2,3]')"),
+            3
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM json_each WHERE json IN ('[]', '[1,2,3]')"),
+            3
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM json_tree WHERE json IN ('[1,2,3]')"),
+            4
+        );
+    }
+
+    #[test]
+    fn generate_series_in_stop_is_bounded() {
+        assert_eq!(
+            count("SELECT count(*) FROM generate_series WHERE start = 1 AND stop = 5"),
+            5
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM generate_series WHERE start = 1 AND stop IN (5)"),
+            5
+        );
+    }
+}

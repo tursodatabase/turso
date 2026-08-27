@@ -1828,17 +1828,20 @@ pub fn is_equality_operator(op: ConstraintOperator) -> bool {
 }
 
 fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
-    let ConstraintOperator::AstNativeOperator(op) = op else {
-        return None;
-    };
     match op {
-        ast::Operator::Equals => Some(ConstraintOp::Eq),
-        ast::Operator::Less => Some(ConstraintOp::Lt),
-        ast::Operator::LessEquals => Some(ConstraintOp::Le),
-        ast::Operator::Greater => Some(ConstraintOp::Gt),
-        ast::Operator::GreaterEquals => Some(ConstraintOp::Ge),
-        ast::Operator::NotEquals => Some(ConstraintOp::Ne),
-        _ => None,
+        ConstraintOperator::AstNativeOperator(op) => match op {
+            ast::Operator::Equals => Some(ConstraintOp::Eq),
+            ast::Operator::Less => Some(ConstraintOp::Lt),
+            ast::Operator::LessEquals => Some(ConstraintOp::Le),
+            ast::Operator::Greater => Some(ConstraintOp::Gt),
+            ast::Operator::GreaterEquals => Some(ConstraintOp::Ge),
+            ast::Operator::NotEquals => Some(ConstraintOp::Ne),
+            _ => None,
+        },
+        // SQLite presents IN to xBestIndex as EQ, then re-invokes xFilter per value.
+        ConstraintOperator::In { not: false, .. } => Some(ConstraintOp::Eq),
+        ConstraintOperator::Like { not: false } => Some(ConstraintOp::Like),
+        ConstraintOperator::In { not: true, .. } | ConstraintOperator::Like { not: true } => None,
     }
 }
 
