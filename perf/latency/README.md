@@ -66,7 +66,7 @@ throughput benchmark wants and what a latency benchmark should not report.
 | `--io` | Turso IO backend, `syscall` (default) or `io_uring` (Linux only). SQLite ignores it |
 | `--checkpoint-mode` | Turso MVCC auto-checkpoint mode, `passive` (default) or `truncate`. SQLite ignores it |
 | `--mvcc-checkpoint-threshold` | Bytes of logical log between Turso MVCC auto-checkpoints, default 4120000. SQLite ignores it |
-| `--checkpointer` | Turn off the writer's auto-checkpoint and run `PRAGMA wal_checkpoint(PASSIVE)` from a separate connection every this many milliseconds. Both engines |
+| `--checkpointer` | Milliseconds between checkpoints run from a separate connection, default 1000. `0` lets each writer auto-checkpoint itself. Both engines |
 
 Both engines run with `synchronous = FULL`, so every commit pays for an fsync
 and the comparison is between the durability paths rather than between two
@@ -74,14 +74,19 @@ different durability settings.
 
 ## Checkpointing
 
-By default both engines checkpoint from the writer's own commit: SQLite every
-1000 WAL pages, Turso every 4.12 MB of logical log. That is what a user gets
-out of the box, but it makes the tail mostly a question of how often each
-engine checkpoints and how much each checkpoint costs. `--mvcc-checkpoint-threshold`
-lines up Turso's cadence with SQLite's, and `--checkpointer` moves the
-checkpoint off the writer for both engines, which is how a server would run
-either of them. The summary then reports how long each checkpoint took, so a
-writer stall can be matched against the checkpoint that caused it.
+The benchmark checkpoints the way a server would: the writer's own
+auto-checkpoint is off and a separate connection runs
+`PRAGMA wal_checkpoint(PASSIVE)` once a second (`--checkpointer`), for both
+engines. That is the best configuration for each of them, and the one that
+tests whether checkpointing stays off the writer's path.
+
+`--checkpointer 0` gives the out-of-the-box behaviour instead: SQLite
+checkpoints from the committing connection every 1000 WAL pages, Turso every
+4.12 MB of logical log, which is about fifteen times fewer checkpoints that
+each cost far more. `--mvcc-checkpoint-threshold` lines Turso's cadence up
+with SQLite's for comparing the checkpoints themselves. The summary reports
+how long each checkpoint took, so a writer stall can be matched against the
+checkpoint that caused it.
 
 ## Output
 

@@ -12,6 +12,7 @@ OUT=${OUT:-"$HERE/plot"}
 
 RATE=${RATE:-200}
 CONNECTIONS=${CONNECTIONS:-1}
+CHECKPOINTER=${CHECKPOINTER:-1000}
 BATCH_SIZE=${BATCH_SIZE:-10}
 DURATION=${DURATION:-60}
 WARMUP=${WARMUP:-5}
@@ -20,7 +21,7 @@ mkdir -p "$OUT"
 
 for engine in sqlite turso; do
   echo "running $engine at $RATE transactions/s" >&2
-  "$BIN" --engine "$engine" --rate "$RATE" --connections "$CONNECTIONS" \
+  "$BIN" --engine "$engine" --rate "$RATE" --connections "$CONNECTIONS" --checkpointer "$CHECKPOINTER" \
       --batch-size "$BATCH_SIZE" --duration "$DURATION" --warmup "$WARMUP" \
       > "$OUT/$engine.csv"
 done

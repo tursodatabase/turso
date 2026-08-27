@@ -145,11 +145,12 @@ struct Args {
     #[arg(
         long = "checkpointer",
         value_name = "MS",
-        help = "Take checkpointing off the writer: turn off its auto-checkpoint and run \
-                PRAGMA wal_checkpoint(PASSIVE) from a separate connection every MS milliseconds. \
-                Applies to both engines"
+        default_value = "1000",
+        help = "Checkpoint from a separate connection every MS milliseconds instead of on the \
+                writer's commit path, for both engines. 0 lets each writer auto-checkpoint \
+                itself, which is what the engines do out of the box"
     )]
-    checkpointer: Option<u64>,
+    checkpointer: u64,
 
     #[arg(
         long = "io",
@@ -345,7 +346,7 @@ fn main() {
         io: args.io,
         checkpoint_mode: args.checkpoint_mode,
         mvcc_checkpoint_threshold: args.mvcc_checkpoint_threshold,
-        checkpointer: args.checkpointer.map(Duration::from_millis),
+        checkpointer: (args.checkpointer > 0).then(|| Duration::from_millis(args.checkpointer)),
         period: if args.closed_loop {
             None
         } else {
