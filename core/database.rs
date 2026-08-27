@@ -3345,6 +3345,55 @@ mod database_tests {
         OpenOptions, PlatformIO, SqliteDialect, IO,
     };
 
+    /// The out-of-range check in `Pager::read_page` reads the header, which
+    /// yields when page 1 is not cached. The read must resume after the
+    /// yield and the check must still fire.
+    #[cfg(feature = "fs")]
+    #[test]
+    fn read_page_bounds_check_survives_uncached_header() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("bounds-yield.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("create table t(x text)").unwrap();
+        for _ in 0..100 {
+            conn.execute(format!("insert into t values ('{}')", "x".repeat(100)))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        let pager = conn.pager.load();
+        pager.clear_page_cache(false);
+        assert!(
+            matches!(pager.read_page(2).unwrap(), IOResult::IO(_)),
+            "uncached header must make the bounds check yield"
+        );
+        let (page, c) = loop {
+            match pager.read_page(2).unwrap() {
+                IOResult::Done(res) => break res,
+                IOResult::IO(_) => io.step().unwrap(),
+            }
+        };
+        if let Some(c) = c {
+            io.wait_for_completion(c).unwrap();
+        }
+        assert_eq!(page.get().id, 2);
+
+        pager.clear_page_cache(false);
+        loop {
+            match pager.read_page(999_999) {
+                Err(err) => {
+                    assert!(matches!(err, LimboError::Corrupt(_)), "got {err:?}");
+                    break;
+                }
+                Ok(IOResult::IO(_)) => io.step().unwrap(),
+                Ok(IOResult::Done(_)) => panic!("out-of-range read must not succeed"),
+            }
+        }
+    }
+
     #[test]
     fn memory_path_classifies_named_memory_databases() {
         assert!(is_memory_like(":memory:"));

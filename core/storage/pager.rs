@@ -3360,6 +3360,24 @@ impl Pager {
                 }
             }
 
+            // A page number beyond the database size is a corrupt reference,
+            // not I/O to attempt (SQLite: btree.c getAndInitPage). The header
+            // size only counts when the change counter matches
+            // version-valid-for (btree.c lockBtree). Page 1 is exempt because
+            // the size lives there; in-range short reads still fail as
+            // ShortRead.
+            if page_idx != DatabaseHeader::PAGE_ID as i64 {
+                let header_ref = return_if_io!(HeaderRef::from_pager(self));
+                let header = header_ref.borrow();
+                let db_size = header.database_size.get();
+                let size_trusted = header.change_counter.get() == header.version_valid_for.get();
+                if size_trusted && db_size != 0 && page_idx > i64::from(db_size) {
+                    return Err(LimboError::Corrupt(format!(
+                        "Invalid page number {page_idx}: database has {db_size} pages"
+                    )));
+                }
+            }
+
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
             let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
             self.pending_reads.write().insert(
