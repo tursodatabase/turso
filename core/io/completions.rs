@@ -111,7 +111,7 @@ pub(super) struct CompletionInner {
     /// sets it before the completion is submitted, so by the time the
     /// completion finishes and its callback counts it into the group, the
     /// link is already there.
-    parent: OnceLock<Arc<GroupCompletionInner>>,
+    parent: OnceLock<Completion>,
     /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
     /// where pwrite returns before the kernel has consumed the buffer.
     write_buffer: OnceLock<Arc<Buffer>>,
@@ -161,12 +161,10 @@ impl CompletionGroup {
             outstanding: AtomicUsize::new(1),
             complete: Box::new(callback),
             result: OnceLock::new(),
-            self_completion: OnceLock::new(),
         });
         let completion = Completion::new(CompletionType::Group(GroupCompletion {
             inner: inner.clone(),
         }));
-        let _ = inner.self_completion.set(completion.clone());
         Self {
             completions: Vec::new(),
             completion,
@@ -181,7 +179,7 @@ impl CompletionGroup {
         self.completions.push(c.clone());
         self.inner.outstanding.fetch_add(1, Ordering::SeqCst);
         turso_assert!(
-            c.get_inner().parent.set(self.inner.clone()).is_ok(),
+            c.get_inner().parent.set(self.completion.clone()).is_ok(),
             "completion can only be linked once"
         );
         turso_assert!(
@@ -214,7 +212,7 @@ impl CompletionGroup {
     /// Release the builder's token. The group finishes now if every child
     /// has already finished, or later when the last one does.
     pub fn build(self) -> Completion {
-        self.inner.one_done(None);
+        self.completion.group_one_done(None);
         self.completion
     }
 }
@@ -241,8 +239,6 @@ struct GroupCompletionInner {
     complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
     /// Cached result after all completions finish
     result: OnceLock<Option<CompletionError>>,
-    /// Reference to the group's own Completion for notifying parents
-    self_completion: OnceLock<Completion>,
 }
 
 impl GroupCompletion {
@@ -253,35 +249,6 @@ impl GroupCompletion {
             "callback called before all completions finished"
         );
         (self.inner.complete)(result);
-    }
-}
-
-impl GroupCompletionInner {
-    /// One outstanding count is done: a child finished with `err`, or
-    /// `build` released the builder's token. Fires the group's callback
-    /// when this was the last one.
-    fn one_done(&self, err: Option<CompletionError>) {
-        if let Some(err) = err {
-            // Keep the first error.
-            let _ = self.result.set(Some(err));
-        }
-        let prev = self.outstanding.fetch_sub(1, Ordering::SeqCst);
-        turso_assert!(prev > 0, "completion group counted below zero");
-        let group_completion = self
-            .self_completion
-            .get()
-            .expect("group completion is set in CompletionGroup::new");
-        if prev > 1 {
-            // Progress wake so the waiter keeps driving io.step.
-            group_completion.wake();
-            return;
-        }
-        // Set result to Some(None) on success so succeeded() returns true.
-        let _ = self.result.set(None);
-        let result = self.result.get().and_then(|e| *e);
-        // This runs Completion::callback on the group's own completion,
-        // which in turn counts the group into its parent, if it has one.
-        group_completion.callback(result.map_or(Ok(0), Err));
     }
 }
 
@@ -416,9 +383,7 @@ impl Completion {
     pub fn wake_progress(&self) {
         if let Some(inner) = &self.inner {
             if let Some(group) = inner.parent.get() {
-                if let Some(group_completion) = group.self_completion.get() {
-                    group_completion.wake();
-                }
+                group.wake();
             }
             inner.context.wake();
         }
@@ -538,10 +503,29 @@ impl Completion {
         // group.
         if first {
             if let Some(group) = inner.parent.get() {
-                group.one_done(inner.result.get().and_then(|e| *e));
+                group.group_one_done(inner.result.get().and_then(|e| *e));
             }
         }
         inner.context.wake();
+    }
+
+    fn group_one_done(&self, err: Option<CompletionError>) {
+        let group = match &self.get_inner().completion_type {
+            CompletionType::Group(group) => &group.inner,
+            _ => unreachable!("parent must be a group completion"),
+        };
+        if let Some(err) = err {
+            let _ = group.result.set(Some(err));
+        }
+        let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(prev > 0, "completion group counted below zero");
+        if prev > 1 {
+            self.wake();
+            return;
+        }
+        let _ = group.result.set(None);
+        let result = group.result.get().and_then(|e| *e);
+        self.callback(result.map_or(Ok(0), Err));
     }
 
     /// only call this method if you are sure that the completion is
