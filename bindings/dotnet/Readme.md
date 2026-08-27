@@ -123,7 +123,7 @@ batch.BatchCommands.Add(select);
 await using var reader = await batch.ExecuteReaderAsync();
 ```
 
-Use `TursoSyncDatabase` when an application needs an embedded replica with explicit pull control:
+Use `TursoSyncDatabase` when an application needs an embedded replica with explicit sync control:
 
 ```C#
 var options = new TursoSyncDatabaseOptions(
@@ -136,11 +136,16 @@ var options = new TursoSyncDatabaseOptions(
 await using var database = await TursoSyncDatabase.CreateAsync(options);
 await using var local = await database.ConnectAsync();
 var changed = await database.PullAsync();
+var stats = await database.GetStatsAsync();
+
+// Push is explicit. Do not call it for pull-only replicas.
+await database.PushAsync();
+await database.CheckpointAsync();
 ```
 
-`PullAsync` never pushes local writes. Sync failures are `TursoSyncException` values carrying the operation, native status, sanitized endpoint, HTTP method/status, and original exception.
+`PullAsync` never pushes local writes. `PushAsync` currently follows the sync engine's last-write-wins conflict behavior, so use it only when that policy is acceptable. `CheckpointAsync` runs the sync engine's local checkpoint operation, while `GetStatsAsync` reports WAL sizes, CDC operations, transfer totals, revision, and the most recent pull and push times. Sync failures are `TursoSyncException` values carrying the operation, native status, sanitized endpoint, HTTP method/status, and original exception.
 
-Push, checkpoint, statistics, partial sync, remote encryption, connection-string replica integration, pooling, and automatic synchronization are not enabled yet. Use the explicit `TursoSyncDatabase` API for managed pull replicas.
+Partial sync, remote encryption, connection-string replica integration, pooling, and automatic synchronization are not enabled yet. Use the explicit `TursoSyncDatabase` API for managed replicas.
 
 Provider factories are available through `TursoFactory.Instance`:
 

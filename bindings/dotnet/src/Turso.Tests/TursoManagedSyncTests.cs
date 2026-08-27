@@ -131,6 +131,82 @@ public sealed class TursoManagedSyncTests
     }
 
     [Test]
+    public async Task StatsAndCheckpointCompleteWithoutRemoteIo()
+    {
+        using var httpClient = new HttpClient(new UnexpectedHttpHandler());
+        await using var database = await TursoSyncDatabase.CreateAsync(
+            new TursoSyncDatabaseOptions(":memory:", new Uri("https://example.test"))
+            {
+                BootstrapIfEmpty = false,
+                HttpClient = httpClient,
+            });
+
+        var asyncStats = await database.GetStatsAsync();
+        await database.CheckpointAsync();
+        var syncStats = database.GetStats();
+        database.Checkpoint();
+
+        asyncStats.LastPullTime.Should().BeNull();
+        asyncStats.LastPushTime.Should().BeNull();
+        asyncStats.Revision.Should().NotBeNull();
+        syncStats.LastPullTime.Should().BeNull();
+        syncStats.LastPushTime.Should().BeNull();
+        syncStats.Revision.Should().NotBeNull();
+    }
+
+    [Test]
+    public async Task PushFailureReportsPushOperation()
+    {
+        using var httpClient = new HttpClient(new RejectingSyncHandler());
+        await using var database = await TursoSyncDatabase.CreateAsync(
+            new TursoSyncDatabaseOptions(":memory:", new Uri("https://example.test"))
+            {
+                BootstrapIfEmpty = false,
+                HttpClient = httpClient,
+            });
+        await using var connection = await database.ConnectAsync();
+        connection.ExecuteNonQuery("CREATE TABLE items(value INTEGER)");
+        connection.ExecuteNonQuery("INSERT INTO items VALUES (1)");
+
+        var action = async () => await database.PushAsync();
+
+        var exception = await action.Should().ThrowAsync<TursoSyncException>();
+        exception.And.Operation.Should().Be(TursoSyncOperationKind.Push);
+        exception.And.HttpMethod.Should().Be("POST");
+        exception.And.HttpStatusCode.Should().Be(HttpStatusCode.InternalServerError);
+
+        Action synchronousAction = database.Push;
+        synchronousAction.Should().Throw<TursoSyncException>()
+            .Which.Operation.Should().Be(TursoSyncOperationKind.Push);
+    }
+
+    [Test]
+    public async Task StatsWaitForActiveReaders()
+    {
+        using var httpClient = new HttpClient(new UnexpectedHttpHandler());
+        await using var database = await TursoSyncDatabase.CreateAsync(
+            new TursoSyncDatabaseOptions(":memory:", new Uri("https://example.test"))
+            {
+                BootstrapIfEmpty = false,
+                HttpClient = httpClient,
+            });
+        await using var connection = await database.ConnectAsync();
+        connection.ExecuteNonQuery("CREATE TABLE items(value INTEGER)");
+        connection.ExecuteNonQuery("INSERT INTO items VALUES (1)");
+
+        using var command = new TursoCommand(connection, "SELECT value FROM items");
+        using var reader = command.ExecuteReader();
+        reader.Read().Should().BeTrue();
+
+        var stats = database.GetStatsAsync();
+        await Task.Delay(50);
+        stats.IsCompleted.Should().BeFalse();
+
+        reader.Dispose();
+        (await stats).Revision.Should().NotBeNull();
+    }
+
+    [Test]
     public async Task CancellationStopsAnInFlightSyncHttpRequest()
     {
         var handler = new BlockingSyncHandler();
@@ -333,6 +409,19 @@ public sealed class TursoManagedSyncTests
             CancellationToken cancellationToken)
         {
             throw new AssertionException($"Unexpected HTTP request: {request.RequestUri}");
+        }
+    }
+
+    private sealed class RejectingSyncHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError)
+            {
+                Content = new ByteArrayContent([]),
+            });
         }
     }
 

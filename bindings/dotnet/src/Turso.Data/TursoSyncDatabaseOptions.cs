@@ -73,3 +73,13 @@ public sealed class TursoSyncDatabaseOptions
 
     }
 }
+
+public sealed record TursoSyncStats(
+    long CdcOperations,
+    long MainWalSize,
+    long RevertWalSize,
+    DateTimeOffset? LastPullTime,
+    DateTimeOffset? LastPushTime,
+    long NetworkSentBytes,
+    long NetworkReceivedBytes,
+    string Revision);

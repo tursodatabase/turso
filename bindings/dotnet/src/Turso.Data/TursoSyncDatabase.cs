@@ -182,6 +182,60 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         }
     }
 
+    public void Push()
+        => RunSynchronously(() => PushAsync(CancellationToken.None));
+
+    public Task PushAsync(CancellationToken cancellationToken = default)
+        => RunVoidOperationAsync(
+            TursoSyncBindings.StartPush,
+            TursoSyncOperationKind.Push,
+            cancellationToken);
+
+    public void Checkpoint()
+        => RunSynchronously(() => CheckpointAsync(CancellationToken.None));
+
+    public Task CheckpointAsync(CancellationToken cancellationToken = default)
+        => RunVoidOperationAsync(
+            TursoSyncBindings.StartCheckpoint,
+            TursoSyncOperationKind.Checkpoint,
+            cancellationToken);
+
+    public TursoSyncStats GetStats()
+        => RunSynchronously(() => GetStatsAsync(CancellationToken.None));
+
+    public async Task<TursoSyncStats> GetStatsAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        await _operationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            using var operation = StartOperation(
+                TursoSyncBindings.StartStats,
+                TursoSyncOperationKind.Stats);
+            await DriveOperationAsync(
+                    operation,
+                    TursoSyncOperationKind.Stats,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            EnsureResultKind(operation, TursoSyncOperationResultKind.Stats);
+            var stats = TursoSyncBindings.ExtractStats(operation);
+            return new TursoSyncStats(
+                stats.CdcOperations,
+                stats.MainWalSize,
+                stats.RevertWalSize,
+                ToTimestamp(stats.LastPullUnixTime),
+                ToTimestamp(stats.LastPushUnixTime),
+                stats.NetworkSentBytes,
+                stats.NetworkReceivedBytes,
+                stats.Revision);
+        }
+        finally
+        {
+            _operationLock.Release();
+        }
+    }
+
     public void Dispose()
     {
         ThrowIfIoReentrant();
@@ -761,6 +815,9 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         if (actual != expected)
             throw new InvalidOperationException($"Expected Turso sync result {expected}, got {actual}.");
     }
+
+    private static DateTimeOffset? ToTimestamp(long value)
+        => value <= 0 ? null : DateTimeOffset.FromUnixTimeSeconds(value);
 
     private TursoSyncException CreateSyncException(
         TursoSyncOperationKind operation,
