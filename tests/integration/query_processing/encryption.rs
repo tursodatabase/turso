@@ -1131,17 +1131,24 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
         let unauthorized_db = TempDatabase::new_with_existent(&tmp_db.path);
         let unauthorized_conn = unauthorized_db.connect_limbo();
 
-        // Reading should fail
+        // Reading should fail. Without the key every byte is ciphertext that
+        // differs per run (random per-page nonce), so the failure is either a
+        // corruption check or a short read: the garbage header rarely passes
+        // the size-trust check, so garbage pointers can land past EOF
+        // (issue #8488).
+        let assert_unreadable = |err_msg: &str| {
+            assert!(
+                err_msg.contains("Corrupt database") || err_msg.contains("short read"),
+                "Error should show the encrypted database is unreadable without \
+                 the key: '{err_msg}'"
+            );
+        };
         let result = unauthorized_conn.execute("SELECT * FROM secret_data");
         assert!(
             result.is_err(),
             "Encrypted source should not be readable as plaintext"
         );
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("Corrupt database"),
-            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
-        );
+        assert_unreadable(&result.err().unwrap().to_string());
 
         // VACUUM INTO should also fail because it cannot read the source schema/data
         let fail_path = dest_dir.path().join("should_fail.db");
@@ -1151,11 +1158,7 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
             result.is_err(),
             "VACUUM INTO should fail on encrypted database when no keys are provided"
         );
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("Corrupt database"),
-            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
-        );
+        assert_unreadable(&result.err().unwrap().to_string());
     }
 
     // 3. Execute VACUUM INTO using an authorized connection
