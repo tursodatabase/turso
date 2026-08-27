@@ -48,11 +48,14 @@ RATE=1000 CONNECTIONS="1 2 4 8 16 32" ./scripts/bench.sh
 ```
 
 That writes one file per engine and connection count, and the plot takes
-one panel per count:
+one panel per count. Each `-o` is one output, and its extension picks the
+format: PNG and PDF are drawn with matplotlib, and `.tikz` is a pgfplots
+picture to `\input` into a paper.
 
 ```console
 cd plot
-uv run plot-latency-ecdf.py sqlite-c{1,8,16,32}.csv turso-c{1,8,16,32}.csv
+uv run plot-latency-ecdf.py sqlite-c{1,8,16,32}.csv turso-c{1,8,16,32}.csv \
+    -o latency-ecdf.png -o latency-ecdf.pdf -o latency-ecdf.tikz
 ```
 
 The benchmark warns on stderr when an engine could not keep up with the offered
