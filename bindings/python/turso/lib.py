@@ -498,6 +498,14 @@ class Connection:
         cur.executescript(sql_script)
         return cur
 
+    def _last_insert_rowid(self) -> Optional[int]:
+        """The rowid of the most recent successful INSERT on this
+        connection, read from the engine without executing a statement."""
+        try:
+            return self._conn.last_insert_rowid()
+        except Exception:
+            return None
+
     def __call__(self, sql: str) -> PyTursoStatement:
         # Shortcut to prepare a single statement
         try:
@@ -727,31 +735,9 @@ class Cursor:
     def _fetch_last_insert_rowid_if_needed(self, sql: str, rows_changed: int) -> Optional[int]:
         if rows_changed <= 0 or not _is_insert_or_replace(sql):
             return self._lastrowid
-        # Query last_insert_rowid(); this is connection-scoped and cheap
-        try:
-            q = self._connection._conn.prepare_single("SELECT last_insert_rowid()")
-            # No parameters; this produces a single-row single-column result
-            # Use stepping to fetch the row
-            status = _step_once_with_io(q, self._connection.extra_io)
-            if status == Status.Row:
-                py_row = q.row()
-                # row() returns a Python tuple with one element
-                # We avoid complex conversions: take first item
-                value = tuple(py_row)[0]  # type: ignore[call-arg]
-                # Finalize to complete
-                q.finalize()
-                if isinstance(value, int):
-                    return value
-                try:
-                    return int(value)
-                except Exception:
-                    return self._lastrowid
-            # Finalize anyway
-            q.finalize()
-        except Exception:
-            # Ignore errors; lastrowid remains unchanged on failure
-            pass
-        return self._lastrowid
+        rowid = self._connection._last_insert_rowid()
+        # lastrowid remains unchanged when it cannot be determined.
+        return rowid if rowid is not None else self._lastrowid
 
     def executemany(self, sql: str, seq_of_parameters: Iterable[Sequence[Any] | Mapping[str, Any]]) -> "Cursor":
         self._ensure_open()
