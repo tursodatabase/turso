@@ -63,7 +63,7 @@ throughput benchmark wants and what a latency benchmark should not report.
 | `--duration`, `--warmup` | Seconds measured and seconds discarded |
 | `--closed-loop` | Offer the next transaction only when the previous one finishes |
 | `--max-overrun` | Give up once the run takes this many times longer than planned |
-| `--io` | Turso IO backend, `syscall` (default) or `io_uring` (Linux only). SQLite ignores it |
+| `--io` | Turso IO backend, `io_uring` (default on Linux) or `syscall`. SQLite ignores it |
 | `--checkpoint-mode` | Turso MVCC auto-checkpoint mode, `passive` (default) or `truncate`. SQLite ignores it |
 | `--mvcc-checkpoint-threshold` | Bytes of logical log between Turso MVCC auto-checkpoints, default 4120000. SQLite ignores it |
 | `--checkpointer` | Milliseconds between checkpoints run from a separate connection, default 1000. `0` lets each writer auto-checkpoint itself. Both engines |

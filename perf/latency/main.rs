@@ -154,11 +154,16 @@ struct Args {
 
     #[arg(
         long = "io",
-        default_value = "syscall",
-        help = "Turso IO backend: syscall or io_uring (Linux only). SQLite ignores this"
+        default_value = DEFAULT_IO,
+        help = "Turso IO backend: io_uring (default on Linux) or syscall. SQLite ignores this"
     )]
     io: String,
 }
+
+#[cfg(target_os = "linux")]
+const DEFAULT_IO: &str = "io_uring";
+#[cfg(not(target_os = "linux"))]
+const DEFAULT_IO: &str = "syscall";
 
 /// One transaction's latency, split into the phases a writer goes through.
 pub struct Sample {
