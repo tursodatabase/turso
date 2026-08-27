@@ -148,15 +148,15 @@ def main():
             ax.plot(np.percentile(samples, PERCENTILES), PERCENTILES, linestyle="none",
                     marker=look["marker"], markersize=4, color=look["color"],
                     markeredgewidth=1.0, zorder=4)
-            # The tail, as a vertical line at p99.9 with the engine and the
-            # value written along it. Each engine gets its own half of the
-            # height, so the labels stay apart when the lines fall on the
-            # same spot.
+            # The tail, as a vertical line at p99.9 with the value written
+            # along it in the engine's colour. Each engine gets its own half
+            # of the height, so the labels stay apart when the lines fall on
+            # the same spot.
             tail = float(np.percentile(samples, 99.9))
             ax.axvline(tail, color=look["color"], linewidth=0.9, linestyle=TAIL_STYLE,
                        zorder=2)
             y, va = (45, "top") if index == 0 else (55, "bottom")
-            ax.annotate(f"{look['name']} {fmt_ms(tail)} ms", xy=(tail, y), xytext=(-3, 0),
+            ax.annotate(f"{fmt_ms(tail)} ms", xy=(tail, y), xytext=(-3, 0),
                         textcoords="offset points", rotation=90, ha="right", va=va,
                         color=look["color"], fontsize=6.5, zorder=5)
             label = label_for(look, mode, modes_per_engine[engine])
