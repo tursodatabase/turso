@@ -127,6 +127,7 @@ def main():
     ax.grid(True, axis="x", which="major", color=GRID, linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
 
+    Y_MAX = 112  # headroom above 100% for the p99 labels
     lo, hi = np.inf, 0.0
     p99_points = []
     for index, ((engine, mode, connections), samples) in enumerate(sorted(series.items())):
@@ -141,8 +142,16 @@ def main():
                 markeredgecolor=SURFACE, markeredgewidth=2, zorder=4)
         p99_points.append((p99, label))
 
+        # A faint vertical line marks the slowest transaction: where the tail ends.
+        worst = float(np.max(samples))
+        ax.axvline(worst, ymax=100 / Y_MAX, color=color, linewidth=1, alpha=0.45,
+                   linestyle=(0, (4, 3)), zorder=2)
+        ax.annotate(fmt_ms(worst), xy=(worst, 0), xytext=(-4, 4),
+                    textcoords="offset points", ha="right", va="bottom", rotation=90,
+                    color=color, alpha=0.8, fontsize=9, zorder=5)
+
         lo = min(lo, float(np.min(samples)))
-        hi = max(hi, float(np.max(samples)))
+        hi = max(hi, worst)
 
     ax.set_ylabel("Transactions (%)", color=INK, fontsize=12, labelpad=12)
 
@@ -152,7 +161,7 @@ def main():
     ax.xaxis.set_minor_locator(NullLocator())
     ax.xaxis.set_major_formatter(FuncFormatter(fmt_tick))
 
-    ax.set_ylim(0, 112)
+    ax.set_ylim(0, Y_MAX)
     ax.set_yticks([0, 25, 50, 75, 100])
     ax.tick_params(colors=MUTED, labelcolor=MUTED, length=0, pad=8, labelsize=10.5)
     ax.tick_params(which="minor", length=0)
