@@ -64,27 +64,6 @@ def label_for(engine, mode, connections, modes_per_engine, connection_levels):
     return name
 
 
-def stagger(points, min_gap=0.35):
-    """Assign a vertical level to each label so neighbours do not overlap.
-
-    Points closer than `min_gap` decades on the log axis are stacked: each
-    label takes the lowest level whose previous label is far enough away.
-    Returns [(x, label, level)] and the highest level used.
-    """
-    placed = []
-    last_at_level = []
-    for x, label in sorted(points):
-        level = 0
-        while level < len(last_at_level) and np.log10(x / last_at_level[level]) < min_gap:
-            level += 1
-        if level == len(last_at_level):
-            last_at_level.append(x)
-        else:
-            last_at_level[level] = x
-        placed.append((x, label, level))
-    return placed, max((lvl for _, _, lvl in placed), default=0)
-
-
 def color_for(engine, index):
     if engine == "turso":
         return TURSO
@@ -165,28 +144,28 @@ def main():
     ax.grid(True, axis="x", which="major", color=GRID, linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
 
-    LABEL_HEIGHT = 6  # percent of axis per stacked p99 label
+    Y_MAX = 106  # a little headroom so the 100% line is not the frame
     lo, hi = np.inf, 0.0
-    p99_points = []
     for index, ((engine, mode, connections), samples) in enumerate(sorted(series.items())):
         color = color_for(engine, index)
-        label = label_for(engine, mode, connections, modes_per_engine, connection_levels)
         style = LINE_STYLES[connection_levels.index(connections)]
+        # The p99 goes in the legend next to the line's name, and a dot on
+        # the curve shows where it sits.
+        p99 = float(np.percentile(samples, 99))
+        label = label_for(engine, mode, connections, modes_per_engine, connection_levels)
+        label = f"{label}: p99 {fmt_ms(p99)}"
         x, y = ecdf_points(samples)
         ax.plot(x, y, color=color, linewidth=2.2, linestyle=style, zorder=3,
                 solid_capstyle="round", solid_joinstyle="round", dash_capstyle="round",
                 label=label)
-
-        p99 = float(np.percentile(samples, 99))
         ax.plot([p99], [99], marker="o", markersize=8, color=color,
                 markeredgecolor=SURFACE, markeredgewidth=2, zorder=4)
-        p99_points.append((p99, label))
 
         # A faint vertical line marks the slowest transaction: where the tail
         # ends. Its label hangs from the top, leaving the lower right corner
         # to the legend.
         worst = float(np.max(samples))
-        ax.axvline(worst, ymax=100 / 112, color=color, linewidth=1, alpha=0.45,
+        ax.axvline(worst, ymax=100 / Y_MAX, color=color, linewidth=1, alpha=0.45,
                    linestyle=(0, (4, 3)), zorder=2)
         ax.annotate(fmt_ms(worst), xy=(worst, 100), xytext=(-4, -6),
                     textcoords="offset points", ha="right", va="top", rotation=90,
@@ -195,8 +174,6 @@ def main():
         lo = min(lo, float(np.min(samples)))
         hi = max(hi, worst)
 
-    placed, top_level = stagger(p99_points, min_gap=0.2)
-    Y_MAX = 112 + LABEL_HEIGHT * top_level  # headroom above 100% for the p99 labels
 
     ax.set_ylabel("Transactions (%)", color=INK, fontsize=12, labelpad=12)
 
@@ -217,17 +194,6 @@ def main():
     ax.spines["bottom"].set_linewidth(1)
 
     LEFT = 0.105
-
-    # Put each p99 value above its dot. The legend says which line is which,
-    # so the label is just the number. Labels that would collide stack
-    # upwards, with a thin leader down to their dot.
-    for p99, _label, level in placed:
-        offset = 11 + level * 16
-        ax.annotate(fmt_ms(p99), xy=(p99, 99), xytext=(0, offset),
-                    textcoords="offset points", ha="center", va="bottom",
-                    color=INK, fontsize=11.5, fontweight="bold", zorder=5,
-                    arrowprops=dict(arrowstyle="-", color=AXIS, linewidth=0.8,
-                                    shrinkA=0, shrinkB=5) if level else None)
 
     legend = ax.legend(loc="lower right", frameon=True, facecolor=SURFACE,
                        edgecolor=AXIS, framealpha=1, fontsize=10.5, labelcolor=INK,
