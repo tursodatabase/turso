@@ -107,8 +107,13 @@ pub(super) struct CompletionInner {
     // Thread safe with OnceLock
     pub(super) result: crate::sync::OnceLock<Option<CompletionError>>,
     context: Context,
-    /// Optional parent group this completion belongs to
-    parent: OnceLock<Arc<GroupCompletionInner>>,
+    /// Optional parent group this completion belongs to. Holds the group's
+    /// own `Completion` strongly: a group must stay alive for as long as it
+    /// has unfinished children — even if the caller dropped its handle — so
+    /// that the group callback and grandparent notification still run when
+    /// the last child finishes. The group does not reference its children,
+    /// so this is not a reference cycle.
+    parent: OnceLock<Completion>,
     /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
     /// where pwrite returns before the kernel has consumed the buffer.
     write_buffer: OnceLock<Arc<Buffer>>,
@@ -164,11 +169,6 @@ impl CompletionGroup {
         }
         let group_completion = GroupCompletion::new(self.callback, total);
         let group = Completion::new(CompletionType::Group(group_completion));
-
-        // Store the group completion reference for later callback
-        if let CompletionType::Group(ref g) = group.get_inner().completion_type {
-            let _ = g.inner.self_completion.set(group.clone());
-        }
 
         for mut c in self.completions {
             // If the completion has not completed, link it to the group.
@@ -226,8 +226,6 @@ struct GroupCompletionInner {
     complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
     /// Cached result after all completions finish
     result: OnceLock<Option<CompletionError>>,
-    /// Reference to the group's own Completion for notifying parents
-    self_completion: OnceLock<Completion>,
 }
 
 impl GroupCompletion {
@@ -240,7 +238,6 @@ impl GroupCompletion {
                 outstanding: AtomicUsize::new(outstanding),
                 complete: Box::new(complete),
                 result: OnceLock::new(),
-                self_completion: OnceLock::new(),
             }),
         }
     }
@@ -374,9 +371,7 @@ impl Completion {
     pub fn wake_progress(&self) {
         if let Some(inner) = &self.inner {
             if let Some(group) = inner.parent.get() {
-                if let Some(group_completion) = group.self_completion.get() {
-                    group_completion.wake();
-                }
+                group.wake();
             }
             inner.context.wake();
         }
@@ -491,27 +486,27 @@ impl Completion {
             let final_error = callback_error.or_else(|| result.err());
 
             if let Some(group) = inner.parent.get() {
+                let group_inner = match &group.get_inner().completion_type {
+                    CompletionType::Group(g) => &g.inner,
+                    _ => unreachable!("parent must be a group completion"),
+                };
                 // Capture first error in group
                 if let Some(err) = final_error {
-                    let _ = group.result.set(Some(err));
+                    let _ = group_inner.result.set(Some(err));
                 }
-                let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
+                let prev = group_inner.outstanding.fetch_sub(1, Ordering::SeqCst);
                 if prev > 1 {
                     // progress wake so the waiter keeps driving io.step,
                     // If prev > 1, there are still children outstanding after this one.
-                    if let Some(group_completion) = group.self_completion.get() {
-                        group_completion.wake();
-                    }
+                    group.wake();
                 }
                 // If this was the last completion in the group, trigger the group's callback
                 // which will recursively call this same callback() method to notify parents
                 if prev == 1 {
                     // Set result to Some(None) on success so succeeded() returns true
-                    let _ = group.result.set(None);
-                    if let Some(group_completion) = group.self_completion.get() {
-                        let group_result = group.result.get().and_then(|e| *e);
-                        group_completion.callback(group_result.map_or(Ok(0), Err));
-                    }
+                    let _ = group_inner.result.set(None);
+                    let group_result = group_inner.result.get().and_then(|e| *e);
+                    group.callback(group_result.map_or(Ok(0), Err));
                 }
             }
 
@@ -533,13 +528,13 @@ impl Completion {
 
     /// Link this completion to a group completion (internal use only)
     fn link_internal(&mut self, group: &Completion) {
-        let group_inner = match &group.get_inner().completion_type {
-            CompletionType::Group(g) => &g.inner,
-            _ => panic!("link_internal() requires a group completion"),
-        };
+        assert!(
+            matches!(group.get_inner().completion_type, CompletionType::Group(..)),
+            "link_internal() requires a group completion"
+        );
 
         // Set the parent (can only be set once)
-        if self.get_inner().parent.set(group_inner.clone()).is_err() {
+        if self.get_inner().parent.set(group.clone()).is_err() {
             panic!("completion can only be linked once");
         }
     }
