@@ -430,6 +430,14 @@ do_execsql_test tvf-args-from-another-tvf {
 2|2
 3|2}
 
+do_execsql_test tvf-in-constraint-json-each {
+    SELECT count(*) FROM json_each WHERE json IN ('[1,2,3]');
+} {3}
+
+do_execsql_test tvf-in-constraint-generate-series {
+    SELECT count(*) FROM generate_series WHERE start = 1 AND stop IN (5);
+} {5}
+
 do_execsql_test_error tvf-circular-column-references {
     SELECT * FROM generate_series(a.start, a.stop) b, generate_series(b.start, b.stop) a;
 } {No valid query plan found|no query solution}
