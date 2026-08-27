@@ -1,4 +1,4 @@
-use crate::turso_assert_eq;
+use crate::{turso_assert, turso_assert_eq};
 use core::fmt::{self, Debug};
 use std::{
     future::Future,
@@ -107,8 +107,14 @@ pub(super) struct CompletionInner {
     // Thread safe with OnceLock
     pub(super) result: crate::sync::OnceLock<Option<CompletionError>>,
     context: Context,
-    /// Optional parent group this completion belongs to
-    parent: OnceLock<Arc<GroupCompletionInner>>,
+    /// The group this completion belongs to, if any. Set exactly once, by
+    /// whichever side gets there first: `CompletionGroup::build` sets it to
+    /// the group when it links the completion, and `Completion::callback`
+    /// sets it to `None` when the completion finishes with no group linked
+    /// yet. The loser counts the completion into the group: the callback
+    /// counts it if `build` linked first, and `build` counts it if the
+    /// completion finished first.
+    parent: OnceLock<Option<Arc<GroupCompletionInner>>>,
     /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
     /// where pwrite returns before the kernel has consumed the buffer.
     write_buffer: OnceLock<Arc<Buffer>>,
@@ -118,7 +124,7 @@ impl fmt::Debug for CompletionInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompletionInner")
             .field("completion_type", &self.completion_type)
-            .field("parent", &self.parent.get().is_some())
+            .field("parent", &matches!(self.parent.get(), Some(Some(_))))
             .finish()
     }
 }
@@ -166,35 +172,34 @@ impl CompletionGroup {
         let group = Completion::new(CompletionType::Group(group_completion));
 
         // Store the group completion reference for later callback
-        if let CompletionType::Group(ref g) = group.get_inner().completion_type {
-            let _ = g.inner.self_completion.set(group.clone());
-        }
+        let group_inner = match &group.get_inner().completion_type {
+            CompletionType::Group(g) => {
+                let _ = g.inner.self_completion.set(group.clone());
+                g.inner.clone()
+            }
+            _ => unreachable!(),
+        };
 
-        for mut c in self.completions {
-            // If the completion has not completed, link it to the group.
-            if !c.finished() {
-                c.link_internal(&group);
+        for c in self.completions {
+            // Link the child to the group. If that fails, the child already
+            // finished (its callback claimed the slot before we could), or it
+            // was already linked to a group and finished since. Either way it
+            // is finished and its callback will not count it, so count it
+            // here. Checking `finished()` before linking left a window where
+            // the child finished in between, and nobody counted it.
+            if c.get_inner().parent.set(Some(group_inner.clone())).is_ok() {
                 continue;
             }
-            let group_inner = match &group.get_inner().completion_type {
-                CompletionType::Group(g) => &g.inner,
-                _ => unreachable!(),
-            };
-            // Return early if there was an error.
+            turso_assert!(c.finished(), "completion can only be linked once");
             if let Some(err) = c.get_error() {
                 let _ = group_inner.result.set(Some(err));
                 group_inner.outstanding.store(0, Ordering::SeqCst);
                 (group_inner.complete)(Err(err));
                 return group;
             }
-            // Mark the successful completion as done.
             group_inner.outstanding.fetch_sub(1, Ordering::SeqCst);
         }
 
-        let group_inner = match &group.get_inner().completion_type {
-            CompletionType::Group(g) => &g.inner,
-            _ => unreachable!(),
-        };
         if group_inner.outstanding.load(Ordering::SeqCst) == 0 {
             // Set result to Some(None) on success so succeeded() returns true
             let _ = group_inner.result.set(None);
@@ -373,7 +378,7 @@ impl Completion {
     /// drains the CQ, the resubmitted chunks pile up and the task deadlocks.
     pub fn wake_progress(&self) {
         if let Some(inner) = &self.inner {
-            if let Some(group) = inner.parent.get() {
+            if let Some(Some(group)) = inner.parent.get() {
                 if let Some(group_completion) = group.self_completion.get() {
                     group_completion.wake();
                 }
@@ -463,7 +468,9 @@ impl Completion {
 
     fn callback(&self, result: Result<i32, CompletionError>) {
         let inner = self.get_inner();
+        let mut first = false;
         inner.result.get_or_init(|| {
+            first = true;
             // Run the type-specific callback. For ReadCompletion, this returns
             // an optional error detected by the callback (e.g., short read).
             let callback_error = match &inner.completion_type {
@@ -488,12 +495,17 @@ impl Completion {
             };
 
             // Use callback error if present, otherwise use the original IO error
-            let final_error = callback_error.or_else(|| result.err());
-
-            if let Some(group) = inner.parent.get() {
-                // Capture first error in group
-                if let Some(err) = final_error {
-                    let _ = group.result.set(Some(err));
+            callback_error.or_else(|| result.err())
+        });
+        // Only the call that finished this completion may count it into a
+        // group. If a group was linked before we got here, count into it.
+        // Otherwise claim the slot with `None`: `CompletionGroup::build` then
+        // fails to link, sees the completion is finished, and counts it.
+        if first {
+            if let Some(group) = inner.parent.get_or_init(|| None) {
+                if let Some(Some(err)) = inner.result.get() {
+                    // Capture first error in group
+                    let _ = group.result.set(Some(*err));
                 }
                 let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
                 if prev > 1 {
@@ -514,9 +526,7 @@ impl Completion {
                     }
                 }
             }
-
-            final_error
-        });
+        }
         // call the waker regardless
         inner.context.wake();
     }
@@ -528,19 +538,6 @@ impl Completion {
         match inner.completion_type {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
-        }
-    }
-
-    /// Link this completion to a group completion (internal use only)
-    fn link_internal(&mut self, group: &Completion) {
-        let group_inner = match &group.get_inner().completion_type {
-            CompletionType::Group(g) => &g.inner,
-            _ => panic!("link_internal() requires a group completion"),
-        };
-
-        // Set the parent (can only be set once)
-        if self.get_inner().parent.set(group_inner.clone()).is_err() {
-            panic!("completion can only be linked once");
         }
     }
 }
@@ -615,6 +612,52 @@ mod tests {
     use crate::CompletionError;
 
     use super::*;
+
+    #[test]
+    fn group_build_racing_with_child_completion_on_another_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        for i in 0..20_000 {
+            let child = Completion::new_write(|_| {});
+            let go = Arc::new(AtomicBool::new(false));
+            let (c2, go2) = (child.clone(), go.clone());
+            let t = thread::spawn(move || {
+                while !go2.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                c2.complete(0);
+            });
+            let mut group = CompletionGroup::new(|_| {});
+            group.add(&child);
+            go.store(true, Ordering::Release);
+            let g = group.build();
+            t.join().unwrap();
+            assert!(child.finished());
+            assert!(
+                g.finished(),
+                "iteration {i}: child is finished but the group never will be"
+            );
+        }
+    }
+
+    #[test]
+    fn group_callback_fires_once_when_children_finished_before_build() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        c1.complete(0);
+        c2.complete(0);
+        let calls2 = calls.clone();
+        let mut group = CompletionGroup::new(move |_| {
+            calls2.fetch_add(1, Ordering::SeqCst);
+        });
+        group.add(&c1);
+        group.add(&c2);
+        let g = group.build();
+        assert!(g.finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_completion_group_empty() {
