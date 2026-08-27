@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["matplotlib", "numpy"]
+# dependencies = ["matplotlib", "numpy", "scienceplots"]
 # ///
 """Plot transaction latency as an eCDF from txn-latency CSV output.
 
@@ -21,16 +21,16 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import scienceplots  # noqa: F401  (registers the styles)
 from matplotlib.ticker import FuncFormatter, LogLocator, NullLocator
 
-SURFACE = "#fcfcfb"
-INK = "#0b0b0b"
-MUTED = "#898781"
-GRID = "#e6e5df"
-AXIS = "#c3c2b7"
-TURSO = "#2a78d6"  # categorical slot 1
-SQLITE = "#eb6834"  # categorical slot 2
-FALLBACK = ["#4a9c6d", "#8b5cd6", "#c9a227"]
+plt.style.use(["science", "no-latex", "vibrant"])
+
+# Paul Tol's "vibrant" cycle, which the style above installs: colour-blind
+# safe and legible in greyscale.
+COLORS = {"turso": "#0077BB", "sqlite": "#CC3311"}
+FALLBACK = ["#009988", "#EE7733", "#33BBEE"]
+LINE_STYLES = ["solid", (0, (4, 2)), (0, (1, 1.5))]
 
 COLUMN_LABELS = {
     "total_ns": "Transaction latency",
@@ -39,9 +39,6 @@ COLUMN_LABELS = {
     "work_ns": "Time inserting rows",
     "commit_ns": "Time to commit",
 }
-
-
-LINE_STYLES = ["solid", (0, (5, 3)), (0, (1.5, 2.5))]
 
 
 def read_series(path, column):
@@ -65,11 +62,7 @@ def label_for(engine, mode, connections, modes_per_engine, connection_levels):
 
 
 def color_for(engine, index):
-    if engine == "turso":
-        return TURSO
-    if engine == "sqlite":
-        return SQLITE
-    return FALLBACK[index % len(FALLBACK)]
+    return COLORS.get(engine, FALLBACK[index % len(FALLBACK)])
 
 
 def ecdf_points(samples, max_points=3000):
@@ -127,24 +120,12 @@ def main():
             "plot the sweep with plot-latency-percentiles.py"
         )
 
-    plt.rcParams.update(
-        {
-            "font.family": ["Helvetica Neue", "Helvetica", "Arial",
-                            "Liberation Sans", "DejaVu Sans"],
-            "font.size": 11,
-        }
-    )
-
-    fig, ax = plt.subplots(figsize=(9, 5), dpi=200)
-    fig.patch.set_facecolor(SURFACE)
-    ax.set_facecolor(SURFACE)
-
+    fig, ax = plt.subplots(figsize=(6, 3.6), dpi=300)
     ax.set_xscale("log")
-    ax.grid(True, axis="y", which="major", color=GRID, linewidth=0.8, zorder=0)
-    ax.grid(True, axis="x", which="major", color=GRID, linewidth=0.8, zorder=0)
+    ax.grid(True, which="major", linewidth=0.4, alpha=0.5)
     ax.set_axisbelow(True)
 
-    Y_MAX = 106  # a little headroom so the 100% line is not the frame
+    Y_MAX = 104
     lo, hi = np.inf, 0.0
     for index, ((engine, mode, connections), samples) in enumerate(sorted(series.items())):
         color = color_for(engine, index)
@@ -155,53 +136,36 @@ def main():
         label = label_for(engine, mode, connections, modes_per_engine, connection_levels)
         label = f"{label}: p99 {fmt_ms(p99)}"
         x, y = ecdf_points(samples)
-        ax.plot(x, y, color=color, linewidth=2.2, linestyle=style, zorder=3,
-                solid_capstyle="round", solid_joinstyle="round", dash_capstyle="round",
-                label=label)
-        ax.plot([p99], [99], marker="o", markersize=8, color=color,
-                markeredgecolor=SURFACE, markeredgewidth=2, zorder=4)
+        ax.plot(x, y, color=color, linewidth=1.4, linestyle=style, zorder=3, label=label)
+        ax.plot([p99], [99], marker="o", markersize=4.5, color=color,
+                markeredgecolor="white", markeredgewidth=0.8, zorder=4)
 
         # A faint vertical line marks the slowest transaction: where the tail
         # ends. Its label hangs from the top, leaving the lower right corner
         # to the legend.
         worst = float(np.max(samples))
-        ax.axvline(worst, ymax=100 / Y_MAX, color=color, linewidth=1, alpha=0.45,
-                   linestyle=(0, (4, 3)), zorder=2)
-        ax.annotate(fmt_ms(worst), xy=(worst, 100), xytext=(-4, -6),
+        ax.axvline(worst, ymax=100 / Y_MAX, color=color, linewidth=0.7, alpha=0.5,
+                   linestyle=(0, (3, 2)), zorder=2)
+        ax.annotate(fmt_ms(worst), xy=(worst, 100), xytext=(-2, -4),
                     textcoords="offset points", ha="right", va="top", rotation=90,
-                    color=color, alpha=0.8, fontsize=9, zorder=5)
+                    color=color, fontsize=6.5, zorder=5)
 
         lo = min(lo, float(np.min(samples)))
         hi = max(hi, worst)
 
-
-    ax.set_ylabel("Transactions (%)", color=INK, fontsize=12, labelpad=12)
-
     ax.set_xlim(10 ** np.floor(np.log10(max(lo, 1e-3))), 10 ** np.ceil(np.log10(hi)))
-    ax.set_xlabel(f"{COLUMN_LABELS[args.column]} (ms)", color=INK, fontsize=12, labelpad=12)
+    ax.set_xlabel(f"{COLUMN_LABELS[args.column]} (ms)")
     ax.xaxis.set_major_locator(LogLocator(base=10, numticks=12))
     ax.xaxis.set_minor_locator(NullLocator())
     ax.xaxis.set_major_formatter(FuncFormatter(fmt_tick))
-
     ax.set_ylim(0, Y_MAX)
     ax.set_yticks([0, 25, 50, 75, 100])
-    ax.tick_params(colors=MUTED, labelcolor=MUTED, length=0, pad=8, labelsize=10.5)
-    ax.tick_params(which="minor", length=0)
+    ax.set_ylabel("Transactions (\\%)" if plt.rcParams["text.usetex"] else "Transactions (%)")
 
-    for side in ("top", "right", "left"):
-        ax.spines[side].set_visible(False)
-    ax.spines["bottom"].set_color(AXIS)
-    ax.spines["bottom"].set_linewidth(1)
+    ax.legend(loc="lower right", frameon=True, framealpha=1, edgecolor="0.8",
+              fancybox=False, handlelength=2.6)
 
-    LEFT = 0.105
-
-    legend = ax.legend(loc="lower right", frameon=True, facecolor=SURFACE,
-                       edgecolor=AXIS, framealpha=1, fontsize=10.5, labelcolor=INK,
-                       handlelength=3.2, borderpad=0.9, labelspacing=0.6)
-    legend.set_zorder(6)
-
-    fig.subplots_adjust(left=LEFT, right=0.97, top=0.95, bottom=0.14)
-    fig.savefig(args.output, facecolor=SURFACE)
+    fig.savefig(args.output, bbox_inches="tight")
     print(f"wrote {args.output}")
 
 
