@@ -20977,3 +20977,145 @@ fn positioned_reader_survives_passive_retire_and_reclaim_mid_pass() {
         "with the reader gone the retired version must be reclaimable"
     );
 }
+
+/// A cursor that opens before the checkpoint's publish window resolves the
+/// negative table-id sentinel as its btree root, because the real root page
+/// is not published yet. The publish can then land mid-statement, and the
+/// btree-readable gate flips to true for a transaction that began after the
+/// checkpoint's pager commit (the materialized pages are already at-or-below
+/// its read mark). The cursor must not act on that flip: its inner btree
+/// cursor has no real page to seek, and seeking the sentinel makes
+/// `Pager::read_page` panic on the negative page id.
+///
+/// Schedule: pause a passive checkpoint after its pager commit but before
+/// the publish window, begin a transaction and open a cursor in that gap
+/// (root map still unpublished, so the cursor caches the sentinel), let the
+/// checkpoint publish, then probe a rowid that exists nowhere. Broken, the
+/// probe fell through to the "btree" and panicked with "pages in pager
+/// should be positive"; it must stay on the version store instead, which is
+/// complete for this transaction (its begin is clock-ordered before every
+/// retirement of this table's rows, so the LWM keeps the chain copies).
+#[test]
+fn cursor_opened_before_root_publish_never_seeks_the_sentinel_root() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+    let root_page = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        root_page < 0,
+        "the table must not be checkpointed yet, got root page {root_page}"
+    );
+    let mv = db.get_mvcc_store();
+    let table_id = mv.get_table_id_from_root_page(root_page);
+    let pager = conn.pager.load().clone();
+
+    // Pause a passive checkpoint between its pager commit (the materialized
+    // pages are committed to the WAL) and the publish window (the root map
+    // still has no root page for the table).
+    let ckpt_conn = db.connect();
+    let injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::AfterPagerCommitBeforePublish.point()]);
+    ckpt_conn.set_yield_injector(Some(injector.clone()));
+    let mut sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mv.clone(),
+        ckpt_conn.clone(),
+        true,
+        ckpt_conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    let mut paused = false;
+    for _ in 0..100_000 {
+        if injector.is_empty() {
+            paused = true;
+            break;
+        }
+        match sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => break,
+        }
+    }
+    assert!(
+        paused,
+        "checkpoint never reached the pre-publish yield point"
+    );
+    assert!(
+        mv.current_root_page(&table_id).is_none(),
+        "the root binding must not be published while the checkpoint is paused"
+    );
+
+    // A transaction that begins here already has the materialized pages
+    // below its read mark. Its cursor still resolves the sentinel root,
+    // exactly like OpenRead/OpenWrite do through get_real_table_id.
+    let reader_tx = mv.begin_tx(pager.clone()).unwrap();
+    let inner_root = mv.get_real_table_id(root_page);
+    assert!(
+        inner_root < 0,
+        "the cursor must open on the sentinel while the root is unpublished"
+    );
+    let mut cursor = MvccLazyCursor::new(
+        mv.clone(),
+        &conn,
+        reader_tx,
+        root_page,
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(pager.clone(), inner_root, 2)),
+    )
+    .unwrap();
+
+    // Let the checkpoint finish: the publish window runs now and the btree
+    // becomes readable for the transaction begun above.
+    ckpt_conn.set_yield_injector(None);
+    for _ in 0..100_000 {
+        match sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => break,
+        }
+    }
+    assert!(sm.is_finalized(), "checkpoint must run to completion");
+    assert!(
+        mv.current_root_page(&table_id).is_some(),
+        "the checkpoint must publish the root binding"
+    );
+
+    // Probe a rowid that exists nowhere. The version store has no chain for
+    // it, so a cursor that honors the flipped gate seeks its cached sentinel
+    // root and read_page panics on the negative page id.
+    let probe = crate::Value::Numeric(crate::numeric::Numeric::Integer(999));
+    let exists = loop {
+        match cursor.exists(&probe).unwrap() {
+            IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+            IOResult::Done(found) => break found,
+        }
+    };
+    assert!(!exists, "rowid 999 was never inserted");
+
+    // A rowid that does exist must still be found through the version store.
+    let probe = crate::Value::Numeric(crate::numeric::Numeric::Integer(1));
+    let exists = loop {
+        match cursor.exists(&probe).unwrap() {
+            IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+            IOResult::Done(found) => break found,
+        }
+    };
+    assert!(
+        exists,
+        "rowid 1 must stay visible through the version store"
+    );
+
+    drop(cursor);
+    mv.rollback_tx(reader_tx, pager, conn.as_ref(), 0);
+}

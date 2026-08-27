@@ -796,6 +796,23 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn is_btree_allocated(&self) -> bool {
+        // The inner btree cursor's root was resolved once, at open
+        // (`get_real_table_id`). If the root map had no published root page
+        // yet, that root is the negative table-id sentinel and there is no
+        // page to seek. The checkpoint's publish window can flip
+        // `is_btree_readable_at` to true under this open cursor: a
+        // transaction that began after the checkpoint's pager commit already
+        // has the materialized pages at-or-below its read mark, while the
+        // root binding publishes later. Such a cursor must keep reading only
+        // the version store, which is complete for it: its begin is
+        // clock-ordered before the publish window and thus before every
+        // retirement of this table's rows, so every btree row its snapshot
+        // can see still has a chain copy the LWM holds until the transaction
+        // ends. Seeking the sentinel instead panics in `Pager::read_page`
+        // ("pages in pager should be positive").
+        if self.btree_cursor.root_page() < 0 {
+            return false;
+        }
         // Dual gate (logical base-validity AND physical visibility): a PASSIVE checkpoint may
         // materialize this object's btree during collection. This cursor may read it only if the binding
         // covers our snapshot AND its pages were already durable when we pinned our read mark

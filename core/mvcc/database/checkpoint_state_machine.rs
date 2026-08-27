@@ -116,6 +116,12 @@ pub(crate) enum CheckpointYieldPoint {
     AfterDurableBoundaryAdvanced,
     AfterCollectTableRows,
     BeforePagerCommit,
+    /// After the pager transaction committed the materialized btree pages to
+    /// the WAL, but before the publish window makes the new root bindings
+    /// visible. A transaction that begins here already has the pages below
+    /// its read mark while the root map still resolves the table-id
+    /// sentinel.
+    AfterPagerCommitBeforePublish,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -2814,6 +2820,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
                 }
+                // Re-entry safe: `pager_commit_done` (and `header_staged_for_commit`)
+                // skip the work above when the yield resumes this state.
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterPagerCommitBeforePublish);
                 if passive {
                     if !self.mvstore.try_begin_passive_publish_window() {
                         if passive_auto_publish_retry {
