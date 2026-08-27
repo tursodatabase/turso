@@ -437,6 +437,15 @@ impl Completion {
         Self::new(CompletionType::Wait)
     }
 
+    /// True for a completion made by `new_wait`: a wait on something another
+    /// connection does, not I/O in flight.
+    pub fn is_wait(&self) -> bool {
+        matches!(
+            &self.inner,
+            Some(inner) if matches!(inner.completion_type, CompletionType::Wait)
+        )
+    }
+
     pub fn wake(&self) {
         if let Some(inner) = &self.inner {
             inner.context.wake();

@@ -1482,7 +1482,17 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
-        if let Some(io) = self.state.io_completions.take() {
+        // A statement parked on a lock another connection holds has no I/O
+        // in flight, so there is nothing to drain: nothing touches its
+        // buffers, and its completion only finishes when the holder runs,
+        // which on a single thread may never happen while we wait here.
+        // Dropping the completion is the whole cancellation.
+        if let Some(io) = self
+            .state
+            .io_completions
+            .take()
+            .filter(|io| !io.0.is_wait())
+        {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
                 capture_reset_error(
                     &mut reset_error,
