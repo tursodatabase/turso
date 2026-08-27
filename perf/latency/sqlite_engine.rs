@@ -28,6 +28,12 @@ pub fn run(config: &Config) -> Run {
             let mut stmt = conn
                 .prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")
                 .unwrap();
+            // Prepared once, so parsing the SQL is not charged to the
+            // transaction. A deferred BEGIN takes the write lock at the first
+            // INSERT instead, which buries the wait in the work phase.
+            // Concurrent SQLite writers use BEGIN IMMEDIATE anyway.
+            let mut begin_stmt = conn.prepare("BEGIN IMMEDIATE").unwrap();
+            let mut commit_stmt = conn.prepare("COMMIT").unwrap();
 
             let mut samples = Vec::new();
 
@@ -37,10 +43,7 @@ pub fn run(config: &Config) -> Run {
                 wait_until(arrival.scheduled);
                 let t0 = Instant::now();
 
-                // A deferred BEGIN takes the write lock at the first INSERT
-                // instead, which buries the wait in the work phase. Concurrent
-                // SQLite writers use BEGIN IMMEDIATE anyway.
-                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                begin_stmt.execute([]).unwrap();
                 let t1 = Instant::now();
 
                 for _ in 0..batch_size {
@@ -49,7 +52,7 @@ pub fn run(config: &Config) -> Run {
                 }
                 let t2 = Instant::now();
 
-                conn.execute_batch("COMMIT").unwrap();
+                commit_stmt.execute([]).unwrap();
                 let t3 = Instant::now();
 
                 if arrival.record {

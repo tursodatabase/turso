@@ -1,4 +1,4 @@
-use crate::{spin_until, Config, Pacer, Run, Sample, TxnMode};
+use crate::{Config, Pacer, Run, Sample, TxnMode};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,10 +44,15 @@ async fn run_async(config: &Config) -> Run {
                 .await
                 .unwrap();
 
-            let begin_stmt = match mode {
+            // Prepared once: `Connection::execute` would parse and compile the
+            // SQL again on every call, and that would be charged to the
+            // transaction.
+            let begin_sql = match mode {
                 TxnMode::Immediate => "BEGIN IMMEDIATE",
                 TxnMode::Concurrent => "BEGIN CONCURRENT",
             };
+            let mut begin_stmt = conn.prepare(begin_sql).await.unwrap();
+            let mut commit_stmt = conn.prepare("COMMIT").await.unwrap();
 
             let mut samples = Vec::new();
 
@@ -61,7 +66,7 @@ async fn run_async(config: &Config) -> Run {
                 // only cure is to start over. The restarts stay inside the
                 // sample, because the caller is still waiting through them.
                 let (t1, t2, t3) = 'txn: loop {
-                    conn.execute(begin_stmt, ()).await.unwrap();
+                    begin_stmt.execute(()).await.unwrap();
                     let t1 = Instant::now();
 
                     for _ in 0..batch_size {
@@ -82,7 +87,7 @@ async fn run_async(config: &Config) -> Run {
                     }
                     let t2 = Instant::now();
 
-                    match conn.execute("COMMIT", ()).await {
+                    match commit_stmt.execute(()).await {
                         Ok(_) => {}
                         Err(turso::Error::BusySnapshot(_)) => {
                             restarts.fetch_add(1, Ordering::Relaxed);
@@ -133,16 +138,22 @@ async fn run_async(config: &Config) -> Run {
 
 /// Same idea as `crate::wait_until`, but it parks the task instead of the
 /// runtime thread for the long part of the wait.
+///
+/// Tokio's timer only ticks once a millisecond, so a task asked to wake up
+/// at `deadline` can come back up to a millisecond late. That lateness would
+/// be charged to the database as queueing time. So the tokio sleep stops
+/// well short of the deadline, and the last stretch is a thread sleep plus a
+/// spin, which land within microseconds.
 async fn wait_until(deadline: Instant) {
-    const SPIN: Duration = Duration::from_micros(300);
+    const TIMER_SLOP: Duration = Duration::from_micros(1500);
     let now = Instant::now();
     if deadline <= now {
         return;
     }
-    if deadline - now > SPIN {
-        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline - SPIN)).await;
+    if deadline - now > TIMER_SLOP {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline - TIMER_SLOP)).await;
     }
-    spin_until(deadline);
+    crate::wait_until(deadline);
 }
 
 async fn setup(config: &Config) -> Database {
