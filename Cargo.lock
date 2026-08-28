@@ -7274,6 +7274,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-txn-latency"
+version = "0.8.0-pre.7"
+dependencies = [
+ "clap",
+ "libc",
+ "rusqlite",
+ "tokio",
+ "turso",
+]
+
+[[package]]
 name = "turso_cli"
 version = "0.8.0-pre.7"
 dependencies = [
