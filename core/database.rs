@@ -2021,7 +2021,7 @@ impl Database {
                     // WAL / clear the cache (must hit the DB file, not the WAL).
                     let c = match completion.take() {
                         Some(c) => c,
-                        None => storage::sqlite3_ondisk::begin_write_btree_page(pager, page)?,
+                        None => storage::sqlite3_ondisk::begin_write_btree_page(pager, page, None)?,
                     };
                     if !c.succeeded() {
                         *completion = Some(c.clone());

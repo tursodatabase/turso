@@ -3862,17 +3862,14 @@ impl Pager {
                                 for page in &pages {
                                     page.set_write_pending();
                                 }
-                                let completions = self.spill_pages_to_disk(&pages)?;
+                                let completions = self.spill_pages_to_disk(&pages, &mut group)?;
                                 if completions.is_empty() {
                                     self.finish_ephemeral_spill(&pages);
                                     return Ok(IOResult::Done(()));
                                 }
-                                for completion in &completions {
-                                    group.add(completion);
-                                }
                                 *self.spill_state.write() = SpillState::WritingToDisk {
                                     pages,
-                                    completions: completions.clone(),
+                                    completions,
                                 };
                                 io_yield_one!(group.build());
                             }
@@ -4036,10 +4033,16 @@ impl Pager {
     }
     /// Write a set of pages directly to the database file (for ephemeral tables without WAL).
     /// This is used by try_spill_dirty_pages for ephemeral tables/indexes.
-    fn spill_pages_to_disk(&self, pages: &[PinGuard]) -> Result<Vec<Completion>> {
+    /// Writes `pages` to the database file. Each write is added to `group`
+    /// before it is submitted.
+    fn spill_pages_to_disk(
+        &self,
+        pages: &[PinGuard],
+        group: &mut CompletionGroup,
+    ) -> Result<Vec<Completion>> {
         let mut completions: Vec<Completion> = Vec::with_capacity(pages.len());
         for page in pages {
-            match begin_write_btree_page(self, &page.to_page()) {
+            match begin_write_btree_page(self, &page.to_page(), Some(group)) {
                 Ok(c) => completions.push(c),
                 Err(e) => {
                     self.io.cancel(&completions)?;
@@ -5345,7 +5348,7 @@ impl Pager {
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
                 );
-                let c = begin_write_btree_page(self, &page1)?;
+                let c = begin_write_btree_page(self, &page1, None)?;
 
                 // Pin page1 to prevent eviction while stored in state machine
                 page1.pin();

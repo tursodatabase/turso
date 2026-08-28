@@ -622,7 +622,13 @@ pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completion> {
+/// Writes one page to the database file. The write is added to `group`,
+/// when given, before it is submitted.
+pub fn begin_write_btree_page(
+    pager: &Pager,
+    page: &PageRef,
+    group: Option<&mut CompletionGroup>,
+) -> Result<Completion> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
     let page_finish = page.clone();
@@ -648,6 +654,9 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
         })
     };
     let c = Completion::new_write(write_complete);
+    if let Some(group) = group {
+        group.add(&c);
+    }
     let io_ctx = pager.io_ctx.read();
     page_source.write_page(page_id, buffer, &io_ctx, c)
 }
