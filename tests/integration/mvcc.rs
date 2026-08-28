@@ -84,6 +84,14 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.sync(sync_type)
     }
 
+    fn sync_then(
+        &self,
+        sync_type: turso_core::io::FileSyncType,
+        done: turso_core::mvcc::persistent_storage::SyncDone,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.inner.sync_then(sync_type, done)
+    }
+
     fn update_header(&self) -> turso_core::Result<turso_core::Completion> {
         self.inner.update_header()
     }

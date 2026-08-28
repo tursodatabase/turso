@@ -965,8 +965,18 @@ impl LogicalLog {
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
-        let completion = Completion::new_sync(move |_| {
+        self.sync_then(sync_type, Box::new(|_| {}))
+    }
+
+    /// See [`super::DurableStorage::sync_then`].
+    pub fn sync_then(
+        &mut self,
+        sync_type: FileSyncType,
+        done: super::SyncDone,
+    ) -> Result<Completion> {
+        let completion = Completion::new_sync(move |result| {
             tracing::debug!("logical_log_sync finish");
+            done(result);
         });
         let c = self.file.sync(completion, sync_type)?;
         Ok(c)

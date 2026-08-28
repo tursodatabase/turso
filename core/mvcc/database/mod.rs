@@ -1025,6 +1025,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     savepoint_stack: RwLock<Vec<Savepoint<A>>>,
     /// True when this transaction currently holds the serialized logical-log commit lock.
     pager_commit_lock_held: AtomicBool,
+    /// True once the transaction's commit record is in the logical log.
+    /// From then on the transaction commits whatever happens to the
+    /// statement driving it: later records are chained after its record
+    /// and recovery replays it.
+    log_appended: AtomicBool,
     /// Number of unresolved commit dependencies (must reach 0 before commit).
     /// i.e the number of transactions this transaction is dependent on and waiting for
     /// commit or abort.
@@ -1069,6 +1074,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
+            log_appended: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
@@ -1474,8 +1480,17 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     FinishLogicalLogWrite {
         end_ts: u64,
     },
+    /// The commit record's write finished: own its bytes, let the next
+    /// committer append, and go wait for the log to be durable.
+    LogicalLogAppended {
+        end_ts: u64,
+    },
+    /// Waiting for the logical log to be fsynced through this commit's
+    /// record, which is append number `seq`. Committers waiting at the
+    /// same time share one fsync.
     SyncLogicalLog {
         end_ts: u64,
+        seq: u64,
     },
     EndCommitLogicalLog {
         end_ts: u64,
@@ -1553,6 +1568,33 @@ struct CommitCoordinator {
     /// committers than cores that spinning starves the thread that drives
     /// the holder's I/O.
     commit_lock_waiters: Mutex<Vec<Completion>>,
+    /// Group commit: which commit records are in the logical log and how
+    /// far it has been fsynced. Records are counted, not measured in log
+    /// offsets, so a checkpoint truncating the log does not confuse it.
+    log_sync: Mutex<LogSyncState>,
+}
+
+#[derive(Debug, Default)]
+struct LogSyncState {
+    /// Number of the last commit record whose write finished.
+    appended: u64,
+    /// Number of the last commit record the log has been fsynced through.
+    durable: u64,
+    /// An fsync is in flight, issued by one of the committers.
+    syncing: bool,
+    /// Committers parked until the log is durable through their record.
+    waiters: Vec<Completion>,
+}
+
+/// What a committer that needs the log durable through its record does next.
+enum LogDurability {
+    /// It is durable already.
+    Durable,
+    /// An fsync is running: park on this until it finishes, then ask again.
+    Wait(Completion),
+    /// Nothing is running: issue the fsync, which covers every record
+    /// appended so far, and report it with `CommitCoordinator::synced`.
+    Lead { through: u64 },
 }
 
 impl CommitCoordinator {
@@ -1560,6 +1602,51 @@ impl CommitCoordinator {
         Self {
             pager_commit_lock: Arc::new(TursoRwLock::new()),
             commit_lock_waiters: Mutex::new(Vec::new()),
+            log_sync: Mutex::new(LogSyncState::default()),
+        }
+    }
+
+    /// Records that a commit record's write finished, and numbers it.
+    /// Called under the commit lock, so the numbers follow log order.
+    fn note_appended(&self) -> u64 {
+        let mut sync = self.log_sync.lock();
+        sync.appended += 1;
+        sync.appended
+    }
+
+    /// Whether the log is fsynced through record `seq`, and if not, whether
+    /// to wait for the running fsync or to lead the next one.
+    fn durable_or_wait(&self, seq: u64) -> LogDurability {
+        let mut sync = self.log_sync.lock();
+        if sync.durable >= seq {
+            return LogDurability::Durable;
+        }
+        if sync.syncing {
+            let waiter = Completion::new_wait();
+            sync.waiters.push(waiter.clone());
+            return LogDurability::Wait(waiter);
+        }
+        sync.syncing = true;
+        LogDurability::Lead {
+            through: sync.appended,
+        }
+    }
+
+    /// The fsync covering records up to `through` finished. Everyone
+    /// parked is woken: those durable now go on, the rest ask again and
+    /// one of them leads the next fsync. After a failed fsync nothing
+    /// becomes durable, so the next leader fsyncs again.
+    fn synced(&self, through: u64, ok: bool) {
+        let waiters = {
+            let mut sync = self.log_sync.lock();
+            sync.syncing = false;
+            if ok {
+                sync.durable = sync.durable.max(through);
+            }
+            std::mem::take(&mut sync.waiters)
+        };
+        for waiter in waiters {
+            waiter.complete(0);
         }
     }
 
@@ -3211,15 +3298,44 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
             CommitState::FinishLogicalLogWrite { end_ts } => {
                 let c = mvcc_store.storage.on_log_write_complete()?;
-                self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
+                self.state = CommitState::LogicalLogAppended { end_ts: *end_ts };
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
+            CommitState::LogicalLogAppended { end_ts } => {
+                let end_ts = *end_ts;
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+                let tx = tx.value();
+                // Own the bytes: the next committer appends after them. A
+                // write that failed never gets here, and its bytes are
+                // discarded in cleanup_unfinished_commit instead.
+                if let Some(append_bytes) = self.pending_log_append_bytes.take() {
+                    mvcc_store
+                        .storage
+                        .advance_logical_log_offset_after_success(append_bytes)?;
+                }
+                // Point of no return: the record is in the log and later
+                // records chain after it, so the transaction commits even if
+                // its statement is dropped from here on.
+                tx.log_appended.store(true, Ordering::Release);
+                let seq = self.commit_coordinator.note_appended();
+                // Let the next committer append while this one waits for the
+                // fsync. That is what makes commits share an fsync. An
+                // exclusive transaction keeps the lock until it finishes.
+                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
+                    mvcc_store.unlock_commit_lock_if_held(tx);
+                }
+                self.state = CommitState::SyncLogicalLog { end_ts, seq };
+                Ok(TransitionResult::Continue)
+            }
 
-            CommitState::SyncLogicalLog { end_ts } => {
+            CommitState::SyncLogicalLog { end_ts, seq } => {
                 // Skip fsync when synchronous mode is not FULL.
                 // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
                 if self.sync_mode != SyncMode::Full {
@@ -3227,13 +3343,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                     return Ok(TransitionResult::Continue);
                 }
-                let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
-                self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
-                    Ok(TransitionResult::Continue)
-                } else {
-                    Ok(TransitionResult::Io(IOCompletions(c)))
+                // Group commit: one fsync serves every committer whose record
+                // was appended before it was issued. The state stays put
+                // until the log is durable through this record.
+                match self.commit_coordinator.durable_or_wait(*seq) {
+                    LogDurability::Durable => {
+                        self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                        Ok(TransitionResult::Continue)
+                    }
+                    LogDurability::Wait(waiter) => Ok(TransitionResult::Io(IOCompletions(waiter))),
+                    LogDurability::Lead { through } => {
+                        let coordinator = self.commit_coordinator.clone();
+                        let c = mvcc_store.storage.sync_then(
+                            self.pager.get_sync_type(),
+                            Box::new(move |result| coordinator.synced(through, result.is_ok())),
+                        )?;
+                        if c.succeeded() {
+                            Ok(TransitionResult::Continue)
+                        } else {
+                            Ok(TransitionResult::Io(IOCompletions(c)))
+                        }
+                    }
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
@@ -3274,42 +3404,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
-                // Order of operations matters here:
-                // 1. Advance logical log writer offset (makes the written bytes "owned")
-                // 2. Mark transaction Committed
-                // 3. Rewrite live row versions from TxID to Timestamp (chunked
+                // The record is in the log, owned since LogicalLogAppended,
+                // and durable. Order of operations from here:
+                // 1. Mark transaction Committed
+                // 2. Rewrite live row versions from TxID to Timestamp (chunked
                 //    in `RewriteLiveVersions` so 2M-row write sets don't stall)
-                // 4. Notify dependents
-                // 5. Release commit lock (allows next committer)
-                // 6. Update cached global header
+                // 3. Notify dependents
+                // 4. Release the commit lock, if an exclusive transaction
+                //    still holds it (a concurrent one let go of it when its
+                //    record was appended)
+                // 5. Update cached global header
                 //
-                // (1) must precede (5): the commit lock serializes log writes, and
-                // log_tx() writes at the current offset. If we released the lock before
-                // advancing, the next committer would overwrite our bytes.
-                //
-                // (2) must precede (3): rewriting before marking Committed would
+                // (1) must precede (2): rewriting before marking Committed would
                 // publish the transaction's effects to readers before its fate is
                 // decided, which breaks rollback of abandoned commits.
-                //
-                // (2) must also precede (5): the next committer's validation (CommitState::Commit)
-                // checks our transaction state. If it still sees Preparing instead of
-                // Committed, the tie-breaking logic (lower end_ts wins) applies instead
-                // of the definitive "already committed = conflict" path.
-                //
-                // pending_log_append_bytes is set in BeginCommitLogicalLog after log_tx
-                // writes to disk. If the commit fails before reaching here (e.g. during
-                // sync), the bytes are never consumed and the in-memory writer offset
-                // stays behind — the next write overwrites the uncommitted bytes.
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
-                if let Some(append_bytes) = self.pending_log_append_bytes.take() {
-                    mvcc_store
-                        .storage
-                        .advance_logical_log_offset_after_success(append_bytes)?;
-                }
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
@@ -6715,7 +6828,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
-        let tx_state = self.txs.get(&tx_id).map(|tx| tx.value().state.load());
+        let tx_state = self.txs.get(&tx_id).map(|tx| {
+            let tx = tx.value();
+            match tx.state.load() {
+                TransactionState::Preparing(end_ts) if tx.log_appended.load(Ordering::Acquire) => {
+                    // The commit record is in the logical log, with later
+                    // records chained after it, and recovery replays it:
+                    // the transaction commits even though its statement is
+                    // gone. Mark it and finish it like a dropped committed one.
+                    tx.state.store(TransactionState::Committed(end_ts));
+                    TransactionState::Committed(end_ts)
+                }
+                state => state,
+            }
+        });
         match tx_state {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
                 self.rollback_tx_inner(tx_id, Some(connection), db_id);
@@ -10541,9 +10667,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
                 .debug_struct("FinishLogicalLogWrite")
                 .field("end_ts", end_ts)
                 .finish(),
-            Self::SyncLogicalLog { end_ts } => f
+            Self::LogicalLogAppended { end_ts } => f
+                .debug_struct("LogicalLogAppended")
+                .field("end_ts", end_ts)
+                .finish(),
+            Self::SyncLogicalLog { end_ts, seq } => f
                 .debug_struct("SyncLogicalLog")
                 .field("end_ts", end_ts)
+                .field("seq", seq)
                 .finish(),
             Self::EndCommitLogicalLog { end_ts } => f
                 .debug_struct("EndCommitLogicalLog")

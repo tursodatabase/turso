@@ -16,6 +16,10 @@ use crate::mvcc::persistent_storage::logical_log::{
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
 
+/// Runs when a logical-log fsync finishes, with the fsync's result.
+pub type SyncDone =
+    Box<dyn Fn(std::result::Result<i32, crate::CompletionError>) + Send + Sync + 'static>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicalLogTruncateOutcome {
     Truncated,
@@ -59,6 +63,12 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>>;
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
+
+    /// Like `sync`, and calls `done` with the fsync's result when it
+    /// finishes, whether or not anyone still waits on the returned
+    /// completion. Group commit uses it to publish how far the log is
+    /// durable to every committer parked on that fsync.
+    fn sync_then(&self, sync_type: FileSyncType, done: SyncDone) -> Result<Completion>;
 
     /// Called after a logical-log write completed successfully, before the
     /// transaction is made visible by advancing the logical-log offset.
@@ -211,6 +221,10 @@ impl DurableStorage for Storage {
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         self.logical_log.write().sync(sync_type)
+    }
+
+    fn sync_then(&self, sync_type: FileSyncType, done: SyncDone) -> Result<Completion> {
+        self.logical_log.write().sync_then(sync_type, done)
     }
 
     fn update_header(&self) -> Result<Completion> {

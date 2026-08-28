@@ -6939,6 +6939,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
+        log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
@@ -8629,6 +8630,7 @@ fn transaction_display() {
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
+        log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
@@ -18555,6 +18557,13 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         fn sync(&self, t: FileSyncType) -> Result<Completion> {
             self.inner.sync(t)
         }
+        fn sync_then(
+            &self,
+            t: FileSyncType,
+            done: crate::mvcc::persistent_storage::SyncDone,
+        ) -> Result<Completion> {
+            self.inner.sync_then(t, done)
+        }
         fn update_header(&self) -> Result<Completion> {
             self.inner.update_header()
         }
@@ -20591,6 +20600,13 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         fn sync(&self, t: FileSyncType) -> Result<Completion> {
             self.inner.sync(t)
         }
+        fn sync_then(
+            &self,
+            t: FileSyncType,
+            done: crate::mvcc::persistent_storage::SyncDone,
+        ) -> Result<Completion> {
+            self.inner.sync_then(t, done)
+        }
         fn update_header(&self) -> Result<Completion> {
             self.inner.update_header()
         }
@@ -20789,4 +20805,292 @@ fn commit_lock_waiter_parks_until_the_holder_releases() {
     assert!(waiter.finished());
     assert!(coordinator.lock_or_wait().is_none());
     coordinator.unlock();
+}
+
+/// Group commit: committers that append while an fsync is running share
+/// the next one, and a committer whose statement is dropped after its
+/// record is in the log still commits.
+mod group_commit {
+    use super::*;
+    use crate::io::FileSyncType;
+    use crate::mvcc;
+    use crate::mvcc::database::{LogRecord, RowVersion};
+    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use crate::mvcc::persistent_storage::DurableStorage;
+    use crate::storage::encryption::EncryptionContext;
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::{CheckpointResult, File, Result, IO};
+    use std::sync::atomic::AtomicUsize;
+
+    /// Storage that holds every fsync until the test releases it, and
+    /// counts them.
+    #[derive(Debug)]
+    struct HoldSyncStorage {
+        inner: Arc<dyn DurableStorage>,
+        held: Mutex<Vec<Completion>>,
+        syncs: AtomicUsize,
+        /// Hold fsyncs only once the test says so: opening the database
+        /// fsyncs too, and waits for it.
+        holding: AtomicBool,
+    }
+    impl HoldSyncStorage {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                held: Mutex::new(Vec::new()),
+                syncs: AtomicUsize::new(0),
+                holding: AtomicBool::new(false),
+            })
+        }
+        fn hold(&self) {
+            self.holding.store(true, Ordering::Release);
+        }
+        fn syncs(&self) -> usize {
+            self.syncs.load(Ordering::Acquire)
+        }
+        /// Finish every held fsync successfully.
+        fn release(&self) {
+            for c in std::mem::take(&mut *self.held.lock()) {
+                c.complete(0);
+            }
+        }
+    }
+    impl DurableStorage for HoldSyncStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            m: LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            self.inner.log_tx(m, c)
+        }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.sync_then(t, Box::new(|_| {}))
+        }
+        fn sync_then(
+            &self,
+            _t: FileSyncType,
+            done: crate::mvcc::persistent_storage::SyncDone,
+        ) -> Result<Completion> {
+            if !self.holding.load(Ordering::Acquire) {
+                return self.inner.sync_then(_t, done);
+            }
+            self.syncs.fetch_add(1, Ordering::AcqRel);
+            let c = Completion::new_sync(done);
+            self.held.lock().push(c.clone());
+            Ok(c)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
+            self.inner.truncate(checkpointed_through_ts)
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    struct Setup {
+        _temp_dir: tempfile::TempDir,
+        db: Arc<Database>,
+        storage: Arc<HoldSyncStorage>,
+    }
+
+    /// An MVCC database on disk whose logical-log fsyncs the test controls.
+    fn setup() -> Setup {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join(format!("test_{}.db", rand::random::<u64>()));
+        let path_str = path.to_str().unwrap().to_string();
+        {
+            let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+            let db = Database::open_file_with_flags(
+                io,
+                &path_str,
+                OpenFlags::default(),
+                DatabaseOpts::new(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            conn.close().unwrap();
+            DATABASE_MANAGER.lock().clear();
+        }
+        let log_path = path.with_extension("db-log");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let log_file = io
+            .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+            .unwrap();
+        let inner: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+            log_file,
+            io.clone(),
+            None,
+        ));
+        let storage = HoldSyncStorage::new(inner);
+        let db = Database::open(
+            io,
+            &path_str,
+            crate::OpenOptions::new(Arc::new(SqliteDialect))
+                .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
+        )
+        .unwrap();
+        Setup {
+            _temp_dir: temp_dir,
+            db,
+            storage,
+        }
+    }
+
+    /// A connection with one row inserted in an open concurrent transaction
+    /// and its COMMIT prepared.
+    fn committer(db: &Arc<Database>, id: i64) -> (Arc<Connection>, Statement) {
+        let conn = db.connect().unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({id}, 'v')"))
+            .unwrap();
+        let stmt = conn.prepare("COMMIT").unwrap();
+        (conn, stmt)
+    }
+
+    /// Steps until the statement finishes or is waiting on I/O the test holds.
+    fn step(stmt: &mut Statement) -> StepResult {
+        for _ in 0..100 {
+            match stmt.step().unwrap() {
+                StepResult::Yield => continue,
+                other => return other,
+            }
+        }
+        panic!("statement keeps yielding");
+    }
+
+    /// Only call once every fsync is released: a reader waits for a
+    /// transaction that is preparing below its snapshot.
+    fn ids(db: &Arc<Database>) -> Vec<i64> {
+        let conn = db.connect().unwrap();
+        get_rows(&conn, "SELECT id FROM t ORDER BY id")
+            .into_iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn committers_that_arrive_during_an_fsync_share_the_next_one() {
+        let s = setup();
+        let (_a, mut a) = committer(&s.db, 1);
+        let (_b, mut b) = committer(&s.db, 2);
+        let (_c, mut c) = committer(&s.db, 3);
+        s.storage.hold();
+
+        // a appends its record and leads the first fsync, which is held.
+        assert!(matches!(step(&mut a), StepResult::IO));
+        assert_eq!(s.storage.syncs(), 1);
+        // b and c append behind it while that fsync runs, and park.
+        assert!(matches!(step(&mut b), StepResult::IO));
+        assert!(matches!(step(&mut c), StepResult::IO));
+        assert_eq!(
+            s.storage.syncs(),
+            1,
+            "nothing else may fsync while one is running"
+        );
+
+        // The first fsync only covers a. b and c wake up and share one more.
+        s.storage.release();
+        assert!(matches!(step(&mut a), StepResult::Done));
+        assert!(matches!(step(&mut b), StepResult::IO));
+        assert!(matches!(step(&mut c), StepResult::IO));
+        assert_eq!(s.storage.syncs(), 2, "b and c should share one fsync");
+
+        s.storage.release();
+        assert!(matches!(step(&mut b), StepResult::Done));
+        assert!(matches!(step(&mut c), StepResult::Done));
+        assert_eq!(s.storage.syncs(), 2);
+        assert_eq!(ids(&s.db), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_commit_dropped_after_its_record_is_in_the_log_still_commits() {
+        let s = setup();
+        let (_a, mut a) = committer(&s.db, 1);
+        let (conn_b, mut b) = committer(&s.db, 2);
+        s.storage.hold();
+
+        assert!(matches!(step(&mut a), StepResult::IO));
+        // b's record is in the log behind a's, waiting for the next fsync.
+        assert!(matches!(step(&mut b), StepResult::IO));
+        drop(b);
+        assert!(
+            conn_b.get_mv_tx_id().is_none(),
+            "the dropped commit should be finished, not rolled back"
+        );
+
+        s.storage.release();
+        assert!(matches!(step(&mut a), StepResult::Done));
+        assert_eq!(ids(&s.db), vec![1, 2]);
+    }
 }
