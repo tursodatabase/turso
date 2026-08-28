@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -132,8 +133,8 @@ _DBCursorT = TypeVar("_DBCursorT", bound="Cursor")
 
 def _first_keyword(sql: str) -> str:
     """
-    Return the first SQL keyword (uppercased) ignoring leading whitespace
-    and single-line and multi-line comments.
+    Return the first SQL keyword (uppercased) ignoring leading whitespace,
+    empty statements, and single-line and multi-line comments.
 
     This is intentionally minimal and only used to detect DML for implicit
     transaction handling. It may not handle all edge cases (e.g. complex WITH).
@@ -142,7 +143,7 @@ def _first_keyword(sql: str) -> str:
     n = len(sql)
     while i < n:
         c = sql[i]
-        if c.isspace():
+        if c.isspace() or c in (";", "\ufeff"):
             i += 1
             continue
         if c == "-" and i + 1 < n and sql[i + 1] == "-":
@@ -207,6 +208,15 @@ _BATCH_MODES = {
     "concurrent": "BEGIN CONCURRENT",
 }
 
+_TRANSACTION_CONTROL_KEYWORDS = {
+    "BEGIN",
+    "COMMIT",
+    "END",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "RELEASE",
+}
+
 
 def _batch_begin_sql(mode: Optional[str]) -> Optional[str]:
     if mode is None:
@@ -242,6 +252,17 @@ def _normalize_batch_statements(
     return normalized
 
 
+def _reject_transaction_control_statements(
+    statements: list[tuple[str, Sequence[Any] | Mapping[str, Any]]],
+) -> None:
+    for index, (sql, _parameters) in enumerate(statements):
+        if _first_keyword(sql) in _TRANSACTION_CONTROL_KEYWORDS:
+            error = ProgrammingError(
+                "transaction-control SQL is not allowed in a batch with a transaction mode"
+            )
+            raise _batch_statement_error(index, error) from error
+
+
 def _batch_statement_error(
     index: int,
     error: Exception,
@@ -250,9 +271,9 @@ def _batch_statement_error(
     """Wrap a statement failure so the raised exception identifies which
     statement failed, preserving the DB-API exception class. The zero-based
     index is available as the `batch_index` attribute, and `batch_results`
-    carries one entry per statement: the completed statement's
-    `BatchResult`, or None for the failing statement and the statements
-    that did not run."""
+    is empty when validation fails before execution. Otherwise it carries
+    one entry per statement: the completed statement's `BatchResult`, or
+    None for the failing statement and the statements that did not run."""
     wrapped = type(error)(f"batch statement {index} failed: {error}")
     wrapped.batch_index = index
     wrapped.batch_results = results if results is not None else []
@@ -590,17 +611,20 @@ class Connection:
         stops at the first statement that fails: the remaining statements
         are skipped and the raised exception identifies the failing
         statement by its zero-based index (the `batch_index` attribute)
-        and carries the per-statement results (the `batch_results`
-        attribute: one entry per statement — the completed statement's
-        `BatchResult`, or None for the failing statement and the
-        statements that did not run).
+        and carries the per-statement results in the `batch_results`
+        attribute. It is empty when parameter validation fails before
+        execution; otherwise it has one entry per statement — the completed
+        statement's `BatchResult`, or None for the failing statement and
+        the statements that did not run.
 
         With `mode` set to "deferred", "immediate", "exclusive", or
         "concurrent", the statements are wrapped in `BEGIN <mode>` /
         `COMMIT`, with a `ROLLBACK` on failure: either every statement
         commits or none does. The statements must not contain their own
-        transaction-control SQL in that case. With `mode` unset the batch
-        is not transactional: each statement commits as it executes.
+        transaction-control SQL in that case. If `ROLLBACK` itself fails,
+        the primary exception has a `rollback_error` attribute and the
+        connection's transaction state is unknown. With `mode` unset the
+        batch is not transactional: each statement commits as it executes.
 
         Unlike `execute()`, `batch()` never opens a legacy implicit
         transaction. If a transaction is already open on this connection,
@@ -612,24 +636,50 @@ class Connection:
         stmts = _normalize_batch_statements(statements)
         if not stmts:
             return []
+        stmts = self._prevalidate_batch_parameters(stmts)
         if self.in_transaction:
             begin_sql = None
         if begin_sql is None:
             return self._run_batch_statements(stmts)
+        _reject_transaction_control_statements(stmts)
         self._exec_ddl_only(begin_sql)
         try:
             results = self._run_batch_statements(stmts)
             self._exec_ddl_only("COMMIT")
-        except Exception:
-            # ROLLBACK errors are ignored: the failure being re-raised is
-            # the error being reported, and surfacing a rollback error
-            # would mask it.
+        except Exception as primary_error:
             try:
                 self._exec_ddl_only("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                primary_error.rollback_error = rollback_error
             raise
         return results
+
+    def _prevalidate_batch_parameters(
+        self, stmts: list[tuple[str, Sequence[Any] | Mapping[str, Any]]]
+    ) -> list[tuple[str, Sequence[Any] | Mapping[str, Any]]]:
+        validator = self._conn.prepare_single("SELECT ?")
+        validated = []
+        try:
+            for index, (sql, parameters) in enumerate(stmts):
+                try:
+                    if isinstance(parameters, Mapping):
+                        copied_parameters: Sequence[Any] | Mapping[str, Any] = dict(parameters)
+                        values = copied_parameters.values()
+                    else:
+                        copied_parameters = Cursor._to_positional_params(parameters)
+                        values = copied_parameters
+                    for value in values:
+                        if isinstance(value, float) and math.isinf(value):
+                            raise ValueError(
+                                "infinite float values cannot be sent over the protocol"
+                            )
+                        validator.bind_positional(1, value)
+                except Exception as exc:  # noqa: BLE001
+                    raise _batch_statement_error(index, _map_turso_exception(exc)) from exc
+                validated.append((sql, copied_parameters))
+        finally:
+            validator.finalize()
+        return validated
 
     def _run_batch_statements(
         self, stmts: list[tuple[str, Sequence[Any] | Mapping[str, Any]]]

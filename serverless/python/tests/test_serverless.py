@@ -314,6 +314,75 @@ class TestBatchValidation:
         with pytest.raises(ProgrammingError, match="batch statement 1"):
             conn.batch(["SELECT 1", 42])
 
+    @pytest.mark.parametrize("mode", [None, "immediate"])
+    def test_every_parameter_is_validated_before_the_request(self, monkeypatch, mode):
+        conn = self._offline_conn()
+
+        def fail_if_requested(_steps):
+            pytest.fail("parameter validation must finish before the request")
+
+        monkeypatch.setattr(conn._session, "execute_batch", fail_if_requested)
+        with pytest.raises(TypeError, match="batch statement 1 failed") as excinfo:
+            conn.batch(
+                [
+                    ("INSERT INTO t VALUES (?)", (1,)),
+                    ("INSERT INTO t VALUES (?)", (object(),)),
+                ],
+                mode=mode,
+            )
+        assert excinfo.value.batch_index == 1
+        assert excinfo.value.batch_results == []
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "BEGIN",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "SAVEPOINT batch_savepoint",
+            "RELEASE batch_savepoint",
+            "; /* empty statement */ COMMIT",
+            "\ufeffCOMMIT",
+        ],
+    )
+    def test_transaction_control_is_rejected_before_the_request(self, monkeypatch, sql):
+        conn = self._offline_conn()
+
+        def fail_if_requested(_steps):
+            pytest.fail("transaction-control SQL must be rejected before the request")
+
+        monkeypatch.setattr(conn._session, "execute_batch", fail_if_requested)
+        with pytest.raises(
+            ProgrammingError, match="transaction-control SQL is not allowed"
+        ) as excinfo:
+            conn.batch([sql], mode="immediate")
+        assert excinfo.value.batch_index == 0
+        assert excinfo.value.batch_results == []
+
+    def test_rollback_failure_is_attached_to_the_statement_error(self):
+        response = {
+            "step_results": [{}, None, None, None],
+            "step_errors": [
+                None,
+                {"message": "statement failed", "code": "SQLITE_ERROR"},
+                None,
+                {"message": "rollback failed", "code": "SQLITE_ERROR"},
+            ],
+        }
+        with pytest.raises(OperationalError, match="batch statement 0 failed") as excinfo:
+            Connection._decode_batch_result(
+                response,
+                [("INSERT INTO t VALUES (?)", (1,))],
+                offset=1,
+                commit_index=2,
+                total_steps=4,
+            )
+        assert excinfo.value.batch_index == 0
+        assert excinfo.value.batch_results == [None]
+        assert isinstance(excinfo.value.rollback_error, OperationalError)
+        assert str(excinfo.value.rollback_error) == "rollback failed"
+
 
 @needs_server
 class TestBatch:

@@ -9,9 +9,11 @@ export class SqliteError extends Error {
    * order — the completed statement's `ResultSet`, or `null` for the
    * failing statement and the statements that did not run. In a
    * non-atomic batch the completed statements' effects are committed; in
-   * an atomic batch they were rolled back. Empty when the batch failed
-   * client-side before anything was sent. */
+   * an atomic batch they were rolled back unless `rollbackError` is set.
+   * Empty when the batch failed client-side before anything was sent. */
   batchResults?: Array<any | null>;
+  /** A rollback error that occurred while handling this error. */
+  rollbackError?: Error;
   constructor(message, code, rawCode) {
     super(message);
     this.name = 'SqliteError';

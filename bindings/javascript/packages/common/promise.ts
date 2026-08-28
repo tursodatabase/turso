@@ -72,6 +72,20 @@ export interface BatchOptions {
   raw?: boolean;
 }
 
+type BatchStatement = string | {
+  sql: string;
+  args?: any[] | Record<string, any>;
+};
+
+const TRANSACTION_CONTROL_KEYWORDS = new Set([
+  "BEGIN",
+  "COMMIT",
+  "END",
+  "ROLLBACK",
+  "SAVEPOINT",
+  "RELEASE",
+]);
+
 export type BatchRow = Record<string, any> | any[];
 
 /**
@@ -132,6 +146,53 @@ function normalizeBatchOptions(options?: BatchMode | BatchOptions): { mode?: Bat
     mode: options as BatchMode | undefined,
     raw: false,
   };
+}
+
+function firstSqlKeyword(sql: string): string | undefined {
+  let offset = 0;
+  while (offset < sql.length) {
+    if (/\s/.test(sql[offset]) || sql[offset] === ";") {
+      offset++;
+      continue;
+    }
+    if (sql.startsWith("--", offset)) {
+      const newline = sql.indexOf("\n", offset + 2);
+      if (newline < 0) return undefined;
+      offset = newline + 1;
+      continue;
+    }
+    if (sql.startsWith("/*", offset)) {
+      const end = sql.indexOf("*/", offset + 2);
+      if (end < 0) return undefined;
+      offset = end + 2;
+      continue;
+    }
+    break;
+  }
+  return /^[A-Za-z]+/.exec(sql.slice(offset))?.[0].toUpperCase();
+}
+
+function batchInputError(index: number, cause: unknown): Error {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  const error = new TypeError(`batch statement ${index} failed: ${message}`) as TypeError & {
+    batchIndex?: number;
+    batchResults?: Array<ResultSet | null>;
+  };
+  error.batchIndex = index;
+  error.batchResults = [];
+  return error;
+}
+
+function attachRollbackError(primary: unknown, rollback: unknown): Error {
+  const rollbackError = rollback instanceof Error ? rollback : new Error(String(rollback));
+  if (primary instanceof Error) {
+    (primary as Error & { rollbackError?: Error }).rollbackError = rollbackError;
+    return primary;
+  }
+  const error = new Error(String(primary)) as Error & { cause?: unknown; rollbackError?: Error };
+  error.cause = primary;
+  error.rollbackError = rollbackError;
+  return error;
 }
 
 /**
@@ -441,10 +502,8 @@ class Database {
    * When `mode` is set, `batch()` owns the surrounding
    * `BEGIN`/`COMMIT`/`ROLLBACK`, so the `statements` array must not
    * contain its own transaction-control SQL (`BEGIN`, `COMMIT`,
-   * `ROLLBACK`, `SAVEPOINT`, `RELEASE`). The input is not validated
-   * for that — a user-supplied `COMMIT` will close the wrapper
-   * transaction mid-batch and leave earlier statements committed,
-   * defeating the all-or-nothing contract.
+   * `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`). Such input is rejected
+   * before the batch starts.
    *
    * @param statements - An array of SQL strings or `{ sql, args }` objects.
    * @param mode - When set, wraps the batch in `BEGIN <mode>` / `COMMIT`
@@ -489,7 +548,7 @@ class Database {
    * await txn.immediate();
    */
   async batch(
-    statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
+    statements: BatchStatement[],
     options?: BatchMode | BatchOptions,
   ): Promise<ResultSet[]> {
     if (!Array.isArray(statements)) {
@@ -698,7 +757,7 @@ class Database {
 async function executeBatch(
   native: NativeDatabase,
   io: () => Promise<void>,
-  statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
+  statements: BatchStatement[],
   options?: BatchMode | BatchOptions,
 ): Promise<ResultSet[]> {
   const runRawSql = async (sql: string) => {
@@ -725,13 +784,38 @@ async function executeBatch(
 
   const { mode, raw } = normalizeBatchOptions(options);
   const wrap = mode != null && !native.inTransaction();
+  const normalizedStatements = statements.map((statement, index): BatchStatement => {
+    if (typeof statement === "string" || statement.args === undefined) {
+      return statement;
+    }
+    try {
+      const args = Array.isArray(statement.args)
+        ? statement.args.map(normalizeBatchBindValue)
+        : Object.fromEntries(
+          Object.entries(statement.args).map(([name, value]) => [name, normalizeBatchBindValue(value)]),
+        );
+      return { sql: statement.sql, args };
+    } catch (error) {
+      throw batchInputError(index, error);
+    }
+  });
+  if (wrap) {
+    for (let index = 0; index < normalizedStatements.length; index++) {
+      const statement = normalizedStatements[index];
+      const sql = typeof statement === "string" ? statement : statement.sql;
+      const keyword = firstSqlKeyword(sql);
+      if (keyword !== undefined && TRANSACTION_CONTROL_KEYWORDS.has(keyword)) {
+        throw batchInputError(index, new Error(`${keyword} is not allowed in an atomic batch`));
+      }
+    }
+  }
   if (wrap) {
     await runRawSql(`BEGIN ${normalizeBatchMode(mode!)}`);
   }
 
   const results: ResultSet[] = [];
   const executeStatement = async (
-    statement: string | { sql: string; args?: any[] | Record<string, any> },
+    statement: BatchStatement,
   ): Promise<ResultSet> => {
     const sql = typeof statement === "string" ? statement : statement.sql;
     const args = typeof statement === "string" ? undefined : statement.args;
@@ -789,9 +873,9 @@ async function executeBatch(
   };
 
   try {
-    for (let index = 0; index < statements.length; index++) {
+    for (let index = 0; index < normalizedStatements.length; index++) {
       try {
-        results.push(await executeStatement(statements[index]));
+        results.push(await executeStatement(normalizedStatements[index]));
       } catch (err: any) {
         // Identify the failing statement and carry the results of the
         // statements that completed, matching the serverless driver:
@@ -802,7 +886,7 @@ async function executeBatch(
           batchErr.batchIndex = index;
           batchErr.batchResults = [
             ...results.map((result) => result as ResultSet | null),
-            ...Array(statements.length - results.length).fill(null),
+            ...Array(normalizedStatements.length - results.length).fill(null),
           ];
         }
         throw err;
@@ -814,11 +898,40 @@ async function executeBatch(
     }
   } catch (err) {
     if (wrap) {
-      try { await runRawSql("ROLLBACK"); } catch { /* ignore */ }
+      try {
+        await runRawSql("ROLLBACK");
+      } catch (rollbackError) {
+        throw attachRollbackError(err, rollbackError);
+      }
     }
     throw err;
   }
   return results;
+}
+
+function normalizeBatchBindValue(value: any): any {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new TypeError("Only finite numbers (not Infinity or NaN) can be passed as arguments");
+    }
+    return value;
+  }
+  if (typeof value === "bigint") {
+    if (value < -(1n << 63n) || value > (1n << 63n) - 1n) {
+      throw new TypeError("BigInt value is outside SQLite's signed 64-bit integer range");
+    }
+    return value;
+  }
+  if (
+    typeof value === "boolean" ||
+    typeof value === "string" ||
+    (ArrayBuffer.isView(value) && !(value instanceof DataView))
+  ) {
+    return value;
+  }
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  return String(value);
 }
 
 /**
@@ -993,7 +1106,7 @@ class Transaction {
    * @param statements - An array of SQL strings or `{ sql, args }` objects.
    */
   async batch(
-    statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
+    statements: BatchStatement[],
     options?: BatchMode | BatchOptions,
   ): Promise<ResultSet[]> {
     this.assertActive();

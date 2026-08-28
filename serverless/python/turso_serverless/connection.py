@@ -18,6 +18,7 @@ from .dbapi import (
     ProgrammingError,
     Row,
     Warning,
+    _first_keyword,
     _is_dml,
     _is_insert_or_replace,
 )
@@ -52,6 +53,15 @@ _BATCH_MODES = {
     "immediate": "BEGIN IMMEDIATE",
     "exclusive": "BEGIN EXCLUSIVE",
     "concurrent": "BEGIN CONCURRENT",
+}
+
+_TRANSACTION_CONTROL_KEYWORDS = {
+    "BEGIN",
+    "COMMIT",
+    "END",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "RELEASE",
 }
 
 
@@ -89,6 +99,17 @@ def _normalize_batch_statements(
     return normalized
 
 
+def _reject_transaction_control_statements(
+    statements: list[tuple[str, Sequence[Any] | Mapping[str, Any]]],
+) -> None:
+    for index, (sql, _parameters) in enumerate(statements):
+        if _first_keyword(sql) in _TRANSACTION_CONTROL_KEYWORDS:
+            error = ProgrammingError(
+                "transaction-control SQL is not allowed in a batch with a transaction mode"
+            )
+            raise _batch_statement_error(index, error) from error
+
+
 def _batch_statement_error(
     index: int,
     error: Exception,
@@ -97,9 +118,9 @@ def _batch_statement_error(
     """Wrap a statement failure so the raised exception identifies which
     statement failed, preserving the DB-API exception class. The zero-based
     index is available as the `batch_index` attribute, and `batch_results`
-    carries one entry per statement: the completed statement's
-    `BatchResult`, or None for the failing statement and the statements
-    that did not run."""
+    is empty when validation fails before execution. Otherwise it carries
+    one entry per statement: the completed statement's `BatchResult`, or
+    None for the failing statement and the statements that did not run."""
     wrapped = type(error)(f"batch statement {index} failed: {error}")
     wrapped.batch_index = index
     wrapped.batch_results = results if results is not None else []
@@ -241,17 +262,20 @@ class Connection:
         stops at the first statement that fails: the remaining statements
         are skipped and the raised exception identifies the failing
         statement by its zero-based index (the `batch_index` attribute)
-        and carries the per-statement results (the `batch_results`
-        attribute: one entry per statement — the completed statement's
-        `BatchResult`, or None for the failing statement and the
-        statements that did not run).
+        and carries the per-statement results in the `batch_results`
+        attribute. It is empty when parameter validation fails before
+        execution; otherwise it has one entry per statement — the completed
+        statement's `BatchResult`, or None for the failing statement and
+        the statements that did not run.
 
         With `mode` set to "deferred", "immediate", "exclusive", or
         "concurrent", the statements are wrapped in `BEGIN <mode>` /
         `COMMIT`, with a `ROLLBACK` on failure, all carried by the same
         request: either every statement commits or none does. The
         statements must not contain their own transaction-control SQL in
-        that case. With `mode` unset the batch is not transactional: each
+        that case. If `ROLLBACK` itself fails, the primary exception has a
+        `rollback_error` attribute and the stream's transaction state is
+        unknown. With `mode` unset the batch is not transactional: each
         statement commits as it executes.
 
         Unlike `execute()`, `batch()` never opens a legacy implicit
@@ -268,25 +292,27 @@ class Connection:
         if self.in_transaction:
             begin_sql = None
 
+        user_steps = []
+        for i, (sql, parameters) in enumerate(stmts):
+            try:
+                args, named_args = Cursor._convert_params(parameters)
+                user_steps.append(
+                    build_batch_step(sql, args=args, named_args=named_args, want_rows=True)
+                )
+            except Exception as e:
+                raise _batch_statement_error(i, e) from e
+
+        if begin_sql is not None:
+            _reject_transaction_control_statements(stmts)
+
         steps = []
         offset = 0
         if begin_sql is not None:
             steps.append(build_batch_step(begin_sql, want_rows=False))
             offset = 1
-        for i, (sql, parameters) in enumerate(stmts):
-            condition = None
+        for i, step in enumerate(user_steps):
             if offset + i > 0:
-                condition = {"type": "ok", "step": offset + i - 1}
-            # Value encoding can fail client-side (e.g. an unsupported
-            # type); report it with the statement's index like any other
-            # statement failure.
-            try:
-                args, named_args = Cursor._convert_params(parameters)
-                step = build_batch_step(
-                    sql, args=args, named_args=named_args, want_rows=True, condition=condition
-                )
-            except Exception as e:
-                raise _batch_statement_error(i, e) from e
+                step["condition"] = {"type": "ok", "step": offset + i - 1}
             steps.append(step)
         commit_index = None
         if begin_sql is not None:
@@ -331,9 +357,8 @@ class Connection:
     ) -> list[BatchResult]:
         """Decode a wire-level batch result into per-statement results, or
         raise the error of the step that failed. Failures of the synthetic
-        BEGIN/COMMIT steps surface as-is; a ROLLBACK failure is ignored
-        because it only runs after a failure that is already being
-        reported."""
+        BEGIN/COMMIT steps surface as-is. A ROLLBACK failure is attached to
+        that primary error as `rollback_error`."""
         step_results = result.get("step_results")
         step_errors = result.get("step_errors")
         if (
@@ -351,7 +376,17 @@ class Connection:
             Connection._decode_batch_statement_result(step_results[offset + i], sql)
             for i, (sql, _parameters) in enumerate(stmts)
         ]
-        Connection._raise_batch_step_error(step_errors, len(stmts), offset, commit_index, results)
+        rollback_error = None
+        if commit_index is not None and step_errors[commit_index + 1] is not None:
+            rollback_error = _classify_error(_server_error(step_errors[commit_index + 1]))
+        try:
+            Connection._raise_batch_step_error(step_errors, len(stmts), offset, commit_index, results)
+        except Exception as primary_error:
+            if rollback_error is not None:
+                primary_error.rollback_error = rollback_error
+            raise
+        if rollback_error is not None:
+            raise rollback_error
         for i, result in enumerate(results):
             if result is None:
                 raise ProtocolError(f"batch response is missing the result for statement {i}")

@@ -58,9 +58,19 @@ pub enum Error {
         /// each statement that completed, or `None` for the failing
         /// statement and the statements that did not run. In a
         /// non-transactional batch the completed statements' effects are
-        /// committed; in a transactional batch they were rolled back.
+        /// committed; in a transactional batch they were rolled back unless
+        /// this error is wrapped in [`Error::BatchRollbackFailed`].
         /// Empty when the batch failed before reaching the database.
         results: Vec<Option<BatchResult>>,
+    },
+    /// A managed transactional batch failed and its automatic rollback
+    /// failed too. `error` is the failure that caused the rollback; when a
+    /// user statement failed, it is a
+    /// [`BatchStatementFailed`](Self::BatchStatementFailed).
+    #[error("batch rollback failed after {error}: {rollback_error}")]
+    BatchRollbackFailed {
+        error: Box<Error>,
+        rollback_error: Box<Error>,
     },
 }
 

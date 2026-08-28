@@ -137,6 +137,9 @@ export function encodeValue(value: any): Value {
   }
   
   if (typeof value === 'bigint') {
+    if (value < -(1n << 63n) || value > (1n << 63n) - 1n) {
+      throw new Error("BigInt value is outside SQLite's signed 64-bit integer range");
+    }
     return { type: 'integer', value: value.toString() };
   }
   

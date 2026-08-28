@@ -1870,6 +1870,42 @@ def test_batch_error_identifies_the_failing_statement():
     conn.close()
 
 
+@pytest.mark.parametrize("mode", [None, "immediate"])
+def test_batch_validates_every_parameter_before_execution(mode):
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError, match="batch statement 1 failed") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch (name) VALUES (?)", (object(),)),
+            ],
+            mode=mode,
+        )
+    assert excinfo.value.batch_index == 1
+    assert excinfo.value.batch_results == []
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("mode", [None, "immediate"])
+def test_batch_rejects_infinity_before_execution(mode):
+    conn = _batch_connection()
+    with pytest.raises(ValueError, match="infinite float") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch (name) VALUES (?)", (float("inf"),)),
+            ],
+            mode=mode,
+        )
+    assert excinfo.value.batch_index == 1
+    assert excinfo.value.batch_results == []
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    assert not conn.in_transaction
+    conn.close()
+
+
 def test_batch_joins_an_open_transaction():
     conn = _batch_connection()
     conn.execute("BEGIN")
@@ -1914,6 +1950,59 @@ def test_batch_mode_rolls_back_on_failure():
     assert not conn.in_transaction
     # The rollback undid the first insert.
     assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "SAVEPOINT batch_savepoint",
+        "RELEASE batch_savepoint",
+        "; /* empty statement */ COMMIT",
+        "\ufeffCOMMIT",
+    ],
+)
+def test_batch_mode_rejects_transaction_control_before_begin(sql):
+    conn = _batch_connection()
+    with pytest.raises(
+        turso.ProgrammingError, match="transaction-control SQL is not allowed"
+    ) as excinfo:
+        conn.batch([sql], mode="immediate")
+    assert excinfo.value.batch_index == 0
+    assert excinfo.value.batch_results == []
+    assert not conn.in_transaction
+    conn.close()
+
+
+def test_batch_preserves_rollback_failure_on_primary_error():
+    conn = _batch_connection()
+    execute_transaction_sql = conn._exec_ddl_only
+
+    def fail_rollback(sql):
+        if sql == "ROLLBACK":
+            raise turso.OperationalError("rollback failed")
+        execute_transaction_sql(sql)
+
+    conn._exec_ddl_only = fail_rollback
+    with pytest.raises(turso.DatabaseError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+            ],
+            mode="immediate",
+        )
+    assert excinfo.value.batch_index == 1
+    assert len(excinfo.value.batch_results) == 2
+    assert isinstance(excinfo.value.rollback_error, turso.OperationalError)
+    assert str(excinfo.value.rollback_error) == "rollback failed"
+
+    conn._exec_ddl_only = execute_transaction_sql
+    conn.rollback()
     conn.close()
 
 

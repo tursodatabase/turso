@@ -211,6 +211,143 @@ test.serial('Session.batch encodes named arguments for statement objects', async
   t.deepEqual(requests[0].requests.at(-1), { type: 'get_autocommit' });
 });
 
+test.serial('Session.batch rejects every transaction-control keyword before an atomic request', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    throw new Error('fetch must not be called');
+  };
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  for (const control of [
+    'BEGIN',
+    'COMMIT',
+    'END',
+    'ROLLBACK',
+    'SAVEPOINT nested',
+    'RELEASE nested',
+    '\ufeffCOMMIT',
+  ]) {
+    const error = await t.throwsAsync(
+      () => session.batch([
+        'SELECT 1',
+        ` ; \n-- leading line comment\n; /* leading block comment */ ${control}`,
+      ], 'immediate'),
+      { instanceOf: DatabaseError },
+    );
+    t.is(error.batchIndex, 1);
+    t.deepEqual(error.batchResults, []);
+  }
+  t.false(fetchCalled);
+});
+
+test.serial('Session.batch validates every argument before sending a request', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    throw new Error('fetch must not be called');
+  };
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  for (const invalid of [Number.POSITIVE_INFINITY, 1n << 63n]) {
+    const error = await t.throwsAsync(
+      () => session.batch([
+        { sql: 'INSERT INTO t VALUES (?)', args: [1] },
+        { sql: 'INSERT INTO t VALUES (?)', args: [invalid] },
+      ]),
+      { instanceOf: DatabaseError },
+    );
+    t.is(error.batchIndex, 1);
+    t.deepEqual(error.batchResults, []);
+  }
+  t.false(fetchCalled);
+});
+
+test.serial('Session.batch attaches a synthetic rollback failure to the primary error', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    baton: null,
+    base_url: null,
+    results: [
+      {
+        type: 'ok',
+        response: {
+          type: 'batch',
+          result: {
+            step_results: [
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              null,
+              null,
+              null,
+            ],
+            step_errors: [
+              null,
+              { message: 'statement failed', code: 'SQLITE_ERROR' },
+              null,
+              { message: 'rollback failed', code: 'SQLITE_IOERR' },
+            ],
+          },
+        },
+      },
+      { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+    ],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const error = await t.throwsAsync(
+    () => session.batch(['SELECT * FROM missing'], 'immediate'),
+    { instanceOf: DatabaseError, message: 'statement failed' },
+  );
+  t.is(error.batchIndex, 0);
+  t.true(error.rollbackError instanceof DatabaseError);
+  t.is(error.rollbackError.message, 'rollback failed');
+  t.is(error.rollbackError.code, 'SQLITE_IOERR');
+});
+
+test.serial('Session.batch never ignores a standalone rollback error', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    baton: null,
+    base_url: null,
+    results: [
+      {
+        type: 'ok',
+        response: {
+          type: 'batch',
+          result: {
+            step_results: [
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              null,
+            ],
+            step_errors: [
+              null,
+              null,
+              null,
+              { message: 'unexpected rollback failure', code: 'SQLITE_IOERR' },
+            ],
+          },
+        },
+      },
+      { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+    ],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const error = await t.throwsAsync(
+    () => session.batch(['SELECT 1'], 'immediate'),
+    { instanceOf: DatabaseError, message: 'unexpected rollback failure' },
+  );
+  t.is(error.code, 'SQLITE_IOERR');
+});
+
 // --- requestHeaders ---
 
 test.serial('Session attaches requestHeaders and lets them override Authorization', async t => {

@@ -8,7 +8,7 @@
 use crate::{
     params::{IntoParams, Params},
     rows::Row,
-    Column, Result,
+    Column, Error, Result, Value,
 };
 
 mod sealed {
@@ -48,6 +48,76 @@ impl BatchStatement {
             params: params.into_params()?,
         })
     }
+
+    pub(crate) fn validate_params(&self) -> Result<()> {
+        let has_infinity = match &self.params {
+            Params::None => false,
+            Params::Positional(values) => values.iter().any(is_infinite),
+            Params::Named(values) => values.iter().any(|(_, value)| is_infinite(value)),
+        };
+        if has_infinity {
+            return Err(Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "only finite floating-point values can be bound",
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn controls_transaction(&self) -> bool {
+        matches!(
+            first_sql_keyword(&self.sql).as_deref(),
+            Some("BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE")
+        )
+    }
+}
+
+fn is_infinite(value: &Value) -> bool {
+    matches!(value, Value::Real(number) if number.is_infinite())
+}
+
+fn first_sql_keyword(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut offset = 0;
+    loop {
+        if bytes.get(offset..offset + 3) == Some(&[0xef, 0xbb, 0xbf]) {
+            offset += 3;
+            continue;
+        }
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b';')
+        {
+            offset += 1;
+        }
+        if bytes.get(offset..offset + 2) == Some(b"--") {
+            offset += 2;
+            while bytes.get(offset).is_some_and(|byte| *byte != b'\n') {
+                offset += 1;
+            }
+            continue;
+        }
+        if bytes.get(offset..offset + 2) == Some(b"/*") {
+            offset += 2;
+            while bytes.get(offset..offset + 2) != Some(b"*/") {
+                bytes.get(offset)?;
+                offset += 1;
+            }
+            offset += 2;
+            continue;
+        }
+        break;
+    }
+    let start = offset;
+    while bytes
+        .get(offset)
+        .is_some_and(|byte| byte.is_ascii_alphabetic())
+    {
+        offset += 1;
+    }
+    (offset > start).then(|| sql[start..offset].to_ascii_uppercase())
 }
 
 /// Converts some type into one statement of a batch.

@@ -69,7 +69,6 @@ function shapeBatchError(error: any): any {
   return error;
 }
 
-
 /**
  * A connection to a Turso database.
  *
@@ -298,10 +297,8 @@ export class Connection {
    * When `mode` is set, `batch()` owns the surrounding
    * `BEGIN`/`COMMIT`/`ROLLBACK`, so the `statements` array must not
    * contain its own transaction-control SQL (`BEGIN`, `COMMIT`,
-   * `ROLLBACK`, `SAVEPOINT`, `RELEASE`). The input is not validated
-   * for that — a user-supplied `COMMIT` will close the wrapper
-   * transaction mid-batch and leave earlier statements committed,
-   * defeating the all-or-nothing contract.
+   * `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`). Such input is rejected
+   * before the batch starts.
    *
    * @param statements - An array of SQL strings or `{ sql, args }` objects.
    * @param mode - When set, makes the batch atomic. Accepts the same

@@ -568,6 +568,59 @@ async fn transactional_batch_rolls_back_on_failure() {
 }
 
 #[tokio::test]
+async fn transactional_batch_updates_rowid_when_commit_fails() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+    let parent = unique_name("t_rowid_parent");
+    let child = unique_name("t_rowid_child");
+
+    conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+    conn.execute(
+        format!("CREATE TABLE {parent} (id INTEGER PRIMARY KEY)"),
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        format!(
+            "CREATE TABLE {child} (\
+                id INTEGER PRIMARY KEY, \
+                parent_id INTEGER REFERENCES {parent}(id) DEFERRABLE INITIALLY DEFERRED\
+            )"
+        ),
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(format!("INSERT INTO {parent} VALUES (5)"), ())
+        .await
+        .unwrap();
+    assert_eq!(conn.last_insert_rowid(), 5);
+
+    let error = conn
+        .transactional_batch(
+            [format!("INSERT INTO {child} VALUES (9, 999)")],
+            TransactionBehavior::Deferred,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Constraint(_)), "{error}");
+    assert_eq!(conn.last_insert_rowid(), 9);
+
+    let mut rows = conn
+        .query(format!("SELECT count(*) FROM {child}"), ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+
+    drop_table(&conn, &child).await;
+    drop_table(&conn, &parent).await;
+}
+
+#[tokio::test]
 async fn transactional_batch_joins_an_open_transaction() {
     let config = config_or_skip!();
     let mut conn = connect(&config.url, &config.auth_token).await;

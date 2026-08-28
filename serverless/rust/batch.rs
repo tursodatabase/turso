@@ -201,7 +201,13 @@ pub(crate) struct BatchLayout {
     user_count: usize,
     begin: Option<usize>,
     commit: Option<usize>,
+    rollback: Option<usize>,
     total_steps: usize,
+}
+
+pub(crate) struct DecodedBatch {
+    pub(crate) outcome: Result<Vec<BatchResult>>,
+    pub(crate) last_insert_rowid: Option<i64>,
 }
 
 /// Build the wire-level batch for the given statements.
@@ -259,72 +265,172 @@ pub(crate) fn build_batch(
         });
         commit
     });
+    let rollback = commit.map(|commit| commit + 1);
     let layout = BatchLayout {
         user_offset,
         user_count,
         begin: wrap.map(|_| 0),
         commit,
+        rollback,
         total_steps: steps.len(),
     };
     (Batch { steps }, layout)
 }
 
 /// Decode a wire-level batch result into per-statement results, or the
-/// error of the step that failed.
+/// error of the step that failed. The decoded rowid is kept separate from
+/// the outcome so the connection cache can still advance when a synthetic
+/// `COMMIT` or `ROLLBACK` step fails after user statements completed.
 ///
 /// A failing user statement is reported as
 /// [`Error::BatchStatementFailed`] with its zero-based index. Failures of
-/// the synthetic `BEGIN`/`COMMIT` steps surface as the underlying error.
-/// The synthetic `ROLLBACK` step's error, if any, is ignored: it only runs
-/// after a failure that is already being reported, and surfacing it would
-/// mask the cause.
+/// the synthetic `BEGIN`/`COMMIT` steps surface as the underlying error. If
+/// the automatic rollback also fails, both errors are preserved in
+/// [`Error::BatchRollbackFailed`].
 pub(crate) fn decode_batch_result(
     result: crate::protocol::BatchResult,
     layout: &BatchLayout,
-) -> Result<Vec<BatchResult>> {
+) -> DecodedBatch {
     if result.step_results.len() != layout.total_steps
         || result.step_errors.len() != layout.total_steps
     {
-        return Err(Error::Http(format!(
-            "batch response has {} results and {} errors for {} steps",
-            result.step_results.len(),
-            result.step_errors.len(),
-            layout.total_steps
-        )));
+        return DecodedBatch {
+            outcome: Err(Error::Http(format!(
+                "batch response has {} results and {} errors for {} steps",
+                result.step_results.len(),
+                result.step_errors.len(),
+                layout.total_steps
+            ))),
+            last_insert_rowid: None,
+        };
     }
     let mut step_results = result.step_results;
     let mut step_errors = result.step_errors;
+    if let Some(step) = step_results
+        .iter()
+        .zip(&step_errors)
+        .position(|(result, error)| result.is_some() && error.is_some())
+    {
+        return DecodedBatch {
+            outcome: Err(Error::Http(format!(
+                "batch response step {step} has both a result and an error"
+            ))),
+            last_insert_rowid: None,
+        };
+    }
     // Decode the results of the statements that executed before looking
     // at the errors, so a failure can still report what completed.
     let mut outputs = Vec::with_capacity(layout.user_count);
+    let mut last_insert_rowid = None;
     for i in 0..layout.user_count {
-        outputs.push(
-            step_results[layout.user_offset + i]
-                .take()
-                .map(BatchResult::from_stmt_result)
-                .transpose()?,
-        );
+        let output = match step_results[layout.user_offset + i]
+            .take()
+            .map(BatchResult::from_stmt_result)
+            .transpose()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return DecodedBatch {
+                    outcome: Err(error),
+                    last_insert_rowid,
+                };
+            }
+        };
+        if let Some(rowid) = output.as_ref().and_then(BatchResult::last_insert_rowid) {
+            last_insert_rowid = Some(rowid);
+        }
+        outputs.push(output);
     }
-    if let Some(begin) = layout.begin {
-        if let Some(error) = step_errors[begin].take() {
-            return Err(error.into());
+
+    enum Failure {
+        Synthetic(Error),
+        Statement { index: usize, error: Error },
+    }
+
+    let mut failure = layout
+        .begin
+        .and_then(|begin| step_errors[begin].take().map(Error::from))
+        .map(Failure::Synthetic);
+    if failure.is_none() {
+        for i in 0..layout.user_count {
+            if let Some(statement_error) = step_errors[layout.user_offset + i].take() {
+                failure = Some(Failure::Statement {
+                    index: i,
+                    error: statement_error.into(),
+                });
+                break;
+            }
         }
     }
-    for i in 0..layout.user_count {
-        if let Some(error) = step_errors[layout.user_offset + i].take() {
-            return Err(Error::BatchStatementFailed {
-                index: i,
-                error: Box::new(error.into()),
-                results: outputs,
-            });
+    if failure.is_none() {
+        failure = layout
+            .commit
+            .and_then(|commit| step_errors[commit].take().map(Error::from))
+            .map(Failure::Synthetic);
+    }
+    let failure_into_error = |failure, results| match failure {
+        Failure::Synthetic(error) => error,
+        Failure::Statement { index, error } => Error::BatchStatementFailed {
+            index,
+            error: Box::new(error),
+            results,
+        },
+    };
+    if let Some(rollback_error) = layout
+        .rollback
+        .and_then(|rollback| step_errors[rollback].take())
+    {
+        let cause = failure.map_or_else(
+            || Error::Http("batch rollback failed without a preceding batch failure".to_string()),
+            |failure| failure_into_error(failure, outputs),
+        );
+        return DecodedBatch {
+            outcome: Err(Error::BatchRollbackFailed {
+                error: Box::new(cause),
+                rollback_error: Box::new(rollback_error.into()),
+            }),
+            last_insert_rowid,
+        };
+    }
+    if let Some(failure) = failure {
+        return DecodedBatch {
+            outcome: Err(failure_into_error(failure, outputs)),
+            last_insert_rowid,
+        };
+    }
+
+    if let Some(begin) = layout.begin {
+        if step_results[begin].is_none() {
+            return DecodedBatch {
+                outcome: Err(Error::Http(
+                    "batch response is missing the BEGIN result".to_string(),
+                )),
+                last_insert_rowid,
+            };
         }
     }
     if let Some(commit) = layout.commit {
-        if let Some(error) = step_errors[commit].take() {
-            return Err(error.into());
+        if step_results[commit].is_none() {
+            return DecodedBatch {
+                outcome: Err(Error::Http(
+                    "batch response is missing the COMMIT result".to_string(),
+                )),
+                last_insert_rowid,
+            };
         }
     }
-    outputs
+    if let Some(rollback) = layout.rollback {
+        if step_results[rollback].is_some() {
+            return DecodedBatch {
+                outcome: Err(Error::Http(
+                    "batch response ran ROLLBACK after a successful COMMIT".to_string(),
+                )),
+                last_insert_rowid,
+            };
+        }
+    }
+
+    let outcome = outputs
         .into_iter()
         .enumerate()
         .map(|(i, output)| {
@@ -334,7 +440,11 @@ pub(crate) fn decode_batch_result(
                 ))
             })
         })
-        .collect()
+        .collect();
+    DecodedBatch {
+        outcome,
+        last_insert_rowid,
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +521,7 @@ mod tests {
         assert_eq!(layout.user_offset, 1);
         assert_eq!(layout.begin, Some(0));
         assert_eq!(layout.commit, Some(3));
+        assert_eq!(layout.rollback, Some(4));
         assert_eq!(layout.total_steps, 5);
     }
 
@@ -432,7 +543,9 @@ mod tests {
             ],
             step_errors: vec![None, None],
         };
-        let outputs = decode_batch_result(result, &layout).unwrap();
+        let decoded = decode_batch_result(result, &layout);
+        assert_eq!(decoded.last_insert_rowid, Some(42));
+        let outputs = decoded.outcome.unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(
             outputs[0].rows()[0].get_value(0).unwrap(),
@@ -449,7 +562,7 @@ mod tests {
             step_results: vec![Some(stmt_result(1)), None, None],
             step_errors: vec![None, Some(proto_error("boom")), None],
         };
-        let error = decode_batch_result(result, &layout).unwrap_err();
+        let error = decode_batch_result(result, &layout).outcome.unwrap_err();
         match error {
             Error::BatchStatementFailed {
                 index,
@@ -482,7 +595,7 @@ mod tests {
             ],
             step_errors: vec![None, None, Some(proto_error("second failed")), None, None],
         };
-        let error = decode_batch_result(result, &layout).unwrap_err();
+        let error = decode_batch_result(result, &layout).outcome.unwrap_err();
         match error {
             Error::BatchStatementFailed { index, .. } => assert_eq!(index, 1),
             other => panic!("expected BatchStatementFailed, got {other:?}"),
@@ -490,40 +603,70 @@ mod tests {
     }
 
     #[test]
-    fn decode_surfaces_commit_failure_without_an_index() {
+    fn decode_surfaces_commit_failure_and_the_latest_user_rowid() {
         let (_, layout) = build_batch(user_stmts(1), Some(TransactionBehavior::Deferred));
         let result = ProtoBatchResult {
             step_results: vec![
                 Some(stmt_result(0)),
-                Some(stmt_result(1)),
+                Some(StmtResult {
+                    last_insert_rowid: Some("41".to_string()),
+                    ..stmt_result(1)
+                }),
                 None,
                 Some(stmt_result(0)),
             ],
             step_errors: vec![None, None, Some(proto_error("commit failed")), None],
         };
-        let error = decode_batch_result(result, &layout).unwrap_err();
+        let decoded = decode_batch_result(result, &layout);
+        assert_eq!(decoded.last_insert_rowid, Some(41));
+        let error = decoded.outcome.unwrap_err();
         assert!(matches!(error, Error::Error(ref m) if m == "commit failed"));
     }
 
     #[test]
-    fn decode_ignores_rollback_errors_in_favor_of_the_cause() {
-        let (_, layout) = build_batch(user_stmts(1), Some(TransactionBehavior::Deferred));
+    fn decode_preserves_the_cause_and_rollback_error() {
+        let (_, layout) = build_batch(user_stmts(2), Some(TransactionBehavior::Deferred));
         let result = ProtoBatchResult {
-            step_results: vec![Some(stmt_result(0)), None, None, None],
+            step_results: vec![
+                Some(stmt_result(0)),
+                Some(StmtResult {
+                    last_insert_rowid: Some("40".to_string()),
+                    ..stmt_result(1)
+                }),
+                None,
+                None,
+                None,
+            ],
             step_errors: vec![
+                None,
                 None,
                 Some(proto_error("the real cause")),
                 None,
                 Some(proto_error("cannot rollback")),
             ],
         };
-        let error = decode_batch_result(result, &layout).unwrap_err();
+        let decoded = decode_batch_result(result, &layout);
+        assert_eq!(decoded.last_insert_rowid, Some(40));
+        let error = decoded.outcome.unwrap_err();
         match error {
-            Error::BatchStatementFailed { index, error, .. } => {
-                assert_eq!(index, 0);
-                assert!(matches!(*error, Error::Error(ref m) if m == "the real cause"));
+            Error::BatchRollbackFailed {
+                error,
+                rollback_error,
+            } => {
+                assert!(matches!(
+                    *error,
+                    Error::BatchStatementFailed {
+                        index: 1,
+                        error,
+                        ..
+                    } if matches!(*error, Error::Error(ref m) if m == "the real cause")
+                ));
+                assert!(matches!(
+                    *rollback_error,
+                    Error::Error(ref m) if m == "cannot rollback"
+                ));
             }
-            other => panic!("expected BatchStatementFailed, got {other:?}"),
+            other => panic!("expected BatchRollbackFailed, got {other:?}"),
         }
     }
 
@@ -534,7 +677,7 @@ mod tests {
             step_results: vec![Some(stmt_result(0)), None],
             step_errors: vec![None, None],
         };
-        let error = decode_batch_result(result, &layout).unwrap_err();
+        let error = decode_batch_result(result, &layout).outcome.unwrap_err();
         assert!(matches!(error, Error::Http(_)));
     }
 
@@ -545,7 +688,29 @@ mod tests {
             step_results: vec![Some(stmt_result(0))],
             step_errors: vec![None],
         };
-        let error = decode_batch_result(result, &layout).unwrap_err();
+        let error = decode_batch_result(result, &layout).outcome.unwrap_err();
         assert!(matches!(error, Error::Http(_)));
+    }
+
+    #[test]
+    fn decode_rejects_a_step_with_a_result_and_an_error() {
+        let (_, layout) = build_batch(user_stmts(1), None);
+        let result = ProtoBatchResult {
+            step_results: vec![Some(stmt_result(0))],
+            step_errors: vec![Some(proto_error("impossible"))],
+        };
+        let error = decode_batch_result(result, &layout).outcome.unwrap_err();
+        assert!(matches!(error, Error::Http(ref message) if message.contains("both")));
+    }
+
+    #[test]
+    fn decode_rejects_a_missing_commit_result() {
+        let (_, layout) = build_batch(user_stmts(1), Some(TransactionBehavior::Deferred));
+        let result = ProtoBatchResult {
+            step_results: vec![Some(stmt_result(0)), Some(stmt_result(1)), None, None],
+            step_errors: vec![None, None, None, None],
+        };
+        let error = decode_batch_result(result, &layout).outcome.unwrap_err();
+        assert!(matches!(error, Error::Http(ref message) if message.contains("COMMIT")));
     }
 }

@@ -9,11 +9,23 @@ use crate::Rows;
 use crate::Statement;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Waker;
 pub type Result<T> = std::result::Result<T, Error>;
+
+const EXCLUSIVE_OPERATION: usize = usize::MAX;
+
+pub(crate) struct ConnectionOperationGate {
+    state: AtomicUsize,
+}
+
+pub(crate) struct ConnectionOperationGuard {
+    gate: Arc<ConnectionOperationGate>,
+    exclusive: bool,
+}
 
 /// Atomic wrapper for [DropBehavior]
 pub(crate) struct AtomicDropBehavior {
@@ -53,6 +65,7 @@ pub struct Connection {
     /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
     pub(crate) dangling_tx: AtomicDropBehavior,
     pub(crate) extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,
+    pub(crate) operation_gate: Arc<ConnectionOperationGate>,
 }
 
 assert_send_sync!(Connection);
@@ -64,6 +77,7 @@ impl Clone for Connection {
             transaction_behavior: self.transaction_behavior,
             dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
             extra_io: self.extra_io.clone(),
+            operation_gate: self.operation_gate.clone(),
         }
     }
 }
@@ -79,6 +93,7 @@ impl Connection {
             transaction_behavior: TransactionBehavior::Deferred,
             dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
             extra_io,
+            operation_gate: Arc::new(ConnectionOperationGate::new()),
         };
         connection
     }
@@ -129,7 +144,9 @@ impl Connection {
 
     /// Execute a batch of SQL statements on the database.
     pub async fn execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
-        self.maybe_handle_dangling_tx().await?;
+        let _operation = self.acquire_exclusive_operation()?;
+        self.maybe_handle_dangling_tx_without_operation_guard()
+            .await?;
         self.prepare_execute_batch(sql).await?;
         Ok(())
     }
@@ -196,7 +213,7 @@ impl Connection {
     ///
     /// This method owns the surrounding transaction, so the statements must
     /// not contain their own transaction-control SQL (`BEGIN`, `COMMIT`,
-    /// `ROLLBACK`, `SAVEPOINT`, `RELEASE`); a user-supplied `COMMIT` would
+    /// `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`); a user-supplied `COMMIT` would
     /// close the wrapper transaction mid-batch and leave earlier statements
     /// committed, defeating the all-or-nothing contract. If a transaction
     /// is already open on this connection, the wrapping is skipped and the
@@ -237,13 +254,39 @@ impl Connection {
         if stmts.is_empty() {
             return Ok(Vec::new());
         }
-        self.maybe_handle_dangling_tx().await?;
+        for (index, stmt) in stmts.iter().enumerate() {
+            stmt.validate_params()
+                .map_err(|error| Error::BatchStatementFailed {
+                    index,
+                    error: Box::new(error),
+                    results: Vec::new(),
+                })?;
+        }
+        let _operation = self.acquire_exclusive_operation()?;
+        self.maybe_handle_dangling_tx_without_operation_guard()
+            .await?;
         // With a transaction already open on the connection, another BEGIN
         // would fail; the statements join the open transaction instead
         // (matching the serverless driver).
         let wrap = if self.is_autocommit()? { wrap } else { None };
+        if wrap.is_some() {
+            if let Some((index, _)) = stmts
+                .iter()
+                .enumerate()
+                .find(|(_, stmt)| stmt.controls_transaction())
+            {
+                return Err(Error::BatchStatementFailed {
+                    index,
+                    error: Box::new(Error::Misuse(
+                        "transactional batch statements must not control transactions".to_string(),
+                    )),
+                    results: Vec::new(),
+                });
+            }
+        }
         if let Some(behavior) = wrap {
-            self.execute(behavior.begin_sql(), ()).await?;
+            self.execute_without_operation_guard(behavior.begin_sql(), ())
+                .await?;
         }
         let statement_count = stmts.len();
         let mut results = Vec::with_capacity(statement_count);
@@ -251,29 +294,27 @@ impl Connection {
             match self.execute_batch_statement(stmt).await {
                 Ok(result) => results.push(result),
                 Err(error) => {
-                    // ROLLBACK errors are ignored: the statement failure is
-                    // the error being reported, and surfacing a rollback
-                    // error would mask it.
-                    if wrap.is_some() {
-                        let _ = self.execute("ROLLBACK", ()).await;
-                    }
                     // One entry per statement: the completed statements'
                     // results, None for the failing and skipped ones.
                     let mut partial: Vec<Option<BatchResult>> =
                         results.into_iter().map(Some).collect();
                     partial.resize_with(statement_count, || None);
-                    return Err(Error::BatchStatementFailed {
+                    let error = Error::BatchStatementFailed {
                         index,
                         error: Box::new(error),
                         results: partial,
-                    });
+                    };
+                    return if wrap.is_some() {
+                        self.rollback_batch(error).await
+                    } else {
+                        Err(error)
+                    };
                 }
             }
         }
         if wrap.is_some() {
-            if let Err(error) = self.execute("COMMIT", ()).await {
-                let _ = self.execute("ROLLBACK", ()).await;
-                return Err(error);
+            if let Err(error) = self.execute_without_operation_guard("COMMIT", ()).await {
+                return self.rollback_batch(error).await;
             }
         }
         Ok(results)
@@ -283,7 +324,7 @@ impl Connection {
     async fn execute_batch_statement(&self, stmt: BatchStatement) -> Result<BatchResult> {
         let rowid_before = self.last_insert_rowid();
         let mut prepared = self.prepare(&stmt.sql).await?;
-        let mut rows = prepared.query(stmt.params).await?;
+        let mut rows = prepared.query_without_operation_guard(stmt.params).await?;
         let columns = rows.columns();
         let mut buffered = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -336,7 +377,6 @@ impl Connection {
     }
 
     async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
-        self.maybe_handle_dangling_tx().await?;
         let conn = self.get_inner_connection()?;
         let mut sql = sql.as_ref();
         while let Some((stmt, offset)) = conn.prepare_first(sql)? {
@@ -344,10 +384,55 @@ impl Connection {
                 conn: self.clone(),
                 inner: Arc::new(Mutex::new(stmt)),
             };
-            let _ = stmt.execute(()).await?;
+            let _ = stmt.execute_without_operation_guard(()).await?;
             sql = &sql[offset..];
         }
         Ok(())
+    }
+
+    async fn rollback_batch<T>(&self, error: Error) -> Result<T> {
+        match self.execute_without_operation_guard("ROLLBACK", ()).await {
+            Ok(_) => Err(error),
+            Err(rollback_error) => Err(Error::BatchRollbackFailed {
+                error: Box::new(error),
+                rollback_error: Box::new(rollback_error),
+            }),
+        }
+    }
+
+    pub(crate) fn acquire_shared_operation(&self) -> Result<ConnectionOperationGuard> {
+        self.operation_gate.acquire_shared()
+    }
+
+    fn acquire_exclusive_operation(&self) -> Result<ConnectionOperationGuard> {
+        self.operation_gate.acquire_exclusive()
+    }
+
+    async fn maybe_handle_dangling_tx_without_operation_guard(&self) -> Result<()> {
+        match self.dangling_tx.load(Ordering::SeqCst) {
+            DropBehavior::Rollback => {
+                self.execute_without_operation_guard("ROLLBACK", ()).await?;
+                self.dangling_tx
+                    .store(DropBehavior::Ignore, Ordering::SeqCst);
+            }
+            DropBehavior::Commit => {
+                self.execute_without_operation_guard("COMMIT", ()).await?;
+                self.dangling_tx
+                    .store(DropBehavior::Ignore, Ordering::SeqCst);
+            }
+            DropBehavior::Ignore => {}
+            DropBehavior::Panic => panic!("Transaction dropped unexpectedly."),
+        }
+        Ok(())
+    }
+
+    async fn execute_without_operation_guard(
+        &self,
+        sql: impl AsRef<str>,
+        params: impl IntoParams,
+    ) -> Result<u64> {
+        let mut stmt = self.prepare(sql).await?;
+        stmt.execute_without_operation_guard(params).await
     }
 
     /// Query a pragma.
@@ -423,5 +508,89 @@ impl Connection {
 impl Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection").finish()
+    }
+}
+
+impl ConnectionOperationGate {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+        }
+    }
+
+    fn acquire_shared(self: &Arc<Self>) -> Result<ConnectionOperationGuard> {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state == EXCLUSIVE_OPERATION {
+                return Err(Error::Misuse(
+                    "connection is busy executing a batch".to_string(),
+                ));
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(ConnectionOperationGuard {
+                        gate: self.clone(),
+                        exclusive: false,
+                    });
+                }
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    fn acquire_exclusive(self: &Arc<Self>) -> Result<ConnectionOperationGuard> {
+        self.state
+            .compare_exchange(0, EXCLUSIVE_OPERATION, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::Misuse("connection is busy with another operation".to_string()))?;
+        Ok(ConnectionOperationGuard {
+            gate: self.clone(),
+            exclusive: true,
+        })
+    }
+}
+
+impl Drop for ConnectionOperationGuard {
+    fn drop(&mut self) {
+        if self.exclusive {
+            let previous = self.gate.state.swap(0, Ordering::Release);
+            debug_assert_eq!(previous, EXCLUSIVE_OPERATION);
+        } else {
+            let previous = self.gate.state.fetch_sub(1, Ordering::Release);
+            debug_assert!(previous > 0 && previous != EXCLUSIVE_OPERATION);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Builder;
+
+    #[tokio::test]
+    async fn rollback_batch_preserves_both_errors() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+
+        let error = conn
+            .rollback_batch::<()>(Error::Error("statement failed".to_string()))
+            .await
+            .unwrap_err();
+        match error {
+            Error::BatchRollbackFailed {
+                error,
+                rollback_error,
+            } => {
+                assert!(
+                    matches!(*error, Error::Error(ref message) if message == "statement failed")
+                );
+                assert!(rollback_error.to_string().contains("transaction"));
+            }
+            other => panic!("expected BatchRollbackFailed, got {other:?}"),
+        }
     }
 }

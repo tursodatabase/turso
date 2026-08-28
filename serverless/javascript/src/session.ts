@@ -27,6 +27,15 @@ import { encodeSqlArgs } from './args.js';
  */
 export type BatchMode = 'write' | 'read' | 'deferred' | 'immediate' | 'exclusive' | 'concurrent' | string;
 
+const TRANSACTION_CONTROL_KEYWORDS = new Set([
+  'BEGIN',
+  'COMMIT',
+  'END',
+  'ROLLBACK',
+  'SAVEPOINT',
+  'RELEASE',
+]);
+
 function normalizeBatchMode(mode: BatchMode): string {
   switch (String(mode).toLowerCase()) {
     case 'write':
@@ -43,6 +52,37 @@ function normalizeBatchMode(mode: BatchMode): string {
     default:
       return String(mode).toUpperCase();
   }
+}
+
+function firstSqlKeyword(sql: string): string | undefined {
+  let offset = 0;
+  while (offset < sql.length) {
+    if (/\s/.test(sql[offset]) || sql[offset] === ';') {
+      offset++;
+      continue;
+    }
+    if (sql.startsWith('--', offset)) {
+      const newline = sql.indexOf('\n', offset + 2);
+      if (newline < 0) return undefined;
+      offset = newline + 1;
+      continue;
+    }
+    if (sql.startsWith('/*', offset)) {
+      const end = sql.indexOf('*/', offset + 2);
+      if (end < 0) return undefined;
+      offset = end + 2;
+      continue;
+    }
+    break;
+  }
+  return /^[A-Za-z]+/.exec(sql.slice(offset))?.[0].toUpperCase();
+}
+
+function batchInputError(index: number, message: string): DatabaseError {
+  const error = new DatabaseError(`batch statement ${index} failed: ${message}`);
+  error.batchIndex = index;
+  error.batchResults = [];
+  return error;
 }
 
 /**
@@ -478,12 +518,7 @@ export class Session {
       try {
         encodedArgs = encodeSqlArgs(statement.args ?? []);
       } catch (e: any) {
-        const error = new DatabaseError(
-          `batch statement ${index} failed: ${e?.message ?? e}`,
-        );
-        error.batchIndex = index;
-        error.batchResults = [];
-        throw error;
+        throw batchInputError(index, e?.message ?? String(e));
       }
       return {
         stmt: {
@@ -495,10 +530,22 @@ export class Session {
       };
     });
 
+    if (mode !== undefined) {
+      for (let index = 0; index < statements.length; index++) {
+        const statement = statements[index];
+        const sql = typeof statement === 'string' ? statement : statement.sql;
+        const keyword = firstSqlKeyword(sql);
+        if (keyword !== undefined && TRANSACTION_CONTROL_KEYWORDS.has(keyword)) {
+          throw batchInputError(index, `${keyword} is not allowed in an atomic batch`);
+        }
+      }
+    }
+
     let steps: BatchStep[];
     let firstUserStepIdx = 0;
     let beginIdx = -1;
     let commitIdx = -1;
+    let rollbackIdx = -1;
     if (mode === undefined) {
       // Each statement is gated on its predecessor succeeding, so
       // execution stops at the first failure (matching the Rust and
@@ -517,6 +564,7 @@ export class Session {
       firstUserStepIdx = 1;
       const lastUserStepIdx = userSteps.length; // 1..userSteps.length inclusive
       commitIdx = lastUserStepIdx + 1;
+      rollbackIdx = commitIdx + 1;
       steps = [
         { stmt: { sql: `BEGIN ${normalizeBatchMode(mode)}`, args: [], named_args: [], want_rows: false } },
         ...userSteps.map((step, i) => ({
@@ -593,16 +641,20 @@ export class Session {
     });
 
     // Surface the failing step: BEGIN first, then the user statements
-    // (with their index), then COMMIT. Errors on the synthetic ROLLBACK
-    // step are suppressed — by the time it runs the transaction has
-    // already been undone and surfacing a ROLLBACK error would mask the
-    // real cause.
+    // (with their index), then COMMIT.
+    const rollbackError = rollbackIdx >= 0 ? stepErrors[rollbackIdx] : null;
     const throwStepError = (error: { message?: string; code?: string } | null, batchIndex?: number): never => {
       const e = new DatabaseError(error?.message || 'Batch execution failed', error?.code);
       if (batchIndex !== undefined) {
         e.batchIndex = batchIndex;
       }
       e.batchResults = results;
+      if (rollbackError) {
+        e.rollbackError = new DatabaseError(
+          rollbackError.message || 'Batch rollback failed',
+          rollbackError.code,
+        );
+      }
       throw e;
     };
     if (beginIdx >= 0 && stepErrors[beginIdx]) {
@@ -616,6 +668,14 @@ export class Session {
     }
     if (commitIdx >= 0 && stepErrors[commitIdx]) {
       throwStepError(stepErrors[commitIdx]);
+    }
+    if (rollbackError) {
+      const error = new DatabaseError(
+        rollbackError.message || 'Batch rollback failed',
+        rollbackError.code,
+      );
+      error.batchResults = results;
+      throw error;
     }
 
     if (results.some(result => result === null)) {
