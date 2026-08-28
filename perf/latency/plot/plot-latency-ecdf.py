@@ -66,16 +66,21 @@ def main():
                              "(default latency-ecdf.png)")
     parser.add_argument("--name", action="append", default=[], metavar="ENGINE=NAME",
                         help="legend name for an engine, e.g. turso=Limbo")
+    parser.add_argument("--panel-by", default="connections",
+                        choices=["connections", "think_ms"],
+                        help="CSV column that separates the panels: connection "
+                             "count (default), or per-transaction think time "
+                             "for interactive-transaction sweeps")
     args = parser.parse_args()
     names = dict(name.split("=", 1) for name in args.name)
 
     series = {}
     for path in args.csv_files:
-        series.update(read_series(path, args.column))
+        merge_series(series, read_series(path, args.column, args.panel_by))
     if not series:
         raise SystemExit("no samples found")
 
-    figure = Figure(series, COLUMN_LABELS[args.column], names)
+    figure = Figure(series, COLUMN_LABELS[args.column], names, args.panel_by)
     for output in args.output or [Path("latency-ecdf.png")]:
         if output.suffix in (".tikz", ".tex"):
             output.write_text(figure.tikz())
@@ -84,22 +89,38 @@ def main():
         print(f"wrote {output}")
 
 
-def read_series(path, column):
-    """Group one CSV file's samples by engine, mode and connection count."""
+def read_series(path, column, panel_by="connections"):
+    """Group one CSV file's samples by engine, mode and the panel column."""
     series = {}
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", newline="") as f:
         for row in csv.DictReader(f):
-            key = (row["engine"], row["mode"], int(row["connections"]))
+            key = (row["engine"], row["mode"], panel_value(row, panel_by))
             series.setdefault(key, []).append(float(row[column]) / 1e6)
     return {k: np.array(v) for k, v in series.items()}
+
+
+def panel_value(row, panel_by):
+    if panel_by == "think_ms":
+        return float(row["think_ms"])
+    return int(row["connections"])
+
+
+def merge_series(into, more):
+    """Concatenate same-key sample arrays from several files."""
+    for key, samples in more.items():
+        if key in into:
+            into[key] = np.concatenate([into[key], samples])
+        else:
+            into[key] = samples
 
 
 class Figure:
     """The panels and curves of the figure, worked out once for both backends."""
 
-    def __init__(self, series, column_label, names):
+    def __init__(self, series, column_label, names, panel_by="connections"):
         self.column_label = column_label
+        self.panel_by = panel_by
         modes_per_engine = {}
         for engine, mode, _ in series:
             modes_per_engine.setdefault(engine, set()).add(mode)
@@ -164,7 +185,7 @@ class Figure:
                 ax.annotate(curve.tail_label, xy=(curve.tail, y), xytext=(-3, 0),
                             textcoords="offset points", rotation=90, ha="right", va=va,
                             color=curve.color, fontsize=6.5, zorder=5)
-            ax.set_title(panel_title(connections), loc="left",
+            ax.set_title(panel_title(connections, self.panel_by), loc="left",
                          fontsize=plt.rcParams["font.size"])
         for ax in axes.flat[len(self.panels):]:
             ax.set_visible(False)
@@ -241,7 +262,7 @@ class Figure:
 ]""")
         legend = self.legend_entries()
         for panel_index, (connections, curves) in enumerate(self.panels):
-            out.append(rf"\nextgroupplot[title={{{panel_title(connections)}}}]")
+            out.append(rf"\nextgroupplot[title={{{panel_title(connections, self.panel_by)}}}]")
             if panel_index == len(self.panels) - 1:
                 for label, curve in legend:
                     out.append(rf"\addlegendimage{{{curve.tikz_color}, line width=0.9pt, "
@@ -305,8 +326,11 @@ class Curve:
         return x[idx], (idx + 1) / n * 100.0
 
 
-def panel_title(connections):
-    return "1 connection" if connections == 1 else f"{connections} connections"
+def panel_title(value, panel_by="connections"):
+    if panel_by == "think_ms":
+        held = f"{value:g}"
+        return f"{held} ms held open" if value else "no think time"
+    return "1 connection" if value == 1 else f"{value} connections"
 
 
 def fmt_ms(value, _pos=None):

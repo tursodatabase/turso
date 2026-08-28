@@ -27,6 +27,7 @@ pub fn run(config: &Config) -> Run {
         let pacer = Arc::clone(&pacer);
         let db_path = config.db_path.clone();
         let batch_size = config.batch_size;
+        let think = config.think;
         let timeout = config.timeout;
         let own_checkpoints = config.checkpointer.is_none();
 
@@ -59,9 +60,18 @@ pub fn run(config: &Config) -> Run {
                 begin_stmt.execute([]).unwrap();
                 let t1 = Instant::now();
 
+                let pause = think
+                    .checked_div(batch_size.max(1) as u32)
+                    .unwrap_or_default();
                 for _ in 0..batch_size {
                     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                     stmt.execute((id, format!("data_{id}"))).unwrap();
+                    if !pause.is_zero() {
+                        // The application computes before its next statement;
+                        // the transaction (and the write lock) stays open. A
+                        // plain sleep, matching the Turso writer's pause.
+                        thread::sleep(pause);
+                    }
                 }
                 let t2 = Instant::now();
 

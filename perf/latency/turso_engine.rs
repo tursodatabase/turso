@@ -44,6 +44,7 @@ pub fn run(config: &Config) -> Run {
         let pacer = Arc::clone(&pacer);
         let restarts = Arc::clone(&restarts);
         let batch_size = config.batch_size;
+        let think = config.think;
         let timeout = config.timeout;
         let mode = config.mode;
 
@@ -53,7 +54,7 @@ pub fn run(config: &Config) -> Run {
                 .build()
                 .unwrap();
             rt.block_on(writer(
-                db, ready, pacer, restarts, batch_size, timeout, mode,
+                db, ready, pacer, restarts, batch_size, think, timeout, mode,
             ))
         }));
     }
@@ -107,12 +108,14 @@ async fn checkpointer(db: Database, interval: Duration, stop: Arc<AtomicBool>) -
     durations
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn writer(
     db: Database,
     ready: Arc<Barrier>,
     pacer: Arc<Pacer>,
     restarts: Arc<AtomicU64>,
     batch_size: usize,
+    think: Duration,
     timeout: Duration,
     mode: TxnMode,
 ) -> Vec<Sample> {
@@ -149,6 +152,9 @@ async fn writer(
             begin_stmt.execute(()).await.unwrap();
             let t1 = Instant::now();
 
+            let pause = think
+                .checked_div(batch_size.max(1) as u32)
+                .unwrap_or_default();
             for _ in 0..batch_size {
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 let params = turso::params::Params::Positional(vec![
@@ -163,6 +169,16 @@ async fn writer(
                         continue 'txn;
                     }
                     Err(e) => panic!("INSERT failed: {e}"),
+                }
+                if !pause.is_zero() {
+                    // The application computes before its next statement; the
+                    // transaction stays open across the pause. A thread sleep,
+                    // exactly like the SQLite writer's pause: tokio's timer
+                    // only ticks once a millisecond, which would stretch
+                    // sub-millisecond pauses and hand the engines different
+                    // think times. Blocking is fine here — nothing is in
+                    // flight on this connection while its client thinks.
+                    thread::sleep(pause);
                 }
             }
             let t2 = Instant::now();

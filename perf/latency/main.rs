@@ -91,6 +91,13 @@ struct Args {
     batch_size: usize,
 
     #[arg(
+        long = "think-ms",
+        default_value = "0",
+        help = "Total client think time inside each transaction, in milliseconds,                 spread evenly after every inserted row. Models an interactive                 transaction that stays open while the application computes; a                 blocking engine holds its write lock through all of it"
+    )]
+    think_ms: f64,
+
+    #[arg(
         short = 'd',
         long = "duration",
         default_value = "20",
@@ -183,6 +190,8 @@ pub struct Config {
     pub db_path: String,
     pub connections: usize,
     pub batch_size: usize,
+    /// Client think time inside each transaction, spread across the batch.
+    pub think: Duration,
     pub warmup: Duration,
     pub duration: Duration,
     pub timeout: Duration,
@@ -344,6 +353,7 @@ fn main() {
         db_path,
         connections: args.connections,
         batch_size: args.batch_size,
+        think: Duration::from_secs_f64(args.think_ms / 1e3),
         warmup: Duration::from_secs(args.warmup),
         duration: Duration::from_secs(args.duration),
         timeout: Duration::from_millis(args.timeout),
@@ -372,12 +382,15 @@ fn main() {
         Engine::Turso => turso_engine::run(&config),
     };
 
-    println!("engine,mode,connections,thread_id,queue_ns,begin_ns,work_ns,commit_ns,total_ns");
+    println!(
+        "engine,mode,connections,thread_id,queue_ns,begin_ns,work_ns,commit_ns,total_ns,think_ms"
+    );
+    let think_ms = config.think.as_secs_f64() * 1e3;
     let mut totals = Vec::new();
     for (thread_id, samples) in run.per_thread.iter().enumerate() {
         for s in samples {
             println!(
-                "{engine_label},{},{},{thread_id},{},{},{},{},{}",
+                "{engine_label},{},{},{thread_id},{},{},{},{},{},{think_ms}",
                 config.mode.label(),
                 config.connections,
                 s.queue_ns,
