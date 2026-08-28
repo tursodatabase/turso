@@ -40,6 +40,7 @@ members = [
     "sql_generation",
     "testing/concurrent-simulator",
     "perf/throughput",
+    "perf/latency",
     "perf/encryption",
     "perf/memory",
     "perf/memory/codspeed",
@@ -52,7 +53,6 @@ members = [
     "testing/differential-oracle/fuzzer",
     "testing/sqltest"
 ]
-exclude = ["perf/latency/limbo"]
 
 default-members = [
     "bindings/java",

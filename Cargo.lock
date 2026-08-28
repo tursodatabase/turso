@@ -7777,6 +7777,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "txn-latency"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "rusqlite",
+ "tokio",
+ "turso",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
