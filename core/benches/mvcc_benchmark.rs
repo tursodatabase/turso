@@ -428,18 +428,109 @@ fn bench_huge_multi_write_rowid(c: &mut Criterion) {
     run_huge_multi_write(c, "mvcc-huge-multi-write-rowid", GhostPlacement::RowidProbe);
 }
 
+// ---------------------------------------------------------------------------
+// Write-transaction benchmark distilled from `perf/latency`: one connection
+// running `BEGIN CONCURRENT; insert a batch; COMMIT` per iteration on
+// in-memory IO, so the CPU cost of the whole MVCC write path (vdbe insert,
+// version store, commit state machine, logical-log serialization) is tracked
+// without fsync noise. The wall-clock latency distribution of the same
+// workload under real IO lives in `perf/latency`.
+// ---------------------------------------------------------------------------
+
+/// Rows per measured transaction, matching `perf/latency`'s default batch.
+const WRITE_TXN_BATCH: usize = 10;
+/// Rebuild the database every this many measured transactions so the version
+/// store's size stays bounded over a long Criterion run.
+const WRITE_TXN_RESET_EVERY: u64 = 2_000;
+
+struct WriteTxnHarness {
+    db: Arc<Database>,
+    conn: Arc<Connection>,
+}
+
+impl WriteTxnHarness {
+    fn new() -> Self {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        // Keep everything in MvStore: checkpoint cost is not what this
+        // benchmark guards, and letting it trigger mid-run would make
+        // iterations bimodal.
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+            .unwrap();
+        Self { db, conn }
+    }
+}
+
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_write_txn(c: &mut Criterion) {
+    let idx1 = NonZeroUsize::new(1).unwrap();
+    let idx2 = NonZeroUsize::new(2).unwrap();
+    let mut group = c.benchmark_group("mvcc-write-txn");
+    group.throughput(Throughput::Elements(WRITE_TXN_BATCH as u64));
+    group.bench_function(
+        format!("begin_concurrent-insert{WRITE_TXN_BATCH}-commit"),
+        |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                let mut harness: Option<WriteTxnHarness> = None;
+                let mut stmts: Option<(Statement, Statement, Statement)> = None;
+                let mut next_id: i64 = 1;
+                for i in 0..iters {
+                    if i % WRITE_TXN_RESET_EVERY == 0 {
+                        // Rebuild from scratch (setup time is excluded from `total`).
+                        let h = WriteTxnHarness::new();
+                        stmts = Some((
+                            h.conn.prepare("BEGIN CONCURRENT").unwrap(),
+                            h.conn
+                                .prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")
+                                .unwrap(),
+                            h.conn.prepare("COMMIT").unwrap(),
+                        ));
+                        harness = Some(h);
+                        next_id = 1;
+                    }
+                    let db = &harness.as_ref().unwrap().db;
+                    let (begin, insert, commit) = stmts.as_mut().unwrap();
+                    let start = Instant::now();
+                    run_to_completion(db, begin);
+                    begin.reset().unwrap();
+                    for _ in 0..WRITE_TXN_BATCH {
+                        insert.bind_at(idx1, Value::from_i64(next_id)).unwrap();
+                        insert
+                            .bind_at(idx2, Value::build_text(format!("data_{next_id}")))
+                            .unwrap();
+                        run_to_completion(db, insert);
+                        insert.reset().unwrap();
+                        next_id += 1;
+                    }
+                    run_to_completion(db, commit);
+                    commit.reset().unwrap();
+                    total += start.elapsed();
+                }
+                total
+            })
+        },
+    );
+    group.finish();
+}
+
 #[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid
+    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid, bench_write_txn
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid
+    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid, bench_write_txn
 }
 
 criterion_main!(benches);
