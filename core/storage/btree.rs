@@ -758,6 +758,12 @@ pub trait CursorTrait: Any + Send + Sync {
     /// share a btree (e.g. OpenDup cursors) when the btree structure is
     /// modified by another cursor (e.g. clear_btree via ResetSorter).
     fn invalidate_btree_cache(&mut self) {}
+    /// Put the cursor back in the state it was built in, keeping its
+    /// allocations and its pager registration: pinned pages are released
+    /// and every cached position and in-flight state machine is cleared.
+    /// A statement keeps its cursors across executions and reuses them
+    /// this way instead of building new ones.
+    fn clear_for_reuse(&mut self);
     /// Opt into the pager's cursor_registry. Default no-op so non-BTreeCursor
     /// impls (MvccLazyCursor) stay out. Opt-in impls must unregister in Drop.
     fn register_with_pager(&self) {}
@@ -7225,6 +7231,45 @@ impl CursorTrait for BTreeCursor {
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
+    }
+
+    fn clear_for_reuse(&mut self) {
+        // Same field values as `new`, minus the pager, root page and index
+        // info, which stay, and the record and payload buffers, which are
+        // kept to be reused.
+        self.clear_transient_overflow_cells();
+        self.stack.clear();
+        self.usable_space_cached = self.pager.usable_space();
+        self.has_record = false;
+        self.null_flag = false;
+        self.going_upwards = false;
+        self.state = CursorState::None;
+        self.balance_state = BalanceState::default();
+        self.overflow_state = OverflowState::Start;
+        self.invalidate_record();
+        self.count = 0;
+        self.context = None;
+        self.valid_state = if self.root_page == 1 && !self.pager.db_initialized() {
+            CursorValidState::Invalid
+        } else {
+            CursorValidState::Valid
+        };
+        self.seek_state = CursorSeekState::Start;
+        self.read_overflow_state = None;
+        self.is_empty_table_state = EmptyTableState::Start;
+        self.move_to_right_state = (MoveToRightState::Start, None);
+        self.seek_to_last_state = SeekToLastState::Start;
+        self.rewind_state = RewindState::Start;
+        self.advance_state = AdvanceState::Start;
+        self.count_state = CountState::Start;
+        self.seek_end_state = SeekEndState::Start;
+        self.move_to_state = MoveToState::Start;
+        self.skip_advance = false;
+        self.blob_cache.reset();
+        self.blob_pinned_rowid = None;
+        self.blob_expired = false;
+        self.iteration_pending_descent = None;
+        self.pending_peer_save = None;
     }
 
     #[inline]

@@ -1039,7 +1039,16 @@ impl ProgramState {
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
-    pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+    /// B-tree cursors on `reusable_pager` survive the reset, cleared, so
+    /// the next execution's OpenRead/OpenWrite can reuse them instead of
+    /// building new ones. Every other cursor is dropped; that includes
+    /// ephemeral tables and indexes, which live on a pager of their own.
+    pub fn reset(
+        &mut self,
+        max_registers: Option<usize>,
+        max_cursors: Option<usize>,
+        reusable_pager: Option<&Arc<Pager>>,
+    ) {
         self.io_completions = None;
         self.pc = 0;
 
@@ -1057,16 +1066,25 @@ impl ProgramState {
             registers.resize_with(max_registers, || Register::Value(Value::Null));
             self.registers = registers.into_boxed_slice();
         }
-        // reset cursors as they can have cached information which will be no longer relevant on next program execution
+        // Cursors carry cached positions that mean nothing to the next
+        // execution: drop them, except the B-tree cursors that are kept and
+        // cleared for reuse.
         for (cursor, context) in self
             .cursors
             .iter_mut()
             .zip(self.index_method_contexts.iter_mut())
         {
-            if let (Some(Cursor::IndexMethod(cursor)), Some(context)) =
-                (cursor.as_mut(), context.as_ref())
-            {
-                cursor.close(context);
+            match (cursor.as_mut(), context.as_ref()) {
+                (Some(Cursor::IndexMethod(cursor)), Some(context)) => cursor.close(context),
+                (Some(Cursor::BTree(cursor)), _)
+                    if reusable_pager
+                        .is_some_and(|pager| Arc::ptr_eq(pager, &cursor.get_pager())) =>
+                {
+                    cursor.clear_for_reuse();
+                    *context = None;
+                    continue;
+                }
+                _ => {}
             }
             let _ = cursor.take();
             *context = None;

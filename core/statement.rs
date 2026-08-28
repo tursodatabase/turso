@@ -1455,7 +1455,7 @@ impl Statement {
     /// fields so the subprogram can run again from the beginning.
     pub fn reset_for_subprogram_reuse(&mut self) {
         self.cleanup_orphaned_seq_inner_tx();
-        self.state.reset(None, None);
+        self.state.reset(None, None, Some(&self.pager));
         self.state
             .n_change
             .store(0, std::sync::atomic::Ordering::Release);
@@ -1623,7 +1623,8 @@ impl Statement {
             self.release_active_root_if_counted();
         }
         self.cleanup_orphaned_seq_inner_tx();
-        self.state.reset(max_registers, max_cursors);
+        self.state
+            .reset(max_registers, max_cursors, Some(&self.pager));
         self.busy = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;
@@ -1722,6 +1723,97 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect()
+    }
+
+    /// The heap addresses of the B-tree cursors the statement holds.
+    fn btree_cursor_addresses(stmt: &Statement) -> Vec<usize> {
+        stmt.state
+            .cursors
+            .iter()
+            .filter_map(|slot| match slot {
+                Some(crate::types::Cursor::BTree(cursor)) => Some(
+                    &**cursor as *const dyn crate::storage::btree::CursorTrait as *const ()
+                        as usize,
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn run_insert(stmt: &mut Statement, id: i64) {
+        stmt.bind_at(1.try_into().unwrap(), Value::from_i64(id))
+            .unwrap();
+        stmt.run_ignore_rows().unwrap();
+        stmt.reset().unwrap();
+    }
+
+    fn ids_in_t(conn: &Arc<crate::Connection>) -> Vec<Value> {
+        conn.prepare("SELECT id FROM t ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect()
+    }
+
+    #[test]
+    fn rerunning_a_statement_reuses_its_table_cursor() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (?, 'x')").unwrap();
+
+        run_insert(&mut stmt, 1);
+        let cursors = btree_cursor_addresses(&stmt);
+        assert_eq!(cursors.len(), 1, "the table cursor should survive reset");
+
+        run_insert(&mut stmt, 2);
+        assert_eq!(
+            btree_cursor_addresses(&stmt),
+            cursors,
+            "the second execution should run on the same cursor"
+        );
+        assert_eq!(
+            ids_in_t(&conn),
+            vec![Value::from_i64(1), Value::from_i64(2)]
+        );
+    }
+
+    #[test]
+    fn rerunning_a_statement_in_mvcc_reuses_its_cursor_across_transactions() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (?, 'x')").unwrap();
+
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        run_insert(&mut stmt, 1);
+        let cursors = btree_cursor_addresses(&stmt);
+        assert_eq!(cursors.len(), 1, "the table cursor should survive reset");
+        run_insert(&mut stmt, 2);
+        assert_eq!(
+            btree_cursor_addresses(&stmt),
+            cursors,
+            "a second execution in the same transaction should reuse the cursor"
+        );
+        conn.execute("COMMIT").unwrap();
+
+        // A new transaction rebinds the kept cursor instead of building one.
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        run_insert(&mut stmt, 3);
+        assert_eq!(
+            btree_cursor_addresses(&stmt),
+            cursors,
+            "an execution in a later transaction should reuse the cursor"
+        );
+        conn.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            ids_in_t(&conn),
+            vec![Value::from_i64(1), Value::from_i64(2), Value::from_i64(3)]
+        );
     }
 
     #[test]

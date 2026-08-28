@@ -508,6 +508,10 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     index_iterator: Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
+    /// The root page (or negative table id) the cursor was opened with,
+    /// as compiled into the program. OpenRead/OpenWrite compare it when
+    /// deciding whether to reuse the cursor.
+    opened_root_page: i64,
     tx_id: u64,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
@@ -559,23 +563,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             (&*btree_cursor as &dyn Any).is::<BTreeCursor>(),
             "BTreeCursor expected for mvcc cursor"
         );
-        // Resolve the root page against this reader's snapshot: a PASSIVE checkpoint may have
-        // dropped (and possibly reused) the page during collection while we still reference it at an
-        // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
-        // root_page -> table_id reverse lookup snapshot-consistent. See `retired_rootpages`.
-        let snapshot_ts = db.read_snapshot_ts(tx_id);
-        let table_id = if connection.experimental_mvcc_passive_checkpoint_enabled() {
-            // Under PASSIVE checkpointing a transaction can capture a schema cookie older than
-            // the drop committed within its own snapshot (the drop publishes its cookie after
-            // the transaction reads the header, even though the drop's commit ts precedes the
-            // transaction's begin ts). The compiled cursor then points at a positive root page
-            // its snapshot already sees dropped. That is a stale-schema read, not an invariant
-            // violation: reprepare against the current schema instead of panicking.
-            db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
-                .ok_or(LimboError::SchemaUpdated)?
-        } else {
-            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
-        };
+        let table_id = Self::resolve_table_id(&db, connection, root_page_or_table_id, tx_id)?;
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
@@ -588,6 +576,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             mv_cursor_type,
             current_pos: CursorPosition::BeforeFirst,
             table_id,
+            opened_root_page: root_page_or_table_id,
             reusable_immutable_record: None,
             btree_cursor,
             null_flag: false,
@@ -599,6 +588,63 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             index_finger: IndexShadowFinger::default(),
             index_finger_epoch: 0,
         })
+    }
+
+    /// Resolves the root page the cursor was compiled with to a table id
+    /// as seen by `tx_id`'s snapshot: a PASSIVE checkpoint may have dropped
+    /// (and possibly reused) the page during collection while we still
+    /// reference it at an older snapshot. The WAL read mark keeps the pages
+    /// readable; this keeps the in-memory root_page -> table_id reverse
+    /// lookup snapshot-consistent. See `retired_rootpages`.
+    fn resolve_table_id(
+        db: &Arc<MvStore<Clock, A>>,
+        connection: &Arc<Connection>,
+        root_page_or_table_id: i64,
+        tx_id: u64,
+    ) -> Result<MVTableId> {
+        let snapshot_ts = db.read_snapshot_ts(tx_id);
+        if connection.experimental_mvcc_passive_checkpoint_enabled() {
+            // Under PASSIVE checkpointing a transaction can capture a schema cookie older than
+            // the drop committed within its own snapshot (the drop publishes its cookie after
+            // the transaction reads the header, even though the drop's commit ts precedes the
+            // transaction's begin ts). The compiled cursor then points at a positive root page
+            // its snapshot already sees dropped. That is a stale-schema read, not an invariant
+            // violation: reprepare against the current schema instead of panicking.
+            db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+                .ok_or(LimboError::SchemaUpdated)
+        } else {
+            Ok(db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts))
+        }
+    }
+
+    /// Whether an OpenRead/OpenWrite of `root_page` on `pager` in `db` can
+    /// reuse this cursor instead of building a new one. `btree_root` is
+    /// the page the B-tree cursor would be built on: it moves when the
+    /// table gets checkpointed between two executions.
+    pub fn is_reusable_for(
+        &self,
+        db: &Arc<MvStore<Clock, A>>,
+        pager: &Arc<Pager>,
+        root_page: i64,
+        btree_root: i64,
+    ) -> bool {
+        Arc::ptr_eq(&self.db, db)
+            && self.opened_root_page == root_page
+            && self.btree_cursor.root_page() == btree_root
+            && Arc::ptr_eq(&self.btree_cursor.get_pager(), pager)
+    }
+
+    /// Binds a cleared cursor to the transaction that is about to use it.
+    /// The table id is resolved again when the transaction changed, the
+    /// same way `new` does it, because a drop committed in between may
+    /// have retired the root page for the new snapshot.
+    pub fn reopen(&mut self, connection: &Arc<Connection>, tx_id: u64) -> Result<()> {
+        if tx_id != self.tx_id {
+            self.table_id =
+                Self::resolve_table_id(&self.db, connection, self.opened_root_page, tx_id)?;
+            self.tx_id = tx_id;
+        }
+        Ok(())
     }
 
     /// Forward-direction shadow check: finger fast-path for index cursors, the
@@ -2221,6 +2267,24 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
+    }
+
+    fn clear_for_reuse(&mut self) {
+        // An error in NewRowid can leave the allocator lock held; this
+        // releases it when it does, and is a no-op otherwise.
+        self.end_new_rowid();
+        self.btree_cursor.clear_for_reuse();
+        self.current_pos = CursorPosition::BeforeFirst;
+        self.table_iterator = None;
+        self.index_iterator = None;
+        self.invalidate_record();
+        self.null_flag = false;
+        self.state = None;
+        self.count_state = None;
+        self.btree_advance_state = None;
+        self.dual_peek = DualCursorPeek::default();
+        self.index_finger = IndexShadowFinger::default();
+        self.index_finger_epoch = 0;
     }
 
     fn has_rowid(&self) -> bool {

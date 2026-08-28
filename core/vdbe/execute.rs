@@ -1255,11 +1255,23 @@ pub fn op_open_read(
         .cursor_ref
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
-    if program.connection.get_mv_tx_id_for_db(*db).is_none() {
+    let mv_tx_id = program.connection.get_mv_tx_id_for_db(*db);
+    if mv_tx_id.is_none() {
         assert!(
             *root_page >= 0,
             "root page should be non negative when we are not in a MVCC transaction"
         );
+    }
+    if reuse_btree_cursor(
+        &mut state.cursors[*cursor_id],
+        &program.connection,
+        &pager,
+        mv_store.as_ref(),
+        mv_tx_id,
+        *root_page,
+    )? {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
@@ -13055,14 +13067,14 @@ pub fn op_open_write(
         _ => None,
     };
 
-    // Check if we can reuse the existing cursor
-    let can_reuse_cursor = if let Some(Some(Cursor::BTree(btree_cursor))) = cursors.get(*cursor_id)
-    {
-        // Reuse if the root_page matches (same table/index)
-        btree_cursor.root_page() == root_page
-    } else {
-        false
-    };
+    let can_reuse_cursor = reuse_btree_cursor(
+        &mut cursors[*cursor_id],
+        &program.connection,
+        &pager,
+        mv_store.as_ref(),
+        program.connection.get_mv_tx_id_for_db(*db),
+        root_page,
+    )?;
 
     if !can_reuse_cursor {
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
@@ -18908,6 +18920,48 @@ fn get_schema_cookie(
     } else {
         pager.get_schema_cookie()
     }
+}
+
+/// Reuses the cursor a previous execution, or an earlier OpenRead/OpenWrite
+/// in this one, left in `slot`: it must be on the same B-tree of the same
+/// pager and, under MVCC, of the same store. The cursor comes back cleared
+/// and bound to the current transaction. Returns false when a new cursor
+/// has to be built.
+fn reuse_btree_cursor(
+    slot: &mut Option<Cursor>,
+    connection: &Arc<Connection>,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+    mv_tx_id: Option<u64>,
+    root_page: i64,
+) -> Result<bool> {
+    let Some(Cursor::BTree(cursor)) = slot else {
+        return Ok(false);
+    };
+    let btree_root = maybe_transform_root_page_to_positive(mv_store, root_page);
+    let cursor = cursor.as_mut() as &mut dyn Any;
+    if let Some(mv_cursor) = cursor.downcast_mut::<MvCursor>() {
+        let (Some(tx_id), Some(mv_store)) = (mv_tx_id, mv_store) else {
+            return Ok(false);
+        };
+        if !mv_cursor.is_reusable_for(mv_store, pager, root_page, btree_root) {
+            return Ok(false);
+        }
+        mv_cursor.clear_for_reuse();
+        mv_cursor.reopen(connection, tx_id)?;
+        return Ok(true);
+    }
+    if let Some(btree_cursor) = cursor.downcast_mut::<BTreeCursor>() {
+        if mv_tx_id.is_some()
+            || btree_cursor.root_page() != btree_root
+            || !Arc::ptr_eq(&btree_cursor.pager, pager)
+        {
+            return Ok(false);
+        }
+        btree_cursor.clear_for_reuse();
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// A root page in MVCC might still be marked as negative in schema. On restart it is automatically transformed to positive but in other cases
