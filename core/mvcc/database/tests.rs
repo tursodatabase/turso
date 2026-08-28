@@ -6156,6 +6156,89 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
     (db, tx_id, table_id, btree_root_page)
 }
 
+/// Runs `exists` for `rowid` to completion and tells whether the row was
+/// found and whether the B-tree was searched for it, which shows as the
+/// ExistsBtreeFallback yield the injector fires once.
+fn probe_exists(db: &MvccTestDb, cursor: &mut crate::MvCursor, rowid: i64) -> (bool, bool) {
+    db.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::ExistsBtreeFallback.point(),
+    ])));
+    let mut searched_btree = false;
+    let found = loop {
+        match cursor.exists(&Value::from_i64(rowid)).unwrap() {
+            IOResult::Done(found) => break found,
+            IOResult::IO(io) if io.is_explicit_yield() => searched_btree = true,
+            IOResult::IO(io) => io.wait(db.conn.db.io.as_ref()).unwrap(),
+        }
+    };
+    db.conn.set_yield_injector(None);
+    (found, searched_btree)
+}
+
+#[test]
+fn exists_skips_the_btree_for_a_rowid_above_the_allocator_max() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (5, 'c')")
+        .unwrap();
+    // Move the rows to the B-tree, where a probe has to seek to find them.
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let allocator = db.mvcc_store.get_rowid_allocator(&table_id);
+    assert_eq!(
+        allocator.max_rowid(),
+        None,
+        "inserts with explicit rowids never seed the allocator"
+    );
+
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        root_page,
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            root_page.abs(),
+            2,
+        )),
+    )
+    .unwrap();
+
+    // The first probe seeds the allocator from the B-tree's largest rowid
+    // and then knows 100 cannot be there.
+    assert_eq!(probe_exists(&db, &mut cursor, 100), (false, false));
+    assert_eq!(allocator.max_rowid(), Some(5));
+    // Rowids at or below the maximum still have to be looked for.
+    assert_eq!(probe_exists(&db, &mut cursor, 3), (false, true));
+    assert!(probe_exists(&db, &mut cursor, 5).0);
+
+    // An insert above the maximum raises it.
+    let record =
+        ImmutableRecord::from_values(&[Value::Text(Text::new("d".to_string()))], 1).unwrap();
+    let row =
+        Row::new_table_row(RowID::new(table_id, RowKey::Int(100)), record.as_blob(), 1).unwrap();
+    db.mvcc_store.insert(tx_id, row).unwrap();
+    assert_eq!(probe_exists(&db, &mut cursor, 100), (true, false));
+    assert_eq!(probe_exists(&db, &mut cursor, 101), (false, false));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
 #[test]
 fn test_mvcc_cursor_next_yields_with_injected_yield() {
     let db = MvccTestDb::new();
