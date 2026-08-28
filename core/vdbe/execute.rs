@@ -1264,6 +1264,7 @@ pub fn op_open_read(
     }
     if reuse_btree_cursor(
         &mut state.cursors[*cursor_id],
+        &mut state.cursor_cleared[*cursor_id],
         &program.connection,
         &pager,
         mv_store.as_ref(),
@@ -13069,6 +13070,7 @@ pub fn op_open_write(
 
     let can_reuse_cursor = reuse_btree_cursor(
         &mut cursors[*cursor_id],
+        &mut state.cursor_cleared[*cursor_id],
         &program.connection,
         &pager,
         mv_store.as_ref(),
@@ -18924,17 +18926,20 @@ fn get_schema_cookie(
 
 /// Reuses the cursor a previous execution, or an earlier OpenRead/OpenWrite
 /// in this one, left in `slot`: it must be on the same B-tree of the same
-/// pager and, under MVCC, of the same store. The cursor comes back cleared
-/// and bound to the current transaction. Returns false when a new cursor
-/// has to be built.
+/// pager and, under MVCC, of the same store. The cursor comes back cleared,
+/// unless `cleared` says reset already did that, and bound to the current
+/// transaction. Returns false when a new cursor has to be built.
 fn reuse_btree_cursor(
     slot: &mut Option<Cursor>,
+    cleared: &mut bool,
     connection: &Arc<Connection>,
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     mv_tx_id: Option<u64>,
     root_page: i64,
 ) -> Result<bool> {
+    // Whatever ends up in the slot now gets used by this execution.
+    let already_cleared = std::mem::replace(cleared, false);
     let Some(Cursor::BTree(cursor)) = slot else {
         return Ok(false);
     };
@@ -18947,7 +18952,9 @@ fn reuse_btree_cursor(
         if !mv_cursor.is_reusable_for(mv_store, pager, root_page, btree_root) {
             return Ok(false);
         }
-        mv_cursor.clear_for_reuse();
+        if !already_cleared {
+            mv_cursor.clear_for_reuse();
+        }
         mv_cursor.reopen(connection, tx_id)?;
         return Ok(true);
     }
@@ -18958,7 +18965,9 @@ fn reuse_btree_cursor(
         {
             return Ok(false);
         }
-        btree_cursor.clear_for_reuse();
+        if !already_cleared {
+            btree_cursor.clear_for_reuse();
+        }
         return Ok(true);
     }
     Ok(false)
