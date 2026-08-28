@@ -32,6 +32,23 @@ const ENTRIES: u32 = 512;
 /// (handled by the io_uring crate in `submit_and_wait`)
 const SQPOLL_IDLE: u32 = 1000;
 
+/// SQPOLL only pays off when a core can be spared for it: the kernel
+/// thread polls the submission queue at 100% of one CPU whenever the ring
+/// is active. On a machine with this many CPUs or more that trade is
+/// worth it; below it the polling thread crowds out the connections it
+/// serves. `TURSO_IOURING_SQPOLL=1`/`0` overrides the automatic choice.
+const SQPOLL_MIN_CPUS: usize = 8;
+
+/// Whether to start the ring with a SQPOLL kernel thread; see
+/// [`SQPOLL_MIN_CPUS`].
+fn sqpoll_wanted() -> bool {
+    match std::env::var("TURSO_IOURING_SQPOLL") {
+        Ok(value) => !matches!(value.as_str(), "0" | "off" | "false"),
+        Err(_) => std::thread::available_parallelism()
+            .is_ok_and(|cpus| cpus.get() >= SQPOLL_MIN_CPUS),
+    }
+}
+
 /// Number of Vec<Box<[iovec]>> we preallocate on initialization
 const IOVEC_POOL_SIZE: usize = 64;
 
@@ -193,12 +210,17 @@ impl IovecPool {
 
 impl UringIO {
     pub fn new() -> Result<Self> {
-        let ring = match io_uring::IoUring::builder()
-            .setup_sqpoll(SQPOLL_IDLE)
-            .build(ENTRIES)
-        {
-            Ok(ring) => ring,
-            Err(_) => io_uring::IoUring::new(ENTRIES).map_err(|e| io_error(e, "io_uring_setup"))?,
+        let sqpoll_ring = if sqpoll_wanted() {
+            io_uring::IoUring::builder()
+                .setup_sqpoll(SQPOLL_IDLE)
+                .build(ENTRIES)
+                .ok()
+        } else {
+            None
+        };
+        let ring = match sqpoll_ring {
+            Some(ring) => ring,
+            None => io_uring::IoUring::new(ENTRIES).map_err(|e| io_error(e, "io_uring_setup"))?,
         };
         // RL_MEMLOCK cap is typically 8MB, the current design is to have one large arena
         // registered at startup and therefore we can simply use the zero index, falling back
