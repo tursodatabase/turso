@@ -58,7 +58,7 @@ pub use super::pager::{PageContent, PageInner};
 use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
+use crate::io::{Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
@@ -2134,7 +2134,13 @@ pub(crate) fn recompute_wal_frame_checksum(
     frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
     final_checksum
 }
-pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> Result<Completion> {
+/// Writes the WAL header. The write is added to `group`, when given,
+/// before it is submitted.
+pub fn begin_write_wal_header<F: File + ?Sized>(
+    io: &F,
+    header: &WalHeader,
+    group: Option<&mut CompletionGroup>,
+) -> Result<Completion> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let buffer = Buffer::new_temporary(WAL_HEADER_SIZE);
@@ -2164,6 +2170,9 @@ pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> R
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
+    if let Some(group) = group {
+        group.add(&c);
+    }
     let c = io.pwrite(0, buffer, c)?;
     Ok(c)
 }
@@ -2424,7 +2433,7 @@ mod tests {
         let (c1, c2) = checksum_wal(header_prefix, &wal_header, (0, 0), use_native);
         wal_header.checksum_1 = c1;
         wal_header.checksum_2 = c2;
-        io.wait_for_completion(begin_write_wal_header(file.as_ref(), &wal_header).unwrap())
+        io.wait_for_completion(begin_write_wal_header(file.as_ref(), &wal_header, None).unwrap())
             .unwrap();
 
         let page = vec![0xAB; page_size];

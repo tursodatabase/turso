@@ -4270,7 +4270,9 @@ impl Wal for WalFile {
 
         self.max_frame.store(0, Ordering::Release);
         let file = self.coordination.wal_file()?;
-        let header_c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
+        let mut group = CompletionGroup::new(|_| {});
+        let _header_c =
+            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header, Some(&mut group))?;
 
         // After a RESTART or try_restart_log_before_write the WAL file may
         // still contain orphaned frames from the previous epoch. Truncate
@@ -4285,21 +4287,15 @@ impl Wal for WalFile {
             }
         };
         if !should_skip_truncate {
-            let trunc_c = file.truncate(
-                WAL_HEADER_SIZE as u64,
-                Completion::new_trunc(|res| {
-                    if let Err(err) = res {
-                        tracing::warn!("WAL truncate of orphaned frames failed: {err}");
-                    }
-                }),
-            )?;
-            let mut group = CompletionGroup::new(|_| {});
-            group.add(&header_c);
-            group.add(&trunc_c);
-            Ok(Some(group.build()))
-        } else {
-            Ok(Some(header_c))
+            let c = Completion::new_trunc(|res| {
+                if let Err(err) = res {
+                    tracing::warn!("WAL truncate of orphaned frames failed: {err}");
+                }
+            });
+            group.add(&c);
+            let _trunc_c = file.truncate(WAL_HEADER_SIZE as u64, c)?;
         }
+        Ok(Some(group.build()))
     }
 
     #[aristo::intent(
@@ -7172,7 +7168,7 @@ pub mod test {
         wal_header.checksum_2 = header_checksum.1;
 
         io.wait_for_completion(
-            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &wal_header).unwrap(),
+            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &wal_header, None).unwrap(),
         )
         .unwrap();
 

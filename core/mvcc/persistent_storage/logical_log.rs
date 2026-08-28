@@ -925,7 +925,7 @@ impl LogicalLog {
             header.clone()
         };
 
-        Ok(Some(self.write_header(upgraded_header)?))
+        Ok(Some(self.write_header(upgraded_header, None)?))
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
@@ -986,7 +986,13 @@ impl LogicalLog {
     }
 
     #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
-    fn write_header(&mut self, mut header: LogHeader) -> Result<Completion> {
+    /// Writes the header. The write is added to `group`, when given,
+    /// before it is submitted.
+    fn write_header(
+        &mut self,
+        mut header: LogHeader,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<Completion> {
         let header_bytes = header.encode();
         header.hdr_crc32c = u32::from_le_bytes([
             header_bytes[LOG_HDR_CRC_START],
@@ -1009,12 +1015,15 @@ impl LogicalLog {
                 );
             }
         });
+        if let Some(group) = group {
+            group.add(&c);
+        }
         self.file.pwrite(0, buffer, c)
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
         let header = self.current_or_new_header()?;
-        self.write_header(header)
+        self.write_header(header, None)
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
@@ -1071,20 +1080,16 @@ impl LogicalLog {
         self.pending_running_crc = None;
         self.header = Some(header.clone());
 
-        let header_c = self.write_header(header)?;
-        let truncate_c = self.file.truncate(
-            LOG_HDR_SIZE as u64,
-            Completion::new_trunc(move |result| {
-                if let Err(err) = result {
-                    tracing::error!("logical_log_truncate failed: {}", err);
-                }
-            }),
-        )?;
-        self.offset = 0;
-
         let mut group = CompletionGroup::new(|_| {});
-        group.add(&header_c);
-        group.add(&truncate_c);
+        let _header_c = self.write_header(header, Some(&mut group))?;
+        let c = Completion::new_trunc(move |result| {
+            if let Err(err) = result {
+                tracing::error!("logical_log_truncate failed: {}", err);
+            }
+        });
+        group.add(&c);
+        let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
+        self.offset = 0;
         Ok(group.build())
     }
 }
