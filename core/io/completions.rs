@@ -527,6 +527,15 @@ impl Completion {
         self.inner.is_none()
     }
 
+    /// True when both handles are clones of the same completion. Yield
+    /// completions carry no state, so two of them never count as the same.
+    pub fn ptr_eq(&self, other: &Completion) -> bool {
+        match (&self.inner, &other.inner) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     /// True for a parked wait (`Completion::new_wait`): no I/O behind it, it
     /// finishes only when another connection fires the event it waits for.
     /// Driving the event loop cannot finish it, so waiting on it with

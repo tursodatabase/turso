@@ -12812,6 +12812,62 @@ fn test_concurrent_commit_yield_spin() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
 
+#[test]
+fn commit_lock_release_wakes_only_the_oldest_parked_committer() {
+    let coordinator = CommitCoordinator::new();
+    assert!(coordinator.lock_or_wait().is_none(), "lock starts free");
+    let first = coordinator.lock_or_wait().expect("must park behind holder");
+    let second = coordinator.lock_or_wait().expect("must park behind holder");
+
+    coordinator.unlock();
+    assert!(first.finished(), "oldest waiter gets the release's wake");
+    assert!(!second.finished(), "younger waiter stays parked");
+
+    // The woken committer retries: it takes the lock and releases it, which
+    // passes the wake on.
+    assert!(coordinator.lock_or_wait().is_none(), "woken retry wins");
+    coordinator.unlock();
+    assert!(second.finished(), "next release wakes the next waiter");
+}
+
+#[test]
+fn dead_woken_committer_hands_its_wake_to_the_next_waiter() {
+    let coordinator = CommitCoordinator::new();
+    assert!(coordinator.lock_or_wait().is_none(), "lock starts free");
+    let first = coordinator.lock_or_wait().expect("must park behind holder");
+    let second = coordinator.lock_or_wait().expect("must park behind holder");
+
+    coordinator.unlock();
+    assert!(first.finished(), "release wakes the oldest waiter");
+    assert!(!second.finished(), "the wake went to the first waiter only");
+
+    // The woken committer dies instead of retrying (its statement was
+    // dropped). Its wake must not be lost.
+    coordinator.disarm_waiter(&first);
+    assert!(second.finished(), "the dead committer's wake is passed on");
+}
+
+#[test]
+fn disarmed_queued_waiter_cannot_swallow_a_release() {
+    let coordinator = CommitCoordinator::new();
+    assert!(coordinator.lock_or_wait().is_none(), "lock starts free");
+    let first = coordinator.lock_or_wait().expect("must park behind holder");
+    let second = coordinator.lock_or_wait().expect("must park behind holder");
+
+    // The first parked committer leaves the queue before being woken (a
+    // dropped statement, or a second lock try that won).
+    coordinator.disarm_waiter(&first);
+    assert!(!first.finished(), "a queued entry is removed, not woken");
+    assert!(!second.finished(), "no release happened yet");
+
+    coordinator.unlock();
+    assert!(!first.finished(), "the removed entry never gets a wake");
+    assert!(
+        second.finished(),
+        "the release's wake reaches a live waiter"
+    );
+}
+
 fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::MvStore>) {
     let lock = &mv_store.commit_coordinator.pager_commit_lock;
     assert!(lock.write(), "should acquire commit lock");

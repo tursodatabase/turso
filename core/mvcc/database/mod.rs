@@ -1564,7 +1564,7 @@ impl CommitCoordinator {
     }
 
     /// Take the commit lock, or hand back a completion that finishes when
-    /// the holder releases it, so the caller can park on it.
+    /// a holder releases it, so the caller can park on it.
     fn lock_or_wait(&self) -> Option<Completion> {
         if self.pager_commit_lock.write() {
             return None;
@@ -1572,22 +1572,61 @@ impl CommitCoordinator {
         let waiter = Completion::new_wait();
         self.commit_lock_waiters.lock().push(waiter.clone());
         // The holder may have released between the failed attempt and the
-        // push. Try once more so that release cannot be missed. The entry
-        // left in the list is finished by the next release, which is
-        // harmless.
+        // push. Try once more so that release cannot be missed.
         if self.pager_commit_lock.write() {
+            // The entry must not stay parked: a release wakes only the
+            // oldest waiter, and a dead entry would swallow that wake.
+            self.disarm_waiter(&waiter);
             return None;
         }
         Some(waiter)
     }
 
-    /// Release the commit lock and wake everyone parked on it. They all
-    /// retry and one of them wins; the rest park again.
+    /// Release the commit lock and wake the longest-parked committer, which
+    /// retries the lock (and parks again if some other acquirer beats it).
+    /// Waking everyone instead had every parked committer wake, retry and
+    /// re-park on each release: with 32 connections committing, almost all
+    /// of those wakes were wasted, and running them sat directly on the
+    /// commit path.
     fn unlock(&self) {
         self.pager_commit_lock.unlock();
-        let waiters = std::mem::take(&mut *self.commit_lock_waiters.lock());
-        for waiter in waiters {
+        self.wake_next_waiter();
+    }
+
+    /// Complete the oldest parked waiter, if any. The completion runs after
+    /// the list mutex drops: it crosses into the committer's scheduler,
+    /// which is not work to do under a lock every committer touches.
+    fn wake_next_waiter(&self) {
+        let waiter = {
+            let mut waiters = self.commit_lock_waiters.lock();
+            if waiters.is_empty() {
+                None
+            } else {
+                Some(waiters.remove(0))
+            }
+        };
+        if let Some(waiter) = waiter {
             waiter.complete(0);
+        }
+    }
+
+    /// Forget a parked waiter whose committer is leaving the queue without
+    /// having been woken up: its second lock attempt won after the entry was
+    /// pushed, or the parked statement is being dropped. If the entry is
+    /// still queued, remove it so it cannot swallow a future release's
+    /// single wake. If it is gone, a release already spent its wake on this
+    /// committer, so pass the wake to the next waiter — otherwise the
+    /// remaining parked committers would wait for a release that already
+    /// happened.
+    fn disarm_waiter(&self, waiter: &Completion) {
+        let removed = {
+            let mut waiters = self.commit_lock_waiters.lock();
+            let before = waiters.len();
+            waiters.retain(|w| !w.ptr_eq(waiter));
+            waiters.len() != before
+        };
+        if !removed {
+            self.wake_next_waiter();
         }
     }
 }
@@ -1688,6 +1727,11 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     log_append_end: Option<u64>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    /// The completion this commit is parked on while it waits for the
+    /// commit lock, so dropping the parked statement can hand its wake to
+    /// the next waiter (`CommitCoordinator::disarm_waiter`). Cleared when
+    /// the commit resumes.
+    commit_lock_waiter: Option<Completion>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -1702,6 +1746,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitStateMachine<C
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> Drop for CommitStateMachine<Clock, A> {
     fn drop(&mut self) {
+        if let Some(waiter) = self.commit_lock_waiter.take() {
+            self.commit_coordinator.disarm_waiter(&waiter);
+        }
         self.cleanup_unfinished_commit();
     }
 }
@@ -1783,6 +1830,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             header,
             log_append_end: None,
             sync_mode,
+            commit_lock_waiter: None,
             _phantom: PhantomData,
         }
     }
@@ -3227,6 +3275,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             // conflicts with the outer `&self.state` match borrow.
             CommitState::BuildLogRecord(_) => self.step_build_log_record(mvcc_store),
             CommitState::BeginCommitLogicalLog { end_ts, .. } => {
+                // Entering (or re-entering after a wake): any wake this
+                // commit was parked on is consumed now.
+                self.commit_lock_waiter = None;
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) {
                     // logical log needs to be serialized.
                     let tx = mvcc_store
@@ -3234,6 +3285,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         .get(&self.tx_id)
                         .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                     if let Some(waiter) = self.commit_coordinator.lock_or_wait() {
+                        self.commit_lock_waiter = Some(waiter.clone());
                         return Ok(TransitionResult::Io(IOCompletions(waiter)));
                     }
                     tx.value()
