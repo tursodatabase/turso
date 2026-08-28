@@ -1105,8 +1105,13 @@ pub enum BtreePageAllocMode {
 
 /// This will keep track of the state of current cache commit in order to not repeat work
 struct CommitInfo {
-    completions: Vec<Completion>,
+    /// Group the reads or writes of the current step are added to. Taken
+    /// and built by `commit_completion` when the step waits on it.
+    group: Option<CompletionGroup>,
+    /// The built `group`, cached so re-entries wait on the same completion.
     completion_group: Option<Completion>,
+    /// The fsync in flight, if `WaitSync` has submitted one.
+    pending_sync: Option<Completion>,
     state: CommitState,
     collected_pages: Vec<PageRef>,
     page_sources: Vec<PageSource>,
@@ -1124,8 +1129,9 @@ enum PageSource {
 
 impl CommitInfo {
     fn reset(&mut self) {
-        self.completions.clear();
+        self.group = None;
         self.completion_group = None;
+        self.pending_sync = None;
         self.state = CommitState::PrepareWal;
         self.collected_pages.clear();
         self.page_sources.clear();
@@ -1137,8 +1143,7 @@ impl CommitInfo {
     fn initialize(&mut self, n: usize) {
         self.page_sources.clear();
         self.page_sources.reserve(n.min(IOV_MAX));
-        self.completions.clear();
-        self.completions.reserve(n / 4);
+        self.group = Some(CompletionGroup::new(|_| {}));
         self.completion_group = None;
         self.collected_pages.reserve(n.min(IOV_MAX));
     }
@@ -1662,8 +1667,9 @@ impl Pager {
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
-                completions: Vec::new(),
+                group: None,
                 completion_group: None,
+                pending_sync: None,
                 state: CommitState::PrepareWal,
                 collected_pages: Vec::new(),
                 prepared_frames: Vec::new(),
@@ -3262,11 +3268,14 @@ impl Pager {
 
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    /// Reads a page without going through the page cache. The read is
+    /// added to `group`, when given, before it is submitted.
     pub fn read_page_no_cache(
         &self,
         page_idx: i64,
         frame_watermark: Option<u64>,
         allow_empty_read: bool,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<(PageRef, Completion)> {
         turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
@@ -3284,20 +3293,26 @@ impl Pager {
                 page.clone(),
                 allow_empty_read,
                 &io_ctx,
+                group,
             )?;
             return Ok((page, c));
         };
 
         if let Some(frame_id) = wal.find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone(), group)?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             return Ok((page, c));
         }
 
         page.set_locked();
-        let c =
-            self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
+        let c = self.begin_read_disk_page(
+            page_idx as usize,
+            page.clone(),
+            allow_empty_read,
+            &io_ctx,
+            group,
+        )?;
         Ok((page, c))
     }
 
@@ -3318,6 +3333,16 @@ impl Pager {
     /// entry is removed exactly when this method returns `Done`.
     #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
+        self.read_page_into(page_idx, None)
+    }
+
+    /// Like `read_page`, but the disk read, if one is needed, is added to
+    /// `group` before it is submitted.
+    pub fn read_page_into(
+        &self,
+        page_idx: i64,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
         #[cfg(test)]
@@ -3361,7 +3386,7 @@ impl Pager {
             }
 
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
-            let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+            let (page, c) = self.read_page_no_cache(page_idx, None, false, group)?;
             self.pending_reads.write().insert(
                 page_idx,
                 PendingRead {
@@ -3392,6 +3417,7 @@ impl Pager {
         page: PageRef,
         allow_empty_read: bool,
         io_ctx: &IOContext,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         sqlite3_ondisk::begin_read_page(
             self.db_file.as_ref(),
@@ -3400,6 +3426,7 @@ impl Pager {
             page_idx,
             allow_empty_read,
             io_ctx,
+            group,
         )
     }
 
@@ -3694,7 +3721,7 @@ impl Pager {
                     // Page evicted, need async read from WAL
                     trace!("cacheflush: page {} evicted, reading from WAL", page_id);
                     let (page, completion) =
-                        self.read_page_no_cache(page_id as i64, None, false)?;
+                        self.read_page_no_cache(page_id as i64, None, false, None)?;
 
                     if !completion.succeeded() {
                         return Ok(CacheFlushStep::Yield(
@@ -3867,10 +3894,8 @@ impl Pager {
                                     self.finish_ephemeral_spill(&pages);
                                     return Ok(IOResult::Done(()));
                                 }
-                                *self.spill_state.write() = SpillState::WritingToDisk {
-                                    pages,
-                                    completions,
-                                };
+                                *self.spill_state.write() =
+                                    SpillState::WritingToDisk { pages, completions };
                                 io_yield_one!(group.build());
                             }
                         }
@@ -4189,60 +4214,42 @@ impl Pager {
                         if cache.peek(&page_key, false).is_some() {
                             commit_info.page_sources.push(PageSource::Cached(page_id));
                         } else {
-                            let (page, completion) =
-                                self.read_page_no_cache(page_id as i64, None, false)?;
-                            // If the read completed synchronously with an error,
-                            // surface it now. Otherwise we would silently drop the
-                            // failure (the completion is "finished" so we'd skip
-                            // pushing it into the wait list) and later trip the
-                            // page-buffer-not-loaded panic in prepare_frames when
-                            // it tries to read content from the evicted page.
-                            if completion.finished() && !completion.succeeded() {
-                                let err = completion.get_error().unwrap_or(
-                                    CompletionError::IOError(std::io::ErrorKind::Other, "read"),
-                                );
-                                return Err(LimboError::CompletionError(err));
-                            }
+                            let group = commit_info
+                                .group
+                                .as_mut()
+                                .expect("initialize() created the group");
+                            let (page, _completion) =
+                                self.read_page_no_cache(page_id as i64, None, false, Some(group))?;
                             commit_info.page_sources.push(PageSource::Evicted(page));
-                            if !completion.finished() {
-                                commit_info.completions.push(completion);
-                            }
                         }
                     }
                     drop(cache);
                     drop(dirty_pages);
-                    if !commit_info.completions.is_empty() {
+                    let issued_reads = !commit_info
+                        .group
+                        .as_ref()
+                        .expect("initialize() created the group")
+                        .is_empty();
+                    if issued_reads {
+                        // WaitBatchedReads also catches a read that failed
+                        // before we got here: the group keeps its error.
                         commit_info.state = CommitState::WaitBatchedReads { db_size };
-                        drop(commit_info);
-                        io_yield_one!(self.commit_completion());
+                        continue;
                     }
                     commit_info.state = CommitState::PrepareFrames { db_size };
                 }
                 CommitState::WaitBatchedReads { db_size } => {
-                    let all_done = self
-                        .commit_info
-                        .read()
-                        .completions
-                        .iter()
-                        .all(|c| c.finished());
-                    if !all_done {
-                        io_yield_one!(self.commit_completion());
+                    let reads = self.commit_completion();
+                    if !reads.finished() {
+                        io_yield_one!(reads);
                     }
-                    // Check for any read errors
                     let mut commit_info = self.commit_info.write();
-                    let failed = commit_info
-                        .completions
-                        .iter()
-                        .find(|c| !c.succeeded())
-                        .cloned();
-                    if let Some(_failed) = failed {
-                        return Err(LimboError::CompletionError(CompletionError::IOError(
-                            std::io::ErrorKind::Other,
-                            "read",
+                    if !reads.succeeded() {
+                        return Err(LimboError::CompletionError(reads.get_error().unwrap_or(
+                            CompletionError::IOError(std::io::ErrorKind::Other, "read"),
                         )));
                     }
                     // All reads complete and successful, proceed to frame preparation
-                    commit_info.completions.clear();
                     commit_info.completion_group = None;
                     commit_info.state = CommitState::PrepareFrames { db_size };
                 }
@@ -4312,32 +4319,19 @@ impl Pager {
                     for prepared in &commit_info.prepared_frames {
                         batch.writev(prepared.offset, &prepared.bufs);
                     }
-                    commit_info.completions = batch.submit()?;
+                    let mut group = CompletionGroup::new(|_| {});
+                    batch.submit(Some(&mut group))?;
+                    commit_info.group = Some(group);
                     commit_info.completion_group = None;
                     commit_info.state = CommitState::WaitWrites;
                 }
                 CommitState::WaitWrites => {
-                    if !self
-                        .commit_info
-                        .read()
-                        .completions
-                        .iter()
-                        .all(|c| c.finished())
-                    {
-                        io_yield_one!(self.commit_completion());
+                    let writes = self.commit_completion();
+                    if !writes.finished() {
+                        io_yield_one!(writes);
                     }
-                    // Check for any write errors
-                    let failed = self
-                        .commit_info
-                        .read()
-                        .completions
-                        .iter()
-                        .find(|c| !c.succeeded())
-                        .cloned();
-
                     let mut commit_info = self.commit_info.write();
-                    if let Some(_failed) = failed {
-                        commit_info.completions.clear();
+                    if !writes.succeeded() {
                         commit_info.completion_group = None;
                         commit_info.prepared_frames.clear();
                         return Err(LimboError::CompletionError(CompletionError::IOError(
@@ -4345,7 +4339,6 @@ impl Pager {
                             "write",
                         )));
                     }
-                    commit_info.completions.clear();
                     commit_info.completion_group = None;
                     // All writes complete; WaitSync submits the WAL fsync if
                     // one is owed.
@@ -4359,23 +4352,17 @@ impl Pager {
                 // to ensure durability in the case of partial writes is to ensure the pwritev
                 // completes before the fsync is submitted.
                 CommitState::WaitSync => {
-                    // A pending completion means a previous entry into this
-                    // state already submitted the fsync; wait on it instead
-                    // of submitting a second one. At most one fsync is ever in
-                    // flight, so completions holds either the pending fsync or
-                    // nothing.
-                    assert!(
-                        self.commit_info.read().completions.len() <= 1,
-                        "WaitSync expects at most one in-flight fsync completion"
-                    );
-                    let pending = self.commit_info.read().completions.first().cloned();
+                    // A pending fsync means a previous entry into this state
+                    // already submitted it; wait on it instead of submitting
+                    // a second one.
+                    let pending = self.commit_info.read().pending_sync.clone();
                     let need_fsync =
                         !self.commit_info.read().prepared_frames.is_empty() || wal.is_dirty();
                     let sync_c = match pending {
                         Some(c) => Some(c),
                         None if sync_mode == SyncMode::Full && need_fsync => {
                             let sync_c = wal.sync(self.get_sync_type())?;
-                            self.commit_info.write().completions.push(sync_c.clone());
+                            self.commit_info.write().pending_sync = Some(sync_c.clone());
                             Some(sync_c)
                         }
                         None => None,
@@ -4388,7 +4375,7 @@ impl Pager {
                         // Check for fsync error as we might need to panic on data_sync_retry=off
                         let mut commit_info = self.commit_info.write();
                         if !sync_c.succeeded() {
-                            commit_info.completions.clear();
+                            commit_info.pending_sync = None;
                             commit_info.prepared_frames.clear();
 
                             if !data_sync_retry {
@@ -4402,7 +4389,7 @@ impl Pager {
                                 "sync",
                             )));
                         }
-                        commit_info.completions.clear();
+                        commit_info.pending_sync = None;
                     }
                     let mut commit_info = self.commit_info.write();
                     if commit_info.prepared_frames.is_empty() {
@@ -4459,18 +4446,21 @@ impl Pager {
         Ok(())
     }
 
+    /// The completion for the reads or writes of the current commit step.
+    /// Builds the step's group on first use and hands out the same
+    /// completion after that.
     fn commit_completion(&self) -> Completion {
         let mut commit_info = self.commit_info.write();
-        if let Some(group) = &commit_info.completion_group {
-            return group.clone();
+        if let Some(c) = &commit_info.completion_group {
+            return c.clone();
         }
-        let mut group = CompletionGroup::new(|_| {});
-        for c in commit_info.completions.iter() {
-            group.add(c);
-        }
-        let result = group.build();
-        commit_info.completion_group = Some(result.clone());
-        result
+        let group = commit_info
+            .group
+            .take()
+            .expect("the commit step issued its IO before waiting on it");
+        let c = group.build();
+        commit_info.completion_group = Some(c.clone());
+        c
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

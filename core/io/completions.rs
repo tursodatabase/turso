@@ -143,6 +143,18 @@ pub struct CompletionGroup {
     inner: Arc<GroupCompletionInner>,
 }
 
+impl fmt::Debug for CompletionGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionGroup")
+            .field("children", &self.completions.len())
+            .field(
+                "outstanding",
+                &self.inner.outstanding.load(Ordering::SeqCst),
+            )
+            .finish()
+    }
+}
+
 impl CompletionGroup {
     pub fn new<F>(callback: F) -> Self
     where
@@ -187,6 +199,14 @@ impl CompletionGroup {
     /// cancelling the group.
     pub fn completions(&self) -> &[Completion] {
         &self.completions
+    }
+
+    pub fn len(&self) -> usize {
+        self.completions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.completions.is_empty()
     }
 
     pub fn cancel(&self) {

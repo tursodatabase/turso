@@ -553,6 +553,8 @@ pub struct OverflowCell {
 /// Send read request for DB page read to the IO
 /// if allow_empty_read is set, than empty read will be raise error for the page, but will not panic
 #[instrument(skip_all, level = Level::DEBUG)]
+/// Reads one page from the database file. The read is added to `group`,
+/// when given, before it is submitted.
 pub fn begin_read_page(
     db_file: &dyn DatabaseStorage,
     buffer_pool: Arc<BufferPool>,
@@ -560,6 +562,7 @@ pub fn begin_read_page(
     page_idx: usize,
     allow_empty_read: bool,
     io_ctx: &IOContext,
+    group: Option<&mut CompletionGroup>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get_page();
@@ -604,6 +607,9 @@ pub fn begin_read_page(
         None
     });
     let c = Completion::new_read(buf, complete);
+    if let Some(group) = group {
+        group.add(&c);
+    }
     db_file.read_page(page_idx, io_ctx, c)
 }
 

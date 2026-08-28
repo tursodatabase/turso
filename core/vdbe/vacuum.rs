@@ -2080,7 +2080,7 @@ fn vacuum_in_place_step(
                 let wal_file = wal.wal_file()?;
                 let mut batch = IOWriteBatch::new(wal_file);
                 batch.writev(prepared.offset, &prepared.bufs);
-                let completions = batch.submit()?;
+                let completions = batch.submit(None)?;
 
                 *phase = VacuumInPlacePhase::WriteWalBatch {
                     total_pages: *total_pages,

@@ -655,12 +655,14 @@ pub trait Wal: Debug + Send + Sync {
     /// caller must guarantee, that frame_watermark must be greater than last checkpointed frame, otherwise method will panic
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>>;
 
-    /// Read a frame from the WAL.
+    /// Read a frame from the WAL. The read is added to `group`, when
+    /// given, before it is submitted.
     fn read_frame(
         &self,
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion>;
 
     /// Read a contiguous run of WAL frames with a single `pread`.
@@ -3560,6 +3562,7 @@ impl Wal for WalFile {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
@@ -3606,7 +3609,7 @@ impl Wal for WalFile {
             complete,
             page_idx,
             &self.io_ctx.read(),
-            None,
+            group,
         )
     }
 
@@ -6686,7 +6689,7 @@ pub mod test {
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let target_page = Arc::new(crate::Page::new(43));
 
-        let completion = wal.read_frame(1, target_page, buffer_pool).unwrap();
+        let completion = wal.read_frame(1, target_page, buffer_pool, None).unwrap();
         let error = wait_for_completion_error(&io, completion);
 
         assert!(matches!(
@@ -6874,7 +6877,9 @@ pub mod test {
             .unwrap();
 
         let target = Arc::new(crate::Page::new(44));
-        let completion = wal.read_frame(1, target.clone(), buffer_pool).unwrap();
+        let completion = wal
+            .read_frame(1, target.clone(), buffer_pool, None)
+            .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(
             &target.get_contents().as_ptr()[..page_size as usize - 8],
@@ -7288,7 +7293,7 @@ pub mod test {
 
         let page = Arc::new(crate::storage::pager::Page::new(7));
         let issued_epoch = wal.coordination.checkpoint_epoch();
-        let completion = wal.read_frame(1, page.clone(), buffer_pool).unwrap();
+        let completion = wal.read_frame(1, page.clone(), buffer_pool, None).unwrap();
 
         wal.increment_checkpoint_epoch();
         deferred_file.complete_pending_reads();
