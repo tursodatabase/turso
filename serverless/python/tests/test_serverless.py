@@ -12,7 +12,7 @@ import os
 import urllib.request
 
 import pytest
-from turso_serverless import IntegrityError, OperationalError, connect
+from turso_serverless import IntegrityError, OperationalError, ProgrammingError, connect
 from turso_serverless.connection import Connection, _classify_error
 from turso_serverless.protocol import ProtocolError, ServerError, decode_value, encode_value
 from turso_serverless.session import Session, _server_error, normalize_url
@@ -284,6 +284,159 @@ class TestExecuteScript:
         )
         cur2 = conn.execute("SELECT SUM(a) FROM t_batch_tx_py")
         assert cur2.fetchone() == (31,)
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Parameterized batches
+# ---------------------------------------------------------------------------
+
+
+class TestBatchValidation:
+    """Input validation happens before any HTTP request, so these tests
+    need no server."""
+
+    def _offline_conn(self):
+        return connect("http://localhost:0")
+
+    def test_empty_batch_returns_no_results(self):
+        conn = self._offline_conn()
+        assert conn.batch([]) == []
+        assert conn.batch([], mode="immediate") == []
+
+    def test_invalid_mode_is_rejected(self):
+        conn = self._offline_conn()
+        with pytest.raises(ProgrammingError, match="batch mode"):
+            conn.batch(["SELECT 1"], mode="bogus")
+
+    def test_invalid_statement_is_rejected_with_index(self):
+        conn = self._offline_conn()
+        with pytest.raises(ProgrammingError, match="batch statement 1"):
+            conn.batch(["SELECT 1", 42])
+
+
+@needs_server
+class TestBatch:
+    def test_batch_executes_parameterized_statements_in_order(self):
+        conn = make_conn()
+        conn.execute("DROP TABLE IF EXISTS t_batch_py")
+        results = conn.batch(
+            [
+                "CREATE TABLE t_batch_py (id INTEGER PRIMARY KEY, name TEXT)",
+                ("INSERT INTO t_batch_py (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch_py (name) VALUES (:name)", {"name": "Bob"}),
+                "SELECT name FROM t_batch_py ORDER BY id",
+            ]
+        )
+        assert len(results) == 4
+        assert results[1].rowcount == 1
+        assert results[1].lastrowid == 1
+        assert results[2].lastrowid == 2
+        select = results[3]
+        assert select.description is not None
+        assert select.description[0][0] == "name"
+        assert select.rows == [("Alice",), ("Bob",)]
+        assert select.rowcount == -1
+        # Server-side execution statistics are reported per statement
+        # (PROTOCOL.md section 8.4).
+        for result in results:
+            assert isinstance(result.rows_read, int)
+            assert isinstance(result.rows_written, int)
+            assert isinstance(result.query_duration_ms, (int, float))
+        assert results[1].rows_written >= 1
+        conn.close()
+
+    def test_batch_error_identifies_the_failing_statement(self):
+        conn = make_conn()
+        conn.execute("DROP TABLE IF EXISTS t_batcherr_py")
+        conn.execute("CREATE TABLE t_batcherr_py (x)")
+        with pytest.raises(OperationalError, match="batch statement 1 failed") as excinfo:
+            conn.batch(
+                [
+                    ("INSERT INTO t_batcherr_py VALUES (?)", (1,)),
+                    ("INSERT INTO no_such_table_py VALUES (?)", (2,)),
+                    ("INSERT INTO t_batcherr_py VALUES (?)", (3,)),
+                ]
+            )
+        assert excinfo.value.batch_index == 1
+        # One entry per statement: the completed first statement's result,
+        # None for the failing and skipped ones.
+        partial = excinfo.value.batch_results
+        assert len(partial) == 3
+        assert partial[0].rowcount == 1
+        assert partial[1] is None
+        assert partial[2] is None
+        # The batch is not transactional: the statement before the failing
+        # one keeps its effect, and the one after it never ran.
+        cur = conn.execute("SELECT COUNT(*) FROM t_batcherr_py")
+        assert cur.fetchone() == (1,)
+        conn.close()
+
+    def test_batch_joins_an_open_transaction(self):
+        conn = make_conn()
+        conn.execute("DROP TABLE IF EXISTS t_batchtx_py")
+        conn.execute("CREATE TABLE t_batchtx_py (x)")
+        conn.execute("BEGIN")
+        conn.batch(
+            [
+                ("INSERT INTO t_batchtx_py VALUES (?)", (1,)),
+                ("INSERT INTO t_batchtx_py VALUES (?)", (2,)),
+            ]
+        )
+        assert conn.in_transaction
+        conn.rollback()
+        cur = conn.execute("SELECT COUNT(*) FROM t_batchtx_py")
+        assert cur.fetchone() == (0,)
+        conn.close()
+
+    def test_batch_mode_commits_atomically(self):
+        conn = make_conn()
+        conn.execute("DROP TABLE IF EXISTS t_tbatch_py")
+        conn.execute("CREATE TABLE t_tbatch_py (x)")
+        results = conn.batch(
+            [
+                ("INSERT INTO t_tbatch_py VALUES (?)", (1,)),
+                ("INSERT INTO t_tbatch_py VALUES (?)", (2,)),
+            ],
+            mode="immediate",
+        )
+        assert len(results) == 2
+        assert not conn.in_transaction
+        cur = conn.execute("SELECT COUNT(*) FROM t_tbatch_py")
+        assert cur.fetchone() == (2,)
+        conn.close()
+
+    def test_batch_mode_rolls_back_on_failure(self):
+        conn = make_conn()
+        conn.execute("DROP TABLE IF EXISTS t_tbatcherr_py")
+        conn.execute("CREATE TABLE t_tbatcherr_py (x)")
+        with pytest.raises(OperationalError) as excinfo:
+            conn.batch(
+                [
+                    ("INSERT INTO t_tbatcherr_py VALUES (?)", (1,)),
+                    ("INSERT INTO no_such_table_py VALUES (?)", (2,)),
+                ],
+                mode="immediate",
+            )
+        assert excinfo.value.batch_index == 1
+        assert not conn.in_transaction
+        # The ROLLBACK step undid the first insert.
+        cur = conn.execute("SELECT COUNT(*) FROM t_tbatcherr_py")
+        assert cur.fetchone() == (0,)
+        conn.close()
+
+    def test_batch_constraint_error_preserves_exception_class(self):
+        conn = make_conn()
+        conn.execute("DROP TABLE IF EXISTS t_batchuniq_py")
+        conn.execute("CREATE TABLE t_batchuniq_py (x UNIQUE)")
+        with pytest.raises(IntegrityError) as excinfo:
+            conn.batch(
+                [
+                    ("INSERT INTO t_batchuniq_py VALUES (?)", (1,)),
+                    ("INSERT INTO t_batchuniq_py VALUES (?)", (1,)),
+                ]
+            )
+        assert excinfo.value.batch_index == 1
         conn.close()
 
 

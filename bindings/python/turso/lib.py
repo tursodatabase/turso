@@ -179,6 +179,86 @@ def _is_insert_or_replace(sql: str) -> bool:
     return kw in ("INSERT", "REPLACE")
 
 
+@dataclass
+class BatchResult:
+    """The result of one statement of a [`Connection.batch`] call, in
+    DB-API vocabulary: `description` and `rows` for statements that return
+    rows, `rowcount` for DML (−1 when the statement returned rows), and
+    `lastrowid` for INSERT/REPLACE. `rows_read`, `rows_written`, and
+    `query_duration_ms` are server-side execution statistics reported by
+    the serverless driver; the embedded engine does not report them per
+    statement, so they are None here."""
+
+    rows: list[tuple]
+    description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]]
+    rowcount: int
+    lastrowid: Optional[int]
+    rows_read: Optional[int] = None
+    rows_written: Optional[int] = None
+    query_duration_ms: Optional[float] = None
+
+
+# Accepted values for the `mode` argument of Connection.batch and the
+# BEGIN statement each maps to.
+_BATCH_MODES = {
+    "deferred": "BEGIN DEFERRED",
+    "immediate": "BEGIN IMMEDIATE",
+    "exclusive": "BEGIN EXCLUSIVE",
+    "concurrent": "BEGIN CONCURRENT",
+}
+
+
+def _batch_begin_sql(mode: Optional[str]) -> Optional[str]:
+    if mode is None:
+        return None
+    begin_sql = _BATCH_MODES.get(str(mode).lower())
+    if begin_sql is None:
+        raise ProgrammingError(
+            f"batch mode must be one of {sorted(_BATCH_MODES)} or None, got {mode!r}"
+        )
+    return begin_sql
+
+
+def _normalize_batch_statements(
+    statements: Iterable[Any],
+) -> list[tuple[str, Sequence[Any] | Mapping[str, Any]]]:
+    """Normalize batch input to (sql, parameters) pairs. Accepts SQL
+    strings and (sql, parameters) pairs."""
+    normalized = []
+    for index, statement in enumerate(statements):
+        if isinstance(statement, str):
+            normalized.append((statement, ()))
+            continue
+        if (
+            isinstance(statement, (tuple, list))
+            and len(statement) == 2
+            and isinstance(statement[0], str)
+        ):
+            normalized.append((statement[0], statement[1]))
+            continue
+        raise ProgrammingError(
+            f"batch statement {index} must be a SQL string or a (sql, parameters) pair"
+        )
+    return normalized
+
+
+def _batch_statement_error(
+    index: int,
+    error: Exception,
+    results: Optional[list] = None,
+) -> Exception:
+    """Wrap a statement failure so the raised exception identifies which
+    statement failed, preserving the DB-API exception class. The zero-based
+    index is available as the `batch_index` attribute, and `batch_results`
+    carries one entry per statement: the completed statement's
+    `BatchResult`, or None for the failing statement and the statements
+    that did not run."""
+    wrapped = type(error)(f"batch statement {index} failed: {error}")
+    wrapped.batch_index = index
+    wrapped.batch_results = results if results is not None else []
+    return wrapped
+
+
 def _run_execute_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], None]]) -> PyTursoExecutionResult:
     """
     Run PyTursoStatement.execute() handling potential async IO loops.
@@ -497,6 +577,113 @@ class Connection:
         cur = self.cursor()
         cur.executescript(sql_script)
         return cur
+
+    def batch(
+        self,
+        statements: Iterable[str | tuple[str, Sequence[Any] | Mapping[str, Any]]],
+        mode: Optional[str] = None,
+    ) -> list[BatchResult]:
+        """Execute multiple parameterized statements as a batch.
+
+        The statements — SQL strings or (sql, parameters) pairs, with the
+        same parameter forms as `execute()` — execute in order. Execution
+        stops at the first statement that fails: the remaining statements
+        are skipped and the raised exception identifies the failing
+        statement by its zero-based index (the `batch_index` attribute)
+        and carries the per-statement results (the `batch_results`
+        attribute: one entry per statement — the completed statement's
+        `BatchResult`, or None for the failing statement and the
+        statements that did not run).
+
+        With `mode` set to "deferred", "immediate", "exclusive", or
+        "concurrent", the statements are wrapped in `BEGIN <mode>` /
+        `COMMIT`, with a `ROLLBACK` on failure: either every statement
+        commits or none does. The statements must not contain their own
+        transaction-control SQL in that case. With `mode` unset the batch
+        is not transactional: each statement commits as it executes.
+
+        Unlike `execute()`, `batch()` never opens a legacy implicit
+        transaction. If a transaction is already open on this connection,
+        the statements join it (and `mode` is ignored).
+
+        Returns one `BatchResult` per statement, in order.
+        """
+        begin_sql = _batch_begin_sql(mode)
+        stmts = _normalize_batch_statements(statements)
+        if not stmts:
+            return []
+        if self.in_transaction:
+            begin_sql = None
+        if begin_sql is None:
+            return self._run_batch_statements(stmts)
+        self._exec_ddl_only(begin_sql)
+        try:
+            results = self._run_batch_statements(stmts)
+            self._exec_ddl_only("COMMIT")
+        except Exception:
+            # ROLLBACK errors are ignored: the failure being re-raised is
+            # the error being reported, and surfacing a rollback error
+            # would mask it.
+            try:
+                self._exec_ddl_only("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        return results
+
+    def _run_batch_statements(
+        self, stmts: list[tuple[str, Sequence[Any] | Mapping[str, Any]]]
+    ) -> list[BatchResult]:
+        """Execute the statements of a batch in order, stopping at the
+        first failure and reporting its index along with the results of
+        the statements that completed."""
+        results = []
+        for index, (sql, parameters) in enumerate(stmts):
+            try:
+                results.append(self._execute_batch_statement(sql, parameters))
+            except Exception as exc:  # noqa: BLE001
+                # One entry per statement: the completed statements'
+                # results, None for the failing and skipped ones.
+                partial = list(results) + [None] * (len(stmts) - len(results))
+                raise _batch_statement_error(index, exc, partial) from exc
+        return results
+
+    def _execute_batch_statement(
+        self, sql: str, parameters: Sequence[Any] | Mapping[str, Any]
+    ) -> BatchResult:
+        """Execute one statement of a batch, buffering its rows."""
+        prepared = self._prepare_first(sql)
+        self._raise_if_multiple_statements(sql, prepared.tail_index)
+        stmt = prepared.stmt
+        try:
+            Cursor._bind_params(stmt, parameters)
+            if prepared.has_columns:
+                rows = []
+                while _step_once_with_io(stmt, self.extra_io) == Status.Row:
+                    rows.append(tuple(stmt.row()))  # type: ignore[call-arg]
+                description = tuple(
+                    (name, None, None, None, None, None, None) for name in prepared.column_names
+                )
+                result = BatchResult(rows=rows, description=description, rowcount=-1, lastrowid=None)
+            else:
+                execution = _run_execute_with_io(stmt, self.extra_io)
+                lastrowid = None
+                if execution.rows_changed > 0 and _is_insert_or_replace(sql):
+                    lastrowid = self._last_insert_rowid()
+                result = BatchResult(
+                    rows=[],
+                    description=None,
+                    rowcount=int(execution.rows_changed),
+                    lastrowid=lastrowid,
+                )
+            stmt.finalize()
+            return result
+        except Exception as exc:  # noqa: BLE001
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
 
     def _last_insert_rowid(self) -> Optional[int]:
         """The rowid of the most recent successful INSERT on this

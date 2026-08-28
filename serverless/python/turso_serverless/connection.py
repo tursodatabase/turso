@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Callable, Optional, TypeVar
 
 from .dbapi import (
@@ -20,9 +21,89 @@ from .dbapi import (
     _is_dml,
     _is_insert_or_replace,
 )
+from .protocol import ProtocolError, build_batch_step, decode_value
 from .session import Session, StmtResult, _server_error
 
 _DBCursorT = TypeVar("_DBCursorT", bound="Cursor")
+
+
+@dataclass
+class BatchResult:
+    """The result of one statement of a [`Connection.batch`] call, in
+    DB-API vocabulary: `description` and `rows` for statements that return
+    rows, `rowcount` for DML (−1 when the statement returned rows), and
+    `lastrowid` for INSERT/REPLACE. `rows_read`, `rows_written`, and
+    `query_duration_ms` are the server-side execution statistics
+    (PROTOCOL.md section 8.4); the embedded driver reports None for them."""
+
+    rows: list[tuple]
+    description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]]
+    rowcount: int
+    lastrowid: Optional[int]
+    rows_read: Optional[int] = None
+    rows_written: Optional[int] = None
+    query_duration_ms: Optional[float] = None
+
+
+# Accepted values for the `mode` argument of Connection.batch and the
+# BEGIN statement each maps to.
+_BATCH_MODES = {
+    "deferred": "BEGIN DEFERRED",
+    "immediate": "BEGIN IMMEDIATE",
+    "exclusive": "BEGIN EXCLUSIVE",
+    "concurrent": "BEGIN CONCURRENT",
+}
+
+
+def _batch_begin_sql(mode: Optional[str]) -> Optional[str]:
+    if mode is None:
+        return None
+    begin_sql = _BATCH_MODES.get(str(mode).lower())
+    if begin_sql is None:
+        raise ProgrammingError(
+            f"batch mode must be one of {sorted(_BATCH_MODES)} or None, got {mode!r}"
+        )
+    return begin_sql
+
+
+def _normalize_batch_statements(
+    statements: Iterable[Any],
+) -> list[tuple[str, Sequence[Any] | Mapping[str, Any]]]:
+    """Normalize batch input to (sql, parameters) pairs. Accepts SQL
+    strings and (sql, parameters) pairs, like the JavaScript driver."""
+    normalized = []
+    for index, statement in enumerate(statements):
+        if isinstance(statement, str):
+            normalized.append((statement, ()))
+            continue
+        if (
+            isinstance(statement, (tuple, list))
+            and len(statement) == 2
+            and isinstance(statement[0], str)
+        ):
+            normalized.append((statement[0], statement[1]))
+            continue
+        raise ProgrammingError(
+            f"batch statement {index} must be a SQL string or a (sql, parameters) pair"
+        )
+    return normalized
+
+
+def _batch_statement_error(
+    index: int,
+    error: Exception,
+    results: Optional[list] = None,
+) -> Exception:
+    """Wrap a statement failure so the raised exception identifies which
+    statement failed, preserving the DB-API exception class. The zero-based
+    index is available as the `batch_index` attribute, and `batch_results`
+    carries one entry per statement: the completed statement's
+    `BatchResult`, or None for the failing statement and the statements
+    that did not run."""
+    wrapped = type(error)(f"batch statement {index} failed: {error}")
+    wrapped.batch_index = index
+    wrapped.batch_results = results if results is not None else []
+    return wrapped
 
 
 def _classify_error(e: Exception) -> Exception:
@@ -145,6 +226,187 @@ class Connection:
         cur = self.cursor()
         cur.executescript(sql_script)
         return cur
+
+    def batch(
+        self,
+        statements: Iterable[str | tuple[str, Sequence[Any] | Mapping[str, Any]]],
+        mode: Optional[str] = None,
+    ) -> list[BatchResult]:
+        """Execute multiple parameterized statements in a single HTTP
+        request.
+
+        The statements — SQL strings or (sql, parameters) pairs, with the
+        same parameter forms as `execute()` — are sent as one batch
+        request (PROTOCOL.md section 6.2) and execute in order. Execution
+        stops at the first statement that fails: the remaining statements
+        are skipped and the raised exception identifies the failing
+        statement by its zero-based index (the `batch_index` attribute)
+        and carries the per-statement results (the `batch_results`
+        attribute: one entry per statement — the completed statement's
+        `BatchResult`, or None for the failing statement and the
+        statements that did not run).
+
+        With `mode` set to "deferred", "immediate", "exclusive", or
+        "concurrent", the statements are wrapped in `BEGIN <mode>` /
+        `COMMIT`, with a `ROLLBACK` on failure, all carried by the same
+        request: either every statement commits or none does. The
+        statements must not contain their own transaction-control SQL in
+        that case. With `mode` unset the batch is not transactional: each
+        statement commits as it executes.
+
+        Unlike `execute()`, `batch()` never opens a legacy implicit
+        transaction. If a transaction is already open on this connection,
+        the statements join it (and `mode` is ignored).
+
+        Returns one `BatchResult` per statement, in order.
+        """
+        self._ensure_open()
+        begin_sql = _batch_begin_sql(mode)
+        stmts = _normalize_batch_statements(statements)
+        if not stmts:
+            return []
+        if self.in_transaction:
+            begin_sql = None
+
+        steps = []
+        offset = 0
+        if begin_sql is not None:
+            steps.append(build_batch_step(begin_sql, want_rows=False))
+            offset = 1
+        for i, (sql, parameters) in enumerate(stmts):
+            condition = None
+            if offset + i > 0:
+                condition = {"type": "ok", "step": offset + i - 1}
+            # Value encoding can fail client-side (e.g. an unsupported
+            # type); report it with the statement's index like any other
+            # statement failure.
+            try:
+                args, named_args = Cursor._convert_params(parameters)
+                step = build_batch_step(
+                    sql, args=args, named_args=named_args, want_rows=True, condition=condition
+                )
+            except Exception as e:
+                raise _batch_statement_error(i, e) from e
+            steps.append(step)
+        commit_index = None
+        if begin_sql is not None:
+            commit_index = offset + len(stmts)
+            steps.append(
+                build_batch_step(
+                    "COMMIT",
+                    want_rows=False,
+                    condition={"type": "ok", "step": commit_index - 1},
+                )
+            )
+            # ROLLBACK runs only when BEGIN succeeded and COMMIT did not.
+            # The ok(BEGIN) guard prevents it from aborting a transaction
+            # opened on the stream out of band.
+            steps.append(
+                build_batch_step(
+                    "ROLLBACK",
+                    want_rows=False,
+                    condition={
+                        "type": "and",
+                        "conds": [
+                            {"type": "ok", "step": 0},
+                            {"type": "not", "cond": {"type": "ok", "step": commit_index}},
+                        ],
+                    },
+                )
+            )
+
+        try:
+            result = self._session.execute_batch(steps)
+        except RuntimeError as e:
+            raise _classify_error(e) from None
+        return self._decode_batch_result(result, stmts, offset, commit_index, len(steps))
+
+    @staticmethod
+    def _decode_batch_result(
+        result: dict,
+        stmts: list[tuple[str, Any]],
+        offset: int,
+        commit_index: Optional[int],
+        total_steps: int,
+    ) -> list[BatchResult]:
+        """Decode a wire-level batch result into per-statement results, or
+        raise the error of the step that failed. Failures of the synthetic
+        BEGIN/COMMIT steps surface as-is; a ROLLBACK failure is ignored
+        because it only runs after a failure that is already being
+        reported."""
+        step_results = result.get("step_results")
+        step_errors = result.get("step_errors")
+        if (
+            not isinstance(step_results, list)
+            or not isinstance(step_errors, list)
+            or len(step_results) != total_steps
+            or len(step_errors) != total_steps
+        ):
+            raise ProtocolError(
+                f"batch response does not have one result and one error per step: {result}"
+            )
+        # Decode the results of the statements that executed before looking
+        # at the errors, so a failure can still report what completed.
+        results: list[Optional[BatchResult]] = [
+            Connection._decode_batch_statement_result(step_results[offset + i], sql)
+            for i, (sql, _parameters) in enumerate(stmts)
+        ]
+        Connection._raise_batch_step_error(step_errors, len(stmts), offset, commit_index, results)
+        for i, result in enumerate(results):
+            if result is None:
+                raise ProtocolError(f"batch response is missing the result for statement {i}")
+        return results
+
+    @staticmethod
+    def _decode_batch_statement_result(step_result: Any, sql: str) -> Optional[BatchResult]:
+        """Decode one statement result of a batch response (section 8.4),
+        or None when the statement did not complete."""
+        if not isinstance(step_result, dict):
+            return None
+        columns = [c.get("name") or "" for c in step_result.get("cols") or []]
+        rows = [tuple(decode_value(v) for v in row) for row in step_result.get("rows") or []]
+        if columns:
+            description = tuple((name, None, None, None, None, None, None) for name in columns)
+            rowcount = -1
+        else:
+            description = None
+            rowcount = step_result.get("affected_row_count") or 0
+        lastrowid = None
+        raw_rowid = step_result.get("last_insert_rowid")
+        if raw_rowid is not None and _is_insert_or_replace(sql):
+            try:
+                lastrowid = int(raw_rowid)
+            except (TypeError, ValueError) as e:
+                raise ProtocolError(f"invalid rowid in server response: {e}") from None
+        return BatchResult(
+            rows=rows,
+            description=description,
+            rowcount=rowcount,
+            lastrowid=lastrowid,
+            rows_read=step_result.get("rows_read"),
+            rows_written=step_result.get("rows_written"),
+            query_duration_ms=step_result.get("query_duration_ms"),
+        )
+
+    @staticmethod
+    def _raise_batch_step_error(
+        step_errors: list,
+        statement_count: int,
+        offset: int,
+        commit_index: Optional[int],
+        results: list,
+    ) -> None:
+        """Raise the error of the batch step that failed, if any: the
+        synthetic BEGIN first, then the user statements (with their index
+        and the per-statement results), then the synthetic COMMIT."""
+        if offset and step_errors[0] is not None:
+            raise _classify_error(_server_error(step_errors[0]))
+        for i in range(statement_count):
+            error = step_errors[offset + i]
+            if error is not None:
+                raise _batch_statement_error(i, _classify_error(_server_error(error)), results)
+        if commit_index is not None and step_errors[commit_index] is not None:
+            raise _classify_error(_server_error(step_errors[commit_index]))
 
     def _maybe_implicit_begin(self, sql: str) -> None:
         """Legacy implicit transaction behavior."""
