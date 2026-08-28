@@ -70,6 +70,34 @@ await conn.transaction(async () => {
 }).concurrent();
 ```
 
+The whole batch is one HTTP request, and the statements execute in order,
+stopping at the first failure. Each returned `ResultSet` carries the
+statement's `rows`, `rowsAffected`, and `lastInsertRowid`, plus the
+server-side execution statistics `rowsRead`, `rowsWritten`, and
+`queryDurationMs`:
+
+```javascript
+const results = await conn.batch([
+  { sql: "INSERT INTO users (email) VALUES (?)", args: ["carol@example.com"] },
+  "SELECT COUNT(*) AS n FROM users",
+]);
+console.log(results[0].lastInsertRowid, results[1].rows[0].n);
+console.log(results[1].rowsRead, results[1].queryDurationMs);
+```
+
+When a statement fails, the thrown error identifies it and carries the
+results of the statements that completed:
+
+```javascript
+try {
+  await conn.batch([...statements]);
+} catch (e) {
+  // e.batchIndex: zero-based index of the failing statement.
+  // e.batchResults: one entry per statement — the completed statement's
+  // ResultSet, or null for the failing statement and those never run.
+}
+```
+
 ### Custom Headers
 
 Requests can carry extra HTTP headers, e.g. for routing through a gateway:

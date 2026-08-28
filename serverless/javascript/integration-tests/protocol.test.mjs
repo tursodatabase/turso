@@ -175,10 +175,23 @@ test.serial('Session.batch encodes named arguments for statement objects', async
 
   globalThis.fetch = async (url, opts) => {
     requests.push(JSON.parse(opts.body));
-    return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n`,
-      { status: 200, headers: { 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({
+      baton: null,
+      base_url: null,
+      results: [
+        {
+          type: 'ok',
+          response: {
+            type: 'batch',
+            result: {
+              step_results: [{ cols: [], rows: [], affected_row_count: 1, last_insert_rowid: null }],
+              step_errors: [null],
+            },
+          },
+        },
+        { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+      ],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
 
   t.teardown(() => { globalThis.fetch = originalFetch; });
@@ -187,14 +200,15 @@ test.serial('Session.batch encodes named arguments for statement objects', async
     { sql: 'INSERT INTO users(name, age) VALUES(:name, :age)', args: { name: 'alice', age: 30 } }
   ]);
 
-  t.deepEqual(requests[0].batch.steps[0].stmt.args, []);
-  t.deepEqual(requests[0].batch.steps[0].stmt.named_args, [
+  const batchRequest = requests[0].requests[0];
+  t.is(batchRequest.type, 'batch');
+  t.deepEqual(batchRequest.batch.steps[0].stmt.args, []);
+  t.deepEqual(batchRequest.batch.steps[0].stmt.named_args, [
     { name: 'name', value: { type: 'text', value: 'alice' } },
     { name: 'age', value: { type: 'integer', value: '30' } },
   ]);
-  // The trailing step is the is_autocommit transaction-state probe.
-  const probeStep = requests[0].batch.steps.at(-1);
-  t.deepEqual(probeStep.condition, { type: 'is_autocommit' });
+  // The transaction-state check rides the same pipeline request.
+  t.deepEqual(requests[0].requests.at(-1), { type: 'get_autocommit' });
 });
 
 // --- requestHeaders ---
@@ -314,17 +328,28 @@ test.serial('per-query requestHeaders apply to batch and sequence requests', asy
 
   globalThis.fetch = async (url, opts) => {
     capturedHeaders.push(opts.headers);
-    if (url.endsWith('/v3/pipeline')) {
+    const body = JSON.parse(opts.body);
+    if (body.requests?.[0]?.type === 'batch') {
       return new Response(JSON.stringify({
         baton: null,
         base_url: null,
-        results: [{ type: 'ok', response: { type: 'sequence' } }],
+        results: [{
+          type: 'ok',
+          response: {
+            type: 'batch',
+            result: {
+              step_results: [{ cols: [], rows: [], affected_row_count: 0 }],
+              step_errors: [null],
+            },
+          },
+        }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
-      { status: 200, headers: { 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({
+      baton: null,
+      base_url: null,
+      results: [{ type: 'ok', response: { type: 'sequence' } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
 
   t.teardown(() => { globalThis.fetch = originalFetch; });

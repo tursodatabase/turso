@@ -87,6 +87,20 @@ export interface ResultSet {
   rows: Array<BatchRow>;
   /** Number of rows changed by the statement (0 for SELECT). */
   rowsAffected: number;
+  /** Rowid inserted by the statement, when the statement inserted one. */
+  lastInsertRowid?: number;
+  /** Rows read while executing the statement. The embedded engine does
+   * not report this per statement; the serverless driver reports the
+   * server's value. */
+  rowsRead?: number;
+  /** Rows written while executing the statement. The embedded engine
+   * does not report this per statement; the serverless driver reports
+   * the server's value. */
+  rowsWritten?: number;
+  /** Server-side execution time in milliseconds. The embedded engine
+   * does not report this per statement; the serverless driver reports
+   * the server's value. */
+  queryDurationMs?: number;
 }
 
 function normalizeBatchMode(mode: BatchMode): string {
@@ -128,13 +142,20 @@ function makeResultSet(
   columnTypes: string[],
   rows: any[],
   rowsAffected: number,
+  lastInsertRowid?: number,
 ): ResultSet {
-  return {
+  const resultSet: ResultSet = {
     columns,
     columnTypes,
     rows,
     rowsAffected,
   };
+  // Only statements that inserted carry the key, so callers can use
+  // `"lastInsertRowid" in resultSet` to detect an insert.
+  if (lastInsertRowid !== undefined) {
+    resultSet.lastInsertRowid = lastInsertRowid;
+  }
+  return resultSet;
 }
 
 /**
@@ -431,7 +452,12 @@ class Database {
    *   transaction.
    * @returns An array of `ResultSet`s — one per input statement, in order —
    *   matching the libsql-js batch contract. Each `ResultSet` carries that
-   *   statement's `columns`, `columnTypes`, `rows`, and `rowsAffected`.
+   *   statement's `columns`, `columnTypes`, `rows`, `rowsAffected`, and
+   *   `lastInsertRowid`. Execution stops at the first statement that
+   *   fails: the thrown error carries `batchIndex` (the zero-based index
+   *   of the failing statement) and `batchResults` (one entry per
+   *   statement — the completed statement's `ResultSet`, or `null` for
+   *   the failing statement and the statements that did not run).
    *
    * @example
    * // Plain SQL strings (non-atomic).
@@ -704,57 +730,82 @@ async function executeBatch(
   }
 
   const results: ResultSet[] = [];
-  try {
-    for (const statement of statements) {
-      const sql = typeof statement === "string" ? statement : statement.sql;
-      const args = typeof statement === "string" ? undefined : statement.args;
+  const executeStatement = async (
+    statement: string | { sql: string; args?: any[] | Record<string, any> },
+  ): Promise<ResultSet> => {
+    const sql = typeof statement === "string" ? statement : statement.sql;
+    const args = typeof statement === "string" ? undefined : statement.args;
 
-      let nativeStmt: NativeStatement;
-      try {
-        nativeStmt = native.prepare(sql);
-      } catch (err) {
-        throw convertError(err);
+    let nativeStmt: NativeStatement;
+    try {
+      nativeStmt = native.prepare(sql);
+    } catch (err) {
+      throw convertError(err);
+    }
+    try {
+      if (args !== undefined) {
+        bindParams(nativeStmt, [args]);
       }
-      try {
-        if (args !== undefined) {
-          bindParams(nativeStmt, [args]);
-        }
-        const cols = nativeStmt.columns();
-        const columnNames = cols.map((c) => c.name);
-        const columnTypes = cols.map((c) => c.type ?? "");
-        if (columnNames.length > 0) {
-          nativeStmt.raw(raw);
-        }
+      const cols = nativeStmt.columns();
+      const columnNames = cols.map((c) => c.name);
+      const columnTypes = cols.map((c) => c.type ?? "");
+      if (columnNames.length > 0) {
+        nativeStmt.raw(raw);
+      }
 
-        const totalChangesBefore = native.totalChanges();
-        const rows: any[] = [];
-        try {
-          while (true) {
-            const [stepResult, sleepMs] = await nativeStmt.stepSync();
-            if (stepResult === STEP_IO) {
-              await io();
-              continue;
-            }
-            if (stepResult === STEP_SLEEP) {
-              await sleepBeforeRetry(sleepMs);
-              continue;
-            }
-            if (stepResult === STEP_DONE) {
-              break;
-            }
-            rows.push(nativeStmt.row());
+      const totalChangesBefore = native.totalChanges();
+      const rowidBefore = native.lastInsertRowid();
+      const rows: any[] = [];
+      try {
+        while (true) {
+          const [stepResult, sleepMs] = await nativeStmt.stepSync();
+          if (stepResult === STEP_IO) {
+            await io();
+            continue;
           }
-          const rowsAffected = columnNames.length > 0
-            ? 0
-            : native.totalChanges() !== totalChangesBefore ? native.changes() : 0;
-          results.push(
-            makeResultSet(columnNames, columnTypes, rows, rowsAffected),
-          );
-        } finally {
-          nativeStmt.reset();
+          if (stepResult === STEP_SLEEP) {
+            await sleepBeforeRetry(sleepMs);
+            continue;
+          }
+          if (stepResult === STEP_DONE) {
+            break;
+          }
+          rows.push(nativeStmt.row());
         }
+        const rowsAffected = columnNames.length > 0
+          ? 0
+          : native.totalChanges() !== totalChangesBefore ? native.changes() : 0;
+        // The engine tracks the inserted rowid per connection, not per
+        // statement; a change across this statement means it inserted.
+        const rowidAfter = native.lastInsertRowid();
+        const lastInsertRowid = rowidAfter !== rowidBefore ? rowidAfter : undefined;
+        return makeResultSet(columnNames, columnTypes, rows, rowsAffected, lastInsertRowid);
       } finally {
-        nativeStmt.finalize();
+        nativeStmt.reset();
+      }
+    } finally {
+      nativeStmt.finalize();
+    }
+  };
+
+  try {
+    for (let index = 0; index < statements.length; index++) {
+      try {
+        results.push(await executeStatement(statements[index]));
+      } catch (err: any) {
+        // Identify the failing statement and carry the results of the
+        // statements that completed, matching the serverless driver:
+        // one entry per statement, null for the failing statement and
+        // the ones that never ran.
+        if (err instanceof Error) {
+          const batchErr = err as Error & { batchIndex?: number; batchResults?: Array<ResultSet | null> };
+          batchErr.batchIndex = index;
+          batchErr.batchResults = [
+            ...results.map((result) => result as ResultSet | null),
+            ...Array(statements.length - results.length).fill(null),
+          ];
+        }
+        throw err;
       }
     }
 

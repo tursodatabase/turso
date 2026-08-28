@@ -2,6 +2,7 @@ import {
   executeCursor,
   executePipeline,
   decodeValue,
+  type BatchResultData,
   type BatchStep,
   type CursorRequest,
   type CursorResponse,
@@ -12,6 +13,7 @@ import {
   type CloseRequest,
   type DescribeRequest,
   type DescribeResult,
+  type ExecuteResult,
   type GetAutocommitRequest,
   type QueryOptions,
   type HttpContext,
@@ -432,11 +434,14 @@ export class Session {
   /**
    * Execute multiple SQL statements in a batch.
    *
-   * When `mode` is set, the batch is sent as a single Hrana request that
-   * also carries `BEGIN <mode>` / `COMMIT` / `ROLLBACK` steps using the
-   * server-side condition chain, giving atomic execution in one round-trip.
-   * When `mode` is omitted, the user statements are sent as-is and run
-   * under autocommit (or whatever transaction is already active on this
+   * The batch is sent as a single `batch` request on the pipeline
+   * endpoint (PROTOCOL.md section 6.2), so the whole batch completes in
+   * one round-trip. Each statement is gated on its predecessor
+   * succeeding, so execution stops at the first failure. When `mode` is
+   * set, the request also carries `BEGIN <mode>` / `COMMIT` / `ROLLBACK`
+   * steps using the server-side condition chain, giving atomic
+   * execution. When `mode` is omitted, the statements run under
+   * autocommit (or whatever transaction is already active on this
    * stream).
    *
    * @param statements - Array of SQL statements to execute.
@@ -447,7 +452,11 @@ export class Session {
    *   BigInt rather than Number.
    * @returns Promise resolving to an array of per-statement results — one
    *   per input statement, in order — each carrying that statement's
-   *   `columns`, `columnTypes`, `rows`, and `rowsAffected`.
+   *   `columns`, `columnTypes`, `rows`, `rowsAffected`, `lastInsertRowid`,
+   *   and the server-side execution statistics `rowsRead`, `rowsWritten`,
+   *   and `queryDurationMs`. On failure the thrown `DatabaseError` carries
+   *   `batchIndex` (the failing statement) and `batchResults` (the results
+   *   of the statements that completed).
    */
   async batch(
     statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
@@ -456,13 +465,26 @@ export class Session {
     safeIntegers: boolean = false,
     raw: boolean = false,
   ): Promise<any> {
-    const userSteps: BatchStep[] = statements.map(statement => {
+    const userSteps: BatchStep[] = statements.map((statement, index) => {
       if (typeof statement === 'string') {
         return {
           stmt: { sql: statement, args: [], named_args: [], want_rows: true },
         };
       }
-      const encodedArgs = encodeSqlArgs(statement.args ?? []);
+      // A value that cannot be encoded fails client-side before anything
+      // is sent; report it with the statement's index like any other
+      // statement failure. Nothing has executed, so batchResults is empty.
+      let encodedArgs;
+      try {
+        encodedArgs = encodeSqlArgs(statement.args ?? []);
+      } catch (e: any) {
+        const error = new DatabaseError(
+          `batch statement ${index} failed: ${e?.message ?? e}`,
+        );
+        error.batchIndex = index;
+        error.batchResults = [];
+        throw error;
+      }
       return {
         stmt: {
           sql: statement.sql,
@@ -475,12 +497,15 @@ export class Session {
 
     let steps: BatchStep[];
     let firstUserStepIdx = 0;
-    let lastUserStepIdx = userSteps.length - 1;
     let beginIdx = -1;
     let commitIdx = -1;
-    let rollbackIdx = -1;
     if (mode === undefined) {
-      steps = userSteps;
+      // Each statement is gated on its predecessor succeeding, so
+      // execution stops at the first failure (matching the Rust and
+      // Python drivers and the `sequence` request).
+      steps = userSteps.map((step, i) =>
+        i === 0 ? step : { ...step, condition: { type: 'ok' as const, step: i - 1 } },
+      );
     } else {
       // Atomic batch: BEGIN <mode>, then each user step gated on its
       // predecessor succeeding, then COMMIT gated on the last user step
@@ -490,9 +515,8 @@ export class Session {
       // stream out of band (e.g. via session.execute("BEGIN")).
       beginIdx = 0;
       firstUserStepIdx = 1;
-      lastUserStepIdx = userSteps.length; // 1..userSteps.length inclusive
+      const lastUserStepIdx = userSteps.length; // 1..userSteps.length inclusive
       commitIdx = lastUserStepIdx + 1;
-      rollbackIdx = commitIdx + 1;
       steps = [
         { stmt: { sql: `BEGIN ${normalizeBatchMode(mode)}`, args: [], named_args: [], want_rows: false } },
         ...userSteps.map((step, i) => ({
@@ -516,121 +540,120 @@ export class Session {
       ];
     }
 
-    const probeIdx = steps.length;
-    const request: CursorRequest = {
+    const request: PipelineRequest = {
       baton: this.baton,
-      batch: { steps: [...steps, Session.autocommitProbeStep()] },
+      requests: [
+        { type: 'batch', batch: { steps } },
+        { type: 'get_autocommit' },
+      ],
     };
 
-    let batchResult;
+    let response: PipelineResponse;
     try {
-      batchResult = await executeCursor(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
+      response = await executePipeline(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       this.autocommit = true;
       throw e;
     }
 
-    const { response, entries } = batchResult;
     this.baton = response.baton;
     if (response.base_url) {
       this.baseUrl = normalizeUrl(response.base_url);
     }
+    this.updateAutocommit(response);
 
-    // One result per user statement, in input order.
-    const results = userSteps.map(() => ({
-      columns: [] as string[],
-      columnTypes: [] as string[],
-      rows: [] as any[],
-      rowsAffected: 0,
-    }));
-    let deferredError: DatabaseError | null = null;
+    const first = response.results?.[0];
+    if (!first) {
+      throw new DatabaseError('missing batch result in pipeline response');
+    }
+    if (first.type === 'error') {
+      throw new DatabaseError(first.error?.message || 'Batch execution failed', first.error?.code);
+    }
+    if (first.response?.type !== 'batch') {
+      throw new DatabaseError(`expected batch result in pipeline response, got ${first.response?.type}`);
+    }
+    const batchResult = first.response.result as BatchResultData | undefined;
+    const stepResults = batchResult?.step_results;
+    const stepErrors = batchResult?.step_errors;
+    if (
+      !Array.isArray(stepResults) ||
+      !Array.isArray(stepErrors) ||
+      stepResults.length !== steps.length ||
+      stepErrors.length !== steps.length
+    ) {
+      throw new DatabaseError('batch response does not have one result and one error per step');
+    }
 
-    // step_end / row entries don't carry a step index on the wire; the Hrana
-    // server only puts `step` on step_begin / step_error. Track the current
-    // step via step_begin so we know which user statement a row or step_end
-    // belongs to. Maps the wire step index to a slot in `results`, or
-    // undefined for the synthetic BEGIN/COMMIT/ROLLBACK steps.
-    let currentResultIdx: number | undefined;
-    // Fallback for responses that omit step_begin (e.g. simplified mocks):
-    // in non-atomic mode every step_end advances to the next user statement.
-    let nextNonAtomicIdx = 0;
-    const stepToResultIdx = (step: number | undefined): number | undefined => {
-      if (mode === undefined) {
-        // Non-atomic batch: every step is a user step, in order.
-        return step ?? nextNonAtomicIdx;
+    // One result per user statement, in input order; null for statements
+    // that did not complete.
+    const results: Array<any | null> = statements.map((_, i) => {
+      const stepResult = stepResults[firstUserStepIdx + i];
+      return stepResult ? this.decodeBatchStepResult(stepResult, safeIntegers, raw) : null;
+    });
+
+    // Surface the failing step: BEGIN first, then the user statements
+    // (with their index), then COMMIT. Errors on the synthetic ROLLBACK
+    // step are suppressed — by the time it runs the transaction has
+    // already been undone and surfacing a ROLLBACK error would mask the
+    // real cause.
+    const throwStepError = (error: { message?: string; code?: string } | null, batchIndex?: number): never => {
+      const e = new DatabaseError(error?.message || 'Batch execution failed', error?.code);
+      if (batchIndex !== undefined) {
+        e.batchIndex = batchIndex;
       }
-      if (step !== undefined && step >= firstUserStepIdx && step <= lastUserStepIdx) {
-        return step - firstUserStepIdx;
-      }
-      return undefined;
+      e.batchResults = results;
+      throw e;
     };
-
-    for await (const entry of this.trackAutocommit(entries, probeIdx, queryOptions)) {
-      // Once a step has errored the whole batch will throw, so stop
-      // decoding and buffering later steps' results while draining the
-      // rest of the stream for the probe. Fatal stream errors still
-      // surface below.
-      if (deferredError !== null && entry.type !== 'error') {
-        continue;
-      }
-      switch (entry.type) {
-        case 'step_begin':
-          currentResultIdx = stepToResultIdx(entry.step);
-          if (currentResultIdx !== undefined && currentResultIdx < results.length && entry.cols) {
-            results[currentResultIdx].columns = entry.cols.map(col => col.name);
-            results[currentResultIdx].columnTypes = entry.cols.map(col => col.decltype || '');
-          }
-          break;
-        case 'row':
-          if (currentResultIdx !== undefined && currentResultIdx < results.length && entry.row) {
-            const decodedRow = entry.row.map(value => decodeValue(value, safeIntegers));
-            const row = raw
-              ? decodedRow
-              : this.createObjectRow(decodedRow, results[currentResultIdx].columns);
-            results[currentResultIdx].rows.push(row);
-          }
-          break;
-        case 'step_end': {
-          let idx = currentResultIdx;
-          if (idx === undefined && mode === undefined) {
-            idx = nextNonAtomicIdx;
-          }
-          if (idx !== undefined && idx < results.length) {
-            if (entry.affected_row_count !== undefined) {
-              results[idx].rowsAffected = results[idx].columns.length > 0
-                ? 0
-                : entry.affected_row_count;
-            }
-          }
-          if (mode === undefined && idx !== undefined) {
-            nextNonAtomicIdx = idx + 1;
-          }
-          currentResultIdx = undefined;
-          break;
-        }
-        case 'step_error':
-          // Capture the first error from BEGIN, any user step, or COMMIT
-          // and keep draining so the trailing probe (and, in atomic mode,
-          // ROLLBACK) is still observed. Errors on the synthetic ROLLBACK
-          // step are suppressed — by the time it runs the transaction has
-          // already been undone and surfacing a ROLLBACK error would mask
-          // the real cause we already captured.
-          if (deferredError === null && entry.step !== rollbackIdx) {
-            deferredError = new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
-          }
-          currentResultIdx = undefined;
-          break;
-        case 'error':
-          throw new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
+    if (beginIdx >= 0 && stepErrors[beginIdx]) {
+      throwStepError(stepErrors[beginIdx]);
+    }
+    for (let i = 0; i < userSteps.length; i++) {
+      const stepError = stepErrors[firstUserStepIdx + i];
+      if (stepError) {
+        throwStepError(stepError, i);
       }
     }
-
-    if (deferredError !== null) {
-      throw deferredError;
+    if (commitIdx >= 0 && stepErrors[commitIdx]) {
+      throwStepError(stepErrors[commitIdx]);
     }
 
+    if (results.some(result => result === null)) {
+      throw new DatabaseError('batch response is missing statement results');
+    }
     return results;
+  }
+
+  /** Decode one statement result of a batch response (section 8.4) into
+   * the per-statement result shape returned by `batch()`. */
+  private decodeBatchStepResult(stepResult: ExecuteResult, safeIntegers: boolean, raw: boolean): any {
+    const columns = (stepResult.cols ?? []).map(col => col.name ?? '');
+    const columnTypes = (stepResult.cols ?? []).map(col => col.decltype || '');
+    const rows = (stepResult.rows ?? []).map(row => {
+      const decoded = row.map(value => decodeValue(value, safeIntegers));
+      return raw ? decoded : this.createObjectRow(decoded, columns);
+    });
+    let lastInsertRowid: number | undefined;
+    if (stepResult.last_insert_rowid !== undefined && stepResult.last_insert_rowid !== null) {
+      lastInsertRowid = typeof stepResult.last_insert_rowid === 'number'
+        ? stepResult.last_insert_rowid
+        : parseInt(stepResult.last_insert_rowid, 10);
+    }
+    const resultSet: any = {
+      columns,
+      columnTypes,
+      rows,
+      rowsAffected: columns.length > 0 ? 0 : (stepResult.affected_row_count ?? 0),
+      rowsRead: stepResult.rows_read,
+      rowsWritten: stepResult.rows_written,
+      queryDurationMs: stepResult.query_duration_ms,
+    };
+    // Only statements that inserted carry the key, so callers can use
+    // `"lastInsertRowid" in resultSet` to detect an insert.
+    if (lastInsertRowid !== undefined) {
+      resultSet.lastInsertRowid = lastInsertRowid;
+    }
+    return resultSet;
   }
 
   /**

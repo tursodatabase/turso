@@ -4,6 +4,7 @@ import { Statement } from './statement.js';
 import { type QueryOptions } from './protocol.js';
 import { normalizeArgs, splitBindParameters } from './args.js';
 import { createExpandedRow } from './row.js';
+import { DatabaseError } from './error.js';
 
 export type { BatchMode } from './session.js';
 
@@ -40,12 +41,32 @@ function normalizeBatchOptions(options?: BatchMode | BatchOptions): { mode?: Bat
  * libsql-js batch ResultSet shape.
  */
 function toResultSet(result: any): any {
-  return {
+  const resultSet: any = {
     columns: result.columns ?? [],
     columnTypes: result.columnTypes ?? [],
     rows: result.rows ?? [],
     rowsAffected: result.rowsAffected ?? 0,
+    rowsRead: result.rowsRead,
+    rowsWritten: result.rowsWritten,
+    queryDurationMs: result.queryDurationMs,
   };
+  // Present only for statements that inserted, like the embedded driver.
+  if (result.lastInsertRowid !== undefined) {
+    resultSet.lastInsertRowid = result.lastInsertRowid;
+  }
+  return resultSet;
+}
+
+/** Shape the per-statement results carried by a batch error into the
+ * ResultSet shape, so `error.batchResults` matches what `batch()` would
+ * have returned. */
+function shapeBatchError(error: any): any {
+  if (error instanceof DatabaseError && Array.isArray(error.batchResults)) {
+    error.batchResults = error.batchResults.map((result: any) =>
+      result === null ? null : toResultSet(result),
+    );
+  }
+  return error;
 }
 
 
@@ -256,14 +277,23 @@ export class Connection {
   /**
    * Executes a batch of SQL statements over this connection.
    *
+   * The batch is dispatched as a single request, so it always completes
+   * in one round-trip, and executes in order, stopping at the first
+   * statement that fails: the remaining statements are skipped and the
+   * thrown `DatabaseError` carries `batchIndex` (the zero-based index of
+   * the failing statement) and `batchResults` (one entry per input
+   * statement — the completed statement's `ResultSet`, or `null` for the
+   * failing statement and the statements that did not run; empty when
+   * the batch failed client-side before anything was sent).
+   *
    * By default, batch() is not transactional: each statement runs in its
    * own autocommit step, so a failure mid-batch leaves earlier successful
-   * statements committed. Pass a `mode` to make the batch atomic — the
-   * statements are wrapped in `BEGIN <mode>` / `COMMIT` (with `ROLLBACK`
-   * on failure) and dispatched as a single Hrana request, so the whole
-   * batch completes in one round-trip. When called from inside a
-   * `connection.transaction(...)` callback the `mode` argument is ignored
-   * and the surrounding transaction is reused.
+   * statements committed (their results are in `batchResults`). Pass a
+   * `mode` to make the batch atomic — the statements are wrapped in
+   * `BEGIN <mode>` / `COMMIT` (with `ROLLBACK` on failure) carried by the
+   * same request. When called from inside a `connection.transaction(...)`
+   * callback the `mode` argument is ignored and the surrounding
+   * transaction is reused.
    *
    * When `mode` is set, `batch()` owns the surrounding
    * `BEGIN`/`COMMIT`/`ROLLBACK`, so the `statements` array must not
@@ -280,7 +310,9 @@ export class Connection {
    *   inside a transaction.
    * @returns An array of `ResultSet`s — one per input statement, in order —
    *   matching the libsql-js batch contract. Each `ResultSet` carries that
-   *   statement's `columns`, `columnTypes`, `rows`, and `rowsAffected`.
+   *   statement's `columns`, `columnTypes`, `rows`, `rowsAffected`, and
+   *   `lastInsertRowid`, plus the server-side execution statistics
+   *   `rowsRead`, `rowsWritten`, and `queryDurationMs`.
    *
    * @example
    * // Plain SQL strings (non-atomic).
@@ -333,6 +365,8 @@ export class Connection {
         raw,
       );
       return results.map((result: any) => toResultSet(result));
+    } catch (error) {
+      throw shapeBatchError(error);
     } finally {
       this.execLock.release();
     }
@@ -694,14 +728,18 @@ export class Transaction {
     }
     const { raw } = normalizeBatchOptions(options);
     return await this.withGate(async () => {
-      const results = await this.session.batch(
-        statements,
-        undefined,
-        queryOptions,
-        this.defaultSafeIntegerMode,
-        raw,
-      );
-      return results.map((result: any) => toResultSet(result));
+      try {
+        const results = await this.session.batch(
+          statements,
+          undefined,
+          queryOptions,
+          this.defaultSafeIntegerMode,
+          raw,
+        );
+        return results.map((result: any) => toResultSet(result));
+      } catch (error) {
+        throw shapeBatchError(error);
+      }
     });
   }
 }

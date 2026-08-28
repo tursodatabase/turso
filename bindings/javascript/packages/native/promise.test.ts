@@ -525,3 +525,65 @@ test('transactionAsync() rejects callbacks that do not declare the handle', asyn
     expect(() => db.transactionAsync(async () => { })).toThrow(/Transaction handle/);
     expect(() => db.transactionAsync((async (...args: any[]) => { }) as any)).toThrow(/Transaction handle/);
 })
+
+test('batch returns per-statement details and stops at the first failure', async () => {
+    const db = await connect(":memory:");
+    const results = await db.batch([
+        "CREATE TABLE t_batch (id INTEGER PRIMARY KEY, name TEXT)",
+        { sql: "INSERT INTO t_batch (name) VALUES (?)", args: ["Alice"] },
+        { sql: "INSERT INTO t_batch (name) VALUES (?)", args: ["Bob"] },
+        "SELECT name FROM t_batch ORDER BY id",
+    ]);
+    expect(results.length).toBe(4);
+    expect(results[1].rowsAffected).toBe(1);
+    expect(results[1].lastInsertRowid).toBe(1);
+    expect(results[2].lastInsertRowid).toBe(2);
+    expect(results[3].rows).toEqual([{ name: "Alice" }, { name: "Bob" }]);
+    // The embedded engine does not report per-statement execution
+    // statistics; the serverless driver fills these from the server.
+    expect(results[1].rowsRead).toBeUndefined();
+    expect(results[1].rowsWritten).toBeUndefined();
+    expect(results[1].queryDurationMs).toBeUndefined();
+
+    let error: any = null;
+    try {
+        await db.batch([
+            { sql: "INSERT INTO t_batch (name) VALUES (?)", args: ["Carol"] },
+            "INSERT INTO no_such_table VALUES (1)",
+            { sql: "INSERT INTO t_batch (name) VALUES (?)", args: ["Dave"] },
+        ]);
+    } catch (e) {
+        error = e;
+    }
+    expect(error).not.toBeNull();
+    // The error identifies the failing statement and carries one entry
+    // per statement: the completed first statement's ResultSet, null for
+    // the failing statement and the skipped one after it.
+    expect(error.batchIndex).toBe(1);
+    expect(error.batchResults.length).toBe(3);
+    expect(error.batchResults[0].rowsAffected).toBe(1);
+    expect(error.batchResults[1]).toBeNull();
+    expect(error.batchResults[2]).toBeNull();
+    // Execution stopped at the failure: Carol committed, Dave never ran.
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_batch");
+    expect(await stmt.all([])).toEqual([{ n: 3 }]);
+})
+
+test('atomic batch failure rolls back and reports the failing statement', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t_atomic (x)");
+    let error: any = null;
+    try {
+        await db.batch([
+            { sql: "INSERT INTO t_atomic VALUES (?)", args: [1] },
+            "INSERT INTO no_such_table VALUES (1)",
+        ], "immediate");
+    } catch (e) {
+        error = e;
+    }
+    expect(error).not.toBeNull();
+    expect(error.batchIndex).toBe(1);
+    expect(error.batchResults.length).toBe(2);
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_atomic");
+    expect(await stmt.all([])).toEqual([{ n: 0 }]);
+})
