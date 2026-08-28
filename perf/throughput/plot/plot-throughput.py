@@ -13,7 +13,10 @@ deviation across the runs. Transactions per second go on the left axis
 as solid lines with filled markers; the CPU the whole process used during
 the run, as a share of every hardware thread on the machine, goes on the
 right axis, from 0 to 100%, as dashed lines with hollow markers, because
-a throughput number must never be shown without what it cost.
+a throughput number must never be shown without what it cost. An engine
+is told by its marker shape alone, so the legend is just one marker per
+engine; each group of lines is labelled on the plot with a sample of its
+line style.
 
 `-o` can be given more than once, and each output's format follows its
 extension: `.png`, `.pdf` and the other matplotlib formats draw the
@@ -30,14 +33,15 @@ from pathlib import Path
 import numpy as np
 
 # The Okabe-Ito palette: colour-blind safe, legible in greyscale, and what
-# gnuplot draws with by default. `tikz_mark` is the pgfplots name of the
-# matplotlib `marker`.
+# gnuplot draws with by default. `tikz_marks` are the pgf names of the
+# matplotlib `marker`, filled and hollow.
 ENGINES = {
-    "sqlite": {"name": "SQLite", "color": "#E69F00", "marker": "s", "tikz_mark": "square"},
-    "turso": {"name": "Turso", "color": "#0072B2", "marker": "o", "tikz_mark": "o"},
+    "sqlite": {"name": "SQLite", "color": "#E69F00", "marker": "s", "tikz_marks": ("square*", "square")},
+    "turso": {"name": "Turso", "color": "#0072B2", "marker": "o", "tikz_marks": ("*", "o")},
 }
 FALLBACK_COLORS = ["#009E73", "#D55E00", "#CC79A7"]
-FALLBACK_MARKERS = [("^", "triangle"), ("D", "diamond"), ("v", "triangle")]
+FALLBACK_MARKERS = [("^", ("triangle*", "triangle")), ("D", ("diamond*", "diamond")),
+                    ("v", ("triangle*", "triangle"))]
 
 
 def main():
@@ -87,10 +91,10 @@ class Series:
         look = ENGINES.get(engine)
         self.label = name or (look["name"] if look else engine)
         if look:
-            self.color, self.marker, self.tikz_mark = look["color"], look["marker"], look["tikz_mark"]
+            self.color, self.marker, self.tikz_marks = look["color"], look["marker"], look["tikz_marks"]
         else:
             self.color = FALLBACK_COLORS[index % len(FALLBACK_COLORS)]
-            self.marker, self.tikz_mark = FALLBACK_MARKERS[index % len(FALLBACK_MARKERS)]
+            self.marker, self.tikz_marks = FALLBACK_MARKERS[index % len(FALLBACK_MARKERS)]
         self.tikz_color = "".join(ch for ch in engine if ch.isalpha())
         mine = sorted(((c, v) for (e, c), v in runs.items() if e == engine), key=lambda kv: kv[0])
         self.throughput = [(c, *mean_sd([r.throughput for r in v])) for c, v in mine]
@@ -106,7 +110,9 @@ class Figure:
         self.connections = sorted({c for _, c in runs})
         self.series = [Series(e, i, runs, names.get(e))
                        for i, e in enumerate(sorted({e for e, _ in runs}))]
-        self.ymax = max(m + sd for s in self.series for _, m, sd in s.throughput) * 1.15
+        self.throughput_top = max(m + sd for s in self.series for _, m, sd in s.throughput)
+        self.cpu_top = max(m + sd for s in self.series for _, m, sd in s.cpu)
+        self.ymax = self.throughput_top * 1.15
 
     def matplotlib(self, output):
         import matplotlib
@@ -115,6 +121,7 @@ class Figure:
         import matplotlib.pyplot as plt
         import scienceplots  # noqa: F401  (registers the styles)
         from matplotlib.lines import Line2D
+        from matplotlib.offsetbox import AnnotationBbox, DrawingArea, HPacker, TextArea
         from matplotlib.ticker import FuncFormatter, NullLocator
 
         plt.style.use(["science", "no-latex"])
@@ -138,25 +145,34 @@ class Figure:
         ax.xaxis.set_minor_locator(NullLocator())
         ax.set_xlim(self.connections[0] / 1.5, self.connections[-1] * 1.5)
         ax.set_ylim(0, self.ymax)
-        ax.yaxis.set_major_formatter(FuncFormatter(fmt_count))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
         ax.set_xlabel("Connections")
-        ax.set_ylabel("Transactions/s")
+        ax.set_ylabel("Transactions per second (TPS)")
         cpu_ax.set_ylim(0, 100)
         cpu_ax.set_yticks([0, 25, 50, 75, 100])
-        cpu_ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}%"))
+        cpu_ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
         cpu_ax.yaxis.set_minor_locator(NullLocator())
-        cpu_ax.set_ylabel("CPU utilization")
+        cpu_ax.set_ylabel("CPU utilization (%)")
 
-        handles = [Line2D([], [], color=s.color, linewidth=1.3, marker=s.marker,
+        # Each group of lines gets a label above its right end, shifted left
+        # off the last marker, led by a sample of the group's line style.
+        def group_label(axis, y, text, linestyle):
+            sample = DrawingArea(14, 6, 0, 0)
+            sample.add_artist(Line2D([0, 14], [3, 3], color="0.4", linewidth=1.2, linestyle=linestyle))
+            label = HPacker(children=[sample, TextArea(text, textprops={"color": "0.4", "size": 7})],
+                            align="center", pad=0, sep=3)
+            axis.add_artist(AnnotationBbox(label, (self.connections[-1], y), xybox=(-10, 4),
+                                           boxcoords="offset points", box_alignment=(1, 0),
+                                           frameon=False, pad=0))
+
+        group_label(ax, self.throughput_top, "TPS", "-")
+        group_label(cpu_ax, self.cpu_top, "CPU", (0, (4, 2)))
+
+        handles = [Line2D([], [], color=s.color, linestyle="none", marker=s.marker,
                           markersize=4.5, label=s.label) for s in self.series]
-        handles += [
-            Line2D([], [], color="0.35", linewidth=1.3, marker="o", markersize=4.5,
-                   label="transactions/s"),
-            Line2D([], [], color="0.35", linewidth=1.1, linestyle=(0, (4, 2)), marker="o",
-                   markersize=4.5, markerfacecolor="white", label="CPU utilization"),
-        ]
-        fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False,
-                   handlelength=2.2, columnspacing=1.4, bbox_to_anchor=(0.5, -0.24))
+        fig.legend(handles=handles, loc="upper center", ncol=len(handles), frameon=False,
+                   handlelength=1.0, handletextpad=0.4, columnspacing=1.8,
+                   bbox_transform=ax.transAxes, bbox_to_anchor=(0.5, -0.2))
         fig.savefig(output, bbox_inches="tight")
 
     def tikz(self):
@@ -177,44 +193,44 @@ class Figure:
         # right. The legend is built on the first and placed under both.
         out.append(rf"""\begin{{axis}}[
   name=throughput, {common},
-  ymin=0, ymax={self.ymax:.4g}, xlabel={{Connections}}, ylabel={{Transactions/s}},
+  ymin=0, ymax={self.ymax:.4g}, xlabel={{Connections}}, ylabel={{Transactions per second (TPS)}},
+  yticklabel style={{/pgf/number format/1000 sep={{}}}},
   grid=major, grid style={{line width=0.3pt, dashed, draw=black!30}},
   axis y line*=left,
-  legend columns=-1, legend to name=throughputlegend, legend cell align=left,
-  legend style={{draw=none, font=\scriptsize, /tikz/every even column/.append style={{column sep=0.4cm}}}},
+  legend columns=-1, legend to name=throughputlegend,
+  legend style={{draw=none, font=\scriptsize, /tikz/every even column/.append style={{column sep=0.5cm}}}},
 ]""")
         for s in self.series:
-            coords = " ".join(f"({c},{m:.4g}) +- (0,{sd:.4g})" for c, m, sd in s.throughput)
-            out.append(rf"\addplot[{s.tikz_color}, line width=0.9pt, mark={s.tikz_mark}*, "
-                       rf"mark size=1.6pt] coordinates {{{coords}}};")
+            out.append(rf"\addlegendimage{{only marks, {s.tikz_color}, mark={s.tikz_marks[0]}, mark size=1.6pt}}")
             out.append(rf"\addlegendentry{{{s.label}}}")
-        out.append(r"\addlegendimage{black!65, line width=0.9pt, mark=*, mark size=1.6pt}")
-        out.append(r"\addlegendentry{transactions/s}")
-        out.append(r"\addlegendimage{black!65, line width=0.8pt, dashed, mark=o, mark size=1.6pt}")
-        out.append(r"\addlegendentry{CPU utilization}")
+        for s in self.series:
+            coords = " ".join(f"({c},{m:.4g}) +- (0,{sd:.4g})" for c, m, sd in s.throughput)
+            out.append(rf"\addplot[forget plot, {s.tikz_color}, line width=0.9pt, mark={s.tikz_marks[0]}, "
+                       rf"mark size=1.6pt] coordinates {{{coords}}};")
+        out.append(self.tikz_group_label(self.throughput_top, "TPS", ""))
         out.append(r"\end{axis}")
         out.append(rf"""\begin{{axis}}[
   at={{(throughput.south west)}}, anchor=south west, {common},
-  ymin=0, ymax=100, ytick={{0,25,50,75,100}}, yticklabel={{\pgfmathprintnumber{{\tick}}\%}},
-  axis y line*=right, axis x line=none, ylabel={{CPU utilization}},
+  ymin=0, ymax=100, ytick={{0,25,50,75,100}},
+  axis y line*=right, axis x line=none, ylabel={{CPU utilization (\%)}},
 ]""")
         for s in self.series:
             coords = " ".join(f"({c},{m:.4g}) +- (0,{sd:.4g})" for c, m, sd in s.cpu)
-            out.append(rf"\addplot[{s.tikz_color}, line width=0.8pt, dashed, mark={s.tikz_mark}, "
+            out.append(rf"\addplot[{s.tikz_color}, line width=0.8pt, dashed, mark={s.tikz_marks[1]}, "
                        rf"mark size=1.6pt, mark options={{solid}}] coordinates {{{coords}}};")
+        out.append(self.tikz_group_label(self.cpu_top, "CPU", "dashed, "))
         out.append(r"\end{axis}")
         out.append(r"\node[anchor=north] at ($(throughput.south west)!0.5!(throughput.south east) + (0,-0.9cm)$) "
                    r"{\pgfplotslegendfromname{throughputlegend}};")
         out.append(r"\end{tikzpicture}")
         return "\n".join(out) + "\n"
 
-
-def fmt_count(value, _pos=None):
-    if value >= 1_000_000:
-        return f"{value / 1e6:g}M"
-    if value >= 1_000:
-        return f"{value / 1e3:g}k"
-    return f"{value:g}"
+    def tikz_group_label(self, y, text, style):
+        """A label above the right end of a group of lines, shifted left off
+        the last marker, led by a sample of the group's line style."""
+        return (rf"\node[anchor=south east, xshift=-10pt, yshift=3pt, font=\scriptsize, text=black!60] "
+                rf"at (axis cs:{self.connections[-1]},{y:.4g}) "
+                rf"{{\tikz[baseline=-0.5ex, x=1cm, y=1cm]\draw[black!60, line width=0.8pt, {style}] (0,0) -- (0.45,0); {text}}};")
 
 
 if __name__ == "__main__":
