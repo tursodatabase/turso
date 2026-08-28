@@ -103,6 +103,22 @@ var name = await command.ExecuteScalarAsync();
 
 Remote mode uses the Hrana HTTP `/v2/pipeline` protocol. `libsql://` URLs default to HTTPS; `Tls=False` maps them to HTTP for local development. `ws://` and `wss://` URLs are accepted and mapped to the equivalent HTTP pipeline endpoint. `Auth Token` requires HTTPS unless the host is `localhost` or loopback.
 
+Add `Replica Path` to use the same provider surface with a local embedded replica:
+
+```C#
+await using var replica = new TursoConnection(
+    "Data Source=turso://example-org.turso.io;"
+    + "Auth Token=eyJ...;"
+    + "Replica Path=./replica.db;"
+    + "Pooling=False");
+await replica.OpenAsync();
+
+// Pull remote changes into the local replica. Local writes are not pushed.
+await replica.SyncAsync();
+```
+
+Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`. Local `Encryption Cipher` and `Encryption Key` do not configure remote replica encryption. Each connection owns its replica exclusively; pooling, automatic sync (`Sync Interval`), and replica batches are not supported yet.
+
 Remote mode also supports ADO.NET `DbBatch` for latency-sensitive workloads that should be sent in one Hrana batch:
 
 ```C#
@@ -155,7 +171,7 @@ await database.CheckpointAsync();
 
 `PullAsync` never pushes local writes. `PushAsync` currently follows the sync engine's last-write-wins conflict behavior, so use it only when that policy is acceptable. `CheckpointAsync` runs the sync engine's local checkpoint operation, while `GetStatsAsync` reports WAL sizes, CDC operations, transfer totals, revision, and the most recent pull and push times. Sync failures are `TursoSyncException` values carrying the operation, native status, sanitized endpoint, HTTP method/status, and original exception.
 
-Remote encryption is configured with `RemoteEncryption = new TursoRemoteEncryptionOptions { Key = key, Cipher = TursoRemoteEncryptionCipher.Aes256Gcm }`. It cannot be combined with partial sync. Query-based partial sync cannot set `PullBytesThreshold`, all partial-sync strategies require `BootstrapIfEmpty`, and partial sync is unavailable on Windows until native sparse-file hole detection is implemented. Connection-string replica integration, pooling, and automatic synchronization are not enabled yet; use the explicit `TursoSyncDatabaseOptions` API for these advanced settings.
+Remote encryption is configured with `RemoteEncryption = new TursoRemoteEncryptionOptions { Key = key, Cipher = TursoRemoteEncryptionCipher.Aes256Gcm }`. It cannot be combined with partial sync. Query-based partial sync cannot set `PullBytesThreshold`, all partial-sync strategies require `BootstrapIfEmpty`, and partial sync is unavailable on Windows until native sparse-file hole detection is implemented.
 
 Provider factories are available through `TursoFactory.Instance`:
 
