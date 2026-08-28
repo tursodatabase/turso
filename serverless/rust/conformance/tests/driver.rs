@@ -7,7 +7,7 @@
 use turso_serverless::{
     named_params,
     transaction::{DropBehavior, TransactionBehavior},
-    Builder, Connection, Error, Value,
+    BatchStatement, Builder, Connection, Error, Value,
 };
 use turso_serverless_conformance::{config_or_skip, unique_name};
 
@@ -298,6 +298,303 @@ async fn execute_batch_stops_at_first_error() {
         .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn batch_executes_parameterized_statements_in_order() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_pbatch");
+
+    let results = conn
+        .batch(vec![
+            BatchStatement::new(
+                format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, name TEXT)"),
+                (),
+            )
+            .unwrap(),
+            BatchStatement::new(
+                format!("INSERT INTO {table} (name) VALUES (?1)"),
+                ("Alice",),
+            )
+            .unwrap(),
+            BatchStatement::new(
+                format!("INSERT INTO {table} (name) VALUES (:name)"),
+                named_params![":name": "Bob"],
+            )
+            .unwrap(),
+            BatchStatement::new(format!("SELECT name FROM {table} ORDER BY id"), ()).unwrap(),
+        ])
+        .await
+        .unwrap();
+
+    // One result per statement, in order.
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[1].rows_affected(), 1);
+    assert_eq!(results[1].last_insert_rowid(), Some(1));
+    assert_eq!(results[2].last_insert_rowid(), Some(2));
+    let select = &results[3];
+    assert_eq!(select.columns()[0].name(), "name");
+    assert_eq!(select.rows().len(), 2);
+    assert_eq!(
+        select.rows()[0].get_value(0).unwrap(),
+        Value::Text("Alice".to_string())
+    );
+    assert_eq!(
+        select.rows()[1].get_value(0).unwrap(),
+        Value::Text("Bob".to_string())
+    );
+    assert_eq!(conn.last_insert_rowid(), 2);
+
+    // Server-side execution statistics are reported per statement
+    // (section 8.4).
+    for result in &results {
+        assert!(result.rows_read().is_some());
+        assert!(result.rows_written().is_some());
+        assert!(result.query_duration_ms().is_some());
+    }
+    assert!(results[1].rows_written().unwrap() >= 1);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn batch_accepts_strings_and_pairs() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_pbatchforms");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    conn.batch([
+        format!("INSERT INTO {table} VALUES (1)"),
+        format!("INSERT INTO {table} VALUES (2)"),
+    ])
+    .await
+    .unwrap();
+    conn.batch([
+        (format!("INSERT INTO {table} VALUES (?1)"), (3,)),
+        (format!("INSERT INTO {table} VALUES (?1)"), (4,)),
+    ])
+    .await
+    .unwrap();
+
+    let mut rows = conn
+        .query(format!("SELECT count(*), sum(x) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 4);
+    assert_eq!(row.get::<i64>(1).unwrap(), 10);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn batch_error_identifies_the_failing_statement() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_pbatcherr");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    let error = conn
+        .batch(vec![
+            BatchStatement::new(format!("INSERT INTO {table} VALUES (?1)"), (1,)).unwrap(),
+            BatchStatement::new(
+                format!("INSERT INTO no_such_table_{table} VALUES (?1)"),
+                (2,),
+            )
+            .unwrap(),
+            BatchStatement::new(format!("INSERT INTO {table} VALUES (?1)"), (3,)).unwrap(),
+        ])
+        .await
+        .unwrap_err();
+    match error {
+        Error::BatchStatementFailed {
+            index,
+            error,
+            results,
+        } => {
+            assert_eq!(index, 1);
+            assert!(error.to_string().contains("no_such_table"), "{error}");
+            // One entry per statement: the completed first statement's
+            // result, None for the failing and skipped ones.
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0].as_ref().unwrap().rows_affected(), 1);
+            assert!(results[1].is_none());
+            assert!(results[2].is_none());
+        }
+        other => panic!("expected BatchStatementFailed, got {other:?}"),
+    }
+
+    // The batch is not transactional: the statement before the failing one
+    // keeps its effect, and the one after it never ran.
+    let mut rows = conn
+        .query(format!("SELECT count(*) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn batch_joins_an_open_transaction() {
+    let config = config_or_skip!();
+    let mut conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_pbatchtx");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    tx.batch([
+        (format!("INSERT INTO {table} VALUES (?1)"), (1,)),
+        (format!("INSERT INTO {table} VALUES (?1)"), (2,)),
+    ])
+    .await
+    .unwrap();
+    // The batch ran inside the transaction rather than starting a stream
+    // of its own.
+    assert!(!tx.is_autocommit().unwrap());
+    tx.rollback().await.unwrap();
+
+    let mut rows = conn
+        .query(format!("SELECT count(*) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn empty_batch_returns_no_results() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+
+    let results = conn.batch(Vec::<BatchStatement>::new()).await.unwrap();
+    assert!(results.is_empty());
+    let results = conn
+        .transactional_batch(Vec::<BatchStatement>::new(), TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn transactional_batch_commits_atomically() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_tbatch");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    let results = conn
+        .transactional_batch(
+            [
+                (format!("INSERT INTO {table} VALUES (?1)"), (1,)),
+                (format!("INSERT INTO {table} VALUES (?1)"), (2,)),
+            ],
+            TransactionBehavior::Immediate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(conn.is_autocommit().unwrap());
+
+    // The committed rows are visible from a fresh connection.
+    let other = connect(&config.url, &config.auth_token).await;
+    let mut rows = other
+        .query(format!("SELECT count(*) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 2);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn transactional_batch_rolls_back_on_failure() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_tbatcherr");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    let error = conn
+        .transactional_batch(
+            [
+                (format!("INSERT INTO {table} VALUES (?1)"), (1,)),
+                (
+                    format!("INSERT INTO no_such_table_{table} VALUES (?1)"),
+                    (2,),
+                ),
+            ],
+            TransactionBehavior::Immediate,
+        )
+        .await
+        .unwrap_err();
+    match error {
+        Error::BatchStatementFailed { index, .. } => assert_eq!(index, 1),
+        other => panic!("expected BatchStatementFailed, got {other:?}"),
+    }
+    assert!(conn.is_autocommit().unwrap());
+
+    // The ROLLBACK step undid the first insert.
+    let mut rows = conn
+        .query(format!("SELECT count(*) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn transactional_batch_joins_an_open_transaction() {
+    let config = config_or_skip!();
+    let mut conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_tbatchtx");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    // With a transaction already open the wrapping is skipped and the
+    // statements join it, so the outer rollback undoes them.
+    let tx = conn.transaction().await.unwrap();
+    tx.transactional_batch(
+        [(format!("INSERT INTO {table} VALUES (?1)"), (1,))],
+        TransactionBehavior::Immediate,
+    )
+    .await
+    .unwrap();
+    assert!(!tx.is_autocommit().unwrap());
+    tx.rollback().await.unwrap();
+
+    let mut rows = conn
+        .query(format!("SELECT count(*) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
 
     drop_table(&conn, &table).await;
 }

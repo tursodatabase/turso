@@ -1,3 +1,4 @@
+use crate::batch::BatchResult;
 use crate::protocol::ProtoError;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -46,6 +47,21 @@ pub enum Error {
     /// non-200 response from the server (section 9.3).
     #[error("{0}")]
     Http(String),
+    /// A statement of a [`batch`](crate::Connection::batch) failed.
+    /// Carries the zero-based index of the failing statement within the
+    /// batch, the underlying error, and the per-statement results.
+    #[error("batch statement {index} failed: {error}")]
+    BatchStatementFailed {
+        index: usize,
+        error: Box<Error>,
+        /// One entry per statement of the batch, in order: the result of
+        /// each statement that completed, or `None` for the failing
+        /// statement and the statements that did not run. In a
+        /// non-transactional batch the completed statements' effects are
+        /// committed; in a transactional batch they were rolled back.
+        /// Empty when the batch failed before reaching the database.
+        results: Vec<Option<BatchResult>>,
+    },
 }
 
 impl From<ProtoError> for Error {

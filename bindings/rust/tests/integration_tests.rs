@@ -2193,3 +2193,238 @@ async fn test_typed_numeric_row_conversions() {
     assert_eq!(row.get::<f64>(4).unwrap(), -1.0);
     assert_eq!(row.get::<f64>(9).unwrap(), 9_007_199_254_740_993_i64 as f64);
 }
+
+async fn memory_connection() -> turso::Connection {
+    Builder::new_local(":memory:")
+        .build()
+        .await
+        .expect("in-memory database must open")
+        .connect()
+        .expect("connection must open")
+}
+
+#[tokio::test]
+async fn test_batch_executes_parameterized_statements_in_order() {
+    use turso::{named_params, BatchStatement};
+
+    let conn = memory_connection().await;
+    let results = conn
+        .batch(vec![
+            BatchStatement::new("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", ()).unwrap(),
+            BatchStatement::new("INSERT INTO t (name) VALUES (?1)", ("Alice",)).unwrap(),
+            BatchStatement::new(
+                "INSERT INTO t (name) VALUES (:name)",
+                named_params![":name": "Bob"],
+            )
+            .unwrap(),
+            BatchStatement::new("SELECT name FROM t ORDER BY id", ()).unwrap(),
+        ])
+        .await
+        .unwrap();
+
+    // One result per statement, in order.
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[1].rows_affected(), 1);
+    assert_eq!(results[1].last_insert_rowid(), Some(1));
+    assert_eq!(results[2].last_insert_rowid(), Some(2));
+    let select = &results[3];
+    assert_eq!(select.columns()[0].name(), "name");
+    assert_eq!(select.rows().len(), 2);
+    assert_eq!(
+        select.rows()[0].get_value(0).unwrap(),
+        Value::Text("Alice".to_string())
+    );
+    assert_eq!(
+        select.rows()[1].get_value(0).unwrap(),
+        Value::Text("Bob".to_string())
+    );
+    assert_eq!(conn.last_insert_rowid(), 2);
+}
+
+#[tokio::test]
+async fn test_batch_accepts_strings_and_pairs() {
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    conn.batch(["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)"])
+        .await
+        .unwrap();
+    conn.batch([
+        ("INSERT INTO t VALUES (?1)", (3,)),
+        ("INSERT INTO t VALUES (?1)", (4,)),
+    ])
+    .await
+    .unwrap();
+
+    let mut rows = conn
+        .query("SELECT count(*), sum(x) FROM t", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 4);
+    assert_eq!(row.get::<i64>(1).unwrap(), 10);
+}
+
+#[tokio::test]
+async fn test_batch_error_identifies_the_failing_statement() {
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let error = conn
+        .batch([
+            ("INSERT INTO t VALUES (?1)", (1,)),
+            ("INSERT INTO no_such_table VALUES (?1)", (2,)),
+            ("INSERT INTO t VALUES (?1)", (3,)),
+        ])
+        .await
+        .unwrap_err();
+    match error {
+        Error::BatchStatementFailed {
+            index,
+            error,
+            results,
+        } => {
+            assert_eq!(index, 1);
+            assert!(error.to_string().contains("no_such_table"), "{error}");
+            // One entry per statement: the completed first statement's
+            // result, None for the failing and skipped ones.
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0].as_ref().unwrap().rows_affected(), 1);
+            assert!(results[1].is_none());
+            assert!(results[2].is_none());
+        }
+        other => panic!("expected BatchStatementFailed, got {other:?}"),
+    }
+
+    // The batch is not transactional: the statement before the failing one
+    // keeps its effect, and the one after it never ran.
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_batch_joins_an_open_transaction() {
+    let mut conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    tx.batch([
+        ("INSERT INTO t VALUES (?1)", (1,)),
+        ("INSERT INTO t VALUES (?1)", (2,)),
+    ])
+    .await
+    .unwrap();
+    // The batch ran inside the transaction rather than committing on its
+    // own.
+    assert!(!tx.is_autocommit().unwrap());
+    tx.rollback().await.unwrap();
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_empty_batch_returns_no_results() {
+    use turso::{transaction::TransactionBehavior, BatchStatement};
+
+    let conn = memory_connection().await;
+    let results = conn.batch(Vec::<BatchStatement>::new()).await.unwrap();
+    assert!(results.is_empty());
+    let results = conn
+        .transactional_batch(Vec::<BatchStatement>::new(), TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn test_transactional_batch_commits_atomically() {
+    use turso::transaction::TransactionBehavior;
+
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let results = conn
+        .transactional_batch(
+            [
+                ("INSERT INTO t VALUES (?1)", (1,)),
+                ("INSERT INTO t VALUES (?1)", (2,)),
+            ],
+            TransactionBehavior::Immediate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(conn.is_autocommit().unwrap());
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_transactional_batch_rolls_back_on_failure() {
+    use turso::transaction::TransactionBehavior;
+
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let error = conn
+        .transactional_batch(
+            [
+                ("INSERT INTO t VALUES (?1)", (1,)),
+                ("INSERT INTO no_such_table VALUES (?1)", (2,)),
+            ],
+            TransactionBehavior::Immediate,
+        )
+        .await
+        .unwrap_err();
+    match error {
+        Error::BatchStatementFailed { index, .. } => assert_eq!(index, 1),
+        other => panic!("expected BatchStatementFailed, got {other:?}"),
+    }
+    assert!(conn.is_autocommit().unwrap());
+
+    // The rollback undid the first insert.
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_transactional_batch_joins_an_open_transaction() {
+    use turso::transaction::TransactionBehavior;
+
+    let mut conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    // With a transaction already open the wrapping is skipped and the
+    // statements join it, so the outer rollback undoes them.
+    let tx = conn.transaction().await.unwrap();
+    tx.transactional_batch(
+        [("INSERT INTO t VALUES (?1)", (1,))],
+        TransactionBehavior::Immediate,
+    )
+    .await
+    .unwrap();
+    assert!(!tx.is_autocommit().unwrap());
+    tx.rollback().await.unwrap();
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+}

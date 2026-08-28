@@ -23,7 +23,7 @@ pub enum TransactionBehavior {
 }
 
 impl TransactionBehavior {
-    fn begin_sql(self) -> &'static str {
+    pub(crate) fn begin_sql(self) -> &'static str {
         match self {
             TransactionBehavior::Deferred => "BEGIN DEFERRED",
             TransactionBehavior::Immediate => "BEGIN IMMEDIATE",

@@ -36,6 +36,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod batch;
 pub mod connection;
 pub mod params;
 mod rows;
@@ -45,6 +46,7 @@ pub mod value;
 #[cfg(feature = "sync")]
 pub mod sync;
 
+pub use batch::{BatchResult, BatchStatement, IntoBatchStatement};
 pub use connection::Connection;
 use turso_sdk_kit::rsapi::TursoError;
 pub use turso_sdk_kit::IoBackend;
@@ -112,6 +114,21 @@ pub enum Error {
     Corrupt(String),
     #[error("I/O error ({1}): {0}")]
     IoError(std::io::ErrorKind, &'static str),
+    /// A statement of a [`batch`](crate::Connection::batch) failed.
+    /// Carries the zero-based index of the failing statement within the
+    /// batch, the underlying error, and the per-statement results.
+    #[error("batch statement {index} failed: {error}")]
+    BatchStatementFailed {
+        index: usize,
+        error: Box<Error>,
+        /// One entry per statement of the batch, in order: the result of
+        /// each statement that completed, or `None` for the failing
+        /// statement and the statements that did not run. In a
+        /// non-transactional batch the completed statements' effects are
+        /// committed; in a transactional batch they were rolled back.
+        /// Empty when the batch failed before reaching the database.
+        results: Vec<Option<BatchResult>>,
+    },
 }
 
 impl From<turso_sdk_kit::rsapi::TursoError> for Error {
@@ -563,6 +580,7 @@ impl Statement {
 }
 
 /// Column information.
+#[derive(Debug, Clone)]
 pub struct Column {
     name: String,
     decl_type: Option<String>,

@@ -1,4 +1,5 @@
 use crate::assert_send_sync;
+use crate::batch::{BatchResult, BatchStatement, IntoBatchStatement};
 use crate::transaction::DropBehavior;
 use crate::transaction::TransactionBehavior;
 use crate::Error;
@@ -131,6 +132,181 @@ impl Connection {
         self.maybe_handle_dangling_tx().await?;
         self.prepare_execute_batch(sql).await?;
         Ok(())
+    }
+
+    /// Execute multiple parameterized statements as a batch.
+    ///
+    /// The statements execute in order. Execution stops at the first
+    /// statement that fails: the remaining statements are skipped and the
+    /// returned [`Error::BatchStatementFailed`](crate::Error::BatchStatementFailed)
+    /// carries the zero-based index of the failing statement together with
+    /// the underlying error.
+    ///
+    /// The batch is not transactional: each statement commits as it
+    /// executes, so statements that ran before a failure stay committed.
+    /// For all-or-nothing execution use
+    /// [`transactional_batch`](Connection::transactional_batch). If a
+    /// transaction is open on this connection — including when calling
+    /// through a [`Transaction`](crate::transaction::Transaction) — the
+    /// statements join it instead of committing individually.
+    ///
+    /// Accepts plain SQL strings, `(sql, params)` pairs, and
+    /// [`crate::BatchStatement`]s (see [`IntoBatchStatement`]). Returns one
+    /// [`BatchResult`] per statement, in order.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn run(conn: turso::Connection) -> turso::Result<()> {
+    /// // Statements whose parameters have the same type can be passed
+    /// // as (sql, params) pairs.
+    /// conn.batch([
+    ///     ("INSERT INTO users (name) VALUES (?1)", ("Alice",)),
+    ///     ("INSERT INTO users (name) VALUES (?1)", ("Bob",)),
+    /// ])
+    /// .await?;
+    ///
+    /// // Batches mixing parameter shapes use `BatchStatement`.
+    /// use turso::BatchStatement;
+    /// let results = conn
+    ///     .batch(vec![
+    ///         BatchStatement::new("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())?,
+    ///         BatchStatement::new("INSERT INTO t (v) VALUES (?1)", ("x",))?,
+    ///     ])
+    ///     .await?;
+    /// assert_eq!(results[1].rows_affected(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn batch<I>(&self, stmts: I) -> Result<Vec<BatchResult>>
+    where
+        I: IntoIterator,
+        I::Item: IntoBatchStatement,
+    {
+        self.run_batch(stmts, None).await
+    }
+
+    /// Execute multiple parameterized statements atomically.
+    ///
+    /// Like [`batch`](Connection::batch), but the statements are wrapped in
+    /// `BEGIN <behavior>` / `COMMIT`, with a `ROLLBACK` on failure: either
+    /// every statement commits or none does. On failure the returned
+    /// [`Error::BatchStatementFailed`](crate::Error::BatchStatementFailed)
+    /// carries the zero-based index of the failing statement.
+    ///
+    /// This method owns the surrounding transaction, so the statements must
+    /// not contain their own transaction-control SQL (`BEGIN`, `COMMIT`,
+    /// `ROLLBACK`, `SAVEPOINT`, `RELEASE`); a user-supplied `COMMIT` would
+    /// close the wrapper transaction mid-batch and leave earlier statements
+    /// committed, defeating the all-or-nothing contract. If a transaction
+    /// is already open on this connection, the wrapping is skipped and the
+    /// statements join it, exactly as with [`batch`](Connection::batch).
+    pub async fn transactional_batch<I>(
+        &self,
+        stmts: I,
+        behavior: TransactionBehavior,
+    ) -> Result<Vec<BatchResult>>
+    where
+        I: IntoIterator,
+        I::Item: IntoBatchStatement,
+    {
+        self.run_batch(stmts, Some(behavior)).await
+    }
+
+    async fn run_batch<I>(
+        &self,
+        stmts: I,
+        wrap: Option<TransactionBehavior>,
+    ) -> Result<Vec<BatchResult>>
+    where
+        I: IntoIterator,
+        I::Item: IntoBatchStatement,
+    {
+        let stmts = stmts
+            .into_iter()
+            .enumerate()
+            .map(|(index, stmt)| {
+                stmt.into_batch_statement()
+                    .map_err(|error| Error::BatchStatementFailed {
+                        index,
+                        error: Box::new(error),
+                        results: Vec::new(),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if stmts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.maybe_handle_dangling_tx().await?;
+        // With a transaction already open on the connection, another BEGIN
+        // would fail; the statements join the open transaction instead
+        // (matching the serverless driver).
+        let wrap = if self.is_autocommit()? { wrap } else { None };
+        if let Some(behavior) = wrap {
+            self.execute(behavior.begin_sql(), ()).await?;
+        }
+        let statement_count = stmts.len();
+        let mut results = Vec::with_capacity(statement_count);
+        for (index, stmt) in stmts.into_iter().enumerate() {
+            match self.execute_batch_statement(stmt).await {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    // ROLLBACK errors are ignored: the statement failure is
+                    // the error being reported, and surfacing a rollback
+                    // error would mask it.
+                    if wrap.is_some() {
+                        let _ = self.execute("ROLLBACK", ()).await;
+                    }
+                    // One entry per statement: the completed statements'
+                    // results, None for the failing and skipped ones.
+                    let mut partial: Vec<Option<BatchResult>> =
+                        results.into_iter().map(Some).collect();
+                    partial.resize_with(statement_count, || None);
+                    return Err(Error::BatchStatementFailed {
+                        index,
+                        error: Box::new(error),
+                        results: partial,
+                    });
+                }
+            }
+        }
+        if wrap.is_some() {
+            if let Err(error) = self.execute("COMMIT", ()).await {
+                let _ = self.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Execute one statement of a batch, buffering its rows.
+    async fn execute_batch_statement(&self, stmt: BatchStatement) -> Result<BatchResult> {
+        let rowid_before = self.last_insert_rowid();
+        let mut prepared = self.prepare(&stmt.sql).await?;
+        let mut rows = prepared.query(stmt.params).await?;
+        let columns = rows.columns();
+        let mut buffered = Vec::new();
+        while let Some(row) = rows.next().await? {
+            buffered.push(row);
+        }
+        let rowid_after = self.last_insert_rowid();
+        // The engine tracks the inserted rowid per connection, not per
+        // statement; a change across this statement means it inserted.
+        let last_insert_rowid = (rowid_after != rowid_before).then_some(rowid_after);
+        // n_change reports the connection's last change count, which a
+        // row-returning statement does not update; report 0 for those
+        // rather than the previous statement's count, matching the server.
+        let rows_affected = if columns.is_empty() {
+            prepared.n_change()
+        } else {
+            0
+        };
+        Ok(BatchResult::new(
+            columns,
+            buffered,
+            rows_affected,
+            last_insert_rowid,
+        ))
     }
 
     /// Prepare a SQL statement for later execution.
