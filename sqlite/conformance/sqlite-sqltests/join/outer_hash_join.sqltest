@@ -178,6 +178,21 @@ expect {
 }
 
 @cross-check-integrity
+test full-outer-join-null-extends-rowid {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(c);
+    INSERT INTO t1(rowid, a) VALUES (7, 9);
+    INSERT INTO t2 VALUES (9);
+    SELECT quote(t1.rowid), quote(t1.a), quote(t2.c)
+      FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c AND t1.a + t2.c = 0
+     ORDER BY t2.c IS NOT NULL;
+}
+expect {
+    7|9|NULL
+    NULL|NULL|9
+}
+
+@cross-check-integrity
 test full-outer-join-all-match {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -766,6 +781,27 @@ test full-outer-join-spill {
 }
 expect {
     600|500|201
+}
+
+# Probe rows for spilled partitions must wait for grace processing instead of
+# being emitted as unmatched rows by the main probe loop.
+@cross-check-integrity
+test full-outer-join-spill-defers-probe-misses {
+    CREATE TABLE spill_left(a, b);
+    CREATE TABLE spill_right(c, d);
+    INSERT INTO spill_left SELECT value, 'left-' || value FROM generate_series(1, 5000);
+    INSERT INTO spill_right SELECT value, 'right-' || value FROM generate_series(1, 5000);
+    SELECT count(*),
+           count(spill_left.rowid),
+           count(spill_right.rowid),
+           sum(spill_left.a),
+           sum(spill_right.c)
+      FROM spill_left FULL OUTER JOIN spill_right
+        ON spill_left.a = spill_right.c
+       AND spill_left.a + spill_right.c < 0;
+}
+expect {
+    10000|5000|5000|12502500|12502500
 }
 
 # Multi-table LEFT JOIN with spill: inner loop must be iterated via Gosub
