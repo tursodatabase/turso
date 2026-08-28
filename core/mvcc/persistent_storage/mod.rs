@@ -211,25 +211,30 @@ impl GroupCommitState {
     /// While an fsync IS in flight nobody is woken: its completion is the
     /// next event, and it does the waking.
     pub fn append_finished(&self, epoch: u64, start: u64, end: u64) {
-        let mut inner = self.inner.lock();
-        if self.epoch.load(Ordering::Acquire) != epoch {
-            return;
-        }
-        if inner.written == start {
-            inner.written = end;
-            while let Some((&next_start, &next_end)) = inner.finished_above.first_key_value() {
-                if next_start != inner.written {
-                    break;
-                }
-                inner.finished_above.remove(&next_start);
-                inner.written = next_end;
+        let mut woken = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            if self.epoch.load(Ordering::Acquire) != epoch {
+                return;
             }
-        } else {
-            inner.finished_above.insert(start, end);
+            if inner.written == start {
+                inner.written = end;
+                while let Some((&next_start, &next_end)) = inner.finished_above.first_key_value() {
+                    if next_start != inner.written {
+                        break;
+                    }
+                    inner.finished_above.remove(&next_start);
+                    inner.written = next_end;
+                }
+            } else {
+                inner.finished_above.insert(start, end);
+            }
+            if !inner.sync_in_flight {
+                let written = inner.written;
+                Self::remove_woken_waiters(&mut inner, written, &mut woken);
+            }
         }
-        if !inner.sync_in_flight {
-            Self::wake_leader_candidates(&mut inner);
-        }
+        Self::complete_woken_waiters(woken);
     }
 
     /// Called from the group fsync's completion: everything written before
@@ -238,64 +243,80 @@ impl GroupCommitState {
     /// for the new log. Wakes the committers the fsync covered, plus the
     /// ones that can lead the next fsync.
     fn sync_finished(&self, epoch: u64, covers: u64) {
-        let mut inner = self.inner.lock();
-        if self.epoch.load(Ordering::Acquire) == epoch {
-            self.durable.fetch_max(covers, Ordering::AcqRel);
-        }
-        inner.sync_in_flight = false;
-        let durable = self.durable.load(Ordering::Acquire);
-        inner.waiters.retain(|(target, waiter)| {
-            if *target <= durable {
-                waiter.complete(0);
-                false
-            } else {
-                true
+        let mut woken = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            if self.epoch.load(Ordering::Acquire) == epoch {
+                self.durable.fetch_max(covers, Ordering::AcqRel);
             }
-        });
-        Self::wake_leader_candidates(&mut inner);
+            inner.sync_in_flight = false;
+            // The fsync covered every waiter at or below the durable line;
+            // waiters at or below the written line can lead the next fsync.
+            // The durable line never passes the written line, so one sweep
+            // catches both groups.
+            let written = inner.written;
+            Self::remove_woken_waiters(&mut inner, written, &mut woken);
+        }
+        Self::complete_woken_waiters(woken);
     }
 
-    /// Wake every parked committer whose bytes the written line covers: each
-    /// can submit the next group fsync, one wins, the rest park again. A
-    /// waiter above the written line stays parked; the append completion
-    /// that advances the line past it wakes it. Callers hold the lock and
-    /// have already checked that no fsync is in flight.
-    fn wake_leader_candidates(inner: &mut GroupCommitInner) {
-        let written = inner.written;
+    /// Remove every parked committer whose bytes the `upto` line covers and
+    /// collect their completions into `woken`: each resumed committer either
+    /// finds its target durable or races to submit the next group fsync (one
+    /// wins, the rest park again). A waiter above the line stays parked; the
+    /// append completion that advances the line past it wakes it. Callers
+    /// hold the lock, have already checked that no fsync is in flight, and
+    /// must run `complete_woken_waiters` AFTER dropping the lock.
+    fn remove_woken_waiters(inner: &mut GroupCommitInner, upto: u64, woken: &mut Vec<Completion>) {
         inner.waiters.retain(|(target, waiter)| {
-            if *target <= written {
-                waiter.complete(0);
+            if *target <= upto {
+                woken.push(waiter.clone());
                 false
             } else {
                 true
             }
         });
+    }
+
+    /// Run collected waiter completions. Never call with the group lock
+    /// held: each completion crosses into the committer's scheduler, which
+    /// can take microseconds, and appends serialize on that lock — a wake
+    /// storm inside it stalls every committing connection and delays the
+    /// next group fsync.
+    fn complete_woken_waiters(woken: Vec<Completion>) {
+        for waiter in woken {
+            waiter.complete(0);
+        }
     }
 
     /// Mark the log tail untrustworthy and wake everyone so they observe it.
     pub fn poison(&self) {
         self.poisoned.store(true, Ordering::Release);
-        let mut inner = self.inner.lock();
-        inner.sync_in_flight = false;
-        Self::wake_all_waiters(&mut inner);
+        let woken = {
+            let mut inner = self.inner.lock();
+            inner.sync_in_flight = false;
+            Self::take_all_waiters(&mut inner)
+        };
+        Self::complete_woken_waiters(woken);
     }
 
     /// Forget all progress after a truncate or reset. Stale completions from
     /// before the reset are ignored via the epoch.
     pub fn reset(&self) {
-        let mut inner = self.inner.lock();
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.durable.store(0, Ordering::Release);
-        inner.written = 0;
-        inner.finished_above.clear();
-        inner.sync_in_flight = false;
-        Self::wake_all_waiters(&mut inner);
+        let woken = {
+            let mut inner = self.inner.lock();
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+            self.durable.store(0, Ordering::Release);
+            inner.written = 0;
+            inner.finished_above.clear();
+            inner.sync_in_flight = false;
+            Self::take_all_waiters(&mut inner)
+        };
+        Self::complete_woken_waiters(woken);
     }
 
-    fn wake_all_waiters(inner: &mut GroupCommitInner) {
-        for (_, waiter) in inner.waiters.drain(..) {
-            waiter.complete(0);
-        }
+    fn take_all_waiters(inner: &mut GroupCommitInner) -> Vec<Completion> {
+        inner.waiters.drain(..).map(|(_, waiter)| waiter).collect()
     }
 }
 
