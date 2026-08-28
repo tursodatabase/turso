@@ -440,7 +440,9 @@ fn bench_huge_multi_write_rowid(c: &mut Criterion) {
 /// Rows per measured transaction, matching `perf/latency`'s default batch.
 const WRITE_TXN_BATCH: usize = 10;
 /// Rebuild the database every this many measured transactions so the version
-/// store's size stays bounded over a long Criterion run.
+/// store's size stays bounded over a long Criterion run. The codspeed path
+/// runs few iterations and never rebuilds.
+#[cfg(not(feature = "codspeed"))]
 const WRITE_TXN_RESET_EVERY: u64 = 2_000;
 
 struct WriteTxnHarness {
@@ -468,13 +470,27 @@ impl WriteTxnHarness {
 
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_write_txn(c: &mut Criterion) {
-    let idx1 = NonZeroUsize::new(1).unwrap();
-    let idx2 = NonZeroUsize::new(2).unwrap();
     let mut group = c.benchmark_group("mvcc-write-txn");
     group.throughput(Throughput::Elements(WRITE_TXN_BATCH as u64));
     group.bench_function(
         format!("begin_concurrent-insert{WRITE_TXN_BATCH}-commit"),
         |b| {
+            // CodSpeed's instrumentation only measures the plain `iter`
+            // family, so that path measures one whole transaction per
+            // iteration against a harness built outside the measurement.
+            // CodSpeed runs a bounded number of iterations, so the store
+            // stays small without rebuilds.
+            #[cfg(feature = "codspeed")]
+            {
+                let harness = WriteTxnHarness::new();
+                let mut stmts = prepare_write_txn_stmts(&harness);
+                let mut next_id: i64 = 1;
+                b.iter(|| run_write_txn(&harness.db, &mut stmts, &mut next_id));
+            }
+            // Plain criterion runs many more iterations, so rebuild the
+            // database every WRITE_TXN_RESET_EVERY transactions (outside the
+            // timed section) to keep the version store bounded.
+            #[cfg(not(feature = "codspeed"))]
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 let mut harness: Option<WriteTxnHarness> = None;
@@ -482,41 +498,56 @@ fn bench_write_txn(c: &mut Criterion) {
                 let mut next_id: i64 = 1;
                 for i in 0..iters {
                     if i % WRITE_TXN_RESET_EVERY == 0 {
-                        // Rebuild from scratch (setup time is excluded from `total`).
                         let h = WriteTxnHarness::new();
-                        stmts = Some((
-                            h.conn.prepare("BEGIN CONCURRENT").unwrap(),
-                            h.conn
-                                .prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")
-                                .unwrap(),
-                            h.conn.prepare("COMMIT").unwrap(),
-                        ));
+                        stmts = Some(prepare_write_txn_stmts(&h));
                         harness = Some(h);
                         next_id = 1;
                     }
                     let db = &harness.as_ref().unwrap().db;
-                    let (begin, insert, commit) = stmts.as_mut().unwrap();
+                    let stmts = stmts.as_mut().unwrap();
                     let start = Instant::now();
-                    run_to_completion(db, begin);
-                    begin.reset().unwrap();
-                    for _ in 0..WRITE_TXN_BATCH {
-                        insert.bind_at(idx1, Value::from_i64(next_id)).unwrap();
-                        insert
-                            .bind_at(idx2, Value::build_text(format!("data_{next_id}")))
-                            .unwrap();
-                        run_to_completion(db, insert);
-                        insert.reset().unwrap();
-                        next_id += 1;
-                    }
-                    run_to_completion(db, commit);
-                    commit.reset().unwrap();
+                    run_write_txn(db, stmts, &mut next_id);
                     total += start.elapsed();
                 }
                 total
-            })
+            });
         },
     );
     group.finish();
+}
+
+fn prepare_write_txn_stmts(harness: &WriteTxnHarness) -> (Statement, Statement, Statement) {
+    (
+        harness.conn.prepare("BEGIN CONCURRENT").unwrap(),
+        harness
+            .conn
+            .prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")
+            .unwrap(),
+        harness.conn.prepare("COMMIT").unwrap(),
+    )
+}
+
+/// One measured transaction: begin, `WRITE_TXN_BATCH` prepared inserts, commit.
+fn run_write_txn(
+    db: &Arc<Database>,
+    (begin, insert, commit): &mut (Statement, Statement, Statement),
+    next_id: &mut i64,
+) {
+    let idx1 = NonZeroUsize::new(1).unwrap();
+    let idx2 = NonZeroUsize::new(2).unwrap();
+    run_to_completion(db, begin);
+    begin.reset().unwrap();
+    for _ in 0..WRITE_TXN_BATCH {
+        insert.bind_at(idx1, Value::from_i64(*next_id)).unwrap();
+        insert
+            .bind_at(idx2, Value::build_text(format!("data_{next_id}")))
+            .unwrap();
+        run_to_completion(db, insert);
+        insert.reset().unwrap();
+        *next_id += 1;
+    }
+    run_to_completion(db, commit);
+    commit.reset().unwrap();
 }
 
 #[cfg(not(feature = "codspeed"))]
