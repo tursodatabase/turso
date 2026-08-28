@@ -532,6 +532,13 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// reseeds at the current B-tree key instead of trusting its stale
     /// position.
     index_finger_epoch: u64,
+    /// Cached [`Self::is_btree_allocated`] answer: 0 unset, 1 no, 2 yes.
+    /// The gate's inputs are fixed for the cursor's life — the transaction's
+    /// begin timestamp and read mark never change, and the btree-read gate
+    /// is stable for a fixed (table, begin, mark) triple — but recomputing
+    /// it did two transaction map lookups and a root-binding search on every
+    /// row operation.
+    btree_allocated: std::sync::atomic::AtomicU8,
 }
 
 pub enum NextRowidResult {
@@ -598,6 +605,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             dual_peek: DualCursorPeek::default(),
             index_finger: IndexShadowFinger::default(),
             index_finger_epoch: 0,
+            btree_allocated: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -796,6 +804,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn is_btree_allocated(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.btree_allocated.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+        let allocated = self.compute_btree_allocated();
+        self.btree_allocated
+            .store(if allocated { 2 } else { 1 }, Ordering::Relaxed);
+        allocated
+    }
+
+    /// See `is_btree_allocated`, which caches this for the cursor's life.
+    fn compute_btree_allocated(&self) -> bool {
         // The inner btree cursor's root was resolved once, at open
         // (`get_real_table_id`). If the root map had no published root page
         // yet, that root is the negative table-id sentinel and there is no
