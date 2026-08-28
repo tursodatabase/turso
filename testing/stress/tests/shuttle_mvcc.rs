@@ -737,3 +737,166 @@ async fn begin_publish_window_gc_scenario(num_readers: usize, rounds: i64) {
         "Observed a row, and then no row. This violates Snapshot Isolation"
     );
 }
+
+async fn setup_mvcc_db_passive(schema: &str) -> (turso::Database, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .experimental_mvcc_passive_checkpoint(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+        .await
+        .unwrap();
+    while let Ok(Some(_)) = rows.next().await {}
+    drop(rows);
+    if !schema.is_empty() {
+        conn.execute_batch(schema).await.unwrap();
+    }
+    (db, dir)
+}
+
+/// Passive checkpoint cursor-before-root-publish race.
+///
+/// A passive checkpoint commits materialized btree pages to the WAL before
+/// publishing the root binding. A reader that begins a transaction after the
+/// pager commit but opens a cursor before the publish window resolves the
+/// negative sentinel as its btree root. When the publish runs and the
+/// btree-readable gate flips true, the cursor falls through to the btree and
+/// panics in read_page on the negative page id.
+///
+/// The scenario:
+/// 1. Writer creates a table and inserts rows (table not yet checkpointed)
+/// 2. Checkpoint runs, commits pages to WAL
+/// 3. Reader begins tx (read mark covers materialized pages)
+/// 4. Reader opens cursor (gets sentinel root - binding not published)
+/// 5. Checkpoint publishes root binding
+/// 6. Reader probes a non-existent rowid → falls through to btree → panic
+async fn passive_checkpoint_cursor_before_root_publish_scenario(
+    num_writers: usize,
+    num_readers: usize,
+    rounds: i64,
+) {
+    let (db, _dir) = setup_mvcc_db_passive("").await;
+
+    let panic_detected = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+
+    // Writer: repeatedly create tables and insert rows
+    for w in 0..num_writers {
+        let conn = db.connect().unwrap();
+        let panic_detected = panic_detected.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            for i in 0..rounds {
+                let table_name = format!("t_w{w}_i{i}");
+                // Create table (rootpage is negative sentinel until checkpointed)
+                if conn
+                    .execute(
+                        &format!("CREATE TABLE {table_name}(id INTEGER PRIMARY KEY, val INTEGER)"),
+                        (),
+                    )
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                // Insert some rows
+                for j in 0..3i64 {
+                    let _ = conn
+                        .execute(&format!("INSERT INTO {table_name} VALUES({j}, {j})"), ())
+                        .await;
+                }
+                // Trigger checkpoint to materialize the btree
+                let _ = conn.execute("PRAGMA wal_checkpoint(PASSIVE)", ()).await;
+            }
+            let _ = &panic_detected;
+        }));
+    }
+
+    // Reader: open cursors on tables and probe non-existent rowids
+    for _ in 0..num_readers {
+        let conn = db.connect().unwrap();
+        let panic_detected = panic_detected.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            for i in 0..rounds * 2 {
+                // Query tables that may be mid-checkpoint
+                conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
+
+                // Probe a rowid that doesn't exist (999) on any table we can find
+                // This forces the cursor to fall through to the btree if the
+                // btree-readable gate flips after the cursor opened
+                let result = conn
+                    .query(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE 't_%' LIMIT 1",
+                        (),
+                    )
+                    .await;
+
+                if let Ok(mut rows) = result {
+                    if let Ok(Some(row)) = rows.next().await {
+                        if let Ok(table_name) = row.get::<String>(0) {
+                            drop(rows);
+                            // Probe non-existent rowid
+                            let probe_sql = format!("SELECT * FROM {table_name} WHERE id = 999");
+                            match conn.query(&probe_sql, ()).await {
+                                Ok(mut probe_rows) => {
+                                    // Just consume the result
+                                    while let Ok(Some(_)) = probe_rows.next().await {}
+                                }
+                                Err(turso::Error::Error(msg))
+                                    if msg.contains("pages in pager should be positive") =>
+                                {
+                                    panic_detected.store(true, Ordering::Release);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+
+                let _ = conn.execute("COMMIT", ()).await;
+                shuttle::future::yield_now().await;
+                turso_stress::note_progress();
+                if panic_detected.load(Ordering::Acquire) {
+                    return;
+                }
+                let _ = i;
+            }
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    assert!(
+        !panic_detected.load(Ordering::Acquire),
+        "Cursor opened before root publish hit negative page id in read_page. \
+         This is the passive checkpoint cursor-before-root-publish bug."
+    );
+}
+
+#[test]
+fn shuttle_test_passive_checkpoint_cursor_before_root_publish() {
+    let scheduler = RandomScheduler::new(100);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| {
+        shuttle::future::block_on(passive_checkpoint_cursor_before_root_publish_scenario(
+            2, 3, 4,
+        ))
+    });
+}
+
+#[test]
+fn shuttle_test_passive_checkpoint_cursor_before_root_publish_slow() {
+    let scheduler = RandomScheduler::new(10);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| {
+        shuttle::future::block_on(passive_checkpoint_cursor_before_root_publish_scenario(
+            4, 6, 8,
+        ))
+    });
+}
