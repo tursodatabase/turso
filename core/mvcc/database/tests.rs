@@ -12749,26 +12749,16 @@ fn test_concurrent_commit_yield_spin() {
     let lock = &mv_store.commit_coordinator.pager_commit_lock;
     assert!(lock.write(), "should acquire lock");
 
-    // Prepare COMMIT — step() should yield (return IO), not spin forever.
+    // Prepare COMMIT — step() should park on the lock (return IO), not spin
+    // forever.
     let mut stmt = conn.prepare("COMMIT").unwrap();
-    let mut returned_io = false;
-    for _ in 0..100 {
-        match stmt.step().unwrap() {
-            crate::StepResult::Yield => {
-                returned_io = true;
-                break;
-            }
-            crate::StepResult::Done => break,
-            _ => {}
-        }
-    }
     assert!(
-        returned_io,
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
         "step() should return IO when pager_commit_lock is contended"
     );
 
-    // Release the lock and let the commit finish
-    lock.unlock();
+    // Release the lock, which wakes the parked COMMIT, and let it finish
+    mv_store.commit_coordinator.unlock();
     loop {
         match stmt.step().unwrap() {
             crate::StepResult::Done => break,
@@ -12788,12 +12778,12 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::M
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::Yield),
-        "COMMIT should yield while the commit lock is held",
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        "COMMIT should park while the commit lock is held",
     );
 
     drop(stmt);
-    lock.unlock();
+    mv_store.commit_coordinator.unlock();
     conn.close().unwrap();
 }
 
