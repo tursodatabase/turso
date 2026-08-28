@@ -20408,6 +20408,98 @@ fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
     assert_eq!(integrity_after_followup_checkpoint, ok);
 }
 
+/// A row committed between a passive checkpoint's snapshot sampling and its
+/// collection must survive that checkpoint. Its key can enter the dirty list
+/// inside the prefix the checkpoint consumes on success while its version is
+/// past the snapshot, so the checkpoint has to queue the key again or the next
+/// checkpoint never materializes the row and log truncation loses it.
+#[test]
+fn commit_between_checkpoint_snapshot_and_collection_survives_restart() {
+    use crate::StepResult;
+
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let setup = db.connect();
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        setup.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+        // The first checkpoint scans the whole store; later ones read only
+        // the dirty list, which is what this test exercises.
+        setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+        let checkpoint_conn = db.connect();
+        checkpoint_conn
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let injector =
+            FixedYieldInjector::new([CheckpointYieldPoint::BeforeCollectTableRows.point()]);
+        checkpoint_conn.set_yield_injector(Some(injector.clone()));
+        let mut checkpoint = checkpoint_conn
+            .prepare("INSERT INTO driver VALUES (1)")
+            .unwrap();
+        let pager_io = checkpoint_conn.pager.load().io.clone();
+
+        // Park the checkpoint after its snapshot is sampled but before its
+        // collection reads the dirty list.
+        let mut parked = false;
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield => {
+                    if injector.remaining_len() == 0 {
+                        parked = true;
+                        break;
+                    }
+                    pager_io.step().unwrap();
+                }
+                StepResult::Done => break,
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        assert!(parked, "checkpoint must park before collecting table rows");
+
+        // Commits past the parked checkpoint's snapshot, but its dirty-list
+        // entry lands before that checkpoint's collection reads the list.
+        let writer = db.connect();
+        writer
+            .execute("INSERT INTO t VALUES (2, 'during')")
+            .unwrap();
+
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+                other => panic!("unexpected checkpoint step after resume: {other:?}"),
+            }
+        }
+        checkpoint_conn.set_yield_injector(None);
+        drop(checkpoint);
+
+        // This checkpoint must still find row 2 and write it to the B-tree.
+        // It also truncates the logical log, so a lost dirty-list entry here
+        // means the row disappears at restart.
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        2,
+        "row committed between checkpoint snapshot and collection was lost: {rows:?}"
+    );
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(&rows[1][1].to_string(), "during");
+    assert_integrity_ok(&conn);
+}
+
 /// Repro for https://github.com/tursodatabase/turso/issues/7957.
 ///
 /// A late DROP of an already-materialized table while a passive checkpoint is

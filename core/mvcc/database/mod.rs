@@ -1851,6 +1851,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let TransactionState::Preparing(end_ts) = tx.state.load() else {
             return;
         };
+        // Same as CommitEnd: the next checkpoint must find this
+        // transaction's chains in the dirty list.
+        {
+            let write_set = tx.write_set.lock();
+            let dirty: Vec<RowID> = write_set
+                .entries
+                .iter()
+                .filter(|(id, _)| matches!(id.row_id, RowKey::Int(_)))
+                .map(|(id, _)| id.clone())
+                .collect();
+            drop(write_set);
+            mvcc_store.record_checkpoint_dirty_table_keys(dirty);
+        }
         tx.state.store(TransactionState::Committed(end_ts));
 
         let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
@@ -3398,6 +3411,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
+                // Record the written table chains for the next checkpoint
+                // collection BEFORE turning Committed: a checkpoint whose
+                // snapshot covers this transaction must find these in the
+                // dirty list. Index chains live in `index_rows` and are
+                // collected by the index scan; tables are always Int-keyed
+                // (WITHOUT ROWID tables are not supported in MVCC).
+                {
+                    let write_set = tx_unlocked.write_set.lock();
+                    let dirty: Vec<RowID> = write_set
+                        .entries
+                        .iter()
+                        .filter(|(id, _)| matches!(id.row_id, RowKey::Int(_)))
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    drop(write_set);
+                    mvcc_store.record_checkpoint_dirty_table_keys(dirty);
+                }
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
@@ -4186,6 +4216,18 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Index counterpart of `retired_table_chains`.
     #[allow(clippy::type_complexity)]
     retired_index_chains: Mutex<Vec<(MVTableId, Arc<SortableIndexKey>, RowVersions<A>)>>,
+    /// Table rows written by transactions committed since the last
+    /// checkpoint collection. The checkpoint drains this instead of scanning
+    /// every chain in the store: CommitEnd records a transaction's written
+    /// rows BEFORE the transaction turns Committed, and the checkpoint
+    /// snapshot is clamped below the lowest Preparing commit, so every
+    /// version committed at or below a checkpoint's snapshot is either in
+    /// the drained set or was materialized by an earlier checkpoint.
+    checkpoint_dirty_table_keys: Mutex<Vec<RowID>>,
+    /// True while the next collection must scan every chain instead:
+    /// at bootstrap and after log recovery, versions exist that no live
+    /// commit recorded. Cleared when a full-scan collection completes.
+    collection_full_scan_needed: AtomicBool,
     /// Allocator backing every skiplist in this store, including lazily
     /// created per-index maps in `index_rows`.
     alloc: A,
@@ -4427,6 +4469,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             finalized_tx_states_len: AtomicUsize::new(0),
             retired_table_chains: Mutex::new(Vec::new()),
             retired_index_chains: Mutex::new(Vec::new()),
+            checkpoint_dirty_table_keys: Mutex::new(Vec::new()),
+            collection_full_scan_needed: AtomicBool::new(true),
             alloc,
             logical_log_alloc,
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
@@ -7531,6 +7575,54 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    /// Record the table rows a committed transaction wrote, for the next
+    /// checkpoint collection. Called before the transaction turns Committed;
+    /// see `checkpoint_dirty_table_keys`. Keys only, not chain handles: GC can
+    /// unlink an emptied chain container and a later write then creates a new
+    /// container for the same key, so collection must look up the current
+    /// container at drain time.
+    pub(crate) fn record_checkpoint_dirty_table_keys(&self, dirty: Vec<RowID>) {
+        if !dirty.is_empty() {
+            self.checkpoint_dirty_table_keys.lock().extend(dirty);
+        }
+    }
+
+    /// Copy the recorded dirty row keys for a checkpoint collection. The
+    /// copy is non-destructive: a failed checkpoint must leave the list
+    /// intact for the retry, so the covered prefix is dropped only when the
+    /// checkpoint succeeds (`consume_checkpoint_dirty_table_keys`).
+    pub(crate) fn snapshot_checkpoint_dirty_table_keys(&self) -> Vec<RowID> {
+        self.checkpoint_dirty_table_keys.lock().clone()
+    }
+
+    /// See `snapshot_checkpoint_dirty_table_keys`: the full-scan collection
+    /// covers every chain, so it only needs the length of the prefix it can
+    /// consume on success.
+    pub(crate) fn checkpoint_dirty_table_keys_len(&self) -> usize {
+        self.checkpoint_dirty_table_keys.lock().len()
+    }
+
+    /// A checkpoint succeeded: drop the prefix of the dirty list its
+    /// collection covered. Keys recorded after the collection snapshot stay
+    /// for the next checkpoint.
+    pub(crate) fn consume_checkpoint_dirty_table_keys(&self, upto: usize) {
+        let mut keys = self.checkpoint_dirty_table_keys.lock();
+        let upto = upto.min(keys.len());
+        keys.drain(..upto);
+    }
+
+    /// See `collection_full_scan_needed`.
+    pub(crate) fn collection_needs_full_scan(&self) -> bool {
+        self.collection_full_scan_needed.load(Ordering::Acquire)
+    }
+
+    /// A full-scan collection completed: later collections can rely on the
+    /// dirty list alone.
+    pub(crate) fn clear_collection_full_scan(&self) {
+        self.collection_full_scan_needed
+            .store(false, Ordering::Release);
+    }
+
     /// Index counterpart of [`Self::record_retired_table_chains`].
     #[allow(clippy::type_complexity)]
     pub(crate) fn record_retired_index_chains(
@@ -8681,6 +8773,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
             }) {
                 rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+                // No commit records this delete, so queue it for the next
+                // collection ourselves.
+                self.record_checkpoint_dirty_table_keys(vec![rowid]);
                 return;
             }
             // Already tombstoned / no live version: nothing to delete again.
@@ -8689,7 +8784,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             // B-tree-only row: btree-resident tombstone so collection materializes the delete.
             let version_id = self.get_version_id();
-            let row = Row::new_table_row_in(rowid, &[], num_cols, self.alloc.clone())
+            let row = Row::new_table_row_in(rowid.clone(), &[], num_cols, self.alloc.clone())
                 .expect("empty tombstone row");
             let _ = self.insert_version_raw(
                 &mut versions,
@@ -8702,6 +8797,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     materialized_at: WalPos::ORIGIN,
                 },
             );
+            // Same as above: only this call knows the chain changed.
+            self.record_checkpoint_dirty_table_keys(vec![rowid]);
             return;
         }
     }
