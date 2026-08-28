@@ -872,6 +872,10 @@ pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    /// Per cursor slot: the B-tree cursor kept there by `reset` is still
+    /// cleared, so OpenRead/OpenWrite can reuse it without clearing it
+    /// again. Cleared by the first open that reuses or rebuilds the slot.
+    pub(crate) cursor_cleared: Vec<bool>,
     /// Immutable execution/storage context captured when each index-method
     /// cursor is first opened for this statement.
     pub(crate) index_method_contexts:
@@ -1043,6 +1047,7 @@ impl ProgramState {
             io_completions: None,
             pc: 0,
             cursors,
+            cursor_cleared: vec![false; max_cursors],
             index_method_contexts: vec![None; max_cursors],
             closed_index_method_cursors: Vec::new(),
             index_method_finalize_cursor: 0,
@@ -1166,6 +1171,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.cursor_cleared.resize(max_cursors, false);
             self.index_method_contexts.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
             self.deferred_seeks.resize(max_cursors, None);
@@ -1181,10 +1187,11 @@ impl ProgramState {
         // Cursors carry cached positions that mean nothing to the next
         // execution: drop them, except the B-tree cursors that are kept and
         // cleared for reuse.
-        for (cursor, context) in self
+        for (slot, (cursor, context)) in self
             .cursors
             .iter_mut()
             .zip(self.index_method_contexts.iter_mut())
+            .enumerate()
         {
             match (cursor.as_mut(), context.as_ref()) {
                 (Some(Cursor::IndexMethod(cursor)), Some(context)) => cursor.close(context),
@@ -1193,6 +1200,7 @@ impl ProgramState {
                         .is_some_and(|pager| Arc::ptr_eq(pager, &cursor.get_pager())) =>
                 {
                     cursor.clear_for_reuse();
+                    self.cursor_cleared[slot] = true;
                     *context = None;
                     continue;
                 }
@@ -1201,6 +1209,7 @@ impl ProgramState {
                         .is_some_and(|pager| Arc::ptr_eq(pager, &cursor.get_pager())) =>
                 {
                     cursor.clear_for_reuse();
+                    self.cursor_cleared[slot] = true;
                     *context = None;
                     continue;
                 }
@@ -1211,6 +1220,7 @@ impl ProgramState {
                 Some(Cursor::Dyn(cursor)) => cursor.recycle(),
                 _ => {}
             }
+            self.cursor_cleared[slot] = false;
             *context = None;
         }
         if !self.closed_index_method_cursors.is_empty() {
