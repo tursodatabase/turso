@@ -1,21 +1,15 @@
 [package]
-name = "write-throughput"
+name = "txn-throughput"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "write-throughput"
+name = "txn-throughput"
 path = "main.rs"
-
-[features]
-console = ["dep:console-subscriber" ,"tokio/tracing"]
 
 [dependencies]
 turso = { workspace = true }
 rusqlite = { workspace = true }
-anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, default-features = true, features = ["full"] }
-futures = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-console-subscriber = { workspace = true, optional = true }
+libc = "0.2"
