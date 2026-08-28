@@ -635,16 +635,47 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             && self.query_btree_version_is_valid(&RowKey::Int(rowid))
     }
 
-    /// Seeds the rowid allocator from the B-tree's largest rowid, as
-    /// NewRowid does. The lock is only tried: when a NewRowid on another
+    /// Seeds the rowid allocator from the table's largest rowid, as NewRowid
+    /// does: the larger of the B-tree's last rowid and the version store's
+    /// last rowid this transaction can see. The store's matters when it
+    /// holds rowids at or below zero, which an insert never records in the
+    /// allocator. The lock is only tried: when a NewRowid on another
     /// connection holds it, that one seeds the allocator instead.
     fn seed_rowid_allocator(&mut self, btree_max: Option<i64>) {
+        let store_max = self
+            .db
+            .seek_rowid(
+                RowID {
+                    table_id: self.table_id,
+                    row_id: RowKey::Int(i64::MAX),
+                },
+                true,
+                false,
+                IterationDirection::Backwards,
+                self.tx_id,
+                &mut self.table_iterator,
+            )
+            .map(|rowid| match rowid.row_id {
+                RowKey::Int(rowid) => rowid,
+                RowKey::Record(_) => unreachable!("table rowids are integers"),
+            });
+        let max = match (btree_max, store_max) {
+            (Some(a), Some(b)) => a.max(b),
+            (Some(max), None) | (None, Some(max)) => max,
+            // An empty table stays unseeded. Seeded, the allocator would
+            // read "largest rowid 0", and an explicit rowid at or below
+            // zero inserted later never raises it, so NewRowid would skip
+            // the rowids SQLite hands out after such rows. NewRowid seeds
+            // an empty table itself and inserts a positive rowid right
+            // away, which is why it can.
+            (None, None) => return,
+        };
         let allocator = self.rowid_allocator();
         if !allocator.lock() {
             return;
         }
         if allocator.is_uninitialized() {
-            allocator.initialize(btree_max);
+            allocator.initialize(Some(max));
         }
         allocator.unlock();
     }
