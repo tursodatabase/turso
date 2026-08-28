@@ -1560,13 +1560,13 @@ fn start_temp_batch_reads(
         } else {
             None
         };
-        let c = wal.read_frames_batch(
+        let _c = wal.read_frames_batch(
             *start_frame,
             run_pages,
             temp_pager.buffer_pool.clone(),
             run_scratch,
+            Some(&mut group),
         )?;
-        group.add(&c);
     }
     let combined = group.build();
 

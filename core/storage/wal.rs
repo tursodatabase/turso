@@ -672,12 +672,15 @@ pub trait Wal: Debug + Send + Sync {
     /// Otherwise a fresh temporary buffer is allocated. VACUUM passes a
     /// pre-allocated buffer to amortize the ~batch-size allocation across
     /// batches.
+    ///
+    /// The read is added to `group`, when given, before it is submitted.
     fn read_frames_batch(
         &self,
         start_frame: u64,
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
         scratch_buf: Option<Arc<Buffer>>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion>;
 
     /// Read a raw WAL frame with its on-disk header and page body decoded by
@@ -3614,6 +3617,7 @@ impl Wal for WalFile {
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
         scratch_buf: Option<Arc<Buffer>>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         turso_assert!(
             !pages.is_empty(),
@@ -3757,6 +3761,9 @@ impl Wal for WalFile {
         });
 
         let c = Completion::new_read(raw_buf, complete);
+        if let Some(group) = group {
+            group.add(&c);
+        }
         let file = self.coordination.wal_file()?;
         file.pread(offset, c)
     }
@@ -6635,7 +6642,7 @@ pub mod test {
             Arc::new(crate::Page::new(5)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -6663,7 +6670,7 @@ pub mod test {
             Arc::new(crate::Page::new(33)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -6707,7 +6714,7 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(32));
         let completion = wal
-            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None)
+            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(target_page.get_contents().as_ptr(), expected.as_slice());
@@ -6903,7 +6910,7 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(43));
         let c = wal
-            .read_frames_batch(1, &[target_page], buffer_pool, None)
+            .read_frames_batch(1, &[target_page], buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -6939,7 +6946,7 @@ pub mod test {
         ];
 
         let completion = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, completion);
 
@@ -6972,7 +6979,7 @@ pub mod test {
             Arc::new(crate::Page::new(13)),
         ];
         let c = wal
-            .read_frames_batch(2, &target_pages, buffer_pool, None)
+            .read_frames_batch(2, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -7003,7 +7010,7 @@ pub mod test {
             Arc::new(crate::Page::new(9)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -7034,7 +7041,7 @@ pub mod test {
             Arc::new(crate::Page::new(22)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -7072,7 +7079,7 @@ pub mod test {
             Arc::new(crate::Page::new(99)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
