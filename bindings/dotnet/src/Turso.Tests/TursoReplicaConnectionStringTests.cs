@@ -82,16 +82,17 @@ public sealed class TursoReplicaConnectionStringTests
             .WithMessage("*exactly one*");
     }
 
-    [TestCase("Pooling=True", "Pooling is not supported")]
-    [TestCase("Sync Interval=1", "Automatic sync is not supported")]
-    public void DeferredReplicaFeaturesAreRejected(string option, string message)
+    [TestCase(-1)]
+    [TestCase(4_294_968)]
+    public void InvalidAutomaticSyncIntervalsAreRejected(int interval)
     {
         using var connection = new TursoConnection(
-            $"Data Source=turso://example.test;Replica Path=:memory:;Bootstrap If Empty=False;{option}");
+            "Data Source=turso://example.test;Replica Path=:memory:;"
+            + $"Bootstrap If Empty=False;Sync Interval={interval}");
 
         connection.Invoking(x => x.Open())
-            .Should().Throw<NotSupportedException>()
-            .WithMessage($"{message}*");
+            .Should().Throw<ArgumentOutOfRangeException>()
+            .WithParameterName("SyncInterval");
     }
 
     [TestCase(false)]
