@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, TypeVar
 
 from .dbapi import (
     DatabaseError,
@@ -38,12 +38,12 @@ class BatchResult:
     (PROTOCOL.md section 8.4); the embedded driver reports None for them."""
 
     rows: list[tuple]
-    description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]]
+    description: tuple[tuple[str, None, None, None, None, None, None], ...] | None
     rowcount: int
-    lastrowid: Optional[int]
-    rows_read: Optional[int] = None
-    rows_written: Optional[int] = None
-    query_duration_ms: Optional[float] = None
+    lastrowid: int | None
+    rows_read: int | None = None
+    rows_written: int | None = None
+    query_duration_ms: float | None = None
 
 
 # Accepted values for the `mode` argument of Connection.batch and the
@@ -65,7 +65,7 @@ _TRANSACTION_CONTROL_KEYWORDS = {
 }
 
 
-def _batch_begin_sql(mode: Optional[str]) -> Optional[str]:
+def _batch_begin_sql(mode: str | None) -> str | None:
     if mode is None:
         return None
     begin_sql = _BATCH_MODES.get(str(mode).lower())
@@ -113,7 +113,7 @@ def _reject_transaction_control_statements(
 def _batch_statement_error(
     index: int,
     error: Exception,
-    results: Optional[list] = None,
+    results: list | None = None,
 ) -> Exception:
     """Wrap a statement failure so the raised exception identifies which
     statement failed, preserving the DB-API exception class. The zero-based
@@ -163,7 +163,7 @@ class Connection:
         self,
         session: Session,
         *,
-        isolation_level: Optional[str] = "DEFERRED",
+        isolation_level: str | None = "DEFERRED",
     ) -> None:
         self._session = session
         self.isolation_level = isolation_level
@@ -179,8 +179,8 @@ class Connection:
     def _execute_stmt(
         self,
         sql: str,
-        params: Optional[list] = None,
-        named_params: Optional[list[tuple[str, Any]]] = None,
+        params: list | None = None,
+        named_params: list[tuple[str, Any]] | None = None,
         want_rows: bool = True,
     ) -> StmtResult:
         self._ensure_open()
@@ -227,7 +227,7 @@ class Connection:
         if self.in_transaction:
             self._execute_stmt("ROLLBACK", want_rows=False)
 
-    def cursor(self, factory: Optional[Callable[[Connection], _DBCursorT]] = None) -> _DBCursorT | Cursor:
+    def cursor(self, factory: Callable[[Connection], _DBCursorT] | None = None) -> _DBCursorT | Cursor:
         self._ensure_open()
         if factory is None:
             return Cursor(self)
@@ -251,7 +251,7 @@ class Connection:
     def batch(
         self,
         statements: Iterable[str | tuple[str, Sequence[Any] | Mapping[str, Any]]],
-        mode: Optional[str] = None,
+        mode: str | None = None,
     ) -> list[BatchResult]:
         """Execute multiple parameterized statements in a single HTTP
         request.
@@ -352,7 +352,7 @@ class Connection:
         result: dict,
         stmts: list[tuple[str, Any]],
         offset: int,
-        commit_index: Optional[int],
+        commit_index: int | None,
         total_steps: int,
     ) -> list[BatchResult]:
         """Decode a wire-level batch result into per-statement results, or
@@ -372,7 +372,7 @@ class Connection:
             )
         # Decode the results of the statements that executed before looking
         # at the errors, so a failure can still report what completed.
-        results: list[Optional[BatchResult]] = [
+        results: list[BatchResult | None] = [
             Connection._decode_batch_statement_result(step_results[offset + i], sql)
             for i, (sql, _parameters) in enumerate(stmts)
         ]
@@ -393,7 +393,7 @@ class Connection:
         return results
 
     @staticmethod
-    def _decode_batch_statement_result(step_result: Any, sql: str) -> Optional[BatchResult]:
+    def _decode_batch_statement_result(step_result: Any, sql: str) -> BatchResult | None:
         """Decode one statement result of a batch response (section 8.4),
         or None when the statement did not complete."""
         if not isinstance(step_result, dict):
@@ -428,7 +428,7 @@ class Connection:
         step_errors: list,
         statement_count: int,
         offset: int,
-        commit_index: Optional[int],
+        commit_index: int | None,
         results: list,
     ) -> None:
         """Raise the error of the batch step that failed, if any: the
@@ -471,8 +471,8 @@ class Cursor:
         self.row_factory: Callable | type[Row] | None = connection.row_factory
         self._rows: list[tuple] = []
         self._row_index = 0
-        self._description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]] = None
-        self._lastrowid: Optional[int] = None
+        self._description: tuple[tuple[str, None, None, None, None, None, None], ...] | None = None
+        self._lastrowid: int | None = None
         self._rowcount: int = -1
         self._closed = False
 
@@ -503,7 +503,7 @@ class Cursor:
     @staticmethod
     def _convert_params(
         parameters: Sequence[Any] | Mapping[str, Any],
-    ) -> tuple[Optional[list], Optional[list[tuple[str, Any]]]]:
+    ) -> tuple[list | None, list[tuple[str, Any]] | None]:
         """Convert DB-API parameters to protocol args/named_args."""
         if isinstance(parameters, Mapping):
             named = []
@@ -611,7 +611,7 @@ class Cursor:
         self._row_index += 1
         return self._apply_row_factory(row)
 
-    def fetchmany(self, size: Optional[int] = None) -> list[Any]:
+    def fetchmany(self, size: int | None = None) -> list[Any]:
         self._ensure_open()
         if size is None:
             size = self.arraysize
@@ -652,9 +652,9 @@ class Cursor:
 def connect(
     url: str,
     *,
-    auth_token: Optional[str] = None,
-    remote_encryption_key: Optional[str] = None,
-    isolation_level: Optional[str] = "DEFERRED",
+    auth_token: str | None = None,
+    remote_encryption_key: str | None = None,
+    isolation_level: str | None = "DEFERRED",
 ) -> Connection:
     """Open a remote connection to a Turso database.
 
