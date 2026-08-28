@@ -3603,6 +3603,7 @@ impl Wal for WalFile {
             complete,
             page_idx,
             &self.io_ctx.read(),
+            None,
         )
     }
 
@@ -3910,6 +3911,7 @@ impl Wal for WalFile {
                 complete,
                 page_id as usize,
                 &self.io_ctx.read(),
+                None,
             )?;
             self.io.wait_for_completion(c)?;
             return if *conflict.lock() {
@@ -4955,9 +4957,11 @@ impl WalFile {
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
-                        let inflight =
-                            self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
-                        group.add(&inflight.completion);
+                        let inflight = self.issue_wal_read_into_buffer(
+                            page_id as usize,
+                            target_frame,
+                            &mut group,
+                        )?;
                         nr_completions += 1;
                         ongoing_chkpt.inflight_reads.push(inflight);
                         ongoing_chkpt.current_page += 1;
@@ -4970,15 +4974,13 @@ impl WalFile {
                         let batch_map = ongoing_chkpt.pending_writes.take();
                         if !batch_map.is_empty() {
                             let new_write = InflightWriteBatch::new();
-                            for c in write_pages_vectored(
+                            nr_completions += write_pages_vectored(
                                 pager,
                                 batch_map,
                                 new_write.done.clone(),
                                 new_write.err.clone(),
-                            )? {
-                                group.add(&c);
-                                nr_completions += 1;
-                            }
+                                &mut group,
+                            )?;
                             ongoing_chkpt.inflight_writes.push(new_write);
                         }
                     }
@@ -5283,7 +5285,14 @@ impl WalFile {
         Ok(())
     }
 
-    fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
+    /// Starts reading a frame's page body for the checkpoint. The read is
+    /// added to `group` before it is submitted.
+    fn issue_wal_read_into_buffer(
+        &self,
+        page_id: usize,
+        frame_id: u64,
+        group: &mut CompletionGroup,
+    ) -> Result<InflightRead> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
         tracing::debug!(
@@ -5318,6 +5327,7 @@ impl WalFile {
             complete,
             page_id,
             &self.io_ctx.read(),
+            Some(group),
         )?;
 
         Ok(InflightRead {

@@ -663,15 +663,19 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
 /// [1,2,3], [6,7], [9,10,11,12]
 /// and submit each run as a `writev` call,
 /// for 3 total syscalls instead of 9.
+///
+/// Each run's write is added to `group` before it is submitted. Returns
+/// the number of runs submitted.
 pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
     done_flag: Arc<AtomicBool>,
     err: Arc<crate::sync::OnceLock<CompletionError>>,
-) -> Result<Vec<Completion>> {
+    group: &mut CompletionGroup,
+) -> Result<usize> {
     if batch.is_empty() {
         done_flag.store(true, Ordering::Release);
-        return Ok(Vec::new());
+        return Ok(0);
     }
 
     let page_sz = pager.get_page_size_unchecked().get() as usize;
@@ -737,6 +741,7 @@ pub fn write_pages_vectored(
                 done_cl.store(true, Ordering::Release);
             }
         });
+        group.add(&cmp);
         let io_ctx = pager.io_ctx.read();
         let bufs = std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY));
         match pager
@@ -754,7 +759,7 @@ pub fn write_pages_vectored(
             }
         }
     }
-    Ok(completions)
+    Ok(completions.len())
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -1961,6 +1966,8 @@ pub fn begin_read_wal_frame_raw<F: File + ?Sized>(
     Ok(c)
 }
 
+/// Reads one WAL frame's page body. The read is added to `group`, when
+/// given, before it is submitted.
 pub fn begin_read_wal_frame<F: File + ?Sized>(
     io: &F,
     offset: u64,
@@ -1968,6 +1975,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
     complete: Box<ReadComplete>,
     page_idx: usize,
     io_ctx: &IOContext,
+    group: Option<&mut CompletionGroup>,
 ) -> Result<Completion> {
     tracing::trace!(
         "begin_read_wal_frame(offset={}, page_idx={})",
@@ -1977,7 +1985,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
     let buf = buffer_pool.get_page();
     let buf = Arc::new(buf);
 
-    match io_ctx.page_transform() {
+    let complete: Box<ReadComplete> = match io_ctx.page_transform() {
         PageTransform::Codec(ctx) => {
             let page_codec = ctx.clone();
             let original_complete = complete;
@@ -1985,76 +1993,69 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let decoded_buf = Arc::new(buffer_pool.get_page());
             let codec_context = PageCodecContext::from_page_idx(page_idx, PageLocation::Wal)?;
 
-            let decode_complete =
-                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                    let Ok((encoded_buf, bytes_read)) = res else {
-                        return original_complete(res);
-                    };
-                    if bytes_read == 0 {
-                        return original_complete(Ok((encoded_buf, bytes_read)));
+            Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                let Ok((encoded_buf, bytes_read)) = res else {
+                    return original_complete(res);
+                };
+                if bytes_read == 0 {
+                    return original_complete(Ok((encoded_buf, bytes_read)));
+                }
+                turso_assert_greater_than!(
+                    bytes_read,
+                    0,
+                    "expected to read data for page codec page",
+                    { "page_idx": page_idx }
+                );
+                if bytes_read as usize != encoded_buf.len() {
+                    return original_complete(Ok((encoded_buf, bytes_read)));
+                }
+                match page_codec.decode_page(
+                    codec_context,
+                    encoded_buf.as_slice(),
+                    decoded_buf.as_mut_slice(),
+                ) {
+                    Ok(()) => original_complete(Ok((decoded_buf.clone(), bytes_read))),
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to decode WAL frame data for page_idx={page_idx}: {e}"
+                        );
+                        let err = page_codec_completion_error(page_codec.as_ref(), page_idx);
+                        original_complete(Err(err));
+                        Some(err)
                     }
-                    turso_assert_greater_than!(
-                        bytes_read,
-                        0,
-                        "expected to read data for page codec page",
-                        { "page_idx": page_idx }
-                    );
-                    if bytes_read as usize != encoded_buf.len() {
-                        return original_complete(Ok((encoded_buf, bytes_read)));
-                    }
-                    match page_codec.decode_page(
-                        codec_context,
-                        encoded_buf.as_slice(),
-                        decoded_buf.as_mut_slice(),
-                    ) {
-                        Ok(()) => original_complete(Ok((decoded_buf.clone(), bytes_read))),
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to decode WAL frame data for page_idx={page_idx}: {e}"
-                            );
-                            let err = page_codec_completion_error(page_codec.as_ref(), page_idx);
-                            original_complete(Err(err));
-                            Some(err)
-                        }
-                    }
-                });
-
-            let new_completion = Completion::new_read(buf, decode_complete);
-            io.pread(offset, new_completion)
+                }
+            })
         }
         PageTransform::Checksum(ctx) => {
             let checksum_ctx = ctx.clone();
             let original_c = complete;
-            let verify_complete =
-                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                    let Ok((buf, bytes_read)) = res else {
-                        return original_c(res);
-                    };
-                    if bytes_read <= 0 {
-                        tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
-                        return original_c(Ok((buf, bytes_read)));
-                    }
+            Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                let Ok((buf, bytes_read)) = res else {
+                    return original_c(res);
+                };
+                if bytes_read <= 0 {
+                    tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
+                    return original_c(Ok((buf, bytes_read)));
+                }
 
-                    match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
-                        Ok(_) => original_c(Ok((buf, bytes_read))),
-                        Err(e) => {
-                            mark_unlikely();
-                            tracing::error!(
-                                "Failed to verify checksum for page_id={page_idx}: {e}"
-                            );
-                            original_c(Err(e));
-                            Some(e)
-                        }
+                match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
+                    Ok(_) => original_c(Ok((buf, bytes_read))),
+                    Err(e) => {
+                        mark_unlikely();
+                        tracing::error!("Failed to verify checksum for page_id={page_idx}: {e}");
+                        original_c(Err(e));
+                        Some(e)
                     }
-                });
-            let c = Completion::new_read(buf, verify_complete);
-            io.pread(offset, c)
+                }
+            })
         }
-        PageTransform::None => {
-            let c = Completion::new_read(buf, complete);
-            io.pread(offset, c)
-        }
+        PageTransform::None => complete,
+    };
+    let c = Completion::new_read(buf, complete);
+    if let Some(group) = group {
+        group.add(&c);
     }
+    io.pread(offset, c)
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
