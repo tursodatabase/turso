@@ -71,6 +71,10 @@ def main():
                         help="CSV column that separates the panels: connection "
                              "count (default), or per-transaction think time "
                              "for interactive-transaction sweeps")
+    parser.add_argument("--subtitle", default=None,
+                        help="one line above the panels naming the workload "
+                             "(offered rate, transaction shape, sync mode), so "
+                             "the figure is readable on its own")
     args = parser.parse_args()
     names = dict(name.split("=", 1) for name in args.name)
 
@@ -80,7 +84,7 @@ def main():
     if not series:
         raise SystemExit("no samples found")
 
-    figure = Figure(series, COLUMN_LABELS[args.column], names, args.panel_by)
+    figure = Figure(series, COLUMN_LABELS[args.column], names, args.panel_by, args.subtitle)
     for output in args.output or [Path("latency-ecdf.png")]:
         if output.suffix in (".tikz", ".tex"):
             output.write_text(figure.tikz())
@@ -118,9 +122,10 @@ def merge_series(into, more):
 class Figure:
     """The panels and curves of the figure, worked out once for both backends."""
 
-    def __init__(self, series, column_label, names, panel_by="connections"):
+    def __init__(self, series, column_label, names, panel_by="connections", subtitle=None):
         self.column_label = column_label
         self.panel_by = panel_by
+        self.subtitle = subtitle
         modes_per_engine = {}
         for engine, mode, _ in series:
             modes_per_engine.setdefault(engine, set()).add(mode)
@@ -212,6 +217,8 @@ class Figure:
                    handlelength=2.4, columnspacing=2.0,
                    bbox_to_anchor=(0.5, -0.2 / nrows**2))
 
+        if self.subtitle:
+            fig.suptitle(self.subtitle, y=1.04, fontsize=plt.rcParams["font.size"] + 1)
         fig.savefig(output, bbox_inches="tight")
 
     def tikz(self):
