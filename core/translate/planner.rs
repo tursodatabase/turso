@@ -2823,28 +2823,17 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     }
 }
 
-pub fn parse_row_id<F>(
-    column_name: &str,
-    table_id: TableInternalId,
-    fn_check: F,
-) -> Result<Option<Expr>>
-where
-    F: FnOnce() -> bool,
-{
+pub fn parse_row_id(column_name: &str, table_id: TableInternalId) -> Option<Expr> {
     if ROWID_STRS
         .iter()
         .any(|s| s.eq_ignore_ascii_case(column_name))
     {
-        if fn_check() {
-            crate::bail_parse_error!("ROWID is ambiguous");
-        }
-
-        return Ok(Some(Expr::RowId {
+        return Some(Expr::RowId {
             database: None, // TODO: support different databases
             table: table_id,
-        }));
+        });
     }
-    Ok(None)
+    None
 }
 
 #[allow(clippy::type_complexity)]

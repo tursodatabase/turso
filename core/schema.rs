@@ -2701,6 +2701,7 @@ impl TryClone for VirtualTable {
         Ok(Self {
             name: self.name.clone(),
             columns: self.columns.try_clone()?,
+            has_visible_rowid: self.has_visible_rowid,
             kind: self.kind,
             vtab_type: self.vtab_type.clone(),
             vtab_id: self.vtab_id,

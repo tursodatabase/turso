@@ -1760,7 +1760,14 @@ impl ProgramBuilder {
                 Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,
                 Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero")?,
                 Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
-                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
+                Insn::HashProbe {
+                    target_pc,
+                    pc_if_deferred,
+                    ..
+                } => {
+                    resolve(target_pc, "HashProbe")?;
+                    resolve(pc_if_deferred, "HashProbe")?;
+                }
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::HashScanUnmatched { target_pc, .. } => {

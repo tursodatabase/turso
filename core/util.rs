@@ -515,7 +515,7 @@ pub fn simple_bind_expr(
                     let is_btree_table = matches!(joined_table.table, Table::BTree(_));
                     if is_btree_table {
                         if let Some(rowid) =
-                            parse_row_id(&normalize_ident(id.as_str()), internal_id, || false)?
+                            parse_row_id(&normalize_ident(id.as_str()), internal_id)
                         {
                             *expr = rowid;
                         }

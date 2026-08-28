@@ -769,6 +769,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             num_keys: to_u32(num_keys),
             dest_reg: to_u32(match_reg),
             target_pc: hash_probe_miss_label,
+            pc_if_deferred: self.next,
             payload_dest_reg: payload_dest_reg.map(to_u32),
             num_payload: to_u32(num_payload),
             // Main probe loop always carries the probe rowid so spilled build
@@ -1065,6 +1066,11 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                 decrement_by: 0,
             });
 
+            self.program.emit_insn(Insn::Null {
+                dest: self.hash_ctx.match_reg,
+                dest_end: None,
+            });
+
             if let Some(cursor_id) = self.hash_ctx.build_cursor_id {
                 self.program.emit_insn(Insn::NullRow { cursor_id });
             }
@@ -1316,6 +1322,7 @@ impl GraceHashLoop {
             num_keys: to_u32(hash_ctx.num_keys),
             dest_reg: to_u32(match_reg),
             target_pc: grace_outer_check,
+            pc_if_deferred: grace_probe_top,
             payload_dest_reg: payload_dest_reg.map(to_u32),
             num_payload: to_u32(num_payload),
             probe_rowid_reg: None, // grace-only: HashGraceLoadPartition already loaded this partition
@@ -1361,6 +1368,11 @@ impl GraceHashLoop {
                     decrement_by: 0,
                 });
             }
+
+            program.emit_insn(Insn::Null {
+                dest: match_reg,
+                dest_end: None,
+            });
 
             // Set build cursor to NULL row
             if let Some(cursor_id) = hash_ctx.build_cursor_id {

@@ -1,11 +1,14 @@
 use super::*;
+use crate::translate::planner::ROWID_STRS;
 
 /// The precedence of binding identifiers to columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingBehavior {
     /// `TryResultColumnsFirst` means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
     TryResultColumnsFirst,
-    /// `TryCanonicalColumnsFirst` means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
+    /// `TryCanonicalColumnsFirst` checks columns in the current query before result aliases.
+    /// Result aliases still take precedence over columns from enclosing queries.
+    /// This is used for e.g. WHERE clauses.
     TryCanonicalColumnsFirst,
     /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
     ResultColumnsNotAllowed,
@@ -60,7 +63,7 @@ pub(super) fn resolve_qualified_on_ref(
     }
 
     if let Table::BTree(btree) = table {
-        if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
+        if parse_row_id(normalized_id, internal_id).is_some() {
             if !btree.has_rowid {
                 crate::bail_parse_error!("no such column: {}", normalized_id);
             }
@@ -110,6 +113,9 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                     let mut match_result = None;
                     let joined_tables = referenced_tables.joined_tables();
+                    let is_rowid_name = ROWID_STRS
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&normalized_id));
 
                     // First check joined tables
                     for joined_table in joined_tables.iter() {
@@ -145,72 +151,27 @@ pub fn bind_and_rewrite_expr<'a>(
                                     col.is_rowid_alias(),
                                 ));
                             }
-                        // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Table::BTree(btree) = &joined_table.table {
-                            if let Some(row_id_expr) =
-                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
-                                    joined_tables.len() != 1
-                                })?
-                            {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
-                                }
-                                *expr = row_id_expr;
-                                return Ok(WalkControl::Continue);
-                            }
                         }
                     }
 
-                    // Then check outer query references, if we still didn't find something.
-                    // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
-                    // but in the case of subqueries, the inner query takes precedence.
-                    // For example:
-                    // SELECT * FROM t WHERE x = (SELECT x FROM t2)
-                    // In this case, there is no ambiguity:
-                    // - x in the outer query refers to t.x,
-                    // - x in the inner query refers to t2.x.
-                    //
-                    // Ambiguity is only checked within the same scope depth. Once a match
-                    // is found at depth N, deeper scopes (N+1, N+2, ...) are not checked.
-                    if match_result.is_none() {
-                        let mut matched_scope_depth = None;
-                        for outer_ref in referenced_tables.outer_query_refs().iter() {
-                            // Definition-only entries let a FROM clause find a CTE by
-                            // name; the CTE's columns are visible only after a FROM
-                            // clause actually adds the table. Every other outer ref is
-                            // a real table in an enclosing scope, including CTEs and
-                            // the recursive self-reference, and its columns can be
-                            // referenced without qualification.
-                            if outer_ref.cte_definition_only {
-                                continue;
+                    if match_result.is_none() && is_rowid_name {
+                        let mut rowid_candidates = joined_tables
+                            .iter()
+                            .filter(|table| is_implicit_rowid_candidate(&table.table));
+                        if let Some(rowid_candidate) = rowid_candidates.next() {
+                            if rowid_candidates.next().is_some() {
+                                crate::bail_parse_error!("ambiguous column name: {}", id.as_str());
                             }
-                            // Skip refs from deeper scopes once we found a match
-                            if let Some(depth) = matched_scope_depth {
-                                if outer_ref.scope_depth > depth {
-                                    continue;
-                                }
+                            let table_id = rowid_candidate.internal_id;
+                            if !matches!(&rowid_candidate.table, Table::BTree(_)) {
+                                crate::bail_parse_error!("no such column: {}", id.as_str());
                             }
-                            let col_idx = outer_ref.table.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                            });
-                            if col_idx.is_some() {
-                                let col_idx = col_idx.unwrap();
-                                if outer_ref.using_dedup_hidden_cols.get(col_idx) {
-                                    continue;
-                                }
-                                if match_result.is_some() {
-                                    crate::bail_parse_error!(
-                                        "ambiguous column name: {}",
-                                        id.as_str()
-                                    );
-                                }
-                                let col = outer_ref.table.columns().get(col_idx).unwrap();
-                                match_result =
-                                    Some((outer_ref.internal_id, col_idx, col.is_rowid_alias()));
-                                matched_scope_depth = Some(outer_ref.scope_depth);
-                            }
+                            *expr = Expr::RowId {
+                                database: None,
+                                table: table_id,
+                            };
+                            referenced_tables.mark_rowid_referenced(table_id);
+                            return Ok(WalkControl::Continue);
                         }
                     }
 
@@ -236,6 +197,105 @@ pub fn bind_and_rewrite_expr<'a>(
                                 }
                             }
                         }
+                    }
+
+                    // Then check outer query references, if we still didn't find something.
+                    // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
+                    // but in the case of subqueries, the inner query takes precedence.
+                    // For example:
+                    // SELECT * FROM t WHERE x = (SELECT x FROM t2)
+                    // In this case, there is no ambiguity:
+                    // - x in the outer query refers to t.x,
+                    // - x in the inner query refers to t2.x.
+                    //
+                    // Ambiguity is only checked within the same scope depth. Once a match
+                    // is found at depth N, deeper scopes (N+1, N+2, ...) are not checked.
+                    let mut matched_scope_depth = None;
+                    let mut outer_column_match = None;
+                    let mut outer_column_is_ambiguous = false;
+                    let mut outer_rowid_match = None;
+                    let mut outer_rowid_is_ambiguous = false;
+
+                    for outer_ref in referenced_tables.outer_query_refs().iter() {
+                        if outer_ref.cte_definition_only {
+                            continue;
+                        }
+                        let column_match = outer_ref
+                            .table
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .find(|(col_idx, column)| {
+                                !outer_ref.using_dedup_hidden_cols.get(*col_idx)
+                                    && column.name.as_ref().is_some_and(|name| {
+                                        name.eq_ignore_ascii_case(&normalized_id)
+                                    })
+                            })
+                            .map(|(col_idx, column)| (col_idx, column.is_rowid_alias()));
+                        let is_rowid_candidate =
+                            is_rowid_name && is_implicit_rowid_candidate(&outer_ref.table);
+                        if column_match.is_none() && !is_rowid_candidate {
+                            continue;
+                        }
+
+                        match matched_scope_depth {
+                            Some(depth) if outer_ref.scope_depth > depth => continue,
+                            Some(depth) if outer_ref.scope_depth < depth => {
+                                outer_column_match = None;
+                                outer_column_is_ambiguous = false;
+                                outer_rowid_match = None;
+                                outer_rowid_is_ambiguous = false;
+                                matched_scope_depth = Some(outer_ref.scope_depth);
+                            }
+                            Some(_) => {}
+                            None => matched_scope_depth = Some(outer_ref.scope_depth),
+                        }
+
+                        if let Some((col_idx, is_rowid_alias)) = column_match {
+                            if outer_column_match.is_some() {
+                                outer_column_is_ambiguous = true;
+                            } else {
+                                outer_column_match =
+                                    Some((outer_ref.internal_id, col_idx, is_rowid_alias));
+                            }
+                        } else if is_rowid_candidate {
+                            if outer_rowid_match.is_some() {
+                                outer_rowid_is_ambiguous = true;
+                            } else {
+                                outer_rowid_match = Some((
+                                    outer_ref.internal_id,
+                                    matches!(&outer_ref.table, Table::BTree(_)),
+                                ));
+                            }
+                        }
+                    }
+
+                    if outer_column_is_ambiguous {
+                        crate::bail_parse_error!("ambiguous column name: {}", id.as_str());
+                    }
+                    if let Some((table_id, col_idx, is_rowid_alias)) = outer_column_match {
+                        *expr = Expr::Column {
+                            database: None, // TODO: support different databases
+                            table: table_id,
+                            column: col_idx,
+                            is_rowid_alias,
+                        };
+                        referenced_tables.mark_column_used(table_id, col_idx);
+                        return Ok(WalkControl::Continue);
+                    }
+                    if outer_rowid_is_ambiguous {
+                        crate::bail_parse_error!("ambiguous column name: {}", id.as_str());
+                    }
+                    if let Some((table_id, can_bind_rowid)) = outer_rowid_match {
+                        if !can_bind_rowid {
+                            crate::bail_parse_error!("no such column: {}", id.as_str());
+                        }
+                        *expr = Expr::RowId {
+                            database: None,
+                            table: table_id,
+                        };
+                        referenced_tables.mark_rowid_referenced(table_id);
+                        return Ok(WalkControl::Continue);
                     }
 
                     // SQLite DQS misfeature: double-quoted identifiers fall back to string literals
@@ -693,6 +753,14 @@ pub fn bind_and_rewrite_expr<'a>(
         },
     )?;
     Ok(())
+}
+
+fn is_implicit_rowid_candidate(table: &Table) -> bool {
+    match table {
+        Table::BTree(table) => table.has_rowid,
+        Table::Virtual(table) => table.has_visible_rowid,
+        Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_) => false,
+    }
 }
 
 /// Extract a string literal value from an expression that has already been
