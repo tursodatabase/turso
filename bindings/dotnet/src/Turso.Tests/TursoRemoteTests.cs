@@ -27,14 +27,13 @@ public class TursoRemoteTests
     }
 
     [Test]
-    public void TestRemoteReplicaFailsBeforeNetworkAccess()
+    public void TestRemoteReplicaConnectionStringIsRecognized()
     {
-        using var connection = new TursoConnection(
+        var options = TursoConnectionOptions.Parse(
             "Data Source=libsql://example.turso.io;Auth Token=secret;Replica Path=replica.db");
 
-        connection.Invoking(x => x.Open())
-            .Should().Throw<NotSupportedException>()
-            .WithMessage("Embedded replica connections are not supported yet by the .NET provider.*");
+        options.IsReplica.Should().BeTrue();
+        options.ReplicaPath.Should().Be("replica.db");
     }
 
     [Test]

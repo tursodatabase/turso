@@ -8,9 +8,12 @@ namespace Turso;
 
 public class TursoConnection : DbConnection
 {
+    internal static Func<HttpClient?>? SyncHttpClientFactory { get; set; }
+
     private TursoDatabaseHandle? _turso;
     private TursoRemoteClient? _remoteClient;
     private TursoSyncDatabase? _syncDatabase;
+    private bool _ownsSyncDatabase;
     private readonly HashSet<TursoDataReader> _syncReaders = [];
     private readonly object _syncReadersLock = new();
     private TursoConnectionOptions _connectionOptions;
@@ -90,6 +93,9 @@ public class TursoConnection : DbConnection
     {
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
+
+        if (_connectionOptions.IsReplica)
+            return OpenReplicaAsync(cancellationToken);
 
         Open();
         return Task.CompletedTask;
@@ -178,7 +184,8 @@ public class TursoConnection : DbConnection
         if (!_connectionOptions.IsReplica)
             throw new NotSupportedException("Sync requires an embedded replica connection.");
 
-        throw new NotSupportedException("Embedded replica sync is not supported yet by the .NET provider.");
+        return (_syncDatabase ?? throw new InvalidOperationException("The embedded replica is not initialized."))
+            .PullAsync(cancellationToken);
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -374,15 +381,128 @@ public class TursoConnection : DbConnection
     private void OpenRemote()
     {
         if (_connectionOptions.IsReplica)
-            throw new NotSupportedException("Embedded replica connections are not supported yet by the .NET provider. Use a remote URL without Replica Path for direct remote execution.");
+        {
+            OpenReplica();
+            return;
+        }
 
         if (_connectionOptions.SyncInterval > 0)
-            throw new NotSupportedException("Sync Interval requires embedded replica support, which is not supported yet by the .NET provider.");
+            throw new NotSupportedException("Sync Interval requires an embedded replica connection.");
+        if (_connectionOptions.HasAdvancedReplicaOptions)
+            throw new NotSupportedException("Advanced sync options require an embedded replica connection.");
 
         if (_connectionOptions.GetEncryptionCipher().HasValue || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
             throw new InvalidOperationException("Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
 
         _remoteClient = new TursoRemoteClient(_connectionOptions.GetRemoteUri(), _connectionOptions.AuthToken);
+    }
+
+    private void OpenReplica()
+    {
+        ValidateReplicaOptions();
+        var syncDatabase = TursoSyncDatabase.Create(CreateReplicaOptions());
+        try
+        {
+            _turso = syncDatabase.ConnectHandleAsync(CancellationToken.None).GetAwaiter().GetResult();
+            _syncDatabase = syncDatabase;
+            _ownsSyncDatabase = true;
+        }
+        catch
+        {
+            _turso?.Dispose();
+            _turso = null;
+            syncDatabase.Dispose();
+            throw;
+        }
+    }
+
+    private async Task OpenReplicaAsync(CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_turso is not null || _remoteClient is not null)
+            throw new InvalidOperationException("The connection is already open.");
+
+        ValidateReplicaOptions();
+        var syncDatabase = await TursoSyncDatabase
+            .CreateAsync(CreateReplicaOptions(), cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            _turso = await syncDatabase.ConnectHandleAsync(cancellationToken).ConfigureAwait(false);
+            _syncDatabase = syncDatabase;
+            _ownsSyncDatabase = true;
+        }
+        catch
+        {
+            _turso?.Dispose();
+            _turso = null;
+            await syncDatabase.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    internal TursoSyncDatabaseOptions CreateReplicaOptions()
+    {
+        if (_connectionOptions.GetEncryptionCipher().HasValue
+            || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
+        {
+            throw new InvalidOperationException(
+                "Encryption Cipher and Encryption Key are local database options. "
+                + "Use Remote Encryption Cipher and Remote Encryption Key for embedded replicas.");
+        }
+
+        TursoPartialSyncOptions? partialSync = null;
+        if (_connectionOptions.HasPartialSyncOptions)
+        {
+            partialSync = new TursoPartialSyncOptions
+            {
+                PrefixLength = _connectionOptions.PartialBootstrapPrefix == 0
+                    ? null
+                    : _connectionOptions.PartialBootstrapPrefix,
+                Query = string.IsNullOrWhiteSpace(_connectionOptions.PartialBootstrapQuery)
+                    ? null
+                    : _connectionOptions.PartialBootstrapQuery,
+                SegmentSize = _connectionOptions.PartialSyncSegmentSize == 0
+                    ? null
+                    : _connectionOptions.PartialSyncSegmentSize,
+                Prefetch = _connectionOptions.PartialSyncPrefetch,
+            };
+        }
+
+        return new TursoSyncDatabaseOptions(
+            _connectionOptions.ReplicaPath,
+            _connectionOptions.GetRemoteUri())
+        {
+            AuthToken = _connectionOptions.AuthToken,
+            ClientName = string.IsNullOrWhiteSpace(_connectionOptions.SyncClientName)
+                ? "turso-sync-dotnet"
+                : _connectionOptions.SyncClientName,
+            LongPollTimeout = _connectionOptions.SyncLongPollTimeout == 0
+                ? null
+                : TimeSpan.FromMilliseconds(_connectionOptions.SyncLongPollTimeout),
+            BootstrapIfEmpty = _connectionOptions.BootstrapIfEmpty,
+            PartialSync = partialSync,
+            RemoteEncryption = _connectionOptions.GetRemoteEncryption(),
+            PushOperationsThreshold = _connectionOptions.PushOperationsThreshold == 0
+                ? null
+                : _connectionOptions.PushOperationsThreshold,
+            PullBytesThreshold = _connectionOptions.PullBytesThreshold == 0
+                ? null
+                : _connectionOptions.PullBytesThreshold,
+            ForceLogicalMvccPull = _connectionOptions.ForceLogicalMvccPull,
+            ExperimentalFeatures = string.IsNullOrWhiteSpace(_connectionOptions.SyncExperimentalFeatures)
+                ? null
+                : _connectionOptions.SyncExperimentalFeatures,
+            HttpClient = SyncHttpClientFactory?.Invoke(),
+        };
+    }
+
+    private void ValidateReplicaOptions()
+    {
+        if (_connectionOptions.Pooling)
+            throw new NotSupportedException("Pooling is not supported for embedded replica connections yet. Set Pooling=False.");
+        if (_connectionOptions.SyncInterval != 0)
+            throw new NotSupportedException("Automatic sync is not supported for embedded replica connections yet. Set Sync Interval=0 and call SyncAsync explicitly.");
     }
 
     private void ValidateLocalOnlyOptions()
@@ -393,6 +513,8 @@ public class TursoConnection : DbConnection
             throw new InvalidOperationException("Replica Path requires a remote Turso URL Data Source.");
         if (_connectionOptions.SyncInterval > 0)
             throw new InvalidOperationException("Sync Interval requires a remote embedded replica connection.");
+        if (_connectionOptions.HasAdvancedReplicaOptions)
+            throw new InvalidOperationException("Advanced sync options require a remote embedded replica connection.");
         if (_connectionOptions.Tls.HasValue)
             throw new InvalidOperationException("Tls requires a remote Turso URL Data Source.");
     }
@@ -448,8 +570,12 @@ public class TursoConnection : DbConnection
         if (syncDatabase is null)
             return;
 
+        var ownsSyncDatabase = _ownsSyncDatabase;
         _syncDatabase = null;
+        _ownsSyncDatabase = false;
         syncDatabase.ReleaseConnection();
+        if (ownsSyncDatabase)
+            syncDatabase.Dispose();
     }
 
     private void CloseSyncReaders()

@@ -51,6 +51,24 @@ public sealed class TursoRemoteEncryptionOptions
         ArgumentException.ThrowIfNullOrWhiteSpace(Key);
         _ = ReservedBytes;
     }
+
+    internal static TursoRemoteEncryptionCipher ParseCipher(string value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value);
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "aes256gcm" => TursoRemoteEncryptionCipher.Aes256Gcm,
+            "aes128gcm" => TursoRemoteEncryptionCipher.Aes128Gcm,
+            "chacha20poly1305" => TursoRemoteEncryptionCipher.ChaCha20Poly1305,
+            "aegis128l" => TursoRemoteEncryptionCipher.Aegis128L,
+            "aegis128x2" => TursoRemoteEncryptionCipher.Aegis128X2,
+            "aegis128x4" => TursoRemoteEncryptionCipher.Aegis128X4,
+            "aegis256" => TursoRemoteEncryptionCipher.Aegis256,
+            "aegis256x2" => TursoRemoteEncryptionCipher.Aegis256X2,
+            "aegis256x4" => TursoRemoteEncryptionCipher.Aegis256X4,
+            _ => throw new InvalidOperationException($"Unknown remote encryption cipher: {value}"),
+        };
+    }
 }
 
 public sealed class TursoPartialSyncOptions
