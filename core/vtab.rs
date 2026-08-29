@@ -35,6 +35,10 @@ impl VirtualTable {
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }
+    pub(crate) fn is_internal(&self) -> bool {
+        matches!(self.vtab_type, VirtualTableType::Internal(_))
+    }
+
     pub(crate) fn readonly(&self) -> bool {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => true,

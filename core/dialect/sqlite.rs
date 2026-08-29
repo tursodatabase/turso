@@ -158,6 +158,8 @@ pub fn register_builtin_catalog(
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_each())?;
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_tree())?;
     }
+    #[cfg(feature = "series")]
+    schema.register_internal_vtab(crate::series::GenerateSeriesTable)?;
     #[cfg(feature = "cli_only")]
     {
         schema.register_internal_vtab(crate::dbpage::DbPageTable::new())?;

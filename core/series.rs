@@ -1,60 +1,32 @@
-use crate::sync::Arc;
-
+use crate::sync::{Arc, RwLock};
+use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
+use crate::{Connection, LimboError, Value};
 use turso_ext::{
-    Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, ExtensionApi, IndexInfo,
-    OrderByInfo, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
+    ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
 
-pub fn register_extension(ext_api: &mut ExtensionApi) {
-    // FIXME: Add macro magic to register functions automatically.
-    unsafe {
-        GenerateSeriesVTabModule::register_GenerateSeriesVTabModule(ext_api);
+/// The generate_series(start, stop, step) table-valued function.
+///
+/// It runs inside the engine rather than through the extension API, so
+/// reading a column is a plain field read instead of an FFI call and a
+/// value conversion.
+#[derive(Debug)]
+pub struct GenerateSeriesTable;
+
+impl InternalVirtualTable for GenerateSeriesTable {
+    fn name(&self) -> String {
+        "generate_series".to_string()
     }
-}
 
-macro_rules! extract_arg_integer {
-    ($args:expr, $idx:expr) => {
-        $args.get($idx).and_then(|v| v.to_integer())
-    };
-}
-
-/// A virtual table that generates a sequence of integers
-#[derive(Debug, VTabModuleDerive, Default)]
-struct GenerateSeriesVTabModule;
-
-impl VTabModule for GenerateSeriesVTabModule {
-    type Table = GenerateSeriesTable;
-    const NAME: &'static str = "generate_series";
-    const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
-
-    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
-        let schema = "CREATE TABLE generate_series (
-            value INTEGER,
-            start INTEGER HIDDEN,
-            stop INTEGER HIDDEN,
-            step INTEGER HIDDEN
-        )"
-        .into();
-        Ok((schema, GenerateSeriesTable {}))
-    }
-}
-
-struct GenerateSeriesTable {}
-
-impl VTable for GenerateSeriesTable {
-    type Cursor = GenerateSeriesCursor;
-    type Error = ResultCode;
-
-    fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
-        Ok(GenerateSeriesCursor {
-            start: 0,
-            stop: 0,
-            step: 0,
-            current: 0,
-        })
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(GenerateSeriesCursor::new())))
     }
 
     fn best_index(
+        &self,
         constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
@@ -126,6 +98,16 @@ impl VTable for GenerateSeriesTable {
             ..Default::default()
         })
     }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE generate_series (
+            value INTEGER,
+            start INTEGER HIDDEN,
+            stop INTEGER HIDDEN,
+            step INTEGER HIDDEN
+        )"
+        .to_string()
+    }
 }
 
 /// The cursor for iterating over the generated sequence
@@ -138,6 +120,15 @@ struct GenerateSeriesCursor {
 }
 
 impl GenerateSeriesCursor {
+    fn new() -> Self {
+        Self {
+            start: 0,
+            stop: 0,
+            step: 0,
+            current: 0,
+        }
+    }
+
     /// Returns true if this is an ascending series (positive step) but start > stop
     fn is_invalid_ascending_series(&self) -> bool {
         self.step > 0 && self.start > self.stop
@@ -157,80 +148,6 @@ impl GenerateSeriesCursor {
     fn would_exceed(&self) -> bool {
         (self.step > 0 && self.current.saturating_add(self.step) > self.stop)
             || (self.step < 0 && self.current.saturating_add(self.step) < self.stop)
-    }
-}
-
-impl VTabCursor for GenerateSeriesCursor {
-    type Error = ResultCode;
-
-    fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode {
-        let mut start: Option<i64> = None;
-        let mut stop: Option<i64> = None;
-        let mut step = 1;
-        // SQLite default for stop when it is omitted
-        const DEFAULT_STOP_OMITTED: Option<i64> = Some(u32::MAX as i64);
-
-        if let Some((_, idx_num)) = idx_info {
-            let mut arg_idx = 0;
-            // For the semantics of `idx_num`, see the comment in the `best_index` method.
-            if idx_num & 1 != 0 {
-                start = extract_arg_integer!(args, arg_idx);
-                arg_idx += 1;
-            }
-            if idx_num & 2 != 0 {
-                stop = extract_arg_integer!(args, arg_idx);
-                arg_idx += 1;
-            } else {
-                stop = DEFAULT_STOP_OMITTED;
-            }
-            if idx_num & 4 != 0 {
-                step = args
-                    .get(arg_idx)
-                    .map(|v| v.to_integer().unwrap_or(1))
-                    .unwrap_or(1);
-            }
-        }
-
-        if start.is_none() {
-            return ResultCode::InvalidArgs;
-        }
-        if stop.is_none() {
-            return ResultCode::EOF; // Sqlite returns an empty series for wacky args
-        }
-
-        // Convert zero step to 1, matching SQLite behavior
-        if step == 0 {
-            step = 1;
-        }
-
-        self.start = start.unwrap();
-        self.step = step;
-        self.stop = stop.unwrap();
-
-        // Set initial value based on range validity
-        // For invalid input SQLite returns an empty series
-        self.current = if self.is_invalid_range() {
-            return ResultCode::EOF;
-        } else {
-            self.start
-        };
-
-        ResultCode::OK
-    }
-
-    fn next(&mut self) -> ResultCode {
-        if self.eof() {
-            return ResultCode::EOF;
-        }
-
-        self.current = match self.current.checked_add(self.step) {
-            Some(val) => val,
-            None => {
-                return ResultCode::EOF;
-            }
-        };
-
-        ResultCode::OK
     }
 
     fn eof(&self) -> bool {
@@ -254,14 +171,83 @@ impl VTabCursor for GenerateSeriesCursor {
 
         false
     }
+}
 
-    fn column(&self, idx: u32) -> Result<Value, Self::Error> {
+impl InternalVirtualTableCursor for GenerateSeriesCursor {
+    /// Returns `Ok(true)` when the cursor is positioned on the first row and
+    /// `Ok(false)` when the series is empty.
+    fn filter(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<String>,
+        idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        // SQLite default for stop when it is omitted
+        const DEFAULT_STOP_OMITTED: Option<i64> = Some(u32::MAX as i64);
+
+        let mut arg_idx = 0;
+        // For the semantics of `idx_num`, see the comment in the `best_index` method.
+        let mut start: Option<i64> = None;
+        if idx_num & 1 != 0 {
+            start = args.get(arg_idx).and_then(Value::as_int);
+            arg_idx += 1;
+        }
+        let stop = if idx_num & 2 != 0 {
+            let stop = args.get(arg_idx).and_then(Value::as_int);
+            arg_idx += 1;
+            stop
+        } else {
+            DEFAULT_STOP_OMITTED
+        };
+        let mut step = 1;
+        if idx_num & 4 != 0 {
+            step = args.get(arg_idx).and_then(Value::as_int).unwrap_or(1);
+        }
+
+        let Some(start) = start else {
+            return Err(LimboError::InvalidArgument(
+                "generate_series() requires a start value".to_string(),
+            ));
+        };
+        let Some(stop) = stop else {
+            return Ok(false); // Sqlite returns an empty series for wacky args
+        };
+
+        // Convert zero step to 1, matching SQLite behavior
+        if step == 0 {
+            step = 1;
+        }
+
+        self.start = start;
+        self.step = step;
+        self.stop = stop;
+        self.current = start;
+
+        // For invalid input SQLite returns an empty series
+        Ok(!self.is_invalid_range())
+    }
+
+    fn next(&mut self) -> Result<bool, LimboError> {
+        if self.eof() {
+            return Ok(false);
+        }
+
+        match self.current.checked_add(self.step) {
+            Some(val) => {
+                self.current = val;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn column(&self, idx: usize) -> Result<Value, LimboError> {
         Ok(match idx {
-            0 => Value::from_integer(self.current),
-            1 => Value::from_integer(self.start),
-            2 => Value::from_integer(self.stop),
-            3 => Value::from_integer(self.step),
-            _ => Value::null(),
+            0 => Value::from_i64(self.current),
+            1 => Value::from_i64(self.start),
+            2 => Value::from_i64(self.stop),
+            3 => Value::from_i64(self.step),
+            _ => Value::Null,
         })
     }
 
@@ -317,38 +303,33 @@ mod tests {
             Series { start, stop, step }
         }
     }
-    // Helper function to collect all values from a cursor, returns Result with error code
-    fn collect_series(series: Series) -> Result<Vec<i64>, ResultCode> {
-        let tbl = GenerateSeriesTable {};
-        let mut cursor = tbl.open(None)?;
+    // Helper function to collect all values from a cursor
+    fn collect_series(series: Series) -> crate::Result<Vec<i64>> {
+        let mut cursor = GenerateSeriesCursor::new();
 
         // Create args array for filter
         let args = vec![
-            Value::from_integer(series.start),
-            Value::from_integer(series.stop),
-            Value::from_integer(series.step),
+            Value::from_i64(series.start),
+            Value::from_i64(series.stop),
+            Value::from_i64(series.step),
         ];
 
         // Initialize cursor through filter
-        match cursor.filter(&args, Some(("idx", 1 | 2 | 4))) {
-            ResultCode::OK => (),
-            ResultCode::EOF => return Ok(vec![]),
-            err => return Err(err),
+        if !cursor.filter(&args, Some("7".to_string()), 1 | 2 | 4)? {
+            return Ok(vec![]);
         }
 
         let mut values = Vec::new();
         loop {
-            values.push(cursor.column(0)?.to_integer().unwrap());
+            values.push(cursor.column(0)?.as_int().unwrap());
             if values.len() > 1000 {
                 panic!(
                     "Generated more than 1000 values, expected this many: {:?}",
                     (series.stop - series.start) / series.step + 1
                 );
             }
-            match cursor.next() {
-                ResultCode::OK => (),
-                ResultCode::EOF => break,
-                err => return Err(err),
+            if !cursor.next()? {
+                break;
             }
         }
         Ok(values)
@@ -606,28 +587,26 @@ mod tests {
         let start = series.start;
         let stop = series.stop;
         let step = series.step;
-        let tbl = GenerateSeriesTable {};
-        let mut cursor = tbl.open(None).unwrap();
+        let mut cursor = GenerateSeriesCursor::new();
 
         let args = vec![
-            Value::from_integer(start),
-            Value::from_integer(stop),
-            Value::from_integer(step),
+            Value::from_i64(start),
+            Value::from_i64(stop),
+            Value::from_i64(step),
         ];
 
         // Initialize cursor through filter
-        cursor.filter(&args, Some(("idx", 1 | 2 | 4)));
+        cursor
+            .filter(&args, Some("7".to_string()), 1 | 2 | 4)
+            .unwrap();
 
         let mut rowids = vec![];
         while !cursor.eof() {
             let cur_rowid = cursor.rowid();
-            match cursor.next() {
-                ResultCode::OK => rowids.push(cur_rowid),
-                ResultCode::EOF => break,
-                err => {
-                    panic!("Unexpected error {err:?} for start={start}, stop={stop}, step={step}")
-                }
+            if !cursor.next().unwrap() {
+                break;
             }
+            rowids.push(cur_rowid);
         }
 
         assert!(
@@ -692,7 +671,7 @@ mod tests {
             usable_constraint(3), // step
         ];
 
-        let index_info = GenerateSeriesTable::best_index(&constraints, &[]).unwrap();
+        let index_info = GenerateSeriesTable.best_index(&constraints, &[]).unwrap();
 
         // Verify start gets argv_index 1, stop gets 2, step gets 3
         assert_eq!(index_info.constraint_usages[0].argv_index, Some(1)); // start
@@ -708,7 +687,7 @@ mod tests {
             usable_constraint(2), // stop
         ];
 
-        let index_info = GenerateSeriesTable::best_index(&constraints, &[]).unwrap();
+        let index_info = GenerateSeriesTable.best_index(&constraints, &[]).unwrap();
 
         // Verify start gets argv_index 1, stop gets 2
         assert_eq!(index_info.constraint_usages[0].argv_index, Some(1)); // start
@@ -722,7 +701,7 @@ mod tests {
             usable_constraint(1), // start
         ];
 
-        let index_info = GenerateSeriesTable::best_index(&constraints, &[]).unwrap();
+        let index_info = GenerateSeriesTable.best_index(&constraints, &[]).unwrap();
 
         // Verify start gets argv_index 1
         assert_eq!(index_info.constraint_usages[0].argv_index, Some(1)); // start
@@ -738,7 +717,7 @@ mod tests {
             usable_constraint(1), // start
         ];
 
-        let index_info = GenerateSeriesTable::best_index(&constraints, &[]).unwrap();
+        let index_info = GenerateSeriesTable.best_index(&constraints, &[]).unwrap();
 
         // Verify start still gets argv_index 1, stop gets 2, step gets 3 regardless of constraint order
         assert_eq!(index_info.constraint_usages[0].argv_index, Some(3)); // step
@@ -755,7 +734,7 @@ mod tests {
             usable_constraint(3), // step
         ];
 
-        let result = GenerateSeriesTable::best_index(&constraints, &[]);
+        let result = GenerateSeriesTable.best_index(&constraints, &[]);
 
         assert!(matches!(result, Err(ResultCode::InvalidArgs)));
     }
@@ -769,7 +748,7 @@ mod tests {
             index: 0,
         }];
 
-        let result = GenerateSeriesTable::best_index(&constraints, &[]);
+        let result = GenerateSeriesTable.best_index(&constraints, &[]);
 
         assert!(matches!(result, Err(ResultCode::ConstraintViolation)));
     }
