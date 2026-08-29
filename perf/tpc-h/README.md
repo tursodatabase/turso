@@ -32,15 +32,15 @@ Convert the results file to CSV and generate the figures:
 ```bash
 cd perf/tpc-h/plot
 ./results2csv.sh ../results_20260216_143000.txt > results.csv
-uv run plot-tpch.py results.csv -o tpch.png -o tpch.pdf -o tpch.tikz
+uv run plot-tpch.py results.csv
 ```
 
 This draws a grouped bar chart of per-query runtime for Limbo and SQLite on
 a log scale, in the same style as the `perf/latency` and `perf/throughput`
-plots. `-o` can be given more than once; `.png`, `.pdf` and the other
-matplotlib formats draw the figure, and `.tikz` writes a pgfplots picture to
-`\input` into a LaTeX document that loads pgfplots with
-`\pgfplotsset{compat=1.18}`. A query an engine did not run is marked `n/a`.
+plots. It always writes `tpch.png`, `tpch.pdf` and `tpch.tikz`; the `.tikz`
+is a pgfplots picture to `\input` into a LaTeX document that loads pgfplots
+with `\pgfplotsset{compat=1.18}`. A query an engine did not run is marked
+`n/a`.
 Use `--name limbo=Turso` to change an engine's legend name.
 
 By default, `results2csv.sh` uses the "WITHOUT ANALYZE" results. To use the "WITH ANALYZE" results instead:

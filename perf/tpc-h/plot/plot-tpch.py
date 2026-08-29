@@ -5,7 +5,7 @@
 """Draw the runtime of every TPC-H query as grouped bars from a results CSV.
 
 Usage: ./results2csv.sh ../results_<timestamp>.txt > results.csv
-       uv run plot-tpch.py results.csv -o tpch.png -o tpch.pdf -o tpch.tikz
+       uv run plot-tpch.py results.csv
 
 The CSV has one row per query and one column per engine, as
 `results2csv.sh` writes it: `Query,Limbo,SQLite`. Every query gets a
@@ -15,9 +15,8 @@ read. A bar that is missing because the engine did not run the query
 (`NA` in the CSV) is marked `n/a` in its place, so a gap is never
 mistaken for a fast run.
 
-`-o` can be given more than once, and each output's format follows its
-extension: `.png`, `.pdf` and the other matplotlib formats draw the
-figure; `.tikz` or `.tex` write a pgfplots picture for `\\input` into a
+Every run writes `tpch.png`, `tpch.pdf` and `tpch.tikz` (`--out` changes
+the `tpch` part). The `.tikz` is a pgfplots picture for `\\input` into a
 LaTeX document that loads pgfplots and `\\pgfplotsset{compat=1.18}`.
 """
 
@@ -46,9 +45,8 @@ GROUP_WIDTH = 0.8
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv_file", type=Path)
-    parser.add_argument("-o", "--output", action="append", type=Path, metavar="FILE",
-                        help="output file; repeat for several formats "
-                             "(default tpch.png)")
+    parser.add_argument("--out", type=Path, default=Path("tpch"), metavar="PREFIX",
+                        help="write PREFIX.png, PREFIX.pdf and PREFIX.tikz (default tpch)")
     parser.add_argument("--name", action="append", default=[], metavar="ENGINE=NAME",
                         help="legend name for an engine, e.g. limbo=Turso")
     args = parser.parse_args()
@@ -62,12 +60,13 @@ def main():
         raise SystemExit("no results found")
 
     figure = Figure(rows, columns, names)
-    for output in args.output or [Path("tpch.png")]:
-        if output.suffix in (".tikz", ".tex"):
-            output.write_text(figure.tikz())
-        else:
-            figure.matplotlib(output)
+    for suffix in (".png", ".pdf"):
+        output = args.out.with_suffix(suffix)
+        figure.matplotlib(output)
         print(f"wrote {output}")
+    output = args.out.with_suffix(".tikz")
+    output.write_text(figure.tikz())
+    print(f"wrote {output}")
 
 
 class Series:
