@@ -1816,7 +1816,7 @@ __metadata:
   resolution: "@tursodatabase/database-common@workspace:packages/common"
   dependencies:
     typescript: "npm:^5.9.2"
-    vitest: "npm:^3.2.4"
+    vitest: "npm:^3.2.7"
   languageName: unknown
   linkType: soft
 
@@ -1838,11 +1838,11 @@ __metadata:
     "@napi-rs/cli": "npm:^3.1.5"
     "@tursodatabase/database-common": "npm:^0.8.0-pre.7"
     "@tursodatabase/database-wasm-common": "npm:^0.8.0-pre.7"
-    "@vitest/browser": "npm:^3.2.4"
+    "@vitest/browser": "npm:^3.2.7"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
-    vite: "npm:^7.3.2"
-    vitest: "npm:^3.2.4"
+    vite: "npm:^7.3.5"
+    vitest: "npm:^3.2.7"
   languageName: unknown
   linkType: soft
 
@@ -1857,7 +1857,7 @@ __metadata:
     drizzle-kit: "npm:^0.31.4"
     drizzle-orm: "npm:^0.45.2"
     typescript: "npm:^5.9.2"
-    vitest: "npm:^3.2.4"
+    vitest: "npm:^3.2.7"
   languageName: unknown
   linkType: soft
 
@@ -1887,11 +1887,11 @@ __metadata:
     "@tursodatabase/database-common": "npm:^0.8.0-pre.7"
     "@tursodatabase/database-wasm-common": "npm:^0.8.0-pre.7"
     "@tursodatabase/sync-common": "npm:^0.8.0-pre.7"
-    "@vitest/browser": "npm:^3.2.4"
+    "@vitest/browser": "npm:^3.2.7"
     playwright: "npm:^1.57.0"
     typescript: "npm:^5.9.2"
-    vite: "npm:^7.3.2"
-    vitest: "npm:^3.2.4"
+    vite: "npm:^7.3.5"
+    vitest: "npm:^3.2.7"
   languageName: unknown
   linkType: soft
 
@@ -1904,7 +1904,7 @@ __metadata:
     "@tursodatabase/sync-common": "npm:^0.8.0-pre.7"
     "@types/node": "npm:^24.12.2"
     typescript: "npm:^5.9.2"
-    vitest: "npm:^3.2.4"
+    vitest: "npm:^3.2.7"
   languageName: unknown
   linkType: soft
 
@@ -1957,7 +1957,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@vitest/browser@npm:^3.2.4":
+"@vitest/browser@npm:^3.2.7":
   version: 3.2.7
   resolution: "@vitest/browser@npm:3.2.7"
   dependencies:
@@ -2941,13 +2941,13 @@ __metadata:
   linkType: hard
 
 "js-yaml@npm:^4.1.0":
-  version: 4.3.0
-  resolution: "js-yaml@npm:4.3.0"
+  version: 4.3.2
+  resolution: "js-yaml@npm:4.3.2"
   dependencies:
     argparse: "npm:^2.0.1"
   bin:
     js-yaml: bin/js-yaml.js
-  checksum: 10c0/058b30473d6915ca5b4feb11e2f7d4d97242f98d00a798ed48dd90b46b7c640398afe9128c5db22c5300f8c6528fe2a174b9a93f351a70ebc28c6203938d8bff
+  checksum: 10c0/dedd34c2e8fef1d504687f1bc94ed0ee1311a1f78770fa2800352c6d59c635ccf555009d74e9afe529ae62199da2b1ccef30e53dc84dcd8d2d8187c22574bc97
   languageName: node
   linkType: hard
 
@@ -3738,7 +3738,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vite@npm:^5.0.0 || ^6.0.0 || ^7.0.0-0, vite@npm:^7.3.2":
+"vite@npm:^5.0.0 || ^6.0.0 || ^7.0.0-0, vite@npm:^7.3.5":
   version: 7.3.6
   resolution: "vite@npm:7.3.6"
   dependencies:
@@ -3793,7 +3793,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vitest@npm:^3.2.4":
+"vitest@npm:^3.2.7":
   version: 3.2.7
   resolution: "vitest@npm:3.2.7"
   dependencies:
