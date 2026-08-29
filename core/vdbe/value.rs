@@ -1159,18 +1159,30 @@ impl Value {
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(lhs), Value::Numeric(rhs)) = (self, rhs) {
+            return lhs.checked_add(*rhs).into();
+        }
         (|| Numeric::from_value(self)?.checked_add(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(lhs), Value::Numeric(rhs)) = (self, rhs) {
+            return lhs.checked_sub(*rhs).into();
+        }
         (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(lhs), Value::Numeric(rhs)) = (self, rhs) {
+            return lhs.checked_mul(*rhs).into();
+        }
         (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_divide(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(lhs), Value::Numeric(rhs)) = (self, rhs) {
+            return lhs.checked_div(*rhs).into();
+        }
         (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
     }
 
@@ -1183,6 +1195,14 @@ impl Value {
     }
 
     pub fn exec_remainder(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(Numeric::Integer(lhs)), Value::Numeric(Numeric::Integer(rhs))) =
+            (self, rhs)
+        {
+            return match NullableInteger::Integer(*lhs) % NullableInteger::Integer(*rhs) {
+                NullableInteger::Null => Value::Null,
+                NullableInteger::Integer(v) => Value::from_i64(v),
+            };
+        }
         let convert_to_float = matches!(Numeric::from_value(self), Some(Numeric::Float(_)))
             || matches!(Numeric::from_value(rhs), Some(Numeric::Float(_)));
 
