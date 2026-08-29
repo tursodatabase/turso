@@ -258,10 +258,7 @@ impl SyncEngine {
             ))]
             {
                 if opts.partial_sync_opts.is_some() {
-                    // Partial sync stores lazily fetched pages in a sparse file
-                    // and probes them with `File::has_hole`, which `PlatformIO`
-                    // does not implement. Fail here instead of panicking later
-                    // in the lazy storage path.
+                    // `PlatformIO` has no sparse-page presence operations.
                     return Err(napi::Error::new(
                         napi::Status::GenericFailure,
                         "partial sync requires sparse-file IO, which is not supported on this platform",
@@ -277,9 +274,7 @@ impl SyncEngine {
             #[cfg(feature = "browser")]
             {
                 if opts.partial_sync_opts.is_some() {
-                    // OPFS files implement neither `has_hole` nor
-                    // `punch_hole`; partial sync would panic in the lazy
-                    // storage path. Fail at configuration time instead.
+                    // OPFS has no sparse-page presence operations.
                     return Err(napi::Error::new(
                         napi::Status::GenericFailure,
                         "partial sync requires sparse-file IO, which is not supported in the browser",

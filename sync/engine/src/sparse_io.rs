@@ -1,45 +1,14 @@
-//! Sparse-file IO backends for partial sync.
+//! Persistent sparse-file IO for partial sync.
 //!
-//! The lazy page storage tracks which pages are locally present via
-//! [`File::has_hole`] and evicts them via [`File::punch_hole`]. Two backends
-//! implement that contract for persistent files:
+//! Linux derives page presence from `SEEK_DATA` and reclaims space with
+//! `PUNCH_HOLE`. [`SparseBitmapIo`] uses an explicit sidecar on filesystems
+//! where allocation cannot represent page presence reliably. It tracks only
+//! the configured database path, rejects aliases, and delegates other files.
 //!
-//! * [`SparseLinuxIo`] (Linux only) uses the filesystem as the source of
-//!   truth: never-written ranges of a sparse file are holes, `lseek(SEEK_DATA)`
-//!   reports them exactly, and `fallocate(PUNCH_HOLE)` restores them.
-//! * [`SparseBitmapIo`] (portable across Unix) keeps an explicit presence
-//!   bitmap for the lazily-populated database file, mirroring the presence-map
-//!   semantics of `MemoryIO`, and persists it to a sidecar file. A hard-link
-//!   anchor binds that sidecar to the database inode. Filesystem hole punching
-//!   is only best-effort space reclamation. Files other than the tracked
-//!   database file (WAL, metadata) are delegated to `PlatformIO` untouched.
-//!
-//! The bitmap backend exists because APFS on macOS cannot carry the Linux
-//! contract. Delayed allocation rounds writes up to multi-block extents and
-//! materializes neighbouring never-written (and even previously punched)
-//! ranges as allocated zeros when dirty data is flushed, so `lseek(SEEK_DATA)`
-//! reports absent pages as data. For lazy page storage that error direction is
-//! fatal: an absent page reported present is served as zeros instead of being
-//! fetched from the server. An explicit bitmap makes presence exact on any
-//! filesystem; it is also fully exercisable on Linux, where the simulator,
-//! stress, and Antithesis workloads run.
-//!
-//! # Crash consistency of the presence bitmap
-//!
-//! Presence bits protect two different things: fetched server pages (where a
-//! lost bit only costs a re-fetch) and locally modified pages checkpointed
-//! into the database file (where a lost bit would let the lazy storage
-//! overwrite local data with an older server page). The backend therefore
-//! maintains two properties:
-//!
-//! 1. The on-disk bitmap never *over*-claims: the data file is synced before
-//!    every bitmap persist, and punched bits are made durable (temp file +
-//!    fsync + rename + parent-directory fsync) before the bytes are released.
-//! 2. The on-disk bitmap may lag fetched data until a sync or clean close;
-//!    those pages are safe to re-fetch. Checkpointed local changes remain in
-//!    the WAL until [`File::sync`] returns, so WAL replay repairs a crash in
-//!    that window. On a cold open of a non-empty file, missing, corrupt, or
-//!    mismatched metadata is rejected rather than guessed.
+//! Data is durable before new presence bits; cleared bits are durable before
+//! space reclamation. A bitmap may under-claim until sync or clean close:
+//! fetched pages are re-fetched, while local checkpoints remain WAL-protected.
+//! Cold non-empty opens reject missing, corrupt, or mismatched metadata.
 
 use std::{
     os::{fd::AsRawFd, unix::fs::FileExt},
@@ -229,21 +198,13 @@ mod bitmap {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use turso_core::{turso_assert, turso_assert_reachable, turso_assert_sometimes};
 
-    /// Presence is tracked per sync-protocol page, matching `MemoryIO`'s
-    /// presence map. Like
-    /// `MemoryIO` and the Linux backend (where any write allocates its whole
-    /// block), a write marks every granule it touches; the untouched
-    /// remainder of an edge granule reads as zeros — enforced by explicit
-    /// zero-fill when the granule was absent, so a punched granule whose
-    /// physical reclamation did not survive a crash can never leak stale
-    /// bytes back through a later partial write.
+    // Partial-sync transport and `MemoryIO` both track `PAGE_SIZE` chunks.
     const GRANULE: u64 = crate::database_sync_operations::PAGE_SIZE as u64;
 
     const SIDECAR_SUFFIX: &str = ".present";
     const ANCHOR_SUFFIX: &str = ".anchor";
     const SIDECAR_MAGIC: &[u8; 4] = b"TPRB";
     const SIDECAR_VERSION: u8 = 4;
-    /// magic + version + granule (u32) + dev (u64) + ino (u64) + crc32c (u32)
     const SIDECAR_HEADER_LEN: usize = 4 + 1 + 4 + 8 + 8 + 4;
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -296,21 +257,12 @@ mod bitmap {
         }
     }
 
-    /// File identity: `(dev, ino)`. Keying the registry by identity rather
-    /// than path string means alias spellings of one file (case-insensitive
-    /// volumes, symlinks) share one presence state; a spelling that differs
-    /// from the one the sidecar was persisted under fails closed at the next
-    /// open (missing-sidecar anomaly) instead of corrupting. The sidecar's
-    /// hard-link anchor keeps the inode allocated, so this identity cannot be
-    /// reused while its presence metadata survives.
+    // The anchor pins the database inode while its sidecar exists, preventing
+    // `(dev, ino)` reuse from attaching stale presence state to a new file.
     type FileId = (u64, u64);
 
-    /// All handles to a tracked file share one [`FileEntry`], process-wide —
-    /// across `SparseBitmapIo` instances too — mirroring how `MemoryIO`
-    /// shares one store per path and how the Linux backend shares filesystem
-    /// state between descriptors. Handle counting (instead of `Weak`) makes
-    /// the last-close flush deterministic: it runs under the registry lock,
-    /// so a concurrent reopen serializes after it.
+    // Live handles share state process-wide. Counting them makes final-close
+    // persistence serialize with a concurrent reopen under the registry lock.
     struct RegistryEntry {
         entry: Arc<FileEntry>,
         handles: usize,
@@ -324,9 +276,7 @@ mod bitmap {
         }
     }
 
-    /// Canonicalize the parent directory (the file itself may not exist yet)
-    /// so relative/absolute spellings and symlinked directories compare
-    /// equal for the tracked-path decision.
+    // The file may not exist yet, so canonicalize only its parent.
     fn canonical_key(path: &str) -> std::io::Result<std::path::PathBuf> {
         let p = std::path::Path::new(path);
         let name = p.file_name().ok_or_else(|| {
@@ -339,26 +289,16 @@ mod bitmap {
         Ok(std::fs::canonicalize(dir)?.join(name))
     }
 
-    /// Sparse IO for one lazily-populated database file.
-    ///
-    /// `open_file` returns presence-tracked handles for `tracked_path` only;
-    /// every other path (WAL, metadata, …) is delegated to [`PlatformIO`]
-    /// so it keeps stock durability behavior and pays no sidecar overhead.
-    ///
-    /// [`PlatformIO`]: turso_core::PlatformIO
+    /// Presence-tracked IO for one lazily populated database file.
     pub struct SparseBitmapIo {
         tracked_key: std::path::PathBuf,
-        /// The canonical spelling used for the sidecar name and entry path,
-        /// so every alias spelling of the tracked file maps to one sidecar.
+        // Canonical configured spelling; final-component aliases are rejected.
         tracked_path: String,
         inner: Arc<dyn IO>,
     }
 
     impl SparseBitmapIo {
-        /// The tracked file's parent directory must already exist (the
-        /// engine creates its metadata files alongside before opening the
-        /// database), so the tracked-path comparison is stable for the
-        /// lifetime of this IO.
+        /// The tracked file's parent directory must exist.
         pub fn new(tracked_path: &str) -> Result<Self> {
             let tracked_key = canonical_key(tracked_path).map_err(|e| {
                 turso_core::LimboError::InvalidArgument(format!(
@@ -377,13 +317,7 @@ mod bitmap {
             canonical_key(path).is_ok_and(|key| key == self.tracked_key)
         }
 
-        /// Alias spellings of the tracked file (final-component symlinks,
-        /// hard links, case aliases on case-insensitive volumes) are
-        /// rejected rather than silently bypassing presence tracking.
-        /// Detection is best-effort — it cannot be raced-proof against
-        /// external renames — but the engine only ever uses the configured
-        /// spelling, so any alias access is caller error, and an undetected
-        /// alias is unsupported external interference.
+        // Reject final-component aliases instead of bypassing presence state.
         fn reject_alias(&self, path: &str, op: &'static str) -> Result<()> {
             let tracked = std::fs::metadata(&self.tracked_key).ok();
             let this = std::fs::metadata(path).ok();
@@ -427,9 +361,8 @@ mod bitmap {
             }
             let sidecar = sidecar_path(&self.tracked_path);
             if let Some(entry) = registry.get(&id).map(|entry| entry.entry.clone()) {
-                // File operations do not take the registry lock. Serialize
-                // with them and re-read length so an empty snapshot cannot
-                // erase a sidecar persisted by a concurrent write and sync.
+                // Re-read length under the file lock so empty-file setup cannot
+                // overwrite a sidecar persisted by a concurrent write.
                 let existing_file = entry.file.read().unwrap();
                 let current_meta = existing_file
                     .metadata()
@@ -444,8 +377,6 @@ mod bitmap {
                 )?;
             } else {
                 if !read_only {
-                    // No live same-process persist can own a temp file: final
-                    // `Drop` also holds the registry lock.
                     sweep_orphan_tmp_files(&sidecar);
                 }
                 prepare_presence_metadata(
@@ -457,10 +388,8 @@ mod bitmap {
                     read_only,
                 )?;
             }
-            // Re-verify under the registry lock that the path still names the
-            // inode we opened: `remove_file` holds this lock across its
-            // unlinks, so an open racing a removal must not register (and
-            // later persist presence for) an already-unlinked inode.
+            // Re-check under the registry lock so an open racing `remove_file`
+            // cannot register an already-unlinked inode.
             let still_named = path_names_file(&self.tracked_path, id);
             if !still_named {
                 return Err(io_error(
@@ -469,9 +398,6 @@ mod bitmap {
                 ));
             }
             if let Some(reg_entry) = registry.get_mut(&id) {
-                // The freshly opened descriptor names the same inode by
-                // construction; if it is writable and the shared one is not,
-                // upgrade in place.
                 if !read_only && !reg_entry.entry.fd_writable.load(Ordering::Acquire) {
                     *reg_entry.entry.file.write().unwrap() = file;
                     reg_entry.entry.fd_writable.store(true, Ordering::Release);
@@ -504,15 +430,8 @@ mod bitmap {
                 self.reject_alias(path, "remove_file")?;
                 return self.inner.remove_file(path);
             }
-            // Hold the registry lock across the whole removal so a concurrent
-            // open cannot observe a half-removed file, and the entry's
-            // persist lock so an in-flight sidecar persist either completes
-            // before the unlinks or observes `defunct` after them.
-            //
-            // Failure ordering keeps every exit internally consistent: a hard
-            // data-unlink failure leaves its required metadata untouched. Once
-            // the data is gone, finish removing both owned metadata paths even
-            // on a retry after partial cleanup.
+            // Serialize open, persistence, and removal. Do not remove metadata
+            // unless the data unlink succeeds; after that, clean up both paths.
             let mut registry = registry();
             let entry = std::fs::symlink_metadata(path)
                 .ok()
@@ -600,10 +519,8 @@ mod bitmap {
             .is_ok_and(|meta| meta.file_type().is_file() && file_id(&meta) == id)
     }
 
-    /// Writable initialization anchors an empty database before it can gain
-    /// data. Every non-empty open instead requires the existing anchor: it
-    /// keeps the sidecar's inode alive across an external unlink, making inode
-    /// reuse impossible rather than relying on filesystem timestamp quality.
+    // Writable empty initialization syncs the data inode before publishing its
+    // anchor and empty sidecar. A cold non-empty open requires that anchor.
     fn prepare_presence_metadata(
         data_path: &str,
         sidecar: &str,
@@ -677,9 +594,7 @@ mod bitmap {
         barrier_sync(&dir, sync_type)
     }
 
-    /// Fsync honoring [`FileSyncType`]: on Apple platforms `FullFsync` maps
-    /// to `fcntl(F_FULLFSYNC)` per the `File::sync` contract; elsewhere it
-    /// is a plain fsync (mirrors `UnixFile`).
+    // Honor `FullFsync` with `F_FULLFSYNC` on Apple platforms.
     fn barrier_sync(file: &std::fs::File, sync_type: FileSyncType) -> std::io::Result<()> {
         #[cfg(target_vendor = "apple")]
         {
@@ -712,23 +627,17 @@ mod bitmap {
         anchor_path: String,
         file: RwLock<std::fs::File>,
         state: RwLock<PresenceState>,
-        /// Serializes sidecar persistence against `remove_file`, closing the
-        /// window where an in-flight persist could re-create the sidecar of
-        /// a just-removed file. No cycle: `sync`/`punch_hole`/`Drop` acquire
-        /// it while holding file/state locks, but `remove_file` (registry →
-        /// persist_lock) never takes file/state locks, and the final `Drop`
-        /// cannot overlap another operation on the same handle.
+        // Serialize persistence with removal. No lock cycle: `remove_file` takes
+        // registry → persist_lock but never file/state; sync and punch take
+        // file/state → persist_lock but never registry. Final Drop owns the last
+        // live handle.
         persist_lock: Mutex<()>,
-        /// Whether the shared descriptor was opened with write access.
         fd_writable: AtomicBool,
-        /// Set by `remove_file`: presence persistence stops, data operations
-        /// keep POSIX unlinked-file semantics.
+        // Data handles retain POSIX unlink semantics, but metadata must stay gone.
         defunct: AtomicBool,
     }
 
-    /// A presence-tracked handle to the lazily-populated database file. All
-    /// handles to one file share a [`FileEntry`]; the access mode is tracked
-    /// per handle.
+    /// A presence-tracked database handle with per-handle access mode.
     pub struct SparseBitmapFile {
         entry: Arc<FileEntry>,
         id: FileId,
@@ -772,14 +681,7 @@ mod bitmap {
         }
     }
 
-    /// Deterministic last-close flush: the handle count lives in the global
-    /// registry, and the final flush runs under the registry lock, so a
-    /// concurrent reopen serializes after it. Pure read hydration never
-    /// triggers [`File::sync`]; without this flush a clean close would leave
-    /// the fetched pages on disk (OS writeback) but not the bitmap — the
-    /// Linux backend gets that coupling from the filesystem for free. A hard
-    /// crash between syncs still loses hydration state and re-fetches, which
-    /// is the safe direction.
+    // Persist hydration on final close; a crash may instead cause a safe re-fetch.
     impl Drop for SparseBitmapFile {
         fn drop(&mut self) {
             let mut registry = registry();
@@ -824,12 +726,8 @@ mod bitmap {
         }
     }
 
-    /// Load and validate the sidecar against the opened data file.
-    ///
-    /// A read-only empty file is treated as absent without changing metadata;
-    /// writable initialization has already published a valid empty sidecar.
-    /// A cold open of a non-empty file requires a sidecar with matching
-    /// identity and checksum because its bits may protect local changes.
+    // Empty read-only opens do not mutate metadata. Other cold opens require a
+    // sidecar bound to this data inode.
     fn load_sidecar(
         path: &str,
         data_len: u64,
@@ -890,9 +788,7 @@ mod bitmap {
         Some((dev, ino, bitmap))
     }
 
-    /// Remove leftovers of persists interrupted by a crash or failure. The
-    /// temp names are namespaced by the sidecar path, so this can only touch
-    /// this backend's own files.
+    // Sweep this sidecar's temp files from this process or dead processes.
     fn sweep_orphan_tmp_files(sidecar: &str) {
         let path = std::path::Path::new(sidecar);
         let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
@@ -916,9 +812,6 @@ mod bitmap {
             else {
                 continue;
             };
-            // Names are `<sidecar>.<pid>.<seq>.tmp`; only sweep our own
-            // leftovers or those of processes that no longer exist, so an
-            // in-flight persist elsewhere is never deleted.
             let Some(pid) = middle
                 .split('.')
                 .next()
@@ -935,18 +828,8 @@ mod bitmap {
         }
     }
 
-    /// Persist the bitmap via write-to-temp + fsync + rename + parent
-    /// directory fsync, so a crash leaves either the old or the new sidecar
-    /// — durably — and never a torn one. Fsyncing the renamed file alone
-    /// would not make the new *directory entry* durable. The temp name is
-    /// unique per process and per persist, so concurrent writers can never
-    /// interleave inside one temp file.
-    ///
-    /// Ordering invariant: the caller must sync the data file BEFORE the
-    /// bitmap is persisted. The on-disk bitmap may then lag the data file
-    /// (safe: within a `File::sync` call the pager has not yet completed
-    /// its checkpoint, so WAL replay repairs a crash) but never lead it
-    /// (which could serve unfetched bytes as zeros).
+    // Callers sync data before publishing new bits. Cleared bits are published
+    // before physical reclamation, so the durable bitmap never over-claims.
     fn persist_presence(
         entry: &FileEntry,
         file: &std::fs::File,
@@ -956,9 +839,6 @@ mod bitmap {
         if !state.dirty {
             return Ok(());
         }
-        // Serialize against `remove_file`: it holds this lock across its
-        // unlinks, so we either finish the rename before removal starts or
-        // observe `defunct` after it finished.
         let _persist_guard = match entry.persist_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -966,10 +846,7 @@ mod bitmap {
         if entry.defunct.load(Ordering::Acquire) {
             return Ok(());
         }
-        // If the path no longer names this entry's inode (removed or replaced
-        // externally), renaming the sidecar into place would attach this
-        // entry's bits to some other file's name. Skip; the identity binding
-        // makes any stale on-disk sidecar fail closed at the next open.
+        // Never attach this entry's bitmap to an externally replaced path.
         let fd_meta = file.metadata().map_err(|e| io_error(e, "metadata"))?;
         let id = file_id(&fd_meta);
         if !path_names_file(&entry.path, id) || !path_names_file(&entry.anchor_path, id) {
@@ -989,6 +866,7 @@ mod bitmap {
         present: &roaring::RoaringTreemap,
         sync_type: FileSyncType,
     ) -> Result<()> {
+        // Rename prevents torn replacement; the two barriers make it durable.
         let mut payload = Vec::with_capacity(present.serialized_size());
         present
             .serialize_into(&mut payload)
@@ -1027,10 +905,7 @@ mod bitmap {
         result
     }
 
-    /// Release the punched byte range back to the filesystem. Best-effort:
-    /// the bitmap is the source of truth, so failure (or a filesystem that
-    /// later re-materializes the range, as APFS does next to flushed writes)
-    /// costs space, never correctness.
+    // Best-effort: the bitmap, not allocation state, is authoritative.
     #[cfg(target_os = "linux")]
     fn reclaim_range(file: &std::fs::File, pos: u64, len: u64) -> std::io::Result<()> {
         let res = unsafe {
@@ -1048,13 +923,7 @@ mod bitmap {
         }
     }
 
-    /// Release the punched byte range back to the filesystem. Best-effort:
-    /// the bitmap is the source of truth, so failure (or a filesystem that
-    /// later re-materializes the range, as APFS does next to flushed writes)
-    /// costs space, never correctness.
-    ///
-    /// `F_PUNCHHOLE` requires block-size alignment (4096 on APFS); callers
-    /// punch at granule alignment, which satisfies it.
+    // Best-effort: the bitmap, not allocation state, is authoritative.
     #[cfg(target_vendor = "apple")]
     fn reclaim_range(file: &std::fs::File, pos: u64, len: u64) -> std::io::Result<()> {
         let args = libc::fpunchhole_t {
@@ -1076,8 +945,6 @@ mod bitmap {
         Ok(())
     }
 
-    /// Granule indices overlapping `[pos, pos + len)`: a write marks all of
-    /// them (any touched block is allocated, like `MemoryIO` and Linux).
     fn overlapping(pos: u64, len: u64) -> Result<std::ops::Range<u64>> {
         let end = pos.checked_add(len).ok_or_else(|| {
             turso_core::LimboError::InvalidArgument(format!(
@@ -1109,8 +976,6 @@ mod bitmap {
                 file.read_exact_at(buf, pos)
                     .map_err(|e| io_error(e, "pread"))?;
                 buf.len() as i32
-                // Guards drop here: completion callbacks may reopen or drop
-                // other handles, which takes the registry lock.
             };
             c.complete(nr);
             Ok(c)
@@ -1121,7 +986,6 @@ mod bitmap {
             self.reject_if_read_only("pwrite")?;
             let buf = buffer.as_slice();
             if buf.is_empty() {
-                // An empty write allocates nothing (matches `MemoryIO`).
                 c.complete(0);
                 return Ok(c);
             }
@@ -1161,7 +1025,6 @@ mod bitmap {
                 if !range.is_empty() && state.present.insert_range(range) > 0 {
                     state.dirty = true;
                 }
-                // Guards drop here, before the completion callback runs.
             }
             c.complete(buffer.len() as i32);
             Ok(c)
@@ -1174,7 +1037,6 @@ mod bitmap {
                 barrier_sync(&file, sync_type).map_err(|e| io_error(e, "sync"))?;
                 let mut state = self.entry.state.write().unwrap();
                 persist_presence(&self.entry, &file, &mut state, sync_type)?;
-                // Guards drop here, before the completion callback runs.
             }
             c.complete(0);
             Ok(c)
@@ -1194,7 +1056,6 @@ mod bitmap {
                 if state.present.remove_range(first_gone..=u64::MAX) > 0 {
                     state.dirty = true;
                 }
-                // Guards drop here, before the completion callback runs.
             }
             c.complete(0);
             Ok(c)
@@ -1205,12 +1066,6 @@ mod bitmap {
             Ok(file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
         }
 
-        /// Whether `[pos, pos + len)` is entirely absent, per the trait
-        /// contract ("if there is a single byte which is allocated within a
-        /// given range - method must return false") and matching `MemoryIO`:
-        /// any overlapping present granule means data. Takes the file lock so
-        /// the answer is atomic with a concurrent `pwrite`'s data-plus-bits
-        /// installation, as it is for the Linux and memory backends.
         fn has_hole(&self, pos: usize, len: usize) -> turso_core::Result<bool> {
             if len == 0 {
                 return Ok(true);
@@ -1218,7 +1073,6 @@ mod bitmap {
             let range = overlapping(pos as u64, len as u64)?;
             let _file = self.entry.file.read().unwrap();
             let state = self.entry.state.read().unwrap();
-            // Present-count within [start, end) via rank difference.
             let below_end = state.present.rank(range.end - 1);
             let below_start = match range.start.checked_sub(1) {
                 Some(prev) => state.present.rank(prev),
@@ -1242,12 +1096,7 @@ mod bitmap {
             if !range.is_empty() && state.present.remove_range(range) > 0 {
                 state.dirty = true;
             }
-            // The cleared bits must be durable before the bytes are released:
-            // sync the data file (persist ordering invariant), then the
-            // sidecar. A crash in between leaves extra "absent" bits — safe,
-            // because evicted pages are re-fetchable cache by definition, and
-            // stale physical bytes cannot resurface: a later write into an
-            // absent granule zero-fills its uncovered remainder.
+            // Publish absent bits before reclamation; stale bytes remain hidden.
             barrier_sync(&file, FileSyncType::Fsync).map_err(|e| io_error(e, "sync"))?;
             persist_presence(&self.entry, &file, &mut state, FileSyncType::Fsync)?;
             drop(state);
@@ -1301,7 +1150,6 @@ mod tests {
         (io, dir, path)
     }
 
-    /// The `has_hole`/`punch_hole` contract every sparse backend must satisfy.
     fn check_sparse_semantics(io: &dyn IO, path: &str) {
         let file = io.open_file(path, OpenFlags::default(), false).unwrap();
         truncate(&file, 1024 * 1024);
@@ -1339,9 +1187,6 @@ mod tests {
         check_sparse_semantics(&io, &path);
     }
 
-    /// Sub-granule writes must mark their granule present, per the trait
-    /// contract ("a single allocated byte within a given range" ⇒ `false`)
-    /// and matching Linux/MemoryIO allocation semantics.
     #[test]
     pub fn sparse_bitmap_partial_write_marks_presence() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1349,17 +1194,12 @@ mod tests {
         truncate(&file, 16 * G);
         write(&file, 1, 1, 7);
         assert!(!file.has_hole(0, G as usize).unwrap());
-        // A write straddling a granule boundary marks both granules.
         write(&file, 2 * G - 1, 2, 7);
         assert!(!file.has_hole(G as usize, G as usize).unwrap());
         assert!(!file.has_hole(2 * G as usize, G as usize).unwrap());
         assert!(file.has_hole(3 * G as usize, G as usize).unwrap());
     }
 
-    /// A write into an absent granule must not expose stale physical bytes
-    /// (e.g. a punched range whose reclamation did not survive): the
-    /// uncovered remainder of the granule reads as zeros, like a fresh
-    /// `MemoryIO` page.
     #[test]
     pub fn sparse_bitmap_partial_write_zero_fills_absent_granule() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1375,8 +1215,6 @@ mod tests {
             let raw = std::fs::File::options().write(true).open(&path).unwrap();
             raw.write_all_at(&[0xAA; 4096], 0).unwrap();
         }
-        // A one-byte write marks the granule present; the other 4095 bytes
-        // must read as zeros, not the stale 0xAA.
         write(&file, 7, 1, 0xBB);
         assert!(!file.has_hole(0, G as usize).unwrap());
         let bytes = std::fs::read(&path).unwrap();
@@ -1385,8 +1223,6 @@ mod tests {
         assert!(bytes[8..G as usize].iter().all(|b| *b == 0));
     }
 
-    /// A zero-length write allocates nothing, matching `MemoryIO`: it must
-    /// not zero-fill or mark any granule present.
     #[test]
     pub fn sparse_bitmap_empty_write_is_noop() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1396,9 +1232,6 @@ mod tests {
         assert!(file.has_hole(0, G as usize).unwrap());
     }
 
-    /// Alias spellings of the tracked file are rejected: presence tracking
-    /// is keyed to the configured spelling, so a symlink or hard link that
-    /// bypasses it must error rather than silently splitting state.
     #[test]
     pub fn sparse_bitmap_alias_spellings_are_rejected() {
         let (io, dir, path) = tracked_io_and_path();
@@ -1418,7 +1251,6 @@ mod tests {
             .open_file(&hardlink, OpenFlags::default(), false)
             .is_err());
         assert!(io.remove_file(&hardlink).is_err());
-        // The configured spelling keeps working.
         let file = io.open_file(&path, OpenFlags::default(), false).unwrap();
         assert!(!file.has_hole(0, G as usize).unwrap());
     }
@@ -1437,8 +1269,6 @@ mod tests {
         assert!(!std::path::Path::new(&format!("{path}.present.anchor")).exists());
     }
 
-    /// Untracked paths must be plain `PlatformIO` files: full durability
-    /// semantics, no sidecar, no presence overhead.
     #[test]
     pub fn sparse_bitmap_untracked_paths_have_no_sidecar() {
         let (io, dir, _path) = tracked_io_and_path();
@@ -1450,9 +1280,6 @@ mod tests {
         assert!(!std::path::Path::new(&format!("{other}.present")).exists());
     }
 
-    /// All handles to the tracked path share presence state — across
-    /// separate `SparseBitmapIo` instances too: a punch through one handle
-    /// must not be resurrected by a sync through another.
     #[test]
     pub fn sparse_bitmap_handles_share_state() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1464,14 +1291,12 @@ mod tests {
         write(&a, G, G as usize, 1);
         fsync(&a);
         a.punch_hole(0, G as usize).unwrap();
-        // The second instance's handle sees the punch immediately…
         assert!(b.has_hole(0, G as usize).unwrap());
         write(&b, 2 * G, G as usize, 2);
         fsync(&b);
         drop(a);
         drop(b);
 
-        // …and the persisted state is the merged view, not a stale snapshot.
         let io = SparseBitmapIo::new(&path).unwrap();
         let file = io.open_file(&path, OpenFlags::default(), false).unwrap();
         assert!(file.has_hole(0, G as usize).unwrap());
@@ -1512,8 +1337,6 @@ mod tests {
         assert!(!reopened.has_hole(0, G as usize).unwrap());
     }
 
-    /// Presence must survive reopen exactly as persisted: pages written and
-    /// synced stay present, punched pages stay absent.
     #[test]
     pub fn sparse_bitmap_presence_survives_reopen() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1587,8 +1410,6 @@ mod tests {
         assert!(reopened.has_hole(0, G as usize).unwrap());
     }
 
-    /// Hydration that never triggers an explicit sync must still be present
-    /// after a clean close: the last handle's drop flushes the bitmap.
     #[test]
     pub fn sparse_bitmap_drop_flushes_presence() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1603,8 +1424,6 @@ mod tests {
         assert!(file.has_hole(G as usize, G as usize).unwrap());
     }
 
-    /// A live handle must not resurrect the sidecar of a removed file, and
-    /// removal deletes the sidecar together with the data file.
     #[test]
     pub fn sparse_bitmap_remove_fences_live_handles() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1709,10 +1528,6 @@ mod tests {
         assert!(!std::path::Path::new(&sidecar).exists());
     }
 
-    /// A non-empty data file whose sidecar is missing, corrupt, or belongs
-    /// to a different file must refuse to open: its bits may guard locally
-    /// modified pages, so "all absent" could overwrite local data with older
-    /// server pages.
     #[test]
     pub fn sparse_bitmap_anomalies_refuse_to_open() {
         // Missing sidecar.
@@ -1823,7 +1638,6 @@ mod tests {
         assert!(io.open_file(&path, OpenFlags::default(), false).is_ok());
     }
 
-    /// A stale sidecar next to a fresh (empty) data file is discarded.
     #[test]
     pub fn sparse_bitmap_fresh_file_discards_stale_sidecar() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1888,9 +1702,6 @@ mod tests {
         assert_eq!((anchor_meta.dev(), anchor_meta.ino()), anchor_id_before);
     }
 
-    /// Access mode is per handle: a read-only handle may probe presence but
-    /// must not mutate it, even while a writable handle to the same file
-    /// exists.
     #[test]
     pub fn sparse_bitmap_read_only_is_per_handle() {
         let (io, _dir, path) = tracked_io_and_path();
@@ -1907,16 +1718,11 @@ mod tests {
         assert!(ro.truncate(G, Completion::new_trunc(|_| {})).is_err());
         assert!(ro.punch_hole(0, G as usize).is_err());
 
-        // The writable handle is unaffected.
         write(&rw, G, G as usize, 2);
         assert!(!rw.has_hole(G as usize, G as usize).unwrap());
     }
 
-    /// Differential check against `MemoryIO`, whose in-memory presence map is
-    /// the reference model for the `has_hole`/`punch_hole` contract: run
-    /// random (including unaligned) write and aligned punch sequences against
-    /// both backends and require identical `has_hole` answers throughout —
-    /// including after the bitmap file is synced, dropped, and reopened.
+    // Compare random operations with `MemoryIO`, including persisted reopen.
     #[test]
     pub fn sparse_bitmap_matches_memory_io() {
         use rand::{Rng, SeedableRng};
@@ -1961,7 +1767,6 @@ mod tests {
                 let granule = rng.random_range(0..GRANULES);
                 let count = rng.random_range(1..=4).min(GRANULES - granule);
                 if rng.random_bool(0.7) {
-                    // Writes may be unaligned and sub-granule.
                     let jitter = rng.random_range(0..G);
                     let pos = (granule * G + jitter).min(GRANULES * G - 1);
                     let max_len = (count * G - jitter).max(1);
@@ -1969,7 +1774,6 @@ mod tests {
                     write(&bitmap_file, pos, len as usize, step as u8);
                     write(&oracle_file, pos, len as usize, step as u8);
                 } else {
-                    // Punches stay granule-aligned per the punch contract.
                     let (pos, len) = ((granule * G) as usize, (count * G) as usize);
                     bitmap_file.punch_hole(pos, len).unwrap();
                     oracle_file.punch_hole(pos, len).unwrap();
@@ -1977,7 +1781,6 @@ mod tests {
                 check_all(&bitmap_file, &oracle_file, step);
             }
 
-            // The persisted bitmap must reproduce the oracle after reopen.
             fsync(&bitmap_file);
             drop(bitmap_file);
             let io = SparseBitmapIo::new(&path).unwrap();

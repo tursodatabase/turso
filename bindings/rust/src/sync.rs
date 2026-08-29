@@ -1707,9 +1707,6 @@ mod tests {
         }
     }
 
-    /// Partial sync against a file-backed database, exercising the persistent
-    /// sparse IO backend (SparseLinuxIo on Linux, SparseBitmapIo on macOS)
-    /// instead of MemoryIO, including hydration persistence across reopen.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     pub async fn test_sync_partial_file_backed() {
@@ -1755,8 +1752,7 @@ mod tests {
             assert!(partial_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
         }
         {
-            // Reopen: the previously hydrated pages must be served from the
-            // local sparse file, not re-fetched from the server.
+            // Reopen without re-fetching hydrated pages.
             let partial_db = crate::sync::Builder::new_remote(path)
                 .with_remote_url(server.db_url())
                 .with_partial_sync_opts_experimental(opts)
@@ -1780,11 +1776,8 @@ mod tests {
         }
     }
 
-    /// Query bootstrap against a file-backed database. NOTE: the local test
-    /// server ignores `server_query_selector` (only Turso Cloud implements
-    /// it) and answers the empty page bitmap with a full bootstrap, so this
-    /// exercises the Query strategy end to end for correctness but cannot
-    /// assert reduced bootstrap traffic.
+    // The local server ignores `server_query_selector` and returns a full
+    // bootstrap, so this checks correctness but not traffic reduction.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     pub async fn test_sync_partial_query_bootstrap_file_backed() {

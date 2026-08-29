@@ -216,9 +216,7 @@ fn persistent_io(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        // Partial sync stores lazily fetched pages in a sparse file and probes
-        // them with `File::has_hole`, which `PlatformIO` does not implement.
-        // Fail here instead of panicking later in the lazy storage path.
+        // `PlatformIO` has no sparse-page presence operations.
         Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
             "partial sync requires sparse-file IO, which is not supported on this platform"
                 .to_string(),
