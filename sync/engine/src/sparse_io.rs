@@ -4,6 +4,8 @@
 //! `PUNCH_HOLE`. [`SparseBitmapIo`] uses an explicit sidecar on filesystems
 //! where allocation cannot represent page presence reliably. It tracks only
 //! the configured database path, rejects aliases, and delegates other files.
+//! In particular, APFS may materialize neighboring holes as allocated zeros,
+//! making allocation probes over-claim pages that were never fetched.
 //!
 //! Data is durable before new presence bits; cleared bits are durable before
 //! space reclamation. A bitmap may under-claim until sync or clean close:
@@ -205,6 +207,7 @@ mod bitmap {
     const ANCHOR_SUFFIX: &str = ".anchor";
     const SIDECAR_MAGIC: &[u8; 4] = b"TPRB";
     const SIDECAR_VERSION: u8 = 4;
+    // Header fields: magic, version, granule, device, inode, payload CRC.
     const SIDECAR_HEADER_LEN: usize = 4 + 1 + 4 + 8 + 8 + 4;
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -819,6 +822,8 @@ mod bitmap {
             else {
                 continue;
             };
+            // This branch has no live registry entry; final Drop also holds the
+            // registry lock.
             let orphaned = pid == std::process::id()
                 || unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
@@ -926,6 +931,7 @@ mod bitmap {
     // Best-effort: the bitmap, not allocation state, is authoritative.
     #[cfg(target_vendor = "apple")]
     fn reclaim_range(file: &std::fs::File, pos: u64, len: u64) -> std::io::Result<()> {
+        // APFS uses 4096-byte blocks, matching `GRANULE`; failures are best-effort.
         let args = libc::fpunchhole_t {
             fp_flags: 0,
             reserved: 0,
@@ -1047,15 +1053,22 @@ mod bitmap {
             self.reject_if_read_only("truncate")?;
             {
                 let file = self.entry.file.write().unwrap();
-                file.set_len(len).map_err(|e| io_error(e, "truncate"))?;
-                let mut state = self.entry.state.write().unwrap();
-                // Granules wholly beyond the new end are gone; the boundary
-                // granule keeps its bit (its in-range prefix still holds
-                // data, and the extension reads back as zeros).
-                let first_gone = len.div_ceil(GRANULE);
-                if state.present.remove_range(first_gone..=u64::MAX) > 0 {
-                    state.dirty = true;
+                let old_len = file.metadata().map_err(|e| io_error(e, "metadata"))?.len();
+                if len < old_len {
+                    let mut state = self.entry.state.write().unwrap();
+                    // Keep the boundary granule, matching `MemoryIO`, and
+                    // publish removed tail bits before `set_len` reclaims data.
+                    let first_gone = len.div_ceil(GRANULE);
+                    if state.present.remove_range(first_gone..=u64::MAX) > 0 {
+                        state.dirty = true;
+                    }
+                    if state.dirty {
+                        barrier_sync(&file, FileSyncType::Fsync)
+                            .map_err(|e| io_error(e, "sync"))?;
+                        persist_presence(&self.entry, &file, &mut state, FileSyncType::Fsync)?;
+                    }
                 }
+                file.set_len(len).map_err(|e| io_error(e, "truncate"))?;
             }
             c.complete(0);
             Ok(c)
@@ -1071,6 +1084,7 @@ mod bitmap {
                 return Ok(true);
             }
             let range = overlapping(pos as u64, len as u64)?;
+            // Serialize with `pwrite`'s data-plus-bitmap update.
             let _file = self.entry.file.read().unwrap();
             let state = self.entry.state.read().unwrap();
             let below_end = state.present.rank(range.end - 1);
@@ -1359,6 +1373,58 @@ mod tests {
         assert!(file.has_hole(G as usize, G as usize).unwrap());
         assert!(!file.has_hole(2 * G as usize, G as usize).unwrap());
         assert!(file.has_hole(3 * G as usize, G as usize).unwrap());
+    }
+
+    #[test]
+    pub fn sparse_bitmap_truncate_persists_absent_tail_before_reclaim() {
+        let (io, _dir, path) = tracked_io_and_path();
+        let file = io.open_file(&path, OpenFlags::default(), false).unwrap();
+        truncate(&file, 100 * G);
+        write(&file, 0, (100 * G) as usize, 1);
+        fsync(&file);
+
+        truncate(&file, 50 * G + 1);
+        let sidecar = std::fs::read(format!("{path}.present")).unwrap();
+        let present = roaring::RoaringTreemap::deserialize_from(&sidecar[29..]).unwrap();
+        assert_eq!(present.len(), 51);
+        assert!(present.contains(50));
+        assert!(!present.contains(51));
+
+        truncate(&file, 80 * G);
+        drop(file);
+        let io = SparseBitmapIo::new(&path).unwrap();
+        let reopened = io.open_file(&path, OpenFlags::default(), false).unwrap();
+        assert!(!reopened.has_hole((50 * G) as usize, G as usize).unwrap());
+        assert!(reopened
+            .has_hole((51 * G) as usize, (29 * G) as usize)
+            .unwrap());
+    }
+
+    #[test]
+    pub fn sparse_bitmap_truncate_retry_persists_dirty_tail() {
+        let (io, _dir, path) = tracked_io_and_path();
+        let file = io.open_file(&path, OpenFlags::default(), false).unwrap();
+        truncate(&file, 100 * G);
+        write(&file, 0, (100 * G) as usize, 1);
+        fsync(&file);
+
+        let sidecar = format!("{path}.present");
+        let persisted = std::fs::read(&sidecar).unwrap();
+        // Block sidecar replacement with a directory, then restore it for retry.
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        assert!(file
+            .truncate(50 * G, Completion::new_trunc(|_| {}))
+            .is_err());
+        assert_eq!(file.size().unwrap(), 100 * G);
+
+        std::fs::remove_dir(&sidecar).unwrap();
+        std::fs::write(&sidecar, persisted).unwrap();
+        truncate(&file, 50 * G);
+        let sidecar = std::fs::read(&sidecar).unwrap();
+        let present = roaring::RoaringTreemap::deserialize_from(&sidecar[29..]).unwrap();
+        assert_eq!(present.len(), 50);
+        assert_eq!(file.size().unwrap(), 50 * G);
     }
 
     #[test]
