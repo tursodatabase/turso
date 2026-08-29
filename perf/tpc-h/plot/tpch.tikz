@@ -3,18 +3,15 @@
 \definecolor{limbo}{HTML}{0072B2}
 \definecolor{sqlite}{HTML}{E69F00}
 \begin{axis}[
-  scale only axis, width=0.9\linewidth, height=0.36\linewidth,
+  scale only axis, width=0.92\linewidth, height=0.36\linewidth, clip=false,
   ybar, bar width=0.4, bar shift=0pt,
   ymode=log, log origin=infty, ymin=0.1, ymax=316.2,
   log ticks with fixed point, yminorticks=false,
-  xmin=-0.7, xmax=20.7,
-  xtick={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20}, xticklabels={Q1,Q2,Q3,Q4,Q5,Q6,Q7,Q8,Q9,Q10,Q11,Q12,Q13,Q14,Q16,Q17,Q18,Q19,Q20,Q21,Q22}, xminorticks=false,
-  x tick style={draw=none},
-  xlabel={TPC-H query}, ylabel={Runtime (s)},
+  xmin=-0.5, xmax=20.5, xtick=\empty, xminorticks=false,
+  ylabel={Runtime (s)},
   ymajorgrids, grid style={line width=0.3pt, dashed, draw=black!30},
   axis on top=false,
-  tick label style={font=\scriptsize}, x tick label style={font=\tiny},
-  label style={font=\footnotesize},
+  tick label style={font=\scriptsize}, label style={font=\footnotesize},
   axis line style={line width=0.4pt}, tick style={line width=0.4pt, black},
   legend pos=north west, legend columns=-1,
   legend style={draw=none, font=\scriptsize, /tikz/every even column/.append style={column sep=0.5cm}},
@@ -24,8 +21,137 @@
 \addlegendentry{Limbo}
 \addplot[fill=sqlite, draw=none] coordinates {(0.2,6.43) (1.2,0.26) (2.2,1.82) (3.2,0.4) (4.2,2.25) (5.2,1.12) (6.2,3.16) (7.2,7.7) (8.2,10.53) (9.2,1.35) (10.2,0.54) (11.2,0.96) (12.2,7.72) (13.2,1.35) (14.2,0.54) (16.2,1.03) (17.2,1.49) (19.2,6.08)};
 \addlegendentry{SQLite}
-\node[rotate=90, anchor=west, inner sep=1pt, font=\tiny, text=sqlite] at (axis cs:15.2,0.12) {n/a};
-\node[rotate=90, anchor=west, inner sep=1pt, font=\tiny, text=sqlite] at (axis cs:18.2,0.12) {n/a};
-\node[rotate=90, anchor=west, inner sep=1pt, font=\tiny, text=sqlite] at (axis cs:20.2,0.12) {n/a};
+\begin{scope}[every node/.style={font=\tiny, scale=0.85, transform shape, inner sep=0pt}, line width=0.3pt]
+\draw ([yshift=0cm]axis description cs:0.0000,0) rectangle ([yshift=-0.36cm]axis description cs:0.0476,0);
+\node at ([yshift=-0.18cm]axis description cs:0.0238,0) {Q1};
+\draw ([yshift=0cm]axis description cs:0.0476,0) rectangle ([yshift=-0.36cm]axis description cs:0.0952,0);
+\node at ([yshift=-0.18cm]axis description cs:0.0714,0) {Q2};
+\draw ([yshift=0cm]axis description cs:0.0952,0) rectangle ([yshift=-0.36cm]axis description cs:0.1429,0);
+\node at ([yshift=-0.18cm]axis description cs:0.1190,0) {Q3};
+\draw ([yshift=0cm]axis description cs:0.1429,0) rectangle ([yshift=-0.36cm]axis description cs:0.1905,0);
+\node at ([yshift=-0.18cm]axis description cs:0.1667,0) {Q4};
+\draw ([yshift=0cm]axis description cs:0.1905,0) rectangle ([yshift=-0.36cm]axis description cs:0.2381,0);
+\node at ([yshift=-0.18cm]axis description cs:0.2143,0) {Q5};
+\draw ([yshift=0cm]axis description cs:0.2381,0) rectangle ([yshift=-0.36cm]axis description cs:0.2857,0);
+\node at ([yshift=-0.18cm]axis description cs:0.2619,0) {Q6};
+\draw ([yshift=0cm]axis description cs:0.2857,0) rectangle ([yshift=-0.36cm]axis description cs:0.3333,0);
+\node at ([yshift=-0.18cm]axis description cs:0.3095,0) {Q7};
+\draw ([yshift=0cm]axis description cs:0.3333,0) rectangle ([yshift=-0.36cm]axis description cs:0.3810,0);
+\node at ([yshift=-0.18cm]axis description cs:0.3571,0) {Q8};
+\draw ([yshift=0cm]axis description cs:0.3810,0) rectangle ([yshift=-0.36cm]axis description cs:0.4286,0);
+\node at ([yshift=-0.18cm]axis description cs:0.4048,0) {Q9};
+\draw ([yshift=0cm]axis description cs:0.4286,0) rectangle ([yshift=-0.36cm]axis description cs:0.4762,0);
+\node at ([yshift=-0.18cm]axis description cs:0.4524,0) {Q10};
+\draw ([yshift=0cm]axis description cs:0.4762,0) rectangle ([yshift=-0.36cm]axis description cs:0.5238,0);
+\node at ([yshift=-0.18cm]axis description cs:0.5000,0) {Q11};
+\draw ([yshift=0cm]axis description cs:0.5238,0) rectangle ([yshift=-0.36cm]axis description cs:0.5714,0);
+\node at ([yshift=-0.18cm]axis description cs:0.5476,0) {Q12};
+\draw ([yshift=0cm]axis description cs:0.5714,0) rectangle ([yshift=-0.36cm]axis description cs:0.6190,0);
+\node at ([yshift=-0.18cm]axis description cs:0.5952,0) {Q13};
+\draw ([yshift=0cm]axis description cs:0.6190,0) rectangle ([yshift=-0.36cm]axis description cs:0.6667,0);
+\node at ([yshift=-0.18cm]axis description cs:0.6429,0) {Q14};
+\draw ([yshift=0cm]axis description cs:0.6667,0) rectangle ([yshift=-0.36cm]axis description cs:0.7143,0);
+\node at ([yshift=-0.18cm]axis description cs:0.6905,0) {Q16};
+\draw ([yshift=0cm]axis description cs:0.7143,0) rectangle ([yshift=-0.36cm]axis description cs:0.7619,0);
+\node at ([yshift=-0.18cm]axis description cs:0.7381,0) {Q17};
+\draw ([yshift=0cm]axis description cs:0.7619,0) rectangle ([yshift=-0.36cm]axis description cs:0.8095,0);
+\node at ([yshift=-0.18cm]axis description cs:0.7857,0) {Q18};
+\draw ([yshift=0cm]axis description cs:0.8095,0) rectangle ([yshift=-0.36cm]axis description cs:0.8571,0);
+\node at ([yshift=-0.18cm]axis description cs:0.8333,0) {Q19};
+\draw ([yshift=0cm]axis description cs:0.8571,0) rectangle ([yshift=-0.36cm]axis description cs:0.9048,0);
+\node at ([yshift=-0.18cm]axis description cs:0.8810,0) {Q20};
+\draw ([yshift=0cm]axis description cs:0.9048,0) rectangle ([yshift=-0.36cm]axis description cs:0.9524,0);
+\node at ([yshift=-0.18cm]axis description cs:0.9286,0) {Q21};
+\draw ([yshift=0cm]axis description cs:0.9524,0) rectangle ([yshift=-0.36cm]axis description cs:1.0000,0);
+\node at ([yshift=-0.18cm]axis description cs:0.9762,0) {Q22};
+\draw ([yshift=-0.36cm]axis description cs:0.0000,0) rectangle ([yshift=-0.72cm]axis description cs:0.0476,0);
+\node at ([yshift=-0.54cm]axis description cs:0.0238,0) {11.09};
+\draw ([yshift=-0.36cm]axis description cs:0.0476,0) rectangle ([yshift=-0.72cm]axis description cs:0.0952,0);
+\node at ([yshift=-0.54cm]axis description cs:0.0714,0) {0.20};
+\draw ([yshift=-0.36cm]axis description cs:0.0952,0) rectangle ([yshift=-0.72cm]axis description cs:0.1429,0);
+\node at ([yshift=-0.54cm]axis description cs:0.1190,0) {3.39};
+\draw ([yshift=-0.36cm]axis description cs:0.1429,0) rectangle ([yshift=-0.72cm]axis description cs:0.1905,0);
+\node at ([yshift=-0.54cm]axis description cs:0.1667,0) {0.79};
+\draw ([yshift=-0.36cm]axis description cs:0.1905,0) rectangle ([yshift=-0.72cm]axis description cs:0.2381,0);
+\node at ([yshift=-0.54cm]axis description cs:0.2143,0) {3.65};
+\draw ([yshift=-0.36cm]axis description cs:0.2381,0) rectangle ([yshift=-0.72cm]axis description cs:0.2857,0);
+\node at ([yshift=-0.54cm]axis description cs:0.2619,0) {2.27};
+\draw ([yshift=-0.36cm]axis description cs:0.2857,0) rectangle ([yshift=-0.72cm]axis description cs:0.3333,0);
+\node at ([yshift=-0.54cm]axis description cs:0.3095,0) {7.31};
+\draw ([yshift=-0.36cm]axis description cs:0.3333,0) rectangle ([yshift=-0.72cm]axis description cs:0.3810,0);
+\node at ([yshift=-0.54cm]axis description cs:0.3571,0) {7.56};
+\draw ([yshift=-0.36cm]axis description cs:0.3810,0) rectangle ([yshift=-0.72cm]axis description cs:0.4286,0);
+\node at ([yshift=-0.54cm]axis description cs:0.4048,0) {18.49};
+\draw ([yshift=-0.36cm]axis description cs:0.4286,0) rectangle ([yshift=-0.72cm]axis description cs:0.4762,0);
+\node at ([yshift=-0.54cm]axis description cs:0.4524,0) {1.75};
+\draw ([yshift=-0.36cm]axis description cs:0.4762,0) rectangle ([yshift=-0.72cm]axis description cs:0.5238,0);
+\node at ([yshift=-0.54cm]axis description cs:0.5000,0) {5.66};
+\draw ([yshift=-0.36cm]axis description cs:0.5238,0) rectangle ([yshift=-0.72cm]axis description cs:0.5714,0);
+\node at ([yshift=-0.54cm]axis description cs:0.5476,0) {2.42};
+\draw ([yshift=-0.36cm]axis description cs:0.5714,0) rectangle ([yshift=-0.72cm]axis description cs:0.6190,0);
+\node at ([yshift=-0.54cm]axis description cs:0.5952,0) {3.19};
+\draw ([yshift=-0.36cm]axis description cs:0.6190,0) rectangle ([yshift=-0.72cm]axis description cs:0.6667,0);
+\node at ([yshift=-0.54cm]axis description cs:0.6429,0) {2.53};
+\draw ([yshift=-0.36cm]axis description cs:0.6667,0) rectangle ([yshift=-0.72cm]axis description cs:0.7143,0);
+\node at ([yshift=-0.54cm]axis description cs:0.6905,0) {0.75};
+\draw ([yshift=-0.36cm]axis description cs:0.7143,0) rectangle ([yshift=-0.72cm]axis description cs:0.7619,0);
+\node at ([yshift=-0.54cm]axis description cs:0.7381,0) {43.02};
+\draw ([yshift=-0.36cm]axis description cs:0.7619,0) rectangle ([yshift=-0.72cm]axis description cs:0.8095,0);
+\node at ([yshift=-0.54cm]axis description cs:0.7857,0) {6.66};
+\draw ([yshift=-0.36cm]axis description cs:0.8095,0) rectangle ([yshift=-0.72cm]axis description cs:0.8571,0);
+\node at ([yshift=-0.54cm]axis description cs:0.8333,0) {2.82};
+\draw ([yshift=-0.36cm]axis description cs:0.8571,0) rectangle ([yshift=-0.72cm]axis description cs:0.9048,0);
+\node at ([yshift=-0.54cm]axis description cs:0.8810,0) {42.38};
+\draw ([yshift=-0.36cm]axis description cs:0.9048,0) rectangle ([yshift=-0.72cm]axis description cs:0.9524,0);
+\node at ([yshift=-0.54cm]axis description cs:0.9286,0) {16.61};
+\draw ([yshift=-0.36cm]axis description cs:0.9524,0) rectangle ([yshift=-0.72cm]axis description cs:1.0000,0);
+\node at ([yshift=-0.54cm]axis description cs:0.9762,0) {14.64};
+\draw ([xshift=-0.95cm, yshift=-0.36cm]axis description cs:0,0) rectangle ([yshift=-0.72cm]axis description cs:0,0);
+\node at ([xshift=-0.475cm, yshift=-0.54cm]axis description cs:0,0) {Limbo};
+\draw ([yshift=-0.72cm]axis description cs:0.0000,0) rectangle ([yshift=-1.08cm]axis description cs:0.0476,0);
+\node at ([yshift=-0.9cm]axis description cs:0.0238,0) {6.43};
+\draw ([yshift=-0.72cm]axis description cs:0.0476,0) rectangle ([yshift=-1.08cm]axis description cs:0.0952,0);
+\node at ([yshift=-0.9cm]axis description cs:0.0714,0) {0.26};
+\draw ([yshift=-0.72cm]axis description cs:0.0952,0) rectangle ([yshift=-1.08cm]axis description cs:0.1429,0);
+\node at ([yshift=-0.9cm]axis description cs:0.1190,0) {1.82};
+\draw ([yshift=-0.72cm]axis description cs:0.1429,0) rectangle ([yshift=-1.08cm]axis description cs:0.1905,0);
+\node at ([yshift=-0.9cm]axis description cs:0.1667,0) {0.40};
+\draw ([yshift=-0.72cm]axis description cs:0.1905,0) rectangle ([yshift=-1.08cm]axis description cs:0.2381,0);
+\node at ([yshift=-0.9cm]axis description cs:0.2143,0) {2.25};
+\draw ([yshift=-0.72cm]axis description cs:0.2381,0) rectangle ([yshift=-1.08cm]axis description cs:0.2857,0);
+\node at ([yshift=-0.9cm]axis description cs:0.2619,0) {1.12};
+\draw ([yshift=-0.72cm]axis description cs:0.2857,0) rectangle ([yshift=-1.08cm]axis description cs:0.3333,0);
+\node at ([yshift=-0.9cm]axis description cs:0.3095,0) {3.16};
+\draw ([yshift=-0.72cm]axis description cs:0.3333,0) rectangle ([yshift=-1.08cm]axis description cs:0.3810,0);
+\node at ([yshift=-0.9cm]axis description cs:0.3571,0) {7.70};
+\draw ([yshift=-0.72cm]axis description cs:0.3810,0) rectangle ([yshift=-1.08cm]axis description cs:0.4286,0);
+\node at ([yshift=-0.9cm]axis description cs:0.4048,0) {10.53};
+\draw ([yshift=-0.72cm]axis description cs:0.4286,0) rectangle ([yshift=-1.08cm]axis description cs:0.4762,0);
+\node at ([yshift=-0.9cm]axis description cs:0.4524,0) {1.35};
+\draw ([yshift=-0.72cm]axis description cs:0.4762,0) rectangle ([yshift=-1.08cm]axis description cs:0.5238,0);
+\node at ([yshift=-0.9cm]axis description cs:0.5000,0) {0.54};
+\draw ([yshift=-0.72cm]axis description cs:0.5238,0) rectangle ([yshift=-1.08cm]axis description cs:0.5714,0);
+\node at ([yshift=-0.9cm]axis description cs:0.5476,0) {0.96};
+\draw ([yshift=-0.72cm]axis description cs:0.5714,0) rectangle ([yshift=-1.08cm]axis description cs:0.6190,0);
+\node at ([yshift=-0.9cm]axis description cs:0.5952,0) {7.72};
+\draw ([yshift=-0.72cm]axis description cs:0.6190,0) rectangle ([yshift=-1.08cm]axis description cs:0.6667,0);
+\node at ([yshift=-0.9cm]axis description cs:0.6429,0) {1.35};
+\draw ([yshift=-0.72cm]axis description cs:0.6667,0) rectangle ([yshift=-1.08cm]axis description cs:0.7143,0);
+\node at ([yshift=-0.9cm]axis description cs:0.6905,0) {0.54};
+\draw ([yshift=-0.72cm]axis description cs:0.7143,0) rectangle ([yshift=-1.08cm]axis description cs:0.7619,0);
+\node at ([yshift=-0.9cm]axis description cs:0.7381,0) {n/a};
+\draw ([yshift=-0.72cm]axis description cs:0.7619,0) rectangle ([yshift=-1.08cm]axis description cs:0.8095,0);
+\node at ([yshift=-0.9cm]axis description cs:0.7857,0) {1.03};
+\draw ([yshift=-0.72cm]axis description cs:0.8095,0) rectangle ([yshift=-1.08cm]axis description cs:0.8571,0);
+\node at ([yshift=-0.9cm]axis description cs:0.8333,0) {1.49};
+\draw ([yshift=-0.72cm]axis description cs:0.8571,0) rectangle ([yshift=-1.08cm]axis description cs:0.9048,0);
+\node at ([yshift=-0.9cm]axis description cs:0.8810,0) {n/a};
+\draw ([yshift=-0.72cm]axis description cs:0.9048,0) rectangle ([yshift=-1.08cm]axis description cs:0.9524,0);
+\node at ([yshift=-0.9cm]axis description cs:0.9286,0) {6.08};
+\draw ([yshift=-0.72cm]axis description cs:0.9524,0) rectangle ([yshift=-1.08cm]axis description cs:1.0000,0);
+\node at ([yshift=-0.9cm]axis description cs:0.9762,0) {n/a};
+\draw ([xshift=-0.95cm, yshift=-0.72cm]axis description cs:0,0) rectangle ([yshift=-1.08cm]axis description cs:0,0);
+\node at ([xshift=-0.475cm, yshift=-0.9cm]axis description cs:0,0) {SQLite};
+\end{scope}
 \end{axis}
 \end{tikzpicture}

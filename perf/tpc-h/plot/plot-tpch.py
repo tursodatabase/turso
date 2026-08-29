@@ -11,9 +11,10 @@ The CSV has one row per query and one column per engine, as
 `results2csv.sh` writes it: `Query,Limbo,SQLite`. Every query gets a
 group of bars, one per engine, with runtime in seconds up a log axis so
 a query that takes a fifth of a second and one that takes a minute both
-read. A bar that is missing because the engine did not run the query
-(`NA` in the CSV) is marked `n/a` in its place, so a gap is never
-mistaken for a fast run.
+read. Under the bars sits a table with the exact runtime of every bar,
+one row per engine and one column per query, lined up with the bars.
+A query an engine did not run (`NA` in the CSV) has no bar and `n/a` in
+its cell, so a gap is never mistaken for a fast run.
 
 Every run writes `tpch.png`, `tpch.pdf` and `tpch.tikz` (`--out` changes
 the `tpch` part). The `.tikz` is a pgfplots picture for `\\input` into a
@@ -40,6 +41,10 @@ FALLBACK_COLORS = ["#009E73", "#D55E00", "#CC79A7"]
 
 # The share of the space between one query and the next that its bars fill.
 GROUP_WIDTH = 0.8
+# The table under the tikz axis: how tall each row is and how wide the
+# column of engine names at its left is, in cm.
+TABLE_ROW_HEIGHT = 0.36
+TABLE_LABEL_WIDTH = 0.95
 
 
 def main():
@@ -96,7 +101,7 @@ class Figure:
         if not times:
             raise SystemExit("no query finished on any engine")
         # A decade of headroom under the fastest query and over the slowest,
-        # so the `n/a` marks fit under the bars and the legend over them.
+        # so the shortest bar still has height and the legend fits over the tallest.
         self.ymin = 10 ** np.floor(np.log10(min(times)))
         self.ymax = 10 ** (np.ceil(np.log10(max(times))) + 0.5)
         self.bar_width = GROUP_WIDTH / len(self.series)
@@ -115,7 +120,7 @@ class Figure:
 
         plt.style.use(["science", "no-latex"])
 
-        fig, ax = plt.subplots(figsize=(6.4, 2.4), dpi=300)
+        fig, ax = plt.subplots(figsize=(7.2, 2.8), dpi=300)
         ax.set_yscale("log")
         ax.grid(True, axis="y", which="major", linewidth=0.5, linestyle=(0, (2, 2)), color="0.7")
         ax.set_axisbelow(True)
@@ -125,20 +130,26 @@ class Figure:
             ax.bar([xi for xi, t in zip(xs, s.times) if t is not None],
                    [t for t in s.times if t is not None],
                    self.bar_width, color=s.color, linewidth=0, label=s.label, zorder=3)
-            for xi, t in zip(xs, s.times):
-                if t is None:
-                    ax.text(xi, self.ymin * 1.2, "n/a", rotation=90, ha="center", va="bottom",
-                            fontsize=5, color=s.color)
-        ax.set_xticks(x)
-        ax.set_xticklabels(self.queries, fontsize=6)
+        # The table replaces the x tick labels: its header row names the
+        # queries, and each column is as wide as one query's group of bars,
+        # so the axis must span exactly the queries with no padding.
+        ax.set_xticks([])
         ax.xaxis.set_minor_locator(NullLocator())
-        ax.tick_params(axis="x", length=0)
-        ax.set_xlim(-0.5 - (1 - GROUP_WIDTH), len(self.queries) - 0.5 + (1 - GROUP_WIDTH))
+        ax.set_xlim(-0.5, len(self.queries) - 0.5)
         ax.set_ylim(self.ymin, self.ymax)
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
         ax.yaxis.set_minor_locator(NullLocator())
-        ax.set_xlabel("TPC-H query")
         ax.set_ylabel("Runtime (s)")
+        table = ax.table(cellText=[[cell_text(t) for t in s.times] for s in self.series],
+                         rowLabels=[s.label for s in self.series],
+                         colLabels=self.queries, cellLoc="center", loc="bottom",
+                         colWidths=[1.0 / len(self.queries)] * len(self.queries))
+        table.auto_set_font_size(False)
+        table.set_fontsize(5.5)
+        table.scale(1.0, 1.1)
+        for cell in table.get_celld().values():
+            cell.set_linewidth(0.4)
+            cell.set_edgecolor("black")
         ax.legend(loc="upper left", ncol=len(self.series), frameon=False,
                   handlelength=1.0, handletextpad=0.4, columnspacing=1.8)
         fig.savefig(output, bbox_inches="tight")
@@ -149,24 +160,21 @@ class Figure:
         for s in self.series:
             out.append(rf"\definecolor{{{s.tikz_color}}}{{HTML}}{{{s.color.lstrip('#')}}}")
         n = len(self.queries)
-        xticks = ",".join(str(i) for i in range(n))
-        xticklabels = ",".join(self.queries)
         # Queries sit at 0, 1, 2, ... and every engine's bars are shifted
         # off that by hand, so `bar width` and `bar shift` are in axis units
-        # and the groups stay the same shape as the matplotlib figure.
+        # and the groups stay the same shape as the matplotlib figure. The
+        # axis spans exactly the queries so the table columns line up with
+        # the bars; `clip=false` lets the table be drawn below the axis.
         out.append(rf"""\begin{{axis}}[
-  scale only axis, width=0.9\linewidth, height=0.36\linewidth,
+  scale only axis, width=0.92\linewidth, height=0.36\linewidth, clip=false,
   ybar, bar width={self.bar_width:.4g}, bar shift=0pt,
   ymode=log, log origin=infty, ymin={self.ymin:g}, ymax={self.ymax:.4g},
   log ticks with fixed point, yminorticks=false,
-  xmin={-0.5 - (1 - GROUP_WIDTH):g}, xmax={n - 0.5 + (1 - GROUP_WIDTH):g},
-  xtick={{{xticks}}}, xticklabels={{{xticklabels}}}, xminorticks=false,
-  x tick style={{draw=none}},
-  xlabel={{TPC-H query}}, ylabel={{Runtime (s)}},
+  xmin=-0.5, xmax={n - 0.5:g}, xtick=\empty, xminorticks=false,
+  ylabel={{Runtime (s)}},
   ymajorgrids, grid style={{line width=0.3pt, dashed, draw=black!30}},
   axis on top=false,
-  tick label style={{font=\scriptsize}}, x tick label style={{font=\tiny}},
-  label style={{font=\footnotesize}},
+  tick label style={{font=\scriptsize}}, label style={{font=\footnotesize}},
   axis line style={{line width=0.4pt}}, tick style={{line width=0.4pt, black}},
   legend pos=north west, legend columns=-1,
   legend style={{draw=none, font=\scriptsize, /tikz/every even column/.append style={{column sep=0.5cm}}}},
@@ -177,14 +185,40 @@ class Figure:
                               for x, t in enumerate(s.times) if t is not None)
             out.append(rf"\addplot[fill={s.tikz_color}, draw=none] coordinates {{{coords}}};")
             out.append(rf"\addlegendentry{{{s.label}}}")
-        for i, s in enumerate(self.series):
-            for x, t in enumerate(s.times):
-                if t is None:
-                    out.append(rf"\node[rotate=90, anchor=west, inner sep=1pt, font=\tiny, "
-                               rf"text={s.tikz_color}] at (axis cs:{x + self.offset(i):.4g},{self.ymin * 1.2:.4g}) {{n/a}};")
+        out.extend(self.tikz_table())
         out.append(r"\end{axis}")
         out.append(r"\end{tikzpicture}")
         return "\n".join(out) + "\n"
+
+    def tikz_table(self):
+        """The table under the axis: a header row of query names, then a row
+        per engine, each column under its query's bars. Cells are placed in
+        `axis description cs`, whose x runs 0 to 1 across the axis, shifted
+        down from the axis bottom by whole rows of `TABLE_ROW_HEIGHT`."""
+        n = len(self.queries)
+        rows = [self.queries] + [[cell_text(t) for t in s.times] for s in self.series]
+        labels = [""] + [s.label for s in self.series]
+        out = [r"\begin{scope}[every node/.style={font=\tiny, scale=0.85, transform shape, inner sep=0pt}, line width=0.3pt]"]
+        for r, (label, cells) in enumerate(zip(labels, rows)):
+            top, bottom = -r * TABLE_ROW_HEIGHT, -(r + 1) * TABLE_ROW_HEIGHT
+            middle = (top + bottom) / 2
+            for c, text in enumerate(cells):
+                left, right = c / n, (c + 1) / n
+                out.append(rf"\draw ([yshift={top:.3g}cm]axis description cs:{left:.4f},0) rectangle "
+                           rf"([yshift={bottom:.3g}cm]axis description cs:{right:.4f},0);")
+                out.append(rf"\node at ([yshift={middle:.3g}cm]axis description cs:{(left + right) / 2:.4f},0) "
+                           rf"{{{text}}};")
+            if label:
+                out.append(rf"\draw ([xshift=-{TABLE_LABEL_WIDTH}cm, yshift={top:.3g}cm]axis description cs:0,0) "
+                           rf"rectangle ([yshift={bottom:.3g}cm]axis description cs:0,0);")
+                out.append(rf"\node at ([xshift=-{TABLE_LABEL_WIDTH / 2}cm, yshift={middle:.3g}cm]"
+                           rf"axis description cs:0,0) {{{label}}};")
+        out.append(r"\end{scope}")
+        return out
+
+
+def cell_text(time):
+    return "n/a" if time is None else f"{time:.2f}"
 
 
 if __name__ == "__main__":

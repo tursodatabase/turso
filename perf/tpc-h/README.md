@@ -40,7 +40,7 @@ a log scale, in the same style as the `perf/latency` and `perf/throughput`
 plots. It always writes `tpch.png`, `tpch.pdf` and `tpch.tikz`; the `.tikz`
 is a pgfplots picture to `\input` into a LaTeX document that loads pgfplots
 with `\pgfplotsset{compat=1.18}`. A query an engine did not run is marked
-`n/a`.
+`n/a` in the table under the bars.
 Use `--name limbo=Turso` to change an engine's legend name.
 
 By default, `results2csv.sh` uses the "WITHOUT ANALYZE" results. To use the "WITH ANALYZE" results instead:
