@@ -19,7 +19,7 @@ RUST_RELEASE_OPT ?=
 RUST_PROFILE_DIR ?= debug
 DOTNET_RELEASE_OPT ?=
 IOS_FRAMEWORK_NAME = libturso_sdk_kit
-IOS_DYLIB_FILE = libturso_sync_sdk_kit.dylib
+IOS_DYLIB_FILE = libturso_sdk_kit.dylib
 IOS_FRAMEWORK_BUILD_DIR = ./rs_compiled/ios-frameworks
 IOS_XCFRAMEWORK_DIR = ./rs_compiled/ios-universal/native/$(IOS_FRAMEWORK_NAME).xcframework
 
@@ -78,9 +78,13 @@ build-rust-android: build-rust-androidarm64 build-rust-androidarm build-rust-and
 
 build-rust-iosarm64:
 	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/aarch64-apple-ios/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.dylib ./rs_compiled/aarch64-apple-ios/$(RUST_PROFILE_DIR)/libturso_sdk_kit.dylib
+	cp ./rs_compiled/aarch64-apple-ios/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.a ./rs_compiled/aarch64-apple-ios/$(RUST_PROFILE_DIR)/libturso_sdk_kit.a
 
 build-rust-iossimulatorarm64:
 	cargo build -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios-sim $(RUST_RELEASE_OPT)
+	cp ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.dylib ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/libturso_sdk_kit.dylib
+	cp ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/libturso_sync_sdk_kit.a ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/libturso_sdk_kit.a
 
 build-rust-ios: build-rust-iosarm64 build-rust-iossimulatorarm64
 
