@@ -342,11 +342,8 @@ mod tests {
         fn open(
             &self,
             _conn: Arc<crate::Connection>,
-        ) -> crate::Result<Arc<crate::sync::RwLock<dyn crate::InternalVirtualTableCursor>>>
-        {
-            Ok(Arc::new(crate::sync::RwLock::new(TestCatalogCursor {
-                row: 0,
-            })))
+        ) -> crate::Result<Box<dyn crate::InternalVirtualTableCursor>> {
+            Ok(Box::new(TestCatalogCursor { row: 0 }))
         }
 
         fn best_index(

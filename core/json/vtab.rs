@@ -1,4 +1,4 @@
-use crate::sync::{Arc, RwLock};
+use crate::sync::Arc;
 use std::iter::successors;
 use std::result::Result;
 
@@ -72,10 +72,8 @@ impl InternalVirtualTable for JsonVirtualTable {
     fn open(
         &self,
         _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
-        Ok(Arc::new(RwLock::new(JsonEachCursor::empty(
-            self.traversal_mode.clone(),
-        ))))
+    ) -> crate::Result<Box<dyn InternalVirtualTableCursor + 'static>> {
+        Ok(Box::new(JsonEachCursor::empty(self.traversal_mode.clone())))
     }
 
     fn best_index(

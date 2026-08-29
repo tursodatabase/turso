@@ -1,4 +1,4 @@
-use crate::sync::{Arc, RwLock};
+use crate::sync::Arc;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, LimboError, Value};
 use turso_ext::{
@@ -18,11 +18,8 @@ impl InternalVirtualTable for GenerateSeriesTable {
         "generate_series".to_string()
     }
 
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(GenerateSeriesCursor::new())))
+    fn open(&self, _conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(GenerateSeriesCursor::new()))
     }
 
     fn best_index(
