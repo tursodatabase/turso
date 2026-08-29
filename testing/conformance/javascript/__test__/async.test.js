@@ -116,6 +116,9 @@ test.serial("Database.exec() after close()", async (t) => {
 //   - rows is an Array<Row>. By default rows match Statement.all() object
 //     rows; pass { raw: true } to receive arrays.
 //   - rowsAffected is the per-statement change count (0 for SELECT).
+//   - lastInsertRowid is present only on entries whose statement inserted
+//     a row (Turso drivers; the serverless driver also reports rowsRead,
+//     rowsWritten, and queryDurationMs per statement).
 // ==========================================================================
 
 // Assert the ResultSet invariants shared by every batch entry, regardless
@@ -126,7 +129,13 @@ const assertResultSetShape = (t, rs) => {
   t.is(rs.columnTypes.length, rs.columns.length, "columnTypes parallels columns");
   t.true(Array.isArray(rs.rows), "rows is an array");
   t.is(typeof rs.rowsAffected, "number", "rowsAffected is a number");
-  t.false("lastInsertRowid" in rs, "batch ResultSet does not expose lastInsertRowid");
+  if ("lastInsertRowid" in rs) {
+    t.is(
+      typeof rs.lastInsertRowid,
+      "number",
+      "lastInsertRowid, present only for statements that inserted, is a number",
+    );
+  }
   t.is(rs.toJSON, undefined, "batch ResultSet does not expose toJSON");
 };
 
@@ -143,10 +152,14 @@ test.serial("Database.batch() [returns one ResultSet per statement, in order]", 
   t.is(results.length, 3, "one ResultSet per input statement");
   results.forEach((rs) => assertResultSetShape(t, rs));
 
-  // INSERT: no result rows, one row affected.
+  // INSERT: no result rows, one row affected. Turso drivers report the
+  // inserted rowid per statement.
   t.deepEqual(results[0].columns, []);
   t.deepEqual(results[0].rows, []);
   t.is(results[0].rowsAffected, 1);
+  if (process.env.PROVIDER === "turso" || process.env.PROVIDER === "serverless") {
+    t.is(typeof results[0].lastInsertRowid, "number", "INSERT entry reports its rowid");
+  }
 
   // SELECT: rows surfaced, nothing affected.
   t.deepEqual(results[1].columns, ["id", "name"]);

@@ -121,6 +121,7 @@ complete example.
 4. **Assert invariants.** Don't silently fail. Don't hedge with if-statements
 5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
 6. **Validate your hypotheses.**: If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
+7. **Driver API parity.** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
 
 ## Always use plain language instead of complex jargon
 

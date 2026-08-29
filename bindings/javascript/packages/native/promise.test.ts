@@ -525,3 +525,181 @@ test('transactionAsync() rejects callbacks that do not declare the handle', asyn
     expect(() => db.transactionAsync(async () => { })).toThrow(/Transaction handle/);
     expect(() => db.transactionAsync((async (...args: any[]) => { }) as any)).toThrow(/Transaction handle/);
 })
+
+test('batch returns per-statement details and stops at the first failure', async () => {
+    const db = await connect(":memory:");
+    const results = await db.batch([
+        "CREATE TABLE t_batch (id INTEGER PRIMARY KEY, name TEXT)",
+        { sql: "INSERT INTO t_batch (name) VALUES (?)", args: ["Alice"] },
+        { sql: "INSERT INTO t_batch (name) VALUES (?)", args: ["Bob"] },
+        "SELECT name FROM t_batch ORDER BY id",
+    ]);
+    expect(results.length).toBe(4);
+    expect(results[1].rowsAffected).toBe(1);
+    expect(results[1].lastInsertRowid).toBe(1);
+    expect(results[2].lastInsertRowid).toBe(2);
+    expect(results[3].rows).toEqual([{ name: "Alice" }, { name: "Bob" }]);
+    // The embedded engine does not report per-statement execution
+    // statistics; the serverless driver fills these from the server.
+    expect(results[1].rowsRead).toBeUndefined();
+    expect(results[1].rowsWritten).toBeUndefined();
+    expect(results[1].queryDurationMs).toBeUndefined();
+
+    let error: any = null;
+    try {
+        await db.batch([
+            { sql: "INSERT INTO t_batch (name) VALUES (?)", args: ["Carol"] },
+            "INSERT INTO no_such_table VALUES (1)",
+            { sql: "INSERT INTO t_batch (name) VALUES (?)", args: ["Dave"] },
+        ]);
+    } catch (e) {
+        error = e;
+    }
+    expect(error).not.toBeNull();
+    // The error identifies the failing statement and carries one entry
+    // per statement: the completed first statement's ResultSet, null for
+    // the failing statement and the skipped one after it.
+    expect(error.batchIndex).toBe(1);
+    expect(error.batchResults.length).toBe(3);
+    expect(error.batchResults[0].rowsAffected).toBe(1);
+    expect(error.batchResults[1]).toBeNull();
+    expect(error.batchResults[2]).toBeNull();
+    // Execution stopped at the failure: Carol committed, Dave never ran.
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_batch");
+    expect(await stmt.all([])).toEqual([{ n: 3 }]);
+})
+
+test('atomic batch failure rolls back and reports the failing statement', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t_atomic (x)");
+    let error: any = null;
+    try {
+        await db.batch([
+            { sql: "INSERT INTO t_atomic VALUES (?)", args: [1] },
+            "INSERT INTO no_such_table VALUES (1)",
+        ], "immediate");
+    } catch (e) {
+        error = e;
+    }
+    expect(error).not.toBeNull();
+    expect(error.batchIndex).toBe(1);
+    expect(error.batchResults.length).toBe(2);
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_atomic");
+    expect(await stmt.all([])).toEqual([{ n: 0 }]);
+})
+
+test('batch validates every bind value before executing the first statement', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t_batch_bind_validation (x)");
+
+    let error: any;
+    try {
+        await db.batch([
+            { sql: "INSERT INTO t_batch_bind_validation VALUES (?)", args: [1] },
+            { sql: "INSERT INTO t_batch_bind_validation VALUES (?)", args: [Number.POSITIVE_INFINITY] },
+        ]);
+    } catch (caught) {
+        error = caught;
+    }
+
+    expect(error.batchIndex).toBe(1);
+    expect(error.batchResults).toEqual([]);
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_batch_bind_validation");
+    expect(await stmt.all([])).toEqual([{ n: 0 }]);
+})
+
+test('batch validates every bigint before executing the first statement', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t_batch_bigint_validation (x)");
+
+    let error: any;
+    try {
+        await db.batch([
+            { sql: "INSERT INTO t_batch_bigint_validation VALUES (?)", args: [1] },
+            { sql: "INSERT INTO t_batch_bigint_validation VALUES (?)", args: [1n << 63n] },
+        ]);
+    } catch (caught) {
+        error = caught;
+    }
+
+    expect(error.batchIndex).toBe(1);
+    expect(error.batchResults).toEqual([]);
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_batch_bigint_validation");
+    expect(await stmt.all([])).toEqual([{ n: 0 }]);
+})
+
+test('batch coerces bind values once during validation', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t_batch_coercion (x TEXT)");
+    let coercions = 0;
+    const value = {
+        toString() {
+            coercions++;
+            if (coercions > 1) throw new Error("value was coerced twice");
+            return "coerced";
+        },
+    };
+
+    await db.batch([
+        { sql: "INSERT INTO t_batch_coercion VALUES (?)", args: [value] },
+    ]);
+
+    expect(coercions).toBe(1);
+    const stmt = await db.prepare("SELECT x FROM t_batch_coercion");
+    expect(await stmt.all([])).toEqual([{ x: "coerced" }]);
+})
+
+test('atomic batch rejects transaction control before BEGIN', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t_batch_control (x)");
+    const controls = [
+        "BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "SAVEPOINT nested",
+        "RELEASE nested",
+        "\ufeffCOMMIT",
+    ];
+
+    for (const control of controls) {
+        let error: any;
+        try {
+            await db.batch([
+                "INSERT INTO t_batch_control VALUES (1)",
+                ` ; \n-- leading line comment\n; /* leading block comment */ ${control}`,
+            ], "immediate");
+        } catch (caught) {
+            error = caught;
+        }
+        expect(error.batchIndex).toBe(1);
+        expect(error.batchResults).toEqual([]);
+    }
+
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_batch_control");
+    expect(await stmt.all([])).toEqual([{ n: 0 }]);
+})
+
+test('atomic batch attaches a rollback failure to the primary error', async () => {
+    const db = await connect(":memory:");
+    const native = (db as any).db;
+    const originalExecutor = native.executor.bind(native);
+    native.executor = (sql: string, ...args: any[]) => {
+        if (sql === "ROLLBACK") throw new Error("rollback failed");
+        return originalExecutor(sql, ...args);
+    };
+
+    let error: any;
+    try {
+        await db.batch(["INSERT INTO no_such_batch_table VALUES (1)"], "immediate");
+    } catch (caught) {
+        error = caught;
+    } finally {
+        native.executor = originalExecutor;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toMatch(/no_such_batch_table/);
+    expect(error.rollbackError).toBeInstanceOf(Error);
+    expect(error.rollbackError.message).toBe("rollback failed");
+})

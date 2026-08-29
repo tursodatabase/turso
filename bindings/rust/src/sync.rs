@@ -1090,7 +1090,9 @@ mod tests {
                 .experimental_without_rowid(true)
                 .experimental_features_string()
                 .as_deref(),
-            Some("attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid")
+            Some(
+                "attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid"
+            )
         );
     }
 

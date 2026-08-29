@@ -16,7 +16,8 @@ use hegel::{generators as gs, TestCase};
 
 use turso_serverless_conformance::{config, TestConfig};
 use turso_serverless_differential::{
-    create_table_sql, gen_error_sql, gen_ops, spec_num_tables, Op, Val,
+    assert_spec_ops_supported, create_table_sql, gen_error_sql, gen_ops, spec_num_tables,
+    BatchStmt, Op, Val,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +124,16 @@ fn value_type_tag(v: &NormalizedValue) -> &'static str {
 // Structural result — compared across drivers
 // ---------------------------------------------------------------------------
 
+/// The whole per-statement outcome of one batch() call: the failing
+/// statement's index (when a user statement failed) and one entry per
+/// statement — the completed statement's result, or None for the failing
+/// statement and the statements that did not run.
+#[derive(Debug, Default)]
+struct BatchOutcome {
+    failed_index: Option<usize>,
+    entries: Vec<Option<OpResult>>,
+}
+
 #[derive(Debug, Default)]
 struct OpResult {
     success: bool,
@@ -134,6 +145,7 @@ struct OpResult {
     column_decltypes: Option<Vec<Option<String>>>,
     affected_rows: Option<u64>,
     last_insert_rowid: Option<i64>,
+    batch: Option<BatchOutcome>,
 }
 
 fn fail_result() -> OpResult {
@@ -272,6 +284,89 @@ async fn query_remote(
 // ---------------------------------------------------------------------------
 // Execute operations against each driver
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Parameterized batch (spec op param_batch)
+// ---------------------------------------------------------------------------
+
+fn local_batch_statements(stmts: &[BatchStmt]) -> Vec<turso::BatchStatement> {
+    stmts
+        .iter()
+        .map(|stmt| match stmt {
+            BatchStmt::Insert { table, values } => turso::BatchStatement::new(
+                format!("INSERT INTO {table} VALUES (?, ?)"),
+                values.iter().map(val_to_local).collect::<Vec<_>>(),
+            ),
+            BatchStmt::Select { table } => {
+                turso::BatchStatement::new(format!("SELECT a, b FROM {table}"), ())
+            }
+            BatchStmt::ErrorSql { sql } => turso::BatchStatement::new(sql.clone(), ()),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("generated batch values always convert")
+}
+
+fn remote_batch_statements(stmts: &[BatchStmt]) -> Vec<turso_serverless::BatchStatement> {
+    stmts
+        .iter()
+        .map(|stmt| match stmt {
+            BatchStmt::Insert { table, values } => turso_serverless::BatchStatement::new(
+                format!("INSERT INTO {table} VALUES (?, ?)"),
+                values.iter().map(val_to_remote).collect::<Vec<_>>(),
+            ),
+            BatchStmt::Select { table } => {
+                turso_serverless::BatchStatement::new(format!("SELECT a, b FROM {table}"), ())
+            }
+            BatchStmt::ErrorSql { sql } => turso_serverless::BatchStatement::new(sql.clone(), ()),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("generated batch values always convert")
+}
+
+/// Normalize one per-statement result of a batch() call. The server-side
+/// execution statistics are excluded: the serverless driver reports them
+/// and the embedded driver does not, by design.
+macro_rules! normalize_batch_entry {
+    ($result:expr, $normalize:ident) => {{
+        let result = $result;
+        let column_names: Vec<String> = result
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        let column_decltypes: Vec<Option<String>> = result
+            .columns()
+            .iter()
+            .map(|c| c.decl_type().map(|s| s.to_string()))
+            .collect();
+        let values: Vec<Vec<NormalizedValue>> = result
+            .rows()
+            .iter()
+            .map(|row| {
+                (0..row.column_count())
+                    .map(|i| $normalize(&row.get_value(i).expect("row value")))
+                    .collect()
+            })
+            .collect();
+        OpResult {
+            success: true,
+            column_count: Some(column_names.len()),
+            row_count: Some(values.len()),
+            value_types: Some(
+                values
+                    .iter()
+                    .map(|row| row.iter().map(|v| value_type_tag(v).to_string()).collect())
+                    .collect(),
+            ),
+            values: Some(values),
+            column_names: Some(column_names),
+            column_decltypes: Some(column_decltypes),
+            affected_rows: Some(result.rows_affected()),
+            last_insert_rowid: result.last_insert_rowid(),
+            batch: None,
+        }
+    }};
+}
 
 fn execute_op_local<'a>(
     conn: &'a turso::Connection,
@@ -517,6 +612,58 @@ async fn execute_op_local_inner(conn: &turso::Connection, op: &Op) -> OpResult {
             match conn.execute("ROLLBACK", ()).await {
                 Ok(_) => exec_ok(),
                 Err(_) => fail_result(),
+            }
+        }
+        Op::ParamBatch { stmts, mode } => {
+            let statements = local_batch_statements(stmts);
+            let result = match mode.as_deref() {
+                None => conn.batch(statements).await,
+                Some("immediate") => {
+                    conn.transactional_batch(
+                        statements,
+                        turso::transaction::TransactionBehavior::Immediate,
+                    )
+                    .await
+                }
+                Some(_) => {
+                    conn.transactional_batch(
+                        statements,
+                        turso::transaction::TransactionBehavior::Deferred,
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(results) => OpResult {
+                    success: true,
+                    batch: Some(BatchOutcome {
+                        failed_index: None,
+                        entries: results
+                            .iter()
+                            .map(|r| Some(normalize_batch_entry!(r, normalize_local)))
+                            .collect(),
+                    }),
+                    ..OpResult::default()
+                },
+                Err(turso::Error::BatchStatementFailed { index, results, .. }) => OpResult {
+                    success: false,
+                    batch: Some(BatchOutcome {
+                        failed_index: Some(index),
+                        entries: results
+                            .iter()
+                            .map(|r| {
+                                r.as_ref()
+                                    .map(|r| normalize_batch_entry!(r, normalize_local))
+                            })
+                            .collect(),
+                    }),
+                    ..OpResult::default()
+                },
+                Err(_) => OpResult {
+                    success: false,
+                    batch: Some(BatchOutcome::default()),
+                    ..OpResult::default()
+                },
             }
         }
     }
@@ -769,6 +916,60 @@ async fn execute_op_remote_inner(conn: &turso_serverless::Connection, op: &Op) -
                 Err(_) => fail_result(),
             }
         }
+        Op::ParamBatch { stmts, mode } => {
+            let statements = remote_batch_statements(stmts);
+            let result = match mode.as_deref() {
+                None => conn.batch(statements).await,
+                Some("immediate") => {
+                    conn.transactional_batch(
+                        statements,
+                        turso_serverless::TransactionBehavior::Immediate,
+                    )
+                    .await
+                }
+                Some(_) => {
+                    conn.transactional_batch(
+                        statements,
+                        turso_serverless::TransactionBehavior::Deferred,
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(results) => OpResult {
+                    success: true,
+                    batch: Some(BatchOutcome {
+                        failed_index: None,
+                        entries: results
+                            .iter()
+                            .map(|r| Some(normalize_batch_entry!(r, normalize_remote)))
+                            .collect(),
+                    }),
+                    ..OpResult::default()
+                },
+                Err(turso_serverless::Error::BatchStatementFailed { index, results, .. }) => {
+                    OpResult {
+                        success: false,
+                        batch: Some(BatchOutcome {
+                            failed_index: Some(index),
+                            entries: results
+                                .iter()
+                                .map(|r| {
+                                    r.as_ref()
+                                        .map(|r| normalize_batch_entry!(r, normalize_remote))
+                                })
+                                .collect(),
+                        }),
+                        ..OpResult::default()
+                    }
+                }
+                Err(_) => OpResult {
+                    success: false,
+                    batch: Some(BatchOutcome::default()),
+                    ..OpResult::default()
+                },
+            }
+        }
     }
 }
 
@@ -829,6 +1030,60 @@ fn assert_values_match(
     }
 }
 
+/// Compare the whole per-statement outcome of a param_batch op: the
+/// failing statement's index and every entry, field by field.
+fn assert_batch_outcomes_match(local: &OpResult, remote: &OpResult, i: usize, op: &Op) {
+    let (Some(lb), Some(rb)) = (&local.batch, &remote.batch) else {
+        panic!(
+            "batch outcome presence mismatch on op #{i} {op:?}\n  local:  {local:?}\n  remote: {remote:?}"
+        );
+    };
+    assert_eq!(
+        lb.failed_index, rb.failed_index,
+        "batch failed_index mismatch on op #{i} {op:?}\n  local:  {local:?}\n  remote: {remote:?}"
+    );
+    assert_eq!(
+        lb.entries.len(),
+        rb.entries.len(),
+        "batch entry count mismatch on op #{i} {op:?}\n  local:  {local:?}\n  remote: {remote:?}"
+    );
+    for (j, (le, re)) in lb.entries.iter().zip(rb.entries.iter()).enumerate() {
+        match (le, re) {
+            (None, None) => {}
+            (Some(le), Some(re)) => {
+                assert_eq!(
+                    le.column_names, re.column_names,
+                    "batch entry {j} column_names mismatch on op #{i} {op:?}\n  local:  {le:?}\n  remote: {re:?}"
+                );
+                assert_eq!(
+                    le.row_count, re.row_count,
+                    "batch entry {j} row_count mismatch on op #{i} {op:?}\n  local:  {le:?}\n  remote: {re:?}"
+                );
+                assert_eq!(
+                    le.value_types, re.value_types,
+                    "batch entry {j} value_types mismatch on op #{i} {op:?}\n  local:  {le:?}\n  remote: {re:?}"
+                );
+                assert_values_match(&le.values, &re.values, i, op);
+                assert_eq!(
+                    le.column_decltypes, re.column_decltypes,
+                    "batch entry {j} column_decltypes mismatch on op #{i} {op:?}\n  local:  {le:?}\n  remote: {re:?}"
+                );
+                assert_eq!(
+                    le.affected_rows, re.affected_rows,
+                    "batch entry {j} affected_rows mismatch on op #{i} {op:?}\n  local:  {le:?}\n  remote: {re:?}"
+                );
+                assert_eq!(
+                    le.last_insert_rowid, re.last_insert_rowid,
+                    "batch entry {j} last_insert_rowid mismatch on op #{i} {op:?}\n  local:  {le:?}\n  remote: {re:?}"
+                );
+            }
+            _ => panic!(
+                "batch entry {j} completion mismatch on op #{i} {op:?}\n  local:  {local:?}\n  remote: {remote:?}"
+            ),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The property test
 // ---------------------------------------------------------------------------
@@ -838,6 +1093,7 @@ fn api_parity(tc: TestCase) {
     let Some(config) = config_or_skip() else {
         return;
     };
+    assert_spec_ops_supported();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // Fresh connections per test case — no stale transaction state.
@@ -876,6 +1132,18 @@ fn api_parity(tc: TestCase) {
                 remote_result.success, remote_result.column_count, remote_result.row_count, remote_result.affected_rows,
             ));
             let trace_dump = || trace.join("\n");
+
+            // Parameterized batch: compare the whole per-statement outcome.
+            // An agreed batch failure leaves well-defined state (execution
+            // stops at the first error), so keep comparing later operations.
+            if matches!(op, Op::ParamBatch { .. }) {
+                assert_eq!(
+                    local_result.success, remote_result.success,
+                    "success mismatch on op #{i} {op:?}\n  local:  {local_result:?}\n  remote: {remote_result:?}\n\nFull trace (prefix={prefix}):\n{}", trace_dump()
+                );
+                assert_batch_outcomes_match(&local_result, &remote_result, i, op);
+                continue;
+            }
 
             // ErrorCheck only compares success/failure — error messages legitimately differ.
             if matches!(op, Op::ErrorCheck { .. }) {

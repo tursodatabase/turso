@@ -22,6 +22,26 @@ harness is in [`serverless/javascript/differential`](../../javascript/differenti
 and the Rust harness in [`serverless/rust/differential`](../../rust/differential);
 harnesses for other serverless drivers join their drivers as those land.
 
+## Driver API parity
+
+The behavioral promise above rests on an API-surface requirement:
+
+* Each serverless driver exposes the same public API as the embedded
+  driver of its language. For Rust that is `turso` (`bindings/rust`,
+  whose `Connection` is also used by the sync driver) and
+  `turso_serverless` (`serverless/rust`): the same types, method
+  signatures, and semantics on both sides.
+* Serverless drivers in other languages track the JavaScript serverless
+  driver's capabilities; a feature the JavaScript driver exposes is a gap
+  in a sibling driver until it lands there too.
+
+A feature added to one side of a pair must be added to the other in the
+same change. Where a behavioral difference is unavoidable (for example,
+metadata the HTTP protocol reports per statement but a local engine only
+tracks per connection), the difference is documented on the affected API.
+This suite is the enforcement mechanism for the behavioral half of the
+contract; extend the operation vocabulary when new API lands.
+
 ## Running against `@tursodatabase/serverless`
 
 ### 1. Create a scratch database

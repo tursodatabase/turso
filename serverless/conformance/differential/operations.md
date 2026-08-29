@@ -21,6 +21,30 @@ operation both drivers must agree on:
 When `success` is false on both sides, error messages are not compared; they
 legitimately differ between an embedded engine and an HTTP server.
 
+## Batch results
+
+For `param_batch` the drivers must agree on the whole per-statement outcome
+of one `batch()` call, not just a single result:
+
+- On success, one result per statement, each compared on the fields above.
+- On failure, the zero-based index of the failing statement must match, and
+  the per-statement results carried by the error must match entry by entry:
+  the same statements completed (with equal results, compared on the fields
+  above) and the same statements are reported as failed or never run.
+
+Because the embedded drivers execute a batch as a sequential loop that stops
+at the first error, this comparison is also the oracle for the serverless
+drivers' server-side batch: one pipeline request must behave exactly like
+sequential execution that stops at the first failure. The server-side
+execution statistics (`rows_read`, `rows_written`, `query_duration_ms`) are
+excluded from the comparison: the serverless driver reports them and the
+embedded driver does not, by design.
+
+Note that a batch is *not* equivalent to executing the statements
+sequentially without stopping: sequential execution of ten statements where
+the fourth fails would keep executing the fifth onward, while `batch()`
+skips them.
+
 ## Operations
 
 `spec/ops.json` defines the operations. They cover, roughly grouped:
@@ -38,6 +62,10 @@ legitimately differ between an embedded engine and an HTTP server.
   (a failing statement mid-transaction followed by recovery)
 - **Errors**: `invalid`, `error_check` (both drivers must agree an SQL fails),
   `batch` (multi-statement SQL)
+- **Parameterized batches**: `param_batch` — 1-4 statements through the
+  `batch()` API, each a parameterized INSERT, a SELECT, or a statement drawn
+  from `error_sqls`, optionally atomic via a `mode` of `deferred` or
+  `immediate`
 
 ## Values
 
