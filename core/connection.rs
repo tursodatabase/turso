@@ -4728,8 +4728,10 @@ impl Connection {
     }
 
     /// Returns true when the step-based progress handler requests interruption.
-    pub fn should_interrupt_for_progress(&self, vm_steps: u64) -> bool {
-        self.progress_handler.should_interrupt(vm_steps)
+    #[inline]
+    pub fn should_interrupt_for_progress(&self, vm_steps: u64, last_checked: &mut u64) -> bool {
+        self.progress_handler
+            .should_interrupt(vm_steps, last_checked)
     }
 
     /// Request interruption of currently running root statements on this connection.

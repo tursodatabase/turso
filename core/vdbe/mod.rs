@@ -813,6 +813,8 @@ pub struct ProgramState {
     /// Per-execution statement deadline derived from the connection query timeout.
     /// `None` means no timeout.
     pub query_deadline: Option<crate::MonotonicInstant>,
+    /// VM step count at the last progress-handler check.
+    progress_last_checked: u64,
     /// Excludes new root statements while an explicit checkpoint is suspended.
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
@@ -949,6 +951,7 @@ impl ProgramState {
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
             query_deadline: None,
+            progress_last_checked: 0,
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
@@ -1090,6 +1093,7 @@ impl ProgramState {
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
+        self.progress_last_checked = 0;
         self.explicit_checkpoint_guard = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
@@ -1706,7 +1710,53 @@ impl Program {
     }
 }
 
+impl ProgramState {
+    /// Checked on every instruction, so the common empty case must not
+    /// touch the 96-byte error slot at all.
+    #[inline]
+    fn take_pending_fail_prepare_error(&mut self) -> Option<LimboError> {
+        self.pending_fail_prepare_error.as_ref()?;
+        self.pending_fail_prepare_error.take()
+    }
+}
+
 impl Program {
+    /// Prints the register diff of the previous opcode and the current
+    /// opcode. Kept out of `normal_step` so the dispatch loop stays small.
+    #[cold]
+    #[inline(never)]
+    fn vdbe_trace_insn(&self, state: &mut ProgramState, insn: &Insn) {
+        // The last opcode (Halt) won't have its diff printed, but Halt
+        // doesn't write to any registers
+        if let Some(ref old) = state.pre_op_registers {
+            for (i, (old_reg, new_reg)) in old.iter().zip(state.registers.iter()).enumerate() {
+                if old_reg != new_reg {
+                    match new_reg {
+                        Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                        Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                        Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                    }
+                }
+            }
+            state.pre_op_registers = None;
+        }
+
+        if matches!(insn, Insn::Init { .. }) {
+            eprintln!("VDBE Trace:");
+        }
+        eprintln!(
+            "{}",
+            explain::insn_to_str(
+                self,
+                state.pc,
+                insn,
+                String::new(),
+                self.explain.comment_at(state.pc)
+            )
+        );
+        state.pre_op_registers = Some(state.registers.clone());
+    }
+
     fn get_pager_from_database_index(&self, idx: &usize) -> Result<Arc<Pager>> {
         self.connection.get_pager_from_database_index(idx)
     }
@@ -1727,9 +1777,10 @@ impl Program {
         let hit_query_deadline = state
             .query_deadline
             .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
-        let progress_interrupt = self
-            .connection
-            .should_interrupt_for_progress(state.metrics.vm_steps);
+        let progress_interrupt = self.connection.should_interrupt_for_progress(
+            state.metrics.vm_steps,
+            &mut state.progress_last_checked,
+        );
         if connection_interrupt || hit_query_deadline || progress_interrupt {
             state.interrupt();
         }
@@ -1947,6 +1998,7 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        let vdbe_trace = self.connection.get_vdbe_trace();
         // Invalidate the previous result row once per step call: rows are only
         // handed out between step calls, and ResultRow returns immediately
         // after setting a fresh one.
@@ -1987,25 +2039,35 @@ impl Program {
                 }
                 state.io_completions = None;
             }
+            // Closed-connection, interrupt, deadline and progress checks run
+            // when a step call starts and after every backwards jump. Every
+            // loop in a program has a backwards jump, so long-running
+            // statements still notice them promptly, but straight-line code
+            // does not pay for the checks on every instruction. This is what
+            // SQLite does too: it only checks at jump opcodes.
+            let mut check_interrupt = true;
             loop {
-                if self.connection.is_closed() {
-                    // Connection is closed for whatever reason, rollback the transaction.
-                    let state = self.connection.get_tx_state();
-                    if let TransactionState::Write { .. } = state {
-                        pager.rollback_tx(&self.connection);
+                if check_interrupt {
+                    check_interrupt = false;
+                    if self.connection.is_closed() {
+                        // Connection is closed for whatever reason, rollback the transaction.
+                        let state = self.connection.get_tx_state();
+                        if let TransactionState::Write { .. } = state {
+                            pager.rollback_tx(&self.connection);
+                        }
+                        return Err(LimboError::InternalError("Connection closed".to_string()));
                     }
-                    return Err(LimboError::InternalError("Connection closed".to_string()));
-                }
-                if self.maybe_request_interrupt(state, pager.io.as_ref()) {
-                    self.abort(pager, None, state, true)?;
-                    return Ok(StepResult::Interrupt);
+                    if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+                        self.abort(pager, None, state, true)?;
+                        return Ok(StepResult::Interrupt);
+                    }
                 }
 
                 // A trigger can return FAIL before the parent program reaches
                 // Halt. FAIL keeps changes made by earlier rows, so their
                 // index-method writes must finish before abort() releases the
                 // statement savepoint and commits those partial changes.
-                if let Some(fail_error) = state.pending_fail_prepare_error.take() {
+                if let Some(fail_error) = state.take_pending_fail_prepare_error() {
                     match execute::index_method_stage_statement_all(state) {
                         Ok(IOResult::Done(())) => {
                             if let Err(abort_err) =
@@ -2057,49 +2119,18 @@ impl Program {
                     trace_insn(self, state.pc as InsnReference, insn);
                     crate::stack::trace_remaining("program_step:opcode");
                 }
-                if self.connection.get_vdbe_trace() {
-                    // Diff registers from PREVIOUS opcode
-                    // The last opcode (Halt) won't have its diff printed, but Halt
-                    // doesn't write to any registers
-                    if let Some(ref old) = state.pre_op_registers {
-                        for (i, (old_reg, new_reg)) in
-                            old.iter().zip(state.registers.iter()).enumerate()
-                        {
-                            if old_reg != new_reg {
-                                match new_reg {
-                                    Register::Value(v) => eprintln!("R[{i}] = {v}"),
-                                    Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
-                                    Register::Record(_) => eprintln!("R[{i}] = <record>"),
-                                }
-                            }
-                        }
-                        state.pre_op_registers = None;
-                    }
-
-                    // Print CURRENT opcode
-                    if matches!(insn, Insn::Init { .. }) {
-                        eprintln!("VDBE Trace:");
-                    }
-                    eprintln!(
-                        "{}",
-                        explain::insn_to_str(
-                            self,
-                            state.pc,
-                            insn,
-                            String::new(),
-                            self.explain.comment_at(state.pc)
-                        )
-                    );
-                    // Snapshot for next iteration
-                    state.pre_op_registers = Some(state.registers.clone());
+                if vdbe_trace {
+                    self.vdbe_trace_insn(state, insn);
                 }
                 // Always increment VM steps for every loop iteration
                 state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
+                let pc_before = state.pc;
                 match insn_function(self, state, insn, pager) {
                     Ok(InsnFunctionStepResult::Step) => {
                         // Instruction completed, moving to next
                         state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                        check_interrupt = state.pc <= pc_before;
                     }
                     Ok(InsnFunctionStepResult::Done) => {
                         // Instruction completed execution

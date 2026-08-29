@@ -19020,7 +19020,7 @@ mod tests {
                 if !conn_for_progress.get_auto_commit() {
                     let calls =
                         source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
-                    calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+                    calls >= 2 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
                 } else {
                     false
                 }
@@ -19039,7 +19039,7 @@ mod tests {
             "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
         );
         assert!(
-            source_txn_progress_calls.load(Ordering::SeqCst) > 10,
+            source_txn_progress_calls.load(Ordering::SeqCst) > 2,
             "test should interrupt after VACUUM INTO opens the source transaction"
         );
         assert!(
