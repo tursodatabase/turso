@@ -1252,15 +1252,40 @@ impl Value {
             return Ok(Value::Blob(blob));
         }
 
-        let Some(lhs) = self.cast_text() else {
+        if matches!(self, Value::Null) || matches!(rhs, Value::Null) {
             return Ok(Value::Null);
-        };
+        }
 
-        let Some(rhs) = rhs.cast_text() else {
-            return Ok(Value::Null);
-        };
+        let mut out = String::new();
+        out.try_reserve(self.text_len_hint() + rhs.text_len_hint())?;
+        self.append_as_text(&mut out);
+        rhs.append_as_text(&mut out);
+        Ok(Value::build_text(out))
+    }
 
-        Ok(Value::build_text(lhs + &rhs))
+    /// Upper bound on the text length of this value, so concatenation can
+    /// allocate once.
+    fn text_len_hint(&self) -> usize {
+        match self {
+            Value::Null => 0,
+            Value::Numeric(_) => 24,
+            Value::Text(t) => t.as_str().len(),
+            Value::Blob(b) => b.len(),
+        }
+    }
+
+    /// Appends the text form of this value, the same one `to_string` gives,
+    /// without going through the formatting machinery or a temporary String.
+    fn append_as_text(&self, out: &mut String) {
+        match self {
+            Value::Null => {}
+            Value::Numeric(Numeric::Integer(i)) => out.push_str(itoa::Buffer::new().format(*i)),
+            Value::Numeric(Numeric::Float(f)) => {
+                out.push_str(&crate::numeric::format_float(f64::from(*f)))
+            }
+            Value::Text(t) => out.push_str(t.as_str()),
+            Value::Blob(b) => out.push_str(&String::from_utf8_lossy(b)),
+        }
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
