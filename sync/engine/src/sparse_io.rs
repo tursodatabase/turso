@@ -35,12 +35,11 @@
 //! 1. The on-disk bitmap never *over*-claims: the data file is synced before
 //!    every bitmap persist, and punched bits are made durable (temp file +
 //!    fsync + rename + parent-directory fsync) before the bytes are released.
-//! 2. The on-disk bitmap can lag the data file only within a single
-//!    [`File::sync`] call. Because the pager only treats a checkpoint as
-//!    complete once `sync` returns — and the WAL is truncated after that —
-//!    a crash inside the window is repaired by WAL replay. Outside normal
-//!    operation (sidecar deleted, corrupted, or belonging to a different
-//!    file generation) the backend refuses to open rather than guess.
+//! 2. The on-disk bitmap may lag fetched data until a sync or clean close;
+//!    those pages are safe to re-fetch. Checkpointed local changes remain in
+//!    the WAL until [`File::sync`] returns, so WAL replay repairs a crash in
+//!    that window. On a cold open of a non-empty file, missing, corrupt, or
+//!    mismatched metadata is rejected rather than guessed.
 
 use std::{
     os::{fd::AsRawFd, unix::fs::FileExt},
@@ -230,15 +229,15 @@ mod bitmap {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use turso_core::{turso_assert, turso_assert_reachable, turso_assert_sometimes};
 
-    /// Presence is tracked per 4 KiB granule, matching `MemoryIO`'s
-    /// `PAGE_SIZE` presence map and the minimum database page size. Like
+    /// Presence is tracked per sync-protocol page, matching `MemoryIO`'s
+    /// presence map. Like
     /// `MemoryIO` and the Linux backend (where any write allocates its whole
     /// block), a write marks every granule it touches; the untouched
     /// remainder of an edge granule reads as zeros — enforced by explicit
     /// zero-fill when the granule was absent, so a punched granule whose
     /// physical reclamation did not survive a crash can never leak stale
     /// bytes back through a later partial write.
-    const GRANULE: u64 = 4096;
+    const GRANULE: u64 = crate::database_sync_operations::PAGE_SIZE as u64;
 
     const SIDECAR_SUFFIX: &str = ".present";
     const ANCHOR_SUFFIX: &str = ".anchor";
@@ -438,6 +437,7 @@ mod bitmap {
                 prepare_presence_metadata(
                     &self.tracked_path,
                     &sidecar,
+                    &existing_file,
                     id,
                     current_meta.len(),
                     read_only,
@@ -448,7 +448,14 @@ mod bitmap {
                     // `Drop` also holds the registry lock.
                     sweep_orphan_tmp_files(&sidecar);
                 }
-                prepare_presence_metadata(&self.tracked_path, &sidecar, id, meta.len(), read_only)?;
+                prepare_presence_metadata(
+                    &self.tracked_path,
+                    &sidecar,
+                    &file,
+                    id,
+                    meta.len(),
+                    read_only,
+                )?;
             }
             // Re-verify under the registry lock that the path still names the
             // inode we opened: `remove_file` holds this lock across its
@@ -600,6 +607,7 @@ mod bitmap {
     fn prepare_presence_metadata(
         data_path: &str,
         sidecar: &str,
+        data_file: &std::fs::File,
         id: FileId,
         data_len: u64,
         read_only: bool,
@@ -611,6 +619,9 @@ mod bitmap {
             return Ok(());
         }
 
+        barrier_sync(data_file, FileSyncType::Fsync)
+            .map_err(|e| completion_error(e, "sync empty database file"))?;
+
         let anchor = anchor_path(sidecar);
         if !path_names_file(&anchor, id) {
             let tmp_anchor = format!(
@@ -620,18 +631,18 @@ mod bitmap {
             );
             std::fs::hard_link(data_path, &tmp_anchor)
                 .map_err(|e| completion_error(e, "create presence anchor"))?;
-            std::fs::rename(&tmp_anchor, &anchor)
-                .map_err(|e| completion_error(e, "install presence anchor"))?;
-        }
-        match std::fs::remove_file(sidecar) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_error(e, "remove stale presence sidecar")),
+            if let Err(e) = std::fs::rename(&tmp_anchor, &anchor) {
+                let _ = std::fs::remove_file(&tmp_anchor);
+                return Err(completion_error(e, "install presence anchor"));
+            }
         }
         require_matching_anchor(sidecar, id)?;
-        sync_parent_dir(sidecar, FileSyncType::Fsync)
-            .map_err(|e| completion_error(e, "sync presence metadata dir"))?;
-        Ok(())
+        write_sidecar(
+            sidecar,
+            id,
+            &roaring::RoaringTreemap::new(),
+            FileSyncType::Fsync,
+        )
     }
 
     fn require_matching_anchor(sidecar: &str, id: FileId) -> Result<()> {
@@ -652,9 +663,8 @@ mod bitmap {
 
     fn presence_anomaly(path: &str, reason: &str) -> turso_core::LimboError {
         turso_core::LimboError::Corrupt(format!(
-            "presence metadata {path} {reason}; refusing to guess page presence for a \
-             non-empty database file (delete the database file and its presence metadata to \
-             re-bootstrap)"
+            "presence metadata {path} {reason}; refusing to guess page presence (delete the \
+             database file and its presence metadata to re-bootstrap)"
         ))
     }
 
@@ -816,12 +826,10 @@ mod bitmap {
 
     /// Load and validate the sidecar against the opened data file.
     ///
-    /// An empty data file is fresh by definition: any sidecar found next to
-    /// it is stale and discarded. For a non-empty data file the sidecar is
-    /// required and must match this file's identity and checksum — the bits
-    /// may guard locally modified pages, so guessing "all absent" could let
-    /// the lazy storage overwrite local data with older server pages. Refuse
-    /// instead.
+    /// A read-only empty file is treated as absent without changing metadata;
+    /// writable initialization has already published a valid empty sidecar.
+    /// A cold open of a non-empty file requires a sidecar with matching
+    /// identity and checksum because its bits may protect local changes.
     fn load_sidecar(
         path: &str,
         data_len: u64,
@@ -829,28 +837,16 @@ mod bitmap {
         ino: u64,
         read_only: bool,
     ) -> Result<roaring::RoaringTreemap> {
-        let discard_stale = |bytes_existed: bool| {
-            if bytes_existed && !read_only {
-                turso_assert_reachable!("stale presence sidecar discarded for fresh file");
-                if let Err(e) = std::fs::remove_file(path) {
-                    tracing::warn!("failed to remove stale presence sidecar {path}: {e}");
-                }
-            }
-            roaring::RoaringTreemap::new()
-        };
+        if data_len == 0 && read_only {
+            return Ok(roaring::RoaringTreemap::new());
+        }
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if data_len == 0 {
-                    return Ok(discard_stale(false));
-                }
                 return Err(presence_anomaly(path, "is missing"));
             }
             Err(e) => return Err(io_error(e, "read presence sidecar")),
         };
-        if data_len == 0 {
-            return Ok(discard_stale(true));
-        }
         match parse_sidecar(&bytes) {
             Some((sidecar_dev, sidecar_ino, bitmap)) => {
                 if sidecar_dev != dev || sidecar_ino != ino {
@@ -982,9 +978,19 @@ mod bitmap {
                 entry.path
             )));
         }
-        let mut payload = Vec::with_capacity(state.present.serialized_size());
-        state
-            .present
+        write_sidecar(&entry.sidecar_path, id, &state.present, sync_type)?;
+        state.dirty = false;
+        Ok(())
+    }
+
+    fn write_sidecar(
+        sidecar: &str,
+        id: FileId,
+        present: &roaring::RoaringTreemap,
+        sync_type: FileSyncType,
+    ) -> Result<()> {
+        let mut payload = Vec::with_capacity(present.serialized_size());
+        present
             .serialize_into(&mut payload)
             .map_err(|e| completion_error(e, "serialize presence sidecar"))?;
         let mut buf = Vec::with_capacity(SIDECAR_HEADER_LEN + payload.len());
@@ -998,21 +1004,27 @@ mod bitmap {
 
         let tmp_path = format!(
             "{}.{}.{}.tmp",
-            entry.sidecar_path,
+            sidecar,
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let mut tmp = std::fs::File::create(&tmp_path)
-            .map_err(|e| completion_error(e, "create presence sidecar"))?;
-        tmp.write_all(&buf)
-            .map_err(|e| completion_error(e, "write presence sidecar"))?;
-        barrier_sync(&tmp, sync_type).map_err(|e| completion_error(e, "sync presence sidecar"))?;
-        std::fs::rename(&tmp_path, &entry.sidecar_path)
-            .map_err(|e| completion_error(e, "rename presence sidecar"))?;
-        sync_parent_dir(&entry.sidecar_path, sync_type)
-            .map_err(|e| completion_error(e, "sync sidecar dir"))?;
-        state.dirty = false;
-        Ok(())
+        let result = (|| {
+            let mut tmp = std::fs::File::create(&tmp_path)
+                .map_err(|e| completion_error(e, "create presence sidecar"))?;
+            tmp.write_all(&buf)
+                .map_err(|e| completion_error(e, "write presence sidecar"))?;
+            barrier_sync(&tmp, sync_type)
+                .map_err(|e| completion_error(e, "sync presence sidecar"))?;
+            std::fs::rename(&tmp_path, sidecar)
+                .map_err(|e| completion_error(e, "rename presence sidecar"))?;
+            sync_parent_dir(sidecar, sync_type)
+                .map_err(|e| completion_error(e, "sync sidecar dir"))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        result
     }
 
     /// Release the punched byte range back to the filesystem. Best-effort:
@@ -1257,7 +1269,7 @@ mod tests {
 
     use crate::sparse_io::SparseBitmapIo;
 
-    const G: u64 = 4096;
+    const G: u64 = crate::database_sync_operations::PAGE_SIZE as u64;
 
     fn truncate(file: &Arc<dyn turso_core::File>, len: u64) {
         #[expect(clippy::let_underscore_future)]
@@ -1524,6 +1536,55 @@ mod tests {
         assert!(file.has_hole(G as usize, G as usize).unwrap());
         assert!(!file.has_hole(2 * G as usize, G as usize).unwrap());
         assert!(file.has_hole(3 * G as usize, G as usize).unwrap());
+    }
+
+    #[test]
+    pub fn sparse_bitmap_incomplete_bootstrap_reopens_as_absent() {
+        let (io, _dir, path) = tracked_io_and_path();
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
+        let sidecar = format!("{path}.present");
+        let anchor = format!("{sidecar}.anchor");
+
+        let data_meta = std::fs::metadata(&path).unwrap();
+        let anchor_meta = std::fs::metadata(&anchor).unwrap();
+        assert_eq!(
+            (anchor_meta.dev(), anchor_meta.ino()),
+            (data_meta.dev(), data_meta.ino())
+        );
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        assert_eq!(&sidecar_bytes[..4], b"TPRB");
+        assert_eq!(sidecar_bytes[4], 4);
+        assert_eq!(
+            u32::from_le_bytes(sidecar_bytes[5..9].try_into().unwrap()),
+            G as u32
+        );
+        assert_eq!(
+            u64::from_le_bytes(sidecar_bytes[9..17].try_into().unwrap()),
+            data_meta.dev()
+        );
+        assert_eq!(
+            u64::from_le_bytes(sidecar_bytes[17..25].try_into().unwrap()),
+            data_meta.ino()
+        );
+        assert_eq!(
+            u32::from_le_bytes(sidecar_bytes[25..29].try_into().unwrap()),
+            crc32c::crc32c(&sidecar_bytes[29..])
+        );
+        let present = roaring::RoaringTreemap::deserialize_from(&sidecar_bytes[29..]).unwrap();
+        assert!(present.is_empty());
+        drop(file);
+
+        {
+            use std::os::unix::fs::FileExt;
+            let raw = std::fs::File::options().write(true).open(&path).unwrap();
+            raw.write_all_at(&[0xAA; 4096], 0).unwrap();
+            raw.sync_all().unwrap();
+        }
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+
+        let io = SparseBitmapIo::new(&path).unwrap();
+        let reopened = io.open_file(&path, OpenFlags::default(), false).unwrap();
+        assert!(reopened.has_hole(0, G as usize).unwrap());
     }
 
     /// Hydration that never triggers an explicit sync must still be present
@@ -1800,6 +1861,31 @@ mod tests {
         drop(writable);
         drop(read_only);
         assert!(io.open_file(&path, OpenFlags::default(), false).is_ok());
+    }
+
+    #[test]
+    pub fn sparse_bitmap_empty_read_only_open_preserves_metadata() {
+        let (io, _dir, path) = tracked_io_and_path();
+        std::fs::write(&path, b"").unwrap();
+        let sidecar = format!("{path}.present");
+        let anchor = format!("{sidecar}.anchor");
+        std::fs::write(&sidecar, b"stale sidecar").unwrap();
+        std::fs::write(&anchor, b"stale anchor").unwrap();
+        let sidecar_before = std::fs::read(&sidecar).unwrap();
+        let anchor_before = std::fs::read(&anchor).unwrap();
+        let anchor_id_before = {
+            let meta = std::fs::metadata(&anchor).unwrap();
+            (meta.dev(), meta.ino())
+        };
+
+        let file = io.open_file(&path, OpenFlags::ReadOnly, false).unwrap();
+        assert!(file.has_hole(0, G as usize).unwrap());
+        drop(file);
+
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_before);
+        assert_eq!(std::fs::read(&anchor).unwrap(), anchor_before);
+        let anchor_meta = std::fs::metadata(&anchor).unwrap();
+        assert_eq!((anchor_meta.dev(), anchor_meta.ino()), anchor_id_before);
     }
 
     /// Access mode is per handle: a read-only handle may probe presence but
