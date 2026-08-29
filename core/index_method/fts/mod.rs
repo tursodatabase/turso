@@ -52,6 +52,7 @@ use tantivy::{
     TERMINATED,
 };
 use turso_parser::ast::{Select, SortOrder};
+use uncased::UncasedStr;
 
 mod directory;
 mod format;
@@ -494,6 +495,13 @@ impl std::fmt::Debug for FtsShared {
 }
 
 impl FtsShared {
+    /// The scratch index exists because tantivy only hands out `SegmentMeta`
+    /// values through an `Index`'s segment inventory
+    /// (`Index::new_segment_meta`), and the read path needs one per visible
+    /// segment to synthesize the `meta.json` a `SnapshotDirectory` serves.
+    /// It is an empty in-RAM index with this attachment's schema: nothing is
+    /// ever written to or read from it, and one instance is shared by every
+    /// cursor of the attachment.
     fn scratch_index(&self, schema: &Schema) -> Result<Index> {
         let mut scratch = self.scratch.lock();
         if let Some(index) = scratch.as_ref() {
@@ -561,17 +569,20 @@ impl FtsIndexAttachment {
         // Validate WITH clause keys the same way bad values are validated:
         // a typo like `tokenzier` must be an error, not a silently different
         // index. Keys are matched case-insensitively.
-        let mut parameters: HashMap<String, &Value> = HashMap::default();
+        let mut parameters: HashMap<&UncasedStr, &Value> = HashMap::default();
         for (key, value) in &cfg.parameters {
-            let normalized = key.to_ascii_lowercase();
-            if !SUPPORTED_WITH_KEYS.contains(&normalized.as_str()) {
+            let key_uncased = UncasedStr::new(key);
+            if !SUPPORTED_WITH_KEYS
+                .iter()
+                .any(|supported| UncasedStr::new(supported) == key_uncased)
+            {
                 return Err(LimboError::ParseError(format!(
                     "unsupported FTS WITH parameter '{}'. Supported parameters: {}",
                     key,
                     SUPPORTED_WITH_KEYS.join(", ")
                 )));
             }
-            if parameters.insert(normalized, value).is_some() {
+            if parameters.insert(key_uncased, value).is_some() {
                 return Err(LimboError::ParseError(format!(
                     "duplicate FTS WITH parameter '{key}'"
                 )));
@@ -581,7 +592,7 @@ impl FtsIndexAttachment {
         // Parse tokenizer from WITH clause parameters, default to "default"
         // The parser may include surrounding quotes in the value, so we strip them
         let tokenizer_name = parameters
-            .get("tokenizer")
+            .get(UncasedStr::new("tokenizer"))
             .and_then(|v| match v {
                 Value::Text(t) => {
                     let s = t.to_string();
@@ -604,7 +615,7 @@ impl FtsIndexAttachment {
 
         // Parse the ngram window: WITH (tokenizer = 'ngram', min_gram = 1, max_gram = 3)
         let parse_gram = |key: &str| -> Result<Option<usize>> {
-            let Some(value) = parameters.get(key) else {
+            let Some(value) = parameters.get(UncasedStr::new(key)) else {
                 return Ok(None);
             };
             match value {
@@ -635,7 +646,8 @@ impl FtsIndexAttachment {
         }
 
         // Parse field weights from WITH clause: weights='body=2.0,title=1.0'
-        let field_weights = if let Some(weights_value) = parameters.get("weights") {
+        let field_weights = if let Some(weights_value) = parameters.get(UncasedStr::new("weights"))
+        {
             let weights_str = match weights_value {
                 Value::Text(t) => {
                     let s = t.to_string();
@@ -791,8 +803,13 @@ fn initialize_btree_storage_table(
         index_ident = quote_identifier(&format!("{table_name}_key")),
         method = super::BACKING_BTREE_INDEX_METHOD_NAME,
     );
-    // Execute nested statements without subtransactions to avoid DatabaseBusy
-    // (we're already inside a transaction from the parent CREATE INDEX statement)
+    // The backing store is a table plus its `backing_btree` index, so two
+    // DDL statements run here, once per CREATE INDEX. They are nested
+    // statements without subtransactions to avoid DatabaseBusy (we are
+    // already inside the parent CREATE INDEX statement's transaction);
+    // the toy index methods create their stores the same way. A helper
+    // that creates a backing B-tree without going through SQL would
+    // replace both.
     {
         conn.start_nested();
         let mut stmt = conn.prepare(create_table_sql)?;

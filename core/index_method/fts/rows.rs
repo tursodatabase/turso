@@ -13,10 +13,13 @@
 //!   Only merge/OPTIMIZE deletes rows.
 
 use crate::{
+    numeric::Numeric,
     return_if_io,
     storage::btree::{BTreeKey, CursorTrait},
-    types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Text},
-    LimboError, Result, Value,
+    types::{
+        IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, TextRef, TextSubtype, ValueRef,
+    },
+    LimboError, Result,
 };
 
 /// One backing row waiting to be inserted.
@@ -28,12 +31,14 @@ pub(super) struct PendingRow {
 }
 
 impl PendingRow {
+    /// Serialize the row straight from its fields: the record buffer is the
+    /// only copy the path and chunk bytes take.
     fn record(&self) -> Result<ImmutableRecord> {
         ImmutableRecord::from_values(
-            &[
-                Value::Text(Text::new(self.path.clone())),
-                Value::from_i64(self.chunk_no),
-                Value::from_slice(&self.bytes)?,
+            [
+                ValueRef::Text(TextRef::new(&self.path, TextSubtype::Text)),
+                ValueRef::Numeric(Numeric::Integer(self.chunk_no)),
+                ValueRef::Blob(&self.bytes),
             ],
             3,
         )
@@ -98,32 +103,36 @@ fn row_path(record: &ImmutableRecord) -> Result<String> {
 /// Seek key positioned at (or before) the first possible row for `path`.
 pub(super) fn seek_key_for_path(path: &str) -> Result<ImmutableRecord> {
     ImmutableRecord::from_values(
-        &[
-            Value::Text(Text::new(path.to_string())),
-            Value::from_i64(0),
-            Value::Blob(crate::alloc::vec![]),
+        [
+            ValueRef::Text(TextRef::new(path, TextSubtype::Text)),
+            ValueRef::Numeric(Numeric::Integer(0)),
+            ValueRef::Blob(&[]),
         ],
         3,
     )
 }
 
+/// The row in flight, with its serialized key. The record lives in the
+/// phase because the cursor's seek and insert state machines are resumed
+/// with the same key after an I/O yield: the key must survive the yield,
+/// not be rebuilt on every re-entry.
 #[derive(Debug)]
 enum InsertPhase {
-    Seeking,
+    Seeking { record: ImmutableRecord },
     Inserting { record: ImmutableRecord },
 }
 
 /// Insert-only flush: every row is written once with a fresh key, so the
-/// machine is pure seek-then-insert. Re-entry after an I/O yield re-seeks.
-/// A row whose exact key is already present (a resumed insert) needs no
-/// probe here: the B-tree overwrites on an exact index-key match and the
-/// MVCC cursor updates the existing version, so re-inserting identical
-/// bytes is idempotent by construction.
+/// machine is pure seek-then-insert. A row whose exact key is already
+/// present (a resumed insert) needs no probe here: the B-tree overwrites
+/// on an exact index-key match and the MVCC cursor updates the existing
+/// version, so re-inserting identical bytes is idempotent by construction.
 #[derive(Debug)]
 pub(super) struct RowInserter {
     rows: Vec<PendingRow>,
     idx: usize,
-    phase: InsertPhase,
+    /// `None` between rows; the record is built once per row.
+    phase: Option<InsertPhase>,
 }
 
 impl RowInserter {
@@ -131,19 +140,22 @@ impl RowInserter {
         Self {
             rows,
             idx: 0,
-            phase: InsertPhase::Seeking,
+            phase: None,
         }
     }
 
     pub fn step(&mut self, cursor: &mut dyn CursorTrait) -> Result<IOResult<()>> {
         loop {
-            if self.idx >= self.rows.len() {
-                return Ok(IOResult::Done(()));
-            }
             match &mut self.phase {
-                InsertPhase::Seeking => {
-                    let row = &self.rows[self.idx];
-                    let record = row.record()?;
+                None => {
+                    let Some(row) = self.rows.get(self.idx) else {
+                        return Ok(IOResult::Done(()));
+                    };
+                    self.phase = Some(InsertPhase::Seeking {
+                        record: row.record()?,
+                    });
+                }
+                Some(InsertPhase::Seeking { record }) => {
                     // Positioning only: `insert` writes at the cursor's
                     // current position (see the struct docs for why no
                     // existence probe is needed).
@@ -153,12 +165,15 @@ impl RowInserter {
                     ));
                     // Insert in a separate phase so an I/O yield does not
                     // repeat the seek.
-                    self.phase = InsertPhase::Inserting { record };
+                    let Some(InsertPhase::Seeking { record }) = self.phase.take() else {
+                        unreachable!("phase matched above");
+                    };
+                    self.phase = Some(InsertPhase::Inserting { record });
                 }
-                InsertPhase::Inserting { record } => {
+                Some(InsertPhase::Inserting { record }) => {
                     return_if_io!(cursor.insert(&BTreeKey::IndexKey(record.as_record_ref())));
                     self.idx += 1;
-                    self.phase = InsertPhase::Seeking;
+                    self.phase = None;
                 }
             }
         }
@@ -202,10 +217,14 @@ enum DeletePhase {
 /// After every deletion the machine re-seeks from the target's logical
 /// prefix: B-tree deletion may retreat, preserve, or advance the physical
 /// cursor depending on balancing, so `next()` could skip a sibling row.
+/// The seek key is built once per target and kept until the target is
+/// done: the cursor's seek state machine is resumed with the same key
+/// after an I/O yield, and every re-seek after a deletion uses it again.
 #[derive(Debug)]
 pub(super) struct RowDeleter {
     targets: Vec<PathTarget>,
     idx: usize,
+    seek_key: Option<ImmutableRecord>,
     phase: DeletePhase,
 }
 
@@ -214,8 +233,16 @@ impl RowDeleter {
         Self {
             targets,
             idx: 0,
+            seek_key: None,
             phase: DeletePhase::Seeking,
         }
+    }
+
+    /// Move on to the next target; its seek key is built on first use.
+    fn next_target(&mut self) {
+        self.idx += 1;
+        self.seek_key = None;
+        self.phase = DeletePhase::Seeking;
     }
 
     pub fn step(&mut self, cursor: &mut dyn CursorTrait) -> Result<IOResult<()>> {
@@ -225,33 +252,31 @@ impl RowDeleter {
             };
             match self.phase {
                 DeletePhase::Seeking => {
-                    let seek_key = seek_key_for_path(target.seek_path())?;
+                    let seek_key = match &self.seek_key {
+                        Some(seek_key) => seek_key,
+                        None => self.seek_key.insert(seek_key_for_path(target.seek_path())?),
+                    };
                     let seek_result = return_if_io!(cursor.seek(
                         SeekKey::IndexKey(seek_key.as_record_ref()),
                         SeekOp::GE { eq_only: false },
                     ));
-                    self.phase = match seek_result {
-                        SeekResult::NotFound => {
-                            self.idx += 1;
-                            DeletePhase::Seeking
-                        }
-                        SeekResult::TryAdvance => DeletePhase::Advancing,
-                        SeekResult::Found => DeletePhase::Checking,
-                    };
+                    match seek_result {
+                        SeekResult::NotFound => self.next_target(),
+                        SeekResult::TryAdvance => self.phase = DeletePhase::Advancing,
+                        SeekResult::Found => self.phase = DeletePhase::Checking,
+                    }
                 }
                 DeletePhase::Advancing => {
                     return_if_io!(cursor.next());
-                    self.phase = if cursor.has_record() {
-                        DeletePhase::Checking
+                    if cursor.has_record() {
+                        self.phase = DeletePhase::Checking;
                     } else {
-                        self.idx += 1;
-                        DeletePhase::Seeking
-                    };
+                        self.next_target();
+                    }
                 }
                 DeletePhase::Checking => {
                     if !cursor.has_record() {
-                        self.idx += 1;
-                        self.phase = DeletePhase::Seeking;
+                        self.next_target();
                         continue;
                     }
                     let record = return_if_io!(cursor.record()).ok_or_else(|| {
@@ -261,8 +286,7 @@ impl RowDeleter {
                     if target.matches(&path) {
                         self.phase = DeletePhase::Deleting;
                     } else {
-                        self.idx += 1;
-                        self.phase = DeletePhase::Seeking;
+                        self.next_target();
                     }
                 }
                 DeletePhase::Deleting => {
