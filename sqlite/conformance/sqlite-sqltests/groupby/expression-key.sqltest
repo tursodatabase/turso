@@ -1,0 +1,183 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (2, 30);
+}
+
+@setup schema
+test select-is-exactly-the-group-by-expression {
+    SELECT a+0, count(*) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+}
+
+@setup schema
+test select-calls-a-function-on-the-group-by-expression {
+    SELECT abs(a+0), count(*) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+}
+
+@setup schema
+test select-does-arithmetic-on-the-group-by-expression {
+    SELECT (a+0)*2, count(*) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    2|1
+    4|2
+}
+
+@setup schema
+test select-negates-the-group-by-expression {
+    SELECT -(a+0), count(*) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    -2|2
+    -1|1
+}
+
+@setup schema
+test select-casts-the-group-by-expression {
+    SELECT CAST(a+0 AS TEXT), count(*) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+}
+
+@setup schema
+test select-uses-the-group-by-expression-in-a-case {
+    SELECT CASE WHEN (a+0) > 1 THEN 'big' ELSE 'small' END, count(*) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    big|2
+    small|1
+}
+
+@setup schema
+test select-tests-the-group-by-expression-for-null {
+    SELECT (a+0) IS NULL, count(*) FROM t GROUP BY a+0 ORDER BY 2;
+}
+expect {
+    0|1
+    0|2
+}
+
+@setup schema
+test select-takes-the-type-of-the-group-by-expression {
+    SELECT typeof(a+0), count(*) FROM t GROUP BY a+0 ORDER BY 2;
+}
+expect {
+    integer|1
+    integer|2
+}
+
+@setup schema
+test select-nests-the-group-by-expression-two-functions-deep {
+    SELECT abs(abs(a+0)), count(*) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+}
+
+@setup schema
+test group-by-a-function-and-wrap-it-in-the-select {
+    SELECT abs(abs(a)), count(*) FROM t GROUP BY abs(a) ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+}
+
+@setup schema
+test group-by-a-concatenation-and-wrap-it-in-the-select {
+    SELECT length(a||'x'), count(*) FROM t GROUP BY a||'x' ORDER BY 1;
+}
+expect {
+    2|1
+    2|2
+}
+
+@setup schema
+test having-wraps-the-group-by-expression {
+    SELECT count(*) FROM t GROUP BY a+0 HAVING abs(a+0) > 1;
+}
+expect {
+    2
+}
+
+@setup schema
+test having-wraps-the-group-by-expression-with-no-select-reference {
+    SELECT count(*) FROM t GROUP BY a+0 HAVING (a+0)*2 IS NOT NULL ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+@setup schema
+test order-by-wraps-the-group-by-expression {
+    SELECT count(*) FROM t GROUP BY a+0 ORDER BY -(a+0);
+}
+expect {
+    2
+    1
+}
+
+@setup schema
+test select-wraps-the-group-by-expression-alongside-a-bare-column {
+    SELECT abs(a+0), b FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+}
+
+@setup schema
+test select-wraps-two-group-by-expressions {
+    SELECT abs(a+0), abs(b+0) FROM t GROUP BY a+0, b+0 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+}
+
+@setup schema
+test distinct-over-a-wrapped-group-by-expression {
+    SELECT DISTINCT abs(a+0) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+@setup schema
+test subquery-selects-a-wrapped-group-by-expression {
+    SELECT g FROM (SELECT abs(a+0) AS g FROM t GROUP BY a+0) ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+setup nulls {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (2, 30), (NULL, 40);
+}
+
+@setup nulls
+test select-wraps-the-group-by-expression-with-a-null-group {
+    SELECT abs(a+0), count(*) FROM t GROUP BY a+0 ORDER BY 1;
+}
+expect {
+    |1
+    1|1
+    2|2
+}

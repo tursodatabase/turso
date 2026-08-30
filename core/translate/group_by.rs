@@ -416,23 +416,30 @@ fn collect_non_aggregate_expressions<'a>(
         Option<turso_parser::ast::NullsOrder>,
     )],
 ) -> Result<()> {
-    let mut result_columns = Vec::new();
-    for expr in root_result_columns
+    let output_exprs: Vec<&'a ast::Expr> = root_result_columns
         .iter()
         .map(|col| &col.expr)
         .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
         .chain(group_by.having.iter().flatten())
-    {
+        .collect();
+
+    let mut result_columns = Vec::new();
+    for expr in &output_exprs {
         collect_result_columns(expr, plan, &mut result_columns)?;
     }
 
     for group_expr in &group_by.exprs {
-        let expr_appears_in_result_columns = result_columns
+        let mut expr_appears_in_result_columns = result_columns
             .iter()
-            .any(|expr| exprs_are_equivalent(expr, group_expr))
-            || root_result_columns
-                .iter()
-                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
+            .any(|expr| exprs_are_equivalent(expr, group_expr));
+        if !expr_appears_in_result_columns {
+            for expr in &output_exprs {
+                if expr_contains_equivalent(expr, group_expr)? {
+                    expr_appears_in_result_columns = true;
+                    break;
+                }
+            }
+        }
         non_aggregate_expressions.push((group_expr, expr_appears_in_result_columns));
     }
     for expr in result_columns {
@@ -522,6 +529,20 @@ fn collect_result_columns<'a>(
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+/// Whether `needle` occurs anywhere inside `haystack`, either as the whole
+/// expression or as a sub-expression.
+fn expr_contains_equivalent(haystack: &ast::Expr, needle: &ast::Expr) -> Result<bool> {
+    let mut found = false;
+    walk_expr(haystack, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if exprs_are_equivalent(expr, needle) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 /// In case sorting is needed for GROUP BY, creates a pseudo table that matches
