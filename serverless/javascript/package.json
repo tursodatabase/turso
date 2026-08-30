@@ -39,6 +39,9 @@
     "dev": "tsup --watch",
     "test": "ava integration-tests/*.test.mjs"
   },
+  "overrides": {
+    "esbuild": "0.28.2"
+  },
   "keywords": [],
   "author": "",
   "license": "MIT",
