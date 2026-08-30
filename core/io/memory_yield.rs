@@ -34,12 +34,11 @@ struct Deferred {
 }
 
 impl MemoryYieldIO {
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         debug!("Using IO backend 'memory_yield'");
         Self {
-            files: Arc::new(Mutex::new(HashMap::default())),
-            pending: Arc::new(Mutex::new(VecDeque::new())),
+            files: Arc::new(Mutex::new(HashMap::<String, Arc<MemoryYieldFile>>::default())),
+            pending: Arc::new(Mutex::new(VecDeque::<Deferred>::new())),
         }
     }
 }

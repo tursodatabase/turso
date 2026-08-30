@@ -30,11 +30,10 @@ struct WritePause {
 }
 
 impl MemoryIO {
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         debug!("Using IO backend 'memory'");
         Self {
-            files: Arc::new(Mutex::new(HashMap::default())),
+            files: Arc::new(Mutex::new(HashMap::<String, Arc<MemoryFile>>::default())),
         }
     }
 }
