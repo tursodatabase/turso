@@ -352,6 +352,8 @@ int sqlite3_blob_close(void *_blob);
 
 int sqlite3_stricmp(const char *_a, const char *_b);
 
+int sqlite3_strnicmp(const char *_a, const char *_b, int _n);
+
 int sqlite3_create_collation_v2(sqlite3 *_db,
                                 const char *_name,
                                 int _enc,

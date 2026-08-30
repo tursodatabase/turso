@@ -173,6 +173,8 @@ extern "C" {
         tail: *mut *const libc::c_char,
     ) -> i32;
     fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3;
+    fn sqlite3_stricmp(a: *const libc::c_char, b: *const libc::c_char) -> i32;
+    fn sqlite3_strnicmp(a: *const libc::c_char, b: *const libc::c_char, n: i32) -> i32;
     fn sqlite3_value_int(value: *mut libc::c_void) -> i32;
     fn sqlite3_result_int(context: *mut libc::c_void, val: i32);
     fn sqlite3_initialize() -> i32;
@@ -3768,6 +3770,57 @@ mod tests {
             assert!(null_handle.is_null());
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_stricmp_and_strnicmp() {
+        unsafe {
+            // NULL handling
+            assert_eq!(sqlite3_stricmp(ptr::null(), ptr::null()), 0);
+            assert_eq!(sqlite3_stricmp(ptr::null(), c"abc".as_ptr()), -1);
+            assert_eq!(sqlite3_stricmp(c"abc".as_ptr(), ptr::null()), 1);
+
+            // NULL precedence over N <= 0 in strnicmp
+            assert_eq!(sqlite3_strnicmp(ptr::null(), c"abc".as_ptr(), 0), -1);
+            assert_eq!(sqlite3_strnicmp(c"abc".as_ptr(), ptr::null(), 0), 1);
+            assert_eq!(sqlite3_strnicmp(ptr::null(), ptr::null(), 0), 0);
+
+            // N <= 0 returns 0 for non-null strings
+            assert_eq!(sqlite3_strnicmp(c"abc".as_ptr(), c"xyz".as_ptr(), 0), 0);
+            assert_eq!(sqlite3_strnicmp(c"abc".as_ptr(), c"xyz".as_ptr(), -1), 0);
+
+            // Case-insensitivity (unbounded vs bounded)
+            assert_eq!(sqlite3_stricmp(c"Hello".as_ptr(), c"hello".as_ptr()), 0);
+            assert_eq!(sqlite3_strnicmp(c"HELLO".as_ptr(), c"hello".as_ptr(), 5), 0);
+
+            // Bounded prefix matching and exact difference on mismatch
+            assert_eq!(
+                sqlite3_strnicmp(c"abcdef".as_ptr(), c"ABCXYZ".as_ptr(), 3),
+                0
+            );
+            assert_eq!(
+                sqlite3_strnicmp(c"abcdef".as_ptr(), c"ABCXYZ".as_ptr(), 4),
+                (b'd' as i32) - (b'x' as i32)
+            );
+            assert_eq!(sqlite3_strnicmp(c"abc".as_ptr(), c"abcd".as_ptr(), 3), 0);
+
+            // Length mismatch return value ('\0' difference)
+            assert_eq!(
+                sqlite3_stricmp(c"abc".as_ptr(), c"abcd".as_ptr()),
+                -(b'd' as i32)
+            );
+            assert_eq!(
+                sqlite3_strnicmp(c"abcd".as_ptr(), c"abc".as_ptr(), 4),
+                b'd' as i32
+            );
+
+            // Non-ASCII byte comparisons (raw byte difference without folding)
+            assert_eq!(sqlite3_stricmp(c"\x80".as_ptr(), c"\x81".as_ptr()), -1);
+            assert_eq!(
+                sqlite3_strnicmp(c"\xc3\xa9".as_ptr(), c"\xc3\x89".as_ptr(), 2),
+                (0xa9_i32) - (0x89_i32)
+            );
         }
     }
 }
