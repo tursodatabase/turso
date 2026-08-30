@@ -2016,7 +2016,15 @@ impl Limbo {
         match v {
             Value::Null => out.write_all(b"NULL"),
             Value::Numeric(Numeric::Integer(i)) => out.write_all(format!("{i}").as_bytes()),
-            Value::Numeric(Numeric::Float(f)) => write!(out, "{}", f64::from(*f)).map(|_| ()),
+            Value::Numeric(Numeric::Float(_)) => {
+                // Use SQLite-compatible quoting so whole-number REAL values keep
+                // their REAL literal marker (for example, `5.0`) in a dump.
+                let quoted = v.exec_quote();
+                let text = quoted
+                    .to_text()
+                    .expect("quoting a numeric value must produce text");
+                out.write_all(text.as_bytes())
+            }
             Value::Text(s) => {
                 out.write_all(b"'")?;
                 let bytes = s.value.as_bytes();
@@ -2474,6 +2482,19 @@ mod tests {
         assert_eq!(
             normalize_db_path("foo.bar?mode=ro?mode=ro".into()),
             "file:foo.bar%3Fmode=ro?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_dump_preserves_real_literal_for_whole_number_float() {
+        let mut output = Vec::new();
+
+        Limbo::write_sql_value_from_value(&mut output, &Value::from_f64(5.0)).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "5.0",
+            "a REAL value must retain its REAL literal marker in a dump"
         );
     }
 }
