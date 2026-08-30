@@ -4002,15 +4002,17 @@ pub enum OpTransactionState {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TransactionYieldPoint {
     BeforeStart,
+    BeforeMvccBegin,
 }
 
 #[cfg(any(test, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
-    const POINT_COUNT: u8 = 1;
+    const POINT_COUNT: u8 = 2;
 
     fn ordinal(self) -> u8 {
         match self {
             TransactionYieldPoint::BeforeStart => 0,
+            TransactionYieldPoint::BeforeMvccBegin => 1,
         }
     }
 }
@@ -4389,6 +4391,19 @@ pub fn op_transaction_inner(
                             // applies to all databases uniformly.
                             let effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
+                            #[cfg(any(test, injected_yields))]
+                            {
+                                if let Some(IOResult::IO(io)) =
+                                    crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                        conn.yield_injector().as_ref(),
+                                        0,
+                                        *db as u64,
+                                        TransactionYieldPoint::BeforeMvccBegin,
+                                    )
+                                {
+                                    return Ok(InsnFunctionStepResult::IO(io));
+                                }
+                            }
                             match begin_mvcc_tx(
                                 mv_store,
                                 &pager,
@@ -4486,6 +4501,19 @@ pub fn op_transaction_inner(
                                         return Err(err);
                                     }
                                 };
+                            #[cfg(any(test, injected_yields))]
+                            {
+                                if let Some(IOResult::IO(io)) =
+                                    crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                        conn.yield_injector().as_ref(),
+                                        0,
+                                        *db as u64,
+                                        TransactionYieldPoint::BeforeMvccBegin,
+                                    )
+                                {
+                                    return Ok(InsnFunctionStepResult::IO(io));
+                                }
+                            }
                             match begin_mvcc_tx(
                                 mv_store,
                                 &pager,
@@ -5048,6 +5076,21 @@ pub fn op_savepoint(
             // before opening the first savepoint so an I/O yield is restartable.
             if let IOResult::IO(io) = load_active_non_main_wal_headers_for_named_savepoint(&conn)? {
                 return Ok(InsnFunctionStepResult::IO(io));
+            }
+            #[cfg(any(test, injected_yields))]
+            {
+                if mv_store.is_some() && conn.get_mv_tx_id().is_none() {
+                    if let Some(IOResult::IO(io)) =
+                        crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                            conn.yield_injector().as_ref(),
+                            0,
+                            crate::MAIN_DB_ID as u64,
+                            TransactionYieldPoint::BeforeMvccBegin,
+                        )
+                    {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
             }
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
