@@ -1586,10 +1586,15 @@ pub unsafe extern "C" fn sqlite3_get_autocommit(db: *mut sqlite3) -> ffi::c_int 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_total_changes(db: *mut sqlite3) -> ffi::c_int {
+pub unsafe extern "C" fn sqlite3_total_changes64(db: *mut sqlite3) -> i64 {
     let db: &sqlite3 = &*db;
     let inner = db.inner.lock().unwrap();
-    inner.conn.total_changes() as ffi::c_int
+    inner.conn.total_changes()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_total_changes(db: *mut sqlite3) -> ffi::c_int {
+    sqlite3_total_changes64(db) as ffi::c_int
 }
 
 #[no_mangle]

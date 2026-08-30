@@ -672,7 +672,7 @@ Modifiers:
 | sqlite3_changes        | ✅ Yes     |         |
 | sqlite3_changes64      | ✅ Yes     |         |
 | sqlite3_total_changes  | ✅ Yes     |         |
-| sqlite3_total_changes64| ❌ No      |         |
+| sqlite3_total_changes64| ✅ Yes     |         |
 | sqlite3_last_insert_rowid | ✅ Yes  |         |
 | sqlite3_set_last_insert_rowid | ❌ No |       |
 

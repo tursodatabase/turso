@@ -187,6 +187,8 @@ int sqlite3_get_autocommit(sqlite3 *_db);
 
 int sqlite3_total_changes(sqlite3 *_db);
 
+int64_t sqlite3_total_changes64(sqlite3 *_db);
+
 int64_t sqlite3_last_insert_rowid(sqlite3 *_db);
 
 void sqlite3_interrupt(sqlite3 *_db);
