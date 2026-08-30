@@ -292,6 +292,23 @@ class Connection:
         if self.in_transaction:
             begin_sql = None
 
+        steps, offset, commit_index = self._build_batch_steps(stmts, begin_sql)
+        try:
+            result = self._session.execute_batch(steps)
+        except RuntimeError as e:
+            raise _classify_error(e) from None
+        return self._decode_batch_result(result, stmts, offset, commit_index, len(steps))
+
+    @staticmethod
+    def _build_batch_steps(
+        stmts: list[tuple[str, Any]],
+        begin_sql: str | None,
+    ) -> tuple[list[dict], int, int | None]:
+        """Build the wire-level steps of a batch request: one step per
+        statement, each conditional on the previous one succeeding, wrapped
+        in BEGIN/COMMIT/ROLLBACK when `begin_sql` is set. Returns the steps,
+        the index of the first statement step, and the index of the COMMIT
+        step (None when the batch is not transactional)."""
         user_steps = []
         for i, (sql, parameters) in enumerate(stmts):
             try:
@@ -302,50 +319,42 @@ class Connection:
             except Exception as e:
                 raise _batch_statement_error(i, e) from e
 
-        if begin_sql is not None:
-            _reject_transaction_control_statements(stmts)
+        if begin_sql is None:
+            for i, step in enumerate(user_steps):
+                if i > 0:
+                    step["condition"] = {"type": "ok", "step": i - 1}
+            return user_steps, 0, None
 
-        steps = []
-        offset = 0
-        if begin_sql is not None:
-            steps.append(build_batch_step(begin_sql, want_rows=False))
-            offset = 1
+        _reject_transaction_control_statements(stmts)
+        steps = [build_batch_step(begin_sql, want_rows=False)]
         for i, step in enumerate(user_steps):
-            if offset + i > 0:
-                step["condition"] = {"type": "ok", "step": offset + i - 1}
+            step["condition"] = {"type": "ok", "step": i}
             steps.append(step)
-        commit_index = None
-        if begin_sql is not None:
-            commit_index = offset + len(stmts)
-            steps.append(
-                build_batch_step(
-                    "COMMIT",
-                    want_rows=False,
-                    condition={"type": "ok", "step": commit_index - 1},
-                )
+        commit_index = 1 + len(stmts)
+        steps.append(
+            build_batch_step(
+                "COMMIT",
+                want_rows=False,
+                condition={"type": "ok", "step": commit_index - 1},
             )
-            # ROLLBACK runs only when BEGIN succeeded and COMMIT did not.
-            # The ok(BEGIN) guard prevents it from aborting a transaction
-            # opened on the stream out of band.
-            steps.append(
-                build_batch_step(
-                    "ROLLBACK",
-                    want_rows=False,
-                    condition={
-                        "type": "and",
-                        "conds": [
-                            {"type": "ok", "step": 0},
-                            {"type": "not", "cond": {"type": "ok", "step": commit_index}},
-                        ],
-                    },
-                )
+        )
+        # ROLLBACK runs only when BEGIN succeeded and COMMIT did not.
+        # The ok(BEGIN) guard prevents it from aborting a transaction
+        # opened on the stream out of band.
+        steps.append(
+            build_batch_step(
+                "ROLLBACK",
+                want_rows=False,
+                condition={
+                    "type": "and",
+                    "conds": [
+                        {"type": "ok", "step": 0},
+                        {"type": "not", "cond": {"type": "ok", "step": commit_index}},
+                    ],
+                },
             )
-
-        try:
-            result = self._session.execute_batch(steps)
-        except RuntimeError as e:
-            raise _classify_error(e) from None
-        return self._decode_batch_result(result, stmts, offset, commit_index, len(steps))
+        )
+        return steps, 1, commit_index
 
     @staticmethod
     def _decode_batch_result(
