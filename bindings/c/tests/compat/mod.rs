@@ -113,6 +113,8 @@ extern "C" {
     fn sqlite3_get_autocommit(db: *mut sqlite3) -> i32;
     fn sqlite3_changes(db: *mut sqlite3) -> i32;
     fn sqlite3_changes64(db: *mut sqlite3) -> i64;
+    fn sqlite3_total_changes(db: *mut sqlite3) -> i32;
+    fn sqlite3_total_changes64(db: *mut sqlite3) -> i64;
     fn sqlite3_table_column_metadata(
         db: *mut sqlite3,
         z_db_name: *const libc::c_char,
@@ -2395,9 +2397,11 @@ mod tests {
             let mut db: *mut sqlite3 = ptr::null_mut();
             assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
 
-            // // Initially no changes
+            // Initially no changes
             assert_eq!(sqlite3_changes(db), 0);
             assert_eq!(sqlite3_changes64(db), 0);
+            assert_eq!(sqlite3_total_changes(db), 0);
+            assert_eq!(sqlite3_total_changes64(db), 0);
 
             // Create a table
             let mut stmt = ptr::null_mut();
@@ -2417,6 +2421,8 @@ mod tests {
             // Still no changes after CREATE TABLE
             assert_eq!(sqlite3_changes(db), 0);
             assert_eq!(sqlite3_changes64(db), 0);
+            assert_eq!(sqlite3_total_changes(db), 0);
+            assert_eq!(sqlite3_total_changes64(db), 0);
 
             // Insert a single row
             let mut stmt = ptr::null_mut();
@@ -2436,6 +2442,8 @@ mod tests {
             // Should have 1 change
             assert_eq!(sqlite3_changes(db), 1);
             assert_eq!(sqlite3_changes64(db), 1);
+            assert_eq!(sqlite3_total_changes(db), 1);
+            assert_eq!(sqlite3_total_changes64(db), 1);
 
             // Insert multiple rows
             let mut stmt = ptr::null_mut();
@@ -2453,9 +2461,11 @@ mod tests {
             assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
 
-            // Should have 3 changes
+            // Statement changes is 3, cumulative total_changes is 1 + 3 = 4
             assert_eq!(sqlite3_changes(db), 3);
             assert_eq!(sqlite3_changes64(db), 3);
+            assert_eq!(sqlite3_total_changes(db), 4);
+            assert_eq!(sqlite3_total_changes64(db), 4);
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
