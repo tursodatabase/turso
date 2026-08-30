@@ -85,6 +85,19 @@ pub mod tests;
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
 
+/// Whether a caller already holds the blocking checkpoint read guard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointReadLockState {
+    NotHeld,
+    Held,
+}
+
+impl CheckpointReadLockState {
+    fn is_held(self) -> bool {
+        matches!(self, Self::Held)
+    }
+}
+
 /// Convert a sequence backing-table row into the exclusive upper bound used by
 /// sync scans. This is intentionally tailored to ascending non-CYCLE sequences,
 /// which is the shape used by AUTOINCREMENT CDC ids.
@@ -5914,8 +5927,81 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         connection: &Connection,
         expected_schema_generation: Option<u64>,
     ) -> Result<TxID> {
+        self.begin_exclusive_tx_with_checkpoint_read_guard(
+            pager,
+            maybe_existing_tx_id,
+            connection,
+            expected_schema_generation,
+            CheckpointReadLockState::NotHeld,
+        )
+    }
+
+    /// Try to acquire the blocking checkpoint read guard for a fresh MVCC
+    /// begin.
+    ///
+    /// Use this only for a fresh MVCC begin that must preserve this order:
+    /// checkpoint gate, pager read mark, MVCC transaction. If this returns
+    /// `CheckpointReadLockState::Held` and the caller fails before handing the
+    /// guard to a `begin_*_with_checkpoint_read_guard` helper, call
+    /// `release_unadopted_checkpoint_read_guard`.
+    ///
+    /// Do not use this for read-to-write upgrades. An existing MVCC
+    /// transaction already owns its checkpoint guard.
+    pub(crate) fn try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin(
+        &self,
+    ) -> Result<CheckpointReadLockState> {
+        if self.experimental_mvcc_passive_checkpoint {
+            return Ok(CheckpointReadLockState::NotHeld);
+        }
+        if !self.blocking_checkpoint_lock.read() {
+            return Err(LimboError::Busy);
+        }
+        Ok(CheckpointReadLockState::Held)
+    }
+
+    /// Release a checkpoint gate acquired by
+    /// `try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin` before MVCC
+    /// has adopted it.
+    ///
+    /// Do not call this after a `begin_*_with_checkpoint_read_guard` helper
+    /// succeeds. At that point the transaction owns the guard and the normal
+    /// transaction finish path releases it.
+    pub(crate) fn release_unadopted_checkpoint_read_guard(&self, guard: CheckpointReadLockState) {
+        if guard.is_held() {
+            self.blocking_checkpoint_lock.unlock();
+        }
+    }
+
+    /// Begin or upgrade a write MVCC transaction, optionally adopting a
+    /// checkpoint gate that the VDBE already acquired.
+    ///
+    /// Ordinary MvStore callers should use `begin_exclusive_tx`. Use this
+    /// helper only when the caller is preserving the fresh-begin order itself:
+    /// checkpoint gate, pager read mark, MVCC transaction. Pass
+    /// `CheckpointReadLockState::NotHeld` for upgrades because the existing
+    /// transaction already owns the gate.
+    pub(crate) fn begin_exclusive_tx_with_checkpoint_read_guard(
+        &self,
+        pager: Arc<Pager>,
+        maybe_existing_tx_id: Option<TxID>,
+        connection: &Connection,
+        expected_schema_generation: Option<u64>,
+        checkpoint_read_guard: CheckpointReadLockState,
+    ) -> Result<TxID> {
         #[cfg(not(any(test, injected_yields)))]
         let _ = connection;
+        turso_assert!(
+            maybe_existing_tx_id.is_none() || !checkpoint_read_guard.is_held(),
+            "checkpoint read guard is only passed for fresh MVCC begins"
+        );
+        turso_assert!(
+            !checkpoint_read_guard.is_held() || !self.experimental_mvcc_passive_checkpoint,
+            "passive MVCC begin must not hold the blocking checkpoint read guard"
+        );
+        turso_assert!(
+            !checkpoint_read_guard.is_held() || pager.holds_read_lock(),
+            "checkpoint read guard must be paired with a pager read mark before MVCC begin"
+        );
         // Existing transactions already hold one blocking-checkpoint read guard
         // from begin_tx() (truncate path only). When upgrading read->write, do not acquire another one.
         let passive = self.experimental_mvcc_passive_checkpoint;
@@ -5928,7 +6014,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             None
         };
-        if acquires_checkpoint_guard && !self.blocking_checkpoint_lock.read() {
+        if acquires_checkpoint_guard
+            && !checkpoint_read_guard.is_held()
+            && !self.blocking_checkpoint_lock.read()
+        {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
         }
@@ -6125,8 +6214,39 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager: Arc<Pager>,
         expected_schema_generation: Option<u64>,
     ) -> Result<TxID> {
+        self.begin_tx_with_schema_generation_and_checkpoint_read_guard(
+            pager,
+            expected_schema_generation,
+            CheckpointReadLockState::NotHeld,
+        )
+    }
+
+    /// Begin a read MVCC transaction, optionally adopting a checkpoint gate
+    /// that the VDBE already acquired.
+    ///
+    /// Ordinary MvStore callers should use `begin_tx_with_schema_generation`.
+    /// Use this helper only after
+    /// `try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin` succeeds and
+    /// the caller has successfully pinned the pager read mark. On success, the
+    /// MVCC transaction owns the checkpoint guard. On error, this helper
+    /// releases the guard, but the caller still owns any pager read mark it
+    /// opened.
+    pub(crate) fn begin_tx_with_schema_generation_and_checkpoint_read_guard(
+        &self,
+        pager: Arc<Pager>,
+        expected_schema_generation: Option<u64>,
+        checkpoint_read_guard: CheckpointReadLockState,
+    ) -> Result<TxID> {
+        turso_assert!(
+            !checkpoint_read_guard.is_held() || !self.experimental_mvcc_passive_checkpoint,
+            "passive MVCC begin must not hold the blocking checkpoint read guard"
+        );
+        turso_assert!(
+            !checkpoint_read_guard.is_held() || pager.holds_read_lock(),
+            "checkpoint read guard must be paired with a pager read mark before MVCC begin"
+        );
         let passive = self.experimental_mvcc_passive_checkpoint;
-        if !passive && !self.blocking_checkpoint_lock.read() {
+        if !passive && !checkpoint_read_guard.is_held() && !self.blocking_checkpoint_lock.read() {
             // Stop-the-world truncate checkpoint in progress.
             return Err(LimboError::Busy);
         }
