@@ -737,8 +737,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         mode: CheckpointMode,
     ) -> Self {
         assert!(
-            !matches!(mode, CheckpointMode::Passive { .. })
-                || connection.experimental_mvcc_passive_checkpoint_enabled(),
+            !matches!(mode, CheckpointMode::Passive { .. }) || mvstore.uses_passive_checkpoint(),
             "passive checkpoint mode requires experimental_mvcc_passive_checkpoint"
         );
         // MVCC supports only Passive (no blocking lock, requires the experimental flag) and
@@ -756,7 +755,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // mode, MVCC checkpoint writes from the mv store back to the pager —
         // so the schema must match the pager being checkpointed.
         let schema = connection.clone_shared_schema(database_id);
-        let index_id_to_index = if connection.experimental_mvcc_passive_checkpoint_enabled() {
+        let index_id_to_index = if mvstore.uses_passive_checkpoint() {
             HashMap::default()
         } else {
             schema
@@ -1955,9 +1954,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::PrepareCheckpoint => {
-                let passive = self
-                    .connection
-                    .experimental_mvcc_passive_checkpoint_enabled();
+                let passive = self.mvstore.uses_passive_checkpoint();
                 if passive {
                     // The passive checkpoint acquires the blocking lock only after
                     // collection, so it needs an explicit single-orchestrator gate. The
@@ -2100,9 +2097,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
 
-                let passive = self
-                    .connection
-                    .experimental_mvcc_passive_checkpoint_enabled();
+                let passive = self.mvstore.uses_passive_checkpoint();
                 if passive {
                     inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
                     // Passive path: collection AND the btree write phase run without the

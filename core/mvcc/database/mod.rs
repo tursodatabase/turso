@@ -3663,10 +3663,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if appended_to_log && mvcc_store.storage.should_checkpoint() {
-                    let auto_checkpoint_mode = if self
-                        .connection
-                        .experimental_mvcc_passive_checkpoint_enabled()
-                    {
+                    let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
                             upper_bound_inclusive: None,
                         }
@@ -7691,6 +7688,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             snapshot_ts = last_committed.min(inflight_floor.saturating_sub(1));
         });
         snapshot_ts
+    }
+
+    pub(crate) fn uses_passive_checkpoint(&self) -> bool {
+        self.experimental_mvcc_passive_checkpoint
     }
 
     /// Try to enter the passive publish window. Returns false if another publish is in flight.

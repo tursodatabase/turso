@@ -47,6 +47,33 @@ fn checkpoint_attached_database(
     Ok(())
 }
 
+#[test]
+fn test_attached_mvcc_checkpoint_uses_attached_passive_setting() -> anyhow::Result<()> {
+    let db = TempDatabase::builder()
+        .with_opts(
+            DatabaseOpts::new()
+                .with_attach(true)
+                .with_experimental_mvcc_passive_checkpoint(true),
+        )
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA main.wal_checkpoint(PASSIVE)")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc_checkpoint_mode.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    let error = conn
+        .execute("PRAGMA aux.wal_checkpoint(PASSIVE)")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"
+    );
+    Ok(())
+}
+
 #[turso_macros::test]
 fn test_attached_schema_refreshes_after_other_connection_create(
     tmp_db: TempDatabase,
