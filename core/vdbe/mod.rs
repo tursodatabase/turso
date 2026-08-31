@@ -3522,11 +3522,9 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
-                    mark_unlikely();
-                    return Some(Err(LimboError::Corrupt(
-                        "TEXT value contains invalid UTF-8".into(),
-                    )));
+                let text_str = match crate::storage::sqlite3_ondisk::read_text(text_data) {
+                    Ok(text_str) => text_str,
+                    Err(err) => return Some(Err(err)),
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {

@@ -975,6 +975,66 @@ pub fn validate_serial_type(value: u64) -> Result<()> {
     Ok(())
 }
 
+/// Payload length from which `simdutf8` runs its SIMD kernel. Anything
+/// shorter it hands to the standard library, which walks the bytes one at a
+/// time.
+const SIMD_UTF8_MIN_LEN: usize = 64;
+
+/// Number of bytes read per step by [`is_all_ascii`].
+const ASCII_STEP: usize = 8;
+
+/// True when every byte is ASCII, meaning `0x00..=0x7F`.
+///
+/// Reads eight bytes at a time and ORs them together, so it costs one load
+/// and one OR per eight bytes and never branches on a byte's value. The final
+/// eight bytes are read overlapping the step before them, which re-reads a
+/// few bytes instead of looping over the leftovers one at a time.
+#[inline(always)]
+fn is_all_ascii(bytes: &[u8]) -> bool {
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    let len = bytes.len();
+    if len < ASCII_STEP {
+        let mut folded = 0u8;
+        for &byte in bytes {
+            folded |= byte;
+        }
+        return folded & 0x80 == 0;
+    }
+    let mut folded = 0u64;
+    let mut at = 0;
+    while at + ASCII_STEP <= len {
+        folded |= u64::from_ne_bytes(bytes[at..at + ASCII_STEP].try_into().unwrap());
+        at += ASCII_STEP;
+    }
+    folded |= u64::from_ne_bytes(bytes[len - ASCII_STEP..].try_into().unwrap());
+    folded & HIGH_BITS == 0
+}
+
+/// Reads a record's TEXT payload as a `&str`, rejecting bytes that are not
+/// UTF-8.
+///
+/// Stored text is usually short and usually ASCII, and short is exactly where
+/// `simdutf8` gives up and scans byte by byte. So for a short payload, look
+/// for a non-ASCII byte first: that test settles the common case on its own,
+/// because every ASCII byte is a complete one-byte UTF-8 sequence. Only a
+/// payload that really does hold non-ASCII bytes pays for the second pass,
+/// and it is under 64 bytes long.
+#[inline(always)]
+pub fn read_text(payload: &[u8]) -> Result<&str> {
+    if payload.len() < SIMD_UTF8_MIN_LEN && is_all_ascii(payload) {
+        // SAFETY: `is_all_ascii` just read every byte of this slice and found
+        // them all at or below 0x7F. Those bytes are the one-byte UTF-8
+        // sequences, so the payload is valid UTF-8. The proof is here, over
+        // these bytes, and does not lean on a validation pass run elsewhere.
+        return Ok(unsafe { std::str::from_utf8_unchecked(payload) });
+    }
+    simdutf8::basic::from_utf8(payload).map_err(|_| {
+        mark_unlikely();
+        LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+    })
+}
+
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]
@@ -1096,10 +1156,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            let val = simdutf8::basic::from_utf8(data).map_err(|_| {
-                mark_unlikely();
-                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-            })?;
+            let val = read_text(data)?;
             Ok((
                 ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
@@ -1226,10 +1283,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                let val = simdutf8::basic::from_utf8(data).map_err(|_| {
-                    mark_unlikely();
-                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-                })?;
+                let val = read_text(data)?;
                 Ok((
                     ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                     content_size,
@@ -2303,6 +2357,59 @@ mod tests {
             result.0.to_owned().expect(crate::alloc::ALLOC_ERR_MSG),
             expected
         );
+    }
+
+    /// `read_text` must answer exactly what the standard library answers, on
+    /// both sides of the length where it stops looking for ASCII first, and
+    /// for every way a payload can stop being ASCII or stop being UTF-8.
+    #[test]
+    fn read_text_agrees_with_the_standard_library() {
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        // Plain ASCII of every length across the 64-byte switchover.
+        for len in 0..=128usize {
+            payloads.push(vec![b'a'; len]);
+        }
+        // The same, with one byte that is not ASCII, moved through every
+        // position: valid two-byte UTF-8, then a byte that cannot start a
+        // sequence, then a continuation byte with nothing to continue.
+        for len in 1..=80usize {
+            for at in 0..len {
+                for tail in [&[0xC3u8, 0xA9][..], &[0xFF][..], &[0x80][..]] {
+                    let mut payload = vec![b'a'; len];
+                    payload.splice(at..at + 1, tail.iter().copied());
+                    payloads.push(payload);
+                }
+            }
+        }
+        // Sequences that are not UTF-8 for reasons a per-byte ASCII test
+        // cannot see: a truncated sequence, an overlong encoding, and a
+        // surrogate half.
+        for broken in [
+            &[0xE2u8, 0x82][..],
+            &[0xC0, 0xAF][..],
+            &[0xED, 0xA0, 0x80][..],
+        ] {
+            for pad in [0usize, 60, 70] {
+                let mut payload = vec![b'a'; pad];
+                payload.extend_from_slice(broken);
+                payloads.push(payload);
+            }
+        }
+
+        for payload in payloads {
+            assert_eq!(
+                is_all_ascii(&payload),
+                payload.iter().all(u8::is_ascii),
+                "payload {payload:?}"
+            );
+
+            let expected = std::str::from_utf8(&payload);
+            match (read_text(&payload), expected) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "payload {payload:?}"),
+                (Err(LimboError::Corrupt(_)), Err(_)) => {}
+                (got, want) => panic!("payload {payload:?}: got {got:?}, std says {want:?}"),
+            }
+        }
     }
 
     #[test]
