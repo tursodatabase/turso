@@ -1,16 +1,25 @@
+use crate::Completion;
+use crate::File;
+use crate::IOExt;
+use crate::LimboError;
+use crate::PageSize;
+use crate::Result;
+#[cfg(feature = "conn_raw_api")]
+use crate::Value;
+use crate::ValueRef;
 use crate::alloc::{
-    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
-    TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
+    ALLOC_ERR_MSG, ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
+    TursoTryWithCapacityExt, TursoVecInExt,
 };
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::cursor::{MvccIterator, static_iterator_hack};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Sequence, Table};
+use crate::skiplist::SkipMap;
 use crate::skiplist::comparator::BasicComparator;
 use crate::skiplist::map::Entry;
-use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -21,60 +30,54 @@ use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
+use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
-use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
-use crate::Completion;
-use crate::File;
-use crate::IOExt;
-use crate::LimboError;
-use crate::PageSize;
-use crate::Result;
-#[cfg(feature = "conn_raw_api")]
-use crate::Value;
-use crate::ValueRef;
-use crate::{io::FileSyncType, io_yield_one, return_if_io};
-use crate::{
-    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
-};
+use crate::types::compare_immutable;
 use crate::{Connection, Pager, SyncMode};
+use crate::{
+    Numeric, turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable,
+};
+use crate::{io::FileSyncType, io_yield_one, return_if_io};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
-use std::collections::{BTreeSet, HashMap as StdHashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap as StdHashMap};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
-use tracing::instrument;
 use tracing::Level;
+use tracing::instrument;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{
-    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
+    CheckpointState, CheckpointStateMachine, sqlite_schema_btree_identity,
 };
 
+mod group_commit;
+pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
+
+use super::persistent_storage::logical_log::{
+    HeaderReadResult, IndexOpKind, LOG_HDR_SIZE, ParsedOp, StreamingLogicalLogReader,
+    StreamingResult,
+};
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
-    parse_ops_from_plaintext, LogSerializer, LOG_RECORD_PREFIX_SIZE,
-};
-use super::persistent_storage::logical_log::{
-    HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
-    LOG_HDR_SIZE,
+    LOG_RECORD_PREFIX_SIZE, LogSerializer, parse_ops_from_plaintext,
 };
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
-    is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
-    portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
+    PortableLogicalBuilder, PortableObjectMapEntry, is_portable_logical_name,
+    is_portable_schema_row, is_portable_table_schema_row, portable_schema_row_from_record,
 };
 
 #[cfg(test)]
@@ -1005,6 +1008,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     savepoint_stack: RwLock<Vec<Savepoint<A>>>,
     /// True when this transaction currently holds the serialized logical-log commit lock.
     pager_commit_lock_held: AtomicBool,
+    /// True once this transaction's commit record is in the logical log.
+    /// From then on the transaction commits whatever happens to the
+    /// statement driving it: later records are chained after its record
+    /// and recovery replays it.
+    log_appended: AtomicBool,
     /// Number of unresolved commit dependencies (must reach 0 before commit).
     /// i.e the number of transactions this transaction is dependent on and waiting for
     /// commit or abort.
@@ -1049,6 +1057,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
+            log_appended: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
@@ -1443,7 +1452,9 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
         end_ts: u64,
         log_record: LogRecord,
     },
-    WaitGroup {
+    /// Enqueued behind a group-commit leader, or waiting for
+    /// `durable_through` to cover this ticket.
+    AwaitGroupCommit {
         end_ts: u64,
         ticket: u64,
     },
@@ -1460,6 +1471,16 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     },
     SyncLogicalLog {
         end_ts: u64,
+    },
+    /// Fsync the log through `written_through` after a leader dropped,
+    /// then return to [`CommitState::AwaitGroupCommit`].
+    SyncGroupPrefix {
+        end_ts: u64,
+        ticket: u64,
+    },
+    GroupPrefixSynced {
+        end_ts: u64,
+        ticket: u64,
     },
     EndCommitLogicalLog {
         end_ts: u64,
@@ -1504,19 +1525,6 @@ pub struct BuildLogRecordCtx {
     pub pending_header: Option<DatabaseHeader>,
 }
 
-#[derive(Debug)]
-pub struct GroupBatch {
-    rest: VecDeque<(u64, LogRecord)>,
-    writing: u64,
-    advanced_through: Option<u64>,
-}
-
-impl GroupBatch {
-    fn highest_ticket(&self) -> u64 {
-        self.rest.back().map_or(self.writing, |(ticket, _)| *ticket)
-    }
-}
-
 /// Iteration state for the chunked `RewriteLiveVersions` step.
 #[derive(Debug)]
 pub struct RewriteLiveVersionsCtx {
@@ -1542,118 +1550,6 @@ pub enum WriteRowState {
     Next,
 }
 
-#[derive(Debug, Default)]
-struct GroupState {
-    next_ticket: u64,
-    durable_through: u64,
-    written_through: u64,
-    pending: VecDeque<(u64, LogRecord)>,
-    aborted: HashSet<u64>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PendingDrop {
-    Discarded,
-    Claimed,
-}
-
-#[derive(Debug)]
-struct CommitCoordinator {
-    pager_commit_lock: Arc<TursoRwLock>,
-    group_commit_enabled: AtomicBool,
-    group: Mutex<GroupState>,
-    #[cfg(test)]
-    last_group_size: AtomicUsize,
-}
-
-impl CommitCoordinator {
-    fn new() -> Self {
-        Self {
-            pager_commit_lock: Arc::new(TursoRwLock::new()),
-            group_commit_enabled: AtomicBool::new(false),
-            group: Mutex::new(GroupState::default()),
-            #[cfg(test)]
-            last_group_size: AtomicUsize::new(0),
-        }
-    }
-
-    fn group_commit_enabled(&self) -> bool {
-        self.group_commit_enabled.load(Ordering::Acquire)
-    }
-
-    fn set_group_commit_enabled(&self, enabled: bool) {
-        self.group_commit_enabled.store(enabled, Ordering::Release);
-    }
-
-    fn enqueue(&self, log_record: LogRecord) -> u64 {
-        let mut group = self.group.lock();
-        group.next_ticket += 1;
-        let ticket = group.next_ticket;
-        group.pending.push_back((ticket, log_record));
-        ticket
-    }
-
-    fn take_pending(&self) -> VecDeque<(u64, LogRecord)> {
-        let mut group = self.group.lock();
-        let batch = std::mem::take(&mut group.pending);
-        #[cfg(test)]
-        if !batch.is_empty() {
-            self.last_group_size.store(batch.len(), Ordering::Release);
-        }
-        batch
-    }
-
-    fn requeue(&self, records: impl DoubleEndedIterator<Item = (u64, LogRecord)>) {
-        let mut group = self.group.lock();
-        for entry in records.rev() {
-            group.pending.push_front(entry);
-        }
-    }
-
-    fn mark_durable(&self, ticket: u64) {
-        let mut group = self.group.lock();
-        group.durable_through = group.durable_through.max(ticket);
-    }
-
-    fn durable_through(&self) -> u64 {
-        self.group.lock().durable_through
-    }
-
-    fn note_written(&self, ticket: u64) {
-        let mut group = self.group.lock();
-        group.written_through = group.written_through.max(ticket);
-    }
-
-    fn written_through(&self) -> u64 {
-        self.group.lock().written_through
-    }
-
-    fn mark_aborted(&self, ticket: u64) {
-        self.group.lock().aborted.insert(ticket);
-    }
-
-    fn is_aborted(&self, ticket: u64) -> bool {
-        self.group.lock().aborted.contains(&ticket)
-    }
-
-    fn drop_pending(&self, ticket: u64) -> PendingDrop {
-        let mut group = self.group.lock();
-        if let Some(index) = group.pending.iter().position(|(t, _)| *t == ticket) {
-            group.pending.remove(index);
-            return PendingDrop::Discarded;
-        }
-        if group.aborted.remove(&ticket) {
-            return PendingDrop::Discarded;
-        }
-        PendingDrop::Claimed
-    }
-
-    #[cfg(test)]
-    fn last_group_size(&self) -> usize {
-        self.last_group_size.load(Ordering::Acquire)
-    }
-}
-
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
@@ -1674,6 +1570,10 @@ pub(crate) enum CommitYieldPoint {
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
     AfterRemoveTx,
+    /// Fires after this transaction's logical-log record is owned (offset
+    /// advanced, `log_appended` set), including the last record of a group
+    /// batch, and before the covering fsync.
+    LogicalLogOwned,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -1738,9 +1638,11 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
-    /// Bytes appended to the logical log for this commit; applied to writer offset only after durability and before lock release.
+    /// Bytes appended to the logical log for this commit; applied to writer offset as soon as the write succeeds.
     pending_log_append_bytes: Option<u64>,
     group_batch: Option<GroupBatch>,
+    /// This state machine issued at least one `log_tx` (leader or exclusive).
+    wrote_logical_log: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
     _phantom: PhantomData<Clock>,
@@ -1838,47 +1740,46 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             header,
             pending_log_append_bytes: None,
             group_batch: None,
+            wrote_logical_log: false,
             sync_mode,
             _phantom: PhantomData,
         }
     }
 
-    fn release_group_claim(&mut self) -> Option<u64> {
+    fn release_group_claim(&mut self) {
         if let Some(batch) = self.group_batch.take() {
             if let Some(advanced) = batch.advanced_through {
                 self.commit_coordinator.note_written(advanced);
             }
-            match std::mem::replace(&mut self.state, CommitState::Initial) {
-                CommitState::UpgradeLogicalLogHeader { log_record, .. }
-                | CommitState::WriteLogicalLog { log_record, .. } => {
+            let owned = batch.advanced_through == Some(batch.writing.ticket);
+            let submitted = self.pending_log_append_bytes.is_some();
+            match &self.state {
+                CommitState::UpgradeLogicalLogHeader { .. }
+                | CommitState::WriteLogicalLog { .. }
+                    if !submitted =>
+                {
                     self.commit_coordinator
-                        .requeue(std::iter::once((batch.writing, log_record)).chain(batch.rest));
+                        .requeue(std::iter::once(batch.writing).chain(batch.rest));
                 }
-                state => {
-                    if batch.advanced_through != Some(batch.writing) {
-                        self.commit_coordinator.mark_aborted(batch.writing);
-                    }
+                CommitState::WriteLogicalLog { .. } | CommitState::FinishLogicalLogWrite { .. }
+                    if !owned =>
+                {
+                    self.commit_coordinator.request_retry(batch.writing.ticket);
                     self.commit_coordinator.requeue(batch.rest.into_iter());
-                    self.state = state;
+                }
+                _ => {
+                    self.commit_coordinator.requeue(batch.rest.into_iter());
                 }
             }
         }
-        let CommitState::WaitGroup { end_ts, ticket } = self.state else {
-            return None;
-        };
-        match self.commit_coordinator.drop_pending(ticket) {
-            PendingDrop::Discarded => None,
-            PendingDrop::Claimed => Some(end_ts),
+        if let CommitState::AwaitGroupCommit { ticket, .. } = self.state {
+            let _ = self.commit_coordinator.drop_pending(ticket);
         }
     }
 
     fn cleanup_unfinished_commit(&mut self) {
         if !self.is_finalized {
-            if let Some(end_ts) = self.release_group_claim() {
-                if let Some(tx) = self.mvcc_store.txs.get(&self.tx_id) {
-                    tx.value().state.store(TransactionState::Committed(end_ts));
-                }
-            }
+            self.release_group_claim();
             self.cleanup_mvcc_checkpoint_state();
             if self.pending_log_append_bytes.take().is_some() {
                 if let Err(err) = self.mvcc_store.storage.discard_pending_log_write() {
@@ -1918,30 +1819,122 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         );
     }
 
-    fn take_next_group_record(
+    fn take_next_group_record(&mut self) -> bool {
+        let Some(batch) = self.group_batch.as_mut() else {
+            return false;
+        };
+        let Some(next) = batch.rest.pop_front() else {
+            return false;
+        };
+        batch.writing = next;
+        true
+    }
+
+    fn own_logical_log_record(
         &mut self,
         mvcc_store: &Arc<MvStore<Clock, A>>,
-    ) -> Result<Option<LogRecord>> {
-        let Some(batch) = self.group_batch.as_ref() else {
-            return Ok(None);
-        };
-        if batch.rest.is_empty() {
-            return Ok(None);
-        }
+        ticket: Option<u64>,
+        owner_tx: TxID,
+    ) -> Result<bool> {
         let append_bytes = self.pending_log_append_bytes.take().ok_or_else(|| {
             LimboError::InternalError(
-                "group commit: log record appended without pending byte count".to_string(),
+                "logical log record completed without pending byte count".to_string(),
             )
         })?;
         mvcc_store
             .storage
             .advance_logical_log_offset_after_success(append_bytes)?;
-        let batch = self.group_batch.as_mut().expect("batch checked above");
-        batch.advanced_through = Some(batch.writing);
-        self.commit_coordinator.note_written(batch.writing);
-        let (ticket, log_record) = batch.rest.pop_front().expect("non-empty checked above");
-        batch.writing = ticket;
-        Ok(Some(log_record))
+        if let Some(ticket) = ticket {
+            self.commit_coordinator.note_written(ticket);
+            if let Some(batch) = self.group_batch.as_mut() {
+                batch.advanced_through = Some(ticket);
+            }
+        }
+        if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
+            tx.value().log_appended.store(true, Ordering::Release);
+        }
+        self.wrote_logical_log = true;
+        Ok(owner_tx == self.tx_id)
+    }
+
+    fn rebuild_log_record(
+        &mut self,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
+        end_ts: u64,
+    ) -> Result<()> {
+        let tx = mvcc_store
+            .txs
+            .get(&self.tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+        let tx = tx.value();
+        let pending_header = if tx.header_dirty.load(Ordering::Acquire) {
+            Some(*tx.header.read())
+        } else {
+            None
+        };
+        self.state = CommitState::BuildLogRecord(BuildLogRecordCtx {
+            end_ts,
+            log_record: LogRecord::new(end_ts, mvcc_store.logical_log_allocator())?,
+            cursor: 0,
+            schema_process: true,
+            pending_header,
+        });
+        Ok(())
+    }
+
+    fn step_await_group_commit(
+        &mut self,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
+        end_ts: u64,
+        ticket: u64,
+    ) -> Result<TransitionResult<()>> {
+        if self.commit_coordinator.durable_through() >= ticket {
+            self.state = CommitState::EndCommitLogicalLog { end_ts };
+            return Ok(TransitionResult::Continue);
+        }
+        if self.commit_coordinator.take_retry(ticket) {
+            self.rebuild_log_record(mvcc_store, end_ts)?;
+            return Ok(TransitionResult::Continue);
+        }
+        if !self.commit_coordinator.pager_commit_lock.write() {
+            return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+        }
+        if self.commit_coordinator.take_retry(ticket) {
+            self.commit_coordinator.pager_commit_lock.unlock();
+            self.rebuild_log_record(mvcc_store, end_ts)?;
+            return Ok(TransitionResult::Continue);
+        }
+        let tx = match mvcc_store.txs.get(&self.tx_id) {
+            Some(tx) => tx,
+            None => {
+                self.commit_coordinator.pager_commit_lock.unlock();
+                return Err(LimboError::NoSuchTransactionID(self.tx_id.to_string()));
+            }
+        };
+        match self.commit_coordinator.take_work() {
+            GroupWork::Lead { writing, rest } => {
+                tx.value()
+                    .pager_commit_lock_held
+                    .store(true, Ordering::Release);
+                self.group_batch = Some(GroupBatch::from_lead(writing, rest));
+                self.state = CommitState::UpgradeLogicalLogHeader {
+                    end_ts,
+                    log_record: LogRecord::empty(end_ts, mvcc_store.logical_log_allocator()),
+                };
+                Ok(TransitionResult::Continue)
+            }
+            GroupWork::SyncPrefix => {
+                tx.value()
+                    .pager_commit_lock_held
+                    .store(true, Ordering::Release);
+                self.state = CommitState::SyncGroupPrefix { end_ts, ticket };
+                Ok(TransitionResult::Continue)
+            }
+            GroupWork::None => {
+                self.commit_coordinator.pager_commit_lock.unlock();
+                Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())))
+            }
+        }
     }
 
     fn end_read_tx_for_db(&self) {
@@ -3280,8 +3273,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
                         _ => unreachable!(),
                     };
-                    let ticket = self.commit_coordinator.enqueue(log_record);
-                    self.state = CommitState::WaitGroup { end_ts, ticket };
+                    let ticket = self.commit_coordinator.enqueue(self.tx_id, log_record);
+                    self.state = CommitState::AwaitGroupCommit { end_ts, ticket };
                     return Ok(TransitionResult::Continue);
                 }
                 if !is_exclusive {
@@ -3312,56 +3305,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 self.state = CommitState::UpgradeLogicalLogHeader { end_ts, log_record };
                 Ok(TransitionResult::Continue)
             }
-            CommitState::WaitGroup { end_ts, ticket } => {
-                let (end_ts, ticket) = (*end_ts, *ticket);
-                if self.commit_coordinator.durable_through() >= ticket {
-                    self.state = CommitState::EndCommitLogicalLog { end_ts };
-                    return Ok(TransitionResult::Continue);
-                }
-                if self.commit_coordinator.is_aborted(ticket) {
-                    return Err(LimboError::Busy);
-                }
-                if !self.commit_coordinator.pager_commit_lock.write() {
-                    return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
-                }
-                let tx = match mvcc_store.txs.get(&self.tx_id) {
-                    Some(tx) => tx,
-                    None => {
-                        self.commit_coordinator.pager_commit_lock.unlock();
-                        return Err(LimboError::NoSuchTransactionID(self.tx_id.to_string()));
-                    }
-                };
-                let mut batch = self.commit_coordinator.take_pending();
-                let Some((writing, log_record)) = batch.pop_front() else {
-                    let written = self.commit_coordinator.written_through();
-                    if written > self.commit_coordinator.durable_through() && ticket <= written {
-                        tx.value()
-                            .pager_commit_lock_held
-                            .store(true, Ordering::Release);
-                        self.group_batch = Some(GroupBatch {
-                            rest: VecDeque::new(),
-                            writing: written,
-                            advanced_through: Some(written),
-                        });
-                        self.state = CommitState::SyncLogicalLog { end_ts };
-                        return Ok(TransitionResult::Continue);
-                    }
-                    self.commit_coordinator.pager_commit_lock.unlock();
-                    return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
-                };
-                tx.value()
-                    .pager_commit_lock_held
-                    .store(true, Ordering::Release);
-                self.group_batch = Some(GroupBatch {
-                    rest: batch,
-                    writing,
-                    advanced_through: None,
-                });
-                self.state = CommitState::UpgradeLogicalLogHeader { end_ts, log_record };
-                Ok(TransitionResult::Continue)
+            CommitState::AwaitGroupCommit { end_ts, ticket } => {
+                self.step_await_group_commit(mvcc_store, *end_ts, *ticket)
             }
             CommitState::UpgradeLogicalLogHeader { end_ts, log_record } => {
-                if let Some(c) = mvcc_store.storage.upgrade_header_for_log_tx(log_record)? {
+                let skip_dropped = self
+                    .group_batch
+                    .as_ref()
+                    .is_some_and(|batch| mvcc_store.txs.get(&batch.writing.tx_id).is_none());
+                if skip_dropped {
+                    let end_ts = *end_ts;
+                    self.state = if self.take_next_group_record() {
+                        CommitState::UpgradeLogicalLogHeader {
+                            end_ts,
+                            log_record: LogRecord::empty(
+                                end_ts,
+                                mvcc_store.logical_log_allocator(),
+                            ),
+                        }
+                    } else {
+                        CommitState::SyncLogicalLog { end_ts }
+                    };
+                    return Ok(TransitionResult::Continue);
+                }
+                let header_c = if let Some(batch) = self.group_batch.as_ref() {
+                    mvcc_store
+                        .storage
+                        .upgrade_header_for_log_tx(&batch.writing.log_record)?
+                } else {
+                    mvcc_store.storage.upgrade_header_for_log_tx(log_record)?
+                };
+                if let Some(c) = header_c {
                     if !c.succeeded() {
                         return Ok(TransitionResult::Io(IOCompletions(c)));
                     }
@@ -3382,16 +3356,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             }
             CommitState::WriteLogicalLog { end_ts, .. } => {
                 let end_ts = *end_ts;
-                let log_record = match std::mem::replace(
-                    &mut self.state,
-                    CommitState::FinishLogicalLogWrite { end_ts },
-                ) {
-                    CommitState::WriteLogicalLog { log_record, .. } => log_record,
-                    _ => unreachable!(),
+                let alloc = mvcc_store.logical_log_allocator();
+                let log_record = if let Some(batch) = self.group_batch.as_mut() {
+                    std::mem::replace(
+                        &mut batch.writing.log_record,
+                        LogRecord::empty(end_ts, alloc),
+                    )
+                } else {
+                    match std::mem::replace(
+                        &mut self.state,
+                        CommitState::FinishLogicalLogWrite { end_ts },
+                    ) {
+                        CommitState::WriteLogicalLog { log_record, .. } => log_record,
+                        _ => unreachable!(),
+                    }
                 };
+                if self.group_batch.is_some() {
+                    self.state = CommitState::FinishLogicalLogWrite { end_ts };
+                }
                 let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
-                // if Completion Completed without errors we can continue
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
@@ -3402,15 +3386,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::FinishLogicalLogWrite { end_ts } => {
                 let end_ts = *end_ts;
                 let c = mvcc_store.storage.on_log_write_complete()?;
-                self.state = match self.take_next_group_record(mvcc_store)? {
-                    Some(log_record) => CommitState::UpgradeLogicalLogHeader { end_ts, log_record },
-                    None => CommitState::SyncLogicalLog { end_ts },
+                let (ticket, owner_tx) = match self.group_batch.as_ref() {
+                    Some(batch) => (Some(batch.writing.ticket), batch.writing.tx_id),
+                    None => (None, self.tx_id),
                 };
-                if c.succeeded() {
-                    Ok(TransitionResult::Continue)
+                let owned_self = self.own_logical_log_record(mvcc_store, ticket, owner_tx)?;
+                self.state = if self.take_next_group_record() {
+                    CommitState::UpgradeLogicalLogHeader {
+                        end_ts,
+                        log_record: LogRecord::empty(end_ts, mvcc_store.logical_log_allocator()),
+                    }
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions(c)))
+                    CommitState::SyncLogicalLog { end_ts }
+                };
+                if !c.succeeded() {
+                    return Ok(TransitionResult::Io(IOCompletions(c)));
                 }
+                if owned_self {
+                    inject_transition_yield!(self, CommitYieldPoint::LogicalLogOwned);
+                }
+                Ok(TransitionResult::Continue)
             }
 
             CommitState::SyncLogicalLog { end_ts } => {
@@ -3423,12 +3418,39 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
                 let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
-                // if Completion Completed without errors we can continue
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions(c)))
                 }
+            }
+            CommitState::SyncGroupPrefix { end_ts, ticket } => {
+                let (end_ts, ticket) = (*end_ts, *ticket);
+                if self.sync_mode != SyncMode::Full {
+                    self.state = CommitState::GroupPrefixSynced { end_ts, ticket };
+                    return Ok(TransitionResult::Continue);
+                }
+                let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
+                self.state = CommitState::GroupPrefixSynced { end_ts, ticket };
+                if c.succeeded() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions(c)))
+                }
+            }
+            CommitState::GroupPrefixSynced { end_ts, ticket } => {
+                self.commit_coordinator
+                    .mark_durable(self.commit_coordinator.written_through());
+                if let Some(tx) = mvcc_store.txs.get(&self.tx_id) {
+                    mvcc_store.unlock_commit_lock_if_held(tx.value());
+                } else {
+                    self.commit_coordinator.pager_commit_lock.unlock();
+                }
+                self.state = CommitState::AwaitGroupCommit {
+                    end_ts: *end_ts,
+                    ticket: *ticket,
+                };
+                Ok(TransitionResult::Continue)
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let tx = mvcc_store
@@ -3436,17 +3458,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
-                if let Some(batch) = self.group_batch.take() {
-                    self.commit_coordinator.mark_durable(
-                        batch
-                            .highest_ticket()
-                            .max(self.commit_coordinator.written_through()),
-                    );
-                } else if tx_unlocked.pager_commit_lock_held.load(Ordering::Acquire) {
-                    let written = self.commit_coordinator.written_through();
-                    if written > self.commit_coordinator.durable_through() {
-                        self.commit_coordinator.mark_durable(written);
-                    }
+                if self.group_batch.take().is_some() {
+                    self.commit_coordinator
+                        .mark_durable(self.commit_coordinator.written_through());
                 }
                 let tx_header = *tx_unlocked.header.read();
                 let schema_did_change = self.did_commit_schema_change
@@ -3480,42 +3494,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
-                // Order of operations matters here:
-                // 1. Advance logical log writer offset (makes the written bytes "owned")
-                // 2. Mark transaction Committed
-                // 3. Rewrite live row versions from TxID to Timestamp (chunked
+                // The record is in the log and owned since FinishLogicalLogWrite.
+                // Order of operations from here:
+                // 1. Mark transaction Committed
+                // 2. Rewrite live row versions from TxID to Timestamp (chunked
                 //    in `RewriteLiveVersions` so 2M-row write sets don't stall)
-                // 4. Notify dependents
-                // 5. Release commit lock (allows next committer)
-                // 6. Update cached global header
+                // 3. Notify dependents
+                // 4. Release commit lock
+                // 5. Update cached global header
                 //
-                // (1) must precede (5): the commit lock serializes log writes, and
-                // log_tx() writes at the current offset. If we released the lock before
-                // advancing, the next committer would overwrite our bytes.
-                //
-                // (2) must precede (3): rewriting before marking Committed would
+                // (1) must precede (2): rewriting before marking Committed would
                 // publish the transaction's effects to readers before its fate is
                 // decided, which breaks rollback of abandoned commits.
-                //
-                // (2) must also precede (5): the next committer's validation (CommitState::Commit)
-                // checks our transaction state. If it still sees Preparing instead of
-                // Committed, the tie-breaking logic (lower end_ts wins) applies instead
-                // of the definitive "already committed = conflict" path.
-                //
-                // pending_log_append_bytes is set in BeginCommitLogicalLog after log_tx
-                // writes to disk. If the commit fails before reaching here (e.g. during
-                // sync), the bytes are never consumed and the in-memory writer offset
-                // stays behind — the next write overwrites the uncommitted bytes.
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
-                if let Some(append_bytes) = self.pending_log_append_bytes.take() {
-                    mvcc_store
-                        .storage
-                        .advance_logical_log_offset_after_success(append_bytes)?;
-                }
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
@@ -3553,7 +3548,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
                 }
 
-                let appended_to_log = tx_unlocked.pager_commit_lock_held.load(Ordering::Acquire);
+                let appended_to_log = self.wrote_logical_log;
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
@@ -5145,8 +5140,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // blocking). A failure here cannot be downgraded: it would
                     // leave the next AUTOINCREMENT INSERT able to re-emit a rowid
                     // already on disk, so it propagates as a bootstrap failure.
-                    return_if_io!(bootstrap_conn
-                        .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(sync_st));
+                    return_if_io!(
+                        bootstrap_conn
+                            .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
+                                sync_st
+                            )
+                    );
                     *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
                     *st = BootstrapState::AwaitingGlobalHeader;
                 }
@@ -6489,9 +6488,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
                 if !tx.write_set.lock().is_empty() {
-                    crate::without_allocation_faults!(self
-                        .insert_finalized_tx_state(tx_id, commit_ts)
-                        .expect(ALLOC_ERR_MSG));
+                    crate::without_allocation_faults!(
+                        self.insert_finalized_tx_state(tx_id, commit_ts)
+                            .expect(ALLOC_ERR_MSG)
+                    );
                 }
             }
             let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
@@ -7021,7 +7021,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
-        let tx_state = self.txs.get(&tx_id).map(|tx| tx.value().state.load());
+        let tx_state = self.txs.get(&tx_id).map(|tx| {
+            let tx = tx.value();
+            match tx.state.load() {
+                TransactionState::Preparing(end_ts) if tx.log_appended.load(Ordering::Acquire) => {
+                    tx.state.store(TransactionState::Committed(end_ts));
+                    TransactionState::Committed(end_ts)
+                }
+                state => state,
+            }
+        });
         match tx_state {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
                 self.rollback_tx_inner(tx_id, Some(connection), db_id);
@@ -7040,9 +7049,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
-                crate::without_allocation_faults!(self
-                    .finish_committed_tx(tx_id, connection, db_id)
-                    .expect(ALLOC_ERR_MSG));
+                crate::without_allocation_faults!(
+                    self.finish_committed_tx(tx_id, connection, db_id)
+                        .expect(ALLOC_ERR_MSG)
+                );
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
@@ -10724,8 +10734,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
                 .field("end_ts", end_ts)
                 .field("log_record", log_record)
                 .finish(),
-            Self::WaitGroup { end_ts, ticket } => f
-                .debug_struct("WaitGroup")
+            Self::AwaitGroupCommit { end_ts, ticket } => f
+                .debug_struct("AwaitGroupCommit")
                 .field("end_ts", end_ts)
                 .field("ticket", ticket)
                 .finish(),
@@ -10746,6 +10756,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
             Self::SyncLogicalLog { end_ts } => f
                 .debug_struct("SyncLogicalLog")
                 .field("end_ts", end_ts)
+                .finish(),
+            Self::SyncGroupPrefix { end_ts, ticket } => f
+                .debug_struct("SyncGroupPrefix")
+                .field("end_ts", end_ts)
+                .field("ticket", ticket)
+                .finish(),
+            Self::GroupPrefixSynced { end_ts, ticket } => f
+                .debug_struct("GroupPrefixSynced")
+                .field("end_ts", end_ts)
+                .field("ticket", ticket)
                 .finish(),
             Self::EndCommitLogicalLog { end_ts } => f
                 .debug_struct("EndCommitLogicalLog")

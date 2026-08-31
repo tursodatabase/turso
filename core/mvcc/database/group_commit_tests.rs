@@ -1,7 +1,8 @@
-use super::{get_rows, MvccTestDbNoConn};
-use crate::mvcc::database::{CommitCoordinator, LogRecord, PendingDrop};
+use super::{FixedYieldInjector, MvccTestDbNoConn, get_rows};
+use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, LogRecord};
+use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::{Connection, Database, LimboError, Value};
+use crate::{Connection, Database, LimboError, StepResult, Value};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -256,46 +257,39 @@ fn empty_record(end_ts: u64) -> LogRecord {
 #[test]
 fn requeued_records_go_back_in_ticket_order() {
     let coordinator = CommitCoordinator::new();
-    let first = coordinator.enqueue(empty_record(10));
-    let second = coordinator.enqueue(empty_record(20));
+    let first = coordinator.enqueue(1, empty_record(10));
+    let second = coordinator.enqueue(2, empty_record(20));
 
     let batch = coordinator.take_pending();
     assert_eq!(
-        batch.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        batch.iter().map(|queued| queued.ticket).collect::<Vec<_>>(),
         vec![first, second]
     );
 
-    let latecomer = coordinator.enqueue(empty_record(30));
+    let latecomer = coordinator.enqueue(3, empty_record(30));
     coordinator.requeue(batch.into_iter());
     assert_eq!(
         coordinator
             .take_pending()
             .iter()
-            .map(|(t, _)| *t)
+            .map(|queued| queued.ticket)
             .collect::<Vec<_>>(),
         vec![first, second, latecomer]
     );
 }
 
 #[test]
-fn drop_pending_distinguishes_claimed_records() {
+fn drop_pending_only_removes_queued_records() {
     let coordinator = CommitCoordinator::new();
 
-    let queued = coordinator.enqueue(empty_record(10));
-    assert_eq!(coordinator.drop_pending(queued), PendingDrop::Discarded);
+    let queued = coordinator.enqueue(1, empty_record(10));
+    assert!(coordinator.drop_pending(queued));
 
-    let claimed = coordinator.enqueue(empty_record(20));
+    let claimed = coordinator.enqueue(2, empty_record(20));
     let _batch = coordinator.take_pending();
-    assert_eq!(coordinator.drop_pending(claimed), PendingDrop::Claimed);
-
-    let aborted = coordinator.enqueue(empty_record(30));
-    let _batch = coordinator.take_pending();
-    coordinator.mark_aborted(aborted);
-    assert!(coordinator.is_aborted(aborted));
-    assert_eq!(coordinator.drop_pending(aborted), PendingDrop::Discarded);
     assert!(
-        !coordinator.is_aborted(aborted),
-        "the abort flag must clear so the ticket cannot leak"
+        !coordinator.drop_pending(claimed),
+        "a record the leader already took is not in the queue"
     );
 }
 
@@ -310,11 +304,11 @@ fn durability_watermark_only_moves_forward() {
 #[test]
 fn failed_leader_does_not_publish_unsynced_prefix() {
     let coordinator = CommitCoordinator::new();
-    let first = coordinator.enqueue(empty_record(10));
-    let second = coordinator.enqueue(empty_record(20));
+    let first = coordinator.enqueue(1, empty_record(10));
+    let second = coordinator.enqueue(2, empty_record(20));
     let mut batch = coordinator.take_pending();
-    let (writing, _) = batch.pop_front().unwrap();
-    assert_eq!(writing, first);
+    let writing = batch.pop_front().unwrap();
+    assert_eq!(writing.ticket, first);
     coordinator.note_written(first);
     coordinator.requeue(batch.into_iter());
 
@@ -327,4 +321,56 @@ fn failed_leader_does_not_publish_unsynced_prefix() {
 
     coordinator.mark_durable(coordinator.written_through().max(second));
     assert_eq!(coordinator.durable_through(), second);
+}
+
+fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
+    for _ in 0..10_000 {
+        match stmt.step().unwrap() {
+            StepResult::IO => continue,
+            other => return other,
+        }
+    }
+    panic!("statement kept returning IO")
+}
+
+#[test]
+fn dropped_commit_after_log_record_is_owned_still_commits() {
+    dropped_after_own_still_commits(true);
+}
+
+#[test]
+fn dropped_commit_after_log_record_is_owned_still_commits_without_group() {
+    dropped_after_own_still_commits(false);
+}
+
+fn dropped_after_own_still_commits(group_commit: bool) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    if group_commit {
+        conn.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    }
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogicalLogOwned.point(),
+    ])));
+
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        assert!(
+            matches!(step_until_yield_or_done(&mut commit), StepResult::Yield),
+            "COMMIT should yield after owning the logical-log record"
+        );
+    }
+
+    assert!(
+        conn.get_mv_tx_id().is_none(),
+        "the dropped commit should be finished, not rolled back"
+    );
+
+    let rows = get_rows(&conn, "SELECT pk FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
 }
