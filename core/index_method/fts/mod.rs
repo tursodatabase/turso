@@ -31,7 +31,7 @@ use crate::{
 };
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::{
     cell::RefCell,
@@ -769,71 +769,89 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     }
 }
 
-fn initialize_btree_storage_table(
-    conn: &Arc<Connection>,
-    database_id: usize,
-    table_name: &str,
-) -> Result<()> {
-    // Fast path: both objects already exist (every open after the index was
-    // created). Skips preparing and running two nested DDL statements per
-    // write cursor open.
-    let index_name = format!("{table_name}_key");
-    let already_exists = conn.with_schema(database_id, |schema| {
-        schema.get_btree_table(table_name).is_some()
-            && schema.get_index(table_name, &index_name).is_some()
-    });
-    if already_exists {
-        return Ok(());
-    }
-    let db_prefix = conn
-        .get_database_name_by_index(database_id)
-        .filter(|name| name != "main")
-        .map(|name| format!("{}.", quote_identifier(&name)))
-        .unwrap_or_default();
-    let table_ident = quote_identifier(table_name);
-    let create_table_sql = format!(
-        "CREATE TABLE IF NOT EXISTS {db_prefix}{table_ident} \
-         (path TEXT NOT NULL, chunk_no INTEGER NOT NULL, bytes BLOB NOT NULL)"
-    );
-    // Use backing_btree to create a BTree that stores all columns without rowid
-    // indirection, allowing direct cursor access with the exact key structure.
-    let create_index_sql = format!(
-        "CREATE INDEX IF NOT EXISTS {db_prefix}{index_ident} ON {table_ident} \
-         USING {method} (path, chunk_no, bytes)",
-        index_ident = quote_identifier(&format!("{table_name}_key")),
-        method = super::BACKING_BTREE_INDEX_METHOD_NAME,
-    );
-    // The backing store is a table plus its `backing_btree` index, so two
-    // DDL statements run here, once per CREATE INDEX. They are nested
-    // statements without subtransactions to avoid DatabaseBusy (we are
-    // already inside the parent CREATE INDEX statement's transaction);
-    // the toy index methods create their stores the same way. A helper
-    // that creates a backing B-tree without going through SQL would
-    // replace both.
-    {
-        conn.start_nested();
-        let mut stmt = conn.prepare(create_table_sql)?;
-        stmt.program
-            .prepared
-            .needs_stmt_subtransactions
-            .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
-    }
-    {
-        conn.start_nested();
-        let mut stmt = conn.prepare(create_index_sql)?;
-        stmt.program
-            .prepared
-            .needs_stmt_subtransactions
-            .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+/// Nested DDL statements a cursor is driving for `create` or `destroy`,
+/// stepped cooperatively so their I/O reaches the caller instead of being
+/// pumped inside the opcode. The connection is nested only while one of
+/// them is being stepped or dropped: the flag tells the pager that the
+/// statement's `Halt` and reset must not finalize the parent's
+/// transaction, and it must not leak to other statements stepped on this
+/// connection while the parent is suspended at a yield.
+struct NestedDdl {
+    connection: Weak<Connection>,
+    /// SQL still to run, in order. Each statement is prepared only when
+    /// its turn comes: a later one may depend on schema an earlier one
+    /// creates (the backing index on the backing table).
+    pending: VecDeque<String>,
+    current: Option<crate::Statement>,
+}
+
+impl NestedDdl {
+    fn new(conn: &Arc<Connection>, statements: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            connection: Arc::downgrade(conn),
+            pending: statements.into_iter().collect(),
+            current: None,
+        }
     }
 
-    Ok(())
+    /// Prepare `sql` nested: `__turso_internal_` names are refused to
+    /// top-level statements. No statement subtransaction: the parent
+    /// statement's transaction covers it (a subtransaction here would
+    /// fail with DatabaseBusy).
+    fn prepare(conn: &Arc<Connection>, sql: String) -> Result<crate::Statement> {
+        conn.start_nested();
+        let stmt = conn.prepare(sql);
+        conn.end_nested();
+        let stmt = stmt?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        Ok(stmt)
+    }
+
+    /// Drive the statements to completion in order, handing their I/O to
+    /// the caller; re-enter after each yield until `Done`.
+    fn step(&mut self) -> Result<IOResult<()>> {
+        let conn = self.connection.upgrade().ok_or_else(|| {
+            LimboError::InternalError("FTS nested DDL outlived its connection".into())
+        })?;
+        loop {
+            if self.current.is_none() {
+                let Some(sql) = self.pending.pop_front() else {
+                    return Ok(IOResult::Done(()));
+                };
+                self.current = Some(Self::prepare(&conn, sql)?);
+            }
+            let stmt = self.current.as_mut().expect("prepared above");
+            conn.start_nested();
+            let result = stmt.run_ignore_rows_nonblock();
+            if !matches!(result, Ok(IOResult::IO(_))) {
+                // Drop a finished (or failed) statement while still
+                // nested: its reset consults `is_nested_stmt()`.
+                self.current = None;
+            }
+            conn.end_nested();
+            return_if_io!(result);
+        }
+    }
+}
+
+impl Drop for NestedDdl {
+    fn drop(&mut self) {
+        // A statement abandoned mid-flight (the parent statement was reset)
+        // is dropped nested for the same reason a finished one is.
+        if self.current.is_none() {
+            return;
+        }
+        let Some(conn) = self.connection.upgrade() else {
+            self.current = None;
+            return;
+        };
+        conn.start_nested();
+        self.current = None;
+        conn.end_nested();
+    }
 }
 
 /// Pattern indices for FTS queries
@@ -997,6 +1015,9 @@ pub struct FtsCursor {
     connection: Option<Weak<Connection>>,
     database_id: Option<usize>,
     fts_dir_cursor: Option<Box<dyn CursorTrait>>,
+    /// Backing-store DDL in flight for `create` / `destroy`; `Some` only
+    /// while it is suspended at an I/O yield.
+    pending_ddl: Option<NestedDdl>,
     btree_root_page: Option<i64>,
 
     control: Option<FtsControlV2>,
@@ -1081,6 +1102,7 @@ impl FtsCursor {
             connection: None,
             database_id: None,
             fts_dir_cursor: None,
+            pending_ddl: None,
             btree_root_page: None,
             control: None,
             segments: Vec::new(),
@@ -1864,6 +1886,64 @@ impl FtsCursor {
         self.drive_open()
     }
 
+    /// Make sure the backing table and its `backing_btree` index exist,
+    /// creating them on the first `create`. Every later open takes the
+    /// fast path and never prepares a statement.
+    fn ensure_backing_store(
+        &mut self,
+        conn: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<IOResult<()>> {
+        if let Some(ddl) = self.pending_ddl.as_mut() {
+            return_if_io!(ddl.step());
+            self.pending_ddl = None;
+            return Ok(IOResult::Done(()));
+        }
+        let table_name = self.dir_table_name.clone();
+        let index_name = format!("{table_name}_key");
+        let already_exists = conn.with_schema(database_id, |schema| {
+            schema.get_btree_table(&table_name).is_some()
+                && schema.get_index(&table_name, &index_name).is_some()
+        });
+        if already_exists {
+            return Ok(IOResult::Done(()));
+        }
+        let db_prefix = conn
+            .get_database_name_by_index(database_id)
+            .filter(|name| name != "main")
+            .map(|name| format!("{}.", quote_identifier(&name)))
+            .unwrap_or_default();
+        let table_ident = quote_identifier(&table_name);
+        let create_table_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {db_prefix}{table_ident} \
+             (path TEXT NOT NULL, chunk_no INTEGER NOT NULL, bytes BLOB NOT NULL)"
+        );
+        // backing_btree stores all columns in the index B-tree, without
+        // rowid indirection, so cursors work on the exact key structure.
+        let create_index_sql = format!(
+            "CREATE INDEX IF NOT EXISTS {db_prefix}{index_ident} ON {table_ident} \
+             USING {method} (path, chunk_no, bytes)",
+            index_ident = quote_identifier(&index_name),
+            method = super::BACKING_BTREE_INDEX_METHOD_NAME,
+        );
+        // The store is a table plus its index, so two DDL statements run
+        // here, once per CREATE INDEX, nested inside the parent statement
+        // and stepped cooperatively (see [`NestedDdl`]). A helper that
+        // creates a backing B-tree without going through SQL would replace
+        // both.
+        self.drive_nested_ddl(NestedDdl::new(conn, [create_table_sql, create_index_sql]))
+    }
+
+    /// Step freshly prepared nested DDL; park it on the cursor if it
+    /// yields so the next entry resumes it.
+    fn drive_nested_ddl(&mut self, mut ddl: NestedDdl) -> Result<IOResult<()>> {
+        let result = ddl.step();
+        if matches!(result, Ok(IOResult::IO(_))) {
+            self.pending_ddl = Some(ddl);
+        }
+        result
+    }
+
     /// Mint a fresh on-disk index incarnation. Mixes in IO-provided entropy
     /// so two processes creating the same index in different files do not
     /// mint the same value (the counter restarts at 1 in every process);
@@ -2454,7 +2534,7 @@ impl IndexMethodCursor for FtsCursor {
             return_if_io!(self.drive_publish());
             return Ok(IOResult::Done(()));
         }
-        initialize_btree_storage_table(&conn, database_id, &self.dir_table_name)?;
+        return_if_io!(self.ensure_backing_store(&conn, database_id));
         self.open_cursor(&conn, database_id)?;
         self.claim_writer_slot()?;
         let control = FtsControlV2::new(self.mint_index_incarnation());
@@ -2483,6 +2563,13 @@ impl IndexMethodCursor for FtsCursor {
         let database_id = context.database().id;
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        if let Some(ddl) = self.pending_ddl.as_mut() {
+            // Resuming the DROP TABLE below after an I/O yield.
+            return_if_io!(ddl.step());
+            self.pending_ddl = None;
+            self.state = FtsState::Init;
+            return Ok(IOResult::Done(()));
+        }
         tracing::debug!(
             "FTS destroy: dropping internal storage {}",
             self.dir_table_name
@@ -2507,9 +2594,8 @@ impl IndexMethodCursor for FtsCursor {
         *self.shared.searchers.lock() = SearcherCache::default();
 
         // Drop the internal storage table; the backing_btree index is
-        // dropped automatically with it. start_nested() bypasses system
-        // table protection; subtransactions are disabled because we're
-        // already inside the parent DROP INDEX transaction.
+        // dropped automatically with it. Nested inside the parent DROP
+        // INDEX statement and stepped cooperatively (see [`NestedDdl`]).
         let db_prefix = conn
             .get_database_name_by_index(database_id)
             .filter(|name| name != "main")
@@ -2519,15 +2605,7 @@ impl IndexMethodCursor for FtsCursor {
             "DROP TABLE IF EXISTS {db_prefix}{}",
             quote_identifier(&self.dir_table_name)
         );
-        conn.start_nested();
-        let mut stmt = conn.prepare(drop_table_sql)?;
-        stmt.program
-            .prepared
-            .needs_stmt_subtransactions
-            .store(false, Ordering::Relaxed);
-        let result = stmt.run_ignore_rows();
-        conn.end_nested();
-        result?;
+        return_if_io!(self.drive_nested_ddl(NestedDdl::new(&conn, [drop_table_sql])));
 
         self.state = FtsState::Init;
         Ok(IOResult::Done(()))
@@ -2559,7 +2637,7 @@ impl IndexMethodCursor for FtsCursor {
         if matches!(self.state, FtsState::Ready) {
             return Ok(IOResult::Done(()));
         }
-        initialize_btree_storage_table(&conn, database_id, &self.dir_table_name)?;
+        return_if_io!(self.ensure_backing_store(&conn, database_id));
         if !self.snapshot_loaded {
             self.probe_only = true;
         }
@@ -3079,7 +3157,7 @@ impl IndexMethodCursor for FtsCursor {
         }
 
         if !matches!(self.state, FtsState::Ready) {
-            initialize_btree_storage_table(&conn, database_id, &self.dir_table_name)?;
+            return_if_io!(self.ensure_backing_store(&conn, database_id));
             self.opening_for_write = true;
             let result = self.drive_open();
             if !matches!(result, Ok(IOResult::IO(_))) {
