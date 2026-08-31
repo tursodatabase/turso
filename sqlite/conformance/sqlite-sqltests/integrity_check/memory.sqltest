@@ -10,6 +10,32 @@ expect {
     ok
 }
 
+
+test integrity-check-qualified-empty-attached-database {
+    CREATE TABLE main.t(a UNIQUE);
+    ATTACH ':memory:' AS aux;
+    PRAGMA aux.user_version = 1;
+    PRAGMA main.page_count;
+    PRAGMA aux.page_count;
+    PRAGMA aux.integrity_check;
+    PRAGMA aux.quick_check;
+}
+expect {
+    3
+    1
+    ok
+    ok
+}
+
+test integrity-check-qualified-corrupt-attached-database {
+    ATTACH 'database/integrity_missing_index_entry.db' AS corrupt_aux;
+    PRAGMA corrupt_aux.integrity_check;
+}
+expect unordered {
+    wrong # of entries in index idx_b
+    row 3 missing from index idx_b
+}
+
 # Test basic quick_check on empty database
 test quick-check-empty {
     PRAGMA quick_check;
@@ -213,4 +239,3 @@ test integrity-check-table-check-constraint-null-passes {
 expect {
     ok
 }
-
