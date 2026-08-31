@@ -32,7 +32,7 @@ use turso_parser::ast::{self, CompoundSelect, Expr};
 
 /// Maximum number of columns in a result set.
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
-const SQLITE_MAX_COLUMN: usize = 2000;
+const SQLITE_MAX_COLUMN: usize = 32767;
 
 #[turso_macros::trace_stack]
 pub fn translate_select(
