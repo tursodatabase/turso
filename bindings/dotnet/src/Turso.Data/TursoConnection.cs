@@ -13,9 +13,16 @@ public class TursoConnection : DbConnection
     private TursoDatabaseHandle? _turso;
     private TursoRemoteClient? _remoteClient;
     private TursoSyncDatabase? _syncDatabase;
-    private bool _ownsSyncDatabase;
+    private TursoReplicaRegistry.Lease? _replicaLease;
+    private TursoAutomaticSyncCoordinator? _automaticSyncCoordinator;
     private readonly HashSet<TursoDataReader> _syncReaders = [];
     private readonly object _syncReadersLock = new();
+    private readonly object _automaticSyncLock = new();
+    private readonly System.Collections.Concurrent.ConcurrentQueue<AutomaticSyncNotification>
+        _automaticSyncNotifications = new();
+    private TursoAutomaticSyncStatus _automaticSyncStatus = TursoAutomaticSyncStatus.Stopped;
+    private long _automaticSyncGeneration;
+    private int _automaticSyncNotificationDrainScheduled;
     private TursoConnectionOptions _connectionOptions;
     private bool _disposed;
     private bool _closing;
@@ -120,8 +127,10 @@ public class TursoConnection : DbConnection
             using (_syncDatabase?.EnterConnectionOperation())
                 _turso?.Dispose();
             _turso = null;
-            ReleaseSyncDatabase();
+            var automaticSyncFailure = ReleaseSyncDatabase();
             _readUncommitted = false;
+            if (automaticSyncFailure is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(automaticSyncFailure).Throw();
         }
         finally
         {
@@ -131,11 +140,16 @@ public class TursoConnection : DbConnection
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
-            Close();
-
-        _disposed = true;
-        base.Dispose(disposing);
+        try
+        {
+            if (disposing)
+                Close();
+        }
+        finally
+        {
+            _disposed = true;
+            base.Dispose(disposing);
+        }
     }
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
@@ -204,6 +218,15 @@ public class TursoConnection : DbConnection
     }
 
     internal TursoDatabaseHandle Turso => _turso ?? throw new InvalidOperationException("Turso database is closed.");
+
+    internal TursoSyncDatabase? SyncDatabase => _syncDatabase;
+
+    public TursoAutomaticSyncStatus AutomaticSyncStatus =>
+        Volatile.Read(ref _automaticSyncCoordinator)?.Status ?? Volatile.Read(ref _automaticSyncStatus);
+
+    public event EventHandler<TursoAutomaticSyncStatusChangedEventArgs>? AutomaticSyncStatusChanged;
+
+    internal TimeProvider AutomaticSyncTimeProvider { get; set; } = TimeProvider.System;
 
     internal static TursoConnection CreateSyncConnection(
         TursoDatabaseHandle connectionHandle,
@@ -399,19 +422,30 @@ public class TursoConnection : DbConnection
 
     private void OpenReplica()
     {
-        ValidateReplicaOptions();
-        var syncDatabase = TursoSyncDatabase.Create(CreateReplicaOptions());
+        var lease = TursoReplicaRegistry
+            .AcquireAsync(
+                CreateReplicaOptions(),
+                _connectionOptions.Pooling,
+                TimeSpan.FromSeconds(_connectionOptions.SyncInterval),
+                AutomaticSyncTimeProvider,
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+        var syncDatabase = lease.Database;
+        var connectionCreated = false;
         try
         {
             _turso = syncDatabase.ConnectHandleAsync(CancellationToken.None).GetAwaiter().GetResult();
-            _syncDatabase = syncDatabase;
-            _ownsSyncDatabase = true;
+            connectionCreated = true;
+            AttachReplicaLease(lease);
         }
         catch
         {
             _turso?.Dispose();
             _turso = null;
-            syncDatabase.Dispose();
+            if (connectionCreated)
+                syncDatabase.ReleaseConnection();
+            _ = lease.Release();
             throw;
         }
     }
@@ -422,21 +456,29 @@ public class TursoConnection : DbConnection
         if (_turso is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");
 
-        ValidateReplicaOptions();
-        var syncDatabase = await TursoSyncDatabase
-            .CreateAsync(CreateReplicaOptions(), cancellationToken)
+        var lease = await TursoReplicaRegistry
+            .AcquireAsync(
+                CreateReplicaOptions(),
+                _connectionOptions.Pooling,
+                TimeSpan.FromSeconds(_connectionOptions.SyncInterval),
+                AutomaticSyncTimeProvider,
+                cancellationToken)
             .ConfigureAwait(false);
+        var syncDatabase = lease.Database;
+        var connectionCreated = false;
         try
         {
             _turso = await syncDatabase.ConnectHandleAsync(cancellationToken).ConfigureAwait(false);
-            _syncDatabase = syncDatabase;
-            _ownsSyncDatabase = true;
+            connectionCreated = true;
+            AttachReplicaLease(lease);
         }
         catch
         {
             _turso?.Dispose();
             _turso = null;
-            await syncDatabase.DisposeAsync().ConfigureAwait(false);
+            if (connectionCreated)
+                syncDatabase.ReleaseConnection();
+            _ = lease.Release();
             throw;
         }
     }
@@ -497,12 +539,42 @@ public class TursoConnection : DbConnection
         };
     }
 
-    private void ValidateReplicaOptions()
+    private void AttachReplicaLease(TursoReplicaRegistry.Lease lease)
     {
-        if (_connectionOptions.Pooling)
-            throw new NotSupportedException("Pooling is not supported for embedded replica connections yet. Set Pooling=False.");
-        if (_connectionOptions.SyncInterval != 0)
-            throw new NotSupportedException("Automatic sync is not supported for embedded replica connections yet. Set Sync Interval=0 and call SyncAsync explicitly.");
+        EventHandler<TursoAutomaticSyncStatusChangedEventArgs>? handlers;
+        TursoAutomaticSyncStatus status;
+        long generation;
+        lock (_automaticSyncLock)
+        {
+            _replicaLease = lease;
+            _syncDatabase = lease.Database;
+            Volatile.Write(ref _automaticSyncCoordinator, lease.Coordinator);
+            lease.Coordinator.StatusChanged += OnAutomaticSyncStatusChanged;
+            status = lease.Coordinator.Status;
+            Volatile.Write(ref _automaticSyncStatus, status);
+            generation = Interlocked.Increment(ref _automaticSyncGeneration);
+            handlers = AutomaticSyncStatusChanged;
+            QueueAutomaticSyncStatusChanged(handlers, status, generation);
+        }
+    }
+
+    private void OnAutomaticSyncStatusChanged(
+        object? sender,
+        TursoAutomaticSyncStatusChangedEventArgs args)
+    {
+        EventHandler<TursoAutomaticSyncStatusChangedEventArgs>? handlers;
+        long generation;
+        lock (_automaticSyncLock)
+        {
+            if (!ReferenceEquals(sender, _automaticSyncCoordinator))
+                return;
+
+            Volatile.Write(ref _automaticSyncStatus, args.Status);
+            generation = Volatile.Read(ref _automaticSyncGeneration);
+            handlers = AutomaticSyncStatusChanged;
+        }
+
+        QueueAutomaticSyncStatusChanged(handlers, args.Status, generation);
     }
 
     private void ValidateLocalOnlyOptions()
@@ -564,18 +636,104 @@ public class TursoConnection : DbConnection
         _readUncommitted = false;
     }
 
-    private void ReleaseSyncDatabase()
+    private Exception? ReleaseSyncDatabase()
     {
         var syncDatabase = _syncDatabase;
         if (syncDatabase is null)
+            return null;
+
+        EventHandler<TursoAutomaticSyncStatusChangedEventArgs>? handlers;
+        TursoAutomaticSyncStatus stoppedStatus;
+        long generation;
+        lock (_automaticSyncLock)
+        {
+            var coordinator = _automaticSyncCoordinator;
+            Volatile.Write(ref _automaticSyncCoordinator, null);
+            if (coordinator is not null)
+                coordinator.StatusChanged -= OnAutomaticSyncStatusChanged;
+
+            stoppedStatus = (coordinator?.Status ?? _automaticSyncStatus) with
+            {
+                State = TursoAutomaticSyncState.Stopped,
+                Attempt = 0,
+                NextAttempt = null,
+            };
+            Volatile.Write(ref _automaticSyncStatus, stoppedStatus);
+            generation = Volatile.Read(ref _automaticSyncGeneration);
+            handlers = AutomaticSyncStatusChanged;
+        }
+
+        _syncDatabase = null;
+        syncDatabase.ReleaseConnection();
+        var lease = _replicaLease;
+        _replicaLease = null;
+        var failure = lease?.Release();
+        QueueAutomaticSyncStatusChanged(handlers, stoppedStatus, generation);
+        return failure;
+    }
+
+    private void QueueAutomaticSyncStatusChanged(
+        EventHandler<TursoAutomaticSyncStatusChangedEventArgs>? handlers,
+        TursoAutomaticSyncStatus status,
+        long generation)
+    {
+        if (handlers is null)
             return;
 
-        var ownsSyncDatabase = _ownsSyncDatabase;
-        _syncDatabase = null;
-        _ownsSyncDatabase = false;
-        syncDatabase.ReleaseConnection();
-        if (ownsSyncDatabase)
-            syncDatabase.Dispose();
+        _automaticSyncNotifications.Enqueue(new AutomaticSyncNotification(
+            status,
+            generation,
+            handlers));
+        ScheduleAutomaticSyncNotificationDrain();
+    }
+
+    private void ScheduleAutomaticSyncNotificationDrain()
+    {
+        if (Interlocked.Exchange(ref _automaticSyncNotificationDrainScheduled, 1) != 0)
+            return;
+
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static connection => connection.DrainAutomaticSyncNotifications(),
+            this,
+            preferLocal: false);
+    }
+
+    private void DrainAutomaticSyncNotifications()
+    {
+        try
+        {
+            while (_automaticSyncNotifications.TryDequeue(out var notification))
+            {
+                if (notification.Generation != Volatile.Read(ref _automaticSyncGeneration))
+                    continue;
+
+                var currentStatus = Volatile.Read(ref _automaticSyncStatus);
+                if (currentStatus.State == TursoAutomaticSyncState.Stopped
+                    && !ReferenceEquals(currentStatus, notification.Status))
+                {
+                    continue;
+                }
+
+                var args = new TursoAutomaticSyncStatusChangedEventArgs(notification.Status);
+                foreach (var callback in notification.Handlers.GetInvocationList())
+                {
+                    try
+                    {
+                        ((EventHandler<TursoAutomaticSyncStatusChangedEventArgs>)callback)(this, args);
+                    }
+                    catch
+                    {
+                        // Observers cannot stop synchronization.
+                    }
+                }
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref _automaticSyncNotificationDrainScheduled, 0);
+            if (!_automaticSyncNotifications.IsEmpty)
+                ScheduleAutomaticSyncNotificationDrain();
+        }
     }
 
     private void CloseSyncReaders()
@@ -587,4 +745,9 @@ public class TursoConnection : DbConnection
         foreach (var reader in readers)
             reader.Dispose();
     }
+
+    private sealed record AutomaticSyncNotification(
+        TursoAutomaticSyncStatus Status,
+        long Generation,
+        EventHandler<TursoAutomaticSyncStatusChangedEventArgs> Handlers);
 }

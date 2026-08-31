@@ -110,14 +110,19 @@ await using var replica = new TursoConnection(
     "Data Source=turso://example-org.turso.io;"
     + "Auth Token=eyJ...;"
     + "Replica Path=./replica.db;"
-    + "Pooling=False");
+    + "Pooling=True;"
+    + "Sync Interval=30");
 await replica.OpenAsync();
 
-// Pull remote changes into the local replica. Local writes are not pushed.
+// Pull immediately in addition to the shared 30-second automatic schedule.
 await replica.SyncAsync();
 ```
 
-Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`. Local `Encryption Cipher` and `Encryption Key` do not configure remote replica encryption. Each connection owns its replica exclusively; pooling, automatic sync (`Sync Interval`), and replica batches are not supported yet.
+`Pooling=True` shares a file replica and one automatic-sync schedule among connections that use the same path and options. Pooling remains opt-in; `Pooling=False` keeps an exclusive path lease, and `:memory:` replicas are always private. Connections for one pooled path must use identical sync settings and credentials.
+
+`Sync Interval` is the automatic pull period in seconds. `AutomaticSyncStatus` and `AutomaticSyncStatusChanged` expose waiting, running, retrying, faulted, and stopped states along with attempt times, the last pull result, the next attempt, and terminal failures. Automatic sync retries transient transport, I/O, and timeout failures twice; other failures are terminal and are also surfaced by `Close`.
+
+Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`. Local `Encryption Cipher` and `Encryption Key` do not configure remote replica encryption. Replica batches are not supported yet.
 
 Remote mode also supports ADO.NET `DbBatch` for latency-sensitive workloads that should be sent in one Hrana batch:
 

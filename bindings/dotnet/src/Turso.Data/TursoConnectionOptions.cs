@@ -5,6 +5,8 @@ namespace Turso;
 
 public class TursoConnectionOptions
 {
+    private const int MaximumSyncIntervalSeconds = 4_294_967;
+
     private readonly TursoConnectionStringBuilder _builder;
 
     private TursoConnectionOptions(TursoConnectionStringBuilder builder)
@@ -32,7 +34,22 @@ public class TursoConnectionOptions
 
     public bool ReadYourWrites => _builder.ReadYourWrites;
 
-    public int SyncInterval => _builder.SyncInterval;
+    public int SyncInterval
+    {
+        get
+        {
+            var value = _builder.SyncInterval;
+            if (value is < 0 or > MaximumSyncIntervalSeconds)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(SyncInterval),
+                    value,
+                    $"Sync Interval must be between 0 and {MaximumSyncIntervalSeconds} seconds.");
+            }
+
+            return value;
+        }
+    }
 
     public string SyncClientName => _builder.SyncClientName;
 
