@@ -15,7 +15,7 @@ public class TursoConnection : DbConnection
     private TursoSyncDatabase? _syncDatabase;
     private TursoReplicaRegistry.Lease? _replicaLease;
     private TursoAutomaticSyncCoordinator? _automaticSyncCoordinator;
-    private readonly HashSet<TursoDataReader> _syncReaders = [];
+    private readonly HashSet<DbDataReader> _syncReaders = [];
     private readonly object _syncReadersLock = new();
     private readonly object _automaticSyncLock = new();
     private readonly System.Collections.Concurrent.ConcurrentQueue<AutomaticSyncNotification>
@@ -52,7 +52,9 @@ public class TursoConnection : DbConnection
         ? ConnectionState.Open
         : ConnectionState.Closed;
 
-    public override bool CanCreateBatch => _connectionOptions.IsRemote && !_connectionOptions.IsReplica;
+    public override bool CanCreateBatch =>
+        _connectionOptions.IsRemote && !_connectionOptions.IsReplica
+        || _syncDatabase is not null;
 
     protected override DbProviderFactory DbProviderFactory => TursoFactory.Instance;
 
@@ -170,7 +172,7 @@ public class TursoConnection : DbConnection
     protected override DbBatch CreateDbBatch()
     {
         if (!CanCreateBatch)
-            throw new NotSupportedException("Turso batch execution is currently supported only for remote connections.");
+            throw new NotSupportedException("Turso batch execution requires a direct remote or embedded replica connection.");
 
         return new TursoBatch(this);
     }
@@ -251,13 +253,20 @@ public class TursoConnection : DbConnection
         return _syncDatabase?.EnterConnectionOperation();
     }
 
-    internal void RegisterSyncReader(TursoDataReader reader)
+    internal async ValueTask<IDisposable?> EnterSyncOperationAsync(CancellationToken cancellationToken)
+    {
+        return _syncDatabase is null
+            ? null
+            : await _syncDatabase.EnterConnectionOperationAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    internal void RegisterSyncReader(DbDataReader reader)
     {
         lock (_syncReadersLock)
             _syncReaders.Add(reader);
     }
 
-    internal void UnregisterSyncReader(TursoDataReader reader)
+    internal void UnregisterSyncReader(DbDataReader reader)
     {
         lock (_syncReadersLock)
             _syncReaders.Remove(reader);
@@ -301,8 +310,15 @@ public class TursoConnection : DbConnection
             return await remoteClient.ExecuteBatchAsync(batchCommands, commandTimeout, wantRows, closeAfter, cancellationToken)
                 .ConfigureAwait(false);
         }
-        catch (TursoRemoteSqlException)
+        catch (TursoRemoteSqlException exception)
         {
+            if (exception.IsStreamExpired)
+            {
+                if (_remoteTransactionActive)
+                    InvalidateRemoteSession();
+                else
+                    remoteClient.ResetSession();
+            }
             throw;
         }
         catch
@@ -738,7 +754,7 @@ public class TursoConnection : DbConnection
 
     private void CloseSyncReaders()
     {
-        TursoDataReader[] readers;
+        DbDataReader[] readers;
         lock (_syncReadersLock)
             readers = [.. _syncReaders];
 

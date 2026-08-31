@@ -75,13 +75,13 @@ public class TursoRemoteTests
     }
 
     [Test]
-    public void TestCanCreateBatchIsRemoteOnly()
+    public void TestCanCreateBatchRejectsLocalConnections()
     {
         using var localConnection = new TursoConnection("Data Source=:memory:");
         localConnection.CanCreateBatch.Should().BeFalse();
         localConnection.Invoking(x => x.CreateBatch())
             .Should().Throw<NotSupportedException>()
-            .WithMessage("Turso batch execution is currently supported only for remote connections.");
+            .WithMessage("Turso batch execution requires a direct remote or embedded replica connection.");
 
         using var remoteConnection = new TursoConnection("Data Source=https://example.com");
         remoteConnection.CanCreateBatch.Should().BeTrue();
@@ -1168,6 +1168,131 @@ public class TursoRemoteTests
         batch.Invoking(x => x.ExecuteNonQuery())
             .Should().Throw<TursoException>()
             .WithMessage("Remote batch returned an unexpected result shape: 1 results, 0 errors, expected 1.");
+    }
+
+    [Test]
+    public async Task TestPartiallyEvaluatedExpiredBatchIsNotRetried()
+    {
+        const string expiredBatchJson = """
+            {
+              "baton": "stale",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "batch",
+                  "result": {
+                    "step_results": [
+                      { "cols": [], "rows": [], "affected_row_count": 1 },
+                      null
+                    ],
+                    "step_errors": [
+                      null,
+                      { "message": "stream expired", "code": "STREAM_EXPIRED" }
+                    ]
+                  }
+                }
+              }]
+            }
+            """;
+        const string executeJson = """
+            {
+              "baton": "fresh",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [{ "name": "value", "decltype": "INTEGER" }],
+                    "rows": [[{ "type": "integer", "value": "2" }]],
+                    "affected_row_count": 0
+                  }
+                }
+              }]
+            }
+            """;
+        const string closeJson = """
+            {
+              "results": [{
+                "type": "ok",
+                "response": { "type": "close" }
+              }]
+            }
+            """;
+
+        using var server = new TestRemoteServer(expiredBatchJson, executeJson, closeJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        await using var batch = (TursoBatch)connection.CreateBatch();
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO items VALUES (1)"));
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO items VALUES (2)"));
+
+        var batchAction = async () => await batch.ExecuteNonQueryAsync(CancellationToken.None);
+
+        await batchAction.Should().ThrowAsync<TursoException>()
+            .WithMessage("Remote SQL execution failed: stream expired (STREAM_EXPIRED)");
+        using var command = new TursoCommand(connection, "SELECT 2");
+        (await command.ExecuteScalarAsync()).Should().Be(2L);
+        server.RequestBodies.Should().HaveCount(2);
+        using var nextRequest = JsonDocument.Parse(server.RequestBodies[1]);
+        nextRequest.RootElement.TryGetProperty("baton", out _).Should().BeFalse();
+    }
+
+    [Test]
+    public async Task TestExpiredBatchClosesAnActiveRemoteTransaction()
+    {
+        const string beginJson = """
+            {
+              "baton": "transaction",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [],
+                    "rows": [],
+                    "affected_row_count": 0
+                  }
+                }
+              }]
+            }
+            """;
+        const string expiredBatchJson = """
+            {
+              "baton": "stale",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "batch",
+                  "result": {
+                    "step_results": [
+                      { "cols": [], "rows": [], "affected_row_count": 1 },
+                      null
+                    ],
+                    "step_errors": [
+                      null,
+                      { "message": "stream expired", "code": "STREAM_EXPIRED" }
+                    ]
+                  }
+                }
+              }]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginJson, expiredBatchJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        await using var batch = (TursoBatch)connection.CreateBatch();
+        batch.Transaction = transaction;
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO items VALUES (1)"));
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO items VALUES (2)"));
+
+        var batchAction = async () => await batch.ExecuteNonQueryAsync(CancellationToken.None);
+
+        await batchAction.Should().ThrowAsync<TursoException>()
+            .WithMessage("Remote SQL execution failed: stream expired (STREAM_EXPIRED)");
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        server.RequestBodies.Should().HaveCount(2);
     }
 
     [Test]

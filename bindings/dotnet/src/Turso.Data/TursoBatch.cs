@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using System.Text.Json;
 using Turso.Raw.Public;
 
 namespace Turso;
@@ -87,13 +88,23 @@ public sealed class TursoBatch : DbBatch
     public override object? ExecuteScalar()
     {
         using var reader = ExecuteDbDataReader(CommandBehavior.Default);
-        return reader.Read() ? reader.GetValue(0) : null;
+        if (_connection?.IsRemote == true)
+            return reader.Read() ? reader.GetValue(0) : null;
+
+        return ReadScalar(reader);
     }
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
         await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
-        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? reader.GetValue(0) : null;
+        if (_connection?.IsRemote == true)
+        {
+            return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+                ? reader.GetValue(0)
+                : null;
+        }
+
+        return await ReadScalarAsync(reader, cancellationToken).ConfigureAwait(false);
     }
 
     public override void Prepare()
@@ -119,7 +130,7 @@ public sealed class TursoBatch : DbBatch
     {
         var results = ExecuteBatch(wantRows: true, CancellationToken.None).GetAwaiter().GetResult();
         SetRecordsAffected(results);
-        return new TursoRemoteDataReader(_connection, results, behavior);
+        return CreateDataReader(results, behavior);
     }
 
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(
@@ -128,19 +139,159 @@ public sealed class TursoBatch : DbBatch
     {
         var results = await ExecuteBatch(wantRows: true, cancellationToken).ConfigureAwait(false);
         SetRecordsAffected(results);
-        return new TursoRemoteDataReader(_connection, results, behavior);
+        return await CreateDataReaderAsync(results, behavior, cancellationToken).ConfigureAwait(false);
     }
 
-    private Task<IReadOnlyList<RemoteStatementResult>> ExecuteBatch(bool wantRows, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<RemoteStatementResult>> ExecuteBatch(
+        bool wantRows,
+        CancellationToken cancellationToken)
     {
-        if (cancellationToken.IsCancellationRequested)
-            return Task.FromCanceled<IReadOnlyList<RemoteStatementResult>>(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
 
         var connection = ValidateBatch();
-        if (!connection.IsRemote)
-            throw new NotSupportedException("Turso batch execution is currently supported only for remote connections.");
+        if (connection.IsRemote)
+        {
+            return await connection
+                .ExecuteRemoteBatchAsync(_batchCommands.AsReadOnly(), Timeout, wantRows, cancellationToken)
+                .ConfigureAwait(false);
+        }
 
-        return connection.ExecuteRemoteBatchAsync(_batchCommands.AsReadOnly(), Timeout, wantRows, cancellationToken);
+        if (connection.SyncDatabase is null)
+            throw new NotSupportedException("Turso batch execution requires a direct remote or embedded replica connection.");
+
+        var results = new List<RemoteStatementResult>(_batchCommands.Count);
+        foreach (var batchCommand in _batchCommands.AsReadOnly())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var command = new TursoCommand(connection)
+            {
+                CommandText = batchCommand.CommandText,
+                CommandTimeout = Timeout,
+                Transaction = _transaction,
+            };
+            foreach (TursoParameter parameter in batchCommand.Parameters)
+                command.Parameters.Add(parameter);
+
+            results.Add(wantRows
+                ? await BufferResultAsync(command, cancellationToken).ConfigureAwait(false)
+                : new RemoteStatementResult
+                {
+                    AffectedRowCount = checked((ulong)Math.Max(
+                        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                        0)),
+                });
+        }
+
+        return results;
+    }
+
+    private DbDataReader CreateDataReader(
+        IReadOnlyList<RemoteStatementResult> results,
+        CommandBehavior behavior)
+    {
+        IDisposable? syncOperation = null;
+        try
+        {
+            if (_connection?.SyncDatabase is not null)
+                syncOperation = _connection.EnterSyncOperation();
+
+            var reader = new TursoRemoteDataReader(_connection, results, behavior, syncOperation);
+            syncOperation = null;
+            return reader;
+        }
+        finally
+        {
+            syncOperation?.Dispose();
+        }
+    }
+
+    private async Task<DbDataReader> CreateDataReaderAsync(
+        IReadOnlyList<RemoteStatementResult> results,
+        CommandBehavior behavior,
+        CancellationToken cancellationToken)
+    {
+        IDisposable? syncOperation = null;
+        try
+        {
+            if (_connection?.SyncDatabase is not null)
+            {
+                syncOperation = await _connection
+                    .EnterSyncOperationAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            var reader = new TursoRemoteDataReader(_connection, results, behavior, syncOperation);
+            syncOperation = null;
+            return reader;
+        }
+        finally
+        {
+            syncOperation?.Dispose();
+        }
+    }
+
+    private static async Task<RemoteStatementResult> BufferResultAsync(
+        TursoCommand command,
+        CancellationToken cancellationToken)
+    {
+        await using var reader = await command
+            .ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var columns = new List<RemoteColumn>(reader.FieldCount);
+        for (var ordinal = 0; ordinal < reader.FieldCount; ordinal++)
+        {
+            columns.Add(new RemoteColumn
+            {
+                Name = reader.GetName(ordinal),
+                DeclType = reader.GetDataTypeName(ordinal),
+            });
+        }
+
+        var rows = new List<List<RemoteResponseValue>>();
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var row = new List<RemoteResponseValue>(reader.FieldCount);
+            for (var ordinal = 0; ordinal < reader.FieldCount; ordinal++)
+                row.Add(ToBufferedValue(reader.GetValue(ordinal)));
+            rows.Add(row);
+        }
+
+        return new RemoteStatementResult
+        {
+            Columns = columns,
+            Rows = rows,
+            AffectedRowCount = checked((ulong)Math.Max(reader.RecordsAffected, 0)),
+        };
+    }
+
+    private static RemoteResponseValue ToBufferedValue(object value)
+    {
+        return value switch
+        {
+            DBNull => new RemoteResponseValue { Type = "null" },
+            byte[] bytes => new RemoteResponseValue
+            {
+                Type = "blob",
+                Base64 = Convert.ToBase64String(bytes),
+            },
+            double number => new RemoteResponseValue
+            {
+                Type = "float",
+                Value = JsonSerializer.SerializeToElement(number),
+            },
+            long number => new RemoteResponseValue
+            {
+                Type = "integer",
+                Value = JsonSerializer.SerializeToElement(number),
+            },
+            string text => new RemoteResponseValue
+            {
+                Type = "text",
+                Value = JsonSerializer.SerializeToElement(text),
+            },
+            _ => throw new InvalidOperationException(
+                $"Cannot buffer a batch value of type {value.GetType().FullName}."),
+        };
     }
 
     private TursoConnection ValidateBatch()
@@ -180,5 +331,32 @@ public sealed class TursoBatch : DbBatch
         }
 
         return total;
+    }
+
+    private static object? ReadScalar(DbDataReader reader)
+    {
+        do
+        {
+            if (reader.FieldCount > 0 && reader.Read())
+                return reader.GetValue(0);
+        } while (reader.NextResult());
+
+        return null;
+    }
+
+    private static async Task<object?> ReadScalarAsync(
+        DbDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        do
+        {
+            if (reader.FieldCount > 0
+                && await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return reader.GetValue(0);
+            }
+        } while (await reader.NextResultAsync(cancellationToken).ConfigureAwait(false));
+
+        return null;
     }
 }

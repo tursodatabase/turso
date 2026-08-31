@@ -268,6 +268,14 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         return new ConnectionOperationLease(_operationLock);
     }
 
+    internal async ValueTask<IDisposable> EnterConnectionOperationAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfIoReentrant();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _resourcesDisposed) != 0, this);
+        await _operationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new ConnectionOperationLease(_operationLock);
+    }
+
     internal void ThrowIfIoReentrant()
     {
         if (_ioCallbackDepth.Value != 0)
