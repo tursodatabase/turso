@@ -100,6 +100,12 @@ impl QueuedIo {
     pub(crate) fn clear_fault(&self) {
         *self.state.fault.lock().unwrap() = None;
     }
+
+    /// Snapshot of every executed operation, for tests that assert on IO
+    /// behavior (op counts, ordering).
+    pub(crate) fn history(&self) -> Vec<QueuedIoEvent> {
+        self.state.history.lock().unwrap().clone()
+    }
 }
 
 impl Clock for QueuedIo {

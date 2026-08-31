@@ -1410,6 +1410,42 @@ pub struct Pager {
     /// Counterpart of SQLite's BtShared.pCursor list; bucketing per root
     /// supplies the BTCF_Multiple fast path (btree.c:9348).
     pub(crate) cursor_registry: Mutex<rustc_hash::FxHashMap<i64, Vec<RegisteredCursor>>>,
+    /// Max pages a scan may read ahead of the cursor. 0 disables readahead.
+    /// Set with `PRAGMA prefetch_pages`.
+    prefetch_pages: AtomicUsize,
+    /// Counters for scan readahead. See [Pager::prefetch_page].
+    readahead_stats: ReadaheadStats,
+}
+
+/// Counters for scan readahead, exposed for tests and diagnostics.
+#[derive(Default)]
+pub struct ReadaheadStats {
+    /// Page reads submitted ahead of the scan.
+    pub pages_submitted: AtomicU64,
+    /// Prefetch targets skipped because the page was already cached or its
+    /// read was already in flight.
+    pub pages_already_cached: AtomicU64,
+    /// Prefetches dropped because the page cache had no room for them.
+    pub dropped_cache_full: AtomicU64,
+}
+
+/// Point-in-time copy of [ReadaheadStats].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadaheadSnapshot {
+    pub pages_submitted: u64,
+    pub pages_already_cached: u64,
+    pub dropped_cache_full: u64,
+}
+
+/// What [Pager::prefetch_page] did for one page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefetchOutcome {
+    /// A read was submitted; the page will appear in the cache when it lands.
+    Submitted,
+    /// The page is already cached or already being read; nothing to do.
+    AlreadyCached,
+    /// The page cache has no room for a speculative page; nothing was read.
+    CacheFull,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1697,6 +1733,8 @@ impl Pager {
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
+            prefetch_pages: AtomicUsize::new(0),
+            readahead_stats: ReadaheadStats::default(),
         })
     }
 
@@ -3271,6 +3309,19 @@ impl Pager {
         turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
+        let c = self.begin_read_page_into(page.clone(), frame_watermark, allow_empty_read)?;
+        Ok((page, c))
+    }
+
+    /// Start a read of `page` from either the WAL or the DB file. The page is
+    /// marked locked; the returned completion unlocks it and marks it loaded.
+    fn begin_read_page_into(
+        &self,
+        page: PageRef,
+        frame_watermark: Option<u64>,
+        allow_empty_read: bool,
+    ) -> Result<Completion> {
+        let page_idx = page.get().id;
         let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
             turso_assert!(
@@ -3279,26 +3330,104 @@ impl Pager {
             );
 
             page.set_locked();
-            let c = self.begin_read_disk_page(
-                page_idx as usize,
-                page.clone(),
-                allow_empty_read,
-                &io_ctx,
-            )?;
-            return Ok((page, c));
+            return self.begin_read_disk_page(page_idx, page, allow_empty_read, &io_ctx);
         };
 
         if let Some(frame_id) = wal.find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
-            return Ok((page, c));
+            return wal.read_frame(frame_id, page, self.buffer_pool.clone());
         }
 
         page.set_locked();
-        let c =
-            self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
-        Ok((page, c))
+        self.begin_read_disk_page(page_idx, page, allow_empty_read, &io_ctx)
+    }
+
+    /// Max pages a scan may read ahead of the cursor. 0 disables readahead.
+    pub fn set_prefetch_pages(&self, pages: usize) {
+        self.prefetch_pages.store(pages, Ordering::Relaxed);
+    }
+
+    pub fn get_prefetch_pages(&self) -> usize {
+        self.prefetch_pages.load(Ordering::Relaxed)
+    }
+
+    pub fn readahead_stats(&self) -> ReadaheadSnapshot {
+        ReadaheadSnapshot {
+            pages_submitted: self.readahead_stats.pages_submitted.load(Ordering::Relaxed),
+            pages_already_cached: self
+                .readahead_stats
+                .pages_already_cached
+                .load(Ordering::Relaxed),
+            dropped_cache_full: self
+                .readahead_stats
+                .dropped_cache_full
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    /// Start reading a page the caller expects to need soon, without waiting
+    /// for it. The read goes through the same WAL-aware path as
+    /// [Pager::read_page], so a later `read_page` for the same page is a cache
+    /// hit (or waits on the in-flight read via the locked page in the cache).
+    #[aristo::intent(
+        "A speculative read stays invisible to queries: it never spills dirty \
+         pages, never yields, and a failed submission leaves the page \
+         unloaded and unlocked so the next cache lookup deletes it and the \
+         real read re-issues the IO. Routing prefetch through the spilling \
+         insert path would silently convert speculation into foreground \
+         write pressure and cache-full stalls.",
+        verify = "neural",
+        id = "prefetch_is_invisible_to_queries"
+    )]
+    pub fn prefetch_page(&self, page_idx: i64) -> Result<PrefetchOutcome> {
+        turso_assert_greater_than_or_equal!(page_idx, 1, "cannot prefetch invalid page number");
+        if self.pending_reads.read().contains_key(&page_idx) {
+            self.readahead_stats
+                .pages_already_cached
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(PrefetchOutcome::AlreadyCached);
+        }
+        let page = Arc::new(Page::new(page_idx));
+        // Publish the page as locked before submitting the read: a concurrent
+        // reader that finds it in the cache treats it exactly like any other
+        // in-flight read (yields until loaded). Insert before submitting so
+        // that a full cache costs us nothing (no wasted IO).
+        page.set_locked();
+        {
+            let mut page_cache = self.page_cache.write();
+            let page_key = PageCacheKey::new(page_idx as usize);
+            if page_cache.get(&page_key)?.is_some() {
+                self.readahead_stats
+                    .pages_already_cached
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(PrefetchOutcome::AlreadyCached);
+            }
+            match page_cache.insert(page_key, page.clone()) {
+                Ok(_) => {}
+                Err(CacheError::Full) => {
+                    self.readahead_stats
+                        .dropped_cache_full
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(PrefetchOutcome::CacheFull);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        match self.begin_read_page_into(page.clone(), None, false) {
+            Ok(_) => {
+                self.readahead_stats
+                    .pages_submitted
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(PrefetchOutcome::Submitted)
+            }
+            Err(e) => {
+                // Leave the entry unloaded+unlocked; the next cache get
+                // deletes it and the real read retries from scratch.
+                page.clear_locked();
+                Err(e)
+            }
+        }
     }
 
     /// Issue a non-blocking page read, inserting into the page cache, may spill to disk.
@@ -6716,6 +6845,135 @@ mod ptrmap_tests {
             }
             IOResult::IO(_) => panic!("loaded cache hit must not yield"),
         }
+    }
+
+    /// Writes raw bytes for `page_idx` directly into the MemoryIO-backed DB
+    /// file so a later read of that page succeeds.
+    fn write_raw_page(pager: &Pager, page_idx: usize, fill: u8) {
+        let page_size = 4096usize;
+        let io = pager.io.clone();
+        let file = io
+            .open_file("test.db", crate::io::OpenFlags::None, true)
+            .unwrap();
+        let buf = Arc::new(crate::Buffer::new_temporary(page_size));
+        buf.as_mut_slice().fill(fill);
+        let c = Completion::new_write(|_| {});
+        let c = file
+            .pwrite((page_idx as u64 - 1) * page_size as u64, buf, c)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+    }
+
+    /// A prefetched page lands in the cache through the normal read path, a
+    /// later `read_page` is a pure cache hit, and a repeated prefetch is a
+    /// no-op.
+    #[test]
+    fn prefetch_page_lands_in_cache_and_read_page_dedups() {
+        let pager = test_pager_setup(4096, 10);
+        write_raw_page(&pager, 50, 0xAB);
+
+        assert_eq!(pager.prefetch_page(50).unwrap(), PrefetchOutcome::Submitted);
+        pager.io.step().unwrap();
+
+        let stats = pager.readahead_stats();
+        assert_eq!(stats.pages_submitted, 1);
+
+        let cached = pager.cache_get(50).unwrap().expect("page must be cached");
+        assert!(cached.is_loaded(), "prefetched page should be loaded");
+        assert_eq!(cached.get_contents().as_ptr()[0], 0xAB);
+
+        match pager.read_page(50).unwrap() {
+            IOResult::Done((page, c)) => {
+                assert!(Arc::ptr_eq(&page, &cached));
+                assert!(c.is_none(), "prefetched page must be a pure cache hit");
+            }
+            IOResult::IO(_) => panic!("prefetched page must not require IO"),
+        }
+        assert!(pager.pending_reads.read().is_empty());
+
+        assert_eq!(
+            pager.prefetch_page(50).unwrap(),
+            PrefetchOutcome::AlreadyCached
+        );
+        assert_eq!(pager.readahead_stats().pages_already_cached, 1);
+    }
+
+    /// The invariant behind `prefetch_is_invisible_to_queries`: when a
+    /// speculative read fails (here: short read past the end of the file),
+    /// the page must vanish from the cache on the next lookup and a real
+    /// read must succeed once the data exists.
+    #[test]
+    fn failed_prefetch_self_heals_and_later_reads_succeed() {
+        let pager = test_pager_setup(4096, 10);
+        write_raw_page(&pager, 50, 0xAB);
+
+        // Page 60 does not exist yet: the prefetch read comes back short.
+        assert_eq!(pager.prefetch_page(60).unwrap(), PrefetchOutcome::Submitted);
+        pager.io.step().unwrap();
+
+        // The failed page must not be served from cache.
+        assert!(
+            pager.cache_get(60).unwrap().is_none(),
+            "a page whose speculative read failed must not stay in the cache"
+        );
+
+        // Once the page exists, a normal read succeeds from scratch.
+        write_raw_page(&pager, 60, 0xCD);
+        let (page, c) = match pager.read_page(60).unwrap() {
+            IOResult::Done(v) => v,
+            IOResult::IO(_) => panic!("read after failed prefetch should proceed"),
+        };
+        if let Some(c) = c {
+            pager.io.wait_for_completion(c).unwrap();
+        }
+        assert!(page.is_loaded());
+        assert_eq!(page.get_contents().as_ptr()[0], 0xCD);
+    }
+
+    /// A full, unevictable cache drops the prefetch instead of spilling,
+    /// erroring, or blocking the foreground read that follows.
+    #[test]
+    fn prefetch_is_dropped_when_the_cache_has_no_room() {
+        let pager = test_pager_setup(4096, 10);
+        write_raw_page(&pager, 50, 0xAB);
+
+        // Fill the cache with pinned pages so nothing is evictable. The vec
+        // only keeps the PageRefs alive (an outstanding ref also blocks
+        // eviction).
+        #[allow(clippy::collection_is_never_read)]
+        let mut pinned = Vec::new();
+        for id in 1000i64.. {
+            let page: PageRef = Arc::new(Page::new(id));
+            page.set_loaded();
+            page.pin();
+            let insert = pager
+                .page_cache
+                .write()
+                .insert(PageCacheKey::new(id as usize), page.clone());
+            match insert {
+                Ok(_) => pinned.push(page),
+                Err(CacheError::Full) => break,
+                Err(e) => panic!("unexpected cache error: {e:?}"),
+            }
+        }
+
+        assert_eq!(pager.prefetch_page(50).unwrap(), PrefetchOutcome::CacheFull);
+        assert_eq!(pager.readahead_stats().dropped_cache_full, 1);
+        assert_eq!(pager.readahead_stats().pages_submitted, 0);
+        assert!(
+            pager.cache_get(50).unwrap().is_none(),
+            "a dropped prefetch must leave no cache entry behind"
+        );
+
+        // The foreground read still succeeds (over-capacity force insert).
+        let (page, c) = match pager.read_page(50).unwrap() {
+            IOResult::Done(v) => v,
+            IOResult::IO(_) => panic!("foreground read should proceed with a full cache"),
+        };
+        if let Some(c) = c {
+            pager.io.wait_for_completion(c).unwrap();
+        }
+        assert!(page.is_loaded());
     }
 }
 

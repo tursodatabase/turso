@@ -18,6 +18,7 @@ use crate::schema::{Schema, Table};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
+use crate::storage::readahead::MAX_PREFETCH_PAGES;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
@@ -364,6 +365,17 @@ fn update_pragma(
         PragmaName::CacheSpill => {
             let enabled = parse_pragma_enabled(&value);
             connection.get_pager().set_spill_enabled(enabled);
+            connection.bump_prepare_context_generation();
+            Ok(TransactionMode::None)
+        }
+        PragmaName::PrefetchPages => {
+            let pages = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(pages)) => pages,
+                Value::Numeric(Numeric::Float(pages)) => f64::from(pages) as i64,
+                _ => bail_parse_error!("Invalid value for prefetch_pages pragma"),
+            };
+            let pages = pages.clamp(0, MAX_PREFETCH_PAGES as i64) as usize;
+            connection.get_pager().set_prefetch_pages(pages);
             connection.bump_prepare_context_generation();
             Ok(TransactionMode::None)
         }
@@ -823,6 +835,13 @@ fn query_pragma(
         PragmaName::CacheSpill => {
             let spill_enabled = connection.get_pager().get_spill_enabled();
             program.emit_int(spill_enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::PrefetchPages => {
+            let prefetch_pages = connection.get_pager().get_prefetch_pages();
+            program.emit_int(prefetch_pages as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

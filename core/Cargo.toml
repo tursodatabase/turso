@@ -298,3 +298,7 @@ harness = false
 [[bench]]
 name = "select_star_benchmark"
 harness = false
+
+[[bench]]
+name = "prefetch_benchmark"
+harness = false

@@ -248,6 +248,21 @@ PRAGMA cache_spill = 0;    -- disable
 PRAGMA cache_spill = 1;    -- enable
 ```
 
+### prefetch_pages
+
+Sets how many pages a scan may read ahead of the cursor. When enabled, forward
+scans that look sequential fetch upcoming B-tree pages before they are needed,
+so the waits for storage overlap instead of happening one page at a time. The
+readahead distance starts small and doubles while the scan keeps going, up to
+this limit. `0` (the default) disables readahead. Values are clamped to at
+most `4096` pages.
+
+```sql
+PRAGMA prefetch_pages;          -- query the current limit
+PRAGMA prefetch_pages = 64;     -- scans may stay up to 64 pages ahead
+PRAGMA prefetch_pages = 0;      -- disable readahead
+```
+
 ### synchronous
 
 Controls the fsync behavior for durability guarantees.
