@@ -405,6 +405,9 @@ PRAGMA mvcc_gc_threshold = 1000;
 Lets concurrent MVCC commits batch their logical-log writes so one of them appends
 every waiting transaction's record and the whole batch shares a single fsync.
 Off by default.
+Exclusive transactions started with `BEGIN IMMEDIATE` or `BEGIN EXCLUSIVE` commit
+on the solo path and do not join the queue. The setting applies to every
+connection on the store.
 
 ```sql
 PRAGMA mvcc_group_commit = on;

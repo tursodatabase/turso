@@ -41,6 +41,11 @@ struct GroupState {
     /// Tickets whose in-flight `log_tx` was discarded before the offset was
     /// advanced. The waiter rebuilds its log record instead of hanging.
     retry: HashSet<u64>,
+    /// Tx currently inside `log_tx`, before the offset advanced.
+    issued: Option<TxID>,
+    /// Waiters that dropped after `log_tx`. The leader finishes or rolls them
+    /// back. They must not roll back themselves.
+    abandoned: HashSet<TxID>,
 }
 
 pub(crate) enum GroupWork {
@@ -72,6 +77,8 @@ impl CommitCoordinator {
                 written_through: 0,
                 pending: VecDeque::new(),
                 retry: HashSet::default(),
+                issued: None,
+                abandoned: HashSet::default(),
             }),
             #[cfg(test)]
             last_group_size: AtomicUsize::new(0),
@@ -111,6 +118,13 @@ impl CommitCoordinator {
 
     pub(crate) fn take_work(&self) -> GroupWork {
         let mut group = self.group.lock();
+        if !group.retry.is_empty() {
+            return if group.written_through > group.durable_through {
+                GroupWork::SyncPrefix
+            } else {
+                GroupWork::None
+            };
+        }
         match group.pending.pop_front() {
             Some(writing) => {
                 let rest = std::mem::take(&mut group.pending);
@@ -135,6 +149,7 @@ impl CommitCoordinator {
 
     pub(crate) fn mark_durable(&self, ticket: u64) {
         let mut group = self.group.lock();
+        let ticket = dense_prefix_cap(ticket, group.written_through, &group.retry);
         group.durable_through = group.durable_through.max(ticket);
     }
 
@@ -144,6 +159,9 @@ impl CommitCoordinator {
 
     pub(crate) fn note_written(&self, ticket: u64) {
         let mut group = self.group.lock();
+        if group.retry.iter().any(|&hole| hole <= ticket) {
+            return;
+        }
         group.written_through = group.written_through.max(ticket);
     }
 
@@ -168,15 +186,56 @@ impl CommitCoordinator {
     }
 
     pub(crate) fn request_retry(&self, ticket: u64) {
-        self.group.lock().retry.insert(ticket);
+        let mut group = self.group.lock();
+        group.retry.insert(ticket);
+        if group.written_through >= ticket {
+            group.written_through = ticket.saturating_sub(1);
+        }
+        if group.durable_through >= ticket {
+            group.durable_through = ticket.saturating_sub(1);
+        }
     }
 
     pub(crate) fn take_retry(&self, ticket: u64) -> bool {
         self.group.lock().retry.remove(&ticket)
     }
 
+    pub(crate) fn note_write_issued(&self, tx_id: TxID) {
+        self.group.lock().issued = Some(tx_id);
+    }
+
+    pub(crate) fn clear_issued(&self) {
+        self.group.lock().issued = None;
+    }
+
+    pub(crate) fn abandon_if_issued(&self, tx_id: TxID) -> bool {
+        let mut group = self.group.lock();
+        if group.issued == Some(tx_id) {
+            group.abandoned.insert(tx_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_abandoned(&self, tx_id: TxID) -> bool {
+        self.group.lock().abandoned.contains(&tx_id)
+    }
+
+    pub(crate) fn take_abandoned(&self, tx_id: TxID) -> bool {
+        self.group.lock().abandoned.remove(&tx_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn last_group_size(&self) -> usize {
         self.last_group_size.load(Ordering::Acquire)
     }
+}
+
+fn dense_prefix_cap(ticket: u64, written_through: u64, retry: &HashSet<u64>) -> u64 {
+    let mut cap = ticket.min(written_through);
+    if let Some(hole) = retry.iter().copied().filter(|&t| t <= cap).min() {
+        cap = hole.saturating_sub(1);
+    }
+    cap
 }

@@ -1,5 +1,5 @@
 use super::{FixedYieldInjector, MvccTestDbNoConn, get_rows};
-use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, LogRecord};
+use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::{Connection, Database, LimboError, StepResult, Value};
@@ -296,6 +296,7 @@ fn drop_pending_only_removes_queued_records() {
 #[test]
 fn durability_watermark_only_moves_forward() {
     let coordinator = CommitCoordinator::new();
+    coordinator.note_written(7);
     coordinator.mark_durable(7);
     coordinator.mark_durable(3);
     assert_eq!(coordinator.durable_through(), 7);
@@ -319,8 +320,48 @@ fn failed_leader_does_not_publish_unsynced_prefix() {
     );
     assert_eq!(coordinator.written_through(), first);
 
-    coordinator.mark_durable(coordinator.written_through().max(second));
-    assert_eq!(coordinator.durable_through(), second);
+    coordinator.mark_durable(second);
+    assert_eq!(
+        coordinator.durable_through(),
+        first,
+        "durable cannot pass a ticket that was not owned"
+    );
+}
+
+#[test]
+fn failed_mid_batch_leader_does_not_cover_retry_hole() {
+    let coordinator = CommitCoordinator::new();
+    let t2 = coordinator.enqueue(2, empty_record(20));
+    let t3 = coordinator.enqueue(3, empty_record(30));
+    let t4 = coordinator.enqueue(4, empty_record(40));
+    assert_eq!((t2, t3, t4), (1, 2, 3));
+
+    let mut batch = coordinator.take_pending();
+    let _owned = batch.pop_front().unwrap();
+    let _retry = batch.pop_front().unwrap();
+    let later = batch.pop_front().unwrap();
+    coordinator.note_written(t2);
+    coordinator.request_retry(t3);
+    coordinator.requeue(std::iter::once(later));
+    coordinator.note_written(t4);
+    coordinator.mark_durable(coordinator.written_through());
+
+    assert!(
+        coordinator.durable_through() < t3,
+        "T3 is a retry hole; durable must not cover it (durable={}, t3={t3})",
+        coordinator.durable_through()
+    );
+    assert!(
+        !matches!(
+            coordinator.take_work(),
+            GroupWork::Lead { writing, .. } if writing.ticket >= t3
+        ),
+        "later tickets cannot be taken while an earlier ticket is a retry hole"
+    );
+    assert!(
+        coordinator.take_retry(t3),
+        "T3 must still be retrying, not acked via the watermark"
+    );
 }
 
 fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
@@ -373,4 +414,106 @@ fn dropped_after_own_still_commits(group_commit: bool) {
 
     let rows = get_rows(&conn, "SELECT pk FROM t");
     assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+}
+
+#[test]
+fn begin_immediate_still_commits_with_group_commit_on() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT pk FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
+#[test]
+fn dropped_waiter_after_log_tx_still_commits() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+        CommitYieldPoint::LogicalLogWriteIssued.point(),
+    ])));
+    conn_b.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+        CommitYieldPoint::LogicalLogWriteIssued.point(),
+    ])));
+
+    let store = db.get_mvcc_store();
+    let lock = &store.commit_coordinator.pager_commit_lock;
+    assert!(lock.write(), "hold the commit lock so both enqueue");
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit_a),
+        StepResult::Yield
+    ));
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit_b),
+        StepResult::Yield
+    ));
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit_a),
+        StepResult::Yield
+    ));
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit_b),
+        StepResult::Yield
+    ));
+
+    lock.unlock();
+
+    assert!(
+        matches!(step_until_yield_or_done(&mut commit_a), StepResult::Yield),
+        "leader should yield after issuing log_tx for the waiter"
+    );
+    assert!(
+        store.last_group_commit_size() >= 2,
+        "both commits must be in one batch"
+    );
+
+    drop(commit_b);
+    conn_a.set_yield_injector(None);
+    loop {
+        match commit_a.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield => continue,
+            other => panic!("leader COMMIT ended with {other:?}"),
+        }
+    }
+
+    let reader = db.connect();
+    assert_eq!(
+        get_rows(&reader, "SELECT pk FROM t ORDER BY pk"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
+        "waiter dropped after log_tx must still commit"
+    );
+
+    db.restart();
+    let reader = db.connect();
+    assert_eq!(
+        get_rows(&reader, "SELECT pk FROM t ORDER BY pk"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
+        "recovery must not replay an aborted waiter"
+    );
 }
