@@ -1001,6 +1001,7 @@ impl Database {
     /// [`OpenOptions`]. Equivalent to `Database::open(io, path,
     /// OpenOptions::new(dialect).flags(flags).db_opts(opts).encryption(enc))`.
     /// Kept for existing callers; new code should not use it.
+    #[deprecated]
     #[cfg(feature = "fs")]
     pub fn open_file_with_flags(
         io: Arc<dyn IO>,

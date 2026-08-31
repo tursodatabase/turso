@@ -4,11 +4,11 @@ use crate::common::{
 use rand::{rng, RngCore};
 use std::sync::Arc;
 use tempfile::TempDir;
+use turso_core::SqliteDialect;
 use turso_core::{
     CipherMode, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, PlatformIO, Row,
     IO,
 };
-use turso_core::SqliteDialect;
 
 const ENABLE_ENCRYPTION: bool = true;
 
@@ -1126,14 +1126,16 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
     use tempfile::TempDir;
 
     let _ = env_logger::try_init();
-    let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
-    let cipher = "aegis256";
+    let encryption_opts = EncryptionOpts {
+        cipher: "aegis256".to_string(),
+        hexkey: "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327".to_string(),
+    };
 
     // 1. Create an encrypted source database and insert data
     {
         let conn = tmp_db.connect_limbo();
-        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+        conn.execute(format!("PRAGMA hexkey = '{}'", encryption_opts.hexkey))?;
+        conn.execute(format!("PRAGMA cipher = '{}'", encryption_opts.cipher))?;
 
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, content TEXT)")?;
         conn.execute("INSERT INTO secret_data (content) VALUES ('this was encrypted')")?;
@@ -1146,47 +1148,26 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     // 2. Demonstrate that the encrypted source CANNOT be read or vacuumed without keys
     {
-        let unauthorized_db = TempDatabase::new_with_existent(&tmp_db.path);
-        let unauthorized_conn = unauthorized_db.connect_limbo();
-
-        // Reading should fail
-        let result = unauthorized_conn.execute("SELECT * FROM secret_data");
-        assert!(
-            result.is_err(),
-            "Encrypted source should not be readable as plaintext"
-        );
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("Corrupt database"),
-            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
-        );
-
-        // VACUUM INTO should also fail because it cannot read the source schema/data
-        let fail_path = dest_dir.path().join("should_fail.db");
-        let fail_path_str = fail_path.to_str().unwrap();
-        let result = unauthorized_conn.execute(format!("VACUUM INTO '{fail_path_str}'"));
-        assert!(
-            result.is_err(),
-            "VACUUM INTO should fail on encrypted database when no keys are provided"
-        );
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("Corrupt database"),
-            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
-        );
+        let unauthorized_err = TempDatabase::builder()
+            .with_db_path(&tmp_db.path)
+            .try_build()
+            .err()
+            .unwrap();
+        assert!(format!("{unauthorized_err}")
+            .contains("Database is encrypted but no encryption options provided"));
     }
 
     // 3. Execute VACUUM INTO using an authorized connection
     {
-        let conn = tmp_db.connect_limbo();
-        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+        let mut authorized_db = tmp_db.clone();
+        authorized_db.encryption = Some(encryption_opts.clone());
+        let conn = authorized_db.connect_limbo();
         conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
     }
 
     // 4. Prove the destination IS readable without keys (it was unencrypted)
     {
-        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_db = TempDatabase::builder().with_db_path(&dest_path).build();
         let dest_conn = dest_db.connect_limbo();
 
         let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, content FROM secret_data");

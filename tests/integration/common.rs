@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Clock, Connection, Database, FromValueRow, LimboError, Row, SqliteDialect, IO};
+use turso_core::{
+    Clock, Connection, Database, EncryptionKey, EncryptionOpts, FromValueRow, LimboError,
+    OpenOptions, Row, SqliteDialect, IO,
+};
 
 /// Temp directories holding test databases, deleted when the test process exits.
 ///
@@ -25,6 +28,7 @@ fn delete_temp_dirs() {
     TEMP_DIRS.lock().unwrap().clear();
 }
 
+#[derive(Clone)]
 pub struct TempDatabase {
     pub path: PathBuf,
     pub io: Arc<dyn IO + Send>,
@@ -36,6 +40,7 @@ pub struct TempDatabase {
     pub init_sql: Option<String>,
     #[allow(dead_code)]
     pub enable_mvcc: bool,
+    pub encryption: Option<EncryptionOpts>,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -49,6 +54,7 @@ pub struct TempDatabaseBuilder {
     enable_mvcc: bool,
     io_uring: bool,
     enable_views: bool,
+    encryption: Option<EncryptionOpts>,
 }
 
 struct TestIo {
@@ -128,6 +134,7 @@ impl TempDatabaseBuilder {
             enable_mvcc: false,
             io_uring: false,
             enable_views: false,
+            encryption: None,
         }
     }
 
@@ -184,6 +191,11 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_encryption(mut self, encryption: EncryptionOpts) -> Self {
+        self.encryption = Some(encryption);
+        self
+    }
+
     /// returns Turso errors, panics for the rest
     pub fn try_build(self) -> Result<TempDatabase, LimboError> {
         let mut opts = self
@@ -234,23 +246,16 @@ impl TempDatabaseBuilder {
                 })
             }
         };
-        let db = Database::open_file_with_flags(
+        let db = Database::open(
             io.clone(),
             db_path.to_str().unwrap(),
-            flags,
-            opts,
-            None,
-            Arc::new(SqliteDialect),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(self.encryption.clone()),
         )?;
 
-        // Enable MVCC via turso connection if requested
-        if self.enable_mvcc {
-            let conn = db.connect()?;
-            conn.pragma_update("journal_mode", "'mvcc'")
-                .expect("enable mvcc");
-        }
-
-        Ok(TempDatabase {
+        let temp_db = TempDatabase {
             path: db_path,
             io,
             db,
@@ -258,7 +263,18 @@ impl TempDatabaseBuilder {
             db_flags: flags,
             init_sql: self.init_sql,
             enable_mvcc: self.enable_mvcc,
-        })
+            encryption: self.encryption,
+        };
+
+        // Enable MVCC via turso connection if requested
+        if temp_db.enable_mvcc {
+            temp_db
+                .connect_limbo()
+                .pragma_update("journal_mode", "'mvcc'")
+                .expect("enable mvcc");
+        }
+
+        Ok(temp_db)
     }
 
     pub fn build(self) -> TempDatabase {
@@ -314,7 +330,13 @@ impl TempDatabase {
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
         log::debug!("conneting to limbo");
 
-        let conn = self.db.connect().unwrap();
+        let conn = match &self.encryption {
+            Some(encryption) => {
+                let key = EncryptionKey::from_hex_string(&encryption.hexkey).unwrap();
+                self.db.connect_with_encryption(Some(key)).unwrap()
+            }
+            None => self.db.connect().unwrap(),
+        };
         log::debug!("connected to limbo");
         conn
     }

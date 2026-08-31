@@ -7,7 +7,9 @@ use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
 use turso_core::SqliteDialect;
-use turso_core::{Connection, Database, DatabaseOpts, LimboError, StepResult, Value};
+use turso_core::{
+    Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, StepResult, Value,
+};
 use turso_parser::{ast::Cmd, parser::Parser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5530,6 +5532,10 @@ fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
 #[test]
 fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
     const HEXKEY: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let encryption_opts = EncryptionOpts {
+        cipher: "aegis256".to_string(),
+        hexkey: HEXKEY.to_string(),
+    };
 
     let tmp_db = TempDatabase::new_empty();
     {
@@ -5545,10 +5551,12 @@ fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
         do_flush(&conn, &tmp_db)?;
     }
 
-    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let reopened = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_opts(tmp_db.db_opts)
+        .with_encryption(encryption_opts.clone())
+        .build();
     let reopened_conn = reopened.connect_limbo();
-    reopened_conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
-    reopened_conn.execute("PRAGMA cipher = 'aegis256'")?;
 
     reopened_conn.execute("VACUUM")?;
     assert_eq!(run_integrity_check(&reopened_conn), "ok");
@@ -5562,10 +5570,12 @@ fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
     assert_eq!(last.len(), 1);
     assert_eq!(last[0], (29, "z".repeat(80)));
 
-    let post_vacuum = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let post_vacuum = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_opts(tmp_db.db_opts)
+        .with_encryption(encryption_opts)
+        .build();
     let post_vacuum_conn = post_vacuum.connect_limbo();
-    post_vacuum_conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
-    post_vacuum_conn.execute("PRAGMA cipher = 'aegis256'")?;
     assert_eq!(run_integrity_check(&post_vacuum_conn), "ok");
     assert_eq!(scalar_i64(&post_vacuum_conn, "SELECT COUNT(*) FROM t"), 30);
 
