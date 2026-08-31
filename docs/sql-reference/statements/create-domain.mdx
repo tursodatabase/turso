@@ -280,7 +280,7 @@ DROP DOMAIN my_domain;
 
 ## Restrictions
 
-- **STRICT tables only**: Using a domain type on a non-STRICT table is rejected at CREATE TABLE and ALTER TABLE ADD COLUMN time. Non-STRICT tables allow arbitrary type names as affinity hints, but domain constraints (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables, so permitting them would be misleading.
+- **STRICT tables only**: Using a domain type on a non-STRICT table is rejected at CREATE TABLE, ALTER TABLE ADD COLUMN, and ALTER TABLE ALTER COLUMN time. Non-STRICT tables allow arbitrary type names as affinity hints, but domain constraints (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables, so permitting them would be misleading.
 - **Cannot drop while in use**: A domain cannot be dropped while any table column or another domain references it.
 
 <Note>
