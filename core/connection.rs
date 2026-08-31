@@ -5261,6 +5261,24 @@ impl Connection {
         }
     }
 
+    pub(crate) fn set_mvcc_group_commit(&self, enabled: bool) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store.set_group_commit_enabled(enabled);
+                self.bump_prepare_context_generation();
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_group_commit(&self) -> Result<bool> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.group_commit_enabled()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
     pub(crate) fn mvcc_tx_should_abort(&self) -> bool {
         match (self.db.get_mv_store().clone(), self.get_mv_tx_id()) {
             (Some(mv_store), Some(tx_id)) => mv_store.tx_should_abort(tx_id),

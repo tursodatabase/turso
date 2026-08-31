@@ -20632,3 +20632,6 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
         Err(LimboError::WriteWriteConflict)
     ));
 }
+
+#[path = "group_commit_tests.rs"]
+mod group_commit_tests;
