@@ -180,34 +180,47 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     sync_busy: Arc<SyncBusyGate>,
 }
 
-#[allow(unused_variables)]
-fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors::Error> {
-    #[cfg(target_os = "linux")]
-    {
-        if !partial {
-            Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
-                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                    "Failed to create platform IO: {e}"
-                ))
-            })?))
-        } else {
-            use turso_sync_engine::sparse_io::SparseLinuxIo;
-
-            Ok(Arc::new(SparseLinuxIo::new().map_err(|e| {
-                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                    "Failed to create sparse IO: {e}"
-                ))
-            })?))
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = partial;
-        Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+fn persistent_io(
+    partial: bool,
+    main_db_path: &str,
+) -> Result<Arc<dyn IO>, turso_sync_engine::errors::Error> {
+    let _ = main_db_path;
+    if !partial {
+        return Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
             turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
                 "Failed to create platform IO: {e}"
             ))
+        })?));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use turso_sync_engine::sparse_io::SparseLinuxIo;
+
+        Ok(Arc::new(SparseLinuxIo::new().map_err(|e| {
+            turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                "Failed to create sparse IO: {e}"
+            ))
         })?))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use turso_sync_engine::sparse_io::SparseBitmapIo;
+
+        Ok(Arc::new(SparseBitmapIo::new(main_db_path).map_err(
+            |e| {
+                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                    "Failed to create sparse IO: {e}"
+                ))
+            },
+        )?))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // `PlatformIO` has no sparse-page presence operations.
+        Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+            "partial sync requires sparse-file IO, which is not supported on this platform"
+                .to_string(),
+        ))
     }
 }
 
@@ -309,7 +322,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                 };
                 let io = match io {
                     Some(io) => io,
-                    None => persistent_io(metadata.partial_bootstrap_server_revision.is_some())?,
+                    None => persistent_io(
+                        metadata.partial_bootstrap_server_revision.is_some(),
+                        &main_db_path,
+                    )?,
                 };
                 let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
                     io.clone(),
@@ -359,11 +375,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                 .await?;
                 let io = match io {
                     Some(io) => io,
-                    None => persistent_io(if let Some(metadata) = &metadata {
-                        metadata.partial_sync_opts().is_some()
-                    } else {
-                        sync_engine_opts.partial_sync_opts.is_some()
-                    })?,
+                    None => persistent_io(
+                        if let Some(metadata) = &metadata {
+                            metadata.partial_sync_opts().is_some()
+                        } else {
+                            sync_engine_opts.partial_sync_opts.is_some()
+                        },
+                        &main_db_path,
+                    )?,
                 };
                 let fresh_bootstrap = metadata.is_none() && sync_engine_opts.bootstrap_if_empty;
                 let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
