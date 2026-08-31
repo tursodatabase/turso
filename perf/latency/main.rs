@@ -460,13 +460,13 @@ fn main() {
             }
         }
         config.db_path = db_path.to_string_lossy().into_owned();
-        let cpu_before = cpu_time();
+        let cpu_before = CpuTime::now();
         let disk_before = DiskStats::for_path(&args.db_dir);
         let run = match args.engine {
             Engine::Sqlite => sqlite_engine::run(&config),
             Engine::Turso => turso_engine::run(&config),
         };
-        let cpu = cpu_time() - cpu_before;
+        let cpu = CpuTime::now().zip(cpu_before).map(|(a, b)| a - b);
         let disk = DiskStats::for_path(&args.db_dir)
             .zip(disk_before)
             .map(|(a, b)| a - b);
@@ -606,11 +606,34 @@ fn write_checkpoints(
     out.flush().unwrap();
 }
 
-/// CPU time this process has used so far, user and system.
+/// CPU time this process has used so far, user and system. `None` where
+/// getrusage is not available.
 #[derive(Debug, Clone, Copy)]
 struct CpuTime {
     user: Duration,
     system: Duration,
+}
+
+impl CpuTime {
+    #[cfg(not(unix))]
+    fn now() -> Option<CpuTime> {
+        None
+    }
+
+    #[cfg(unix)]
+    fn now() -> Option<CpuTime> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: RUSAGE_SELF is always valid and getrusage fills the struct on
+        // success, which is the only way it returns zero.
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(rc, 0, "getrusage failed");
+        let usage = unsafe { usage.assume_init() };
+        let duration = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1000);
+        Some(CpuTime {
+            user: duration(usage.ru_utime),
+            system: duration(usage.ru_stime),
+        })
+    }
 }
 
 impl std::ops::Sub for CpuTime {
@@ -623,27 +646,13 @@ impl std::ops::Sub for CpuTime {
     }
 }
 
-fn cpu_time() -> CpuTime {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    // SAFETY: RUSAGE_SELF is always valid and getrusage fills the struct on
-    // success, which is the only way it returns zero.
-    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-    assert_eq!(rc, 0, "getrusage failed");
-    let usage = unsafe { usage.assume_init() };
-    let duration = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1000);
-    CpuTime {
-        user: duration(usage.ru_utime),
-        system: duration(usage.ru_stime),
-    }
-}
-
 fn report(
     tag: &str,
     config: &Config,
     totals: &mut [u64],
     run: &Run,
     target_rate: f64,
-    cpu: CpuTime,
+    cpu: Option<CpuTime>,
     disk: Option<DiskStats>,
 ) {
     if totals.is_empty() {
@@ -675,17 +684,19 @@ fn report(
     );
     // The benchmark's own CPU use, so a run that burnt cores waiting is
     // visible. Includes warmup and, on Linux, the io_uring SQPOLL thread.
-    let busy = cpu.user + cpu.system;
-    let hardware_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let wall = run.elapsed.as_secs_f64().max(f64::EPSILON);
-    eprintln!(
-        "[{tag}] cpu: user {:.1}s  sys {:.1}s  {:.0}% of one core over {wall:.1}s, \
-         {:.1}% of {hardware_threads} hardware threads",
-        cpu.user.as_secs_f64(),
-        cpu.system.as_secs_f64(),
-        busy.as_secs_f64() / wall * 100.0,
-        busy.as_secs_f64() / wall / hardware_threads as f64 * 100.0
-    );
+    if let Some(cpu) = cpu {
+        let busy = cpu.user + cpu.system;
+        let hardware_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        eprintln!(
+            "[{tag}] cpu: user {:.1}s  sys {:.1}s  {:.0}% of one core over {wall:.1}s, \
+             {:.1}% of {hardware_threads} hardware threads",
+            cpu.user.as_secs_f64(),
+            cpu.system.as_secs_f64(),
+            busy.as_secs_f64() / wall * 100.0,
+            busy.as_secs_f64() / wall / hardware_threads as f64 * 100.0
+        );
+    }
     // What the disk under the database did during the run, from the kernel's
     // counters for the whole device. Other traffic on the device is in here
     // too, which is the point: a slow disk shows up as a slow disk.
