@@ -7339,6 +7339,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "codspeed-divan-compat",
  "crc32c",
+ "crc32fast",
  "criterion",
  "crossbeam-epoch",
  "crossbeam-utils",
