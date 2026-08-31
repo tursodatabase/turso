@@ -504,6 +504,12 @@ struct DiskStats {
 }
 
 impl DiskStats {
+    #[cfg(not(target_os = "linux"))]
+    fn for_path(_path: &std::path::Path) -> Option<DiskStats> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
     fn for_path(path: &std::path::Path) -> Option<DiskStats> {
         use std::os::unix::fs::MetadataExt;
         let dev = std::fs::metadata(path).ok()?.dev();
