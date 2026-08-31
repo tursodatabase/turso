@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Clock, Connection, Database, FromValueRow, Row, SqliteDialect, IO};
+use turso_core::{Clock, Connection, Database, FromValueRow, LimboError, Row, SqliteDialect, IO};
 
 /// Temp directories holding test databases, deleted when the test process exits.
 ///
@@ -184,7 +184,8 @@ impl TempDatabaseBuilder {
         self
     }
 
-    pub fn build(self) -> TempDatabase {
+    /// returns Turso errors, panics for the rest
+    pub fn try_build(self) -> Result<TempDatabase, LimboError> {
         let mut opts = self
             .opts
             .unwrap_or_else(|| turso_core::DatabaseOpts::new().with_encryption(true));
@@ -240,17 +241,16 @@ impl TempDatabaseBuilder {
             opts,
             None,
             Arc::new(SqliteDialect),
-        )
-        .unwrap();
+        )?;
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
-            let conn = db.connect().unwrap();
+            let conn = db.connect()?;
             conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
 
-        TempDatabase {
+        Ok(TempDatabase {
             path: db_path,
             io,
             db,
@@ -258,7 +258,11 @@ impl TempDatabaseBuilder {
             db_flags: flags,
             init_sql: self.init_sql,
             enable_mvcc: self.enable_mvcc,
-        }
+        })
+    }
+
+    pub fn build(self) -> TempDatabase {
+        self.try_build().unwrap()
     }
 }
 

@@ -3206,6 +3206,18 @@ impl Database {
     pub fn get_pending_byte() -> u32 {
         Pager::get_pending_byte()
     }
+
+    /// returns false if the cipher was already set
+    #[aristo::intent(
+        "the encryption_cipher_mode field is only set to a non-None value once per Connection",
+        id = "encryption_cipher_mode_is_only_set_once",
+        verify = "full"
+    )]
+    pub fn set_encryption_cipher(&self, cipher: CipherMode) -> bool {
+        self.encryption_cipher_mode
+            .compare_exchange(CipherMode::None, cipher)
+            .is_ok()
+    }
 }
 
 // Optimized for fast get() operations and supports unlimited attached databases.

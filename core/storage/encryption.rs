@@ -12,7 +12,8 @@ use aes_gcm::{
     aead::{Aead, AeadCore, AeadInPlace, KeyInit, OsRng},
     Aes128Gcm, Aes256Gcm, Key, Nonce,
 };
-use turso_macros::{match_ignore_ascii_case, AtomicEnum};
+use std::sync::atomic::{AtomicU8, Ordering};
+use turso_macros::match_ignore_ascii_case;
 
 /// Encryption Scheme
 /// We support two major algorithms: AEGIS, AES GCM. These algorithms picked so that they also do
@@ -409,7 +410,8 @@ define_aegis_cipher!(
     "AEGIS-128X4"
 );
 
-#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CipherMode {
     None,
     Aes128Gcm,
@@ -420,6 +422,34 @@ pub enum CipherMode {
     Aegis128X4,
     Aegis256X2,
     Aegis256X4,
+}
+
+#[derive(Debug)]
+pub struct AtomicCipherMode(AtomicU8);
+
+impl AtomicCipherMode {
+    pub const fn new(mode: CipherMode) -> Self {
+        Self(AtomicU8::new(mode as u8))
+    }
+
+    pub fn get(&self) -> CipherMode {
+        CipherMode::from_u8(self.0.load(Ordering::SeqCst))
+    }
+
+    pub fn set(&self, mode: CipherMode) {
+        self.0.store(mode as u8, Ordering::SeqCst);
+    }
+
+    pub fn compare_exchange(
+        &self,
+        current: CipherMode,
+        new: CipherMode,
+    ) -> std::result::Result<CipherMode, CipherMode> {
+        self.0
+            .compare_exchange(current as u8, new as u8, Ordering::SeqCst, Ordering::SeqCst)
+            .map(CipherMode::from_u8)
+            .map_err(CipherMode::from_u8)
+    }
 }
 
 impl TryFrom<&str> for CipherMode {
@@ -440,6 +470,28 @@ impl TryFrom<&str> for CipherMode {
                 "Unknown cipher name: {s}"
             ))),
         })
+    }
+}
+
+impl CipherMode {
+    #[aristo::intent(
+        "this cannot panic",
+        id = "cipher_mode_from_u8_cannot_panic",
+        verify = "full"
+    )]
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::None,
+            1 => Self::Aes128Gcm,
+            2 => Self::Aes256Gcm,
+            3 => Self::Aegis256,
+            4 => Self::Aegis128L,
+            5 => Self::Aegis128X2,
+            6 => Self::Aegis128X4,
+            7 => Self::Aegis256X2,
+            8 => Self::Aegis256X4,
+            _ => panic!("invalid CipherMode value: {value}"),
+        }
     }
 }
 

@@ -3,11 +3,12 @@ use crate::common::{
 };
 use rand::{rng, RngCore};
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use tempfile::TempDir;
 use turso_core::{
     CipherMode, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, PlatformIO, Row,
     IO,
 };
+use turso_core::SqliteDialect;
 
 const ENABLE_ENCRYPTION: bool = true;
 
@@ -594,12 +595,8 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
     // step 1: Create encrypted database with correct key
     {
-        let correct_encryption_key =
-            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
-
-        let conn = main_db.connect()?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn =
+            main_db.connect_with_encryption(Some(EncryptionKey::from_hex_string(correct_key)?))?;
 
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
@@ -611,9 +608,6 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
     // Step 2: re-open with correct key (this uses the DATABASE_MANAGER cache)
     {
-        let correct_encryption_key =
-            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
-
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
@@ -623,9 +617,8 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect()?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn =
+            db.connect_with_encryption(Some(EncryptionKey::from_hex_string(correct_key)?))?;
 
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
@@ -651,8 +644,6 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
     // Step 3: Opening with wrong key succeeds, but reading data fails with decryption error
     {
-        let wrong_encryption_key = turso_core::EncryptionKey::from_hex_string(wrong_key).unwrap();
-
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
@@ -665,13 +656,11 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        // opening succeeds - the key is not validated at open time
+        // opening succeeds - the key is not validated at connect time
         let conn = db.connect()?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(wrong_encryption_key)?;
 
         // Reading data should fail with a decryption error
-        let read_failed = match conn.query("SELECT * FROM secret_data") {
+        let read_failed = match conn.query("SELECT value FROM secret_data") {
             Err(_) => true,
             Ok(Some(mut rows)) => loop {
                 match rows.step() {
@@ -718,9 +707,6 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
     // Step 5: verify correct key still works after wrong key attempt
     {
-        let correct_encryption_key =
-            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
-
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
@@ -730,9 +716,8 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect()?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn =
+            db.connect_with_encryption(Some(EncryptionKey::from_hex_string(correct_key)?))?;
 
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
@@ -1097,6 +1082,39 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
         assert_eq!(val_a, "data from A");
         assert_eq!(val_b, "data from B");
     }
+
+    Ok(())
+}
+
+#[test]
+fn when_database_is_encrypted_with_pragmas_is_still_alive_and_another_unencrypted_connections_tries_to_access_the_db_then_error(
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let dir = TempDir::new()?;
+
+    // long-lived database
+    let encrypted_db = TempDatabase::new(dir.path().join("encrypted.db").to_str().unwrap());
+    {
+        let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        let cipher = "aegis256";
+        let encrypted_conn = encrypted_db.connect_limbo();
+        encrypted_conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
+        encrypted_conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+
+        encrypted_conn.execute(
+            "CREATE TABLE if not exists secret_data (id INTEGER PRIMARY KEY, content TEXT)",
+        )?;
+        do_flush(&encrypted_conn, &encrypted_db)?;
+    }
+
+    let err = TempDatabaseBuilder::new()
+        .with_db_name(dir.path().join("encrypted.db").to_str().unwrap())
+        .try_build()
+        .err()
+        .unwrap();
+
+    assert!(format!("{err:?}").contains("Database is encrypted but no encryption options provided"));
 
     Ok(())
 }
