@@ -214,6 +214,60 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
     found
 }
 
+pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableReferences) -> bool {
+    let mut has_outer_ref = false;
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = expr {
+            has_outer_ref = table_references
+                .find_outer_query_ref_by_internal_id(*table)
+                .is_some();
+        }
+        Ok(if has_outer_ref {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })
+    .expect("walking an expression cannot fail");
+    has_outer_ref
+}
+
+/// Return whether evaluating an expression may fail for a particular input.
+///
+/// This is deliberately conservative. Extension functions can fail, `LIKE`
+/// can call a user-defined function, and JSON or array operators can reject
+/// their input. Callers use this when an optimization would evaluate an
+/// expression for more rows than the original plan.
+pub fn expression_can_fail_on_input(expr: &ast::Expr) -> bool {
+    let mut can_fail = false;
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            expr,
+            ast::Expr::FunctionCall { .. }
+                | ast::Expr::FunctionCallStar { .. }
+                | ast::Expr::Like { .. }
+                | ast::Expr::Raise(_, _)
+                | ast::Expr::Binary(
+                    _,
+                    ast::Operator::ArrowRight
+                        | ast::Operator::ArrowRightShift
+                        | ast::Operator::ArrayContains
+                        | ast::Operator::ArrayOverlap,
+                    _
+                )
+        ) {
+            can_fail = true;
+        }
+        Ok(if can_fail {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })
+    .expect("walking an expression cannot fail");
+    can_fail
+}
+
 /// Returns true if this expression calls a scalar function whose result can
 /// change between calls.
 ///
