@@ -1450,10 +1450,19 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    // TODO: remove format, it sucks for performance but is convenient
     let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
-    let mut parse_schema_where_clause =
-        format!("tbl_name = '{escaped_tbl_name}' AND type != 'trigger'");
+    let mut parse_schema_where_clause = String::with_capacity(
+        "tbl_name = '' AND type != 'trigger'".len()
+            + escaped_tbl_name.len()
+            + if created_sequence_table {
+                " OR tbl_name = 'sqlite_sequence'".len()
+            } else {
+                0
+            },
+    );
+    parse_schema_where_clause.push_str("tbl_name = '");
+    parse_schema_where_clause.push_str(&escaped_tbl_name);
+    parse_schema_where_clause.push_str("' AND type != 'trigger'");
     if created_sequence_table {
         parse_schema_where_clause.push_str(" OR tbl_name = 'sqlite_sequence'");
     }
