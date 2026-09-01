@@ -111,6 +111,12 @@ where
                             stack.push(WalkItem::Expr(filter_clause));
                         }
                     }
+                    ast::Expr::MergedColumn(columns) => {
+                        // The generated node owns real source expressions, so visitors must see them.
+                        for column in columns.iter().rev() {
+                            stack.push(WalkItem::Expr(column));
+                        }
+                    }
                     ast::Expr::InList { lhs, rhs, .. } => {
                         for expr in rhs.iter().rev() {
                             stack.push(WalkItem::Expr(expr));
@@ -439,6 +445,12 @@ where
                         }
                         if let Some(filter_clause) = &mut filter_over.filter_clause {
                             stack.push(WalkItem::Expr(filter_clause));
+                        }
+                    }
+                    ast::Expr::MergedColumn(columns) => {
+                        // Mutable rewrites must reach every source of the generated value.
+                        for column in columns.iter_mut().rev() {
+                            stack.push(WalkItem::Expr(column));
                         }
                     }
                     ast::Expr::InList { lhs, rhs, .. } => {
