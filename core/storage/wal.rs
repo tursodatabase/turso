@@ -655,12 +655,14 @@ pub trait Wal: Debug + Send + Sync {
     /// caller must guarantee, that frame_watermark must be greater than last checkpointed frame, otherwise method will panic
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>>;
 
-    /// Read a frame from the WAL.
+    /// Read a frame from the WAL. The read is added to `group`, when
+    /// given, before it is submitted.
     fn read_frame(
         &self,
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion>;
 
     /// Read a contiguous run of WAL frames with a single `pread`.
@@ -672,12 +674,15 @@ pub trait Wal: Debug + Send + Sync {
     /// Otherwise a fresh temporary buffer is allocated. VACUUM passes a
     /// pre-allocated buffer to amortize the ~batch-size allocation across
     /// batches.
+    ///
+    /// The read is added to `group`, when given, before it is submitted.
     fn read_frames_batch(
         &self,
         start_frame: u64,
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
         scratch_buf: Option<Arc<Buffer>>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion>;
 
     /// Read a raw WAL frame with its on-disk header and page body decoded by
@@ -3557,6 +3562,7 @@ impl Wal for WalFile {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
@@ -3603,6 +3609,7 @@ impl Wal for WalFile {
             complete,
             page_idx,
             &self.io_ctx.read(),
+            group,
         )
     }
 
@@ -3613,6 +3620,7 @@ impl Wal for WalFile {
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
         scratch_buf: Option<Arc<Buffer>>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         turso_assert!(
             !pages.is_empty(),
@@ -3756,6 +3764,9 @@ impl Wal for WalFile {
         });
 
         let c = Completion::new_read(raw_buf, complete);
+        if let Some(group) = group {
+            group.add(&c);
+        }
         let file = self.coordination.wal_file()?;
         file.pread(offset, c)
     }
@@ -3910,6 +3921,7 @@ impl Wal for WalFile {
                 complete,
                 page_id as usize,
                 &self.io_ctx.read(),
+                None,
             )?;
             self.io.wait_for_completion(c)?;
             return if *conflict.lock() {
@@ -4270,7 +4282,9 @@ impl Wal for WalFile {
 
         self.max_frame.store(0, Ordering::Release);
         let file = self.coordination.wal_file()?;
-        let header_c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
+        let mut group = CompletionGroup::new(|_| {});
+        let _header_c =
+            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header, Some(&mut group))?;
 
         // After a RESTART or try_restart_log_before_write the WAL file may
         // still contain orphaned frames from the previous epoch. Truncate
@@ -4285,21 +4299,15 @@ impl Wal for WalFile {
             }
         };
         if !should_skip_truncate {
-            let trunc_c = file.truncate(
-                WAL_HEADER_SIZE as u64,
-                Completion::new_trunc(|res| {
-                    if let Err(err) = res {
-                        tracing::warn!("WAL truncate of orphaned frames failed: {err}");
-                    }
-                }),
-            )?;
-            let mut group = CompletionGroup::new(|_| {});
-            group.add(&header_c);
-            group.add(&trunc_c);
-            Ok(Some(group.build()))
-        } else {
-            Ok(Some(header_c))
+            let c = Completion::new_trunc(|res| {
+                if let Err(err) = res {
+                    tracing::warn!("WAL truncate of orphaned frames failed: {err}");
+                }
+            });
+            group.add(&c);
+            let _trunc_c = file.truncate(WAL_HEADER_SIZE as u64, c)?;
         }
+        Ok(Some(group.build()))
     }
 
     #[aristo::intent(
@@ -4959,9 +4967,11 @@ impl WalFile {
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
-                        let inflight =
-                            self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
-                        group.add(&inflight.completion);
+                        let inflight = self.issue_wal_read_into_buffer(
+                            page_id as usize,
+                            target_frame,
+                            &mut group,
+                        )?;
                         nr_completions += 1;
                         ongoing_chkpt.inflight_reads.push(inflight);
                         ongoing_chkpt.current_page += 1;
@@ -4974,15 +4984,13 @@ impl WalFile {
                         let batch_map = ongoing_chkpt.pending_writes.take();
                         if !batch_map.is_empty() {
                             let new_write = InflightWriteBatch::new();
-                            for c in write_pages_vectored(
+                            nr_completions += write_pages_vectored(
                                 pager,
                                 batch_map,
                                 new_write.done.clone(),
                                 new_write.err.clone(),
-                            )? {
-                                group.add(&c);
-                                nr_completions += 1;
-                            }
+                                &mut group,
+                            )?;
                             ongoing_chkpt.inflight_writes.push(new_write);
                         }
                     }
@@ -5287,7 +5295,14 @@ impl WalFile {
         Ok(())
     }
 
-    fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
+    /// Starts reading a frame's page body for the checkpoint. The read is
+    /// added to `group` before it is submitted.
+    fn issue_wal_read_into_buffer(
+        &self,
+        page_id: usize,
+        frame_id: u64,
+        group: &mut CompletionGroup,
+    ) -> Result<InflightRead> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
         tracing::debug!(
@@ -5322,6 +5337,7 @@ impl WalFile {
             complete,
             page_id,
             &self.io_ctx.read(),
+            Some(group),
         )?;
 
         Ok(InflightRead {
@@ -6629,7 +6645,7 @@ pub mod test {
             Arc::new(crate::Page::new(5)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -6657,7 +6673,7 @@ pub mod test {
             Arc::new(crate::Page::new(33)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -6673,7 +6689,7 @@ pub mod test {
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let target_page = Arc::new(crate::Page::new(43));
 
-        let completion = wal.read_frame(1, target_page, buffer_pool).unwrap();
+        let completion = wal.read_frame(1, target_page, buffer_pool, None).unwrap();
         let error = wait_for_completion_error(&io, completion);
 
         assert!(matches!(
@@ -6701,7 +6717,7 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(32));
         let completion = wal
-            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None)
+            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(target_page.get_contents().as_ptr(), expected.as_slice());
@@ -6861,7 +6877,9 @@ pub mod test {
             .unwrap();
 
         let target = Arc::new(crate::Page::new(44));
-        let completion = wal.read_frame(1, target.clone(), buffer_pool).unwrap();
+        let completion = wal
+            .read_frame(1, target.clone(), buffer_pool, None)
+            .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(
             &target.get_contents().as_ptr()[..page_size as usize - 8],
@@ -6897,7 +6915,7 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(43));
         let c = wal
-            .read_frames_batch(1, &[target_page], buffer_pool, None)
+            .read_frames_batch(1, &[target_page], buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -6933,7 +6951,7 @@ pub mod test {
         ];
 
         let completion = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, completion);
 
@@ -6966,7 +6984,7 @@ pub mod test {
             Arc::new(crate::Page::new(13)),
         ];
         let c = wal
-            .read_frames_batch(2, &target_pages, buffer_pool, None)
+            .read_frames_batch(2, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -6997,7 +7015,7 @@ pub mod test {
             Arc::new(crate::Page::new(9)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -7028,7 +7046,7 @@ pub mod test {
             Arc::new(crate::Page::new(22)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -7066,7 +7084,7 @@ pub mod test {
             Arc::new(crate::Page::new(99)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -7172,7 +7190,7 @@ pub mod test {
         wal_header.checksum_2 = header_checksum.1;
 
         io.wait_for_completion(
-            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &wal_header).unwrap(),
+            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &wal_header, None).unwrap(),
         )
         .unwrap();
 
@@ -7275,7 +7293,7 @@ pub mod test {
 
         let page = Arc::new(crate::storage::pager::Page::new(7));
         let issued_epoch = wal.coordination.checkpoint_epoch();
-        let completion = wal.read_frame(1, page.clone(), buffer_pool).unwrap();
+        let completion = wal.read_frame(1, page.clone(), buffer_pool, None).unwrap();
 
         wal.increment_checkpoint_epoch();
         deferred_file.complete_pending_reads();

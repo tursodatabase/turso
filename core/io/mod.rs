@@ -554,9 +554,10 @@ impl<'a> WriteBatch<'a> {
             .sum()
     }
 
-    /// Submit all writes. Returns completions caller must wait on.
+    /// Submit all writes. Returns completions caller must wait on. Each
+    /// write is added to `group`, when given, before it is submitted.
     #[inline]
-    pub fn submit(self) -> Result<Vec<Completion>> {
+    pub fn submit(self, mut group: Option<&mut CompletionGroup>) -> Result<Vec<Completion>> {
         let mut completions = Vec::with_capacity(self.ops.len());
         for WriteOp { pos, bufs } in self.ops {
             let total_len = bufs.iter().map(|b| b.len()).sum::<usize>() as i32;
@@ -569,6 +570,9 @@ impl<'a> WriteBatch<'a> {
                     "pwritev wrote {bytes_written} bytes, expected {total_len}"
                 );
             });
+            if let Some(group) = group.as_deref_mut() {
+                group.add(&c);
+            }
             completions.push(self.file.pwritev(pos, bufs.to_vec(), c)?);
         }
         Ok(completions)

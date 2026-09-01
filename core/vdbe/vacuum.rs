@@ -1560,13 +1560,13 @@ fn start_temp_batch_reads(
         } else {
             None
         };
-        let c = wal.read_frames_batch(
+        let _c = wal.read_frames_batch(
             *start_frame,
             run_pages,
             temp_pager.buffer_pool.clone(),
             run_scratch,
+            Some(&mut group),
         )?;
-        group.add(&c);
     }
     let combined = group.build();
 
@@ -2080,7 +2080,7 @@ fn vacuum_in_place_step(
                 let wal_file = wal.wal_file()?;
                 let mut batch = IOWriteBatch::new(wal_file);
                 batch.writev(prepared.offset, &prepared.bufs);
-                let completions = batch.submit()?;
+                let completions = batch.submit(None)?;
 
                 *phase = VacuumInPlacePhase::WriteWalBatch {
                     total_pages: *total_pages,

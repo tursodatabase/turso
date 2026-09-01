@@ -318,15 +318,12 @@ struct BalanceState {
     /// Reusable Vec for CellArray cell_payloads to avoid per-balance allocation.
     /// Cleared before each use; grows as needed and retains capacity across operations.
     reusable_cell_payloads: crate::alloc::Vec<&'static mut [u8]>,
-    /// Disk-read completions accumulated during the sibling-load loop in
-    /// `NonRootPickSiblings`. We persist them in `BalanceState` (rather than
-    /// in a local `CompletionGroup`) so that when the loop yields for spill
-    /// IO and is re-entered, completions from earlier iterations are not
-    /// lost — they would otherwise leak: the IO is still in flight, but we
-    /// would no longer have a handle to wait on them before reading page
-    /// contents in `NonRootDoBalancing`. Cleared when the loop completes
-    /// and transitions to `NonRootDoBalancing`.
-    pending_sibling_load_completions: crate::alloc::Vec<Completion>,
+    /// Group for the sibling page reads issued by `NonRootPickSiblings`.
+    /// It lives in `BalanceState` rather than on the stack so that when
+    /// the loop yields for spill IO and is re-entered, reads from earlier
+    /// iterations are still waited on before `NonRootDoBalancing` looks at
+    /// page contents. Taken and built when the loop completes.
+    sibling_load_group: Option<CompletionGroup>,
 }
 
 impl Default for BalanceState {
@@ -336,7 +333,7 @@ impl Default for BalanceState {
             balance_info: None,
             reusable_divider_buffers: std::array::from_fn(|_| crate::alloc::vec![]),
             reusable_cell_payloads: crate::alloc::vec![],
-            pending_sibling_load_completions: crate::alloc::vec![],
+            sibling_load_group: None,
         }
     }
 }
@@ -3250,7 +3247,7 @@ impl BTreeCursor {
                 balance_info,
                 reusable_divider_buffers,
                 reusable_cell_payloads,
-                pending_sibling_load_completions,
+                sibling_load_group,
             } = &mut self.balance_state;
             tracing::debug!(?sub_state);
 
@@ -3403,8 +3400,10 @@ impl BTreeCursor {
                     let mut pgno: u32 =
                         unsafe { right_pointer.cast::<u32>().read_unaligned().swap_bytes() };
                     let current_sibling = sibling_pointer;
+                    let group =
+                        sibling_load_group.get_or_insert_with(|| CompletionGroup::new(|_| {}));
                     for i in (0..=current_sibling).rev() {
-                        match self.pager.read_page(pgno as i64) {
+                        match self.pager.read_page_into(pgno as i64, Some(group)) {
                             Err(e) => {
                                 mark_unlikely();
                                 tracing::error!("error reading page {}: {}", pgno, e);
@@ -3412,30 +3411,21 @@ impl BTreeCursor {
                                 // across previous iterations / yields so the
                                 // IO scheduler can finalize them before we
                                 // bail out.
-                                self.pager
-                                    .io
-                                    .drain_completions(pending_sibling_load_completions)?;
-                                pending_sibling_load_completions.clear();
+                                self.pager.io.drain_completions(group.completions())?;
+                                *sibling_load_group = None;
                                 return Err(e);
                             }
-                            Ok(IOResult::Done((page, c))) => {
+                            Ok(IOResult::Done((page, _))) => {
                                 pages_to_balance[i].replace(PinGuard::new(page));
-                                if let Some(c) = c {
-                                    // Accumulate in `BalanceState` rather
-                                    // than a local group: a spill yield
-                                    // later in this loop drops local state
-                                    // but the persistent vec survives.
-                                    pending_sibling_load_completions.push(c);
-                                }
                             }
                             Ok(IOResult::IO(IOCompletions(spill_c))) => {
                                 // Spill yield. The loop is fully re-entrant:
                                 // on re-entry we re-execute from the top of
                                 // `NonRootPickSiblings`, the pager's
                                 // `pending_reads` returns the same PageRef
-                                // for the in-flight sibling, and cache hits
-                                // for previously-loaded siblings yield
-                                // `c=None` so we don't double-add them.
+                                // for the in-flight sibling (its read is
+                                // already in the group), and cache hits for
+                                // previously-loaded siblings need no read.
                                 io_yield_one!(spill_c);
                             }
                         }
@@ -3506,15 +3496,13 @@ impl BTreeCursor {
                         reusable_divider_cell: crate::alloc::vec![],
                     });
                     *sub_state = BalanceSubState::NonRootDoBalancing;
-                    // Build the wait-group from the accumulated completions
-                    // collected across (possibly multiple) calls. Drain so
-                    // a subsequent balance operation starts fresh.
-                    let mut group = CompletionGroup::new(|_| {});
-                    let completions = take_vec(pending_sibling_load_completions);
-                    for c in &completions {
-                        group.add(c);
-                    }
-                    let completion = group.build();
+                    // Wait for the sibling reads issued across (possibly
+                    // multiple) entries into this state. Take the group so
+                    // the next balance starts fresh.
+                    let completion = sibling_load_group
+                        .take()
+                        .expect("the sibling loop above created the group")
+                        .build();
                     if !completion.finished() {
                         io_yield_one!(completion);
                     }
@@ -10344,7 +10332,6 @@ mod tests {
         let balance = BalanceState::default();
         assert_alloc_vec(&balance.reusable_divider_buffers[0]);
         assert_alloc_vec(&balance.reusable_cell_payloads);
-        assert_alloc_vec(&balance.pending_sibling_load_completions);
         let integrity_check = IntegrityCheckState::new(0);
         assert_alloc_vec(&integrity_check.page_stack);
         let op_integrity_check =

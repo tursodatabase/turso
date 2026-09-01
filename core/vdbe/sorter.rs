@@ -422,16 +422,12 @@ impl Sorter {
             InitChunkHeapState::Start => {
                 let mut group = CompletionGroup::new(|_| {});
                 for chunk in self.chunks.iter_mut() {
-                    match chunk.read() {
-                        Err(e) => {
-                            tracing::error!("Failed to read chunk: {e}");
-                            group.cancel();
-                            self.io.drain_completions(group.completions())?;
-                            return Err(e);
-                        }
-                        Ok(Some(c)) => group.add(&c),
-                        Ok(None) => {}
-                    };
+                    if let Err(e) = chunk.read(Some(&mut group)) {
+                        tracing::error!("Failed to read chunk: {e}");
+                        group.cancel();
+                        self.io.drain_completions(group.completions())?;
+                        return Err(e);
+                    }
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
                 let completion = group.build();
@@ -450,9 +446,7 @@ impl Sorter {
                 // TODO: blocking will be unnecessary here with IO completions
                 let mut group = CompletionGroup::new(|_| {});
                 for chunk_idx in 0..self.chunks.len() {
-                    if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
-                        group.add(&c);
-                    };
+                    self.push_to_chunk_heap(chunk_idx, Some(&mut group))?;
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::Start;
                 let completion = group.build();
@@ -481,14 +475,14 @@ impl Sorter {
                 return Ok(IOResult::IO(IOCompletions(completion)));
             }
             // IO completed - push result to heap and retry
-            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx, None)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
         }
 
         // No pending IO - safe to pop from heap
         if let Some((next_record, chunk_idx)) = self.chunk_heap.pop() {
-            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx, None)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
             return Ok(IOResult::Done(Some(next_record.0)));
@@ -498,10 +492,17 @@ impl Sorter {
         Ok(IOResult::Done(None))
     }
 
-    fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<Option<Completion>> {
+    /// Pushes the next record of chunk `chunk_idx` onto the heap. If the
+    /// chunk needs a read first, the read is added to `group` when given,
+    /// and its completion is returned.
+    fn push_to_chunk_heap(
+        &mut self,
+        chunk_idx: usize,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<Option<Completion>> {
         let chunk = &mut self.chunks[chunk_idx];
 
-        match chunk.next()? {
+        match chunk.next(group)? {
             ChunkNextResult::Done(Some(record)) => {
                 self.chunk_heap.try_push((
                     Reverse(Box::new(BoxedSortableRecord::new(
@@ -672,7 +673,7 @@ impl SortedChunk {
     /// Internally manages a two-phase state machine:
     /// - `Start`: Parse records from buffer, issue prefetch read if needed
     /// - `Finish`: Return the next parsed record
-    fn next(&mut self) -> Result<ChunkNextResult> {
+    fn next(&mut self, mut group: Option<&mut CompletionGroup>) -> Result<ChunkNextResult> {
         loop {
             match self.next_state {
                 NextState::Start => {
@@ -734,7 +735,7 @@ impl SortedChunk {
                     if self.records.len() == 1
                         && *self.io_state.read() != SortedChunkIOState::ReadEOF
                     {
-                        if let Some(c) = self.read()? {
+                        if let Some(c) = self.read(group.as_deref_mut())? {
                             if !c.succeeded() {
                                 return Ok(ChunkNextResult::IO(c));
                             }
@@ -755,7 +756,9 @@ impl SortedChunk {
     /// if there's no room in the buffer or no data left to read (no IO issued).
     ///
     /// On completion, appends data to `buffer` and updates `buffer_len` and `total_bytes_read`.
-    fn read(&mut self) -> Result<Option<Completion>> {
+    /// Reads more of the chunk file into the buffer. The read is added to
+    /// `group`, when given, before it is submitted.
+    fn read(&mut self, group: Option<&mut CompletionGroup>) -> Result<Option<Completion>> {
         let free_buffer_space = self.buffer.read().len() - self.buffer_len();
         let remaining_chunk_bytes =
             self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst);
@@ -806,6 +809,9 @@ impl SortedChunk {
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
+        if let Some(group) = group {
+            group.add(&c);
+        }
         let c = self.file.pread(
             self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64,
             c,

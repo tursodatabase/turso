@@ -2210,16 +2210,17 @@ impl Connection {
         frame_watermark: Option<u64>,
     ) -> Result<Option<(Arc<Page>, Completion)>> {
         let pager = self.pager.load();
-        let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
-            Ok(result) => result,
-            // on windows, zero read will trigger UnexpectedEof
-            #[cfg(target_os = "windows")]
-            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
-                std::io::ErrorKind::UnexpectedEof,
-                _,
-            ))) => return Ok(None),
-            Err(err) => return Err(err),
-        };
+        let (page_ref, c) =
+            match pager.read_page_no_cache(page_idx as i64, frame_watermark, true, None) {
+                Ok(result) => result,
+                // on windows, zero read will trigger UnexpectedEof
+                #[cfg(target_os = "windows")]
+                Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
+                    std::io::ErrorKind::UnexpectedEof,
+                    _,
+                ))) => return Ok(None),
+                Err(err) => return Err(err),
+            };
 
         Ok(Some((page_ref, c)))
     }
