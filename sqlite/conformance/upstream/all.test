@@ -326,12 +326,12 @@ set test_files {
   join7                fail
   join8                skip {needs "load_static_extension" (series)}
   join9                fail
-  joinA                fail
-  joinB                fail
-  joinC                fail
+  joinA                pass
+  joinB                pass
+  joinC                pass
   joinD                fail
   joinE                pass
-  joinF                fail
+  joinF                pass
   joinH                fail
   journal1             skip {tests rollback journal files; Turso is WAL-only and will never support rollback journal modes}
   journal2             skip {tests rollback journal files; Turso is WAL-only and will never support rollback journal modes}
@@ -752,7 +752,7 @@ set test_files {
   upfrom1              fail
   upfrom2              fail
   upfrom3              fail
-  upfrom4              fail
+  upfrom4              pass
   upsert1              fail
   upsert2              fail
   upsert3              fail

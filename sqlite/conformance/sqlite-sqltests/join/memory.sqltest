@@ -475,7 +475,6 @@ expect {
     3|3
 }
 
-@skip-if sqlite "sqlite supports full outer joins"
 @cross-check-integrity
 test full-outer-join {
 	create table t(a);
@@ -484,7 +483,10 @@ test full-outer-join {
 	insert into u values (2), (3);
 	select coalesce(t.a, u.a) as a from t full outer join u using(a) order by a;
 }
-expect error {
+expect {
+    1
+    2
+    3
 }
 
 # Regression test for LEFT JOIN + materialized subquery bug
