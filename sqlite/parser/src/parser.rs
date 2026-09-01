@@ -989,7 +989,9 @@ impl<'a> Parser<'a> {
             return Err(Error::Custom("unexpected COMMA in vtab args".to_owned()));
         }
 
-        Ok(smol_str::SmolStr::from(from_bytes(&self.lexer.input[start_idx..end_idx])))
+        Ok(smol_str::SmolStr::from(from_bytes(
+            &self.lexer.input[start_idx..end_idx],
+        )))
     }
 
     fn parse_create_virtual(&mut self) -> Result<Stmt> {

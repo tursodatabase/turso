@@ -212,6 +212,16 @@ impl ToTokens for String {
     }
 }
 
+impl ToTokens for smol_str::SmolStr {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_ANY, Some(self.as_str()))
+    }
+}
+
 impl_display_for_to_tokens!(Cmd);
 impl ToTokens for Cmd {
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
