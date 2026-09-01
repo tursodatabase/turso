@@ -1,0 +1,7 @@
+db/
+plot/*.csv
+plot/*.png
+plot/*.pdf
+plot/*.tikz
+plot/bench.log
+plot/.status
