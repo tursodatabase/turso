@@ -657,7 +657,8 @@ fn write_timeline(path: &std::path::Path, engine_label: &str, config: &Config, t
     out.flush().unwrap();
 }
 
-/// CPU time this process has used so far, user and system.
+/// CPU time this process has used so far, user and system. Zero where
+/// getrusage is not available.
 #[derive(Debug, Clone, Copy)]
 struct CpuTime {
     user: Duration,
@@ -674,6 +675,15 @@ impl std::ops::Sub for CpuTime {
     }
 }
 
+#[cfg(not(unix))]
+fn cpu_time() -> CpuTime {
+    CpuTime {
+        user: Duration::ZERO,
+        system: Duration::ZERO,
+    }
+}
+
+#[cfg(unix)]
 fn cpu_time() -> CpuTime {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: RUSAGE_SELF is always valid and getrusage fills the struct on
@@ -703,6 +713,12 @@ struct DiskStats {
 }
 
 impl DiskStats {
+    #[cfg(not(target_os = "linux"))]
+    fn for_path(_path: &std::path::Path) -> Option<DiskStats> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
     fn for_path(path: &std::path::Path) -> Option<DiskStats> {
         use std::os::unix::fs::MetadataExt;
         let dev = std::fs::metadata(path).ok()?.dev();

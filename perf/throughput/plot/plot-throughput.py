@@ -230,7 +230,8 @@ class Figure:
         the last marker, led by a sample of the group's line style."""
         return (rf"\node[anchor=south east, xshift=-10pt, yshift=3pt, font=\scriptsize, text=black!60] "
                 rf"at (axis cs:{self.connections[-1]},{y:.4g}) "
-                rf"{{\tikz[baseline=-0.5ex, x=1cm, y=1cm]\draw[black!60, line width=0.8pt, {style}] (0,0) -- (0.45,0); {text}}};")
+                rf"{{\tikz[baseline=-0.5ex, x=1cm, y=1cm]"
+                rf"\draw[black!60, line width=0.8pt, {style}] (0,0) -- (0.45,0); {text}}};")
 
 
 if __name__ == "__main__":
