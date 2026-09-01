@@ -17,7 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
-use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::alloc::TryReserveError;
 use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
@@ -294,9 +294,7 @@ impl TryClone for Register {
         match (self, source) {
             (Register::Value(dst), Register::Value(src)) => dst.try_clone_from(src)?,
             (Register::Record(dst), Register::Record(src)) => {
-                let buf = dst.as_blob_mut();
-                buf.clear();
-                buf.try_extend(src.get_payload().iter().copied())?;
+                dst.replace_payload(src.get_payload())?;
             }
             (dst, Register::Value(src)) => {
                 let mut value = Value::Null;
@@ -1623,6 +1621,14 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    pub cursors_worth_caching_column_positions: BitSet,
+}
+
+impl PreparedProgram {
+    #[inline(always)]
+    pub fn cursor_caches_column_positions(&self, cursor_id: usize) -> bool {
+        self.cursors_worth_caching_column_positions.get(cursor_id)
+    }
 }
 
 #[derive(Clone)]

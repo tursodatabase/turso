@@ -2264,6 +2264,9 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
+        let cursors_worth_caching_column_positions =
+            pick_cursors_worth_caching_column_positions(&self.insns)?;
+
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2284,6 +2287,7 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            cursors_worth_caching_column_positions,
         };
         Ok(prepared)
     }
@@ -2314,5 +2318,136 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Pseudo(_)
                 | CursorType::Sorter
         )
+    }
+}
+
+fn pick_cursors_worth_caching_column_positions(insns: &[(Insn, usize)]) -> crate::Result<BitSet> {
+    let mut walk_costs_per_cursor: HashMap<CursorID, HeaderWalkCosts> = HashMap::default();
+    for (insn, _) in insns {
+        if let Insn::Column {
+            cursor_id, column, ..
+        } = insn
+        {
+            walk_costs_per_cursor
+                .entry(*cursor_id)
+                .or_default()
+                .count_read_of(*column);
+        }
+    }
+    let mut worth_caching = BitSet::default();
+    for (cursor_id, walk_costs) in walk_costs_per_cursor {
+        if walk_costs.caching_wins() {
+            worth_caching.set(cursor_id)?;
+        }
+    }
+    Ok(worth_caching)
+}
+
+const CACHED_FILL_COST_IN_DECODES_PER_COLUMN: usize = 4;
+const CACHED_BREAK_EVEN_SLACK_IN_DECODES: usize = 16;
+
+#[derive(Default)]
+struct HeaderWalkCosts {
+    decodes_without_cache: usize,
+    columns_one_shared_walk_must_fill: usize,
+}
+
+impl HeaderWalkCosts {
+    fn count_read_of(&mut self, column: usize) {
+        let decodes_to_walk_from_the_front = column + 1;
+        self.decodes_without_cache += decodes_to_walk_from_the_front;
+        self.columns_one_shared_walk_must_fill = self
+            .columns_one_shared_walk_must_fill
+            .max(decodes_to_walk_from_the_front);
+    }
+
+    fn caching_wins(&self) -> bool {
+        let decodes_with_cache = self.columns_one_shared_walk_must_fill
+            * CACHED_FILL_COST_IN_DECODES_PER_COLUMN
+            + CACHED_BREAK_EVEN_SLACK_IN_DECODES;
+        self.decodes_without_cache > decodes_with_cache
+    }
+}
+
+#[cfg(test)]
+mod column_position_cache_gating_tests {
+    use super::*;
+
+    fn column_read(cursor_id: CursorID, column: usize) -> (Insn, usize) {
+        (
+            Insn::Column {
+                cursor_id,
+                column,
+                dest: 0,
+                default: None,
+            },
+            0,
+        )
+    }
+
+    fn worth_caching(insns: &[(Insn, usize)]) -> BitSet {
+        pick_cursors_worth_caching_column_positions(insns).unwrap()
+    }
+
+    #[test]
+    fn one_read_of_a_late_column_walks_exactly_as_far_as_the_fill_would() {
+        assert!(!worth_caching(&[column_read(0, 9)]).get(0));
+    }
+
+    #[test]
+    fn two_early_columns_cost_too_few_decodes_to_repay_a_fill() {
+        assert!(!worth_caching(&[column_read(0, 0), column_read(0, 1)]).get(0));
+    }
+
+    #[test]
+    fn select_star_over_a_wide_table_repays_the_fill_many_times() {
+        let insns: Vec<_> = (0..106).map(|c| column_read(0, c)).collect();
+        assert!(worth_caching(&insns).get(0));
+    }
+
+    #[test]
+    fn select_star_over_a_narrow_table_decodes_single_byte_varints_faster_than_any_fill() {
+        let insns: Vec<_> = (0..10).map(|c| column_read(0, c)).collect();
+        assert!(!worth_caching(&insns).get(0));
+    }
+
+    #[test]
+    fn select_star_crossover_sits_between_ten_and_twenty_one_columns() {
+        let insns: Vec<_> = (0..21).map(|c| column_read(0, c)).collect();
+        assert!(worth_caching(&insns).get(0));
+    }
+
+    #[test]
+    fn reading_one_column_under_many_aggregates_walks_once_instead_of_once_per_aggregate() {
+        let insns: Vec<_> = (0..32).map(|_| column_read(0, 4)).collect();
+        assert!(worth_caching(&insns).get(0));
+    }
+
+    #[test]
+    fn a_few_far_apart_columns_cost_less_to_walk_than_to_fill() {
+        let insns = [
+            column_read(0, 90),
+            column_read(0, 2),
+            column_read(0, 50),
+            column_read(0, 7),
+        ];
+        assert!(!worth_caching(&insns).get(0));
+    }
+
+    #[test]
+    fn many_columns_read_out_of_order_share_one_walk_no_fusion_could_provide() {
+        let insns: Vec<_> = (0..40)
+            .map(|i| column_read(0, if i % 2 == 0 { 39 - i } else { i }))
+            .collect();
+        assert!(worth_caching(&insns).get(0));
+    }
+
+    #[test]
+    fn each_cursor_is_judged_on_its_own_columns() {
+        let mut insns: Vec<_> = (0..40).map(|c| column_read(0, c)).collect();
+        insns.push(column_read(1, 1));
+        let worth_caching = worth_caching(&insns);
+        assert!(worth_caching.get(0));
+        assert!(!worth_caching.get(1));
     }
 }

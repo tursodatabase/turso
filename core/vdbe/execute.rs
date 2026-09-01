@@ -25,8 +25,9 @@ use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef, SavepointR
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef,
+    ColumnPosition, Extendable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult,
+    Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
@@ -2085,11 +2086,37 @@ fn op_column_fetch(
 
                 let mut payload_iterator = record.iter()?;
 
-                // Parse the header for serial types incrementally until we have the target column
-                // Use nth_into_register to write directly to the register without
-                // creating intermediate ValueRef allocations
+                let position = record.column_position(
+                    payload_iterator.header_section_ref(),
+                    column,
+                    || program.cursor_caches_column_positions(cursor_id),
+                )?;
 
-                match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                let decoded = match position {
+                    ColumnPosition::Found {
+                        header_offset,
+                        data_offset,
+                    } => {
+                        let header = payload_iterator.header_section_ref();
+                        let data = payload_iterator.data_section_ref();
+                        if unlikely(header_offset > header.len() || data_offset > data.len()) {
+                            return Err(LimboError::Corrupt(
+                                "Data section too small for indicated serial type size".into(),
+                            ));
+                        }
+                        payload_iterator.set_header_section(&header[header_offset..]);
+                        payload_iterator.set_data_section(&data[data_offset..]);
+                        payload_iterator.nth_into_register(0, &mut state.registers[dest])
+                    }
+                    // Parse the header for serial types incrementally until we have the target column
+                    // Use nth_into_register to write directly to the register without
+                    // creating intermediate ValueRef allocations
+                    ColumnPosition::NoSuchColumn | ColumnPosition::Unusable => {
+                        payload_iterator.nth_into_register(column, &mut state.registers[dest])
+                    }
+                };
+
+                match decoded {
                     Some(result) => {
                         result?;
                         return Ok(InsnFunctionStepResult::Step);

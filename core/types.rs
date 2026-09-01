@@ -1156,6 +1156,16 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPosition {
+    Found {
+        header_offset: usize,
+        data_offset: usize,
+    },
+    NoSuchColumn,
+    Unusable,
+}
+
 mod immutable_record {
     use super::*;
 
@@ -1170,6 +1180,7 @@ mod immutable_record {
         //
         // payload is the std::vec::Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store std::vec::Vec<u8> as Value::Blob
         payload: Value,
+        column_positions: Cell<Option<Box<ColumnPositionCache>>>,
     }
 
     // SAFETY: all ImmutableRecord instances are intended to be used in a single thread
@@ -1181,6 +1192,7 @@ mod immutable_record {
         fn clone(&self) -> Self {
             Self {
                 payload: self.payload.clone(),
+                column_positions: Cell::new(None),
             }
         }
     }
@@ -1557,6 +1569,31 @@ mod immutable_record {
         }
 
         #[inline]
+        pub fn column_position(
+            &self,
+            header: &[u8],
+            column: usize,
+            cache_wanted: impl FnOnce() -> bool,
+        ) -> Result<ColumnPosition> {
+            let mut slot = self.column_positions.take();
+            let cache =
+                slot.get_or_insert_with(|| Box::new(ColumnPositionCache::new(cache_wanted())));
+            let position = cache.position_of(header, column);
+            self.column_positions.set(slot);
+            position
+        }
+
+        #[cfg(test)]
+        pub fn cached_column_count(&self) -> usize {
+            let slot = self.column_positions.take();
+            let count = slot
+                .as_ref()
+                .map_or(0, |cache| cache.column_starts.len().saturating_sub(1));
+            self.column_positions.set(slot);
+            count
+        }
+
+        #[inline]
         /// Returns true if the record contains any NULL values.
         /// This is an optimization that only examines the header (serial types)
         /// without deserializing the data section.
@@ -1646,6 +1683,7 @@ mod immutable_record {
             payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
                 payload: Value::Blob(payload),
+                column_positions: Cell::new(None),
             })
         }
 
@@ -1660,6 +1698,7 @@ mod immutable_record {
         pub fn from_buf(buf: RecordBuf) -> Self {
             Self {
                 payload: Value::Blob(buf.0),
+                column_positions: Cell::new(None),
             }
         }
 
@@ -1670,12 +1709,14 @@ mod immutable_record {
             buf.try_extend(payload.iter().copied())?;
             Ok(Self {
                 payload: Value::Blob(buf),
+                column_positions: Cell::new(None),
             })
         }
 
         pub const fn from_bin_record(payload: ValueBlob) -> Self {
             Self {
                 payload: Value::Blob(payload),
+                column_positions: Cell::new(None),
             }
         }
 
@@ -1791,6 +1832,7 @@ mod immutable_record {
             writer.assert_finish_capacity();
             Ok(Self {
                 payload: Value::Blob(buf),
+                column_positions: Cell::new(None),
             })
         }
 
@@ -1811,10 +1853,17 @@ mod immutable_record {
         }
 
         #[inline]
-        pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
+        const fn as_blob_mut(&mut self) -> &mut ValueBlob {
             match &mut self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
+            }
+        }
+
+        #[inline]
+        fn forget_column_positions(&mut self) {
+            if let Some(cache) = self.column_positions.get_mut() {
+                cache.forget_row();
             }
         }
 
@@ -1826,6 +1875,7 @@ mod immutable_record {
         #[inline]
         #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
         pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
+            self.forget_column_positions();
             let blob = self.as_blob_mut();
             blob.try_reserve(payload.len())?;
             blob.extend_from_slice(payload);
@@ -1834,7 +1884,17 @@ mod immutable_record {
 
         #[inline]
         pub fn invalidate(&mut self) {
+            self.forget_column_positions();
             self.as_blob_mut().clear();
+        }
+
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+        pub fn replace_payload(&mut self, payload: &[u8]) -> Result<(), TryReserveError> {
+            self.forget_column_positions();
+            let blob = self.as_blob_mut();
+            blob.clear();
+            blob.try_extend(payload.iter().copied())?;
+            Ok(())
         }
 
         #[inline]
@@ -1887,6 +1947,77 @@ mod immutable_record {
             ImmutableRecordRef {
                 payload: ImmutableRecordRefPayload::Borrowed(self.get_payload()),
             }
+        }
+    }
+
+    struct ColumnPositionCache {
+        column_starts: crate::alloc::Vec<ColumnStart>,
+        usable: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ColumnStart {
+        header_offset: u32,
+        data_offset: u32,
+    }
+
+    impl ColumnStart {
+        const FIRST: Self = Self {
+            header_offset: 0,
+            data_offset: 0,
+        };
+    }
+
+    impl ColumnPositionCache {
+        fn new(usable: bool) -> Self {
+            Self {
+                column_starts: crate::alloc::vec![],
+                usable,
+            }
+        }
+
+        fn forget_row(&mut self) {
+            self.column_starts.clear();
+        }
+
+        fn position_of(&mut self, header: &[u8], column: usize) -> Result<ColumnPosition> {
+            if !self.usable {
+                return Ok(ColumnPosition::Unusable);
+            }
+            if self.column_starts.is_empty() {
+                let column_count_upper_bound = header.len() + 1;
+                self.column_starts.try_reserve(column_count_upper_bound)?;
+                self.column_starts.push(ColumnStart::FIRST);
+            }
+            while self.column_starts.len() <= column + 1 {
+                let last = *self
+                    .column_starts
+                    .last()
+                    .expect("column_starts starts with ColumnStart::FIRST");
+                if last.header_offset as usize >= header.len() {
+                    return Ok(ColumnPosition::NoSuchColumn);
+                }
+                let (serial_type, varint_len) =
+                    read_varint(&header[last.header_offset as usize..])?;
+                let value_len = get_serial_type_size(serial_type)?;
+                let (Ok(header_offset), Ok(data_offset)) = (
+                    u32::try_from(last.header_offset as usize + varint_len),
+                    u32::try_from(last.data_offset as usize + value_len),
+                ) else {
+                    self.column_starts.clear();
+                    self.usable = false;
+                    return Ok(ColumnPosition::Unusable);
+                };
+                self.column_starts.push(ColumnStart {
+                    header_offset,
+                    data_offset,
+                });
+            }
+            let start = self.column_starts[column];
+            Ok(ColumnPosition::Found {
+                header_offset: start.header_offset as usize,
+                data_offset: start.data_offset as usize,
+            })
         }
     }
 }
@@ -4860,5 +4991,193 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+}
+
+#[cfg(test)]
+mod column_position_cache_tests {
+    use super::*;
+
+    fn record_of_alternating_ints_and_texts(column_count: usize) -> ImmutableRecord {
+        let values: std::vec::Vec<Value> = (0..column_count)
+            .map(|c| {
+                if c % 2 == 0 {
+                    Value::from_i64(c as i64)
+                } else {
+                    Value::build_text(format!("s{c}"))
+                }
+            })
+            .collect();
+        ImmutableRecord::from_values(values.iter(), column_count).unwrap()
+    }
+
+    fn read_through_cache(record: &ImmutableRecord, column: usize) -> Option<String> {
+        let mut iter = record.iter().unwrap();
+        let header = iter.header_section_ref();
+        let data = iter.data_section_ref();
+        let ColumnPosition::Found {
+            header_offset,
+            data_offset,
+        } = record.column_position(header, column, || true).unwrap()
+        else {
+            return None;
+        };
+        iter.set_header_section(&header[header_offset..]);
+        iter.set_data_section(&data[data_offset..]);
+        let value = iter.next().unwrap().unwrap();
+        Some(format!("{:?}", value.to_owned().unwrap()))
+    }
+
+    #[test]
+    fn cached_reads_match_uncached_reads_in_any_order() {
+        let column_count = 40;
+        let record = record_of_alternating_ints_and_texts(column_count);
+
+        let expected: std::vec::Vec<String> = record
+            .iter()
+            .unwrap()
+            .map(|v| format!("{:?}", v.unwrap().to_owned().unwrap()))
+            .collect();
+        assert_eq!(expected.len(), column_count);
+
+        let jumping_order = [39usize, 0, 17, 1, 38, 17, 5, 39, 2];
+        for &c in &jumping_order {
+            assert_eq!(
+                read_through_cache(&record, c).as_deref(),
+                Some(expected[c].as_str()),
+                "column {c} read through the cache differs"
+            );
+        }
+
+        for (c, want) in expected.iter().enumerate() {
+            assert_eq!(
+                read_through_cache(&record, c).as_deref(),
+                Some(want.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn reading_past_the_end_of_a_record_reports_no_column() {
+        let record = record_of_alternating_ints_and_texts(3);
+        assert!(read_through_cache(&record, 2).is_some());
+        assert_eq!(read_through_cache(&record, 3), None);
+        assert_eq!(read_through_cache(&record, 400), None);
+    }
+
+    #[test]
+    fn parsing_stops_at_the_column_that_was_asked_for() {
+        let record = record_of_alternating_ints_and_texts(100);
+
+        assert!(read_through_cache(&record, 3).is_some());
+        assert_eq!(record.cached_column_count(), 4);
+
+        assert!(read_through_cache(&record, 9).is_some());
+        assert_eq!(record.cached_column_count(), 10);
+
+        assert!(read_through_cache(&record, 2).is_some());
+        assert_eq!(record.cached_column_count(), 10);
+    }
+
+    #[test]
+    fn the_first_call_decides_caching_for_the_life_of_the_record() {
+        let record = record_of_alternating_ints_and_texts(8);
+        let iter = record.iter().unwrap();
+        let header = iter.header_section_ref();
+
+        assert_eq!(
+            record.column_position(header, 0, || false).unwrap(),
+            ColumnPosition::Unusable
+        );
+        assert_eq!(
+            record
+                .column_position(header, 0, || panic!("asked the gate again"))
+                .unwrap(),
+            ColumnPosition::Unusable
+        );
+    }
+
+    #[test]
+    fn a_clone_starts_cold_and_decides_for_itself() {
+        let record = record_of_alternating_ints_and_texts(8);
+        assert!(read_through_cache(&record, 7).is_some());
+        assert_eq!(record.cached_column_count(), 8);
+
+        let clone = record.clone();
+        assert_eq!(clone.cached_column_count(), 0);
+        assert!(read_through_cache(&clone, 7).is_some());
+        assert_eq!(record.cached_column_count(), 8);
+    }
+
+    #[test]
+    fn replacing_the_payload_forgets_the_old_positions() {
+        let mut reused = record_of_alternating_ints_and_texts(20);
+        let second = {
+            let values: std::vec::Vec<Value> = (0..20)
+                .map(|c| {
+                    if c % 2 == 0 {
+                        Value::build_text(format!("long-text-value-{c}"))
+                    } else {
+                        Value::from_i64(c as i64 * 1000)
+                    }
+                })
+                .collect();
+            ImmutableRecord::from_values(values.iter(), 20).unwrap()
+        };
+
+        for c in 0..20 {
+            assert!(read_through_cache(&reused, c).is_some());
+        }
+
+        reused.replace_payload(second.get_payload()).unwrap();
+
+        for c in 0..20 {
+            assert_eq!(
+                read_through_cache(&reused, c),
+                read_through_cache(&second, c),
+                "column {c} still reads at the previous row's offset"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_reuse_cycle_forgets_the_previous_row() {
+        let mut record = record_of_alternating_ints_and_texts(12);
+        for c in 0..12 {
+            assert!(read_through_cache(&record, c).is_some());
+        }
+
+        record.invalidate();
+        assert!(record.is_invalidated());
+
+        let next = {
+            let values: std::vec::Vec<Value> = (0..12)
+                .map(|c| {
+                    if c % 2 == 0 {
+                        Value::build_text(format!("much-longer-text-{c}"))
+                    } else {
+                        Value::from_i64(c as i64 * 7777)
+                    }
+                })
+                .collect();
+            ImmutableRecord::from_values(values.iter(), 12).unwrap()
+        };
+        record.start_serialization(next.get_payload()).unwrap();
+
+        for c in 0..12 {
+            assert_eq!(
+                read_through_cache(&record, c),
+                read_through_cache(&next, c),
+                "column {c} still reads at the previous row's offset"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cache_slot_costs_one_word_per_record() {
+        assert_eq!(
+            std::mem::size_of::<ImmutableRecord>(),
+            std::mem::size_of::<Value>() + std::mem::size_of::<usize>()
+        );
     }
 }
