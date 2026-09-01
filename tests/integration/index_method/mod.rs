@@ -6010,3 +6010,220 @@ fn fts_store_without_control_row_refuses_writes_and_reads_empty() {
         );
     }
 }
+
+/// Worktree-local debug tool: dump the raw FTS backing rows of the whopper
+/// database named by FTS_DUMP_DB, list physical duplicate keys, and re-run
+/// the fts_match/base-scan differential per token on a fresh (disk-truth)
+/// open. Does nothing without the env var.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_dump_backing_rows_tool() {
+    let Some(path) = std::env::var_os("FTS_DUMP_DB") else {
+        return;
+    };
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(std::path::Path::new(&path))
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("BEGIN").unwrap();
+    let _ = limbo_exec_rows(&conn, "SELECT count(*) FROM fts_docs");
+    let mut dumper =
+        turso_core::index_method::fts::FtsBackingRowDumper::new(&conn, MAIN_DB_ID, "fts_docs_fts")
+            .unwrap();
+    run(&tmp_db, || dumper.step()).unwrap();
+    let rows = std::mem::take(&mut dumper.rows);
+    drop(dumper);
+    conn.execute("ROLLBACK").unwrap();
+
+    println!("total backing rows: {}", rows.len());
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (path, _, _, _) in &rows {
+        let kind = if path.starts_with("fts2/seg/") {
+            "seg"
+        } else if path.starts_with("fts2/chunk/") {
+            "chunk"
+        } else if path.starts_with("fts2/tomb/") {
+            "tomb"
+        } else {
+            "other"
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+    println!("row kinds: {counts:?}");
+    for window in rows.windows(2) {
+        let (ap, ac, al, ah) = &window[0];
+        let (bp, bc, bl, bh) = &window[1];
+        if ap == bp && ac == bc {
+            println!(
+                "DUPLICATE KEY: path={ap} chunk_no={ac} len_a={al} hash_a={ah:016x} \
+                 len_b={bl} hash_b={bh:016x} identical={}",
+                al == bl && ah == bh
+            );
+        }
+    }
+    for (path, chunk_no, len, _) in &rows {
+        if path.starts_with("fts2/seg/") || path.starts_with("fts2/control") {
+            println!("row: {path} chunk_no={chunk_no} len={len}");
+        }
+    }
+    let tomb_counts: std::collections::BTreeMap<String, usize> = rows
+        .iter()
+        .filter(|(p, _, _, _)| p.starts_with("fts2/tomb/"))
+        .fold(Default::default(), |mut m, (p, _, _, _)| {
+            *m.entry(p.clone()).or_default() += 1;
+            m
+        });
+    println!("tombstone rows per segment: {tomb_counts:?}");
+
+    for token in [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+    ] {
+        let sql = format!(
+            "SELECT \
+               (SELECT group_concat(id) FROM (\
+                  SELECT id FROM fts_docs WHERE fts_match(body, '{token}') \
+                  EXCEPT \
+                  SELECT id FROM fts_docs WHERE (' '||body||' ') LIKE '% {token} %')), \
+               (SELECT group_concat(id) FROM (\
+                  SELECT id FROM fts_docs WHERE (' '||body||' ') LIKE '% {token} %' \
+                  EXCEPT \
+                  SELECT id FROM fts_docs WHERE fts_match(body, '{token}')))"
+        );
+        let rows = limbo_exec_rows(&conn, &sql);
+        println!("differential {token}: {rows:?}");
+    }
+}
+
+/// Deterministic reproduction of the multiprocess torn-read anomaly the
+/// whopper FTS differential caught (worktree-local; asserts CONSISTENCY, so
+/// it is RED while the bug exists).
+///
+/// Mechanism under test: `Pager::read_page`'s cache-hit fast path returns
+/// shared-cache pages with no per-snapshot validation. The cache is shared
+/// by every connection of one Database (one "process"), while commits from
+/// another Database over the same file (another "process") do not write
+/// through it. A connection holding an old read snapshot legally re-loads
+/// old-version pages into the shared cache after a sibling's
+/// changed-detection cleared it; a fresh-snapshot sibling then cache-hits a
+/// MIXTURE of old and new pages inside one statement.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
+    use turso_core::{Database, DatabaseOpts, OpenFlags, SqliteDialect};
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("torn.db");
+    let path = path.to_str().unwrap();
+    let open = || {
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new()
+                .with_multiprocess_wal(true)
+                .with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+    };
+    let db1 = open();
+    let db2 = open();
+
+    let setup = db1.connect().unwrap();
+    setup
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    setup
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..200 {
+        setup
+            .execute(format!(
+                "INSERT INTO docs VALUES ({id}, 'alpha filler{id}')"
+            ))
+            .unwrap();
+    }
+
+    let run_rows = |conn: &Arc<turso_core::Connection>, sql: &str| -> Vec<Vec<turso_core::Value>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                turso_core::StepResult::Row => {
+                    rows.push(stmt.row().unwrap().get_values().cloned().collect());
+                }
+                turso_core::StepResult::IO => {
+                    stmt._io().step().unwrap();
+                }
+                turso_core::StepResult::Done => break,
+                r => panic!("unexpected step result {r:?}"),
+            }
+        }
+        rows
+    };
+
+    // Step 1: "process" 1, connection X pins an old snapshot and warms the
+    // shared cache with FTS backing pages at that snapshot.
+    let conn_x = db1.connect().unwrap();
+    conn_x.execute("BEGIN").unwrap();
+    let _ = run_rows(
+        &conn_x,
+        "SELECT count(*) FROM docs WHERE fts_match(body, 'alpha')",
+    );
+
+    // Step 2: "process" 2 commits FTS churn — deletes make old postings
+    // dead (tombstones) and add new ones. Process 1's cache sees none of it.
+    let writer = db2.connect().unwrap();
+    for id in 0..50 {
+        writer
+            .execute(format!(
+                "UPDATE docs SET body = 'bravo fresh{id}' WHERE id = {id}"
+            ))
+            .unwrap();
+    }
+
+    // Step 3: process 1, connection Z begins a fresh snapshot: its
+    // changed-detection clears the shared cache and loads some NEW pages.
+    let conn_z = db1.connect().unwrap();
+    let _ = run_rows(&conn_z, "SELECT count(*) FROM docs WHERE id < 10");
+
+    // Step 4: connection X (still pinned at the OLD snapshot) runs another
+    // FTS statement: its loads are bounded by its own snapshot and re-fill
+    // the shared cache with OLD-version FTS pages.
+    let _ = run_rows(
+        &conn_x,
+        "SELECT count(*) FROM docs WHERE fts_match(body, 'alpha')",
+    );
+    conn_x.execute("COMMIT").unwrap();
+
+    // Step 5: a fresh-snapshot statement on process 1 must see a
+    // self-consistent view: fts_match and the padded-LIKE base scan agree.
+    // `conn_z`'s last-seen snapshot is already current, so its begin skips
+    // the cache clear — it reads whatever mixture the shared cache holds.
+    let conn_y = conn_z;
+    for token in ["alpha", "bravo"] {
+        let rows = run_rows(
+            &conn_y,
+            &format!(
+                "SELECT \
+                   (SELECT count(*) FROM (\
+                      SELECT id FROM docs WHERE fts_match(body, '{token}') \
+                      EXCEPT \
+                      SELECT id FROM docs WHERE (' '||body||' ') LIKE '% {token} %')) \
+                 + (SELECT count(*) FROM (\
+                      SELECT id FROM docs WHERE (' '||body||' ') LIKE '% {token} %' \
+                      EXCEPT \
+                      SELECT id FROM docs WHERE fts_match(body, '{token}')))"
+            ),
+        );
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::from_i64(0)]],
+            "token {token}: fts_match and the base scan disagree — torn snapshot \
+             served from the shared page cache"
+        );
+    }
+}

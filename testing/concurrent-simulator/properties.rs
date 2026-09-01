@@ -353,7 +353,10 @@ impl Property for FtsSelfDifferentialProperty {
         if symmetric_difference != Some(0) {
             bail!(
                 "step {step} fiber {fiber_id}: fts_match and the base-table scan disagree \
-                 for token {token:?}: symmetric difference {symmetric_difference:?}"
+                 for token {token:?}: symmetric difference {symmetric_difference:?} \
+                 (fts-only ids: {:?}, scan-only ids: {:?})",
+                row.get(2),
+                row.get(3)
             );
         }
         Ok(())

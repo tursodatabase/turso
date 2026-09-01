@@ -323,7 +323,15 @@ impl Operation {
                           EXCEPT \
                           SELECT id FROM {table} WHERE fts_match(body, '{token}'))), \
                        (SELECT count(*) FROM sqlite_schema \
-                          WHERE type = 'index' AND name = '{index}')"
+                          WHERE type = 'index' AND name = '{index}'), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
                 )
             }
         }
