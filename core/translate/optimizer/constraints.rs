@@ -745,6 +745,29 @@ pub fn constraints_from_where_clause(
                     continue;
                 }
             }
+
+            // A term must not constrain the loop of a table that an outer join
+            // can null-extend, except in the cases below. Consuming the
+            // term into the access path filters that table's rows, which
+            // changes which rows of the other side count as unmatched. The
+            // join then emits NULL rows that never see the term.
+            //
+            // Exception 1: terms from this table's own ON clause define what
+            // counts as a match, so they are always fine.
+            //
+            // Exception 2: on the right side of a plain LEFT JOIN, the engine
+            // re-checks consumed WHERE terms when it emits the NULL row. Any
+            // operator except `IS` is never true on a NULL row, so the
+            // re-check removes that row. This does not apply to `IS`, to an ON
+            // term of a later join, or to a table at or left of a RIGHT JOIN or
+            // FULL JOIN, whose unmatched-row pass can bypass the access path.
+            let can_use_before_null_extension = |is_op: bool| {
+                let table = table_reference.internal_id;
+                join_origin.is_some_and(|origin| origin.right_table() == table)
+                    || (!table_references.is_at_or_left_of_right_or_full_join(table)
+                        && ((join_origin.is_none() && !is_op)
+                            || !table_references.outer_join_may_null_extend(table)))
+            };
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
                 // `x IS TRUE` checks whether x is true; it does not compare x
@@ -764,37 +787,8 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
-                // A WHERE term must not constrain the loop of a table that an
-                // outer join can null-extend, with two exceptions below.
-                // Consuming the term into the access path filters that table's
-                // rows, which changes which rows of the other side count as
-                // unmatched — and the join then emits null-extended rows the
-                // consumed term is never checked against.
-                //
-                // Exception 1: terms from that join's own ON clause define what
-                // counts as a match, so they are always fine.
-                // An ON term from a later join cannot constrain this table before
-                // an earlier outer join creates a NULL row for the table.
-                //
-                // Exception 2: on the right side of a plain LEFT JOIN, the
-                // engine re-checks consumed terms when it emits the
-                // null-extended row, so any operator except `IS` stays usable
-                // there: such terms are never TRUE on a null-extended row, so
-                // the re-check removes the bogus rows. `IS` (e.g. `e.id IS
-                // NULL`) *is* TRUE on the null-extended row, so no re-check can
-                // repair it — it is unusable for every null-extendable table.
-                // A RIGHT JOIN or FULL JOIN scans unmatched right rows after
-                // the normal loops. A WHERE term cannot constrain any table in
-                // that join range because the later scan can bypass its loop.
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
-                let usable = join_origin
-                    .is_some_and(|origin| origin.right_table() == table_reference.internal_id)
-                    || if join_origin.is_some() || is_op {
-                        !table_references.outer_join_may_null_extend(table_reference.internal_id)
-                    } else {
-                        !table_references
-                            .is_at_or_left_of_right_or_full_join(table_reference.internal_id)
-                    };
+                let usable = can_use_before_null_extension(is_op);
                 // See [Constraint::null_matching]. The constraining value sits
                 // on the opposite side of the constrained column.
                 let null_matching = |constraining_expr: &ast::Expr| {

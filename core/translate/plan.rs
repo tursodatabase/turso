@@ -1888,7 +1888,7 @@ impl TableReferences {
     /// Whether an outer join in the FROM list can give this table's columns
     /// NULLs ("null-extend" it).
     ///
-    /// The right table of an outer join can get NULLs for an unmatched left row.
+    /// The right table of a LEFT JOIN or FULL JOIN can get NULLs for an unmatched left row.
     /// A RIGHT JOIN or FULL JOIN can also give NULLs to every table on its left.
     /// Those left tables have no join information of their own.
     pub fn outer_join_may_null_extend(&self, table: TableInternalId) -> bool {
@@ -1906,7 +1906,7 @@ impl TableReferences {
         if self.joined_tables[pos]
             .join_info
             .as_ref()
-            .is_some_and(JoinInfo::is_outer)
+            .is_some_and(JoinInfo::keeps_left_rows)
         {
             return true;
         }
