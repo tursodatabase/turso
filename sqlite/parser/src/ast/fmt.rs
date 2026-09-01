@@ -1013,6 +1013,13 @@ impl ToTokens for Expr {
                 filter_over.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::MergedColumn(columns) => {
+                // SQLite shows its internal merged column as coalesce() in EXPLAIN text.
+                s.append(TK_ID, Some("coalesce"))?;
+                s.append(TK_LP, None)?;
+                comma(columns, s, context)?;
+                s.append(TK_RP, None)
+            }
             Self::Id(id) => id.to_tokens(s, context),
             Self::Column { table, column, .. } => {
                 let (tbl_name, col_name) = context.get_table_and_column_names(*table, *column);

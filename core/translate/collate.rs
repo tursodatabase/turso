@@ -426,6 +426,24 @@ pub fn get_expr_collation_ctx_with_symbols(
                 }
                 return Ok(WalkControl::SkipChildren);
             }
+            Expr::MergedColumn(columns) => {
+                // SQLite gets this internal coalesce's collation from its first column only.
+                let first_column = columns
+                    .first()
+                    .expect("a merged column must have at least two source columns");
+                if let Some((collation, explicit)) = get_expr_collation_ctx_with_symbols(
+                    first_column,
+                    referenced_tables,
+                    symbol_table,
+                )? {
+                    if explicit && maybe_explicit_collseq.is_none() {
+                        maybe_explicit_collseq = Some(collation);
+                    } else if !explicit && maybe_column_collseq.is_none() {
+                        maybe_column_collseq = Some(collation);
+                    }
+                }
+                return Ok(WalkControl::SkipChildren);
+            }
             Expr::Column { table, column, .. } => {
                 // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
                 // collation from their expression, so we skip them
@@ -568,6 +586,24 @@ fn get_collseq_parts_from_expr_with_symbols(
                     maybe_column_collseq =
                         resolver.and_then(|resolver| resolver.self_table_collation(None));
                 }
+            }
+            Expr::MergedColumn(columns) => {
+                // Later columns cannot supply collation when the first column uses BINARY.
+                let first_column = columns
+                    .first()
+                    .expect("a merged column must have at least two source columns");
+                let (explicit, column) = get_collseq_parts_from_expr_with_symbols(
+                    first_column,
+                    referenced_tables,
+                    symbol_table,
+                )?;
+                if maybe_explicit_collseq.is_none() {
+                    maybe_explicit_collseq = explicit;
+                }
+                if maybe_column_collseq.is_none() {
+                    maybe_column_collseq = column;
+                }
+                return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
                 let (_, table_ref) = referenced_tables

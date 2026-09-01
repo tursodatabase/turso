@@ -80,6 +80,16 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
+        Expr::MergedColumn(columns) => {
+            // Name binding creates this node from scalar table columns only.
+            // Keep the check because later rewrites can replace a source expression.
+            for column in columns {
+                if expr_vector_size(column)? != 1 {
+                    crate::bail_parse_error!("row value misused");
+                }
+            }
+            1
+        }
         Expr::FunctionCallStar { .. } => 1,
         Expr::Id(_) => 1,
         Expr::Column { .. } => 1,
