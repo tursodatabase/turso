@@ -628,6 +628,8 @@ fn join_lhs_and_rhs<'a>(
                 .unwrap_or(false);
 
             let build_table_is_last = build_table_idx == last_lhs_table_idx;
+            // The unmatched-right pass can set every earlier table cursor to NULL.
+            // Hash materialization makes these values independent of that cursor state.
             let build_is_left_of_right_or_full_join = joined_tables
                 .iter()
                 .enumerate()

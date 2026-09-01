@@ -798,6 +798,10 @@ impl EqpDetail {
     }
 }
 
+/// Build the EQP rows for Turso's current right-preserving join pass.
+///
+/// The first row names the RIGHT-JOIN pass. Its child is a full scan because
+/// Turso does not yet plan a separate access path for unmatched right rows.
 pub(crate) fn eqp_details_for_right_join(table: &JoinedTable) -> (EqpDetail, EqpDetail) {
     let eqp_table = EqpTable::from_joined(table);
     let source = match table.table {
