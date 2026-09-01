@@ -6,6 +6,10 @@ use crate::translate::main_loop::open::{
     emit_materialized_subquery_result_columns, emit_right_join_key,
 };
 
+/// Set every source left of a right-preserving join to its NULL-row state.
+///
+/// The unmatched-right-row subroutine reuses the normal result body. These NULL
+/// states make that body produce the same row shape as SQLite.
 fn set_left_sources_to_null(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
@@ -14,10 +18,23 @@ fn set_left_sources_to_null(
 ) -> Result<()> {
     for table in tables.joined_tables().iter().take(right_table_index) {
         let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program, mode.clone())?;
-        for cursor_id in [table_cursor_id, index_cursor_id].into_iter().flatten() {
-            program.emit_insn(Insn::NullRow { cursor_id });
-        }
-        if let Table::FromClauseSubquery(subquery) = &table.table {
+        emit_null_row_for_source(program, table, table_cursor_id, index_cursor_id);
+    }
+    Ok(())
+}
+
+/// Emit SQLite's null-row steps for one outer-join source.
+///
+/// A subquery can read cached result registers, so SQLite clears those too.
+/// `NullRow` leaves a recursive pseudo-row unchanged in both engines.
+fn emit_null_row_for_source(
+    program: &mut ProgramBuilder,
+    table: &JoinedTable,
+    table_cursor_id: Option<CursorID>,
+    index_cursor_id: Option<CursorID>,
+) {
+    match &table.table {
+        Table::FromClauseSubquery(subquery) => {
             if let Some(start_reg) = subquery.result_columns_start_reg {
                 if !subquery.columns.is_empty() {
                     program.emit_insn(Insn::Null {
@@ -27,10 +44,17 @@ fn set_left_sources_to_null(
                 }
             }
         }
+        Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => {}
     }
-    Ok(())
+    for cursor_id in [table_cursor_id, index_cursor_id].into_iter().flatten() {
+        program.emit_insn(Insn::NullRow { cursor_id });
+    }
 }
 
+/// Emit each right-side row that the main join loop did not match.
+///
+/// Table-backed sources are rewound and checked against the stored rowid set.
+/// A recursive CTE exposes only its current pseudo-row, so it uses a direct check.
 fn emit_unmatched_right_rows(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
@@ -45,6 +69,26 @@ fn emit_unmatched_right_rows(
     let table_cursor_id =
         table_cursor_id.expect("a right-preserving join must keep its table cursor open");
 
+    if matches!(table.table, Table::RecursiveCteInput(_)) {
+        // SQLite checks the current recursive row directly because a pseudo-row cannot rewind.
+        let scan_end = program.allocate_label();
+        emit_right_join_key(program, right_join, table_cursor_id);
+        // A pseudo-row has a NULL rowid. Turso's bloom filter rejects NULL keys,
+        // but the exact ephemeral-index lookup supports them and decides the result.
+        program.emit_insn(Insn::Found {
+            cursor_id: right_join.matched_rows_cursor_id,
+            target_pc: scan_end,
+            record_reg: right_join.rowid_reg,
+            num_regs: 1,
+        });
+        program.emit_insn(Insn::Gosub {
+            target_pc: right_join.body_label,
+            return_reg: right_join.return_reg,
+        });
+        program.preassign_label_to_next_insn(scan_end);
+        return Ok(());
+    }
+
     match &table.table {
         Table::BTree(btree) => program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
@@ -53,6 +97,7 @@ fn emit_unmatched_right_rows(
         }),
         Table::FromClauseSubquery(subquery) if subquery.materialized_cursor_id.is_some() => {}
         _ => {
+            // Turso cannot yet restart a coroutine or virtual table for this pass.
             return Err(crate::LimboError::InternalError(
                 "right-preserving joins need a table-backed right source".to_string(),
             ));
@@ -69,6 +114,7 @@ fn emit_unmatched_right_rows(
     program.preassign_label_to_next_insn(scan_start);
 
     emit_right_join_key(program, right_join, table_cursor_id);
+    // The bloom filter can skip most exact lookups. It never decides that a row matched.
     program.emit_insn(Insn::Filter {
         cursor_id: right_join.matched_rows_cursor_id,
         target_pc: emit_row,
@@ -150,6 +196,8 @@ impl CloseLoop {
             }
 
             if let Some(right_join) = t_ctx.meta_right_joins[table_index].as_ref() {
+                // The unmatched-row scan enters the normal body with Gosub.
+                // Return sends that path back, but normal loop execution falls through.
                 program.preassign_label_to_next_insn(right_join.return_label);
                 program.emit_insn(Insn::Return {
                     return_reg: right_join.return_reg,
@@ -439,6 +487,8 @@ impl CloseLoop {
             }
 
             if let Some(right_join) = t_ctx.meta_right_joins[table_index].as_ref() {
+                // Join-condition failure can reach the loop end from the same subroutine.
+                // Keep a Return on that path before outer-loop cleanup starts.
                 program.emit_insn(Insn::Return {
                     return_reg: right_join.return_reg,
                     can_fallthrough: true,
@@ -499,34 +549,8 @@ impl CloseLoop {
                         target_pc: label_when_right_table_notnull,
                         decrement_by: 0,
                     });
-                    // If the left join match flag is still 0, it means there was no match on the right table,
-                    // but since it's a LEFT JOIN, we still need to emit a row with NULLs for the right table.
-                    // In that case, we now enter the routine that does exactly that.
-                    // First we set the right table cursor's "pseudo null bit" on, which means any Insn::Column will return NULL.
-                    // This needs to be set for both the table and the index cursor, if present,
-                    // since even if the iteration cursor is the index cursor, it might fetch values from the table cursor.
-                    [table_cursor_id, index_cursor_id]
-                        .iter()
-                        .filter_map(|maybe_cursor_id| maybe_cursor_id.as_ref())
-                        .for_each(|cursor_id| {
-                            program.emit_insn(Insn::NullRow {
-                                cursor_id: *cursor_id,
-                            });
-                        });
-                    if let Table::FromClauseSubquery(from_clause_subquery) = &table.table {
-                        if let Some(start_reg) = from_clause_subquery.result_columns_start_reg {
-                            let column_count = from_clause_subquery.columns.len();
-                            if column_count > 0 {
-                                // Subqueries materialize their row into registers rather than being read back
-                                // through a cursor. NullRow only affects cursor reads, so we also have to
-                                // explicitly null out the cached registers or stale values would be re-emitted.
-                                program.emit_insn(Insn::Null {
-                                    dest: start_reg,
-                                    dest_end: Some(start_reg + column_count - 1),
-                                });
-                            }
-                        }
-                    }
+                    // The normal body must see a NULL right source for this unmatched left row.
+                    emit_null_row_for_source(program, table, table_cursor_id, index_cursor_id);
                     // Re-enter the loop body at match-flag set so
                     // post-join predicates are re-evaluated with right-table NULLs.
                     program.emit_insn(Insn::Goto {

@@ -1381,6 +1381,8 @@ fn choose_from_clause_subquery_execution_mode(
     keeps_right_rows: bool,
 ) -> FromClauseSubqueryExecutionMode {
     if keeps_right_rows {
+        // The unmatched-row pass must restart and scan this source after the main loop.
+        // A coroutine cannot rewind, and a direct seek index can omit preserved rows.
         return FromClauseSubqueryExecutionMode::MaterializedTable;
     }
 
@@ -1601,6 +1603,7 @@ pub fn emit_from_clause_subqueries(
         program.pop_current_parent_explain();
     }
 
+    // SQLite lists each RIGHT-JOIN pass after the normal source plans.
     for table in tables.joined_tables() {
         if table
             .join_info

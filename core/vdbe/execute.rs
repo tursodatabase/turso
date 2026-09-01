@@ -5939,6 +5939,12 @@ pub fn op_row_id(
                     } else {
                         state.registers[*dest].set_null();
                     }
+                } else if let Some(Cursor::Pseudo(_)) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
+                {
+                    // SQLite gives a pseudo-row a NULL rowid. Recursive joins use it as a match key.
+                    state.registers[*dest].set_null();
                 } else {
                     mark_unlikely();
                     return Err(LimboError::InternalError(
