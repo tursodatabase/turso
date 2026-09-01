@@ -597,6 +597,60 @@ test false-where-term-still-ends-right-join-query {
 expect {
 }
 
+@cross-check-integrity
+test right-join-view-metadata-uses-the-visible-using-column {
+    CREATE TABLE left_source(keep TEXT, x TEXT);
+    CREATE TABLE right_source(x REAL, keep_right BLOB);
+    CREATE VIEW expression_view AS
+        SELECT x FROM left_source RIGHT JOIN right_source USING(x);
+    CREATE VIEW star_view AS
+        SELECT * FROM left_source RIGHT JOIN right_source USING(x);
+    CREATE VIEW left_star_view AS
+        SELECT left_source.*
+          FROM left_source RIGHT JOIN right_source USING(x);
+
+    SELECT 'expression', name, type
+      FROM pragma_table_info('expression_view');
+    SELECT 'star', name, type
+      FROM pragma_table_info('star_view');
+    SELECT 'left-star', name, type
+      FROM pragma_table_info('left_star_view');
+}
+expect {
+    expression|x|REAL
+    star|keep|TEXT
+    star|x|REAL
+    star|keep_right|BLOB
+    left-star|keep|TEXT
+    left-star|x|REAL
+}
+
+test right-join-view-rejects-an-unmerged-earlier-using-column {
+    CREATE TABLE left_one(x TEXT);
+    CREATE TABLE left_two(x REAL);
+    CREATE TABLE right_one(x BLOB);
+    CREATE VIEW invalid_view AS
+        SELECT x
+          FROM left_one JOIN left_two ON true
+          RIGHT JOIN right_one USING(x);
+}
+expect error {
+    ambiguous reference to x in USING()
+}
+
+test right-join-view-checks-the-right-column-before-left-ambiguity {
+    CREATE TABLE left_one(x);
+    CREATE TABLE left_two(x);
+    CREATE TABLE right_without_x(y);
+    CREATE VIEW invalid_view AS
+        SELECT *
+          FROM left_one JOIN left_two ON true
+          RIGHT JOIN right_without_x USING(x);
+}
+expect error {
+    cannot join using column x - column not present in both tables
+}
+
 # The shared row body must run output subqueries again for unmatched right rows.
 # Otherwise, the result and sort key keep a value from the last matched row.
 @cross-check-integrity
