@@ -3580,7 +3580,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
+                let Some(text_str) = validate_utf8(text_data) else {
                     mark_unlikely();
                     return Some(Err(LimboError::Corrupt(
                         "TEXT value contains invalid UTF-8".into(),
@@ -3626,6 +3626,41 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         }
         Ok(dests.len())
     }
+}
+
+/// UTF-8 validation tuned for record decoding. TEXT values are usually short
+/// ASCII read at arbitrary offsets inside a b-tree page: simdutf8 only uses
+/// SIMD from 64 bytes up, and core's `from_utf8` word-at-a-time path is
+/// alignment-sensitive, so both are slow here. OR-ing every byte together is
+/// alignment-independent and branch-light; if no byte had the high bit set
+/// the value is pure ASCII and needs no further validation. Non-ASCII and
+/// values longer than the cutoff fall back to full simdutf8 validation —
+/// above the cutoff the scalar OR loop loses to real SIMD.
+///
+/// Measured by `core/benches/text_validate_benchmark.rs` (varying slice
+/// alignment, ASCII content) on an Apple M2, macOS 15.7, vs
+/// `simdutf8::basic::from_utf8` alone:
+///
+///   1-128 B:  1.4-4x faster (peak 4.1x at 16 B)
+///   256-512 B: 1.1-1.2x faster
+///   1-2 KB:   parity
+///   4 KB:     ~25% slower without the cutoff; equal with it
+///   multibyte fallback: pays the wasted OR scan (~15% at 64 B)
+///   length branch: ~+0.1ns/call, visible only on 1-2 B values
+#[inline]
+fn validate_utf8(data: &[u8]) -> Option<&str> {
+    const ASCII_SCAN_CUTOFF: usize = 512;
+    if data.len() <= ASCII_SCAN_CUTOFF {
+        let mut acc = 0u8;
+        for &byte in data {
+            acc |= byte;
+        }
+        if acc.is_ascii() {
+            // SAFETY: all bytes are ASCII, which is valid UTF-8.
+            return Some(unsafe { core::str::from_utf8_unchecked(data) });
+        }
+    }
+    simdutf8::basic::from_utf8(data).ok()
 }
 
 #[cfg(test)]
