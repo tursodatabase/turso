@@ -2221,12 +2221,21 @@ fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Sche
 /// comparison then accepts), so nothing below them counts. A comparison or an
 /// arithmetic expression yields NULL when an input is NULL, so for those it
 /// is enough that one input mentions the table.
-fn where_term_is_null_rejecting_for_table(
+fn where_term_rejects_null_row(
     expr: &ast::Expr,
     table_id: ast::TableInternalId,
+    table_references: Option<&TableReferences>,
 ) -> bool {
     use ast::Operator::*;
-    let rejects = |e: &ast::Expr| where_term_is_null_rejecting_for_table(e, table_id);
+    let rejects = |expr: &ast::Expr| where_term_rejects_null_row(expr, table_id, table_references);
+    let is_direct_virtual_column = |expr: &ast::Expr| {
+        let ast::Expr::Column { table, .. } = expr else {
+            return false;
+        };
+        table_references
+            .and_then(|tables| tables.find_joined_table_by_internal_id(*table))
+            .is_some_and(|table| matches!(table.table, Table::Virtual(_)))
+    };
     match expr {
         ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => *table == table_id,
 
@@ -2245,6 +2254,14 @@ fn where_term_is_null_rejecting_for_table(
         // terms are already split on AND, so an AND here sits under a NOT or
         // inside parentheses, where the polarity is unknown.)
         ast::Expr::Binary(lhs, And | Or, rhs) => rejects(lhs) && rejects(rhs),
+
+        // SQLite lets virtual tables interpret `x=NULL` as a usable constraint.
+        // A comparison with a virtual column does not prove that either row exists.
+        ast::Expr::Binary(
+            lhs,
+            Equals | NotEquals | Less | LessEquals | Greater | GreaterEquals,
+            rhs,
+        ) if is_direct_virtual_column(lhs) || is_direct_virtual_column(rhs) => false,
 
         // A comparison with a NULL input is never TRUE, and an arithmetic or
         // concatenation result with a NULL input is NULL. Either side counts.
@@ -2305,6 +2322,8 @@ fn enforce_indexed_by_hints(
                 let Some(forced_index) = forced_index else {
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
+                // A partial index can omit rows that a later RIGHT or FULL JOIN must keep.
+                // SQLite treats that forced index as unusable, even if its predicate matches WHERE.
                 let forced_partial_index_unusable = forced_index.where_clause.is_some()
                     && (table_references.is_left_of_right_or_full_join(table_ref.internal_id)
                         || !can_use_partial_index(forced_index.as_ref(), table_ref, where_clause));
@@ -2504,43 +2523,84 @@ fn find_table_access_plan(
     let maybe_order_target = simple_aggregate
         .and_then(|sa| simple_aggregate_order_target(sa, table_references))
         .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
-    // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
-    // will never be true for a NULL operand.
-    // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
-    // the outer join can be converted into an inner join.
-    // for example:
-    // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
-    // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
-    // hence: we can convert the outer join into an inner join.
-    //
-    // Converting a LEFT JOIN into an INNER JOIN can enable join reordering.
-    loop {
-        let mut outer_join_rewritten = false;
-        for t in table_references.joined_tables_mut().iter_mut().filter(|t| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.join_type == JoinType::LeftOuter)
-        }) {
-            // Check if a WHERE term filters out the join's null-extended rows,
-            // allowing us to convert the LEFT JOIN into an INNER JOIN for join
-            // reordering purposes. This looks at the raw WHERE terms, not the
-            // extracted constraints, so terms that never become constraints
-            // (like `t.v = 5 OR t.w = 7`) also count.
-            if where_clause.iter().any(|term| {
-                !term.from_join.is_some_and(JoinOrigin::is_outer)
-                    && where_term_is_null_rejecting_for_table(&term.expr, t.internal_id)
-            }) {
-                t.join_info.as_mut().unwrap().join_type = JoinType::Inner;
-                for term in where_clause.iter_mut() {
-                    if term.from_join == Some(JoinOrigin::Outer(t.internal_id)) {
-                        term.from_join = Some(JoinOrigin::Inner(t.internal_id));
-                    }
+
+    // Match SQLite's outer-join strength reduction. A WHERE term that rejects
+    // one null-filled side makes that side's row preservation unnecessary.
+    // SQLite visits each table once. A later reduction must not change an
+    // earlier join after SQLite has already visited that join.
+    let table_count = table_references.joined_tables().len();
+
+    for table_index in 0..table_count {
+        let table_id = table_references.joined_tables()[table_index].internal_id;
+        let join_type = table_references.joined_tables()[table_index]
+            .join_info
+            .as_ref()
+            .map(|join_info| join_info.join_type);
+        let has_later_right_or_full_join = table_references.joined_tables()[table_index + 1..]
+            .iter()
+            .any(|table| {
+                table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(JoinInfo::keeps_right_rows)
+            });
+
+        // Outer ON terms do not prove that the right table must exist.
+        // SQLite also ignores inner ON terms left of a right-preserving join.
+        let right_side_must_exist =
+            matches!(join_type, Some(JoinType::LeftOuter | JoinType::FullOuter))
+                && where_clause.iter().any(|term| {
+                    let term_can_reduce_join = if has_later_right_or_full_join {
+                        term.from_join.is_none()
+                    } else {
+                        !term.from_join.is_some_and(JoinOrigin::is_outer)
+                    };
+                    term_can_reduce_join
+                        && where_term_rejects_null_row(&term.expr, table_id, Some(table_references))
+                });
+        if right_side_must_exist {
+            let join_info = table_references.joined_tables_mut()[table_index]
+                .join_info
+                .as_mut()
+                .expect("an outer right table has join information");
+            join_info.join_type = match join_info.join_type {
+                JoinType::LeftOuter => {
+                    clear_outer_join_origin(where_clause, table_id);
+                    JoinType::Inner
                 }
-                outer_join_rewritten = true;
-            }
+                JoinType::FullOuter => JoinType::RightOuter,
+                _ => unreachable!("only a left-preserving join reaches this branch"),
+            };
         }
-        if !outer_join_rewritten {
-            break;
+
+        if !has_later_right_or_full_join {
+            continue;
+        }
+
+        // SQLite ignores every ON term for this test. An inner ON term to
+        // the left of a RIGHT JOIN does not require that left row to exist.
+        let left_side_must_exist = where_clause.iter().any(|term| {
+            term.from_join.is_none()
+                && where_term_rejects_null_row(&term.expr, table_id, Some(table_references))
+        });
+        if !left_side_must_exist {
+            continue;
+        }
+
+        for later_table in table_references.joined_tables_mut()[table_index + 1..].iter_mut() {
+            let Some(join_info) = later_table.join_info.as_mut() else {
+                continue;
+            };
+            join_info.join_type = match join_info.join_type {
+                JoinType::RightOuter => {
+                    clear_outer_join_origin(where_clause, later_table.internal_id);
+                    JoinType::Inner
+                }
+                JoinType::FullOuter => {
+                    JoinType::LeftOuter
+                }
+                other => other,
+            };
         }
     }
 
@@ -2642,6 +2702,18 @@ fn find_table_access_plan(
         sort_eliminated,
         initial_input_rows: initial_input_cardinality,
     }))
+}
+
+/// Remove the outer-join marker from terms for one table.
+///
+/// SQLite does this as soon as an outer join becomes an inner join. Terms
+/// from that join can then reduce tables that SQLite has not visited yet.
+fn clear_outer_join_origin(where_clause: &mut [WhereTerm], table_id: ast::TableInternalId) {
+    for term in where_clause {
+        if term.from_join.and_then(JoinOrigin::outer_table) == Some(table_id) {
+            term.from_join = None;
+        }
+    }
 }
 
 /// Write chosen table reads into the query plan.
@@ -4385,7 +4457,7 @@ fn build_seek_def(
 
 #[cfg(test)]
 mod tests {
-    use super::{where_term_is_null_rejecting_for_table, Optimizable};
+    use super::{where_term_rejects_null_row, Optimizable};
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
@@ -4513,7 +4585,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("127".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4539,7 +4611,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("1".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, target_table));
+        assert!(!where_term_rejects_null_row(&expr, target_table, None));
     }
 
     #[test]
@@ -4568,7 +4640,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("2".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4585,7 +4657,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Null)),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4608,11 +4680,8 @@ mod tests {
             rhs: vec![Box::new(Expr::Literal(ast::Literal::Numeric("1".into())))],
         };
 
-        assert!(!where_term_is_null_rejecting_for_table(
-            &not_in_empty,
-            table
-        ));
-        assert!(where_term_is_null_rejecting_for_table(&in_value, table));
+        assert!(!where_term_rejects_null_row(&not_in_empty, table, None));
+        assert!(where_term_rejects_null_row(&in_value, table, None));
     }
 
     #[test]
@@ -4634,7 +4703,7 @@ mod tests {
             }),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4651,7 +4720,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4668,7 +4737,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4698,7 +4767,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4735,7 +4804,7 @@ mod tests {
         // Any CASE can turn NULL inputs into a non-NULL result (here the ELSE
         // arm yields 0 for a NULL t.col), so no CASE term proves anything
         // about null-extended rows. Same rule as SQLite's impliesNotNullRow.
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4755,7 +4824,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("1".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4782,9 +4851,10 @@ mod tests {
             ast::Operator::Or,
             Box::new(eq_five(table, 1)),
         );
-        assert!(where_term_is_null_rejecting_for_table(
+        assert!(where_term_rejects_null_row(
             &both_arms_on_table,
-            table
+            table,
+            None
         ));
 
         // t.a = 5 OR u.x = 5: the u arm can make the OR true on t's
@@ -4794,9 +4864,10 @@ mod tests {
             ast::Operator::Or,
             Box::new(eq_five(other_table, 0)),
         );
-        assert!(!where_term_is_null_rejecting_for_table(
+        assert!(!where_term_rejects_null_row(
             &one_arm_on_other_table,
-            table
+            table,
+            None
         ));
     }
 
@@ -4827,6 +4898,6 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 }
