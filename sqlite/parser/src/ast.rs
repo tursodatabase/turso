@@ -500,6 +500,22 @@ pub enum Expr {
         /// `FILTER`
         filter_over: FunctionTail,
     },
+    /// The value of an unqualified USING column that more than one table can supply.
+    ///
+    /// In `SELECT a FROM t1 FULL JOIN t2 USING(a)`, a row can be missing from
+    /// either table, so `a` is `t1.a` when that is not NULL and `t2.a` otherwise.
+    /// This node holds the source columns in that order: `[t1.a, t2.a]`.
+    ///
+    /// The value is the same as `coalesce(t1.a, t2.a)`, but comparisons treat it
+    /// like the column `t1.a`: it takes the affinity and collation of its first
+    /// column. A user-written `coalesce()` has no affinity and can take its
+    /// collation from any argument. With `t1.a INTEGER` and a row only in `t2`
+    /// whose `a` is the text `'7'`, `a = 7` is true but `coalesce(t1.a, t2.a) = 7`
+    /// is false. SQLite gets the same effect by marking its internal coalesce
+    /// call with `SQLITE_AFF_DEFER`.
+    ///
+    /// The parser never creates this node. Name binding creates it.
+    MergedColumn(Vec<Box<Expr>>),
     /// Identifier
     Id(Name),
     /// Column

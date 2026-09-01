@@ -175,6 +175,9 @@ fn translate_expr_by_kind(
         ast::Expr::Exists(_) => {
             crate::bail_parse_error!("EXISTS is not supported in this position")
         }
+        ast::Expr::MergedColumn(_) => {
+            translate_merged_column(program, referenced_tables, expr, target_register, resolver)
+        }
         ast::Expr::FunctionCall { .. } => translate_function_call_expr(
             program,
             referenced_tables,
@@ -3420,5 +3423,57 @@ fn translate_fts_score(
         0
     };
     program.emit_column_or_rowid(cursor_id, score_column, target_register);
+    Ok(target_register)
+}
+
+/// Emit the value of a merged USING column (see [ast::Expr::MergedColumn]).
+///
+/// For `[t1.a, t2.a]` this emits:
+///
+/// ```text
+///   Column t1.a -> r
+///   NotNull r -> end
+///   Column t2.a -> r
+/// end:
+/// ```
+///
+/// so `r` holds the first non-NULL source value. The collation comes from
+/// `t1.a` alone.
+#[inline(never)]
+fn translate_merged_column(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let ast::Expr::MergedColumn(columns) = expr else {
+        unreachable!("translate_merged_column expects Expr::MergedColumn");
+    };
+    assert!(columns.len() >= 2);
+    let end_label = program.allocate_label();
+    let mut first_collation = None;
+    for (index, column) in columns.iter().enumerate() {
+        let register = translate_expr_no_constant_opt(
+            program,
+            referenced_tables,
+            column,
+            target_register,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        if index == 0 {
+            first_collation = program.curr_collation_ctx();
+        }
+        program.reset_collation();
+        if index + 1 < columns.len() {
+            program.emit_insn(Insn::NotNull {
+                reg: register,
+                target_pc: end_label,
+            });
+        }
+    }
+    program.preassign_label_to_next_insn(end_label);
+    program.set_collation(first_collation);
     Ok(target_register)
 }
