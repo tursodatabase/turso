@@ -3407,6 +3407,8 @@ impl Optimizable for ast::Expr {
             Expr::Exists(..) => false,
             Expr::FunctionCall { .. } => false,
             Expr::FunctionCallStar { .. } => false,
+            // The result is NULL when every source column is NULL.
+            Expr::MergedColumn(_) => false,
             Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
             Expr::Column {
                 table,
@@ -3526,6 +3528,8 @@ impl Optimizable for ast::Expr {
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,
+            // Name binding generates this node from row-dependent table columns.
+            Expr::MergedColumn(_) => false,
             Expr::Id(_) => true,
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,

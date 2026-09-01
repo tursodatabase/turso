@@ -1642,6 +1642,12 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             Expr::FunctionCallStar { filter_over, .. } => {
                 push_function_tail_exprs(&mut stack, filter_over);
             }
+            Expr::MergedColumn(columns) => {
+                // Generated merge sources must still be checked for nested subqueries.
+                for column in columns.iter().rev() {
+                    stack.push(column.as_ref());
+                }
+            }
             Expr::InList { lhs, rhs, .. } => {
                 for item in rhs.iter().rev() {
                     stack.push(item.as_ref());

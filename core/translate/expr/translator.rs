@@ -655,6 +655,13 @@ pub fn translate_expr(
         ast::Expr::Exists(_) => {
             crate::bail_parse_error!("EXISTS is not supported in this position")
         }
+        ast::Expr::MergedColumn(columns) => translate_merged_column(
+            program,
+            referenced_tables,
+            columns,
+            target_register,
+            resolver,
+        ),
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -3164,5 +3171,46 @@ pub fn translate_expr(
         program.constant_span_end(span);
     }
 
+    Ok(target_register)
+}
+
+/// Emit SQLite's generated coalesce for a merged USING column.
+///
+/// Every source writes the same register. A `NotNull` jump keeps the first
+/// non-NULL value, while the first source alone supplies the collation.
+fn translate_merged_column(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    columns: &[Box<ast::Expr>],
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    assert!(columns.len() >= 2);
+    let end_label = program.allocate_label();
+    let mut first_collation = None;
+    for (index, column) in columns.iter().enumerate() {
+        let register = translate_expr_no_constant_opt(
+            program,
+            referenced_tables,
+            column,
+            target_register,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        if index == 0 {
+            // SQLite gives a merged column the first source column's collation.
+            first_collation = program.curr_collation_ctx();
+        }
+        program.reset_collation();
+        if index + 1 < columns.len() {
+            // The last source does not need a jump because execution already reaches the end.
+            program.emit_insn(Insn::NotNull {
+                reg: register,
+                target_pc: end_label,
+            });
+        }
+    }
+    program.preassign_label_to_next_insn(end_label);
+    program.set_collation(first_collation);
     Ok(target_register)
 }
