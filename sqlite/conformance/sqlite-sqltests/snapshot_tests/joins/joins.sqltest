@@ -920,6 +920,92 @@ snapshot full-outer-join-sqlite-style {
     FULL OUTER JOIN h_items i ON h.customer_name = i.order_name;
 }
 
+setup full_using_schema {
+    CREATE TABLE u1(id TEXT COLLATE NOCASE, a TEXT);
+    CREATE TABLE u2(id TEXT, b TEXT);
+    CREATE TABLE u3(id TEXT, c TEXT);
+}
+
+# The second join must compare u3.id with the merged u1/u2 value.
+# The result column must use the same merged value.
+@setup full_using_schema
+snapshot chained-full-join-using-merged-column {
+    SELECT id, u1.a, u2.b, u3.c
+    FROM u1
+    FULL JOIN u2 USING(id)
+    FULL JOIN u3 USING(id);
+}
+
+# RIGHT replaces the visible USING column with u2.id. The later FULL JOIN
+# keeps that choice while its join condition reads all three source columns.
+@setup full_using_schema
+snapshot right-then-full-join-using-resets-merged-column {
+    SELECT id, u1.a, u2.b, u3.c
+    FROM u1
+    RIGHT JOIN u2 USING(id)
+    FULL JOIN u3 USING(id);
+}
+
+setup outer_join_reduction_schema {
+    CREATE TABLE reduce_left(id INTEGER);
+    CREATE TABLE reduce_right(id INTEGER);
+}
+
+# A WHERE term on the right side removes the left-preserving half of FULL.
+@setup outer_join_reduction_schema
+snapshot full-join-reduces-to-right-join {
+    SELECT *
+    FROM reduce_left FULL JOIN reduce_right USING(id)
+    WHERE reduce_right.id>0;
+}
+
+# A WHERE term on the left side removes the right-preserving half of FULL.
+@setup outer_join_reduction_schema
+snapshot full-join-reduces-to-left-join {
+    SELECT *
+    FROM reduce_left FULL JOIN reduce_right USING(id)
+    WHERE reduce_left.id>0;
+}
+
+# A WHERE term on the left side removes RIGHT JOIN row preservation.
+@setup outer_join_reduction_schema
+snapshot right-join-reduces-to-inner-join {
+    SELECT *
+    FROM reduce_left RIGHT JOIN reduce_right USING(id)
+    WHERE reduce_left.id>0;
+}
+
+setup right_join_inner_on_schema {
+    CREATE TABLE reduction_chain_a(id INTEGER);
+    CREATE TABLE reduction_chain_b(id INTEGER);
+    CREATE TABLE reduction_chain_c(id INTEGER);
+    CREATE TABLE reduction_chain_d(id INTEGER);
+}
+
+# An inner ON term left of RIGHT must not start a chain of join reductions.
+@setup right_join_inner_on_schema
+snapshot inner-on-term-does-not-cascade-outer-join-reduction {
+    SELECT *
+    FROM reduction_chain_a
+    LEFT JOIN reduction_chain_b ON reduction_chain_a.id=reduction_chain_b.id
+    JOIN reduction_chain_c ON reduction_chain_b.id=reduction_chain_c.id
+    RIGHT JOIN reduction_chain_d ON true;
+}
+
+# SQLite checks joins once from left to right. Reducing the later RIGHT JOIN
+# must not make SQLite return to the earlier LEFT JOIN.
+@setup right_join_inner_on_schema
+snapshot later-right-reduction-does-not-revisit-left-join {
+    SELECT *
+    FROM reduction_chain_a
+    LEFT JOIN reduction_chain_b NOT INDEXED
+        ON reduction_chain_a.id=reduction_chain_b.id
+    JOIN reduction_chain_c ON true
+    RIGHT JOIN reduction_chain_d NOT INDEXED
+        ON reduction_chain_b.id=reduction_chain_d.id
+    WHERE reduction_chain_c.id>0;
+}
+
 setup right_join_false_inner_on_schema {
     CREATE TABLE false_inner_left(a INTEGER);
     CREATE TABLE false_inner_middle(b INTEGER);
