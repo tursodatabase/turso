@@ -577,7 +577,7 @@ pub fn constraints_from_where_clause(
         };
 
         for (i, term) in where_clause.iter().enumerate() {
-            // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
+            // Constraints originating from an outer JOIN must always be evaluated in that join's RHS table's loop,
             // regardless of which tables the constraint references.
             if let Some(outer_join_tbl) = term.from_join.and_then(JoinOrigin::outer_table) {
                 if outer_join_tbl != table_reference.internal_id {
@@ -630,6 +630,9 @@ pub fn constraints_from_where_clause(
                     .is_some_and(|origin| origin.right_table() == table_reference.internal_id)
                     || if is_op {
                         !table_references.outer_join_may_null_extend(table_reference.internal_id)
+                            && !table_references.right_or_full_join_blocks_where_constraint(
+                                table_reference.internal_id,
+                            )
                     } else {
                         !table_references
                             .right_or_full_join_blocks_where_constraint(table_reference.internal_id)

@@ -1614,14 +1614,14 @@ impl TableReferences {
     /// Whether an outer join in the FROM list can give this table's columns
     /// NULLs ("null-extend" it).
     ///
-    /// The right table of an outer join can get NULLs for an unmatched left row.
+    /// The right table of a LEFT JOIN or FULL JOIN can get NULLs for an unmatched left row.
     /// A RIGHT JOIN or FULL JOIN can also give NULLs to every table on its left.
     /// Those left tables have no join information of their own.
     pub fn outer_join_may_null_extend(&self, table: TableInternalId) -> bool {
-        let Some(pos) = self
+        let Some(table_index) = self
             .joined_tables
             .iter()
-            .position(|t| t.internal_id == table)
+            .position(|joined_table| joined_table.internal_id == table)
         else {
             // A correlated subquery does not have the outer FROM list. Its
             // table reference carries the nullability from that outer scope.
@@ -1629,44 +1629,59 @@ impl TableReferences {
                 .find_outer_query_ref_by_internal_id(table)
                 .is_some_and(|outer_ref| outer_ref.outer_join_can_add_nulls);
         };
-        if self.joined_tables[pos]
+        if self.joined_tables[table_index]
             .join_info
             .as_ref()
-            .is_some_and(JoinInfo::is_outer)
+            .is_some_and(JoinInfo::keeps_left_rows)
         {
             return true;
         }
-        self.joined_tables[pos + 1..]
+        self.joined_tables[table_index + 1..]
             .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows))
+            .any(|joined_table| {
+                joined_table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(JoinInfo::keeps_right_rows)
+            })
     }
 
     /// Whether a RIGHT JOIN or FULL JOIN blocks a WHERE constraint on this table.
     pub fn right_or_full_join_blocks_where_constraint(&self, table: TableInternalId) -> bool {
-        let Some(pos) = self
+        let Some(table_index) = self
             .joined_tables
             .iter()
-            .position(|t| t.internal_id == table)
+            .position(|joined_table| joined_table.internal_id == table)
         else {
             return false;
         };
-        self.joined_tables[pos..]
+        self.joined_tables[table_index..]
             .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows))
+            .any(|joined_table| {
+                joined_table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(JoinInfo::keeps_right_rows)
+            })
     }
 
     /// Whether this table is left of a RIGHT JOIN or FULL JOIN.
     pub fn is_left_of_right_or_full_join(&self, table: TableInternalId) -> bool {
-        let Some(pos) = self
+        let Some(table_index) = self
             .joined_tables
             .iter()
-            .position(|t| t.internal_id == table)
+            .position(|joined_table| joined_table.internal_id == table)
         else {
             return false;
         };
-        self.joined_tables[pos + 1..]
+        self.joined_tables[table_index + 1..]
             .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows))
+            .any(|joined_table| {
+                joined_table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(JoinInfo::keeps_right_rows)
+            })
     }
 
     /// Resets the expression index usages for all joined tables.

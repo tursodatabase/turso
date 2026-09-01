@@ -777,10 +777,10 @@ fn evaluate_multi_index_branches(
 ///
 /// The scan *is* the term's evaluation: rows failing it are never visited, and
 /// the term is marked consumed so nothing checks it again. For a table that an
-/// outer join can null-extend (the right table of an outer join, or any table
+/// outer join can null-extend (the right table of a LEFT/FULL JOIN, or any table
 /// on the left side of a RIGHT/FULL JOIN) that only holds for the join's
 /// own ON clause, which defines what counts as a match. Any other term must
-/// also reject the null-extended row the join emits when nothing matched, and
+/// must also reject the null-extended row the join emits when nothing matched, and
 /// that row is produced by jumping straight past the scan — so consuming such
 /// a term silently drops it.
 fn multi_index_can_consume_term(
