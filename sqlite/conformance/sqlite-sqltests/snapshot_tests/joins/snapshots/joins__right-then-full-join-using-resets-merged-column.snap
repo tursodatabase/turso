@@ -1,0 +1,98 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT id, u1.a, u2.b, u3.c
+      FROM u1
+      RIGHT JOIN u2 USING(id)
+      FULL JOIN u3 USING(id);
+info:
+  statement_type: SELECT
+  tables:
+  - u1
+  - u2
+  - u3
+  setup_blocks:
+  - full_using_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN u1
+|--SCAN u2
+|--SCAN u3 LEFT-JOIN
+|--RIGHT-JOIN u2
+|  `--SCAN u2
+`--RIGHT-JOIN u3
+   `--SCAN u3
+
+BYTECODE
+addr  opcode                     p1  p2  p3  p4             p5  comment
+   0          Init                0  68   0                  0  Start at 68
+   1          OpenRead            0   2   0  k(3,NoCase,B)   0  table=u1, root=2, iDb=0
+   2          OpenRead            2   3   0  k(3,B,B)        0  table=u2, root=3, iDb=0
+   3          OpenRead            4   4   0  k(3,B,B)        0  table=u3, root=4, iDb=0
+   4          Null                0   6   0                  0  r[6]=NULL
+   5          OpenEphemeral       1   0   0                  0  cursor=1 is_table=false
+   6          Null                0   9   0                  0  r[9]=NULL
+   7          OpenEphemeral       3   0   0                  0  cursor=3 is_table=false
+   8          Rewind              0  50   0                  0  Rewind table u1
+   9            Rewind            2  48   0                  0  Rewind table u2
+  10              Column          0   0  11                  0  r[11]=u1.id
+  11              Column          2   0  12                  0  r[12]=u2.id
+  12              Ne             11  12  46  NoCase          0  if r[11]!=r[12] goto 46
+  13              RowId           2   5   0                  0  r[5]=u2.rowid
+  14              Found           1  18   5                  0  if found goto 18
+  15              MakeRecord      5   1  13                  0  r[13]=mkrec(r[5..5])
+  16              IdxInsert       1  13   5                  0  key=r[13]
+  17              FilterAdd       1   5   1                  0  bloom_filter_add(r[5..6])
+  18              BeginSubrtn     6   0   0                  0  r[6]=NULL
+  19              Integer         0   7   0                  0  r[7]=0
+  20              Rewind          4  42   0                  0  Rewind table u3
+  21                Column        0   0  15                  0  r[15]=u1.id
+  22                NotNull      15  24   0                  0  r[15]!=NULL -> goto 24
+  23                Column        2   0  15                  0  r[15]=u2.id
+  24                Column        4   0  16                  0  r[16]=u3.id
+  25                Ne           15  16  40  NoCase          0  if r[15]!=r[16] goto 40
+  26                RowId         4   8   0                  0  r[8]=u3.rowid
+  27                Found         3  31   8                  0  if found goto 31
+  28                MakeRecord    8   1  17                  0  r[17]=mkrec(r[8..8])
+  29                IdxInsert     3  17   8                  0  key=r[17]
+  30                FilterAdd     3   8   1                  0  bloom_filter_add(r[8..9])
+  31                Integer       1   7   0                  0  r[7]=1
+  32                BeginSubrtn   9   0   0                  0  r[9]=NULL
+  33                Column        2   0   1                  0  r[1]=u2.id
+  34                NotNull       1  36   0                  0  r[1]!=NULL -> goto 36
+  35                Column        4   0   1                  0  r[1]=u3.id
+  36                Column        0   1   2                  0  r[2]=u1.a
+  37                Column        2   1   3                  0  r[3]=u2.b
+  38                Column        4   1   4                  0  r[4]=u3.c
+  39                ResultRow     1   4   0                  0  output=r[1..4]
+  40              Return          9   0   1                  0
+  41            Next              4  21   0                  1
+  42          Return              9   0   1                  0
+  43          IfPos               7  46   0                  0  r[7]>0 -> r[7]-=0, goto 46
+  44          NullRow             4   0   0                  0  Set cursor 4 to a (pseudo) NULL row
+  45          Goto                0  31   0                  0
+  46        Return                6   0   1                  0
+  47      Next                    2  10   0                  1
+  48    Return                    6   0   1                  0
+  49  Next                        0   9   0                  1
+  50  NullRow                     0   0   0                  0  Set cursor 0 to a (pseudo) NULL row
+  51  OpenRead                    2   3   0  k(3,B,B)        0  table=u2, root=3, iDb=0
+  52  Rewind                      2  58   0                  0  Rewind table u2
+  53    RowId                     2   5   0                  0  r[5]=u2.rowid
+  54    Filter                    1  56   5                  1  if !bloom_filter(r[5..6]) goto 56
+  55    Found                     1  57   5                  0  if found goto 57
+  56    Gosub                     6  19   0                  0
+  57  Next                        2  53   0                  1
+  58  NullRow                     0   0   0                  0  Set cursor 0 to a (pseudo) NULL row
+  59  NullRow                     2   0   0                  0  Set cursor 2 to a (pseudo) NULL row
+  60  OpenRead                    4   4   0  k(3,B,B)        0  table=u3, root=4, iDb=0
+  61  Rewind                      4  67   0                  0  Rewind table u3
+  62    RowId                     4   8   0                  0  r[8]=u3.rowid
+  63    Filter                    3  65   8                  1  if !bloom_filter(r[8..9]) goto 65
+  64    Found                     3  66   8                  0  if found goto 66
+  65    Gosub                     9  33   0                  0
+  66  Next                        4  62   0                  1
+  67  Halt                        0   0   0                  0
+  68  Transaction                 0   1   3                  0  iDb=0 tx_mode=Read
+  69  Goto                        0   1   0                  0
