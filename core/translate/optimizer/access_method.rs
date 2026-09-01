@@ -474,6 +474,8 @@ pub(super) fn choose_best_btree_candidate(
         }
     }
 
+    // `best_choice` starts as a table scan even when INDEXED BY removed that choice.
+    // Do not return that placeholder if all forced candidates were rejected.
     if has_valid_candidate {
         Ok(Some(best_choice))
     } else {
@@ -945,6 +947,8 @@ fn find_best_access_method_for_btree(
             ..
         } if constraint_refs.is_empty()
     );
+    // SQLite excludes this temporary-index path for a right-preserving source.
+    // The unmatched-row pass must scan the preserved source after the main loop.
     if rhs_table.indexed.is_none()
         && uses_full_table_scan
         && !lhs_mask.is_empty()
@@ -1056,6 +1060,8 @@ fn find_best_access_method_for_btree(
             );
         }
 
+        // Turso's multi-index emitters do not add matched rowids to the RIGHT JOIN set.
+        // If Turso uses one here, the final pass emits matched right rows again.
         if !keeps_right_rows {
             if let Some(multi_idx_method) = consider_multi_index_union(
                 rhs_table,
@@ -1365,19 +1371,13 @@ pub fn try_hash_join_access_method(
     {
         return Ok(None);
     }
-    // Determine join type from the probe table's join_info.
+    // The early return above sends right-preserving joins to nested loops.
     let hash_join_type = if probe_table
         .join_info
         .as_ref()
         .is_some_and(|ji| ji.is_anti())
     {
         HashJoinType::LeftAnti
-    } else if probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_full_outer())
-    {
-        HashJoinType::FullOuter
     } else if probe_table
         .join_info
         .as_ref()
@@ -1453,11 +1453,7 @@ pub fn try_hash_join_access_method(
         "hash-join equi-join keys"
     );
 
-    // A hash join normally needs at least one equi-join condition. A FULL OUTER
-    // JOIN is the exception: it has no nested-loop form, so when the ON clause has
-    // no equality (e.g. `a.x < b.x`) we still build a single-bucket hash join and
-    // let the predicate apply as a residual, rather than rejecting the query.
-    if join_keys.is_empty() && hash_join_type != HashJoinType::FullOuter {
+    if join_keys.is_empty() {
         return Ok(None);
     }
     // Custom-collated equality depends on a connection-owned callback, so the
@@ -1469,47 +1465,44 @@ pub fn try_hash_join_access_method(
         return Ok(None);
     }
 
-    if hash_join_type != HashJoinType::FullOuter {
-        for join_key in &join_keys {
-            let probe_expr = join_key.get_probe_expr(where_clause);
-            if expr_is_simple_column_from_table(probe_expr, probe_table.internal_id)
-                && probe_index_can_seek_join_key(
-                    probe_constraints,
-                    join_key,
-                    joined_before_probe_mask,
-                    probe_table_idx,
-                )
+    // Prefer nested loops when an index can read the join columns.
+    for join_key in &join_keys {
+        let probe_expr = join_key.get_probe_expr(where_clause);
+        if expr_is_simple_column_from_table(probe_expr, probe_table.internal_id)
+            && probe_index_can_seek_join_key(
+                probe_constraints,
+                join_key,
+                joined_before_probe_mask,
+                probe_table_idx,
+            )
+        {
+            return Ok(None);
+        }
+
+        let build_expr = join_key.get_build_expr(where_clause);
+        let build_is_simple_column =
+            expr_is_simple_column_from_table(build_expr, build_table.internal_id);
+
+        if build_is_simple_column && !hash_can_replace_build_index {
+            if let Some(constraint) = build_constraints
+                .constraints
+                .iter()
+                .find(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
             {
-                return Ok(None);
-            }
-
-            let build_expr = join_key.get_build_expr(where_clause);
-            let build_is_simple_column =
-                expr_is_simple_column_from_table(build_expr, build_table.internal_id);
-
-            if build_is_simple_column && !hash_can_replace_build_index {
-                if let Some(constraint) = build_constraints
-                    .constraints
-                    .iter()
-                    .find(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
-                {
-                    if let Some(column_position) = constraint.table_col_pos {
-                        if build_table
-                            .columns()
-                            .get(column_position)
-                            .is_some_and(|column| column.is_rowid_alias())
-                        {
-                            return Ok(None);
-                        }
-                        if build_constraints.candidates.iter().any(|candidate| {
-                            candidate.index.as_ref().is_some_and(|index| {
-                                index
-                                    .column_table_pos_to_index_pos(column_position)
-                                    .is_some()
-                            })
-                        }) {
-                            return Ok(None);
-                        }
+                if let Some(column_position) = constraint.table_col_pos {
+                    if build_table
+                        .columns()
+                        .get(column_position)
+                        .is_some_and(|column| column.is_rowid_alias())
+                    {
+                        return Ok(None);
+                    }
+                    if build_constraints.candidates.iter().any(|candidate| {
+                        candidate.index.as_ref().is_some_and(|index| {
+                            index.column_table_pos_to_index_pos(column_position).is_some()
+                        })
+                    }) {
+                        return Ok(None);
                     }
                 }
             }
