@@ -24,6 +24,23 @@ expect {
     -2000
 }
 
+@cross-check-integrity
+test pragma-attached-database-has-its-own-synchronous-mode {
+    PRAGMA main.synchronous=OFF;
+    ATTACH ':memory:' AS aux;
+    PRAGMA main.synchronous;
+    PRAGMA aux.synchronous;
+    PRAGMA aux.synchronous=NORMAL;
+    PRAGMA main.synchronous;
+    PRAGMA aux.synchronous;
+}
+expect {
+    0
+    2
+    0
+    1
+}
+
 test pragma-function-cache-size {
     SELECT * FROM pragma_cache_size()
 }
@@ -293,5 +310,4 @@ test pragma-page-size-set-uninitialized-db {
 expect {
     1024
 }
-
 
