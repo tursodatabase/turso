@@ -3083,10 +3083,13 @@ impl Pager {
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
     /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
     /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
+    /// `sync_mode` belongs to this pager's database because attached databases
+    /// can use a different synchronous mode from the connection's main database.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_tx(
         &self,
         connection: &Connection,
+        sync_mode: SyncMode,
         update_transaction_state: bool,
     ) -> IOResultOr<()> {
         if connection.is_nested_stmt() {
@@ -3118,7 +3121,7 @@ impl Pager {
                         CheckpointMode::Passive {
                             upper_bound_inclusive: None,
                         },
-                        connection.get_sync_mode(),
+                        sync_mode,
                         false,
                     );
                     match checkpoint_result {
@@ -3136,7 +3139,7 @@ impl Pager {
                 _ => {
                     return_if_io!(self.commit_wal(
                         connection.wal_auto_actions(),
-                        connection.get_sync_mode(),
+                        sync_mode,
                         connection.get_data_sync_retry(),
                     ));
 

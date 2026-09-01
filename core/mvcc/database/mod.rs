@@ -1720,7 +1720,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn new(
         state: CommitState<Clock, A>,
         tx_id: TxID,
@@ -1729,9 +1728,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
-        sync_mode: SyncMode,
-    ) -> Self {
-        let pager = connection.pager.load().clone();
+    ) -> Result<Self> {
+        let pager = connection.get_pager_from_database_index(&db_id)?;
+        let sync_mode = connection.get_sync_mode_for_database(db_id)?;
         // Use the connection's tx-level schema_did_change flag as the
         // single source of truth.  This flag is set by SetCookie(SchemaVersion)
         // which every DDL emits, so it covers all schema-changing operations
@@ -1743,7 +1742,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 schema_did_change: true
             }
         );
-        Self {
+        Ok(Self {
             state,
             is_finalized: false,
             #[cfg(any(test, injected_yields))]
@@ -1761,7 +1760,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             wrote_logical_log: false,
             sync_mode,
             _phantom: PhantomData,
-        }
+        })
     }
 
     fn release_group_claim(&mut self) {
@@ -3677,7 +3676,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.clone(),
                         self.connection.clone(),
                         false,
-                        self.connection.get_sync_mode(),
+                        self.sync_mode,
                         self.db_id,
                         auto_checkpoint_mode,
                     ));
@@ -7092,8 +7091,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             db_id,
             self.commit_coordinator.clone(),
             self.global_header.clone(),
-            connection.get_sync_mode(),
-        ));
+        )?);
         let state_machine = StateMachine::new(state);
         Ok(state_machine)
     }

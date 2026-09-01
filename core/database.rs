@@ -3231,11 +3231,17 @@ impl Database {
     }
 }
 
+pub(crate) struct AttachedDatabase {
+    pub(crate) db: Arc<Database>,
+    pub(crate) pager: Arc<Pager>,
+    pub(crate) sync_mode: SyncMode,
+}
+
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
     pub(crate) name_to_index: HashMap<String, usize>,
     allocated: Vec<u64>,
-    pub(crate) index_to_data: HashMap<usize, (Arc<Database>, Arc<Pager>)>,
+    pub(crate) index_to_data: HashMap<usize, AttachedDatabase>,
 }
 
 #[allow(unused)]
@@ -3249,9 +3255,7 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn get_database_by_index(&self, index: usize) -> Option<Arc<Database>> {
-        self.index_to_data
-            .get(&index)
-            .map(|(db, _pager)| db.clone())
+        self.index_to_data.get(&index).map(|entry| entry.db.clone())
     }
 
     pub(crate) fn get_name_by_index(&self, index: usize) -> Option<String> {
@@ -3267,16 +3271,12 @@ impl DatabaseCatalog {
             Some(idx) => self
                 .index_to_data
                 .get(idx)
-                .map(|(db, _pager)| (*idx, db.clone())),
+                .map(|entry| (*idx, entry.db.clone())),
         }
     }
 
-    pub(crate) fn get_pager_by_index(&self, idx: &usize) -> Arc<Pager> {
-        let (_db, pager) = self
-            .index_to_data
-            .get(idx)
-            .expect("If we are looking up a database by index, it must exist.");
-        pager.clone()
+    pub(crate) fn get_pager_by_index(&self, idx: &usize) -> Option<Arc<Pager>> {
+        self.index_to_data.get(idx).map(|entry| entry.pager.clone())
     }
 
     fn add(&mut self, s: &str) -> usize {
@@ -3291,9 +3291,16 @@ impl DatabaseCatalog {
         index
     }
 
-    pub(crate) fn insert(&mut self, s: &str, data: (Arc<Database>, Arc<Pager>)) -> usize {
+    pub(crate) fn insert(&mut self, s: &str, db: Arc<Database>, pager: Arc<Pager>) -> usize {
         let idx = self.add(s);
-        self.index_to_data.insert(idx, data);
+        self.index_to_data.insert(
+            idx,
+            AttachedDatabase {
+                db,
+                pager,
+                sync_mode: SyncMode::Full,
+            },
+        );
         idx
     }
 

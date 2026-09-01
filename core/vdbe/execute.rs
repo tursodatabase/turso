@@ -643,6 +643,7 @@ pub fn op_checkpoint(
     // Re-fetch mv_store from connection to get the latest value.
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "mvcc"`).
+    let sync_mode = program.connection.get_sync_mode_for_database(*database)?;
     let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
         use crate::state_machine::{StateTransition, TransitionResult};
@@ -653,7 +654,7 @@ pub fn op_checkpoint(
             mv_store.clone(),
             program.connection.clone(),
             true,
-            program.connection.get_sync_mode(),
+            sync_mode,
             *database,
             *checkpoint_mode,
         );
@@ -686,7 +687,7 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    let step_result = pager.checkpoint(*checkpoint_mode, program.connection.get_sync_mode(), true);
+    let step_result = pager.checkpoint(*checkpoint_mode, sync_mode, true);
     match step_result {
         Ok(IOResult::Done(CheckpointResult {
             wal_max_frame,
@@ -14675,7 +14676,7 @@ pub fn op_parse_schema(
     } else if *db != crate::MAIN_DB_ID {
         let fallback_schema = {
             let attached_dbs = conn.attached_databases.read();
-            let Some((db_inst, _pager)) = attached_dbs.index_to_data.get(db) else {
+            let Some(entry) = attached_dbs.index_to_data.get(db) else {
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::InternalError(format!(
@@ -14683,7 +14684,7 @@ pub fn op_parse_schema(
                 ))
                 .into());
             };
-            let schema = db_inst.schema.lock().clone();
+            let schema = entry.db.schema.lock().clone();
             schema
         };
         let mut schemas = conn.database_schemas().write();

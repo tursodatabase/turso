@@ -488,11 +488,11 @@ impl<'a> Resolver<'a> {
                 }),
             _ => {
                 let attached_dbs = self.attached_databases.read();
-                let (db, _pager) = attached_dbs
+                let entry = attached_dbs
                     .index_to_data
                     .get(&database_id)
                     .expect("Database ID should be valid after resolve_database_id");
-                let schema = db.schema.lock().clone();
+                let schema = entry.db.schema.lock().clone();
                 schema
             }
         };

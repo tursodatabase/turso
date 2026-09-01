@@ -10886,7 +10886,11 @@ mod tests {
             &pager,
         )
         .unwrap();
-        run_until_done(|| pager.commit_tx(&conn, true), &pager).unwrap();
+        run_until_done(
+            || pager.commit_tx(&conn, conn.get_sync_mode(), true),
+            &pager,
+        )
+        .unwrap();
 
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
@@ -11209,7 +11213,10 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+                pager
+                    .io
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .unwrap();
                 pager.begin_read_tx().unwrap();
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
                 let _c = cursor.move_to_root().unwrap();
@@ -11348,7 +11355,10 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+                pager
+                    .io
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .unwrap();
             }
 
             // Check that all keys can be found by seeking
@@ -11580,7 +11590,10 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+                pager
+                    .io
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .unwrap();
             }
 
             // Final validation
@@ -11906,7 +11919,10 @@ mod tests {
             if let Some(c) = c {
                 pager.io.wait_for_completion(c).unwrap();
             }
-            pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+            pager
+                .io
+                .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                .unwrap();
 
             // Full scan: every key must appear exactly once.
             pager.begin_read_tx().unwrap();
