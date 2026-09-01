@@ -2081,8 +2081,7 @@ fn op_column_fetch(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                let record_result = return_if_io!(cursor.record());
-                let Some(record) = record_result else {
+                let Some(record) = return_if_io!(cursor.record()) else {
                     // Cursor is not positioned on a valid row (e.g., empty table).
                     // Return NULL, not the column's default value.
                     // DEFAULT handling below is for when record exists
@@ -2242,8 +2241,7 @@ fn op_column_range_fetch(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                let record_result = return_if_io!(cursor.record());
-                let Some(record) = record_result else {
+                let Some(record) = return_if_io!(cursor.record()) else {
                     for reg in &mut state.registers[dest..dest + count] {
                         reg.set_null();
                     }
@@ -5847,6 +5845,16 @@ pub fn op_row_id(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(RowId { cursor_id, dest }, insn);
+    // Fast path: no deferred seek pending and no suspended state machine, so
+    // the op-state slot (enum write + drop per transition) is bypassed
+    // entirely. On IO resume the slot is still idle and this path re-executes.
+    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+        let result = read_rowid_into_register(state, *cursor_id, *dest)?;
+        if matches!(result, InsnFunctionStepResult::Step) {
+            state.pc += 1;
+        }
+        return Ok(result);
+    }
     loop {
         match *state.active_op_state.row_id() {
             OpRowIdState::Start => {
@@ -5904,60 +5912,9 @@ pub fn op_row_id(
                 *state.active_op_state.row_id() = OpRowIdState::GetRowid;
             }
             OpRowIdState::GetRowid => {
-                let cursors = &mut state.cursors;
-                if let Some(Cursor::NullRow) = cursors
-                    .get_mut(*cursor_id)
-                    .expect("cursor_id should be valid")
-                {
-                    state.registers[*dest].set_null();
-                } else if let Some(Cursor::BTree(btree_cursor)) = cursors
-                    .get_mut(*cursor_id)
-                    .expect("cursor_id should be valid")
-                {
-                    if btree_cursor.get_null_flag() {
-                        state.registers[*dest].set_null();
-                        break;
-                    }
-                    if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
-                        state.registers[*dest].set_int(*rowid);
-                    } else {
-                        state.registers[*dest].set_null();
-                    }
-                } else if let Some(Cursor::Virtual(virtual_cursor)) = cursors
-                    .get_mut(*cursor_id)
-                    .expect("cursor_id should be valid")
-                {
-                    let rowid = virtual_cursor.rowid();
-                    if rowid != 0 {
-                        state.registers[*dest].set_int(rowid);
-                    } else {
-                        state.registers[*dest].set_null();
-                    }
-                } else if let Some(Cursor::MaterializedView(mv_cursor)) = cursors
-                    .get_mut(*cursor_id)
-                    .expect("cursor_id should be valid")
-                {
-                    if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
-                        state.registers[*dest].set_int(rowid);
-                    } else {
-                        state.registers[*dest].set_null();
-                    }
-                } else if let Some(Cursor::IndexMethod(cursor)) = cursors
-                    .get_mut(*cursor_id)
-                    .expect("cursor_id should be valid")
-                {
-                    if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
-                        state.registers[*dest].set_int(rowid);
-                    } else {
-                        state.registers[*dest].set_null();
-                    }
-                } else {
-                    mark_unlikely();
-                    return Err(LimboError::InternalError(
-                        "RowId: cursor is not a table, virtual, or materialized view cursor"
-                            .to_string(),
-                    )
-                    .into());
+                let result = read_rowid_into_register(state, *cursor_id, *dest)?;
+                if !matches!(result, InsnFunctionStepResult::Step) {
+                    return Ok(result);
                 }
                 break;
             }
@@ -5966,6 +5923,67 @@ pub fn op_row_id(
 
     state.active_op_state.clear();
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Writes the rowid of the row `cursor_id` is positioned on into register
+/// `dest` (NULL when there is no row). Shared by op_row_id's fast path and
+/// its resumable state machine.
+fn read_rowid_into_register(state: &mut ProgramState, cursor_id: usize, dest: usize) -> InsnResult {
+    let cursors = &mut state.cursors;
+    if let Some(Cursor::NullRow) = cursors
+        .get_mut(cursor_id)
+        .expect("cursor_id should be valid")
+    {
+        state.registers[dest].set_null();
+    } else if let Some(Cursor::BTree(btree_cursor)) = cursors
+        .get_mut(cursor_id)
+        .expect("cursor_id should be valid")
+    {
+        if btree_cursor.get_null_flag() {
+            state.registers[dest].set_null();
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
+            state.registers[dest].set_int(*rowid);
+        } else {
+            state.registers[dest].set_null();
+        }
+    } else if let Some(Cursor::Virtual(virtual_cursor)) = cursors
+        .get_mut(cursor_id)
+        .expect("cursor_id should be valid")
+    {
+        let rowid = virtual_cursor.rowid();
+        if rowid != 0 {
+            state.registers[dest].set_int(rowid);
+        } else {
+            state.registers[dest].set_null();
+        }
+    } else if let Some(Cursor::MaterializedView(mv_cursor)) = cursors
+        .get_mut(cursor_id)
+        .expect("cursor_id should be valid")
+    {
+        if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
+            state.registers[dest].set_int(rowid);
+        } else {
+            state.registers[dest].set_null();
+        }
+    } else if let Some(Cursor::IndexMethod(cursor)) = cursors
+        .get_mut(cursor_id)
+        .expect("cursor_id should be valid")
+    {
+        if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
+            state.registers[dest].set_int(rowid);
+        } else {
+            state.registers[dest].set_null();
+        }
+    } else {
+        mark_unlikely();
+        return Err(LimboError::InternalError(
+            "RowId: cursor is not a table, virtual, or materialized view cursor".to_string(),
+        )
+        .into());
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
