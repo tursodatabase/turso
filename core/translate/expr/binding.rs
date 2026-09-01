@@ -90,78 +90,29 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                         }
                     }
-                    let mut match_result = None;
                     let joined_tables = referenced_tables.joined_tables();
-
                     let is_rowid_name = crate::translate::planner::ROWID_STRS
                         .iter()
                         .any(|name| name.eq_ignore_ascii_case(&normalized_id));
-                    let has_declared_column = is_rowid_name
-                        && joined_tables.iter().try_fold(false, |found, table| {
-                            if found
-                                && table
-                                    .join_info
-                                    .as_ref()
-                                    .is_some_and(|join| join.merges_column(&normalized_id))
-                            {
-                                return Ok(true);
-                            }
-                            Ok::<_, LimboError>(
-                                find_unqualified_column_with_rowid(
-                                    &table.table,
-                                    &normalized_id,
-                                    false,
-                                )?
-                                .is_some()
-                                    || found,
-                            )
-                        })?;
-                    for joined_table in joined_tables.iter() {
-                        if match_result.is_some()
-                            && joined_table
-                                .join_info
-                                .as_ref()
-                                .is_some_and(|join| join.merges_column(&normalized_id))
-                        {
-                            continue;
+                    // First check joined tables
+                    // A first-match search cannot model RIGHT reset or FULL fallback rules.
+                    let resolved_column = crate::translate::plan::resolve_unqualified_column(
+                        joined_tables,
+                        id.as_str(),
+                    )?;
+                    if let Some(resolved_column) = resolved_column {
+                        *expr = resolved_column.expr;
+                        // FULL JOIN can make the merged value read several table columns.
+                        for (table_id, column_index) in resolved_column.source_columns {
+                            referenced_tables.mark_column_used(table_id, column_index);
                         }
-                        let col_idx = find_unqualified_column_with_rowid(
-                            &joined_table.table,
-                            &normalized_id,
-                            !has_declared_column,
-                        )?;
-                        if col_idx.is_some() {
-                            if match_result.is_some() {
-                                let mut ok = false;
-                                // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
-                                // and the left table is used.
-                                if let Some(join_info) = &joined_table.join_info {
-                                    if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
-                                    }) {
-                                        ok = true;
-                                    }
-                                }
-                                if !ok {
-                                    crate::bail_parse_error!(
-                                        "ambiguous column name: {}",
-                                        id.as_str()
-                                    );
-                                }
-                            } else {
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
-                            }
-                        // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Table::BTree(btree) = &joined_table.table {
-                            if has_declared_column {
-                                continue;
-                            }
+                        return Ok(WalkControl::Continue);
+                    }
+
+                    let mut match_result = None;
+                    // No real column matched. SQLite now tries rowid names before outer scopes.
+                    for joined_table in joined_tables.iter() {
+                        if let Table::BTree(btree) = &joined_table.table {
                             if let Some(row_id_expr) =
                                 parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
                                     joined_tables.len() != 1
@@ -660,7 +611,7 @@ pub(in crate::translate) fn find_unqualified_column(
     find_unqualified_column_with_rowid(table, column_name, true)
 }
 
-fn find_unqualified_column_with_rowid(
+pub(in crate::translate) fn find_unqualified_column_with_rowid(
     table: &Table,
     column_name: &str,
     include_rowid: bool,

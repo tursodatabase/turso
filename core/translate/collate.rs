@@ -596,6 +596,7 @@ fn get_collseq_parts_from_expr_with_symbols(
                     first_column,
                     referenced_tables,
                     symbol_table,
+                    resolver,
                 )?;
                 if maybe_explicit_collseq.is_none() {
                     maybe_explicit_collseq = explicit;
