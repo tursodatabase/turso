@@ -11768,6 +11768,172 @@ mod tests {
         btree_index_insert_fuzz_run(2, 10_000);
     }
 
+    /// Re-insert an already-present index key the way FTS's RowInserter
+    /// does — seek `GE { eq_only: true }`, advance once on `TryAdvance`,
+    /// insert at the cursor — after delete churn that leaves stale interior
+    /// dividers. `insert` only checks the cursor's current cell for an
+    /// exact-key overwrite, so a caller that skips the advance lands one
+    /// leaf early and writes a second physical copy of the key (the whopper
+    /// duplicate-registry-row corruption). The full scan must see every key
+    /// exactly once.
+    #[test]
+    pub fn btree_index_reinsert_after_tryadvance_never_duplicates() {
+        use crate::storage::pager::CreateBTreeFlags;
+        let (mut rng, seed) = rng_from_time_or_env();
+        tracing::info!("seed: {seed}");
+        for attempt in 0..8 {
+            let (pager, _, _db, conn) = empty_btree();
+            let index_root_page = pager
+                .io
+                .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
+                .unwrap() as i64;
+            let index_def = Index {
+                name: "testindex".to_string(),
+                where_clause: None,
+                columns: IndexColumn::new_many(vec!["testcol"]),
+                table_name: "test".to_string(),
+                root_page: index_root_page,
+                unique: false,
+                ephemeral: false,
+                has_rowid: false,
+                index_method: None,
+                on_conflict: None,
+            };
+            let mut cursor =
+                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
+
+            let key_bytes = |i: u64| -> Vec<u8> {
+                let mut k = vec![0u8; 128];
+                k[..8].copy_from_slice(&i.to_be_bytes());
+                k
+            };
+            let record_for = |k: &[u8]| {
+                let regs = vec![Register::Value(Value::from_slice(k).unwrap())];
+                ImmutableRecord::from_registers(&regs, regs.len()).unwrap()
+            };
+
+            let mut live: Vec<u64> = Vec::new();
+            pager.begin_read_tx().unwrap();
+            pager
+                .io
+                .block(|| pager.begin_write_tx(WalAutoActions::all_enabled()))
+                .unwrap();
+            for i in 0..600u64 {
+                let record = record_for(&key_bytes(i));
+                run_until_done(
+                    || {
+                        cursor.seek(
+                            SeekKey::IndexKey(record.as_record_ref()),
+                            SeekOp::GE { eq_only: false },
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_index_key(record.as_record_ref())),
+                    pager.deref(),
+                )
+                .unwrap();
+                live.push(i);
+            }
+            // Delete a random half to churn interior dividers.
+            for _ in 0..300 {
+                let idx = rng.next_u64() as usize % live.len();
+                let victim = live.swap_remove(idx);
+                let record = record_for(&key_bytes(victim));
+                let seek_result = run_until_done(
+                    || {
+                        cursor.seek(
+                            SeekKey::IndexKey(record.as_record_ref()),
+                            SeekOp::GE { eq_only: true },
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                if matches!(seek_result, SeekResult::TryAdvance) {
+                    run_until_done(|| cursor.next(), pager.deref()).unwrap();
+                }
+                run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+            }
+            // Re-insert EVERY surviving key with RowInserter's protocol:
+            // seek GE eq_only, advance once on TryAdvance, insert.
+            let mut tryadvance_reinserts = 0usize;
+            for &survivor in &live {
+                let record = record_for(&key_bytes(survivor));
+                let seek_result = run_until_done(
+                    || {
+                        cursor.seek(
+                            SeekKey::IndexKey(record.as_record_ref()),
+                            SeekOp::GE { eq_only: true },
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                if matches!(seek_result, SeekResult::TryAdvance) {
+                    tryadvance_reinserts += 1;
+                    run_until_done(|| cursor.next(), pager.deref()).unwrap();
+                }
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_index_key(record.as_record_ref())),
+                    pager.deref(),
+                )
+                .unwrap();
+            }
+            let c = cursor.move_to_root().unwrap();
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c).unwrap();
+            }
+            pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+
+            // Full scan: every key must appear exactly once.
+            pager.begin_read_tx().unwrap();
+            let _c = cursor.move_to_root().unwrap();
+            run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            while cursor.has_record() {
+                let bytes = loop {
+                    match cursor.record().unwrap() {
+                        IOResult::Done(record) => {
+                            let record = record.unwrap();
+                            break record
+                                .get_value_opt(0)
+                                .and_then(|v| match v {
+                                    crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
+                                    _ => None,
+                                })
+                                .unwrap();
+                        }
+                        IOResult::IO(io) => {
+                            while !io.finished() {
+                                pager.io.step().unwrap();
+                            }
+                        }
+                    }
+                };
+                seen.push(bytes);
+                run_until_done(|| cursor.next(), pager.deref()).unwrap();
+            }
+            pager.end_read_tx();
+            let total = seen.len();
+            seen.dedup();
+            assert_eq!(
+                total,
+                seen.len(),
+                "attempt {attempt}: duplicate index keys after RowInserter-style \
+                 re-inserts (seed {seed}, {tryadvance_reinserts} TryAdvance re-inserts)"
+            );
+            assert_eq!(total, live.len(), "attempt {attempt}: scan count mismatch");
+            tracing::info!(
+                "attempt {attempt}: {} keys, {} TryAdvance re-inserts, no duplicates",
+                total,
+                tryadvance_reinserts
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     pub fn fuzz_long_btree_index_insert_delete_fuzz_run() {

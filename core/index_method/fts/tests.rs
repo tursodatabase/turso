@@ -188,6 +188,59 @@ fn segment_build_round_trips_through_synthesized_snapshot() {
 }
 
 #[test]
+fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(
+        &attachment,
+        &[(1, "hello turso"), (2, "hello world"), (3, "goodbye")],
+    );
+    let minted = SegmentId::from_uuid_string("0123456789abcdef0123456789abcdef").unwrap();
+    assert_ne!(segment.id(), minted);
+
+    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+        .data
+        .files
+        .iter()
+        .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
+        .collect();
+    let renamed = rename_segment_files(files.clone(), &segment.id(), &minted).unwrap();
+    assert_eq!(renamed.len(), files.len());
+    assert!(renamed
+        .keys()
+        .all(|path| path.to_str().unwrap().starts_with(&minted.uuid_string())));
+
+    // The renamed files open and answer queries under the new id: the
+    // bytes never embed the segment id.
+    let (rekeyed, _) =
+        segment_rows_from_files(minted, segment.descriptor.max_doc, renamed).unwrap();
+    let rekeyed = rekeyed.expect("non-empty segment");
+    assert_eq!(rekeyed.id(), minted);
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![rekeyed];
+    cursor.snapshot_loaded = true;
+    cursor.ensure_searcher().unwrap();
+    let searcher = cursor.searcher.as_ref().unwrap();
+    let (query, _) = cursor
+        .cached_parser
+        .as_ref()
+        .unwrap()
+        .parse_query_lenient("hello");
+    assert_eq!(
+        searcher.search(&query, &tantivy::collector::Count).unwrap(),
+        2
+    );
+
+    // A file that is not named after the source segment is a bug, not
+    // something to rename silently.
+    let mut stray = files;
+    stray.insert(PathBuf::from("meta.json"), Arc::from(Vec::new()));
+    assert!(matches!(
+        rename_segment_files(stray, &segment.id(), &minted),
+        Err(LimboError::InternalError(_))
+    ));
+}
+
+#[test]
 fn tombstoned_docs_are_invisible_at_the_reader_level() {
     let attachment = test_attachment();
     let (mut segment, _) = build_and_load_segment(

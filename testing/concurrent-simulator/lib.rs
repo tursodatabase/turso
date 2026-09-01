@@ -556,6 +556,8 @@ pub struct Stats {
     pub corruption_events: usize,
     /// Sequence nextval calls
     pub sequence_nextvals: usize,
+    /// FTS self-differential checks that ran to completion
+    pub fts_checks: usize,
     /// Same-connection checkpoint probes fired against suspended statements
     pub checkpoint_probes: usize,
 }
@@ -732,6 +734,10 @@ impl Whopper {
         let db = {
             let db_opts = DatabaseOpts::new()
                 .with_encryption(encryption_opts.is_some())
+                // Index methods power the FTS workloads; the flag only
+                // gates `CREATE INDEX ... USING` and `OPTIMIZE INDEX`, so
+                // it is safe globally.
+                .with_index_method(true)
                 .with_experimental_mvcc_passive_checkpoint(
                     opts.experimental_mvcc_passive_checkpoint,
                 );
@@ -1324,6 +1330,13 @@ impl Whopper {
     }
 
     /// Dump database files to simulator-output directory.
+    /// The database files the simulated IO holds, keyed by suffix (`.db`,
+    /// `-wal`, `-log`) so two runs can be compared without their unique
+    /// path prefix.
+    pub fn db_file_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        self.io.db_file_bytes()
+    }
+
     pub fn dump_db_files(&self) -> anyhow::Result<()> {
         let out_dir = std::path::PathBuf::from("simulator-output");
         if !out_dir.exists() {
@@ -1649,6 +1662,7 @@ impl Whopper {
     fn open_connections(&mut self) -> anyhow::Result<()> {
         let db_opts = DatabaseOpts::new()
             .with_encryption(self.encryption_opts.is_some())
+            .with_index_method(true)
             .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
         let db = Database::open_file_with_flags(
             self.io.clone(),

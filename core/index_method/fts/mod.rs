@@ -1649,8 +1649,15 @@ impl FtsCursor {
                     {
                         self.scan_descriptors.push(descriptor);
                     } else {
+                        let existing = self
+                            .scan_descriptors
+                            .iter()
+                            .find(|existing| existing.segment_id == segment_id);
                         tracing::error!(
                             segment = %segment_id.uuid_string(),
+                            identical = existing == Some(&descriptor),
+                            existing = ?existing,
+                            duplicate = ?descriptor,
                             "duplicate FTS registry row; keeping the first"
                         );
                     }
@@ -1944,21 +1951,44 @@ impl FtsCursor {
         result
     }
 
-    /// Mint a fresh on-disk index incarnation. Mixes in IO-provided entropy
-    /// so two processes creating the same index in different files do not
-    /// mint the same value (the counter restarts at 1 in every process);
-    /// the IO trait's generator is deterministic under the simulator.
+    /// Mint a fresh on-disk index incarnation. Drawn from the IO's random
+    /// source when the cursor is attached to a database: two processes
+    /// creating the same index in different files get different values,
+    /// and the simulator's seeded IO hands out the same value on the same
+    /// seed, so a seeded run replays byte for byte. Without an IO
+    /// (connection-less unit tests) a process-local counter keeps values
+    /// distinct.
     fn mint_index_incarnation(&self) -> u64 {
-        let nonce = NEXT_FTS_INDEX_INCARNATION.fetch_add(1, Ordering::Relaxed);
+        let root = self.btree_root_page.unwrap_or_default() as u64;
         let entropy = self
-            .connection
+            .io_random_u64()
+            .unwrap_or_else(|| NEXT_FTS_INDEX_INCARNATION.fetch_add(1, Ordering::Relaxed));
+        (root.rotate_left(32) ^ entropy).max(1)
+    }
+
+    /// One 64-bit draw from the pager's IO random source, if the cursor is
+    /// attached to a database.
+    fn io_random_u64(&self) -> Option<u64> {
+        self.connection
             .as_ref()
             .and_then(Weak::upgrade)
             .zip(self.database_id)
             .and_then(|(conn, database_id)| conn.get_pager_from_database_index(&database_id).ok())
-            .map_or(0, |pager| pager.io.generate_random_number() as u64);
-        let root = self.btree_root_page.unwrap_or_default() as u64;
-        (root.rotate_left(32) ^ nonce ^ entropy).max(1)
+            .map(|pager| pager.io.generate_random_number() as u64)
+    }
+
+    /// Mint the id of a segment this cursor is about to build. The id is
+    /// the key prefix of every backing row, so it decides B-tree layout;
+    /// drawing it from the IO random source keeps seeded simulator runs
+    /// replaying byte for byte (tantivy's own ids come from OS entropy).
+    /// Without an IO, tantivy's random id is used.
+    fn mint_segment_id(&self) -> SegmentId {
+        let (Some(hi), Some(lo)) = (self.io_random_u64(), self.io_random_u64()) else {
+            return SegmentId::generate_random();
+        };
+        let value = (u128::from(hi) << 64) | u128::from(lo);
+        SegmentId::from_uuid_string(&format!("{value:032x}"))
+            .expect("32 hex digits are a valid simple uuid")
     }
 
     /// Build one immutable segment from the buffered documents (if any) and
@@ -2022,8 +2052,8 @@ impl FtsCursor {
         // The segment writer pulls tokenizers off `segment.index()`, so the
         // build index needs the same registrations as the read side.
         self.register_tokenizers(&index);
-        let segment = index.new_segment();
-        let segment_id = segment.id();
+        let segment_id = self.mint_segment_id();
+        let segment = index.segment(index.new_segment_meta(segment_id, 0));
         let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
             .map_err(|e| LimboError::InternalError(format!("FTS segment writer: {e}")))?;
         for buffered in self.doc_buffer.drain(..) {
@@ -2135,9 +2165,14 @@ impl FtsCursor {
             let merged_meta = merged_metas
                 .first()
                 .ok_or_else(|| LimboError::InternalError("FTS merge produced no segment".into()))?;
-            let captured = build_dir.captured_files();
+            // `merge_filtered_segments` names its output after an OS-random
+            // id; re-key the files to a minted one (see `mint_segment_id`).
+            // Segment file bytes never embed the id, only the names do.
+            let segment_id = self.mint_segment_id();
+            let captured =
+                rename_segment_files(build_dir.captured_files(), &merged_meta.id(), &segment_id)?;
             let (segment, rows) =
-                segment_rows_from_files(merged_meta.id(), merged_meta.max_doc(), captured)?;
+                segment_rows_from_files(segment_id, merged_meta.max_doc(), captured)?;
             self.shared
                 .stats
                 .segment_builds
@@ -2416,6 +2451,33 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
 
 /// Turn a built segment's captured files into a `LoadedSegment` plus its
 /// descriptor and chunk rows.
+/// Re-key captured segment files from segment id `from` to `to`. Tantivy
+/// names every component `<segment uuid>.<ext>`; the bytes never carry the
+/// id, so a rename is all a merged segment needs to take a minted id.
+fn rename_segment_files(
+    files: HashMap<PathBuf, Arc<[u8]>>,
+    from: &SegmentId,
+    to: &SegmentId,
+) -> Result<HashMap<PathBuf, Arc<[u8]>>> {
+    let from = from.uuid_string();
+    let to = to.uuid_string();
+    files
+        .into_iter()
+        .map(|(path, bytes)| {
+            let rest = path
+                .to_str()
+                .and_then(|name| name.strip_prefix(from.as_str()))
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "FTS merge wrote a file that is not named after its segment: {}",
+                        path.display()
+                    ))
+                })?;
+            Ok((PathBuf::from(format!("{to}{rest}")), bytes))
+        })
+        .collect()
+}
+
 fn segment_rows_from_files(
     segment_id: SegmentId,
     max_doc: u32,
@@ -2499,6 +2561,68 @@ impl FtsBackingRowWiper {
 
     pub fn step(&mut self) -> Result<IOResult<()>> {
         self.deleter.step(self.cursor.as_mut())
+    }
+}
+
+/// Test helper: enumerate every raw row of an FTS index's backing store as
+/// `(path, chunk_no, byte_len, fnv64-of-bytes)`. Drive `step` to completion
+/// inside a read transaction; rows land in `rows` in key order, including
+/// physical duplicates the reader normally dedupes.
+#[cfg(feature = "test_helper")]
+pub struct FtsBackingRowDumper {
+    cursor: Box<dyn CursorTrait>,
+    started: bool,
+    advance_pending: bool,
+    pub rows: Vec<(String, i64, usize, u64)>,
+}
+
+#[cfg(feature = "test_helper")]
+impl FtsBackingRowDumper {
+    pub fn new(conn: &Arc<Connection>, database_id: usize, index_name: &str) -> Result<Self> {
+        let dir_table_name = format!(
+            "{}fts_dir_{}",
+            crate::schema::TURSO_INTERNAL_PREFIX,
+            index_name
+        );
+        let key_index_name = format!("{dir_table_name}_key");
+        let cursor = open_index_cursor(
+            conn,
+            database_id,
+            &dir_table_name,
+            &key_index_name,
+            [key_info(), key_info(), key_info()],
+        )?;
+        Ok(Self {
+            cursor,
+            started: false,
+            advance_pending: false,
+            rows: Vec::new(),
+        })
+    }
+
+    pub fn step(&mut self) -> Result<IOResult<()>> {
+        loop {
+            if !self.started {
+                return_if_io!(self.cursor.rewind());
+                self.started = true;
+            }
+            if self.advance_pending {
+                return_if_io!(self.cursor.next());
+                self.advance_pending = false;
+            }
+            if !self.cursor.has_record() {
+                return Ok(IOResult::Done(()));
+            }
+            let record = return_if_io!(self.cursor.record()).ok_or_else(|| {
+                LimboError::Corrupt("FTS dump cursor has no record payload".into())
+            })?;
+            let (path, chunk_no, bytes) = row_fields(record)?;
+            let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+            });
+            self.rows.push((path, chunk_no, bytes.len(), hash));
+            self.advance_pending = true;
+        }
     }
 }
 

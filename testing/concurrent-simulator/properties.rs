@@ -305,6 +305,64 @@ impl Property for IntegrityCheckProperty {
     }
 }
 
+/// The FTS self-differential: `fts_match` and a base-table token scan run
+/// inside one statement (one snapshot), so their id sets must be equal —
+/// the operation's SQL reports the size of the symmetric difference, plus
+/// whether the FTS index still exists (without it `fts_match` silently
+/// falls back to a scalar scan and the comparison proves nothing).
+pub struct FtsSelfDifferentialProperty;
+
+impl Property for FtsSelfDifferentialProperty {
+    fn finish_op(
+        &mut self,
+        step: usize,
+        fiber_id: usize,
+        _txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        let Operation::FtsMatchDifferential { token } = op else {
+            return Ok(());
+        };
+        let rows = match result {
+            Ok(rows) => rows,
+            // The statement is fixed and valid, so a parse or argument
+            // rejection means the table, the index, or `fts_match` itself
+            // regressed; the driver would otherwise retry it forever.
+            Err(err @ (LimboError::ParseError(_) | LimboError::InvalidArgument(_))) => bail!(
+                "step {step} fiber {fiber_id}: the FTS differential statement was rejected: {err}"
+            ),
+            // Contention errors are the driver's business; nothing to check.
+            Err(_) => return Ok(()),
+        };
+        let Some(row) = rows.first() else {
+            bail!("step {step} fiber {fiber_id}: the FTS differential returned no row");
+        };
+        let symmetric_difference = row.first().and_then(Value::as_int);
+        let index_present = row.get(1).and_then(Value::as_int);
+        if index_present != Some(1) {
+            bail!(
+                "step {step} fiber {fiber_id}: FTS index {} is missing from sqlite_schema \
+                 (count {index_present:?}); fts_match would fall back to a scalar scan and \
+                 the differential would prove nothing",
+                crate::workloads::FTS_SIM_INDEX
+            );
+        }
+        if symmetric_difference != Some(0) {
+            bail!(
+                "step {step} fiber {fiber_id}: fts_match and the base-table scan disagree \
+                 for token {token:?}: symmetric difference {symmetric_difference:?} \
+                 (fts-only ids: {:?}, scan-only ids: {:?})",
+                row.get(2),
+                row.get(3)
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Check if an integrity_check result is informational (not actual corruption).
 /// In MVCC mode, "Page N: never used" is expected for allocated but unused pages.
 fn is_integrity_check_informational(text: &str) -> bool {
