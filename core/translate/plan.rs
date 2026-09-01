@@ -1013,12 +1013,16 @@ pub enum IterationDirection {
     Backwards,
 }
 
+/// Expand `*` with SQLite's join-column rules.
+///
+/// A USING column normally appears once from its left source. A later RIGHT or
+/// FULL JOIN can change that source into a generated merged column.
 pub fn select_star(
     tables: &[JoinedTable],
     out_columns: &mut Vec<ResultSetColumn>,
     long_names: bool,
 ) -> crate::Result<()> {
-    for table in tables {
+    for (table_index, table) in tables.iter().enumerate() {
         // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
         // and should not contribute columns to SELECT *.
         if table
@@ -1061,50 +1065,44 @@ pub fn select_star(
                 }
             }
         }
-        out_columns.extend(
-            table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(column_index, _)| !table.column_is_hidden_from_star(*column_index))
-                .filter(|(_, col)| {
-                    // If we are joining with USING, we need to deduplicate the columns from the right table
-                    // that are also present in the USING clause.
-                    if let Some(join_info) = &table.join_info {
-                        !join_info.using.iter().any(|using_col| {
-                            col.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
-                        })
-                    } else {
-                        true
-                    }
-                })
-                .map(|(i, col)| {
-                    // Like SQLite, SELECT * sets column names as aliases (ENAME_NAME),
-                    // bypassing full/short column name logic in get_column_name().
-                    // When long_names (full=ON, short=OFF), use "TABLE.COLUMN".
-                    // Otherwise, use just "COLUMN".
-                    let alias = col.name.as_ref().map(|col_name| {
-                        if long_names {
-                            format!("{}.{}", table.identifier, col_name)
-                        } else {
-                            col_name.clone()
-                        }
-                    });
-                    ResultSetColumn {
-                        alias,
-                        implicit_column_name: None,
-                        expr: ast::Expr::Column {
-                            database: None,
-                            table: table.internal_id,
-                            column: i,
-                            is_rowid_alias: col.is_rowid_alias(),
-                        },
-                        contains_aggregates: false,
-                    }
-                }),
-        );
+        for (column_index, column) in table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(column_index, _)| !table.column_is_hidden_from_star(*column_index))
+        {
+            let Some(column_name) = column.name.as_deref() else {
+                // Star expansion needs a name for its output and for later USING lookups.
+                continue;
+            };
+            if table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.merges_column(column_name))
+            {
+                // If we are joining with USING, we need to deduplicate the columns from the right table
+                // that are also present in the USING clause.
+                continue;
+            }
+
+            let expr = resolve_star_column(tables, table_index, column_index, column_name)?.expr;
+            // Like SQLite, SELECT * sets column names as aliases (ENAME_NAME),
+            // bypassing full/short column name logic in get_column_name().
+            // When long_names (full=ON, short=OFF), use "TABLE.COLUMN".
+            // Otherwise, use just "COLUMN".
+            // A merged value also uses the first source column's name.
+            let alias = Some(if long_names {
+                format!("{}.{}", table.identifier, column_name)
+            } else {
+                column_name.to_string()
+            });
+            out_columns.push(ResultSetColumn {
+                alias,
+                implicit_column_name: None,
+                expr,
+                contains_aggregates: false,
+            });
+        }
     }
     Ok(())
 }
@@ -1168,6 +1166,35 @@ pub enum JoinType {
     Anti,
 }
 
+impl JoinType {
+    /// Convert parser join flags into the join type used after name binding.
+    ///
+    /// The parser keeps SQLite's accepted spellings as flags. For example,
+    /// `LEFT RIGHT JOIN` means FULL JOIN.
+    pub fn from_join_operator(operator: &ast::JoinOperator) -> Self {
+        let ast::JoinOperator::TypedJoin(Some(join_type)) = operator else {
+            return Self::Inner;
+        };
+        let has_left = join_type.contains(ast::JoinType::LEFT);
+        let has_right = join_type.contains(ast::JoinType::RIGHT);
+        // FULL OUTER: LEFT+RIGHT or bare OUTER
+        if has_left && has_right {
+            Self::FullOuter
+        } else if has_right {
+            Self::RightOuter
+        } else if has_left {
+            Self::LeftOuter
+        } else {
+            Self::Inner
+        }
+    }
+
+    /// Return true when this join keeps unmatched rows from its right side.
+    pub fn keeps_right_rows(self) -> bool {
+        matches!(self, Self::RightOuter | Self::FullOuter)
+    }
+}
+
 /// Join information for a table reference.
 #[derive(Debug, Clone)]
 pub struct JoinInfo {
@@ -1181,13 +1208,6 @@ pub struct JoinInfo {
 }
 
 impl JoinInfo {
-    /// Return true when `USING` or `NATURAL` merges this column.
-    pub fn merges_column(&self, column_name: &str) -> bool {
-        self.using
-            .iter()
-            .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
-    }
-
     /// Whether this join keeps rows from either side when they do not match.
     pub fn is_outer(&self) -> bool {
         matches!(
@@ -1203,7 +1223,14 @@ impl JoinInfo {
 
     /// Whether this join keeps unmatched rows from the right side.
     pub fn keeps_right_rows(&self) -> bool {
-        matches!(self.join_type, JoinType::RightOuter | JoinType::FullOuter)
+        self.join_type.keeps_right_rows()
+    }
+
+    /// Return true when this join merges the specified column with USING.
+    pub fn merges_column(&self, column_name: &str) -> bool {
+        self.using
+            .iter()
+            .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
     }
 
     /// Whether this is a FULL OUTER JOIN.
@@ -1230,6 +1257,157 @@ impl JoinInfo {
     pub fn is_ordering_constrained(&self) -> bool {
         self.is_outer() || self.is_semi_or_anti() || self.no_reorder
     }
+}
+
+/// A bound column and all table columns that can supply its value.
+///
+/// The source list lets the planner keep each required table column available.
+/// This is necessary when FULL JOIN produces a value from several sources.
+pub struct ResolvedColumn {
+    /// The expression that returns the visible column value.
+    pub expr: Expr,
+    /// The table columns that the expression reads.
+    pub source_columns: SmallVec<[(TableInternalId, usize); 4]>,
+}
+
+/// Apply SQLite's merge rule to one column from `*` or `table.*`.
+///
+/// SQLite treats some qualified star columns as unqualified names. It does this
+/// when a later USING clause and a later right-preserving join both exist.
+pub fn resolve_star_column(
+    tables: &[JoinedTable],
+    table_index: usize,
+    column_index: usize,
+    column_name: &str,
+) -> Result<ResolvedColumn> {
+    let later_tables = &tables[table_index + 1..];
+    if star_column_uses_merged_value(
+        later_tables
+            .iter()
+            .filter_map(|table| table.join_info.as_ref()),
+        column_name,
+    ) {
+        // SQLite emits an unqualified name here, so normal USING binding merges its value.
+        return Ok(resolve_unqualified_column(tables, column_name)?
+            .expect("star expansion found this column"));
+    }
+
+    let table = &tables[table_index];
+    let column = &table.columns()[column_index];
+    let mut source_columns = SmallVec::new();
+    source_columns.push((table.internal_id, column_index));
+    Ok(ResolvedColumn {
+        expr: ast::Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: column_index,
+            is_rowid_alias: column.is_rowid_alias(),
+        },
+        source_columns,
+    })
+}
+
+/// Return true when SQLite resolves a qualified star column as an unqualified name.
+///
+/// A later USING clause and a later right-preserving join are both required.
+/// They can belong to different joins.
+pub fn star_column_uses_merged_value<'a>(
+    later_joins: impl Iterator<Item = &'a JoinInfo>,
+    column_name: &str,
+) -> bool {
+    let mut has_later_using = false;
+    let mut has_later_right_or_full_join = false;
+    for join_info in later_joins {
+        has_later_using |= join_info.merges_column(column_name);
+        has_later_right_or_full_join |= join_info.keeps_right_rows();
+    }
+    has_later_using && has_later_right_or_full_join
+}
+
+/// Bind an unqualified column with SQLite's left-to-right USING rules.
+///
+/// INNER and LEFT keep the first copy. RIGHT replaces it. FULL adds a new
+/// fallback because either side can be NULL in an unmatched output row.
+pub fn resolve_unqualified_column(
+    tables: &[JoinedTable],
+    column_name: &str,
+) -> Result<Option<ResolvedColumn>> {
+    let mut expressions = Vec::new();
+    let mut source_columns = SmallVec::new();
+
+    for table in tables {
+        let Some((column_index, column)) =
+            table.columns().iter().enumerate().find(|(_, column)| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+            })
+        else {
+            continue;
+        };
+        let column_expr = Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: column_index,
+            is_rowid_alias: column.is_rowid_alias(),
+        };
+
+        if expressions.is_empty() {
+            // The first visible copy supplies the value until a later join changes it.
+            expressions.push(column_expr);
+            source_columns.push((table.internal_id, column_index));
+            continue;
+        }
+
+        // A repeated name is valid only when this table merged it with USING.
+        let Some(join_info) = table
+            .join_info
+            .as_ref()
+            .filter(|join_info| join_info.merges_column(column_name))
+        else {
+            crate::bail_parse_error!("ambiguous column name: {}", column_name);
+        };
+
+        match join_info.join_type {
+            JoinType::RightOuter => {
+                // SQLite resets its USING expression when RIGHT makes the new copy canonical.
+                expressions.clear();
+                source_columns.clear();
+                expressions.push(column_expr);
+                source_columns.push((table.internal_id, column_index));
+            }
+            JoinType::FullOuter => {
+                // FULL uses the new value only when all earlier copies are NULL.
+                expressions.push(column_expr);
+                source_columns.push((table.internal_id, column_index));
+            }
+            JoinType::Inner | JoinType::LeftOuter | JoinType::Semi | JoinType::Anti => {
+                // These joins keep the existing canonical copy of a USING column.
+            }
+        }
+    }
+
+    if expressions.is_empty() {
+        // The binder must still try rowid names and outer query scopes.
+        return Ok(None);
+    }
+    Ok(Some(ResolvedColumn {
+        expr: merge_columns(expressions),
+        source_columns,
+    }))
+}
+
+/// Build SQLite's generated coalesce expression for a merged USING column.
+///
+/// This is not a user function call. Its first source alone supplies affinity
+/// and collation, including when that source uses the default BINARY collation.
+pub fn merge_columns(mut expressions: Vec<Expr>) -> Expr {
+    assert!(!expressions.is_empty());
+    if expressions.len() == 1 {
+        return expressions.pop().unwrap();
+    }
+    Expr::MergedColumn(expressions.into_iter().map(Box::new).collect())
 }
 
 /// A joined table in the query plan.
@@ -1289,11 +1467,7 @@ impl JoinedTable {
             .enumerate()
             .filter_map(|(idx, col)| {
                 let col_name = col.name.as_deref()?;
-                join_info
-                    .using
-                    .iter()
-                    .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
-                    .then_some(idx)
+                join_info.merges_column(col_name).then_some(idx)
             })
             .try_collect()?;
         Ok(col_mask)

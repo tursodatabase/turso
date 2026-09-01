@@ -5,10 +5,10 @@ use super::plan::NamedWindowBound;
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        query_output_columns, Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt,
-        IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin, JoinType as PlanJoinType,
-        JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan,
-        TableReferences, WhereTerm,
+        merge_columns, query_output_columns, Aggregate, ColumnMask, ColumnUsedMask, Distinctness,
+        EvalAt, IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin,
+        JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference, Plan,
+        QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -2472,6 +2472,11 @@ pub fn parse_from(
             inner_joins.extend(joins_owned);
             joins_owned = inner_joins;
         }
+        // SQLite enables strict USING checks for the whole FROM list.
+        // A RIGHT or FULL JOIN can appear after the USING clause that needs the check.
+        let has_right_or_full_join = joins_owned
+            .iter()
+            .any(|join| PlanJoinType::from_join_operator(&join.operator).keeps_right_rows());
         parse_from_clause_table(
             *select_owned,
             resolver,
@@ -2492,6 +2497,7 @@ pub fn parse_from(
                 vtab_predicates,
                 table_references,
                 connection,
+                has_right_or_full_join,
             )?;
         }
     }
@@ -2545,6 +2551,7 @@ pub fn parse_where(
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
                 break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                // Preserve the JOIN source from the original term.
                 for new_term in new_terms.iter_mut() {
                     new_term.from_join = term.from_join;
                 }
@@ -2868,6 +2875,7 @@ fn parse_join(
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
+    has_right_or_full_join: bool,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,
@@ -2887,28 +2895,12 @@ fn parse_join(
 
     let is_cross = matches!(join_operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::CROSS));
 
-    let (plan_join_type, natural) = match join_operator {
-        ast::JoinOperator::TypedJoin(Some(join_type)) => {
-            let is_right = join_type.contains(JoinType::RIGHT);
-            let is_left = join_type.contains(JoinType::LEFT);
-            let is_outer = join_type.contains(JoinType::OUTER);
-            let is_natural = join_type.contains(JoinType::NATURAL);
-            // FULL OUTER: LEFT+RIGHT or bare OUTER
-            let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
-
-            let plan_join_type = if is_full {
-                PlanJoinType::FullOuter
-            } else if is_right {
-                PlanJoinType::RightOuter
-            } else if is_outer || is_left {
-                PlanJoinType::LeftOuter
-            } else {
-                PlanJoinType::Inner
-            };
-            (plan_join_type, is_natural)
-        }
-        _ => (PlanJoinType::Inner, false),
-    };
+    let plan_join_type = PlanJoinType::from_join_operator(&join_operator);
+    let natural = matches!(
+        join_operator,
+        ast::JoinOperator::TypedJoin(Some(join_type))
+            if join_type.contains(JoinType::NATURAL)
+    );
     let outer = !matches!(plan_join_type, PlanJoinType::Inner);
 
     if natural && constraint.is_some() {
@@ -2938,8 +2930,9 @@ fn parse_join(
                         .zip(right_col.name.as_deref())
                         .is_some_and(|(l, r)| l.eq_ignore_ascii_case(r))
                     {
+                        // SQLite keeps the right column's spelling in the generated USING list.
                         distinct_names.push(ast::Name::exact(
-                            left_col.name.clone().expect("column name is None"),
+                            right_col.name.clone().expect("column name is None"),
                         ));
                         found_match = true;
                         break;
@@ -2991,51 +2984,38 @@ fn parse_join(
                     let left_tables = &table_references.joined_tables()[..cur_table_idx];
                     turso_assert!(!left_tables.is_empty());
                     let right_table = table_references.joined_tables().last().unwrap();
-                    let mut left_col = None;
-                    for (left_table_offset, left_table) in left_tables.iter().enumerate() {
-                        left_col = left_table
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, col)| !natural || !col.hidden())
-                            .find(|(_, col)| {
-                                col.name
-                                    .as_deref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
-                            })
-                            .map(|(idx, col)| {
-                                (left_table_offset, left_table.internal_id, idx, col)
-                            });
-                        if left_col.is_some() {
-                            break;
-                        }
-                    }
-                    if left_col.is_none() {
+                    // SQLite checks the right side before it checks ambiguity on the left.
+                    // This order decides which error an invalid USING clause reports.
+                    let Some((right_col_idx, right_col)) =
+                        right_table.columns().iter().enumerate().find(|(_, col)| {
+                            col.name
+                                .as_deref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
+                        })
+                    else {
                         crate::bail_parse_error!(
                             "cannot join using column {} - column not present in both tables",
                             distinct_name.as_str()
                         );
-                    }
-                    let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
-                        col.name
-                            .as_deref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
-                    });
-                    if right_col.is_none() {
+                    };
+                    // SQLite compares the new table with all earlier copies merged by USING.
+                    let Some(LeftUsingColumn {
+                        expr: left_expr,
+                        source_columns: left_columns,
+                    }) = find_left_using_column(
+                        left_tables,
+                        distinct_name.as_str(),
+                        natural,
+                        has_right_or_full_join,
+                    )?
+                    else {
                         crate::bail_parse_error!(
                             "cannot join using column {} - column not present in both tables",
                             distinct_name.as_str()
                         );
-                    }
-                    let (left_table_idx, left_table_id, left_col_idx, left_col) = left_col.unwrap();
-                    let (right_col_idx, right_col) = right_col.unwrap();
+                    };
                     let expr = Expr::Binary(
-                        Box::new(Expr::Column {
-                            database: None,
-                            table: left_table_id,
-                            column: left_col_idx,
-                            is_rowid_alias: left_col.is_rowid_alias(),
-                        }),
+                        Box::new(left_expr),
                         ast::Operator::Equals,
                         Box::new(Expr::Column {
                             database: None,
@@ -3045,11 +3025,9 @@ fn parse_join(
                         }),
                     );
 
-                    let left_table: &mut JoinedTable = table_references
-                        .joined_tables_mut()
-                        .get_mut(left_table_idx)
-                        .unwrap();
-                    left_table.mark_column_used(left_col_idx);
+                    for (left_table_id, left_col_idx) in left_columns {
+                        table_references.mark_column_used(left_table_id, left_col_idx);
+                    }
                     let right_table: &mut JoinedTable = table_references
                         .joined_tables_mut()
                         .get_mut(cur_table_idx)
@@ -3085,6 +3063,85 @@ fn parse_join(
     Ok(())
 }
 
+/// The merged left operand for one USING equality term.
+struct LeftUsingColumn {
+    expr: Expr,
+    source_columns: SmallVec<[(TableInternalId, usize); 4]>,
+}
+
+/// Find the left operand for one USING equality term.
+///
+/// SQLite merges all earlier copies when a RIGHT or FULL JOIN exists anywhere
+/// in the FROM list. It also rejects an unmerged duplicate in that mode.
+fn find_left_using_column(
+    tables: &[JoinedTable],
+    column_name: &str,
+    ignore_hidden_columns: bool,
+    has_right_or_full_join: bool,
+) -> Result<Option<LeftUsingColumn>> {
+    let mut matches = SmallVec::<[(usize, TableInternalId, usize, Expr); 4]>::new();
+    for (table_index, table) in tables.iter().enumerate() {
+        // NATURAL ignores hidden columns. An explicit USING clause can name one.
+        let Some((column_index, column)) = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !ignore_hidden_columns || !column.hidden())
+            .find(|(_, column)| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+            })
+        else {
+            continue;
+        };
+        matches.push((
+            table_index,
+            table.internal_id,
+            column_index,
+            Expr::Column {
+                database: None,
+                table: table.internal_id,
+                column: column_index,
+                is_rowid_alias: column.is_rowid_alias(),
+            },
+        ));
+    }
+    if matches.is_empty() {
+        // The caller reports SQLite's "column not present in both tables" error.
+        return Ok(None);
+    }
+
+    if has_right_or_full_join {
+        // A later copy is unambiguous only if its earlier join merged the same name.
+        for (table_index, _, _, _) in matches.iter().skip(1) {
+            if !tables[*table_index]
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.merges_column(column_name))
+            {
+                crate::bail_parse_error!("ambiguous reference to {} in USING()", column_name);
+            }
+        }
+    } else {
+        // SQLite keeps its legacy first-match rule when no RIGHT or FULL JOIN exists.
+        matches.truncate(1);
+    }
+
+    let mut source_columns = SmallVec::new();
+    let mut expressions = Vec::with_capacity(matches.len());
+    for (_, table_id, column_index, expr) in matches {
+        // Every source must stay available for the generated coalesce and covering checks.
+        source_columns.push((table_id, column_index));
+        expressions.push(expr);
+    }
+    Ok(Some(LeftUsingColumn {
+        expr: merge_columns(expressions),
+        source_columns,
+    }))
+}
+
 pub(crate) fn append_vtab_predicates_to_where_clause(
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
@@ -3103,8 +3160,8 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
 
         // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
         // must be associated with the virtual table's outer join context if the table is
-        // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
-        // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
+        // the RHS of an outer join. Otherwise the optimizer may incorrectly simplify the
+        // join into an INNER JOIN, breaking NULL row emission for unmatched rows.
         let from_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
             table_references
                 .find_joined_table_by_internal_id(table_id)
