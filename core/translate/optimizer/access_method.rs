@@ -475,6 +475,8 @@ pub(super) fn choose_best_btree_candidate(
         }
     }
 
+    // `best_choice` starts as a table scan even when INDEXED BY removed that choice.
+    // Do not return that placeholder if all forced candidates were rejected.
     if has_valid_candidate {
         Ok(Some(best_choice))
     } else {
@@ -925,6 +927,8 @@ fn find_best_access_method_for_btree(
             ..
         } if constraint_refs.is_empty()
     );
+    // SQLite excludes this temporary-index path for a right-preserving source.
+    // The unmatched-row pass must scan the preserved source after the main loop.
     if rhs_table.indexed.is_none()
         && uses_full_table_scan
         && !lhs_mask.is_empty()
@@ -1034,6 +1038,8 @@ fn find_best_access_method_for_btree(
             );
         }
 
+        // Turso's multi-index emitters do not add matched rowids to the RIGHT JOIN set.
+        // If Turso uses one here, the final pass emits matched right rows again.
         if !keeps_right_rows {
             if let Some(multi_idx_method) = consider_multi_index_union(
                 rhs_table,
@@ -1326,14 +1332,8 @@ pub fn try_hash_join_access_method(
     {
         return Ok(None);
     }
-    // Determine join type from the probe table's join_info.
+    // The early return above sends right-preserving joins to nested loops.
     let hash_join_type = if probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_full_outer())
-    {
-        HashJoinType::FullOuter
-    } else if probe_table
         .join_info
         .as_ref()
         .is_some_and(|ji| ji.is_outer())
@@ -1398,11 +1398,7 @@ pub fn try_hash_join_access_method(
         "hash-join equi-join keys"
     );
 
-    // A hash join normally needs at least one equi-join condition. A FULL OUTER
-    // JOIN is the exception: it has no nested-loop form, so when the ON clause has
-    // no equality (e.g. `a.x < b.x`) we still build a single-bucket hash join and
-    // let the predicate apply as a residual, rather than rejecting the query.
-    if join_keys.is_empty() && hash_join_type != HashJoinType::FullOuter {
+    if join_keys.is_empty() {
         return Ok(None);
     }
     // Custom-collated equality depends on a connection-owned callback, so the
@@ -1415,65 +1411,62 @@ pub fn try_hash_join_access_method(
     }
 
     // Prefer nested-loop with index lookup when an index exists on join columns.
-    // FULL OUTER must use hash join (needed for the unmatched-build scan).
     // Check both tables because we could potentially use a different
     // join order where the indexed table becomes the probe/inner table.
-    if hash_join_type != HashJoinType::FullOuter {
-        for join_key in &join_keys {
-            let probe_expr = join_key.get_probe_expr(where_clause);
-            let probe_is_simple_column =
-                expr_is_simple_column_from_table(probe_expr, probe_table.internal_id);
-            let build_expr = join_key.get_build_expr(where_clause);
-            let build_is_simple_column =
-                expr_is_simple_column_from_table(build_expr, build_table.internal_id);
-            // Check probe table constraints for index on join column, only when the probe side
-            // references the probe table alone and is a simple column/rowid reference.
-            if probe_is_simple_column {
-                if let Some(constraint) = probe_constraints
-                    .constraints
-                    .iter()
-                    .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
-                {
-                    if let Some(col_pos) = constraint.table_col_pos {
-                        // Check if the join column is a rowid alias directly from the table schema
-                        if let Some(column) = probe_table.columns().get(col_pos) {
-                            if column.is_rowid_alias() {
-                                return Ok(None);
-                            }
+    for join_key in &join_keys {
+        let probe_expr = join_key.get_probe_expr(where_clause);
+        let probe_is_simple_column =
+            expr_is_simple_column_from_table(probe_expr, probe_table.internal_id);
+        let build_expr = join_key.get_build_expr(where_clause);
+        let build_is_simple_column =
+            expr_is_simple_column_from_table(build_expr, build_table.internal_id);
+        // Check probe table constraints for index on join column, only when the probe side
+        // references the probe table alone and is a simple column/rowid reference.
+        if probe_is_simple_column {
+            if let Some(constraint) = probe_constraints
+                .constraints
+                .iter()
+                .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+            {
+                if let Some(col_pos) = constraint.table_col_pos {
+                    // Check if the join column is a rowid alias directly from the table schema
+                    if let Some(column) = probe_table.columns().get(col_pos) {
+                        if column.is_rowid_alias() {
+                            return Ok(None);
                         }
-                        // Also check regular indexes
-                        for candidate in &probe_constraints.candidates {
-                            if let Some(index) = &candidate.index {
-                                if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return Ok(None);
-                                }
+                    }
+                    // Also check regular indexes
+                    for candidate in &probe_constraints.candidates {
+                        if let Some(index) = &candidate.index {
+                            if index.column_table_pos_to_index_pos(col_pos).is_some() {
+                                return Ok(None);
                             }
                         }
                     }
                 }
             }
+        }
 
-            // Check build table constraints for index on join column, only when the build side
-            // is a simple column/rowid reference.
-            if build_is_simple_column {
-                if let Some(constraint) = build_constraints
-                    .constraints
-                    .iter()
-                    .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
-                {
-                    if let Some(col_pos) = constraint.table_col_pos {
-                        // Check if the join column is a rowid alias directly from the table schema
-                        if let Some(column) = build_table.columns().get(col_pos) {
-                            if column.is_rowid_alias() {
-                                return Ok(None);
-                            }
+        // Check build table constraints for index on join column, only when the build side
+        // is a simple column/rowid reference.
+        if build_is_simple_column {
+            if let Some(constraint) = build_constraints
+                .constraints
+                .iter()
+                .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+            {
+                if let Some(col_pos) = constraint.table_col_pos {
+                    // Check if the join column is a rowid alias directly from the table schema
+                    if let Some(column) = build_table.columns().get(col_pos) {
+                        if column.is_rowid_alias() {
+                            return Ok(None);
                         }
-                        // Also check regular indexes
-                        for candidate in &build_constraints.candidates {
-                            if let Some(index) = &candidate.index {
-                                if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return Ok(None);
-                                }
+                    }
+                    // Also check regular indexes
+                    for candidate in &build_constraints.candidates {
+                        if let Some(index) = &candidate.index {
+                            if index.column_table_pos_to_index_pos(col_pos).is_some() {
+                                return Ok(None);
                             }
                         }
                     }
