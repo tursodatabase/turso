@@ -47,7 +47,7 @@ pub struct CreateVirtualTable {
     /// module name
     pub module_name: Name,
     /// args
-    pub args: Vec<String>, // TODO smol str
+    pub args: Vec<smol_str::SmolStr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -15,7 +15,7 @@ name = "turso_parser"
 
 [features]
 default = []
-serde = ["dep:serde", "bitflags/serde"]
+serde = ["dep:serde", "bitflags/serde", "smol_str/serde"]
 simulator = []
 codspeed = []
 
@@ -28,6 +28,7 @@ serde = { workspace = true , optional = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 turso_macros = { workspace = true }
 memchr = "2.7.6"
+smol_str = { workspace = true }
 
 [dev-dependencies]
 fallible-iterator = { workspace = true }

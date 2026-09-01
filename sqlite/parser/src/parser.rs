@@ -953,7 +953,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_vtab_arg(&mut self) -> Result<String> {
+    fn parse_vtab_arg(&mut self) -> Result<smol_str::SmolStr> {
         let start_idx = self.offset();
 
         loop {
@@ -989,7 +989,7 @@ impl<'a> Parser<'a> {
             return Err(Error::Custom("unexpected COMMA in vtab args".to_owned()));
         }
 
-        Ok(from_bytes(&self.lexer.input[start_idx..end_idx]))
+        Ok(smol_str::SmolStr::from(from_bytes(&self.lexer.input[start_idx..end_idx])))
     }
 
     fn parse_create_virtual(&mut self) -> Result<Stmt> {
