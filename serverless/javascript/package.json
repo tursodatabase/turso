@@ -1,6 +1,10 @@
 {
   "name": "@tursodatabase/serverless",
   "version": "1.4.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
