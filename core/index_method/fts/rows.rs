@@ -118,15 +118,30 @@ pub(super) fn seek_key_for_path(path: &str) -> Result<ImmutableRecord> {
 /// not be rebuilt on every re-entry.
 #[derive(Debug)]
 enum InsertPhase {
-    Seeking { record: ImmutableRecord },
-    Inserting { record: ImmutableRecord },
+    Seeking {
+        record: ImmutableRecord,
+    },
+    /// The seek stopped one leaf early (`SeekResult::TryAdvance`): a stale
+    /// interior divider can navigate the cursor to a leaf that no longer
+    /// holds the seek boundary. `insert` only checks the cursor's current
+    /// cell for an exact-key overwrite, so inserting from this position
+    /// would add a second physical copy of a key that already exists at the
+    /// start of the next leaf. Advance once before inserting, exactly like
+    /// the VDBE's `seek_internal` does.
+    Advancing {
+        record: ImmutableRecord,
+    },
+    Inserting {
+        record: ImmutableRecord,
+    },
 }
 
 /// Insert-only flush: every row is written once with a fresh key, so the
-/// machine is pure seek-then-insert. A row whose exact key is already
-/// present (a resumed insert) needs no probe here: the B-tree overwrites
-/// on an exact index-key match and the MVCC cursor updates the existing
-/// version, so re-inserting identical bytes is idempotent by construction.
+/// machine is seek-then-insert. A row whose exact key is already present
+/// (a resumed insert) is overwritten in place — but only if the cursor is
+/// actually positioned on the equal cell when `insert` runs. A seek that
+/// stops one leaf early (`TryAdvance`) must advance first, or the insert
+/// adds a second physical copy of the key (see [`InsertPhase::Advancing`]).
 #[derive(Debug)]
 pub(super) struct RowInserter {
     rows: Vec<PendingRow>,
@@ -156,16 +171,31 @@ impl RowInserter {
                     });
                 }
                 Some(InsertPhase::Seeking { record }) => {
-                    // Positioning only: `insert` writes at the cursor's
-                    // current position (see the struct docs for why no
-                    // existence probe is needed).
-                    return_if_io!(cursor.seek(
+                    // `eq_only: true`: `NotFound` positions the cursor at
+                    // the exact slot where the key belongs (the fresh-key
+                    // case), `Found` lands on the equal cell (the resumed
+                    // re-insert case, overwritten in place). `TryAdvance`
+                    // means the equal key may sit at the start of the next
+                    // leaf behind a stale interior divider: advancing before
+                    // the insert reaches it, so the overwrite happens
+                    // instead of a second physical copy of the key.
+                    let seek_result = return_if_io!(cursor.seek(
                         SeekKey::IndexKey(record.as_record_ref()),
-                        SeekOp::GE { eq_only: false },
+                        SeekOp::GE { eq_only: true },
                     ));
                     // Insert in a separate phase so an I/O yield does not
                     // repeat the seek.
                     let Some(InsertPhase::Seeking { record }) = self.phase.take() else {
+                        unreachable!("phase matched above");
+                    };
+                    self.phase = Some(match seek_result {
+                        SeekResult::TryAdvance => InsertPhase::Advancing { record },
+                        _ => InsertPhase::Inserting { record },
+                    });
+                }
+                Some(InsertPhase::Advancing { .. }) => {
+                    return_if_io!(cursor.next());
+                    let Some(InsertPhase::Advancing { record }) = self.phase.take() else {
                         unreachable!("phase matched above");
                     };
                     self.phase = Some(InsertPhase::Inserting { record });

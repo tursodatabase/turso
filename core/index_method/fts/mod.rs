@@ -1649,8 +1649,15 @@ impl FtsCursor {
                     {
                         self.scan_descriptors.push(descriptor);
                     } else {
+                        let existing = self
+                            .scan_descriptors
+                            .iter()
+                            .find(|existing| existing.segment_id == segment_id);
                         tracing::error!(
                             segment = %segment_id.uuid_string(),
+                            identical = existing == Some(&descriptor),
+                            existing = ?existing,
+                            duplicate = ?descriptor,
                             "duplicate FTS registry row; keeping the first"
                         );
                     }
@@ -2554,6 +2561,68 @@ impl FtsBackingRowWiper {
 
     pub fn step(&mut self) -> Result<IOResult<()>> {
         self.deleter.step(self.cursor.as_mut())
+    }
+}
+
+/// Test helper: enumerate every raw row of an FTS index's backing store as
+/// `(path, chunk_no, byte_len, fnv64-of-bytes)`. Drive `step` to completion
+/// inside a read transaction; rows land in `rows` in key order, including
+/// physical duplicates the reader normally dedupes.
+#[cfg(feature = "test_helper")]
+pub struct FtsBackingRowDumper {
+    cursor: Box<dyn CursorTrait>,
+    started: bool,
+    advance_pending: bool,
+    pub rows: Vec<(String, i64, usize, u64)>,
+}
+
+#[cfg(feature = "test_helper")]
+impl FtsBackingRowDumper {
+    pub fn new(conn: &Arc<Connection>, database_id: usize, index_name: &str) -> Result<Self> {
+        let dir_table_name = format!(
+            "{}fts_dir_{}",
+            crate::schema::TURSO_INTERNAL_PREFIX,
+            index_name
+        );
+        let key_index_name = format!("{dir_table_name}_key");
+        let cursor = open_index_cursor(
+            conn,
+            database_id,
+            &dir_table_name,
+            &key_index_name,
+            [key_info(), key_info(), key_info()],
+        )?;
+        Ok(Self {
+            cursor,
+            started: false,
+            advance_pending: false,
+            rows: Vec::new(),
+        })
+    }
+
+    pub fn step(&mut self) -> Result<IOResult<()>> {
+        loop {
+            if !self.started {
+                return_if_io!(self.cursor.rewind());
+                self.started = true;
+            }
+            if self.advance_pending {
+                return_if_io!(self.cursor.next());
+                self.advance_pending = false;
+            }
+            if !self.cursor.has_record() {
+                return Ok(IOResult::Done(()));
+            }
+            let record = return_if_io!(self.cursor.record()).ok_or_else(|| {
+                LimboError::Corrupt("FTS dump cursor has no record payload".into())
+            })?;
+            let (path, chunk_no, bytes) = row_fields(record)?;
+            let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+            });
+            self.rows.push((path, chunk_no, bytes.len(), hash));
+            self.advance_pending = true;
+        }
     }
 }
 
