@@ -52,7 +52,7 @@ struct Fixture {
     conn: Arc<Connection>,
 }
 
-fn seed_db(mode: Mode) -> Fixture {
+fn seed_db(mode: Mode, tables: &[(&str, usize, usize)]) -> Fixture {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("columns.db");
     #[allow(clippy::arc_with_non_send_sync)]
@@ -65,7 +65,7 @@ fn seed_db(mode: Mode) -> Fixture {
     }
     conn.execute("PRAGMA cache_size=-65536").unwrap(); //negative means kibibytes (https://sqlite.org/pragma.html#pragma_cache_size)
 
-    for (table, ncols, nrows) in TABLES {
+    for (table, ncols, nrows) in tables {
         let cols = (0..*ncols)
             .map(|c| {
                 if c % 2 == 0 {
@@ -135,7 +135,7 @@ fn bench_select_star(criterion: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(3));
 
     for mode in [Mode::Wal, Mode::Mvcc] {
-        let fixture = seed_db(mode);
+        let fixture = seed_db(mode, TABLES);
         for (table, ncols, nrows) in TABLES {
             let label = format!("select_star_{ncols}_{}", mode.suffix());
             group.bench_with_input(BenchmarkId::new(label, nrows), nrows, |b, _| {
@@ -155,5 +155,58 @@ fn bench_select_star(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_select_star);
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_column_shapes(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("column_fetch");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(10));
+    group.warm_up_time(Duration::from_secs(3));
+
+    let wide_table = &TABLES[0];
+    let (table, _, nrows) = *wide_table;
+
+    let sum_32_of_one_column = format!(
+        "SELECT {} FROM {table}",
+        (0..32)
+            .map(|k| format!("SUM(c90 + {k})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let select_32_descending = format!(
+        "SELECT {} FROM {table}",
+        (74..106)
+            .rev()
+            .map(|c| format!("c{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let select_sparse_4 = format!("SELECT c90, c2, c50, c7 FROM {table}");
+    let select_single_late = format!("SELECT c101 FROM {table}");
+
+    let shapes = [
+        ("sum_32_of_one_column_106", sum_32_of_one_column, 1),
+        ("select_32_descending_106", select_32_descending, nrows),
+        ("select_sparse_4_of_106", select_sparse_4, nrows),
+        ("select_single_late_106", select_single_late, nrows),
+    ];
+
+    for mode in [Mode::Wal, Mode::Mvcc] {
+        let fixture = seed_db(mode, std::slice::from_ref(wide_table));
+        for (name, sql, expected_rows) in &shapes {
+            let label = format!("{name}_{}", mode.suffix());
+            group.bench_with_input(BenchmarkId::new(label, nrows), &nrows, |b, _| {
+                let mut stmt = fixture.conn.prepare(sql.as_str()).unwrap();
+                assert_eq!(
+                    drive_stmt_to_completion(&fixture.db, &mut stmt),
+                    *expected_rows,
+                    "{sql} should return {expected_rows} rows"
+                );
+                b.iter(|| drive_stmt_to_completion(&fixture.db, &mut stmt));
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_select_star, bench_column_shapes);
 criterion_main!(benches);
