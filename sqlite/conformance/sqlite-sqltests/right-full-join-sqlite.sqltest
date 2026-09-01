@@ -544,6 +544,453 @@ expect {
     2|1|0
 }
 
+# These cases come from SQLite join8.test and smaller command-line
+# comparisons. They cover the merged column that USING creates.
+
+@cross-check-integrity
+test full-join-using-returns-the-column-from-either-side {
+    CREATE TABLE t1(id, left_value);
+    CREATE TABLE t2(id, right_value);
+    INSERT INTO t1 VALUES (1, 'left');
+    INSERT INTO t2 VALUES (2, 'right');
+
+    SELECT id, left_value, right_value
+      FROM t1 FULL JOIN t2 USING(id)
+     ORDER BY id;
+
+    SELECT *
+      FROM t1 FULL JOIN t2 USING(id)
+     ORDER BY id;
+}
+expect {
+    1|left|
+    2||right
+    1|left|
+    2||right
+}
+
+@cross-check-integrity
+test right-join-using-returns-the-right-column {
+    CREATE TABLE t1(id, left_value);
+    CREATE TABLE t2(id, right_value);
+    INSERT INTO t1 VALUES (1, 'left');
+    INSERT INTO t2 VALUES (2, 'right');
+
+    SELECT id, left_value, right_value
+      FROM t1 RIGHT JOIN t2 USING(id);
+}
+expect {
+    2||right
+}
+
+@cross-check-integrity
+test chained-full-join-using-compares-the-merged-column {
+    CREATE TABLE t1(id, a);
+    CREATE TABLE t2(id, b);
+    CREATE TABLE t3(id, c);
+    INSERT INTO t1 VALUES (1, 1), (3, 1);
+    INSERT INTO t2 VALUES (2, 1), (3, 1);
+    INSERT INTO t3 VALUES (2, 1), (4, 1);
+
+    SELECT id, a, b, c
+      FROM t1
+      FULL JOIN t2 USING(id)
+      FULL JOIN t3 USING(id)
+     ORDER BY id;
+}
+expect {
+    1|1||
+    2||1|1
+    3|1|1|
+    4|||1
+}
+
+@cross-check-integrity
+test table-star-uses-the-merged-column-left-of-a-full-join {
+    CREATE TABLE t1(id, a);
+    CREATE TABLE t2(id, b);
+    CREATE TABLE t3(id, c);
+    INSERT INTO t1 VALUES (1, 'a1'), (2, 'a2');
+    INSERT INTO t2 VALUES (2, 'b2'), (3, 'b3');
+    INSERT INTO t3 VALUES (3, 'c3'), (4, 'c4');
+
+    SELECT t1.*, t2.*, t3.*, id
+      FROM t1
+      FULL JOIN t2 USING(id)
+      FULL JOIN t3 USING(id)
+     ORDER BY 7;
+}
+expect {
+    1|a1|1||||1
+    2|a2|2|b2|||2
+    3||3|b3|3|c3|3
+    4||4||4|c4|4
+}
+
+@cross-check-integrity
+test chained-full-join-using-keeps-the-left-collation {
+    CREATE TABLE t1(id TEXT COLLATE NOCASE);
+    CREATE TABLE t2(id TEXT);
+    CREATE TABLE t3(id TEXT);
+    INSERT INTO t2 VALUES ('a');
+    INSERT INTO t3 VALUES ('A');
+
+    SELECT id, t1.id, t2.id, t3.id
+      FROM t1
+      FULL JOIN t2 USING(id)
+      FULL JOIN t3 USING(id);
+}
+expect {
+    a||a|A
+}
+
+@cross-check-integrity
+test chained-full-join-using-does-not-take-a-later-collation {
+    CREATE TABLE t1(id TEXT);
+    CREATE TABLE t2(id TEXT COLLATE NOCASE);
+    CREATE TABLE t3(id TEXT);
+    INSERT INTO t2 VALUES ('a');
+    INSERT INTO t3 VALUES ('A');
+
+    SELECT id, t1.id, t2.id, t3.id
+      FROM t1
+      FULL JOIN t2 USING(id)
+      FULL JOIN t3 USING(id)
+     ORDER BY id;
+}
+expect {
+    A|||A
+    a||a|
+}
+
+@skip-if sqlite "SQLite 3.50.4 does not apply affinity to a merged USING column"
+@cross-check-integrity
+test create-table-from-full-join-applies-the-merged-column-affinity {
+    CREATE TABLE t1(id INTEGER, a);
+    CREATE TABLE t2(id TEXT, b);
+    INSERT INTO t2 VALUES ('01', 'right');
+
+    CREATE TABLE joined AS
+    SELECT * FROM t1 FULL JOIN t2 USING(id);
+
+    SELECT quote(id), typeof(id), id=1, id='1' FROM joined;
+}
+expect {
+    1|integer|1|1
+}
+
+@skip-if sqlite "SQLite 3.50.4 does not apply affinity to a merged USING column"
+@cross-check-integrity
+test merged-column-affinity-does-not-change-user-coalesce {
+    CREATE TABLE t1(id NUMERIC);
+    CREATE TABLE t2(id TEXT);
+    INSERT INTO t2 VALUES ('01');
+
+    SELECT id=1, coalesce(t1.id,t2.id)=1, id, typeof(id)
+      FROM t1 FULL JOIN t2 USING(id);
+}
+expect {
+    1|0|01|text
+}
+
+@skip-if sqlite "SQLite 3.50.4 does not apply the left collation to a merged USING column"
+@cross-check-integrity
+test merged-column-collation-does-not-change-user-coalesce {
+    CREATE TABLE t1(id TEXT COLLATE NOCASE);
+    CREATE TABLE t2(id TEXT);
+    INSERT INTO t2 VALUES ('a');
+
+    SELECT id='A', coalesce(t1.id,t2.id)='A', id, typeof(id)
+      FROM t1 FULL JOIN t2 USING(id);
+}
+expect {
+    1|0|a|text
+}
+
+@cross-check-integrity
+test right-then-full-using-resets-and-then-merges-the-visible-column {
+    CREATE TABLE t1(id INTEGER);
+    CREATE TABLE t2(id TEXT);
+    CREATE TABLE t3(id INTEGER);
+    INSERT INTO t2 VALUES ('01');
+    INSERT INTO t3 VALUES (1);
+
+    SELECT quote(id), typeof(id), id=1, id='1', t1.id, t2.id, t3.id
+      FROM t1 RIGHT JOIN t2 USING(id)
+      FULL JOIN t3 USING(id);
+}
+expect {
+    '01'|text|0|0||01|1
+}
+
+@cross-check-integrity
+test chained-natural-full-joins-keep-one-row-for-each-key {
+    CREATE TABLE t1(id, a);
+    CREATE TABLE t2(id, b);
+    CREATE TABLE t3(id, c);
+    CREATE TABLE t4(id, d);
+    INSERT INTO t1 VALUES (1, 1), (3, 1);
+    INSERT INTO t2 VALUES (2, 1), (3, 1);
+    INSERT INTO t3 VALUES (2, 1), (4, 1);
+    INSERT INTO t4 VALUES (1, 1), (4, 1), (5, 1);
+
+    SELECT id, a, b, c, d
+      FROM t1
+      NATURAL FULL JOIN t2
+      NATURAL FULL JOIN t3
+      NATURAL FULL JOIN t4
+     ORDER BY id;
+}
+expect {
+    1|1|||1
+    2||1|1|
+    3|1|1||
+    4|||1|1
+    5||||1
+}
+
+@cross-check-integrity
+test eight-natural-full-joins-grow-the-merged-column-list {
+    CREATE TABLE numbers(value INTEGER PRIMARY KEY);
+    WITH RECURSIVE sequence(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value+1 FROM sequence WHERE value<256
+    )
+    INSERT INTO numbers SELECT value FROM sequence;
+
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, c INT);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, d INT);
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, e INT);
+    CREATE TABLE t6(id INTEGER PRIMARY KEY, f INT);
+    CREATE TABLE t7(id INTEGER PRIMARY KEY, g INT);
+    CREATE TABLE t8(id INTEGER PRIMARY KEY, h INT);
+    INSERT INTO t1 SELECT value, 1 FROM numbers WHERE value & 1;
+    INSERT INTO t2 SELECT value, 1 FROM numbers WHERE value & 2;
+    INSERT INTO t3 SELECT value, 1 FROM numbers WHERE value & 4;
+    INSERT INTO t4 SELECT value, 1 FROM numbers WHERE value & 8;
+    INSERT INTO t5 SELECT value, 1 FROM numbers WHERE value & 16;
+    INSERT INTO t6 SELECT value, 1 FROM numbers WHERE value & 32;
+    INSERT INTO t7 SELECT value, 1 FROM numbers WHERE value & 64;
+    INSERT INTO t8 SELECT value, 1 FROM numbers WHERE value & 128;
+
+    CREATE TABLE joined AS
+    SELECT id, h, g, f, e, d, c, b, a
+      FROM t1
+      NATURAL FULL JOIN t2
+      NATURAL FULL JOIN t3
+      NATURAL FULL JOIN t4
+      NATURAL FULL JOIN t5
+      NATURAL FULL JOIN t6
+      NATURAL FULL JOIN t7
+      NATURAL FULL JOIN t8;
+
+    SELECT count(*) FROM joined;
+    SELECT count(*) FROM (
+        SELECT id FROM joined GROUP BY id HAVING count(*)!=1
+    );
+
+    UPDATE joined SET a=0 WHERE a IS NULL;
+    UPDATE joined SET b=0 WHERE b IS NULL;
+    UPDATE joined SET c=0 WHERE c IS NULL;
+    UPDATE joined SET d=0 WHERE d IS NULL;
+    UPDATE joined SET e=0 WHERE e IS NULL;
+    UPDATE joined SET f=0 WHERE f IS NULL;
+    UPDATE joined SET g=0 WHERE g IS NULL;
+    UPDATE joined SET h=0 WHERE h IS NULL;
+    SELECT count(*) FROM joined
+     WHERE id=128*h+64*g+32*f+16*e+8*d+4*c+2*b+a;
+    SELECT count(*) FROM joined
+     WHERE id<>128*h+64*g+32*f+16*e+8*d+4*c+2*b+a;
+}
+expect {
+    255
+    0
+    255
+    0
+}
+
+@cross-check-integrity
+test right-join-view-metadata-uses-the-visible-using-column {
+    CREATE TABLE left_source(keep TEXT, x TEXT);
+    CREATE TABLE right_source(x REAL, keep_right BLOB);
+    CREATE VIEW expression_view AS
+        SELECT x FROM left_source RIGHT JOIN right_source USING(x);
+    CREATE VIEW star_view AS
+        SELECT * FROM left_source RIGHT JOIN right_source USING(x);
+    CREATE VIEW left_star_view AS
+        SELECT left_source.*
+          FROM left_source RIGHT JOIN right_source USING(x);
+
+    SELECT 'expression', name, type
+      FROM pragma_table_info('expression_view');
+    SELECT 'star', name, type
+      FROM pragma_table_info('star_view');
+    SELECT 'left-star', name, type
+      FROM pragma_table_info('left_star_view');
+}
+expect {
+    expression|x|REAL
+    star|keep|TEXT
+    star|x|REAL
+    star|keep_right|BLOB
+    left-star|keep|TEXT
+    left-star|x|REAL
+}
+
+test right-join-view-rejects-an-unmerged-earlier-using-column {
+    CREATE TABLE left_one(x TEXT);
+    CREATE TABLE left_two(x REAL);
+    CREATE TABLE right_one(x BLOB);
+    CREATE VIEW invalid_view AS
+        SELECT x
+          FROM left_one JOIN left_two ON true
+          RIGHT JOIN right_one USING(x);
+    SELECT * FROM invalid_view;
+}
+expect error {
+    ambiguous reference to x in USING()
+}
+
+test right-join-using-checks-the-right-column-before-left-ambiguity {
+    CREATE TABLE left_one(x);
+    CREATE TABLE left_two(x);
+    CREATE TABLE right_without_x(y);
+
+    SELECT *
+      FROM left_one JOIN left_two ON true
+      RIGHT JOIN right_without_x USING(x);
+}
+expect error {
+    cannot join using column x - column not present in both tables
+}
+
+test right-join-view-checks-the-right-column-before-left-ambiguity {
+    CREATE TABLE left_one(x);
+    CREATE TABLE left_two(x);
+    CREATE TABLE right_without_x(y);
+    CREATE VIEW invalid_view AS
+        SELECT *
+          FROM left_one JOIN left_two ON true
+          RIGHT JOIN right_without_x USING(x);
+    SELECT * FROM invalid_view;
+}
+expect error {
+    cannot join using column x - column not present in both tables
+}
+
+test natural-join-rejects-an-unmerged-left-column-before-right-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t2.a<>0 NATURAL RIGHT JOIN t3;
+}
+expect error {
+    ambiguous reference to a in USING()
+}
+
+test using-ambiguity-keeps-the-column-name-case {
+    CREATE TABLE t1("a");
+    CREATE TABLE t2("a");
+    CREATE TABLE t3("A");
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t2."a"<>0 NATURAL RIGHT JOIN t3;
+}
+expect error {
+    ambiguous reference to A in USING()
+}
+
+test natural-join-rejects-an-unmerged-left-column-before-left-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t2.a<>0 NATURAL LEFT JOIN t3;
+}
+expect error {
+    ambiguous reference to a in USING()
+}
+
+# An inner ON term to the left does not require a row from that side.
+# SQLite ignores it when it decides whether RIGHT can become INNER.
+test inner-on-term-does-not-remove-right-join-row-preservation {
+    CREATE TABLE reduction_empty_left(id INTEGER);
+    CREATE TABLE reduction_empty_middle(id INTEGER);
+    CREATE TABLE reduction_preserved_right(id INTEGER);
+    INSERT INTO reduction_preserved_right VALUES(1);
+    SELECT reduction_preserved_right.id, reduction_empty_left.id
+      FROM reduction_empty_left
+      JOIN reduction_empty_middle ON reduction_empty_left.id>0
+      RIGHT JOIN reduction_preserved_right ON true;
+}
+expect {
+    1|
+}
+
+# SQLite keeps an earlier LEFT JOIN when its only rejecting term comes from
+# an inner ON clause left of a later RIGHT JOIN.
+test inner-on-term-does-not-cascade-outer-join-reduction {
+    CREATE TABLE reduction_chain_a(id INTEGER);
+    CREATE TABLE reduction_chain_b(id INTEGER);
+    CREATE TABLE reduction_chain_c(id INTEGER);
+    CREATE TABLE reduction_chain_d(id INTEGER);
+    INSERT INTO reduction_chain_d VALUES(7);
+    SELECT quote(reduction_chain_a.id),
+           quote(reduction_chain_b.id),
+           quote(reduction_chain_c.id),
+           quote(reduction_chain_d.id)
+      FROM reduction_chain_a
+      LEFT JOIN reduction_chain_b ON reduction_chain_a.id=reduction_chain_b.id
+      JOIN reduction_chain_c ON reduction_chain_b.id=reduction_chain_c.id
+      RIGHT JOIN reduction_chain_d ON true;
+}
+expect {
+    NULL|NULL|NULL|7
+}
+
+# SQLite does not use a virtual-table argument to reduce a later RIGHT JOIN.
+# The argument can use private NULL-matching rules inside the virtual table.
+test virtual-table-argument-does-not-remove-right-join-row-preservation {
+    CREATE TABLE reduction_preserved_after_virtual(id INTEGER);
+    INSERT INTO reduction_preserved_after_virtual VALUES(1);
+    SELECT reduction_preserved_after_virtual.id, pragma_columns.name
+      FROM pragma_table_info('no_such_table') AS pragma_columns
+      RIGHT JOIN reduction_preserved_after_virtual ON true;
+}
+expect {
+    1|
+}
+
+test natural-join-rejects-an-unmerged-left-column-before-a-later-right-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+
+    SELECT * FROM t1 LEFT JOIN t2 ON t2.a<>0 NATURAL RIGHT JOIN t3;
+}
+expect error {
+    ambiguous reference to a in USING()
+}
+
+@cross-check-integrity
+test natural-left-join-keeps-the-legacy-left-column-rule {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+    INSERT INTO t1 VALUES (0), (1);
+    INSERT INTO t2 VALUES (0), (2);
+    INSERT INTO t3 VALUES (0), (3);
+
+    SELECT * FROM t1 LEFT JOIN t2 ON t2.a<>0 NATURAL LEFT JOIN t3;
+}
+expect {
+    0|2
+    1|2
+}
+
 # A constant false inner ON term cannot end the query. The later RIGHT JOIN
 # must still return each unmatched row from its right table.
 test false-inner-on-term-keeps-unmatched-right-row {
@@ -611,60 +1058,6 @@ test false-where-term-still-ends-right-join-query {
      WHERE false;
 }
 expect {
-}
-
-@cross-check-integrity
-test right-join-view-metadata-uses-the-visible-using-column {
-    CREATE TABLE left_source(keep TEXT, x TEXT);
-    CREATE TABLE right_source(x REAL, keep_right BLOB);
-    CREATE VIEW expression_view AS
-        SELECT x FROM left_source RIGHT JOIN right_source USING(x);
-    CREATE VIEW star_view AS
-        SELECT * FROM left_source RIGHT JOIN right_source USING(x);
-    CREATE VIEW left_star_view AS
-        SELECT left_source.*
-          FROM left_source RIGHT JOIN right_source USING(x);
-
-    SELECT 'expression', name, type
-      FROM pragma_table_info('expression_view');
-    SELECT 'star', name, type
-      FROM pragma_table_info('star_view');
-    SELECT 'left-star', name, type
-      FROM pragma_table_info('left_star_view');
-}
-expect {
-    expression|x|REAL
-    star|keep|TEXT
-    star|x|REAL
-    star|keep_right|BLOB
-    left-star|keep|TEXT
-    left-star|x|REAL
-}
-
-test right-join-view-rejects-an-unmerged-earlier-using-column {
-    CREATE TABLE left_one(x TEXT);
-    CREATE TABLE left_two(x REAL);
-    CREATE TABLE right_one(x BLOB);
-    CREATE VIEW invalid_view AS
-        SELECT x
-          FROM left_one JOIN left_two ON true
-          RIGHT JOIN right_one USING(x);
-}
-expect error {
-    ambiguous reference to x in USING()
-}
-
-test right-join-view-checks-the-right-column-before-left-ambiguity {
-    CREATE TABLE left_one(x);
-    CREATE TABLE left_two(x);
-    CREATE TABLE right_without_x(y);
-    CREATE VIEW invalid_view AS
-        SELECT *
-          FROM left_one JOIN left_two ON true
-          RIGHT JOIN right_without_x USING(x);
-}
-expect error {
-    cannot join using column x - column not present in both tables
 }
 
 # The shared row body must run output subqueries again for unmatched right rows.
