@@ -6112,6 +6112,16 @@ fn fts_dump_backing_rows_tool() {
 #[test]
 fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
     use turso_core::{Database, DatabaseOpts, OpenFlags, SqliteDialect};
+    // Multiprocess WAL needs an IO backend with shared-memory coordination.
+    // The default platform IO has it on unix but not on Windows (only the
+    // IOCP backend does there), and the open below refuses without it.
+    {
+        let probe: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        if !probe.supports_shared_wal_coordination() {
+            println!("skipping: platform IO does not support multiprocess WAL");
+            return;
+        }
+    }
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let path = tmp_dir.path().join("torn.db");
     let path = path.to_str().unwrap();
