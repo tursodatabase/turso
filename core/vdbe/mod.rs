@@ -19,6 +19,7 @@
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
+use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
@@ -777,6 +778,9 @@ pub struct SequenceInnerTxState {
 }
 
 pub struct ProgramState {
+    /// Interrupt/progress-check gate mask for normal_step; re-derived from
+    /// the progress handler's interval each time the gate fires.
+    check_mask: u64,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -930,6 +934,7 @@ impl ProgramState {
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
+            check_mask: 63,
             io_completions: None,
             pc: 0,
             cursors,
@@ -1307,7 +1312,7 @@ impl ProgramState {
         connection: &Connection,
         pager: &Arc<Pager>,
         write: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
         if write && in_explicit_txn {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
@@ -1745,7 +1750,7 @@ impl Program {
         pager: &Arc<Pager>,
         query_mode: QueryMode,
         waker: Option<&Waker>,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, Box<LimboError>> {
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, pager, waker),
@@ -1772,14 +1777,18 @@ impl Program {
         result
     }
 
-    fn explain_step(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Result<StepResult> {
+    fn explain_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<StepResult, Box<LimboError>> {
         turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             let tx_state = self.connection.get_tx_state();
             if let TransactionState::Write { .. } = tx_state {
                 pager.rollback_tx(&self.connection);
             }
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(LimboError::InternalError("Connection closed".to_string()).into());
         }
 
         if self.maybe_request_interrupt(
@@ -1869,7 +1878,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, Box<LimboError>> {
         turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
             if self.connection.is_closed() {
@@ -1878,7 +1887,7 @@ impl Program {
                 if let TransactionState::Write { .. } = state {
                     pager.rollback_tx(&self.connection);
                 }
-                return Err(LimboError::InternalError("Connection closed".to_string()));
+                return Err(LimboError::InternalError("Connection closed".to_string()).into());
             }
 
             if self.maybe_request_interrupt(
@@ -1921,7 +1930,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, Box<LimboError>> {
         turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len());
         if self.connection.is_closed() {
             // Connection is closed for whatever reason, rollback the transaction.
@@ -1929,7 +1938,7 @@ impl Program {
             if let TransactionState::Write { .. } = tx_state {
                 pager.rollback_tx(&self.connection);
             }
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(LimboError::InternalError("Connection closed".to_string()).into());
         }
         if self.maybe_request_interrupt(
             state,
@@ -1954,17 +1963,17 @@ impl Program {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    // inline(always): called once per returned row from step(); outlined it
+    // costs a call plus a 40-byte memory-returned Result per row.
+    #[inline(always)]
     fn normal_step(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, Box<LimboError>> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
-        // A progress handler with a small interval narrows the check gate so
-        // its cadence is honored; without one the gate stays at the maximum.
-        let progress_ops = self.connection.progress_ops();
         // Reborrow the instruction list once: reloading it through `self`
         // every iteration defeats LLVM's hoisting because the opcode call
         // below is opaque to it.
@@ -1999,13 +2008,13 @@ impl Program {
                             );
                         }
                         pager.cleanup_after_checkpoint_failure();
-                        return Err(checkpoint_err);
+                        return Err(checkpoint_err.into());
                     }
                     let err = err.into();
                     if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
                         tracing::error!("Abort failed during error handling: {abort_err}");
                     }
-                    return Err(err);
+                    return Err(err.into());
                 }
                 state.io_completions = None;
             }
@@ -2017,23 +2026,32 @@ impl Program {
                 // callers regain control at every returned row regardless.
                 // The interval must stay a power of two so this gate is a
                 // mask test, never a division, in the interpreter hot loop.
+                // The gate mask lives in ProgramState and is re-derived from the
+                // progress handler's interval only when the gate fires, so the
+                // steady-state cost is one mask test with no atomics. A handler
+                // with interval N < 64 narrows the mask at the next firing (a
+                // one-time lag of at most CHECK_INTERVAL instructions; the
+                // cadence is approximate by contract).
                 const CHECK_INTERVAL: u64 = 64;
                 const _: () = assert!(CHECK_INTERVAL.is_power_of_two());
-                let check_mask = if progress_ops == 0 {
-                    CHECK_INTERVAL - 1
-                } else {
-                    progress_ops.next_power_of_two().min(CHECK_INTERVAL) - 1
-                };
-                if state.metrics.vm_steps & check_mask == 0 {
+                if state.metrics.vm_steps & state.check_mask == 0 {
+                    let progress_ops = self.connection.progress_ops();
+                    state.check_mask = if progress_ops == 0 || progress_ops >= CHECK_INTERVAL {
+                        CHECK_INTERVAL - 1
+                    } else {
+                        progress_ops.next_power_of_two() - 1
+                    };
                     if self.connection.is_closed() {
                         // Connection is closed for whatever reason, rollback the transaction.
                         let state = self.connection.get_tx_state();
                         if let TransactionState::Write { .. } = state {
                             pager.rollback_tx(&self.connection);
                         }
-                        return Err(LimboError::InternalError("Connection closed".to_string()));
+                        return Err(
+                            LimboError::InternalError("Connection closed".to_string()).into()
+                        );
                     }
-                    let prev_steps = state.metrics.vm_steps.saturating_sub(check_mask + 1);
+                    let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_mask + 1);
                     if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
                         self.abort(pager, None, state, true)?;
                         return Ok(StepResult::Interrupt);
@@ -2058,7 +2076,7 @@ impl Program {
                                     "Abort failed after preparing FAIL index methods: {abort_err}"
                                 );
                             }
-                            return Err(fail_error);
+                            return Err(fail_error.into());
                         }
                         Ok(IOResult::IO(io)) => {
                             state.pending_fail_prepare_error = Some(fail_error);
@@ -2095,7 +2113,6 @@ impl Program {
                     }
                 }
                 let (insn, _) = &insns[state.pc as usize];
-                let insn_function = insn.to_function();
                 if enable_tracing {
                     trace_insn(self, state.pc as InsnReference, insn);
                     crate::stack::trace_remaining("program_step:opcode");
@@ -2139,7 +2156,7 @@ impl Program {
                 // Always increment VM steps for every loop iteration
                 state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-                match insn_function(self, state, insn, pager) {
+                match insn::dispatch_insn(self, state, insn, pager) {
                     Ok(InsnFunctionStepResult::Step) => {
                         // Instruction completed, moving to next
                         state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
@@ -2176,32 +2193,34 @@ impl Program {
                         state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                         return Ok(StepResult::Row);
                     }
-                    Err(LimboError::Busy) => {
-                        // Instruction blocked - will retry at same PC
-                        return Ok(StepResult::Busy);
-                    }
-                    Err(LimboError::BusySnapshot)
-                        if self.connection.transaction_state.get() == TransactionState::None =>
-                    {
-                        // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
-                        // because the snapshot will continue to be stale no matter how many times we retry.
-                        // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
-                        // back, so auto-retrying can be useful.
-                        return Ok(StepResult::Busy);
-                    }
-                    Err(err)
-                        if (matches!(err, LimboError::Constraint(_))
+                    Err(boxed_err) => match *boxed_err {
+                        LimboError::Busy => {
+                            // Instruction blocked - will retry at same PC
+                            return Ok(StepResult::Busy);
+                        }
+                        LimboError::BusySnapshot
+                            if self.connection.transaction_state.get()
+                                == TransactionState::None =>
+                        {
+                            // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
+                            // because the snapshot will continue to be stale no matter how many times we retry.
+                            // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
+                            // back, so auto-retrying can be useful.
+                            return Ok(StepResult::Busy);
+                        }
+                        err if (matches!(err, LimboError::Constraint(_))
                             && self.resolve_type == ResolveType::Fail)
                             || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
-                    {
-                        state.pending_fail_prepare_error = Some(err);
-                    }
-                    Err(err) => {
-                        if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
-                            tracing::error!("Abort failed during error handling: {abort_err}");
+                        {
+                            state.pending_fail_prepare_error = Some(err);
                         }
-                        return Err(err);
-                    }
+                        err => {
+                            if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
+                                tracing::error!("Abort failed during error handling: {abort_err}");
+                            }
+                            return Err(err.into());
+                        }
+                    },
                 }
             }
         }
@@ -2213,7 +2232,7 @@ impl Program {
         state: &mut ProgramState,
         rollback: bool,
         pager: &Arc<Pager>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         use crate::types::IOResult;
 
         loop {
@@ -2317,7 +2336,7 @@ impl Program {
         program_state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         if !rollback {
             turso_assert!(
                 !matches!(
@@ -2398,7 +2417,7 @@ impl Program {
         pager: Arc<Pager>,
         program_state: &mut ProgramState,
         rollback: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let connection = self.connection.clone();
         let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
         let tx_state = connection.get_tx_state();
@@ -2495,7 +2514,7 @@ impl Program {
         program_state: &mut ProgramState,
         mv_store: &Arc<MvStore>,
         rollback: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let conn = self.connection.clone();
         let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
         if !auto_commit {
@@ -2585,7 +2604,7 @@ impl Program {
                     // Rollback remaining uncommitted attached MVCC transactions
                     // so they don't block checkpointing until connection close.
                     conn.rollback_attached_mvcc_txs(true);
-                    return Err(e);
+                    return Err(e.into());
                 }
             };
             match state_machine.step(&attached_mv_store)? {
@@ -2644,7 +2663,7 @@ impl Program {
         connection: &Connection,
         program_state: &mut ProgramState,
         rollback: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let commit_state = &mut program_state.commit_state;
         if matches!(commit_state, CommitState::CommittingAttached) {
             // Resume committing attached pagers after IO yield.
@@ -2698,11 +2717,7 @@ impl Program {
     /// because in explicit transactions, the COMMIT statement's program may differ
     /// from the statement that acquired the attached write lock.
     /// On IO yield, already-committed pagers are skipped on re-entry via holds_write_lock().
-    fn end_attached_write_txns(
-        &self,
-        connection: &Connection,
-        rollback: bool,
-    ) -> Result<IOResult<()>> {
+    fn end_attached_write_txns(&self, connection: &Connection, rollback: bool) -> IOResultOr<()> {
         connection.with_all_attached_pagers_with_index(|pagers| {
             for (db_id, attached_pager) in pagers {
                 let db_id = *db_id;
@@ -2771,7 +2786,7 @@ impl Program {
         &self,
         commit_state: &mut StateMachine<Box<MvccCommitStateMachine>>,
         mv_store: &Arc<MvStore>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         commit_state.step(mv_store)
     }
 
@@ -3095,7 +3110,7 @@ impl Program {
                                         Err(e) => {
                                             capture_abort_error(
                                                 &mut abort_error,
-                                                e,
+                                                *e,
                                                 "commit_txn failed during FAIL abort",
                                             );
                                             break;

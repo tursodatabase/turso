@@ -9512,7 +9512,7 @@ fn test_mvcc_integrity_check() {
 #[test]
 fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     fn run_pager_until_done<T>(
-        mut action: impl FnMut() -> Result<IOResult<T>>,
+        mut action: impl FnMut() -> IOResultOr<T>,
         pager: &Pager,
     ) -> Result<T> {
         loop {

@@ -725,6 +725,12 @@ pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
     unsafe { std::ffi::CString::from_raw(ptr as *mut std::ffi::c_char) }
 }
 
+impl From<Box<LimboError>> for TursoError {
+    fn from(value: Box<LimboError>) -> Self {
+        (*value).into()
+    }
+}
+
 impl From<LimboError> for TursoError {
     fn from(value: LimboError) -> Self {
         match value {

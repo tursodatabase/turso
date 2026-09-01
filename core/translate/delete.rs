@@ -67,7 +67,9 @@ fn validate_delete(
             views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
         );
     }
-    Ok(())
+    // Pins the closure's error type: bail_parse_error! is polymorphic over
+    // boxed and unboxed LimboError since the InsnResult migration.
+    Ok::<(), crate::LimboError>(())
     })?;
     Ok(table)
 }

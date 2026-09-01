@@ -6,6 +6,7 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
+use crate::types::IOResultOr;
 use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
@@ -80,15 +81,15 @@ macro_rules! ends_with_ignore_ascii_case {
 }
 
 pub trait IOExt {
-    fn block<T>(&self, f: impl FnMut() -> Result<IOResult<T>>) -> Result<T>;
+    fn block<T>(&self, f: impl FnMut() -> IOResultOr<T>) -> Result<T>;
     fn wait<T, F>(&self, f: F) -> impl Future<Output = Result<T>> + Send
     where
-        F: FnMut() -> Result<IOResult<T>> + Send,
+        F: FnMut() -> IOResultOr<T> + Send,
         T: Send;
 }
 
 impl<I: ?Sized + IO> IOExt for I {
-    fn block<T>(&self, mut f: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
+    fn block<T>(&self, mut f: impl FnMut() -> IOResultOr<T>) -> Result<T> {
         Ok(loop {
             match f()? {
                 IOResult::Done(v) => break v,
@@ -99,7 +100,7 @@ impl<I: ?Sized + IO> IOExt for I {
 
     async fn wait<T, F>(&self, mut f: F) -> Result<T>
     where
-        F: FnMut() -> Result<IOResult<T>> + Send,
+        F: FnMut() -> IOResultOr<T> + Send,
         T: Send,
     {
         Ok(loop {
@@ -257,7 +258,7 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
     dialect: &dyn crate::dialect::Dialect,
-) -> Result<IOResult<()>> {
+) -> IOResultOr<()> {
     {
         let inner = state
             .inner

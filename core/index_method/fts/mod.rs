@@ -14,6 +14,7 @@
 //! degenerate concurrency: the pager write lock serializes writers.
 
 use crate::sync::{Arc, Weak};
+use crate::types::IOResultOr;
 use crate::{
     index_method::{
         open_index_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
@@ -812,7 +813,7 @@ impl NestedDdl {
 
     /// Drive the statements to completion in order, handing their I/O to
     /// the caller; re-enter after each yield until `Done`.
-    fn step(&mut self) -> Result<IOResult<()>> {
+    fn step(&mut self) -> IOResultOr<()> {
         let conn = self.connection.upgrade().ok_or_else(|| {
             LimboError::InternalError("FTS nested DDL outlived its connection".into())
         })?;
@@ -1448,7 +1449,7 @@ impl FtsCursor {
     /// with no control row is either empty or was written by the
     /// pre-registry FTS implementation; the latter is refused with a
     /// rebuild hint, since that layout is not readable by this code.
-    fn drive_open(&mut self) -> Result<IOResult<()>> {
+    fn drive_open(&mut self) -> IOResultOr<()> {
         let conn = self
             .connection
             .as_ref()
@@ -1544,7 +1545,8 @@ impl FtsCursor {
                                  and cannot be written; rebuild it with `DROP INDEX {name}` \
                                  followed by `CREATE INDEX ... USING fts`",
                                 name = self.index_name
-                            )));
+                            ))
+                            .into());
                         }
                         self.segments.clear();
                         self.snapshot_loaded = true;
@@ -1561,7 +1563,8 @@ impl FtsCursor {
                         // found.
                         return Err(LimboError::Corrupt(
                             "FTS v2 store has rows but no control record".into(),
-                        ));
+                        )
+                        .into());
                     }
                     // Rows without the `fts2/` prefix were written by the
                     // pre-registry FTS implementation (a whole Tantivy
@@ -1574,7 +1577,8 @@ impl FtsCursor {
                          and its storage format is no longer supported; rebuild it \
                          with `DROP INDEX {name}` followed by `CREATE INDEX ... USING fts`",
                         name = self.index_name
-                    )));
+                    ))
+                    .into());
                 }
                 FtsState::ScanSegments {
                     seeked,
@@ -1629,7 +1633,8 @@ impl FtsCursor {
                         if !path.starts_with(FTS2_TOMB_PREFIX) {
                             return Err(LimboError::Corrupt(format!(
                                 "FTS registry scan hit an unrecognized row: {path}"
-                            )));
+                            ))
+                            .into());
                         }
                         self.state = FtsState::ScanTombs {
                             seeked: false,
@@ -1707,7 +1712,8 @@ impl FtsCursor {
                         // would resurrect every deleted doc after it.
                         return Err(LimboError::Corrupt(format!(
                             "FTS tombstone scan hit an unrecognized row: {path}"
-                        )));
+                        ))
+                        .into());
                     };
                     let segment_id = parse_segment_id(uuid)?;
                     let doc_id = u32::try_from(doc_id).map_err(|_| {
@@ -1771,7 +1777,8 @@ impl FtsCursor {
                                 {
                                     return Err(LimboError::Corrupt(format!(
                                         "duplicate FTS chunk {path}:{chunk_no}"
-                                    )));
+                                    ))
+                                    .into());
                                 }
                                 *advance_pending = true;
                             }
@@ -1877,7 +1884,7 @@ impl FtsCursor {
 
     /// Load the snapshot view if this cursor skipped it (the insert fast
     /// path). Needed before the first delete or same-transaction query.
-    fn ensure_snapshot_loaded(&mut self) -> Result<IOResult<()>> {
+    fn ensure_snapshot_loaded(&mut self) -> IOResultOr<()> {
         if self.snapshot_loaded {
             return Ok(IOResult::Done(()));
         }
@@ -1900,7 +1907,7 @@ impl FtsCursor {
         &mut self,
         conn: &Arc<Connection>,
         database_id: usize,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         if let Some(ddl) = self.pending_ddl.as_mut() {
             return_if_io!(ddl.step());
             self.pending_ddl = None;
@@ -1943,7 +1950,7 @@ impl FtsCursor {
 
     /// Step freshly prepared nested DDL; park it on the cursor if it
     /// yields so the next entry resumes it.
-    fn drive_nested_ddl(&mut self, mut ddl: NestedDdl) -> Result<IOResult<()>> {
+    fn drive_nested_ddl(&mut self, mut ddl: NestedDdl) -> IOResultOr<()> {
         let result = ddl.step();
         if matches!(result, Ok(IOResult::IO(_))) {
             self.pending_ddl = Some(ddl);
@@ -2085,7 +2092,7 @@ impl FtsCursor {
 
     /// Drive the in-flight publication (row deletions, then row inserts,
     /// then in-memory effects exactly once).
-    fn drive_publish(&mut self) -> Result<IOResult<()>> {
+    fn drive_publish(&mut self) -> IOResultOr<()> {
         let Some(publish) = self.publish.as_mut() else {
             return Ok(IOResult::Done(()));
         };
@@ -2229,7 +2236,7 @@ impl FtsCursor {
     /// Complete any in-flight or due batch publication before a mutation.
     /// The VDBE retries the current instruction when an operation returns
     /// `IOResult::IO`, so this must finish before Tantivy state changes.
-    fn flush_gate(&mut self) -> Result<IOResult<()>> {
+    fn flush_gate(&mut self) -> IOResultOr<()> {
         if self.is_publishing() {
             return_if_io!(self.drive_publish());
         }
@@ -2559,7 +2566,7 @@ impl FtsBackingRowWiper {
         })
     }
 
-    pub fn step(&mut self) -> Result<IOResult<()>> {
+    pub fn step(&mut self) -> IOResultOr<()> {
         self.deleter.step(self.cursor.as_mut())
     }
 }
@@ -2600,7 +2607,7 @@ impl FtsBackingRowDumper {
         })
     }
 
-    pub fn step(&mut self) -> Result<IOResult<()>> {
+    pub fn step(&mut self) -> IOResultOr<()> {
         loop {
             if !self.started {
                 return_if_io!(self.cursor.rewind());
@@ -2649,7 +2656,7 @@ impl Drop for FtsCursor {
 impl IndexMethodCursor for FtsCursor {
     /// Creates the FTS index storage (internal BTree table for segment
     /// rows) and stages the v2 control row.
-    fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn create(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
@@ -2682,7 +2689,7 @@ impl IndexMethodCursor for FtsCursor {
     }
 
     /// Destroys the FTS index, dropping all storage and clearing caches.
-    fn destroy(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn destroy(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
@@ -2737,7 +2744,7 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Opens the index for reading: scan the visible registry rows at this
     /// snapshot and assemble a searcher over exactly those segments.
-    fn open_read(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
@@ -2752,7 +2759,7 @@ impl IndexMethodCursor for FtsCursor {
     /// Opens the index for writing. Pure inserts only need to know the
     /// store's format — they append segments without reading the index —
     /// so this stops after format detection.
-    fn open_write(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
@@ -2775,7 +2782,7 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Buffers a document for the next segment build. Values are text
     /// columns followed by rowid.
-    fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+    fn insert(&mut self, values: &[Register]) -> IOResultOr<()> {
         self.claim_writer_slot()?;
         return_if_io!(self.flush_gate());
 
@@ -2786,9 +2793,7 @@ impl IndexMethodCursor for FtsCursor {
         let rowid = match rowid_reg {
             Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => {
-                return Err(LimboError::InternalError(
-                    "FTS rowid must be integer".into(),
-                ));
+                return Err(LimboError::InternalError("FTS rowid must be integer".into()).into());
             }
         };
 
@@ -2820,7 +2825,7 @@ impl IndexMethodCursor for FtsCursor {
     /// Deletes a document by rowid: drop it from the buffer if it has not
     /// been serialized yet, and tombstone every live posting it has in the
     /// visible segment set.
-    fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+    fn delete(&mut self, values: &[Register]) -> IOResultOr<()> {
         self.claim_writer_slot()?;
         // Announce this transaction as a tombstone writer before any
         // tombstone exists, so a concurrent merge cannot retire the
@@ -2838,9 +2843,7 @@ impl IndexMethodCursor for FtsCursor {
         let rowid = match rowid_reg {
             Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => {
-                return Err(LimboError::InternalError(
-                    "FTS rowid must be integer".into(),
-                ));
+                return Err(LimboError::InternalError("FTS rowid must be integer".into()).into());
             }
         };
 
@@ -2868,7 +2871,7 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Starts an FTS query. Parses the query string and executes the search.
     /// Returns true if there are results, false otherwise.
-    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>> {
+    fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool> {
         self.ensure_searcher()?;
         let searcher = self
             .searcher
@@ -2877,7 +2880,8 @@ impl IndexMethodCursor for FtsCursor {
         if values.len() < 2 {
             return Err(LimboError::InternalError(
                 "FTS query_start: expected pattern id and query string".into(),
-            ));
+            )
+            .into());
         }
 
         // values[0] = pattern index
@@ -2890,7 +2894,7 @@ impl IndexMethodCursor for FtsCursor {
         // values[1] = query string
         let query_str = match &values[1] {
             Register::Value(Value::Text(t)) => t.as_str().to_string(),
-            _ => return Err(LimboError::InternalError("FTS query must be text".into())),
+            _ => return Err(LimboError::InternalError("FTS query must be text".into()).into()),
         };
 
         // Determine the optional SQL LIMIT captured by the selected pattern.
@@ -2929,12 +2933,14 @@ impl IndexMethodCursor for FtsCursor {
                 return Err(LimboError::InternalError(
                     "FTS query_start: LIMIT pattern selected but no limit value captured"
                         .to_string(),
-                ));
+                )
+                .into());
             }),
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "FTS query_start: unknown pattern {pattern_idx}"
-                )));
+                ))
+                .into());
             }
         };
 
@@ -2952,7 +2958,8 @@ impl IndexMethodCursor for FtsCursor {
             return Err(LimboError::InternalError(format!(
                 "FTS query is too long ({} bytes; the limit is {FTS_MAX_QUERY_BYTES})",
                 query_str.len()
-            )));
+            ))
+            .into());
         }
         let mut depth = 0usize;
         for byte in query_str.bytes() {
@@ -2962,7 +2969,8 @@ impl IndexMethodCursor for FtsCursor {
                     if depth > FTS_MAX_QUERY_NESTING {
                         return Err(LimboError::InternalError(format!(
                             "FTS query nests deeper than {FTS_MAX_QUERY_NESTING} parentheses"
-                        )));
+                        ))
+                        .into());
                     }
                 }
                 b')' => depth = depth.saturating_sub(1),
@@ -2971,9 +2979,7 @@ impl IndexMethodCursor for FtsCursor {
         }
         let (query, parse_errors) = parser.parse_query_lenient(&query_str);
         if let Some(error) = parse_errors.first() {
-            return Err(LimboError::InternalError(format!(
-                "FTS parse error: {error:?}"
-            )));
+            return Err(LimboError::InternalError(format!("FTS parse error: {error:?}")).into());
         }
 
         // TopDocs keeps a heap proportional to its limit. Cap that heap at the
@@ -3116,7 +3122,7 @@ impl IndexMethodCursor for FtsCursor {
     }
 
     /// Advances to the next query result. Returns true if more results exist.
-    fn query_next(&mut self) -> Result<IOResult<bool>> {
+    fn query_next(&mut self) -> IOResultOr<bool> {
         if let Some(stream) = &mut self.streaming_hits {
             return Ok(IOResult::Done(stream.advance()?));
         }
@@ -3128,12 +3134,10 @@ impl IndexMethodCursor for FtsCursor {
     }
 
     /// Returns the column value for the current result (score or match indicator).
-    fn query_column(&mut self, idx: usize) -> Result<IOResult<Value>> {
+    fn query_column(&mut self, idx: usize) -> IOResultOr<Value> {
         // Column 0 = score for fts_score, or 1 (true) for fts_match
         if idx != 0 {
-            return Err(LimboError::InternalError(
-                "FTS: only column 0 supported".into(),
-            ));
+            return Err(LimboError::InternalError("FTS: only column 0 supported".into()).into());
         }
 
         match self.current_pattern {
@@ -3146,7 +3150,8 @@ impl IndexMethodCursor for FtsCursor {
                 {
                     return Err(LimboError::InternalError(
                         "FTS: query_column out of bounds".into(),
-                    ));
+                    )
+                    .into());
                 }
                 // For fts_match patterns, return 1 (true) - indicates this row matches
                 Ok(IOResult::Done(Value::from_i64(1)))
@@ -3182,7 +3187,7 @@ impl IndexMethodCursor for FtsCursor {
     }
 
     /// Returns the rowid for the current query result.
-    fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+    fn query_rowid(&mut self) -> IOResultOr<Option<i64>> {
         if let Some(stream) = &self.streaming_hits {
             return Ok(IOResult::Done(stream.current.map(|(_, rowid)| rowid)));
         }
@@ -3198,7 +3203,7 @@ impl IndexMethodCursor for FtsCursor {
     /// new segment and the visible set exceeds `PRAGMA fts_merge_threshold`,
     /// merges it down in the same transaction (skipped silently on
     /// maintenance contention).
-    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
         if self.is_publishing() {
             return_if_io!(self.drive_publish());
         } else if self.pending_op_count() > 0 {
@@ -3259,7 +3264,7 @@ impl IndexMethodCursor for FtsCursor {
     /// Merge the visible segments into one, compacting tombstones away.
     /// Call via `OPTIMIZE INDEX idx_name`. The only operation that touches
     /// other transactions' rows; serialized by the per-index merge mutex.
-    fn optimize(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);

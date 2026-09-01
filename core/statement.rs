@@ -335,7 +335,7 @@ impl std::fmt::Debug for Statement {
 }
 
 impl Statement {
-    pub(crate) fn prepare_index_methods(&mut self) -> Result<crate::IOResult<()>> {
+    pub(crate) fn prepare_index_methods(&mut self) -> crate::types::IOResultOr<()> {
         crate::vdbe::execute::index_method_stage_statement_all(&mut self.state)
     }
 
@@ -617,7 +617,7 @@ impl Statement {
             .step(&mut self.state, &self.pager, self.query_mode, waker);
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
-            if !matches!(res, Err(LimboError::SchemaUpdated)) {
+            if !matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
                 break;
             }
             // In a write transaction, reprepare may not help (e.g. cross-process
@@ -721,7 +721,9 @@ impl Statement {
             self.cleanup_orphaned_seq_inner_tx();
         }
 
-        res
+        // The interpreter chain carries a boxed error to keep per-row returns
+        // register-sized; unbox once at the public boundary.
+        res.map_err(|err| *err)
     }
 
     #[inline]
@@ -741,6 +743,7 @@ impl Statement {
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
+            .map_err(|err| *err)
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
@@ -807,7 +810,7 @@ impl Statement {
     /// Used by engine-internal callers that must stay non-blocking (MVCC
     /// bootstrap/recovery) so they don't call `io.step()` on backends that have
     /// no synchronous IO pump (e.g. WASM).
-    pub fn run_ignore_rows_nonblock(&mut self) -> Result<crate::IOResult<()>> {
+    pub fn run_ignore_rows_nonblock(&mut self) -> crate::types::IOResultOr<()> {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
@@ -818,8 +821,8 @@ impl Statement {
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
-                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
-                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy.into()),
             }
         }
     }
@@ -838,7 +841,7 @@ impl Statement {
     pub fn run_with_row_callback_nonblock(
         &mut self,
         mut func: impl FnMut(&Row) -> Result<()>,
-    ) -> Result<crate::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
@@ -851,8 +854,8 @@ impl Statement {
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
-                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
-                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy.into()),
             }
         }
     }
@@ -1528,7 +1531,7 @@ impl Statement {
                         Err(e) => {
                             capture_reset_error(
                                 &mut reset_error,
-                                e,
+                                *e,
                                 "Error halting statement during reset",
                             );
                             break;

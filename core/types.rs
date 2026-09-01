@@ -3459,6 +3459,12 @@ impl IOCompletions {
     }
 }
 
+/// Return type for storage-layer functions that may suspend for I/O.
+/// The boxed error keeps the whole value register-sized for small `T`
+/// (a bare `LimboError` is 40 bytes and forces a memory return on every
+/// call in cursor and pager hot paths); `?` boxes automatically.
+pub type IOResultOr<T> = std::result::Result<IOResult<T>, Box<crate::LimboError>>;
+
 #[derive(Debug)]
 #[must_use]
 pub enum IOResult<T> {
@@ -3489,7 +3495,7 @@ impl<T> IOResult<T> {
     }
 }
 
-/// Evaluate a Result<IOResult<T>>, if IO return IO.
+/// Evaluate a IOResultOr<T>, if IO return IO.
 #[macro_export]
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -3498,7 +3504,8 @@ macro_rules! return_if_io {
             Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
             Err(err) => {
                 branches::mark_unlikely();
-                return Err(err);
+                // Polymorphic over boxed and unboxed LimboError contexts.
+                return Err(err.into());
             }
         }
     };

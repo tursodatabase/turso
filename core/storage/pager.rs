@@ -21,6 +21,7 @@ use crate::sync::atomic::{
 };
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
+use crate::types::IOResultOr;
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
@@ -75,7 +76,7 @@ use ptrmap::*;
 pub struct HeaderRef(PageRef);
 
 impl HeaderRef {
-    pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
+    pub fn from_pager(pager: &Pager) -> IOResultOr<Self> {
         let page = return_if_io!(pager.read_header_page());
         Ok(IOResult::Done(Self(page)))
     }
@@ -91,7 +92,7 @@ impl HeaderRef {
 pub struct HeaderRefMut(PageRef);
 
 impl HeaderRefMut {
-    pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
+    pub fn from_pager(pager: &Pager) -> IOResultOr<Self> {
         let page = return_if_io!(pager.read_header_page());
         pager.add_dirty(&page)?;
         Ok(IOResult::Done(Self(page)))
@@ -1825,7 +1826,7 @@ impl Pager {
 
     /// Read page 1 (the database header page) using the header_ref_state state machine.
     /// Used by HeaderRef and HeaderRefMut to avoid duplicating the page-loading logic.
-    fn read_header_page(&self) -> Result<IOResult<PageRef>> {
+    fn read_header_page(&self) -> IOResultOr<PageRef> {
         loop {
             let state = self.header_ref_state.read().clone();
             tracing::trace!("read_header_page - {:?}", state);
@@ -2357,7 +2358,7 @@ impl Pager {
 
     /// Set the maximum page count for this database
     /// Returns the new maximum page count (may be clamped to current database size)
-    pub fn set_max_page_count(&self, new_max: u32) -> crate::Result<IOResult<u32>> {
+    pub fn set_max_page_count(&self, new_max: u32) -> IOResultOr<u32> {
         // Get current database size
         let current_page_count =
             return_if_io!(self.with_header(|header| header.database_size.get()));
@@ -2413,7 +2414,7 @@ impl Pager {
     /// `target_page_num` (1-indexed) is the page whose entry is sought.
     /// Returns `Ok(None)` if the page is not supposed to have a ptrmap entry (e.g. header, or a ptrmap page itself).
     #[cfg(feature = "autovacuum")]
-    pub fn ptrmap_get(&self, target_page_num: u32) -> Result<IOResult<Option<PtrmapEntry>>> {
+    pub fn ptrmap_get(&self, target_page_num: u32) -> IOResultOr<Option<PtrmapEntry>> {
         loop {
             let ptrmap_get_state = {
                 let vacuum_state = self.vacuum_state.read();
@@ -2472,7 +2473,8 @@ impl Pager {
                             "Ptrmap page {} has unexpected internal offset {}",
                             ptrmap_pg_no,
                             page_content.offset()
-                        )));
+                        ))
+                        .into());
                     }
                     let ptrmap_page_data_slice: &[u8] = &full_buffer_slice[page_content.offset()..];
                     let actual_data_length = ptrmap_page_data_slice.len();
@@ -2481,7 +2483,7 @@ impl Pager {
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > actual_data_length {
                         return Err(LimboError::InternalError(format!(
                         "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
-                    )));
+                    )).into());
                     }
 
                     let entry_slice = &ptrmap_page_data_slice
@@ -2491,7 +2493,7 @@ impl Pager {
                         Some(entry) => Ok(IOResult::Done(Some(entry))),
                         None => Err(LimboError::Corrupt(format!(
                             "Failed to deserialize ptrmap entry for page {target_page_num} from ptrmap page {ptrmap_pg_no}"
-                        ))),
+                        )).into()),
                     };
                 }
             }
@@ -2507,7 +2509,7 @@ impl Pager {
         db_page_no_to_update: u32,
         entry_type: PtrmapType,
         parent_page_no: u32,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         tracing::trace!(
             "ptrmap_put(page_idx = {}, entry_type = {:?}, parent_page_no = {})",
             db_page_no_to_update,
@@ -2530,7 +2532,7 @@ impl Pager {
                         turso_soft_unreachable!("Cannot set ptrmap entry for header/ptrmap page or invalid page", { "page": db_page_no_to_update });
                         return Err(LimboError::InternalError(format!(
                         "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
-                    )));
+                    )).into());
                     }
 
                     let ptrmap_pg_no =
@@ -2575,7 +2577,7 @@ impl Pager {
                         PTRMAP_ENTRY_SIZE,
                         ptrmap_pg_no,
                         full_buffer_slice.len()
-                    )));
+                    )).into());
                     }
 
                     let entry = PtrmapEntry {
@@ -2601,7 +2603,7 @@ impl Pager {
     /// This method is used to allocate a new root page for a btree, both for tables and indexes
     /// FIXME: handle no room in page cache
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn btree_create(&self, flags: &CreateBTreeFlags) -> Result<IOResult<u32>> {
+    pub fn btree_create(&self, flags: &CreateBTreeFlags) -> IOResultOr<u32> {
         let page_type = match flags {
             _ if flags.is_table() => PageType::TableLeaf,
             _ if flags.is_index() => PageType::IndexLeaf,
@@ -2707,7 +2709,8 @@ impl Pager {
                 AutoVacuumMode::Incremental => {
                     return Err(LimboError::InternalError(
                         "Incremental auto-vacuum is not supported".to_string(),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -2716,7 +2719,7 @@ impl Pager {
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> Result<IOResult<PageRef>> {
+    pub fn allocate_overflow_page(&self) -> IOResultOr<PageRef> {
         let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
@@ -2736,7 +2739,7 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<IOResult<PageRef>> {
+    ) -> IOResultOr<PageRef> {
         let page = return_if_io!(self.allocate_page());
         #[cfg(debug_assertions)]
         turso_assert_eq!(
@@ -2937,7 +2940,7 @@ impl Pager {
     }
 
     /// Get the schema cookie, using the cached value if available to avoid reading page 1.
-    pub fn get_schema_cookie(&self) -> Result<IOResult<u32>> {
+    pub fn get_schema_cookie(&self) -> IOResultOr<u32> {
         // Try to use cached value first
         if let Some(cookie) = self.get_schema_cookie_cached() {
             return Ok(IOResult::Done(cookie));
@@ -3000,7 +3003,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
+    pub fn maybe_allocate_page1(&self) -> IOResultOr<()> {
         if !self.db_initialized() {
             if let Some(_lock) = self.init_lock.try_lock() {
                 return Ok(self.allocate_page1()?.map(|_| ()));
@@ -3019,7 +3022,7 @@ impl Pager {
     /// `try_restart_log_before_write`. Callers managing WAL state externally
     /// (sync engine) must not pass `Restart` because rotating the WAL header
     /// behind their back invalidates watermarks they have already published.
-    pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<IOResult<()>> {
+    pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> IOResultOr<()> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
@@ -3060,11 +3063,11 @@ impl Pager {
     ///
     /// VACUUM runs on an existing database, so page 1 must already be allocated
     /// and a WAL must be present.
-    pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
+    pub fn begin_vacuum_blocking_tx(&self) -> IOResultOr<()> {
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
                 "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
-            ));
+            ).into());
         }
         let wal = self.wal.as_ref().ok_or_else(|| {
             LimboError::InternalError("begin_vacuum_blocking_tx requires WAL mode".into())
@@ -3085,7 +3088,7 @@ impl Pager {
         &self,
         connection: &Connection,
         update_transaction_state: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
@@ -3332,7 +3335,7 @@ impl Pager {
     /// `pending_reads` corresponds to a single outstanding disk read; the
     /// entry is removed exactly when this method returns `Done`.
     #[tracing::instrument(skip_all, level = Level::TRACE)]
-    pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
+    pub fn read_page(&self, page_idx: i64) -> IOResultOr<(PageRef, Option<Completion>)> {
         self.read_page_into(page_idx, None)
     }
 
@@ -3342,7 +3345,7 @@ impl Pager {
         &self,
         page_idx: i64,
         group: Option<&mut CompletionGroup>,
-    ) -> Result<IOResult<(PageRef, Option<Completion>)>> {
+    ) -> IOResultOr<(PageRef, Option<Completion>)> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
         #[cfg(test)]
@@ -3436,7 +3439,7 @@ impl Pager {
     /// evicted, the page is admitted over capacity rather than failing the
     /// read (mirroring SQLite, where `cache_size` may be exceeded while all
     /// pages are in use); later inserts drain the excess.
-    fn cache_insert(&self, page_idx: usize, page: PageRef) -> Result<IOResult<()>> {
+    fn cache_insert(&self, page_idx: usize, page: PageRef) -> IOResultOr<()> {
         {
             let mut page_cache = self.page_cache.write();
             let page_key = PageCacheKey::new(page_idx);
@@ -3555,7 +3558,7 @@ impl Pager {
     /// Flush all dirty pages to disk (async/re-entrant).
     /// Unlike commit_wal, this function does not commit, checkpoint nor sync the WAL/Database.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
+    pub fn cacheflush(&self) -> IOResultOr<Vec<Completion>> {
         let wal = self
             .wal
             .as_ref()
@@ -3834,7 +3837,7 @@ impl Pager {
     /// then mark them as spilled so they can be evicted even while dirty.
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn try_spill_dirty_pages(&self) -> Result<IOResult<()>> {
+    fn try_spill_dirty_pages(&self) -> IOResultOr<()> {
         loop {
             let state = self.spill_state.read().clone();
             match state {
@@ -3990,7 +3993,7 @@ impl Pager {
     /// `SpillState::WritingToWal` and yields the write completion. The WAL
     /// must already be initialized (callers route through `PreparingWal*`
     /// first).
-    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> Result<IOResult<()>> {
+    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> IOResultOr<()> {
         let wal = self
             .wal
             .as_ref()
@@ -4032,7 +4035,7 @@ impl Pager {
 
     /// Wait for any in-flight spill writes to finish.
     /// This prevents publishing WAL metadata that references frames that are not yet durable.
-    fn wait_for_spill_completions(&self) -> Result<IOResult<()>> {
+    fn wait_for_spill_completions(&self) -> IOResultOr<()> {
         loop {
             let state = self.spill_state.read().clone();
             if matches!(state, SpillState::Idle) {
@@ -4082,7 +4085,7 @@ impl Pager {
 
     /// Check if the cache needs spilling and attempt to spill if necessary.
     /// This should be called before inserting new pages into the cache.
-    fn ensure_cache_space(&self) -> Result<IOResult<()>> {
+    fn ensure_cache_space(&self) -> IOResultOr<()> {
         let needs_spill = {
             let cache = self.page_cache.read();
             cache.needs_spill()
@@ -4122,7 +4125,7 @@ impl Pager {
         allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         {
             let mut commit_info = self.commit_info.write();
             if commit_info.state == CommitState::PrepareWal {
@@ -4153,12 +4156,10 @@ impl Pager {
         allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("commit_wal() called without WAL");
-            return Err(LimboError::InternalError(
-                "commit_wal() called without WAL".into(),
-            ));
+            return Err(LimboError::InternalError("commit_wal() called without WAL".into()).into());
         };
 
         loop {
@@ -4247,7 +4248,8 @@ impl Pager {
                     if !reads.succeeded() {
                         return Err(LimboError::CompletionError(reads.get_error().unwrap_or(
                             CompletionError::IOError(std::io::ErrorKind::Other, "read"),
-                        )));
+                        ))
+                        .into());
                     }
                     // All reads complete and successful, proceed to frame preparation
                     commit_info.completion_group = None;
@@ -4285,7 +4287,8 @@ impl Pager {
                             return Err(LimboError::InternalError(format!(
                                 "dirty page {} has no buffer loaded at commit time",
                                 page.get().id
-                            )));
+                            ))
+                            .into());
                         }
                         turso_assert!(
                             page.get().overflow_cells.is_empty(),
@@ -4337,7 +4340,8 @@ impl Pager {
                         return Err(LimboError::CompletionError(CompletionError::IOError(
                             std::io::ErrorKind::Other,
                             "write",
-                        )));
+                        ))
+                        .into());
                     }
                     commit_info.completion_group = None;
                     // All writes complete; WaitSync submits the WAL fsync if
@@ -4387,7 +4391,8 @@ impl Pager {
                             return Err(LimboError::CompletionError(CompletionError::IOError(
                                 std::io::ErrorKind::Other,
                                 "sync",
-                            )));
+                            ))
+                            .into());
                         }
                         commit_info.pending_sync = None;
                     }
@@ -4620,7 +4625,7 @@ impl Pager {
         mode: CheckpointMode,
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         self.checkpoint_inner(
             mode,
             sync_mode,
@@ -4633,7 +4638,7 @@ impl Pager {
         &self,
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         self.checkpoint_inner(
             CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
@@ -4651,12 +4656,13 @@ impl Pager {
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
         lock_source: CheckpointLockSource,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
                 "checkpoint() called on database without WAL".to_string(),
-            ));
+            )
+            .into());
         };
         loop {
             // Clone the phase to check what state we're in, but keep result in place
@@ -4881,7 +4887,8 @@ impl Pager {
                     if bytes_read < DatabaseHeader::SIZE {
                         return Err(LimboError::Corrupt(
                             "database header unreadable after checkpoint sync".into(),
-                        ));
+                        )
+                        .into());
                     }
                     let (db_size_pages, db_header_crc32c) =
                         super::wal::database_identity_from_header_bytes(
@@ -5148,7 +5155,7 @@ impl Pager {
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn free_page(&self, mut page: Option<PageRef>, page_id: usize) -> Result<IOResult<()>> {
+    pub fn free_page(&self, mut page: Option<PageRef>, page_id: usize) -> IOResultOr<()> {
         tracing::trace!("free_page(page_id={})", page_id);
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
@@ -5164,7 +5171,8 @@ impl Pager {
                     if page_id < 2 || page_id > header.database_size.get() as usize {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid page number {page_id} for free operation"
-                        )));
+                        ))
+                        .into());
                     }
 
                     // The first yield point is the `HeaderRefMut::from_pager`
@@ -5286,7 +5294,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page1(&self) -> Result<IOResult<PageRef>> {
+    pub fn allocate_page1(&self) -> IOResultOr<PageRef> {
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
@@ -5379,7 +5387,7 @@ impl Pager {
     /// Final step of [Pager::allocate_page1]: page 1 is written (and, for
     /// WAL-backed databases, fsync'd) to the main database file; publish it
     /// in the page cache and mark the database initialized.
-    fn finish_allocate_page1(&self, page: PageRef) -> Result<IOResult<PageRef>> {
+    fn finish_allocate_page1(&self, page: PageRef) -> IOResultOr<PageRef> {
         let page_key = PageCacheKey::new(page.get().id);
         let mut cache = self.page_cache.write();
         cache.insert(page_key, page.clone()).map_err(|e| {
@@ -5408,7 +5416,7 @@ impl Pager {
     ///        or allocate a new page.
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
+    pub fn allocate_page(&self) -> IOResultOr<PageRef> {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
@@ -5629,7 +5637,8 @@ impl Pager {
                     if new_db_size > max_page_count {
                         return Err(LimboError::DatabaseFull(
                             "database or disk is full".to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
@@ -5752,7 +5761,7 @@ impl Pager {
         *self.header_ref_state.write() = HeaderRefState::Start;
     }
 
-    pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
+    pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> IOResultOr<T> {
         let header_ref = return_if_io!(HeaderRef::from_pager(self));
         let header = header_ref.borrow();
         // Update cached schema cookie when reading header
@@ -5760,7 +5769,7 @@ impl Pager {
         Ok(IOResult::Done(f(header)))
     }
 
-    pub fn with_header_mut<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> Result<IOResult<T>> {
+    pub fn with_header_mut<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> IOResultOr<T> {
         let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
         let result = f(header);
@@ -6278,7 +6287,7 @@ mod tests {
 
         let err = pager.cacheflush().unwrap_err();
         assert!(matches!(
-            err,
+            *err,
             LimboError::CompletionError(CompletionError::PageCodecError { page_idx: 2 })
         ));
         assert!(matches!(
@@ -6328,7 +6337,7 @@ mod ptrmap_tests {
     use arc_swap::ArcSwapOption;
 
     pub fn run_until_done<T>(
-        mut action: impl FnMut() -> Result<IOResult<T>>,
+        mut action: impl FnMut() -> IOResultOr<T>,
         pager: &Pager,
     ) -> Result<T> {
         loop {
