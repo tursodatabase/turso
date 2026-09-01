@@ -12558,9 +12558,9 @@ mod tests {
                     },
                     module_name: Name::exact("bar".to_owned()),
                     args: vec![
-                        "1".to_owned(),
-                        "2".to_owned(),
-                        "('hello', (3.333), 'world', (1, 2))".to_owned(),
+                        smol_str::SmolStr::new("1"),
+                        smol_str::SmolStr::new("2"),
+                        smol_str::SmolStr::new("('hello', (3.333), 'world', (1, 2))"),
                     ],
                 }))],
             ),
@@ -12575,8 +12575,8 @@ mod tests {
                     },
                     module_name: Name::exact("fts5".to_owned()),
                     args: vec![
-                        "x".to_owned(),
-                        "tokenize = '''porter'' ''ascii'''".to_owned(),
+                        smol_str::SmolStr::new("x"),
+                        smol_str::SmolStr::new("tokenize = '''porter'' ''ascii'''"),
                     ],
                 }))],
             ),
