@@ -2,6 +2,10 @@ use super::*;
 use crate::alloc::TursoIteratorExt;
 use crate::function::AggFunc;
 
+/// Allocate the match set and subroutine state for one right-preserving join.
+///
+/// SQLite records matched right rowids during the main loop. It scans the same
+/// source later and calls the shared result body for each missing rowid.
 fn right_join_metadata(
     program: &mut ProgramBuilder,
     table: &JoinedTable,

@@ -6253,6 +6253,7 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
             }
             Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
             Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
+            Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),
             _ => {
                 mark_unlikely();
                 Err(LimboError::InternalError(

@@ -77,11 +77,17 @@ pub struct LeftJoinMetadata {
 }
 
 #[derive(Debug, Clone)]
+/// State shared by the main join loop and the unmatched-right-row pass.
 pub struct RightJoinMetadata {
+    /// Ephemeral index that stores each matched right-side rowid.
     pub matched_rows_cursor_id: CursorID,
+    /// Register used to read and look up the current right-side rowid.
     pub rowid_reg: usize,
+    /// Return-address register for the shared result-row subroutine.
     pub return_reg: usize,
+    /// Entry label for the result-row subroutine.
     pub body_label: BranchOffset,
+    /// Label that returns from the result-row subroutine to the main loop.
     pub return_label: BranchOffset,
 }
 
