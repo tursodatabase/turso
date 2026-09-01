@@ -187,7 +187,7 @@ pub fn emit_program_for_update(
             identifier: target_table.identifier.clone(),
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
-            using_dedup_hidden_cols: ColumnMask::default(),
+            join_info: None,
             col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
             cte_explicit_columns: vec![],

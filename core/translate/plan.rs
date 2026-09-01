@@ -11,7 +11,7 @@ use crate::{
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
-            StorageClassMask,
+            lookup_unqualified_column, StorageClassMask,
         },
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
@@ -1042,6 +1042,7 @@ pub(super) fn expand_star(
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
     let tables = table_references.joined_tables();
+    let mut used_columns = Vec::new();
     for (table_index, table) in tables.iter().enumerate() {
         // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
         // and should not contribute columns to SELECT *.
@@ -1096,48 +1097,54 @@ pub(super) fn expand_star(
             }
         }
         for (mut column_index, column) in table.columns_for_star() {
-            if let Some(column_name) = column.name.as_deref() {
-                if table
-                    .join_info
-                    .as_ref()
-                    .is_some_and(|join| join.merges_column(column_name))
-                {
-                    continue;
+            let Some(column_name) = column.name.as_deref() else {
+                // Star expansion needs a name for its output and for later USING lookups.
+                continue;
+            };
+            if table
+                .join_info
+                .as_ref()
+                .is_some_and(|join| join.merges_column(column_name))
+            {
+                continue;
+            }
+            if join_columns.is_some() {
+                if tables.len() == 1 {
+                    column_index = rebind_parenthesized_star_column(table, column_name)?;
                 }
-                if join_columns.is_some() {
-                    if tables.len() == 1 {
-                        column_index = rebind_parenthesized_star_column(table, column_name)?;
-                    }
-                } else if parenthesized_star_source_match(tables, table_index, column_name)
-                    == StarSourceMatch::Ambiguous
-                {
-                    if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
-                        let database_name = resolver
-                            .get_database_name_by_index(table.database_id)
-                            .expect("the table database must exist while compiling a query");
-                        crate::bail_parse_error!(
-                            "ambiguous column name: {}.{}.{}",
-                            database_name,
-                            table.identifier,
-                            column_name
-                        );
-                    }
+            } else if parenthesized_star_source_match(tables, table_index, column_name)
+                == StarSourceMatch::Ambiguous
+            {
+                if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
+                    let database_name = resolver
+                        .get_database_name_by_index(table.database_id)
+                        .expect("the table database must exist while compiling a query");
                     crate::bail_parse_error!(
-                        "ambiguous column name: {}.{}",
+                        "ambiguous column name: {}.{}.{}",
+                        database_name,
                         table.identifier,
                         column_name
                     );
                 }
+                crate::bail_parse_error!(
+                    "ambiguous column name: {}.{}",
+                    table.identifier,
+                    column_name
+                );
             }
-            out_columns.push(star_result_column(table, column_index, long_names));
+            let resolved_column =
+                resolve_star_column(tables, table_index, column_index, column_name)?;
+            used_columns.extend(resolved_column.source_columns);
+            out_columns.push(star_result_column(
+                table,
+                column_index,
+                long_names,
+                resolved_column.expr,
+            ));
         }
     }
-    for table in table_references.joined_tables_mut() {
-        for column_index in 0..table.columns().len() {
-            if !table.column_is_hidden_from_star(column_index) {
-                table.mark_column_used(column_index);
-            }
-        }
+    for (table_id, column_index) in used_columns {
+        table_references.mark_column_used(table_id, column_index);
     }
     Ok(())
 }
@@ -1219,33 +1226,26 @@ pub(super) fn expand_table_star(
             // name can find several sources, or none after a numeric suffix.
             column_index = rebind_parenthesized_star_column(table, column_name)?;
         }
-        let mut result = star_result_column(table, column_index, long_names);
-        let mut used_table = table;
-        let mut used_column_index = column_index;
-        if let (Some((direct_index, _)), Some(column_name)) = (
-            first_direct_match,
-            table.columns()[column_index].name.as_deref(),
-        ) {
+        let mut resolved_column =
+            resolve_star_column(tables, table_index, column_index, column_name)?;
+        if let Some((direct_index, _)) = first_direct_match {
             if let StarSourceMatch::Merged { first_table_index } =
                 parenthesized_star_source_match(tables, direct_index, column_name)
             {
                 // SQLite resolves a later direct copy through USING.
                 if table_index == direct_index && table_index != first_table_index {
-                    used_table = &tables[first_table_index];
-                    used_column_index = find_unqualified_column(&used_table.table, column_name)?
+                    resolved_column = resolve_unqualified_column(tables, column_name)?
                         .expect("the merged source must have the USING column");
-                    let source_column = &used_table.columns()[used_column_index];
-                    result.expr = ast::Expr::Column {
-                        database: None,
-                        table: used_table.internal_id,
-                        column: used_column_index,
-                        is_rowid_alias: source_column.is_rowid_alias(),
-                    };
                 }
             }
         }
-        out_columns.push(result);
-        used_columns.push((used_table.internal_id, used_column_index));
+        used_columns.extend(resolved_column.source_columns);
+        out_columns.push(star_result_column(
+            table,
+            column_index,
+            long_names,
+            resolved_column.expr,
+        ));
     }
     for (table_id, column_index) in used_columns {
         table_references.mark_column_used(table_id, column_index);
@@ -1313,6 +1313,7 @@ fn star_result_column(
     table: &JoinedTable,
     column_index: usize,
     long_names: bool,
+    expr: Expr,
 ) -> ResultSetColumn {
     let column = &table.columns()[column_index];
     // SQLite gives star outputs explicit names. This bypasses the normal
@@ -1327,12 +1328,7 @@ fn star_result_column(
     ResultSetColumn {
         alias,
         implicit_column_name: None,
-        expr: ast::Expr::Column {
-            database: None,
-            table: table.internal_id,
-            column: column_index,
-            is_rowid_alias: column.is_rowid_alias(),
-        },
+        expr,
         contains_aggregates: false,
     }
 }
@@ -1348,6 +1344,34 @@ pub enum JoinType {
     Semi,
     /// Anti-join: keep outer row if NO inner match found (NOT EXISTS).
     Anti,
+}
+
+impl JoinType {
+    /// Convert parser join flags into the join type used after name binding.
+    ///
+    /// The parser keeps SQLite's accepted spellings as flags. For example,
+    /// `LEFT RIGHT JOIN` means FULL JOIN.
+    pub fn from_join_operator(operator: &ast::JoinOperator) -> Self {
+        let ast::JoinOperator::TypedJoin(Some(join_type)) = operator else {
+            return Self::Inner;
+        };
+        let has_left = join_type.contains(ast::JoinType::LEFT);
+        let has_right = join_type.contains(ast::JoinType::RIGHT);
+        if has_left && has_right {
+            Self::FullOuter
+        } else if has_right {
+            Self::RightOuter
+        } else if has_left {
+            Self::LeftOuter
+        } else {
+            Self::Inner
+        }
+    }
+
+    /// Return true when this join keeps unmatched rows from its right side.
+    pub fn keeps_right_rows(self) -> bool {
+        matches!(self, Self::RightOuter | Self::FullOuter)
+    }
 }
 
 /// Join information for a table reference.
@@ -1384,7 +1408,7 @@ impl JoinInfo {
 
     /// Whether this join keeps unmatched rows from the right side.
     pub fn keeps_right_rows(&self) -> bool {
-        matches!(self.join_type, JoinType::RightOuter | JoinType::FullOuter)
+        self.join_type.keeps_right_rows()
     }
 
     /// Whether this is a FULL OUTER JOIN.
@@ -1410,6 +1434,247 @@ impl JoinInfo {
     /// Whether the optimizer must preserve this table's position in the join order.
     pub fn is_ordering_constrained(&self) -> bool {
         self.is_outer() || self.is_semi_or_anti() || self.no_reorder
+    }
+}
+
+/// A bound column and all table columns that can supply its value.
+///
+/// The source list lets the planner keep each required table column available.
+/// This is necessary when FULL JOIN produces a value from several sources.
+pub struct ResolvedColumn {
+    /// The expression that returns the visible column value.
+    pub expr: Expr,
+    /// The table columns that the expression reads.
+    pub source_columns: SmallVec<[(TableInternalId, usize); 4]>,
+}
+
+/// Bind one column from `*` or `table.*`.
+fn resolve_star_column(
+    tables: &[JoinedTable],
+    table_index: usize,
+    column_index: usize,
+    column_name: &str,
+) -> Result<ResolvedColumn> {
+    let later_joins = tables[table_index + 1..]
+        .iter()
+        .filter_map(|table| table.join_info.as_ref());
+    if star_column_uses_merged_value(later_joins, column_name) {
+        // SQLite emits an unqualified name here, so normal USING binding merges its value.
+        return Ok(resolve_unqualified_column(tables, column_name)?
+            .expect("star expansion found this column"));
+    }
+    let table = &tables[table_index];
+    Ok(merge_columns([(
+        table.internal_id,
+        &table.table,
+        column_index,
+    )]))
+}
+
+/// Return true when SQLite resolves a qualified star column as an unqualified name.
+///
+/// A later USING clause and a later RIGHT or FULL JOIN are both required.
+/// They can belong to different joins.
+pub fn star_column_uses_merged_value<'a>(
+    later_joins: impl Iterator<Item = &'a JoinInfo>,
+    column_name: &str,
+) -> bool {
+    let mut has_later_using = false;
+    let mut has_later_right_or_full_join = false;
+    for join_info in later_joins {
+        has_later_using |= join_info.merges_column(column_name);
+        has_later_right_or_full_join |= join_info.keeps_right_rows();
+    }
+    has_later_using && has_later_right_or_full_join
+}
+
+/// Bind an unqualified column with SQLite's left-to-right USING rules.
+/// See [unqualified_column_sources].
+pub fn resolve_unqualified_column(
+    tables: &[JoinedTable],
+    column_name: &str,
+) -> Result<Option<ResolvedColumn>> {
+    let has_declared_column = crate::translate::planner::ROWID_STRS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(column_name))
+        && tables.iter().any(|table| {
+            !matches!(
+                lookup_unqualified_column(&table.table, column_name, false),
+                ColumnLookup::Missing
+            )
+        });
+    let found = unqualified_column_sources(
+        tables,
+        column_name,
+        |table| table.join_info.as_ref(),
+        |table| lookup_unqualified_column(&table.table, column_name, !has_declared_column),
+    );
+    if found.ambiguous {
+        crate::bail_parse_error!("ambiguous column name: {}", column_name);
+    }
+    // With no match, the binder must still try rowid names and outer query scopes.
+    Ok((!found.sources.is_empty()).then(|| {
+        merge_columns(
+            found
+                .sources
+                .into_iter()
+                .map(|(table_index, column_index)| {
+                    let table = &tables[table_index];
+                    (table.internal_id, &table.table, column_index)
+                }),
+        )
+    }))
+}
+
+/// The FROM sources that supply an unqualified column.
+pub struct UnqualifiedColumnSources {
+    /// `(source index, column index)` pairs, first source first. Empty when no
+    /// source has the column.
+    pub sources: SmallVec<[(usize, usize); 4]>,
+    /// Whether the name is ambiguous. `sources` then holds the copies found
+    /// before the ambiguity.
+    pub ambiguous: bool,
+}
+
+/// The result of looking up an unqualified column name in one FROM source.
+pub enum ColumnLookup {
+    Found(usize),
+    Missing,
+    /// The source has more than one column with this name. A parenthesized
+    /// join can keep a copy of the name from each joined table.
+    Ambiguous,
+}
+
+/// Find the FROM sources that supply an unqualified column, from left to right.
+///
+/// INNER and LEFT JOIN USING keep the copy found so far. RIGHT JOIN USING
+/// replaces it, because the left copy is NULL in an unmatched right row. FULL
+/// JOIN USING adds a fallback, because either copy can be NULL.
+///
+/// As in SQLite, an ambiguous name is only ambiguous if no later RIGHT JOIN
+/// replaces it with USING:
+///
+/// ```sql
+/// SELECT a FROM (SELECT 1 AS a, 2 AS a) AS s RIGHT JOIN t3 USING(a); -- t3.a
+/// SELECT a FROM (SELECT 1 AS a, 2 AS a) AS s, t3;  -- ambiguous column name: a
+/// ```
+///
+/// Query binding and view metadata both use this, so their results agree.
+pub fn unqualified_column_sources<'a, S>(
+    sources: &'a [S],
+    column_name: &str,
+    join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
+    lookup: impl Fn(&'a S) -> ColumnLookup,
+) -> UnqualifiedColumnSources {
+    let mut found = SmallVec::new();
+    let mut ambiguous = false;
+    for (source_index, source) in sources.iter().enumerate() {
+        let already_found = !found.is_empty() || ambiguous;
+        let using_join_type = join_info(source)
+            .filter(|join_info| join_info.merges_column(column_name))
+            .map(|join_info| join_info.join_type);
+        if already_found && matches!(using_join_type, Some(JoinType::Inner | JoinType::LeftOuter)) {
+            continue;
+        }
+        let column_index = match lookup(source) {
+            ColumnLookup::Found(column_index) => column_index,
+            ColumnLookup::Missing => continue,
+            ColumnLookup::Ambiguous => {
+                ambiguous = true;
+                continue;
+            }
+        };
+
+        if !already_found {
+            found.push((source_index, column_index));
+            continue;
+        }
+
+        match using_join_type {
+            // A repeated name is valid only when this source merged it with USING.
+            None => ambiguous = true,
+            Some(JoinType::RightOuter) => {
+                found.clear();
+                ambiguous = false;
+                found.push((source_index, column_index));
+            }
+            Some(JoinType::FullOuter) => found.push((source_index, column_index)),
+            Some(JoinType::Inner | JoinType::LeftOuter | JoinType::Semi | JoinType::Anti) => {}
+        }
+    }
+    UnqualifiedColumnSources {
+        sources: found,
+        ambiguous,
+    }
+}
+
+/// Find the earlier FROM sources that a USING or NATURAL join compares with.
+///
+/// Returns `(source index, column index)` pairs; an empty list means no
+/// earlier source has the column. Without a RIGHT or FULL JOIN in the FROM
+/// list, SQLite compares only the first copy. With one, every copy after the
+/// first must have been merged by an earlier USING, as in
+/// `sqlite3ProcessJoin` (select.c):
+///
+/// ```sql
+/// SELECT * FROM t1 JOIN t2 USING(a) JOIN t3 USING(a) RIGHT JOIN t4 ON 1;  -- ok
+/// SELECT * FROM t1 JOIN t2 ON 1 JOIN t3 USING(a) RIGHT JOIN t4 ON 1;
+/// -- ambiguous reference to a in USING()
+/// ```
+///
+/// The planner and view metadata both use this, so they report the same errors.
+pub fn left_using_column_sources<'a, S>(
+    sources: &'a [S],
+    column_name: &str,
+    has_right_or_full_join: bool,
+    join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
+    column_index: impl Fn(&'a S) -> Option<usize>,
+) -> Result<SmallVec<[(usize, usize); 4]>> {
+    let mut found = SmallVec::<[(usize, usize); 4]>::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        let Some(column_index) = column_index(source) else {
+            continue;
+        };
+        if !found.is_empty() && !has_right_or_full_join {
+            break;
+        }
+        if !found.is_empty()
+            && !join_info(source).is_some_and(|join_info| join_info.merges_column(column_name))
+        {
+            crate::bail_parse_error!("ambiguous reference to {} in USING()", column_name);
+        }
+        found.push((source_index, column_index));
+    }
+    Ok(found)
+}
+
+/// Build the value of a USING column from the table columns that can supply it.
+///
+/// One source gives a plain column. Several sources give an
+/// [Expr::MergedColumn], which returns the first non-NULL source value.
+pub fn merge_columns<'a>(
+    sources: impl IntoIterator<Item = (TableInternalId, &'a Table, usize)>,
+) -> ResolvedColumn {
+    let mut expressions = Vec::new();
+    let mut source_columns = SmallVec::new();
+    for (table_id, table, column_index) in sources {
+        expressions.push(Box::new(Expr::Column {
+            database: None,
+            table: table_id,
+            column: column_index,
+            is_rowid_alias: table.columns()[column_index].is_rowid_alias(),
+        }));
+        source_columns.push((table_id, column_index));
+    }
+    assert!(!expressions.is_empty());
+    let expr = if expressions.len() == 1 {
+        *expressions.pop().unwrap()
+    } else {
+        Expr::MergedColumn(expressions)
+    };
+    ResolvedColumn {
+        expr,
+        source_columns,
     }
 }
 
@@ -1475,29 +1740,6 @@ pub struct TablePlanEstimate {
     pub total_cost: f64,
 }
 
-impl JoinedTable {
-    pub fn using_dedup_hidden_cols(&self) -> Result<ColumnMask> {
-        let Some(join_info) = self.join_info.as_ref() else {
-            return Ok(ColumnMask::default());
-        };
-        let col_mask = self
-            .table
-            .columns()
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, col)| {
-                let col_name = col.name.as_deref()?;
-                join_info
-                    .using
-                    .iter()
-                    .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
-                    .then_some(idx)
-            })
-            .try_collect()?;
-        Ok(col_mask)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1506,8 +1748,11 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
-    /// Columns hidden by USING/NATURAL deduplication in the outer scope.
-    pub using_dedup_hidden_cols: ColumnMask,
+    /// The join that added this table in the outer scope's FROM list, so an
+    /// unqualified name follows the same USING rules there as it does in the
+    /// outer query itself (see [unqualified_column_sources]). None for the
+    /// first table and for references that are not part of a FROM list.
+    pub join_info: Option<JoinInfo>,
     /// Bitmask of columns that are referenced in the query.
     /// Used to track dependencies, so that it can be resolved
     /// when a WHERE clause subquery should be evaluated;
