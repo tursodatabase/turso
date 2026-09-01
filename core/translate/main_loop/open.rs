@@ -6,6 +6,10 @@ use crate::translate::{
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
 
+/// Reload a materialized subquery row into its result registers.
+///
+/// The unmatched-row pass scans the materialized cursor after its normal loop.
+/// Expressions still read the subquery through these result registers.
 pub(super) fn emit_materialized_subquery_result_columns(
     program: &mut ProgramBuilder,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
@@ -41,6 +45,10 @@ pub(super) fn emit_materialized_subquery_result_columns(
     }
 }
 
+/// Read the current right-side rowid into the shared match-key register.
+///
+/// SQLite uses the rowid as the identity of a matched right row. A recursive
+/// pseudo-row has a NULL rowid and still follows the same exact-set lookup.
 pub(super) fn emit_right_join_key(
     program: &mut ProgramBuilder,
     right_join: &RightJoinMetadata,
@@ -52,6 +60,10 @@ pub(super) fn emit_right_join_key(
     });
 }
 
+/// Record one matched right-side row in the exact set and its bloom filter.
+///
+/// The exact `Found` check avoids duplicate index inserts when several left rows
+/// match the same right row. The bloom filter only speeds up the later scan.
 fn emit_right_join_match(
     program: &mut ProgramBuilder,
     right_join: &RightJoinMetadata,

@@ -2295,6 +2295,7 @@ pub fn translate_expr(
                     .expect("table_references needed translating Expr::Column")
                     .find_joined_table_by_internal_id(*table_ref_id)
                 {
+                    // The unmatched-row pass reads the base table after the main index loop ends.
                     let requires_table_cursor =
                         table_reference.requires_table_cursor_for_unmatched_rows();
                     (
@@ -2620,6 +2621,7 @@ pub fn translate_expr(
                             .iter()
                             .find(|t| t.internal_id == *table_ref_id)
                         {
+                            // A right-preserving join must reload unmatched subquery rows from its table cursor.
                             let requires_table_cursor =
                                 table_reference.requires_table_cursor_for_unmatched_rows();
                             // Check if the operation is Search::Seek with an ephemeral index
@@ -2744,6 +2746,7 @@ pub fn translate_expr(
             } else if let Some(table_reference) =
                 referenced_tables.find_joined_table_by_internal_id(*table_ref_id)
             {
+                // The unmatched-row pass gets its match key from the base table cursor.
                 let requires_table_cursor =
                     table_reference.requires_table_cursor_for_unmatched_rows();
                 (

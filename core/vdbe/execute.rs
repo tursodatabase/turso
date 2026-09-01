@@ -6131,6 +6131,10 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
                 state.registers[dest].set_null();
             }
         }
+        Some(Cursor::Pseudo(_)) => {
+            // SQLite gives a pseudo-row a NULL rowid. Recursive joins use it as a match key.
+            state.registers[dest].set_null();
+        }
         _ => {
             mark_unlikely();
             return Err(LimboError::InternalError(
