@@ -631,6 +631,9 @@ pub fn constraints_from_where_clause(
                     .is_some_and(|origin| origin.right_table() == table_reference.internal_id)
                     || if join_origin.is_some() || is_op {
                         !table_references.outer_join_may_null_extend(table_reference.internal_id)
+                            && !table_references.right_or_full_join_blocks_where_constraint(
+                                table_reference.internal_id,
+                            )
                     } else {
                         !table_references
                             .right_or_full_join_blocks_where_constraint(table_reference.internal_id)
