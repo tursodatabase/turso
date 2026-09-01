@@ -1,4 +1,4 @@
-use super::{FixedYieldInjector, MvccTestDbNoConn, get_rows};
+use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
 use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

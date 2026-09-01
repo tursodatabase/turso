@@ -1,25 +1,16 @@
-use crate::Completion;
-use crate::File;
-use crate::IOExt;
-use crate::LimboError;
-use crate::PageSize;
-use crate::Result;
-#[cfg(feature = "conn_raw_api")]
-use crate::Value;
-use crate::ValueRef;
 use crate::alloc::{
-    ALLOC_ERR_MSG, ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
-    TursoTryWithCapacityExt, TursoVecInExt,
+    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
+    TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::cursor::{MvccIterator, static_iterator_hack};
+use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Sequence, Table};
-use crate::skiplist::SkipMap;
 use crate::skiplist::comparator::BasicComparator;
 use crate::skiplist::map::Entry;
+use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -30,23 +21,32 @@ use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
-use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
+use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
-use crate::types::compare_immutable;
-use crate::{Connection, Pager, SyncMode};
-use crate::{
-    Numeric, turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable,
-};
+use crate::Completion;
+use crate::File;
+use crate::IOExt;
+use crate::LimboError;
+use crate::PageSize;
+use crate::Result;
+#[cfg(feature = "conn_raw_api")]
+use crate::Value;
+use crate::ValueRef;
 use crate::{io::FileSyncType, io_yield_one, return_if_io};
+use crate::{
+    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
+};
+use crate::{Connection, Pager, SyncMode};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::{BTreeSet, HashMap as StdHashMap};
@@ -55,29 +55,29 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
-use tracing::Level;
 use tracing::instrument;
+use tracing::Level;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{
-    CheckpointState, CheckpointStateMachine, sqlite_schema_btree_identity,
+    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
-use super::persistent_storage::logical_log::{
-    HeaderReadResult, IndexOpKind, LOG_HDR_SIZE, ParsedOp, StreamingLogicalLogReader,
-    StreamingResult,
-};
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
-    LOG_RECORD_PREFIX_SIZE, LogSerializer, parse_ops_from_plaintext,
+    parse_ops_from_plaintext, LogSerializer, LOG_RECORD_PREFIX_SIZE,
+};
+use super::persistent_storage::logical_log::{
+    HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
+    LOG_HDR_SIZE,
 };
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
-    PortableLogicalBuilder, PortableObjectMapEntry, is_portable_logical_name,
-    is_portable_schema_row, is_portable_table_schema_row, portable_schema_row_from_record,
+    is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
+    portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
 #[cfg(test)]
@@ -5196,12 +5196,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // blocking). A failure here cannot be downgraded: it would
                     // leave the next AUTOINCREMENT INSERT able to re-emit a rowid
                     // already on disk, so it propagates as a bootstrap failure.
-                    return_if_io!(
-                        bootstrap_conn
-                            .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
-                                sync_st
-                            )
-                    );
+                    return_if_io!(bootstrap_conn
+                        .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(sync_st));
                     *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
                     *st = BootstrapState::AwaitingGlobalHeader;
                 }
@@ -6544,10 +6540,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
                 if !tx.write_set.lock().is_empty() {
-                    crate::without_allocation_faults!(
-                        self.insert_finalized_tx_state(tx_id, commit_ts)
-                            .expect(ALLOC_ERR_MSG)
-                    );
+                    crate::without_allocation_faults!(self
+                        .insert_finalized_tx_state(tx_id, commit_ts)
+                        .expect(ALLOC_ERR_MSG));
                 }
             }
             let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
@@ -7111,10 +7106,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
-                crate::without_allocation_faults!(
-                    self.finish_committed_tx(tx_id, connection, db_id)
-                        .expect(ALLOC_ERR_MSG)
-                );
+                crate::without_allocation_faults!(self
+                    .finish_committed_tx(tx_id, connection, db_id)
+                    .expect(ALLOC_ERR_MSG));
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {

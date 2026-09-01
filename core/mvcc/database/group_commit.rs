@@ -1,10 +1,10 @@
 use super::{LogRecord, TxID};
 use crate::storage::wal::TursoRwLock;
-use crate::sync::Arc;
-use crate::sync::Mutex;
 #[cfg(test)]
 use crate::sync::atomic::AtomicUsize;
 use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::VecDeque;
 
