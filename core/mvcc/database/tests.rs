@@ -700,11 +700,26 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     assert_eq!(current.len(), 1);
 
     let mut current = stamped_insert();
+    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+        &mut current,
+        10,
+        10,
+        true,
+        frame(100),
+        true,
+        40,
+    );
+    assert_eq!(dropped, 0, "Passive Rule 3 retires instead of dropping");
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].retired_at(), Some(40));
+    assert_eq!(current[0].end(), None);
+
+    let mut current = stamped_insert();
     let dropped =
         MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), true);
     assert_eq!(
         dropped, 1,
-        "Truncate may drop the current SkipMap version once it is in the B-tree"
+        "wrapper retire_ts=0 plus Rule 3b drops once lwm > 0"
     );
     assert!(current.is_empty());
 
@@ -974,9 +989,6 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
         wal_bf > 0,
         "passive checkpoint must publish nbackfills, got wal_nbackfill={wal_bf}, snap={snap:?}"
     );
-    // Passive Finalize keeps currents (SkipMap cover) but drains empty slots /
-    // superseded history. Write-buffer reads can prefer B-tree for sole
-    // materialized currents without unlinking them.
     assert_eq!(
         snap.rows_empty_slots, 0,
         "passive Finalize must drain empty SkipMap slots: {snap:?}"
@@ -986,7 +998,6 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
         "backfill_floor must track published nbackfills: {snap:?}"
     );
 
-    // Full Rule 3 reclaim of currents requires a blocking Truncate Finalize.
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     let after_truncate = mv.debug_gc_snapshot();
     assert_eq!(
@@ -999,12 +1010,10 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
     );
 }
 
-/// Regression test for why Rule 3 (see the `gc_version_chain` doc comment) must stay
-/// off for every Passive GC path: a reader whose snapshot predates a write must never
-/// observe that write while its transaction is still open, even with a single table
-/// and no index involved (ruling out table/index publish skew as the cause). If Rule 3
-/// were ever turned on for Passive without also fixing the underlying B-tree-fallthrough
-/// isolation gap, this test would fail with `after == [2000]` instead of `[1000]`.
+/// Snapshot isolation after Passive Finalize reclaims a materialized current
+/// version: a reader whose snapshot predates a later write must still see the
+/// pre-write value. Retirement (not `clear`) is what keeps a positioned cursor
+/// valid; this test covers the re-read after GC has already run.
 #[test]
 fn passive_reader_snapshot_survives_later_write_after_row_versions_gc() {
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -1019,9 +1028,12 @@ fn passive_reader_snapshot_survives_later_write_after_row_versions_gc() {
     // blocking protocol regardless of `experimental_mvcc_passive_checkpoint`): this
     // materializes row 1 into the B-tree and runs Passive Finalize GC on it.
     conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
-    assert!(
-        mv.debug_gc_snapshot().rows_versions > 0,
-        "row 1's current version must survive Passive Finalize (Rule 3 off)"
+    // With no transaction open, Rule 3 retires and Rule 3b reclaims in the same
+    // Finalize sweep. The reader below must not notice either way.
+    assert_eq!(
+        mv.debug_gc_snapshot().rows_versions,
+        0,
+        "with no reader open, Passive Finalize reclaims the materialized version"
     );
 
     // Reader opens a snapshot BEFORE any further write.
@@ -10345,6 +10357,16 @@ fn test_update_multiple_unique_columns_partial_rollback() {
 
 // ─── GC helpers ───────────────────────────────────────────────────────────
 
+fn skipmap_has_retired(mv: &crate::MvStore) -> bool {
+    mv.rows
+        .iter()
+        .any(|e| e.value().read().iter().any(|rv| rv.retired_at().is_some()))
+}
+
+fn skipmap_version_count(mv: &crate::MvStore) -> usize {
+    mv.rows.iter().map(|e| e.value().read().len()).sum()
+}
+
 fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowVersion {
     RowVersion {
         id: 0,
@@ -10607,6 +10629,52 @@ fn test_gc_rule3_after_history_reclaimed() {
         true,
     );
     assert_eq!(dropped, 2);
+    assert!(versions.is_empty());
+}
+
+/// Rule 3 retires a sole current version instead of dropping it. Rule 3b
+/// reclaims only once `retired_at < lwm`. Equality keeps the version: a
+/// transaction that began at the retire timestamp may still see it.
+#[test]
+fn test_gc_rule3_retires_current_then_rule3b_reclaims() {
+    let mut versions = crate::alloc::vec![make_rv(ts(5), None)];
+    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+        &mut versions,
+        10,
+        10,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+        true,
+        40,
+    );
+    assert_eq!(dropped, 0);
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].retired_at(), Some(40));
+    assert_eq!(versions[0].end(), None);
+
+    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+        &mut versions,
+        40,
+        10,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+        true,
+        41,
+    );
+    assert_eq!(dropped, 0);
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].retired_at(), Some(40));
+
+    let dropped = MvStore::<MvccClock>::gc_version_chain_with_retire(
+        &mut versions,
+        41,
+        10,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+        true,
+        42,
+    );
+    assert_eq!(dropped, 1);
     assert!(versions.is_empty());
 }
 
@@ -11727,6 +11795,205 @@ fn test_gc_incremental_respects_held_snapshot() {
         1,
         "only the current version remains"
     );
+}
+
+/// An older `BEGIN CONCURRENT` reader keeps seeing a row after GC. A newer
+/// connection reads the same value from the B-tree. After the older transaction
+/// ends, a later sweep reclaims retired versions.
+#[test]
+fn test_gc_retired_current_serves_older_reader_then_reclaims() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    let older = db.connect();
+    older.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&older, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]]
+    );
+
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert!(
+        skipmap_version_count(&mv) > 0,
+        "versions an open transaction can see are retired, not removed"
+    );
+    assert_eq!(
+        get_rows(&older, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]],
+        "older reader keeps seeing row 1"
+    );
+
+    let newer = db.connect();
+    assert_eq!(
+        get_rows(&newer, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]],
+        "newer connection reads the same value from the B-tree"
+    );
+
+    older.execute("COMMIT").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        skipmap_version_count(&mv),
+        0,
+        "retired versions are reclaimed once nobody can see them"
+    );
+    assert_eq!(
+        get_rows(&newer, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
+            vec![Value::from_i64(3), Value::from_i64(30)],
+            vec![Value::from_i64(4), Value::from_i64(40)],
+        ]
+    );
+}
+
+/// A reader that has already selected a multi-column row must keep seeing every
+/// column after GC that would previously have `clear()`ed the current version.
+/// No checkpoint: B-tree fallthrough cannot hide a drop. `durable_txid_max` is
+/// raised so Rule 3 is eligible.
+#[test]
+fn test_gc_retire_keeps_columns_of_positioned_reader() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv = db.get_mvcc_store();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT, c INT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, 20, 30)")
+        .unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let before = get_rows(&reader, "SELECT a, b, c FROM t WHERE id = 1");
+    assert_eq!(
+        before,
+        vec![vec![
+            Value::from_i64(10),
+            Value::from_i64(20),
+            Value::from_i64(30)
+        ]]
+    );
+
+    mv.durable_txid_max.store(u64::MAX, Ordering::SeqCst);
+    for _ in 0..4 {
+        mv.gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
+    }
+    mv.drop_unused_row_versions();
+    assert!(
+        skipmap_has_retired(&mv),
+        "GC must retire, not drop, while the reader is open"
+    );
+
+    let after = get_rows(&reader, "SELECT a, b, c FROM t WHERE id = 1");
+    assert_eq!(
+        after, before,
+        "must not get NULL or empty columns after retirement"
+    );
+    reader.execute("COMMIT").unwrap();
+}
+
+/// SkipMap `read` after incremental GC that retires the sole current version.
+/// `clear()` would make this return None; retirement keeps the row for the
+/// transaction that began at or before `retired_at`.
+#[test]
+fn test_gc_incremental_retire_keeps_held_reader_row() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row = generate_simple_string_row(table_id, 1, "keep_me");
+    db.mvcc_store.insert(tx1, row.clone()).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    db.mvcc_store
+        .durable_txid_max
+        .store(u64::MAX, Ordering::SeqCst);
+
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+    assert_eq!(db.mvcc_store.read(tx2, &row_id).unwrap().unwrap(), row);
+
+    db.mvcc_store
+        .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
+    db.mvcc_store.drop_unused_row_versions();
+
+    assert_eq!(
+        db.mvcc_store.read(tx2, &row_id).unwrap().unwrap(),
+        row,
+        "held reader still reads the retired current version"
+    );
+    let versions = db.mvcc_store.rows.get(&row_id).unwrap();
+    let versions = versions.value().read();
+    assert_eq!(versions.len(), 1);
+    assert!(versions[0].retired_at().is_some());
+    assert_eq!(versions[0].end(), None);
+}
+
+/// Two overlapping writers plus GC while a third connection holds a snapshot.
+/// Truncate is Busy with the reader open; incremental GC must not change the
+/// snapshot values.
+#[test]
+fn test_gc_retire_snapshot_stable_with_overlapping_writers() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let snap = get_rows(&reader, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        snap,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
+            vec![Value::from_i64(3), Value::from_i64(30)],
+        ]
+    );
+
+    let w1 = db.connect();
+    let w2 = db.connect();
+    w1.execute("BEGIN CONCURRENT").unwrap();
+    w2.execute("BEGIN CONCURRENT").unwrap();
+    w1.execute("UPDATE t SET v = 21 WHERE id = 2").unwrap();
+    w2.execute("UPDATE t SET v = 31 WHERE id = 3").unwrap();
+    w1.execute("COMMIT").unwrap();
+    w2.execute("COMMIT").unwrap();
+
+    assert!(
+        matches!(
+            setup.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+            Err(LimboError::Busy)
+        ),
+        "Truncate cannot run while the snapshot is held"
+    );
+    for _ in 0..4 {
+        mv.gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
+    }
+    mv.drop_unused_row_versions();
+
+    let again = get_rows(&reader, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(again, snap, "held snapshot must stay stable across GC");
+    reader.execute("COMMIT").unwrap();
 }
 
 /// Index rows live in a separate SkipMap from table rows and go through their own

@@ -1767,14 +1767,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // (unchanged since CommitPagerTxn — single orchestrator).
         let materialized_frame = WalPos::from_pair(self.pager.wal_pos());
         let snapshot_ts = self.snapshot_ts;
-        let CheckpointState::GcTableRows { next_index, lwm } = self.state else {
+        let CheckpointState::GcTableRows { next_index, lwm: _ } = self.state else {
             unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
         };
         let mut index = next_index;
         let mut processed = 0;
-        // Drop current SkipMap versions only when B-trees are stable (blocking Truncate).
-        let drop_current_if_in_btree = self.lock_states.blocking_checkpoint_lock_held
-            || !self.mvstore.experimental_mvcc_passive_checkpoint;
+        let drop_current_if_in_btree = true;
         while index < self.write_set.len() {
             let current = index;
             index += 1;
@@ -1791,11 +1789,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     materialized_frame,
                     snapshot_ts,
                 );
-                let dropped = MvStore::<Clock, A>::gc_version_chain(
+                let dropped = self.mvstore.gc_chain_now(
                     &mut versions,
-                    lwm,
                     ckpt_max,
-                    self.mvstore.experimental_mvcc_passive_checkpoint,
                     min_reader_mark,
                     drop_current_if_in_btree,
                 );
@@ -1834,13 +1830,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // Same stamp as table GC (unchanged since CommitPagerTxn).
         let materialized_frame = WalPos::from_pair(self.pager.wal_pos());
         let snapshot_ts = self.snapshot_ts;
-        let CheckpointState::GcIndexRows { next_index, lwm } = self.state else {
+        let CheckpointState::GcIndexRows { next_index, lwm: _ } = self.state else {
             unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
         };
         let mut index = next_index;
         let mut processed = 0;
-        let drop_current_if_in_btree = self.lock_states.blocking_checkpoint_lock_held
-            || !self.mvstore.experimental_mvcc_passive_checkpoint;
+        let drop_current_if_in_btree = true;
         while index < self.index_write_set.len() {
             let current = index;
             index += 1;
@@ -1865,11 +1860,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     materialized_frame,
                     snapshot_ts,
                 );
-                let dropped = MvStore::<Clock, A>::gc_version_chain(
+                let dropped = self.mvstore.gc_chain_now(
                     &mut versions,
-                    lwm,
                     ckpt_max,
-                    self.mvstore.experimental_mvcc_passive_checkpoint,
                     min_reader_mark,
                     drop_current_if_in_btree,
                 );

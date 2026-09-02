@@ -1060,8 +1060,39 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Refresh the current position based on the peek values
     fn refresh_current_position(&mut self, dir: IterationDirection) {
-        let new_position = self.dual_peek.cursor_position_from_next(self.table_id, dir);
-        self.current_pos = new_position;
+        self.current_pos = self.position_from_peeks(dir);
+    }
+
+    fn position_from_peeks(&mut self, dir: IterationDirection) -> CursorPosition<A> {
+        loop {
+            let pos = self.dual_peek.cursor_position_from_next(self.table_id, dir);
+            let CursorPosition::Loaded {
+                row_id,
+                in_btree: false,
+                versions: Some(versions),
+            } = &pos
+            else {
+                return pos;
+            };
+            let row_id = row_id.clone();
+            let table_id = row_id.table_id;
+            let falls_through = {
+                let chain = versions.read();
+                self.db
+                    .chain_falls_through_for_tx(self.tx_id, table_id, &chain)
+            };
+            if !falls_through {
+                return pos;
+            }
+            if self.dual_peek.btree_peek.get_row_key() == Some(&row_id.row_id) {
+                return CursorPosition::Loaded {
+                    row_id,
+                    in_btree: true,
+                    versions: None,
+                };
+            }
+            self.advance_mvcc_iterator();
+        }
     }
 
     /// Reset dual peek state (called on rewind/last/seek)
@@ -1683,19 +1714,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 Some(MvccLazyCursorState::Seek(SeekState::PickWinner, direction)) => {
                     // Pick winner and return result
                     // Now pick the winner based on direction
-                    let winner = self.dual_peek.get_next(direction);
-
-                    // Clear seek state
+                    let winner_pos = self.position_from_peeks(direction);
                     self.state = None;
-
-                    if let Some((winner_key, in_btree, winner_versions)) = winner {
+                    if let CursorPosition::Loaded {
+                        row_id,
+                        in_btree,
+                        versions,
+                    } = winner_pos
+                    {
+                        let winner_key = row_id.row_id.clone();
                         self.current_pos = CursorPosition::Loaded {
-                            row_id: RowID {
-                                table_id: self.table_id,
-                                row_id: winner_key.clone(),
-                            },
+                            row_id,
                             in_btree,
-                            versions: winner_versions,
+                            versions,
                         };
 
                         if op.eq_only() {
