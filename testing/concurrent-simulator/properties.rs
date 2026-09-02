@@ -2143,6 +2143,50 @@ mod tests {
     }
 
     #[test]
+    fn cycle_wrap_accepts_post_wrap_values_when_watermark_is_in_last_slot() {
+        // start=1, increment=3, min=1, max=19 emits 1,4,...,19 then wraps
+        // to 1. An in-flight tx can consume the wrap value (1) without
+        // advancing the shared watermark, so an autocommit emission then
+        // sees 4 (or 7, with two in-flight txs) against watermark=19.
+        let params = SequenceParams {
+            start: 1,
+            increment: 3,
+            min_value: 1,
+            max_value: 19,
+            cycle: true,
+        };
+        // Exact landing on min_value is a wrap from anywhere past it.
+        assert!(is_cycle_wrap(&params, 1, 19));
+        assert!(is_cycle_wrap(&params, 1, 10));
+        // Watermark in the last pre-wrap slot: the whole post-wrap grid
+        // is a legitimate wrap observation.
+        assert!(is_cycle_wrap(&params, 4, 19));
+        assert!(is_cycle_wrap(&params, 7, 19));
+        // Watermark mid-range: a backward step is a real bug.
+        assert!(!is_cycle_wrap(&params, 4, 10));
+        // Off-grid value is never a wrap.
+        assert!(!is_cycle_wrap(&params, 5, 19));
+        // Non-cycling sequences never wrap.
+        let no_cycle = SequenceParams {
+            cycle: false,
+            ..params
+        };
+        assert!(!is_cycle_wrap(&no_cycle, 1, 19));
+
+        // Descending mirror: 19,16,...,1 then wraps to 19.
+        let desc = SequenceParams {
+            start: 19,
+            increment: -3,
+            min_value: 1,
+            max_value: 19,
+            cycle: true,
+        };
+        assert!(is_cycle_wrap(&desc, 19, 1));
+        assert!(is_cycle_wrap(&desc, 16, 1));
+        assert!(!is_cycle_wrap(&desc, 16, 10));
+    }
+
+    #[test]
     fn simple_keys_abort_fiber_drops_pending_transaction_state() {
         let mut property = SimpleKeysDoNotDisappear::new();
         property.txn_started_at.insert(7, 11);
@@ -2299,14 +2343,34 @@ fn parse_comma_separated_ints(s: &str) -> Option<Vec<i64>> {
 /// emission set on wrap and treat a backward step as a wrap only when
 /// it actually lands on MIN/MAX — every other backward step still
 /// fires the wrong-direction bail.
+///
+/// In-tx emissions defer their watermark update until commit, so
+/// in-flight transactions can consume the wrap value (and more values
+/// past it) while the shared watermark still sits in the last
+/// pre-wrap slot. A later autocommit emission then observes
+/// `min_value + k*increment` against the stale pre-wrap watermark,
+/// so the wrap value itself never shows up here. Accept the whole
+/// post-wrap grid when the watermark is in the last pre-wrap slot —
+/// the next emission after it MUST wrap. A backward step with the
+/// watermark anywhere else in the range still fires the bail.
 fn is_cycle_wrap(params: &SequenceParams, value: i64, prev_watermark: i64) -> bool {
     if !params.cycle {
         return false;
     }
     if params.increment > 0 {
-        value == params.min_value && prev_watermark > params.min_value
+        if value == params.min_value && prev_watermark > params.min_value {
+            return true;
+        }
+        prev_watermark.saturating_add(params.increment) > params.max_value
+            && value >= params.min_value
+            && (value - params.min_value) % params.increment == 0
     } else {
-        value == params.max_value && prev_watermark < params.max_value
+        if value == params.max_value && prev_watermark < params.max_value {
+            return true;
+        }
+        prev_watermark.saturating_add(params.increment) < params.min_value
+            && value <= params.max_value
+            && (value - params.max_value) % params.increment == 0
     }
 }
 
