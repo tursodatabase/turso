@@ -1247,6 +1247,63 @@ impl Schema {
             .unwrap_or_else(|| vec![])
     }
 
+    /// Every materialized view that has to be brought up to date once the views in
+    /// `seeds` change, `seeds` included. A view is always listed after the views it
+    /// reads from, so maintaining the list front to back feeds each view the deltas
+    /// its sources just produced.
+    pub fn materialized_view_maintenance_order(&self, seeds: &[String]) -> Vec<String> {
+        let mut affected: HashSet<String> = HashSet::default();
+        let mut queue: VecDeque<String> = seeds.iter().map(|s| normalize_ident(s)).collect();
+        while let Some(name) = queue.pop_front() {
+            if !affected.insert(name.clone()) {
+                continue;
+            }
+            for dependent in self.get_dependent_materialized_views(&name) {
+                queue.push_back(dependent);
+            }
+        }
+
+        // Sources of each affected view, restricted to the affected set. Sorted by
+        // name so the order does not depend on hash iteration.
+        let mut names: Vec<String> = affected.iter().cloned().collect();
+        names.sort();
+        let mut pending: Vec<(String, HashSet<String>)> = names
+            .into_iter()
+            .map(|name| {
+                let sources = self
+                    .get_materialized_view(&name)
+                    .map(|view| view.lock().get_referenced_table_names())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|source| normalize_ident(&source))
+                    .filter(|source| *source != name && affected.contains(source))
+                    .collect();
+                (name, sources)
+            })
+            .collect();
+
+        let mut order = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            let ready: Vec<String> = pending
+                .iter()
+                .filter(|(_, sources)| sources.is_empty())
+                .map(|(name, _)| name.clone())
+                .collect();
+            // CREATE MATERIALIZED VIEW needs its sources to exist, so the graph
+            // cannot contain a cycle.
+            turso_assert!(
+                !ready.is_empty(),
+                "materialized view dependencies must be acyclic"
+            );
+            pending.retain(|(name, _)| !ready.contains(name));
+            for (_, sources) in pending.iter_mut() {
+                sources.retain(|source| !ready.contains(source));
+            }
+            order.extend(ready);
+        }
+        order
+    }
+
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) -> Result<()> {
         self.check_object_name_conflict(&view.name, SchemaObjectType::View)?;
@@ -1924,6 +1981,55 @@ impl Schema {
         Ok(())
     }
 
+    /// Order in which stored materialized views can be rebuilt: a view comes after
+    /// every view it selects from, because compiling it needs its sources to be in
+    /// the schema already.
+    fn materialized_view_load_order(
+        materialized_view_info: &HashMap<String, (String, i64)>,
+    ) -> Result<Vec<String>> {
+        // sqlite_schema keeps view names as written, so match sources against them
+        // case-insensitively.
+        let by_normalized_name: HashMap<String, String> = materialized_view_info
+            .keys()
+            .map(|name| (normalize_ident(name), name.clone()))
+            .collect();
+
+        let mut pending: Vec<(String, HashSet<String>)> =
+            Vec::try_with_capacity_ext(materialized_view_info.len())?;
+        for (view_name, (sql, _)) in materialized_view_info.iter() {
+            let sources = IncrementalView::source_names_from_sql(sql)?
+                .into_iter()
+                .filter_map(|source| by_normalized_name.get(&normalize_ident(&source)).cloned())
+                .filter(|source| source != view_name)
+                .collect();
+            pending
+                .push_within_capacity((view_name.clone(), sources))
+                .expect("pending vector was preallocated to the number of views");
+        }
+        // Sorted by name so a database always rebuilds its views in the same order.
+        pending.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        let mut order = Vec::try_with_capacity_ext(pending.len())?;
+        while !pending.is_empty() {
+            let ready: Vec<String> = pending
+                .iter()
+                .filter(|(_, sources)| sources.is_empty())
+                .map(|(name, _)| name.clone())
+                .collect();
+            if ready.is_empty() {
+                return Err(LimboError::InternalError(
+                    "materialized views in the schema form a dependency cycle".to_string(),
+                ));
+            }
+            pending.retain(|(name, _)| !ready.contains(name));
+            for (_, sources) in pending.iter_mut() {
+                sources.retain(|source| !ready.contains(source));
+            }
+            order.extend(ready);
+        }
+        Ok(order)
+    }
+
     /// Populate materialized views parsed from the schema.
     pub fn populate_materialized_views(
         &mut self,
@@ -1931,7 +2037,12 @@ impl Schema {
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
-        for (view_name, (sql, main_root)) in materialized_view_info {
+        let load_order = Self::materialized_view_load_order(&materialized_view_info)?;
+        let mut materialized_view_info = materialized_view_info;
+        for view_name in load_order {
+            let (sql, main_root) = materialized_view_info
+                .remove(&view_name)
+                .expect("load order is built from the same map");
             // Look up the DBSP state root for this view
             // If missing, it means version mismatch - skip this view
             // Check if we have a compatible DBSP state root
