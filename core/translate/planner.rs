@@ -3,13 +3,13 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
 use super::{
-    expr::{find_unqualified_column, walk_expr, walk_expr_mut},
+    expr::{walk_expr, walk_expr_mut},
     plan::{
-        left_using_column_sources, merge_columns, query_output_columns, Aggregate,
-        ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo, JoinOrderMember,
-        JoinOrigin, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference, Plan,
-        QueryDestination, ResolvedColumn, ResultSetColumn, Scan, TableReferences, WhereTerm,
-        WhereTermOrigin,
+        left_using_column_sources, merge_columns, query_output_columns, resolve_unqualified_column,
+        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
+        JoinOrderMember, JoinOrigin, JoinType as PlanJoinType, JoinedTable, Operation,
+        OuterQueryReference, Plan, QueryDestination, ResolvedColumn, ResultSetColumn, Scan,
+        TableReferences, WhereTerm, WhereTermOrigin,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -1773,10 +1773,10 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
         // sides of `USING`. Outer unqualified names find this value first.
         for using_name in next_using {
             let column_name = using_name.as_str();
-            let (expr, source_columns) =
-                resolve_parenthesized_using_column(source_tables, table_index, column_name)?;
-            used_columns.extend(source_columns);
-            result_columns.push(parenthesized_join_result_column(expr, column_name));
+            let resolved = resolve_unqualified_column(source_tables, column_name)?
+                .expect("USING already proved that the column exists");
+            used_columns.extend(resolved.source_columns);
+            result_columns.push(parenthesized_join_result_column(resolved.expr, column_name));
             join_columns.push(ParenthesizedJoinColumn {
                 source: ParenthesizedJoinColumnSource::Using {
                     column_name: column_name.to_string(),
@@ -1917,57 +1917,6 @@ fn parenthesized_join_result_column(expr: Expr, column_name: &str) -> ResultSetC
         implicit_column_name: None,
         contains_aggregates: false,
     }
-}
-
-fn resolve_parenthesized_using_column(
-    tables: &[JoinedTable],
-    last_table_index: usize,
-    column_name: &str,
-) -> Result<(Expr, Vec<(TableInternalId, usize)>)> {
-    let mut expr = None;
-    let mut used_columns = Vec::new();
-    for (table_index, table) in tables.iter().enumerate() {
-        let join_info = table.join_info.as_ref();
-        let merges_column = join_info.is_some_and(|join| join.merges_column(column_name));
-        let is_full_outer = join_info.is_some_and(JoinInfo::is_full_outer);
-        if expr.is_some() && merges_column && !is_full_outer {
-            continue;
-        }
-        let Some(column_index) = find_unqualified_column(&table.table, column_name)? else {
-            continue;
-        };
-        if expr.is_some() && !merges_column {
-            crate::bail_parse_error!("ambiguous column name: {}", column_name);
-        }
-        if table_index > last_table_index + 1 {
-            continue;
-        }
-        let source = Expr::Column {
-            database: None,
-            table: table.internal_id,
-            column: column_index,
-            is_rowid_alias: table.columns()[column_index].is_rowid_alias(),
-        };
-        expr = Some(match expr.take() {
-            None => source,
-            Some(previous) => Expr::FunctionCall {
-                name: ast::Name::exact("coalesce".to_string()),
-                distinctness: None,
-                args: vec![Box::new(previous), Box::new(source)],
-                order_by: vec![],
-                within_group: vec![],
-                filter_over: ast::FunctionTail {
-                    filter_clause: None,
-                    over_clause: None,
-                },
-            },
-        });
-        used_columns.push((table.internal_id, column_index));
-    }
-    Ok((
-        expr.expect("USING already proved that the column exists"),
-        used_columns,
-    ))
 }
 
 #[allow(clippy::too_many_arguments)]
