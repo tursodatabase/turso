@@ -9,7 +9,8 @@ use crate::incremental::operator::{
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::IOResult;
-use crate::{Result, Value};
+use crate::types::IOResultOr;
+use crate::Value;
 use std::cmp::Ordering;
 
 /// Filter predicate for filtering rows
@@ -176,7 +177,7 @@ impl IncrementalOperator for FilterOperator {
         &mut self,
         state: &mut EvalState,
         _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         let delta = match state {
             EvalState::Init { deltas } => {
                 // Filter operators only use left_delta, right_delta must be empty
@@ -211,11 +212,7 @@ impl IncrementalOperator for FilterOperator {
         Ok(IOResult::Done(output_delta))
     }
 
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn commit(&mut self, deltas: DeltaPair, _cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         // Filter operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),

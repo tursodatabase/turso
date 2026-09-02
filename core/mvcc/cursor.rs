@@ -1,6 +1,7 @@
 use crate::alloc::{ConcurrentAllocator, TryReserveError, TursoAllocator};
 use crate::skiplist::{comparator::BasicComparator, map::Entry};
 use crate::turso_assert;
+use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
@@ -634,7 +635,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     /// Returns the current row as an immutable record.
-    pub fn current_row(&mut self) -> Result<IOResult<Option<&crate::types::ImmutableRecord>>> {
+    pub fn current_row(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -728,7 +729,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         Ok(())
     }
 
-    pub fn start_new_rowid(&mut self) -> Result<IOResult<NextRowidResult>> {
+    pub fn start_new_rowid(&mut self) -> IOResultOr<NextRowidResult> {
         tracing::trace!("start_new_rowid");
 
         let allocator = self.db.get_rowid_allocator(&self.table_id);
@@ -842,16 +843,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     /// Advance btree cursor forward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
-    fn advance_btree_forward(&mut self) -> Result<IOResult<()>> {
+    fn advance_btree_forward(&mut self) -> IOResultOr<()> {
         self._advance_btree_forward(true)
     }
 
     /// Advance btree cursor forward from current position (cursor already positioned by seek)
-    fn advance_btree_forward_from_current(&mut self) -> Result<IOResult<()>> {
+    fn advance_btree_forward_from_current(&mut self) -> IOResultOr<()> {
         self._advance_btree_forward(false)
     }
 
-    fn _advance_btree_forward(&mut self, initialize: bool) -> Result<IOResult<()>> {
+    fn _advance_btree_forward(&mut self, initialize: bool) -> IOResultOr<()> {
         loop {
             let state = self.btree_advance_state;
             match state {
@@ -929,16 +930,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     /// Advance btree cursor backward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
-    fn advance_btree_backward(&mut self) -> Result<IOResult<()>> {
+    fn advance_btree_backward(&mut self) -> IOResultOr<()> {
         self._advance_btree_backward(true)
     }
 
     /// Advance btree cursor backward from current position (cursor already positioned by seek)
-    fn advance_btree_backward_from_current(&mut self) -> Result<IOResult<()>> {
+    fn advance_btree_backward_from_current(&mut self) -> IOResultOr<()> {
         self._advance_btree_backward(false)
     }
 
-    fn _advance_btree_backward(&mut self, initialize: bool) -> Result<IOResult<()>> {
+    fn _advance_btree_backward(&mut self, initialize: bool) -> IOResultOr<()> {
         loop {
             let state = self.btree_advance_state;
             match state {
@@ -1074,11 +1075,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// Seek btree cursor and set btree_peek to the result.
     /// Skips rows that are shadowed by MVCC.
     /// Returns IOResult indicating if we need to yield for IO or are done.
-    fn seek_btree_and_set_peek(
-        &mut self,
-        seek_key: SeekKey<'_>,
-        op: SeekOp,
-    ) -> Result<IOResult<()>> {
+    fn seek_btree_and_set_peek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<()> {
         // Fast path: btree not allocated
         if !self.is_btree_allocated() {
             self.dual_peek.btree_peek = CursorPeek::Exhausted;
@@ -1206,7 +1203,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCur
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     for MvccLazyCursor<Clock, A>
 {
-    fn last(&mut self) -> Result<IOResult<()>> {
+    fn last(&mut self) -> IOResultOr<()> {
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -1281,7 +1278,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
-    fn next(&mut self) -> Result<IOResult<()>> {
+    fn next(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             let current_pos = self.get_current_pos();
@@ -1377,7 +1374,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Move the cursor to the previous row. Returns true if the cursor moved, false if at the beginning.
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
-    fn prev(&mut self) -> Result<IOResult<()>> {
+    fn prev(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             let current_pos = self.get_current_pos();
@@ -1464,7 +1461,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         Ok(IOResult::Done(()))
     }
 
-    fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+    fn rowid(&mut self) -> IOResultOr<Option<i64>> {
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -1500,20 +1497,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         Ok(IOResult::Done(rowid))
     }
 
-    fn record(&mut self) -> Result<IOResult<Option<&crate::types::ImmutableRecord>>> {
+    fn record(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
         self.current_row()
     }
 
-    fn seek_unpacked(
-        &mut self,
-        registers: &[Register],
-        op: SeekOp,
-    ) -> Result<IOResult<SeekResult>> {
+    fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
         let record = ImmutableRecord::from_registers(registers, registers.len())?;
         self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
     }
 
-    fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
+    fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
         // gt -> lower_bound bound excluded, we want first row after row_id
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
@@ -1752,7 +1745,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     /// Insert a row into the table or index.
     /// Sets the cursor to the inserted row.
-    fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
+    fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         let row_id = match key {
             BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
             BTreeKey::IndexKey(record) => {
@@ -1772,7 +1765,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let BTreeKey::TableRowId((_, record)) = key else {
                     return Err(LimboError::InternalError(
                         "Table cursor requires a TableRowId key".to_string(),
-                    ));
+                    )
+                    .into());
                 };
                 let record = record.as_ref().ok_or_else(|| {
                     LimboError::InternalError("TableRowId should have a record".to_string())
@@ -1792,7 +1786,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let BTreeKey::IndexKey(record) = key else {
                     return Err(LimboError::InternalError(
                         "Index cursor requires an IndexKey".to_string(),
-                    ));
+                    )
+                    .into());
                 };
                 Ok(Row::new_index_row(row_id, record.column_count()))
             }
@@ -1849,7 +1844,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         Ok(IOResult::Done(()))
     }
 
-    fn delete(&mut self) -> Result<IOResult<()>> {
+    fn delete(&mut self) -> IOResultOr<()> {
         let (rowid, in_btree) = match self.get_current_pos() {
             CursorPosition::Loaded {
                 row_id, in_btree, ..
@@ -1926,7 +1921,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.null_flag
     }
 
-    fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
+    fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.state.is_none() {
             self.invalidate_record();
             let int_key = match key {
@@ -2052,15 +2047,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         }
     }
 
-    fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
+    fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
         todo!()
     }
 
-    fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
+    fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
         todo!()
     }
 
-    fn count(&mut self) -> Result<IOResult<usize>> {
+    fn count(&mut self) -> IOResultOr<usize> {
         loop {
             let state = self.count_state;
             match state {
@@ -2115,7 +2110,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.table_id.into()
     }
 
-    fn rewind(&mut self) -> Result<IOResult<()>> {
+    fn rewind(&mut self) -> IOResultOr<()> {
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -2199,7 +2194,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         }
     }
 
-    fn seek_end(&mut self) -> Result<IOResult<()>> {
+    fn seek_end(&mut self) -> IOResultOr<()> {
         if self.is_btree_allocated() {
             // Defer to btree cursor's seek_end implementation
             self.btree_cursor.seek_end()
@@ -2210,7 +2205,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         }
     }
 
-    fn seek_to_last(&mut self) -> Result<IOResult<()>> {
+    fn seek_to_last(&mut self) -> IOResultOr<()> {
         match self.seek(SeekKey::TableRowId(i64::MAX), SeekOp::LE { eq_only: false })? {
             IOResult::Done(_) => Ok(IOResult::Done(())),
             IOResult::IO(iocompletions) => Ok(IOResult::IO(iocompletions)),

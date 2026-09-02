@@ -10,6 +10,7 @@ use crate::sync::{
     },
     Arc, Mutex, RwLock,
 };
+use crate::types::IOResultOr;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -1414,7 +1415,7 @@ impl Connection {
     pub(crate) fn reparse_schema_nonblock(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if matches!(state, ReparseSchemaState::Start) {
             // read cookie before consuming statement program - otherwise we can
@@ -1498,7 +1499,7 @@ impl Connection {
     fn drive_reparse_building(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         loop {
             let ReparseSchemaState::Building(inner) = state else {
@@ -1661,7 +1662,7 @@ impl Connection {
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
                     // Type loading is best-effort: log and continue on error.
-                    let scan = (|| -> Result<IOResult<()>> {
+                    let scan = (|| -> IOResultOr<()> {
                         crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
                             type_rows.push(row.get::<&str>(1)?.to_string());
                             Ok(())
@@ -1727,9 +1728,7 @@ impl Connection {
     /// Non-blocking variant of [`Self::read_current_schema_cookie`]. The MVCC
     /// path reads an in-memory header (never yields); the pager path may yield
     /// while reading page 1. Idempotent across re-entry.
-    pub(crate) fn read_current_schema_cookie_nonblock(
-        &self,
-    ) -> Result<crate::types::IOResult<u32>> {
+    pub(crate) fn read_current_schema_cookie_nonblock(&self) -> crate::types::IOResultOr<u32> {
         use crate::types::IOResult;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
@@ -3433,7 +3432,7 @@ impl Connection {
         _path: &str,
         _alias: &str,
         _state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         Err(LimboError::InvalidArgument(
             "attach not available in this build (no-fs)".to_string(),
         ))
@@ -3446,7 +3445,7 @@ impl Connection {
         _alias: &str,
         _reserved_space: Option<u8>,
         _state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         // File-backed ATTACH is unavailable without `fs`, so pre-initialization
         // page-layout overrides are also unsupported in this build.
         self.attach_database(_path, _alias, _state)
@@ -3459,7 +3458,7 @@ impl Connection {
         path: &str,
         alias: &str,
         state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         self.attach_database_with_config(path, alias, None, state)
     }
 
@@ -3472,30 +3471,35 @@ impl Connection {
         alias: &str,
         reserved_space: Option<u8>,
         state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match state {
                 AttachDatabaseState::Start => {
                     if self.is_closed() {
-                        return Err(LimboError::InternalError("Connection closed".to_string()));
+                        return Err(
+                            LimboError::InternalError("Connection closed".to_string()).into()
+                        );
                     }
 
                     if self.is_attached(alias) {
                         return Err(LimboError::InvalidArgument(format!(
                             "database {alias} is already in use"
-                        )));
+                        ))
+                        .into());
                     }
 
                     if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
                         return Err(LimboError::InvalidArgument(format!(
                             "reserved name {alias} is already in use"
-                        )));
+                        ))
+                        .into());
                     }
                     if self.pager.load().has_external_page_codec() {
                         return Err(LimboError::InvalidArgument(
                             "ATTACH is unsupported for connections using an external page codec"
                                 .to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     let db_opts = DatabaseOpts::new()
@@ -3624,7 +3628,8 @@ impl Connection {
                     let Some(mv_store) = mv_store_guard.as_ref() else {
                         return Err(LimboError::InternalError(
                             "fresh MVCC attach missing MV store".to_string(),
-                        ));
+                        )
+                        .into());
                     };
                     crate::return_if_io!(mv_store.bootstrap_nonblock(
                         bootstrap
@@ -3651,7 +3656,8 @@ impl Connection {
                 AttachDatabaseState::Done => {
                     return Err(LimboError::InternalError(
                         "attach_database called after completion".to_string(),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -4055,7 +4061,7 @@ impl Connection {
     pub(crate) fn load_sequence_descriptors_via_sql_nonblock(
         self: &Arc<Connection>,
         state: &mut LoadSequenceDescriptorsState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         loop {
             match state {
@@ -4165,7 +4171,7 @@ impl Connection {
         seq_name: &str,
         stmt: &mut Option<Box<Statement>>,
         meta: &mut Option<(i64, i64, i64, i64, bool)>,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
@@ -4198,7 +4204,8 @@ impl Connection {
             Err(err) => Err(LimboError::Corrupt(format!(
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{seq_name}\": descriptor row read failed: {err}"
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -4242,7 +4249,7 @@ impl Connection {
         seq: &crate::schema::Sequence,
         stmt: &mut Option<Box<Statement>>,
         row: &mut Option<(i64, bool)>,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
@@ -4273,7 +4280,8 @@ impl Connection {
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{}\": watermark row read failed: {err}",
                 seq.name
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -4326,7 +4334,7 @@ impl Connection {
     pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
         self: &Arc<Connection>,
         state: &mut SyncAutoincrementState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::schema::{autoincrement_sequence_name, SQLITE_SEQUENCE_TABLE_NAME};
         use crate::translate::sequence::sequence_backing_table_name;
         use crate::types::IOResult;

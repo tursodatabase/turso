@@ -58,67 +58,66 @@ impl crate::index_method::IndexMethodCursor for FailingPrepareCursor {
     fn create(
         &mut self,
         _context: &crate::index_method::IndexMethodContext,
-    ) -> Result<crate::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         Ok(crate::IOResult::Done(()))
     }
 
     fn destroy(
         &mut self,
         _context: &crate::index_method::IndexMethodContext,
-    ) -> Result<crate::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         Ok(crate::IOResult::Done(()))
     }
 
     fn open_read(
         &mut self,
         _context: &crate::index_method::IndexMethodContext,
-    ) -> Result<crate::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         Ok(crate::IOResult::Done(()))
     }
 
     fn open_write(
         &mut self,
         _context: &crate::index_method::IndexMethodContext,
-    ) -> Result<crate::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         Ok(crate::IOResult::Done(()))
     }
 
-    fn insert(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<()>> {
+    fn insert(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<()> {
         self.dirty = true;
         Ok(crate::IOResult::Done(()))
     }
 
-    fn delete(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<()>> {
+    fn delete(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<()> {
         self.dirty = true;
         Ok(crate::IOResult::Done(()))
     }
 
-    fn query_start(&mut self, _values: &[crate::vdbe::Register]) -> Result<crate::IOResult<bool>> {
+    fn query_start(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<bool> {
         Ok(crate::IOResult::Done(false))
     }
 
-    fn query_next(&mut self) -> Result<crate::IOResult<bool>> {
+    fn query_next(&mut self) -> crate::types::IOResultOr<bool> {
         Ok(crate::IOResult::Done(false))
     }
 
-    fn query_column(&mut self, _idx: usize) -> Result<crate::IOResult<Value>> {
-        Err(LimboError::InternalError(
-            "failing_prepare has no query rows".to_string(),
-        ))
+    fn query_column(&mut self, _idx: usize) -> crate::types::IOResultOr<Value> {
+        Err(LimboError::InternalError("failing_prepare has no query rows".to_string()).into())
     }
 
-    fn query_rowid(&mut self) -> Result<crate::IOResult<Option<i64>>> {
+    fn query_rowid(&mut self) -> crate::types::IOResultOr<Option<i64>> {
         Ok(crate::IOResult::Done(None))
     }
 
     fn stage_statement_commit(
         &mut self,
         _context: &crate::index_method::IndexMethodContext,
-    ) -> Result<crate::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         if self.dirty {
             return Err(LimboError::InternalError(
                 "forced index-method preparation failure".to_string(),
-            ));
+            )
+            .into());
         }
         Ok(crate::IOResult::Done(()))
     }

@@ -1,6 +1,7 @@
 use crate::alloc::vec;
 use crate::alloc::*;
 use crate::turso_assert;
+use crate::types::IOResultOr;
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
@@ -1147,7 +1148,7 @@ impl HashTable {
         rowid: i64,
         payload_values: Vec<Value>,
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let pending = PendingHashInsert {
             key_values,
             rowid,
@@ -1263,7 +1264,7 @@ impl HashTable {
         key_values: &[Value],
         key_refs: &[ValueRef],
         mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
             "Cannot insert_distinct into hash table in unexpected state",
@@ -1803,10 +1804,7 @@ impl HashTable {
 
     /// Finalize the build phase and prepare for probing.
     /// If spilled, flushes remaining in-memory partition entries to disk.
-    pub fn finalize_build(
-        &mut self,
-        metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    pub fn finalize_build(&mut self, metrics: Option<&mut HashJoinMetrics>) -> IOResultOr<()> {
         let mut metrics = metrics;
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
@@ -2273,7 +2271,7 @@ impl HashTable {
         &mut self,
         partition_idx: usize,
         mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             // to avoid holding mut borrows, split this into two phases.
             let action = {
@@ -2289,9 +2287,9 @@ impl HashTable {
                 let io_state = spilled.io_state.get();
 
                 if unlikely(matches!(io_state, SpillIOState::Error)) {
-                    return Err(LimboError::InternalError(
-                        "hash join spill I/O failure".into(),
-                    ));
+                    return Err(
+                        LimboError::InternalError("hash join spill I/O failure".into()).into(),
+                    );
                 }
                 // Already fully loaded
                 if spilled.is_loaded() {
@@ -2694,7 +2692,7 @@ impl HashTable {
         key_values: Vec<Value>,
         probe_rowid: i64,
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let spill_state = self
             .spill_state
             .as_ref()
@@ -2849,7 +2847,7 @@ impl HashTable {
     pub fn finalize_probe_spill(
         &mut self,
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let mut metrics = metrics;
         let Some(probe_state) = self.probe_spill_state.as_ref() else {
             return Ok(IOResult::Done(()));
@@ -2943,7 +2941,7 @@ impl HashTable {
     pub fn grace_load_current_partition(
         &mut self,
         mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         loop {
             let grace = self.grace_state.as_ref().expect("grace state must exist");
             if grace.partition_list_idx >= grace.partitions_to_process.len() {
@@ -2980,7 +2978,7 @@ impl HashTable {
     }
 
     /// Advance to next probe entry. Returns keys+rowid or None when exhausted.
-    pub fn grace_next_probe_entry(&mut self) -> Result<IOResult<Option<GraceProbeEntry>>> {
+    pub fn grace_next_probe_entry(&mut self) -> IOResultOr<Option<GraceProbeEntry>> {
         loop {
             let grace = self.grace_state.as_ref().expect("grace state must exist");
             if grace.probe_entry_cursor < grace.probe_entries.len() {
@@ -3010,7 +3008,7 @@ impl HashTable {
 
     /// Try to load the next probe chunk for the given partition.
     /// Returns true if more probe entries were loaded, false if exhausted.
-    fn grace_try_load_next_probe_chunk(&mut self, partition_idx: usize) -> Result<IOResult<bool>> {
+    fn grace_try_load_next_probe_chunk(&mut self, partition_idx: usize) -> IOResultOr<bool> {
         loop {
             let Some(probe_state) = self.probe_spill_state.as_ref() else {
                 return Ok(IOResult::Done(false));
@@ -3084,7 +3082,7 @@ impl HashTable {
 
     /// Load probe entries for a given partition into grace_state.probe_entries.
     /// Loads from in-memory buffers or from the first spill chunk.
-    fn grace_load_probe_entries(&mut self, partition_idx: usize) -> Result<IOResult<()>> {
+    fn grace_load_probe_entries(&mut self, partition_idx: usize) -> IOResultOr<()> {
         {
             let grace = self.grace_state.as_mut().expect("grace state");
             grace.probe_entries.clear();
@@ -3116,7 +3114,7 @@ impl HashTable {
     }
 
     /// Load the next probe spill chunk into grace_state.probe_entries.
-    fn grace_load_next_probe_chunk(&mut self, partition_idx: usize) -> Result<IOResult<bool>> {
+    fn grace_load_next_probe_chunk(&mut self, partition_idx: usize) -> IOResultOr<bool> {
         loop {
             let action = {
                 let probe_state = self.probe_spill_state.as_mut().expect("probe spill state");
@@ -3126,9 +3124,9 @@ impl HashTable {
                 let io_state = spilled.io_state.get();
 
                 if unlikely(matches!(io_state, SpillIOState::Error)) {
-                    return Err(LimboError::InternalError(
-                        "grace probe spill I/O failure".into(),
-                    ));
+                    return Err(
+                        LimboError::InternalError("grace probe spill I/O failure".into()).into(),
+                    );
                 }
 
                 if matches!(io_state, SpillIOState::WaitingForRead) {

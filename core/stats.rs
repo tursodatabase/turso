@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::alloc::TursoVecExt;
@@ -149,7 +150,7 @@ pub enum RefreshAnalyzeStatsState {
 pub fn refresh_analyze_stats_nonblock(
     conn: &Arc<Connection>,
     st: &mut RefreshAnalyzeStatsState,
-) -> Result<IOResult<()>> {
+) -> IOResultOr<()> {
     loop {
         match st {
             RefreshAnalyzeStatsState::Start => {
@@ -207,7 +208,7 @@ fn load_sqlite_stat1_rows_nonblock(
     stmt: &mut Statement,
     schema: &Schema,
     stats: &mut AnalyzeStats,
-) -> Result<crate::types::IOResult<()>> {
+) -> crate::types::IOResultOr<()> {
     crate::return_if_io!(
         stmt.run_with_row_callback_nonblock(|row| { load_sqlite_stat1_row(row, schema, stats) })
     );

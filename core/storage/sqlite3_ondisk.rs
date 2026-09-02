@@ -43,6 +43,7 @@
 
 #![allow(clippy::arc_with_non_send_sync)]
 
+use crate::types::IOResultOr;
 use crate::{
     io_yield_one, turso_assert, turso_assert_eq, turso_assert_greater_than,
     types::{IOCompletions, IOResult},
@@ -1559,7 +1560,7 @@ impl BuildSharedWal {
     /// Drive the recovery state machine. Yields the in-flight read completion
     /// when it must wait; returns `Done(wal_file_shared)` once the full WAL
     /// has been scanned (or recovery short-circuited).
-    pub fn poll(&mut self) -> Result<IOResult<Arc<RwLock<WalFileShared>>>> {
+    pub fn poll(&mut self) -> IOResultOr<Arc<RwLock<WalFileShared>>> {
         loop {
             match self.phase.clone() {
                 BuildSharedWalPhase::NeedHeaderRead => {

@@ -19,7 +19,7 @@ use turso_core::{
 
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, ExecRows, TempDatabase};
 
-fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
+fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> turso_core::types::IOResultOr<T>) -> Result<T> {
     loop {
         match f()? {
             IOResult::Done(value) => return Ok(value),

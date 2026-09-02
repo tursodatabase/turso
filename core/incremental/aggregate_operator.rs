@@ -12,6 +12,7 @@ use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::plan::ColumnMask;
+use crate::types::IOResultOr;
 use crate::types::{
     IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult, ValueRef,
 };
@@ -503,7 +504,7 @@ impl AggregateEvalState {
         &mut self,
         operator: &mut AggregateOperator,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<(Delta, ComputedStates)>> {
+    ) -> IOResultOr<(Delta, ComputedStates)> {
         loop {
             match self {
                 AggregateEvalState::FetchKey {
@@ -1451,7 +1452,7 @@ impl AggregateOperator {
         &mut self,
         state: &mut EvalState,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<(Delta, ComputedStates)>> {
+    ) -> IOResultOr<(Delta, ComputedStates)> {
         match state {
             EvalState::Uninitialized => {
                 panic!("Cannot eval AggregateOperator with Uninitialized state");
@@ -1770,11 +1771,7 @@ impl AggregateOperator {
 }
 
 impl IncrementalOperator for AggregateOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn eval(&mut self, state: &mut EvalState, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         let (delta, _) = return_if_io!(self.eval_internal(state, cursors));
         Ok(IOResult::Done(delta))
     }
@@ -1783,7 +1780,7 @@ impl IncrementalOperator for AggregateOperator {
         &mut self,
         mut deltas: DeltaPair,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         // Aggregate operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),
@@ -2111,7 +2108,7 @@ impl RecomputeMinMax {
         existing_groups: &mut HashMap<String, AggregateState>,
         operator: &AggregateOperator,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 RecomputeMinMax::ProcessElements {
@@ -2299,7 +2296,7 @@ impl ScanState {
         seek_op: SeekOp,
         storage_id: i64,
         zset_hash: Hash128,
-    ) -> Result<IOResult<Option<Value>>> {
+    ) -> IOResultOr<Option<Value>> {
         let seek_result = return_if_io!(cursors
             .index_cursor
             .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
@@ -2373,10 +2370,7 @@ impl ScanState {
         }
     }
 
-    pub fn find_new_value(
-        &mut self,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Option<Value>>> {
+    pub fn find_new_value(&mut self, cursors: &mut DbspStateCursors) -> IOResultOr<Option<Value>> {
         loop {
             match self {
                 ScanState::CheckCandidate {
@@ -2638,7 +2632,7 @@ impl FetchDistinctState {
         cursors: &mut DbspStateCursors,
         generate_group_hash: impl Fn(&str) -> Hash128,
         is_plain_distinct: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 FetchDistinctState::Init { groups_to_fetch } => {
@@ -2884,7 +2878,7 @@ impl DistinctPersistState {
         operator_id: i64,
         cursors: &mut DbspStateCursors,
         generate_group_hash: impl Fn(&str) -> Hash128,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 DistinctPersistState::Init {
@@ -3040,7 +3034,7 @@ impl MinMaxPersistState {
         column_min_max: &HashMap<usize, AggColumnInfo>,
         cursors: &mut DbspStateCursors,
         generate_group_hash: impl Fn(&str) -> Hash128,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 MinMaxPersistState::Init {

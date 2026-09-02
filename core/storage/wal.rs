@@ -3,6 +3,7 @@
 use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
+use crate::types::IOResultOr;
 use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
 use branches::mark_unlikely;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -748,7 +749,7 @@ pub trait Wal: Debug + Send + Sync {
         pager: &Pager,
         mode: CheckpointMode,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>>;
+    ) -> IOResultOr<CheckpointResult>;
     fn install_durable_backfill_proof(
         &self,
         max_frame: u64,
@@ -805,7 +806,7 @@ pub trait Wal: Debug + Send + Sync {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
-    ) -> Result<IOResult<()>>;
+    ) -> IOResultOr<()>;
 
     /// Try to acquire the checkpoint serialization lock. Returns `Busy` if
     /// another checkpointer or VACUUM already holds it. Used by plain VACUUM
@@ -838,7 +839,7 @@ pub trait Wal: Debug + Send + Sync {
         &self,
         pager: &Pager,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>>;
+    ) -> IOResultOr<CheckpointResult>;
 
     /// Release the exclusive VACUUM lock acquired by `begin_vacuum_blocking_tx`.
     /// VACUUM calls this once done, after which new
@@ -2860,7 +2861,7 @@ pub enum OpenSharedWal {
 }
 
 impl OpenSharedWal {
-    pub fn poll(&mut self) -> Result<IOResult<Arc<RwLock<WalFileShared>>>> {
+    pub fn poll(&mut self) -> IOResultOr<Arc<RwLock<WalFileShared>>> {
         match self {
             OpenSharedWal::Noop(wal) => Ok(IOResult::Done(wal.clone())),
             OpenSharedWal::Build(driver) => driver.poll(),
@@ -3972,7 +3973,7 @@ impl Wal for WalFile {
         pager: &Pager,
         mode: CheckpointMode,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire, sync_mode)
             .inspect_err(|e| {
                 tracing::debug!("WAL checkpoint failed: {e}");
@@ -3985,7 +3986,7 @@ impl Wal for WalFile {
         &self,
         pager: &Pager,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         self.checkpoint_inner(
             pager,
             CheckpointMode::Truncate {
@@ -4647,7 +4648,7 @@ impl Wal for WalFile {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         self.truncate_log(result, sync_type)
     }
 }
@@ -4794,7 +4795,7 @@ impl WalFile {
         mode: CheckpointMode,
         lock_source: CheckpointLockSource,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         loop {
             let state = self.ongoing_checkpoint.read().state.clone();
             tracing::debug!(?state);
@@ -4834,7 +4835,7 @@ impl WalFile {
                             tracing::debug!(
                                 "abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}"
                             );
-                            return Err(LimboError::Busy);
+                            return Err(LimboError::Busy.into());
                         }
                     }
                     if let CheckpointMode::Passive {
@@ -4936,7 +4937,7 @@ impl WalFile {
                             .collect();
                         pager.io.cancel(&to_cancel)?;
                         pager.io.drain_completions(&to_cancel)?;
-                        return Err(LimboError::CompletionError(e));
+                        return Err(LimboError::CompletionError(e).into());
                     }
                     let epoch = self.coordination.checkpoint_epoch();
                     // Issue reads until we hit limits
@@ -5003,7 +5004,8 @@ impl WalFile {
                         mark_unlikely();
                         return Err(LimboError::InternalError(
                             "checkpoint stuck: no inflight completions but not complete".into(),
-                        ));
+                        )
+                        .into());
                     }
                 }
                 // All eligible frames copied to the db file.
@@ -5030,7 +5032,7 @@ impl WalFile {
                     );
                     tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
-                        return Err(LimboError::Busy);
+                        return Err(LimboError::Busy.into());
                     }
                     if mode.should_restart_log() {
                         turso_assert!(
@@ -5203,7 +5205,7 @@ impl WalFile {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let file = self.coordination.prepare_truncate()?;
 
         if !result.wal_truncate_sent {
@@ -9880,7 +9882,7 @@ pub mod test {
                 }
                 e => {
                     assert!(
-                        matches!(e, Err(LimboError::Busy)),
+                        matches!(&e, Err(err) if matches!(**err, LimboError::Busy)),
                         "reader is holding readmark0 we should return Busy"
                     );
                     break;
@@ -9911,7 +9913,7 @@ pub mod test {
                 }
                 Err(e) => {
                     assert!(
-                        matches!(e, LimboError::Busy),
+                        matches!(*e, LimboError::Busy),
                         "should return busy if we have readers"
                     );
                     break;
@@ -10075,7 +10077,7 @@ pub mod test {
         };
 
         assert!(
-            matches!(result, Err(LimboError::Busy)),
+            matches!(&result, Err(err) if matches!(**err, LimboError::Busy)),
             "Restart checkpoint should fail when write lock is held"
         );
 
@@ -10422,7 +10424,7 @@ pub mod test {
             let result = wal.checkpoint(&pager, CheckpointMode::Restart, SyncMode::Full);
 
             assert!(
-                matches!(result, Err(LimboError::Busy)),
+                matches!(&result, Err(err) if matches!(**err, LimboError::Busy)),
                 "RESTART checkpoint should fail when a reader is using slot 0"
             );
         }
@@ -10532,7 +10534,7 @@ pub mod test {
                         // Drive any pending IO (should quickly become Busy or Done)
                         io.wait(db.io.as_ref()).unwrap();
                     }
-                    Err(LimboError::Busy) => {
+                    Err(err) if matches!(*err, LimboError::Busy) => {
                         break;
                     }
                     other => panic!("expected Busy from FULL with old reader, got {other:?}"),

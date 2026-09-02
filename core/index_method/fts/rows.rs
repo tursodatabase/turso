@@ -12,6 +12,7 @@
 //! * [`RowDeleter`] — delete every row matching a list of path targets.
 //!   Only merge/OPTIMIZE deletes rows.
 
+use crate::types::IOResultOr;
 use crate::{
     numeric::Numeric,
     return_if_io,
@@ -159,7 +160,7 @@ impl RowInserter {
         }
     }
 
-    pub fn step(&mut self, cursor: &mut dyn CursorTrait) -> Result<IOResult<()>> {
+    pub fn step(&mut self, cursor: &mut dyn CursorTrait) -> IOResultOr<()> {
         loop {
             match &mut self.phase {
                 None => {
@@ -275,7 +276,7 @@ impl RowDeleter {
         self.phase = DeletePhase::Seeking;
     }
 
-    pub fn step(&mut self, cursor: &mut dyn CursorTrait) -> Result<IOResult<()>> {
+    pub fn step(&mut self, cursor: &mut dyn CursorTrait) -> IOResultOr<()> {
         loop {
             let Some(target) = self.targets.get(self.idx) else {
                 return Ok(IOResult::Done(()));

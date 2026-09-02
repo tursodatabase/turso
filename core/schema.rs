@@ -14,6 +14,7 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
@@ -1543,7 +1544,7 @@ impl Schema {
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
-    /// Returns Result<IOResult<()>> to allow async operation with external IO loop
+    /// Returns IOResultOr<()> to allow async operation with external IO loop
     pub fn make_from_btree(
         &mut self,
         state: &mut MakeFromBtreeState,
@@ -1551,7 +1552,7 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
         if result.is_err() {
             state.cleanup(pager);
@@ -1571,7 +1572,7 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
             match &state.phase {
@@ -1579,7 +1580,8 @@ impl Schema {
                     if mv_cursor.is_some() {
                         return Err(crate::LimboError::ParseError(
                             "MVCC is not supported for make_from_btree schema recovery".to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
@@ -1633,20 +1635,28 @@ impl Schema {
                     // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
                     let ty_value = row.get_value(0)?;
                     let ValueRef::Text(ty) = ty_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(
+                            LimboError::ConversionError("Expected text value".into()).into()
+                        );
                     };
                     let ValueRef::Text(name) = row.get_value(1)? else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(
+                            LimboError::ConversionError("Expected text value".into()).into()
+                        );
                     };
                     let table_name_value = row.get_value(2)?;
                     let ValueRef::Text(table_name) = table_name_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(
+                            LimboError::ConversionError("Expected text value".into()).into()
+                        );
                     };
                     let root_page_value = row.get_value(3)?;
                     let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
                         root_page_value
                     else {
-                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                        return Err(
+                            LimboError::ConversionError("Expected integer value".into()).into()
+                        );
                     };
                     let sql_value = row.get_value(4)?;
                     let sql_textref = match sql_value {

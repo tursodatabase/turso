@@ -20,6 +20,7 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
+use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
@@ -483,7 +484,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> SeqCompactDriver<Clock, A> {
     /// any cursor page IO so the caller can yield up; returns
     /// `IOResult::Done(())` when every pending backing table has been
     /// compacted to its single watermark row.
-    fn step(&mut self) -> Result<IOResult<()>> {
+    fn step(&mut self) -> IOResultOr<()> {
         loop {
             let Some(seq) = self.pending.get(self.current_idx).copied() else {
                 return Ok(IOResult::Done(()));
@@ -1468,7 +1469,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     /// Perform a TRUNCATE checkpoint on the WAL
-    fn checkpoint_wal(&self) -> Result<IOResult<CheckpointResult>> {
+    fn checkpoint_wal(&self) -> IOResultOr<CheckpointResult> {
         let Some(wal) = &self.pager.wal else {
             panic!("No WAL to checkpoint");
         };
@@ -2859,8 +2860,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                     Ok(IOResult::IO(io)) => Ok(TransitionResult::Io(io)),
                     // Busy under a DbFile reader: finish without publishing nbackfills.
-                    Err(crate::LimboError::Busy)
-                        if matches!(self.mode, CheckpointMode::Passive { .. }) =>
+                    Err(err)
+                        if matches!(*err, crate::LimboError::Busy)
+                            && matches!(self.mode, CheckpointMode::Passive { .. }) =>
                     {
                         tracing::debug!(
                             "Passive WAL checkpoint Busy under pinned DbFile reader; continuing without backfill"
@@ -2876,7 +2878,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         self.state = CheckpointState::TruncateLogicalLog;
                         Ok(TransitionResult::Continue)
                     }
-                    Err(e) => Err(e),
+                    Err(e) => Err(*e),
                 }
             }
 

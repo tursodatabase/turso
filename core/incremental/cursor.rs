@@ -1,6 +1,7 @@
 use crate::numeric::Numeric;
 use crate::sync::Arc;
 use crate::sync::Mutex;
+use crate::types::IOResultOr;
 use crate::{
     incremental::{
         compiler::{DeltaSet, ExecuteState},
@@ -91,7 +92,7 @@ impl MaterializedViewCursor {
     }
 
     /// Compute transaction changes lazily on first access
-    fn ensure_tx_changes_computed(&mut self) -> Result<IOResult<()>> {
+    fn ensure_tx_changes_computed(&mut self) -> IOResultOr<()> {
         // Check if we've already processed the current state
         let current_len = self.tx_state.len();
         if current_len == self.last_tx_state_len {
@@ -120,7 +121,7 @@ impl MaterializedViewCursor {
     }
 
     // Read the current btree entry as a vector (empty if no current position)
-    fn read_btree_delta_entry(&mut self) -> Result<IOResult<Vec<(HashableRow, isize)>>> {
+    fn read_btree_delta_entry(&mut self) -> IOResultOr<Vec<(HashableRow, isize)>> {
         let btree_rowid = return_if_io!(self.btree_cursor.rowid());
         let rowid = match btree_rowid {
             None => return Ok(IOResult::Done(Vec::new())),
@@ -147,14 +148,15 @@ impl MaterializedViewCursor {
             _ => {
                 return Err(crate::LimboError::InternalError(format!(
                     "Invalid data in materialized view: expected integer weight, found {weight_value:?}"
-                )))
+                )).into())
             }
         };
 
         if weight <= 0 {
             return Err(crate::LimboError::InternalError(format!(
                 "Invalid data in materialized view: expected a positive weight, found {weight}"
-            )));
+            ))
+            .into());
         }
 
         // TODO: std boundary conversion; adjust once incremental uses the
@@ -173,7 +175,7 @@ impl MaterializedViewCursor {
         target_rowid: i64,
         op: SeekOp,
         changes: Vec<(HashableRow, isize)>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let mut btree_entries = Delta { changes };
         let changes = self.uncommitted.seek(target, op);
 
@@ -227,7 +229,7 @@ impl MaterializedViewCursor {
     }
 
     /// Internal seek implementation that doesn't check preconditions
-    fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> Result<IOResult<SeekResult>> {
+    fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> IOResultOr<SeekResult> {
         loop {
             // Process state machine - need to handle mutable borrow carefully
             match &mut self.seek_state {
@@ -306,7 +308,7 @@ impl MaterializedViewCursor {
         }
     }
 
-    pub fn seek(&mut self, key: SeekKey, op: SeekOp) -> Result<IOResult<SeekResult>> {
+    pub fn seek(&mut self, key: SeekKey, op: SeekOp) -> IOResultOr<SeekResult> {
         // Ensure transaction changes are computed
         return_if_io!(self.ensure_tx_changes_computed());
 
@@ -315,14 +317,15 @@ impl MaterializedViewCursor {
             SeekKey::IndexKey(_) => {
                 return Err(LimboError::ParseError(
                     "Cannot search a materialized view with an index key".to_string(),
-                ));
+                )
+                .into());
             }
         };
 
         self.do_seek(target_rowid, op)
     }
 
-    pub fn next(&mut self) -> Result<IOResult<bool>> {
+    pub fn next(&mut self) -> IOResultOr<bool> {
         // If there's a pending seek operation (due to IO), complete it first.
         // SeekState::Seek or SeekState::Advancing means IO was interrupted mid-seek and we need to resume.
         // SeekState::Init means cursor was never positioned - don't resume, fall through to check current_row.
@@ -346,7 +349,7 @@ impl MaterializedViewCursor {
         Ok(IOResult::Done(result == SeekResult::Found))
     }
 
-    pub fn column(&mut self, col: usize) -> Result<IOResult<Value>> {
+    pub fn column(&mut self, col: usize) -> IOResultOr<Value> {
         if let Some((_, ref values)) = self.current_row {
             Ok(IOResult::Done(
                 values.get(col).cloned().unwrap_or(Value::Null),
@@ -356,11 +359,11 @@ impl MaterializedViewCursor {
         }
     }
 
-    pub fn rowid(&self) -> Result<IOResult<Option<i64>>> {
+    pub fn rowid(&self) -> IOResultOr<Option<i64>> {
         Ok(IOResult::Done(self.current_row.as_ref().map(|(id, _)| *id)))
     }
 
-    pub fn rewind(&mut self) -> Result<IOResult<()>> {
+    pub fn rewind(&mut self) -> IOResultOr<()> {
         return_if_io!(self.ensure_tx_changes_computed());
         // Seek GT from i64::MIN to find the first row using internal do_seek
         let _result = return_if_io!(self.do_seek(i64::MIN, SeekOp::GT));
@@ -1777,7 +1780,7 @@ mod tests {
         }
 
         impl CursorTrait for MockBTreeCursor {
-            fn seek(&mut self, _key: SeekKey<'_>, _op: SeekOp) -> Result<IOResult<SeekResult>> {
+            fn seek(&mut self, _key: SeekKey<'_>, _op: SeekOp) -> IOResultOr<SeekResult> {
                 let count = self.seek_count.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     // First seek returns TryAdvance
@@ -1793,12 +1796,12 @@ mod tests {
                 &mut self,
                 _registers: &[Register],
                 _op: SeekOp,
-            ) -> Result<IOResult<SeekResult>> {
+            ) -> IOResultOr<SeekResult> {
                 // Not used in these tests
                 Ok(IOResult::Done(SeekResult::NotFound))
             }
 
-            fn next(&mut self) -> Result<IOResult<()>> {
+            fn next(&mut self) -> IOResultOr<()> {
                 let count = self.next_count.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     // First call returns IO (pending)
@@ -1810,7 +1813,7 @@ mod tests {
                 }
             }
 
-            fn prev(&mut self) -> Result<IOResult<()>> {
+            fn prev(&mut self) -> IOResultOr<()> {
                 let count = self.prev_count.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     // First call returns IO (pending)
@@ -1822,23 +1825,23 @@ mod tests {
                 }
             }
 
-            fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+            fn rowid(&mut self) -> IOResultOr<Option<i64>> {
                 Ok(IOResult::Done(self.current_rowid))
             }
 
-            fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>> {
+            fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
                 Ok(IOResult::Done(Some(&self.record)))
             }
 
-            fn last(&mut self) -> Result<IOResult<()>> {
+            fn last(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
-            fn insert(&mut self, _key: &BTreeKey) -> Result<IOResult<()>> {
+            fn insert(&mut self, _key: &BTreeKey) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
-            fn delete(&mut self) -> Result<IOResult<()>> {
+            fn delete(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
@@ -1848,19 +1851,19 @@ mod tests {
                 false
             }
 
-            fn exists(&mut self, _key: &Value) -> Result<IOResult<bool>> {
+            fn exists(&mut self, _key: &Value) -> IOResultOr<bool> {
                 Ok(IOResult::Done(false))
             }
 
-            fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
+            fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
                 Ok(IOResult::Done(None))
             }
 
-            fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
+            fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
                 Ok(IOResult::Done(None))
             }
 
-            fn count(&mut self) -> Result<IOResult<usize>> {
+            fn count(&mut self) -> IOResultOr<usize> {
                 Ok(IOResult::Done(0))
             }
 
@@ -1872,7 +1875,7 @@ mod tests {
                 1
             }
 
-            fn rewind(&mut self) -> Result<IOResult<()>> {
+            fn rewind(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
@@ -1886,11 +1889,11 @@ mod tests {
                 &self.index_info
             }
 
-            fn seek_end(&mut self) -> Result<IOResult<()>> {
+            fn seek_end(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
-            fn seek_to_last(&mut self) -> Result<IOResult<()>> {
+            fn seek_to_last(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 

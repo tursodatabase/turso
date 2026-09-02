@@ -3,6 +3,7 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
 use crate::MemoryYieldIO;
@@ -1163,13 +1164,14 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         options: &OpenOptions,
-    ) -> Result<IOResult<Arc<Database>>> {
+    ) -> IOResultOr<Arc<Database>> {
         Self::reject_wal_path_for_registry_open(options)?;
         Self::validate_open_options(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::open_async".to_string(),
-            ));
+            )
+            .into());
         };
         // Re-derive lock-mode flags from opts: multiprocess WAL must open the
         // WAL file with NoLock or the second process fails to lock `-wal`.
@@ -1203,7 +1205,8 @@ impl Database {
                                 return Err(LimboError::InvalidArgument(
                                     "Database is encrypted but no encryption options provided"
                                         .to_string(),
-                                ));
+                                )
+                                .into());
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
@@ -1300,12 +1303,13 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         options: &OpenOptions,
-    ) -> Result<IOResult<Arc<Database>>> {
+    ) -> IOResultOr<Arc<Database>> {
         Self::validate_open_options(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::do_open_async".to_string(),
-            ));
+            )
+            .into());
         };
         Self::do_open_async_guarded(
             state,
@@ -1340,12 +1344,13 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
+    ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
                 "built-in encryption cannot be combined with an external page codec".to_string(),
-            ));
+            )
+            .into());
         }
         let result = Self::do_open_async_internal(
             state,
@@ -1381,7 +1386,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
+    ) -> IOResultOr<Arc<Database>> {
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
             match &state.phase {
@@ -1536,7 +1541,10 @@ impl Database {
                             // Release the schema lock
                             state.schema_guard = None;
                         }
-                        Err(LimboError::ExtensionError(e)) => {
+                        Err(err) if matches!(*err, LimboError::ExtensionError(_)) => {
+                            let LimboError::ExtensionError(e) = *err else {
+                                unreachable!()
+                            };
                             // this means that a vtab exists and we no longer have the module loaded.
                             // we print a warning to the user to load the module
                             state.schema_guard = None;
@@ -1650,11 +1658,12 @@ impl Database {
         st: &mut InitState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
-    ) -> Result<IOResult<Pager>> {
+    ) -> IOResultOr<Pager> {
         if encryption_key.is_some() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
                 "built-in encryption cannot be combined with an external page codec".to_string(),
-            ));
+            )
+            .into());
         }
         loop {
             match st {
@@ -1690,11 +1699,11 @@ impl Database {
                             Err(LimboError::Busy) => {
                                 read_tx_attempts += 1;
                                 if read_tx_attempts > 1 {
-                                    return Err(LimboError::Busy);
+                                    return Err(LimboError::Busy.into());
                                 }
                                 pager.io.yield_now();
                             }
-                            Err(err) => return Err(err),
+                            Err(err) => return Err(err.into()),
                         }
                     }
 
@@ -1750,7 +1759,7 @@ impl Database {
                             };
                             if let Err(err) = validate_codec_header() {
                                 pager.end_read_tx();
-                                return Err(err);
+                                return Err(err.into());
                             }
                             if header.vacuum_mode_largest_root_page.get() > 0 {
                                 if header.incremental_vacuum_enabled.get() > 0 {
@@ -1795,7 +1804,7 @@ impl Database {
         st: &mut HeaderValidationState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
-    ) -> Result<IOResult<Arc<Pager>>> {
+    ) -> IOResultOr<Arc<Pager>> {
         loop {
             match st {
                 HeaderValidationState::Start { init } => {
@@ -1842,7 +1851,8 @@ impl Database {
                     if !header_mut.text_encoding.is_utf8() {
                         return Err(LimboError::UnsupportedEncoding(
                             header_mut.text_encoding.to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     let (read_version, write_version) =
@@ -1853,7 +1863,7 @@ impl Database {
                             "invalid value of database header magic bytes: {:?}",
                             header_mut.magic
                         );
-                        return Err(LimboError::NotADB);
+                        return Err(LimboError::NotADB.into());
                     }
                     // when we open fresh db with encryption params - header will be SQLite at this point
                     if encryption_key.is_some()
@@ -1864,7 +1874,7 @@ impl Database {
                             "invalid value of database header magic bytes: {:?}",
                             header_mut.magic
                         );
-                        return Err(LimboError::NotADB);
+                        return Err(LimboError::NotADB.into());
                     }
 
                     // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
@@ -1872,7 +1882,7 @@ impl Database {
                     if read_version != write_version {
                         return Err(LimboError::Corrupt(format!(
                             "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
-                        )));
+                        )).into());
                     }
 
                     let (read_version, _write_version) = (
@@ -1889,26 +1899,30 @@ impl Database {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid max_embed_frac: expected 64, got {}",
                             header_mut.max_embed_frac
-                        )));
+                        ))
+                        .into());
                     }
                     if header_mut.min_embed_frac != 32 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid min_embed_frac: expected 32, got {}",
                             header_mut.min_embed_frac
-                        )));
+                        ))
+                        .into());
                     }
                     if header_mut.leaf_frac != 32 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid leaf_frac: expected 32, got {}",
                             header_mut.leaf_frac
-                        )));
+                        ))
+                        .into());
                     }
                     let schema_format = header_mut.schema_format.get();
                     // If the database is completely empty, if it has no schema, then the schema format number can be zero.
                     if !(0..=4).contains(&schema_format) {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid schema_format: expected 1-4, got {schema_format}"
-                        )));
+                        ))
+                        .into());
                     }
                     if !matches!(
                         header_mut.text_encoding,
@@ -1920,7 +1934,8 @@ impl Database {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid text_encoding: {}",
                             header_mut.text_encoding
-                        )));
+                        ))
+                        .into());
                     }
                     if !matches!(
                         header_mut.text_encoding,
@@ -1929,7 +1944,8 @@ impl Database {
                         return Err(LimboError::Corrupt(format!(
                             "Only utf8 text_encoding is supported by tursodb: got={}",
                             header_mut.text_encoding
-                        )));
+                        ))
+                        .into());
                     }
 
                     // Determine if we should open in MVCC mode based on the database header version
@@ -1939,7 +1955,8 @@ impl Database {
                         return Err(LimboError::InvalidArgument(
                             "external page codecs are not supported with MVCC databases"
                                 .to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     // MVCC has no cross-process coordination: commit
@@ -1951,7 +1968,7 @@ impl Database {
                         return Err(LimboError::InvalidArgument(format!(
                             "cannot open MVCC database '{}' with experimental multiprocess WAL: MVCC does not support multiprocess access",
                             self.path
-                        )));
+                        )).into());
                     }
 
                     // Now check the Header Version to see which mode the DB file really is on
@@ -1982,7 +1999,7 @@ impl Database {
                         return Err(LimboError::Corrupt(format!(
                             "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
                             self.path
-                        )));
+                        )).into());
                     }
 
                     let page = header.page().clone();
@@ -2439,7 +2456,7 @@ impl Database {
     /// Non-blocking read of the 512-byte database file header (page 1's
     /// header region). Yields the read completion via the supplied state until
     /// it finishes, then returns the filled buffer.
-    fn read_db_header_buf(&self, st: &mut DbHeaderReadState) -> Result<IOResult<Arc<Buffer>>> {
+    fn read_db_header_buf(&self, st: &mut DbHeaderReadState) -> IOResultOr<Arc<Buffer>> {
         loop {
             match st {
                 DbHeaderReadState::Start => {
@@ -2910,7 +2927,7 @@ impl Database {
         requested_page_size: Option<usize>,
         hdr_st: &mut DbHeaderReadState,
         page_codec: Option<&Arc<dyn PageCodec>>,
-    ) -> Result<IOResult<Pager>> {
+    ) -> IOResultOr<Pager> {
         let cipher = self.encryption_cipher_mode.get();
 
         // For an existing (initialized) database, read the 512-byte header
@@ -2930,14 +2947,16 @@ impl Database {
                     return Err(LimboError::InvalidArgument(format!(
                         "page codec reported invalid page size {}",
                         header_info.page_size
-                    )));
+                    ))
+                    .into());
                 };
                 if !page_size.has_valid_reserved_space(header_info.reserved_space) {
                     return Err(LimboError::InvalidArgument(format!(
                         "page codec reported invalid reserved space {} for page size {}",
                         header_info.reserved_space,
                         page_size.get()
-                    )));
+                    ))
+                    .into());
                 }
                 (Some(header_info.reserved_space), Some(page_size))
             } else {
@@ -2954,7 +2973,7 @@ impl Database {
             if reserved_bytes != required_reserved_bytes {
                 return Err(LimboError::InvalidArgument(format!(
                     "page codec requires exactly {required_reserved_bytes} reserved bytes, but database provides {reserved_bytes}"
-                )));
+                )).into());
             }
         }
 
@@ -4152,7 +4171,7 @@ mod database_tests {
         };
 
         assert!(matches!(
-            err,
+            *err,
             LimboError::InvalidArgument(ref message)
                 if message
                     == "external page codecs are not supported with experimental multiprocess WAL"

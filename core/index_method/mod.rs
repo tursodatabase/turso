@@ -1,5 +1,6 @@
 use std::sync::{Arc, Weak};
 
+use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
@@ -542,23 +543,23 @@ pub struct IndexMethodTestStats {
 /// skipping `stage_statement_commit` silently loses writes.
 pub trait IndexMethodCursor: Send {
     /// create necessary components for index method (usually, this is a bunch of btree-s)
-    fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
+    fn create(&mut self, context: &IndexMethodContext) -> IOResultOr<()>;
     /// destroy components created in the create(...) call for index method
-    fn destroy(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
+    fn destroy(&mut self, context: &IndexMethodContext) -> IOResultOr<()>;
 
     /// open necessary components for reading the index
-    fn open_read(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
+    fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()>;
     /// open necessary components for writing the index
-    fn open_write(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
+    fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()>;
 
     /// handle insert action
     /// "values" argument contains registers with values for index columns followed by rowid Integer register
     /// (e.g. for "CREATE INDEX i ON t USING method (x, z)" insert(...) call will have 3 registers in values: [x, z, rowid])
-    fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>>;
+    fn insert(&mut self, values: &[Register]) -> IOResultOr<()>;
     /// handle delete action
     /// "values" argument contains registers with values for index columns followed by rowid Integer register
     /// (e.g. for "CREATE INDEX i ON t USING method (x, z)" insert(...) call will have 3 registers in values: [x, z, rowid])
-    fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>>;
+    fn delete(&mut self, values: &[Register]) -> IOResultOr<()>;
 
     /// initialize query to the index method
     /// first element of "values" slice is the Integer register which holds index of the chosen [IndexMethodDefinition::patterns] by query planner
@@ -569,14 +570,14 @@ pub trait IndexMethodCursor: Send {
     /// - [Integer(1), Text("turso")] - pattern "SELECT * FROM {table} WHERE x = ?" was chosen with equality comparison equals to "turso"
     ///
     /// Returns false if query will produce no rows (similar to VFilter/Rewind op codes)
-    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>>;
+    fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool>;
 
     /// Moves cursor to the next response row
     /// Returns false if query exhausted all rows
-    fn query_next(&mut self) -> Result<IOResult<bool>>;
+    fn query_next(&mut self) -> IOResultOr<bool>;
 
     /// Return column with given idx (zero-based) from current row
-    fn query_column(&mut self, idx: usize) -> Result<IOResult<Value>>;
+    fn query_column(&mut self, idx: usize) -> IOResultOr<Value>;
 
     /// Return rowid of the original table row which corresponds to the current cursor row
     ///
@@ -592,11 +593,11 @@ pub trait IndexMethodCursor: Send {
     /// In this case query planner will execute index method query first, and then
     /// enrich its result with name, comment, rating columns from original table accessing original row by its rowid
     /// returned from query_rowid(...) method
-    fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>>;
+    fn query_rowid(&mut self) -> IOResultOr<Option<i64>>;
 
     /// Stage all pending index changes before the statement savepoint is
     /// released. Any fallible work or I/O belongs in this phase.
-    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
         Ok(IOResult::Done(()))
     }
 
@@ -624,7 +625,7 @@ pub trait IndexMethodCursor: Send {
     fn close(&mut self, _context: &IndexMethodContext) {}
 
     /// Optimize the index by merging segments or performing other maintenance.
-    fn optimize(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn optimize(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
         Ok(IOResult::Done(()))
     }
 

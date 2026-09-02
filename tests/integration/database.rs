@@ -225,7 +225,7 @@ fn test_open_async_requires_storage() {
     )
     .expect_err("open_async without storage must fail");
     assert!(
-        matches!(err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
+        matches!(*err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
         "expected InvalidArgument about missing storage, got {err:?}"
     );
 }
