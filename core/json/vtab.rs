@@ -253,7 +253,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         self.traversal_states.clear();
         self.rowid = 0;
 
-        if args.is_empty() {
+        if args.is_empty() || args[0] == Value::Null {
             return Ok(false);
         }
         if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
