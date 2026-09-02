@@ -7226,6 +7226,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
+        log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
@@ -8916,6 +8917,7 @@ fn transaction_display() {
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
+        log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
@@ -21131,3 +21133,6 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
         Err(LimboError::WriteWriteConflict)
     ));
 }
+
+#[path = "group_commit_tests.rs"]
+mod group_commit_tests;
