@@ -1711,8 +1711,10 @@ impl Program {
         self.connection.get_pager_from_database_index(idx)
     }
 
+    // `prev_steps` is the vm_steps value at the previous consultation, so the
+    // progress handler sees every crossed multiple of its interval.
     #[inline]
-    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I) -> bool
+    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I, prev_steps: u64) -> bool
     where
         I: crate::IO + ?Sized,
     {
@@ -1729,7 +1731,7 @@ impl Program {
             .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
         let progress_interrupt = self
             .connection
-            .should_interrupt_for_progress(state.metrics.vm_steps);
+            .should_interrupt_for_progress(prev_steps, state.metrics.vm_steps);
         if connection_interrupt || hit_query_deadline || progress_interrupt {
             state.interrupt();
         }
@@ -1780,7 +1782,11 @@ impl Program {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
-        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+        if self.maybe_request_interrupt(
+            state,
+            pager.io.as_ref(),
+            state.metrics.vm_steps.saturating_sub(1),
+        ) {
             return Ok(StepResult::Interrupt);
         }
 
@@ -1875,7 +1881,11 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
 
-            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+            if self.maybe_request_interrupt(
+                state,
+                pager.io.as_ref(),
+                state.metrics.vm_steps.saturating_sub(1),
+            ) {
                 return Ok(StepResult::Interrupt);
             }
 
@@ -1921,7 +1931,11 @@ impl Program {
             }
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+        if self.maybe_request_interrupt(
+            state,
+            pager.io.as_ref(),
+            state.metrics.vm_steps.saturating_sub(1),
+        ) {
             return Ok(StepResult::Interrupt);
         }
         // The single row has already been returned when pc is non-zero.
@@ -1947,6 +1961,14 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        let vdbe_trace = self.connection.get_vdbe_trace();
+        // A progress handler with a small interval narrows the check gate so
+        // its cadence is honored; without one the gate stays at the maximum.
+        let progress_ops = self.connection.progress_ops();
+        // Reborrow the instruction list once: reloading it through `self`
+        // every iteration defeats LLVM's hoisting because the opcode call
+        // below is opaque to it.
+        let insns = self.insns.as_slice();
         // Invalidate the previous result row once per step call: rows are only
         // handed out between step calls, and ResultRow returns immediately
         // after setting a fresh one.
@@ -1988,24 +2010,45 @@ impl Program {
                 state.io_completions = None;
             }
             loop {
-                if self.connection.is_closed() {
-                    // Connection is closed for whatever reason, rollback the transaction.
-                    let state = self.connection.get_tx_state();
-                    if let TransactionState::Write { .. } = state {
-                        pager.rollback_tx(&self.connection);
+                // Closed/interrupt/deadline/progress checks run once every
+                // CHECK_INTERVAL instructions instead of on each one (SQLite
+                // similarly only checks at jump opcodes). vm_steps persists
+                // across step calls, so the cadence spans the whole statement;
+                // callers regain control at every returned row regardless.
+                // The interval must stay a power of two so this gate is a
+                // mask test, never a division, in the interpreter hot loop.
+                const CHECK_INTERVAL: u64 = 64;
+                const _: () = assert!(CHECK_INTERVAL.is_power_of_two());
+                let check_mask = if progress_ops == 0 {
+                    CHECK_INTERVAL - 1
+                } else {
+                    progress_ops.next_power_of_two().min(CHECK_INTERVAL) - 1
+                };
+                if state.metrics.vm_steps & check_mask == 0 {
+                    if self.connection.is_closed() {
+                        // Connection is closed for whatever reason, rollback the transaction.
+                        let state = self.connection.get_tx_state();
+                        if let TransactionState::Write { .. } = state {
+                            pager.rollback_tx(&self.connection);
+                        }
+                        return Err(LimboError::InternalError("Connection closed".to_string()));
                     }
-                    return Err(LimboError::InternalError("Connection closed".to_string()));
-                }
-                if self.maybe_request_interrupt(state, pager.io.as_ref()) {
-                    self.abort(pager, None, state, true)?;
-                    return Ok(StepResult::Interrupt);
+                    let prev_steps = state.metrics.vm_steps.saturating_sub(check_mask + 1);
+                    if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
+                        self.abort(pager, None, state, true)?;
+                        return Ok(StepResult::Interrupt);
+                    }
                 }
 
                 // A trigger can return FAIL before the parent program reaches
                 // Halt. FAIL keeps changes made by earlier rows, so their
                 // index-method writes must finish before abort() releases the
                 // statement savepoint and commits those partial changes.
-                if let Some(fail_error) = state.pending_fail_prepare_error.take() {
+                if state.pending_fail_prepare_error.is_some() {
+                    let fail_error = state
+                        .pending_fail_prepare_error
+                        .take()
+                        .expect("checked is_some above");
                     match execute::index_method_stage_statement_all(state) {
                         Ok(IOResult::Done(())) => {
                             if let Err(abort_err) =
@@ -2051,13 +2094,13 @@ impl Program {
                         }
                     }
                 }
-                let (insn, _) = &self.insns[state.pc as usize];
+                let (insn, _) = &insns[state.pc as usize];
                 let insn_function = insn.to_function();
                 if enable_tracing {
                     trace_insn(self, state.pc as InsnReference, insn);
                     crate::stack::trace_remaining("program_step:opcode");
                 }
-                if self.connection.get_vdbe_trace() {
+                if vdbe_trace {
                     // Diff registers from PREVIOUS opcode
                     // The last opcode (Halt) won't have its diff printed, but Halt
                     // doesn't write to any registers

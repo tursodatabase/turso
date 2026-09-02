@@ -4755,9 +4755,15 @@ impl Connection {
         self.progress_handler.set(ops, handler);
     }
 
-    /// Returns true when the step-based progress handler requests interruption.
-    pub fn should_interrupt_for_progress(&self, vm_steps: u64) -> bool {
-        self.progress_handler.should_interrupt(vm_steps)
+    /// Configured progress-handler interval in VM steps; 0 when disabled.
+    pub fn progress_ops(&self) -> u64 {
+        self.progress_handler.ops()
+    }
+
+    /// Returns true when the step-based progress handler requests interruption
+    /// for the VM steps executed in `(prev_steps, vm_steps]`.
+    pub fn should_interrupt_for_progress(&self, prev_steps: u64, vm_steps: u64) -> bool {
+        self.progress_handler.should_interrupt(prev_steps, vm_steps)
     }
 
     /// Request interruption of currently running root statements on this connection.
