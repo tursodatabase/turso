@@ -122,9 +122,9 @@ await replica.SyncAsync();
 
 `Sync Interval` is the automatic pull period in seconds. `AutomaticSyncStatus` and `AutomaticSyncStatusChanged` expose waiting, running, retrying, faulted, and stopped states along with attempt times, the last pull result, the next attempt, and terminal failures. Automatic sync retries transient transport, I/O, and timeout failures twice; other failures are terminal and are also surfaced by `Close`.
 
-Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`. Local `Encryption Cipher` and `Encryption Key` do not configure remote replica encryption. Replica batches are not supported yet.
+Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`. Local `Encryption Cipher` and `Encryption Key` do not configure remote replica encryption.
 
-Remote mode also supports ADO.NET `DbBatch` for latency-sensitive workloads that should be sent in one Hrana batch:
+Direct remote and opened embedded replica connections support ADO.NET `DbBatch`:
 
 ```C#
 await using var batch = connection.CreateBatch();
@@ -142,6 +142,28 @@ select.CommandText = "SELECT COUNT(*) FROM customers";
 batch.BatchCommands.Add(select);
 
 await using var reader = await batch.ExecuteReaderAsync();
+```
+
+Direct remote batches are sent in one Hrana request. Replica batches execute each
+command sequentially against the local replica connection and expose each result
+through `NextResult`. They are not implicitly atomic. Use an explicit transaction
+when every command must commit or roll back together:
+
+```C#
+await using var transaction = await replica.BeginTransactionAsync();
+await using var batch = replica.CreateBatch();
+batch.Transaction = transaction;
+
+var first = batch.CreateBatchCommand();
+first.CommandText = "INSERT INTO customers(name) VALUES ('Alice')";
+batch.BatchCommands.Add(first);
+
+var second = batch.CreateBatchCommand();
+second.CommandText = "INSERT INTO customers(name) VALUES ('Bob')";
+batch.BatchCommands.Add(second);
+
+await batch.ExecuteNonQueryAsync();
+await transaction.CommitAsync();
 ```
 
 Use `TursoSyncDatabase` when an application needs an embedded replica with explicit sync control and advanced sync configuration:

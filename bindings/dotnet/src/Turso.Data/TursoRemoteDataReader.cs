@@ -12,6 +12,8 @@ internal sealed class TursoRemoteDataReader : DbDataReader
     private readonly IReadOnlyList<RemoteStatementResult> _results;
     private readonly CommandBehavior _behavior;
     private readonly int _recordsAffected;
+    private IDisposable? _syncOperation;
+    private TursoConnection? _syncConnection;
     private int _resultIndex;
     private int _rowIndex = -1;
     private bool _isClosed;
@@ -21,7 +23,11 @@ internal sealed class TursoRemoteDataReader : DbDataReader
     {
     }
 
-    public TursoRemoteDataReader(TursoConnection? connection, IReadOnlyList<RemoteStatementResult> results, CommandBehavior behavior)
+    public TursoRemoteDataReader(
+        TursoConnection? connection,
+        IReadOnlyList<RemoteStatementResult> results,
+        CommandBehavior behavior,
+        IDisposable? syncOperation = null)
     {
         ArgumentNullException.ThrowIfNull(results);
 
@@ -30,6 +36,13 @@ internal sealed class TursoRemoteDataReader : DbDataReader
         _behavior = behavior;
         foreach (var result in results)
             _recordsAffected = checked(_recordsAffected + (int)result.AffectedRowCount);
+
+        _syncOperation = syncOperation;
+        if (syncOperation is not null && connection is not null)
+        {
+            _syncConnection = connection;
+            connection.RegisterSyncReader(this);
+        }
     }
 
     public override bool GetBoolean(int ordinal)
@@ -229,8 +242,15 @@ internal sealed class TursoRemoteDataReader : DbDataReader
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !_isClosed && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-            _connection?.Close();
+        if (disposing && !_isClosed)
+        {
+            _syncOperation?.Dispose();
+            _syncOperation = null;
+            _syncConnection?.UnregisterSyncReader(this);
+            _syncConnection = null;
+            if ((_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+                _connection?.Close();
+        }
 
         _isClosed = true;
         base.Dispose(disposing);
