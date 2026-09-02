@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::HashMap;
+use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
@@ -733,6 +734,11 @@ fn validate(
         constraints,
     } = &body
     {
+        if columns.len() > crate::types::MAX_COLUMN {
+            return Err(LimboError::ParseError(format!(
+                "too many columns on {table_name}"
+            )));
+        }
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
             let col_i = &columns[i];
