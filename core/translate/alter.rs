@@ -1565,17 +1565,18 @@ pub fn translate_alter_table(
             let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
 
-            if resolver.with_schema(database_id, |s| {
-                s.get_table(new_name).is_some()
-                    || s.indexes
-                        .values()
-                        .flatten()
-                        .any(|index| index.name == normalize_ident(new_name))
-            }) {
+            // Views whose SQL failed to load are absent from the schema maps
+            // but their rows are still in sqlite_schema, so the name is taken.
+            let new_name_taken = resolver.with_schema(database_id, |s| {
+                s.get_object_type(&normalized_new_name).is_some()
+                    || s.broken_views.contains(&normalized_new_name)
+                    || s.incompatible_views.contains(&normalized_new_name)
+            });
+            if new_name_taken {
                 return Err(LimboError::ParseError(format!(
                     "there is already another table or index with this name: {new_name}"
                 )));
-            };
+            }
 
             for trigger_entry in collect_triggers_for_alter_target(resolver, database_id) {
                 if let Some(missing_table) = validate_trigger_table_refs_after_rename(

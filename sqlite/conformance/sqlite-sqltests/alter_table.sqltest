@@ -582,6 +582,28 @@ test fail-alter-table-rename-to-existing-table {
 expect error {
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test fail-alter-table-rename-to-existing-view {
+    CREATE TABLE x (a);
+    CREATE VIEW y AS SELECT 1;
+    ALTER TABLE x RENAME TO y;
+}
+expect error {
+    there is already another table or index with this name: y
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test fail-alter-table-rename-to-existing-view-different-case {
+    CREATE TABLE x (a);
+    CREATE VIEW y AS SELECT 1;
+    ALTER TABLE x RENAME TO Y;
+}
+expect error {
+    there is already another table or index with this name: Y
+}
+
 @cross-check-integrity
 test alter-table-rename-to-quoted-identifier {
     CREATE TABLE t (a);
