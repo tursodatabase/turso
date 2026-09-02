@@ -32,7 +32,7 @@ use crate::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
             },
             cost::RowCountEstimate,
-            multi_index::MultiIndexBranchAccessParams,
+            multi_index::{MultiIndexBranchAccessParams, MultiIndexBranchParams},
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
@@ -3042,43 +3042,15 @@ fn apply_table_access_plan(
                     }
                 }
 
-                let w_idx = *where_term_idx;
-                let s_op = set_op.clone();
-                // Build the MultiIndexScanOp from the branch parameters
-                let mut multi_idx_branches = Vec::with_capacity(branches.len());
-                for branch in std::mem::take(branches) {
-                    let access = match branch.access {
-                        MultiIndexBranchAccessParams::Seek {
-                            constraints,
-                            constraint_refs,
-                        } => MultiIndexBranchAccess::Seek {
-                            seek_def: build_seek_def_from_constraints(
-                                &constraints,
-                                &constraint_refs,
-                                IterationDirection::Forwards, // Multi-index always scans forward
-                                where_clause,
-                                Some(table_references),
-                                Some(resolver),
-                            )?,
-                        },
-                        MultiIndexBranchAccessParams::InSeek { source } => {
-                            MultiIndexBranchAccess::InSeek { source }
-                        }
-                    };
-                    multi_idx_branches.push(MultiIndexBranch {
-                        index: branch.index,
-                        access,
-                        estimated_rows: branch.estimated_rows,
-                        union_residuals: branch.residuals,
-                    });
-                }
-
-                table_references.joined_tables_mut()[table_idx].op =
-                    Operation::MultiIndexScan(MultiIndexScanOp {
-                        branches: multi_idx_branches,
-                        where_term_idx: w_idx,
-                        set_op: s_op,
-                    });
+                let operation = build_multi_index_scan_operation(
+                    std::mem::take(branches),
+                    *where_term_idx,
+                    set_op.clone(),
+                    where_clause,
+                    table_references,
+                    resolver,
+                )?;
+                table_references.joined_tables_mut()[table_idx].op = operation;
             }
             AccessMethodParams::InSeek {
                 index,
@@ -3197,6 +3169,52 @@ fn apply_table_access_plan(
     }
 
     Ok(best_join_order)
+}
+
+/// This function builds a multi-index operation for two types of table read.
+/// The main loop and an unmatched-right read both use this function.
+fn build_multi_index_scan_operation(
+    branches: Vec<MultiIndexBranchParams>,
+    where_term_idx: usize,
+    set_op: SetOperation,
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Operation> {
+    let mut planned_branches = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let access = match branch.access {
+            MultiIndexBranchAccessParams::Seek {
+                constraints,
+                constraint_refs,
+            } => MultiIndexBranchAccess::Seek {
+                seek_def: build_seek_def_from_constraints(
+                    &constraints,
+                    &constraint_refs,
+                    // Multi-index branches always read in the forward direction.
+                    IterationDirection::Forwards,
+                    where_clause,
+                    Some(table_references),
+                    Some(resolver),
+                )?,
+            },
+            MultiIndexBranchAccessParams::InSeek { source } => {
+                MultiIndexBranchAccess::InSeek { source }
+            }
+        };
+        planned_branches.push(MultiIndexBranch {
+            index: branch.index,
+            access,
+            estimated_rows: branch.estimated_rows,
+            union_residuals: branch.residuals,
+        });
+    }
+
+    Ok(Operation::MultiIndexScan(MultiIndexScanOp {
+        branches: planned_branches,
+        where_term_idx,
+        set_op,
+    }))
 }
 
 fn build_vtab_scan_op(
