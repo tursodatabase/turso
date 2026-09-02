@@ -1462,6 +1462,111 @@ expect {
     480
 }
 
+# These cases come from command-line comparisons with SQLite. SQLite removes
+# a top-level wrapper but keeps a multi-source group on the right as one source.
+@cross-check-integrity
+test top-level-parenthesized-full-join-keeps-inner-aliases {
+    CREATE TABLE grouped_top_left(id INTEGER, value TEXT);
+    CREATE TABLE grouped_top_right(id INTEGER, value TEXT);
+    INSERT INTO grouped_top_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO grouped_top_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT top_left.id, top_left.value, top_right.id, top_right.value
+      FROM (grouped_top_left AS top_left
+            FULL JOIN grouped_top_right AS top_right USING(id))
+     ORDER BY coalesce(top_left.id, top_right.id);
+}
+expect {
+    1|left-one||
+    2|left-two|2|right-two
+    ||3|right-three
+}
+
+@cross-check-integrity
+test inner-join-reads-parenthesized-full-join {
+    CREATE TABLE grouped_filter(id INTEGER, filter_value TEXT);
+    CREATE TABLE grouped_full_left(id INTEGER, left_value TEXT);
+    CREATE TABLE grouped_full_right(id INTEGER, right_value TEXT);
+    INSERT INTO grouped_filter VALUES(2,'keep-two'),(3,'keep-three');
+    INSERT INTO grouped_full_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO grouped_full_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT id, filter_value, left_value, right_value
+      FROM grouped_filter
+      JOIN (grouped_full_left FULL JOIN grouped_full_right USING(id)) USING(id)
+     ORDER BY id;
+}
+expect {
+    2|keep-two|left-two|right-two
+    3|keep-three||right-three
+}
+
+# This case comes from a command-line comparison with SQLite. SQLite keeps
+# each inner table name after it turns the join group into one derived table.
+@cross-check-integrity
+test parenthesized-full-join-keeps-qualified-source-columns {
+    CREATE TABLE nested_name_anchor(marker INTEGER);
+    CREATE TABLE nested_name_left(id INTEGER, left_value TEXT);
+    CREATE TABLE nested_name_right(id INTEGER, right_value TEXT);
+    INSERT INTO nested_name_anchor VALUES(1);
+    INSERT INTO nested_name_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO nested_name_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT id, nested_name_left.id, nested_name_right.id,
+           nested_name_left.*, nested_name_right.*
+      FROM nested_name_anchor
+      JOIN (nested_name_left FULL JOIN nested_name_right USING(id))
+     ORDER BY id;
+}
+expect {
+    1|1||1|left-one||
+    2|2|2|2|left-two|2|right-two
+    3||3|||3|right-three
+}
+
+# SQLite gives duplicate derived-table names a numeric suffix. It keeps the
+# suffixed columns available through the group alias but omits them from `*`.
+@cross-check-integrity
+test parenthesized-full-join-keeps-hidden-columns-under-group-alias {
+    CREATE TABLE nested_alias_anchor(marker INTEGER);
+    CREATE TABLE nested_alias_left(id INTEGER, left_value TEXT);
+    CREATE TABLE nested_alias_right(id INTEGER, right_value TEXT);
+    INSERT INTO nested_alias_anchor VALUES(1);
+    INSERT INTO nested_alias_left VALUES(2,'left-two');
+    INSERT INTO nested_alias_right VALUES(2,'right-two');
+
+    SELECT joined.id, joined."id:1", joined."id:2",
+           joined.left_value, joined.right_value
+      FROM nested_alias_anchor
+      JOIN (nested_alias_left FULL JOIN nested_alias_right USING(id)) AS joined;
+}
+expect {
+    2|2|2|left-two|right-two
+}
+
+# This case comes from a command-line comparison with SQLite. The implicit
+# rowid values remain available through each original table name.
+@cross-check-integrity
+test parenthesized-full-join-keeps-qualified-rowids {
+    CREATE TABLE nested_rowid_anchor(marker INTEGER);
+    CREATE TABLE nested_rowid_left(id INTEGER);
+    CREATE TABLE nested_rowid_right(id INTEGER);
+    INSERT INTO nested_rowid_anchor VALUES(1);
+    INSERT INTO nested_rowid_left VALUES(1),(2);
+    INSERT INTO nested_rowid_right VALUES(2),(3);
+
+    SELECT nested_rowid_left.rowid, nested_rowid_left._rowid_,
+           nested_rowid_right.oid
+      FROM nested_rowid_anchor
+      JOIN (nested_rowid_left FULL JOIN nested_rowid_right USING(id))
+     ORDER BY id;
+}
+expect {
+    1|1|
+    2|2|1
+    ||2
+}
+
 # The shared row body must run output subqueries again for unmatched right rows.
 # Otherwise, the result and sort key keep a value from the last matched row.
 @cross-check-integrity

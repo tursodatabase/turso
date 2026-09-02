@@ -8,10 +8,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{
-            as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
-            StorageClassMask,
-        },
+        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -1519,6 +1516,43 @@ pub fn resolve_unqualified_column(
         expr: merge_columns(expressions),
         source_columns,
     }))
+}
+
+/// Find one column by its unqualified name.
+///
+/// A parenthesized join can keep several source columns with the same name.
+/// Hidden source copies do not take part in an unqualified lookup. A visible
+/// column wins over an implicit rowid. Other duplicate names remain ambiguous.
+pub(super) fn find_unqualified_column(table: &Table, column_name: &str) -> Result<Option<usize>> {
+    let join_columns = match table {
+        Table::FromClauseSubquery(subquery) => subquery.parenthesized_join_columns.as_ref(),
+        _ => None,
+    };
+    let Some(join_columns) = join_columns else {
+        return Ok(table
+            .get_column_by_name(column_name)
+            .map(|(column_index, _)| column_index));
+    };
+
+    let mut column = None;
+    let mut rowid_column = None;
+    let mut rowid_is_ambiguous = false;
+    for (column_index, saved_column) in join_columns.iter().enumerate() {
+        if !saved_column.source.matches_column_name(column_name) {
+            continue;
+        }
+        if saved_column.source.is_rowid() {
+            rowid_is_ambiguous |= rowid_column.replace(column_index).is_some();
+        } else if saved_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
+            && column.replace(column_index).is_some()
+        {
+            crate::bail_parse_error!("ambiguous column name: {}", column_name);
+        }
+    }
+    if column.is_none() && rowid_is_ambiguous {
+        crate::bail_parse_error!("ambiguous column name: {}", column_name);
+    }
+    Ok(column.or(rowid_column))
 }
 
 /// Build SQLite's generated coalesce expression for a merged USING column.

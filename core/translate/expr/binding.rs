@@ -153,8 +153,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                     continue;
                                 }
                             }
-                            let col_idx =
-                                find_unqualified_column(&outer_ref.table, &normalized_id)?;
+                            let col_idx = crate::translate::plan::find_unqualified_column(
+                                &outer_ref.table,
+                                &normalized_id,
+                            )?;
                             if col_idx.is_some() {
                                 let col_idx = col_idx.unwrap();
                                 if outer_ref.using_dedup_hidden_cols.get(col_idx) {
@@ -569,46 +571,6 @@ pub fn bind_and_rewrite_expr<'a>(
         },
     )?;
     Ok(())
-}
-
-/// Find one column by its unqualified name.
-///
-/// A parenthesized join can keep several source columns with the same name.
-/// Hidden source copies do not take part in an unqualified lookup. A visible
-/// column wins over an implicit rowid. Other duplicate names remain ambiguous.
-pub(in crate::translate) fn find_unqualified_column(
-    table: &Table,
-    column_name: &str,
-) -> Result<Option<usize>> {
-    let join_columns = match table {
-        Table::FromClauseSubquery(subquery) => subquery.parenthesized_join_columns.as_ref(),
-        _ => None,
-    };
-    let Some(join_columns) = join_columns else {
-        return Ok(table
-            .get_column_by_name(column_name)
-            .map(|(column_index, _)| column_index));
-    };
-
-    let mut column = None;
-    let mut rowid_column = None;
-    let mut rowid_is_ambiguous = false;
-    for (column_index, saved_column) in join_columns.iter().enumerate() {
-        if !saved_column.source.matches_column_name(column_name) {
-            continue;
-        }
-        if saved_column.source.is_rowid() {
-            rowid_is_ambiguous |= rowid_column.replace(column_index).is_some();
-        } else if saved_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
-            && column.replace(column_index).is_some()
-        {
-            crate::bail_parse_error!("ambiguous column name: {}", column_name);
-        }
-    }
-    if column.is_none() && rowid_is_ambiguous {
-        crate::bail_parse_error!("ambiguous column name: {}", column_name);
-    }
-    Ok(column.or(rowid_column))
 }
 
 /// Search the current query first, then search the nearest outer query.
