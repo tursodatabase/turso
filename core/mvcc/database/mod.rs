@@ -464,9 +464,7 @@ impl PackedTs {
     fn unpack(self) -> Option<TxTimestampOrID> {
         // Both tags together is retired, not TxID: the TXID_TAG bit is set on
         // both, so this check must win.
-        if self.0 & Self::RETIRED_TAG == Self::RETIRED_TAG {
-            None
-        } else if self.0 == 0 {
+        if self.0 & Self::RETIRED_TAG == Self::RETIRED_TAG || self.0 == 0 {
             None
         } else if self.0 & Self::TXID_TAG != 0 {
             Some(TxTimestampOrID::TxID(self.0 & Self::VALUE_MASK))
