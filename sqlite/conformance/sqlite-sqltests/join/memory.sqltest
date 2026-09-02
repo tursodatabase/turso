@@ -195,6 +195,40 @@ test left-join-temp-index-does-not-use-later-on-term {
 expect {
 }
 
+# A materialized hash input can remove an inner join's right table from the
+# main loop. The ON terms must still run when the remaining table is read.
+@cross-check-integrity
+test materialized-hash-input-keeps-on-term-for-remaining-table {
+    CREATE TABLE materialized_hash_t1(a);
+    CREATE TABLE materialized_hash_t2(id INTEGER PRIMARY KEY, a, b);
+    CREATE TABLE materialized_hash_t3(id INTEGER PRIMARY KEY, b, c, d);
+    CREATE TABLE materialized_hash_t4(a, c, d);
+    INSERT INTO materialized_hash_t1 VALUES(-10);
+    INSERT INTO materialized_hash_t2 VALUES(10143, -10, 5);
+    INSERT INTO materialized_hash_t3 VALUES(20159, 5, NULL, 0);
+    INSERT INTO materialized_hash_t4 VALUES(1, 999, 999);
+
+    WITH cte_t4 AS (
+        SELECT * FROM materialized_hash_t4 WHERE a IS NOT NULL
+    )
+    SELECT materialized_hash_t1.a,
+           materialized_hash_t2.id,
+           materialized_hash_t3.id,
+           cte_t4.a
+    FROM materialized_hash_t1
+    JOIN materialized_hash_t2
+      ON materialized_hash_t1.a = materialized_hash_t2.a
+    JOIN materialized_hash_t3
+      ON materialized_hash_t2.b = materialized_hash_t3.b
+     AND materialized_hash_t2.b IS materialized_hash_t3.b
+    JOIN cte_t4
+      ON materialized_hash_t3.c = cte_t4.c
+     AND materialized_hash_t3.d = cte_t4.d
+    WHERE materialized_hash_t3.c IS NULL;
+}
+expect {
+}
+
 # regression test: ORDER BY cannot be satisfied by a deeper join loop when the
 # earlier loop can emit duplicate prefixes for the consumed order terms
 @cross-check-integrity
@@ -664,6 +698,26 @@ expect {
     100
     150
     200
+}
+
+# The first hash join removes its build table from the loop.
+# Its other ON term must run when the probe reads the hash payload.
+@cross-check-integrity
+test materialized-hash-join-keeps-inner-on-filter {
+    CREATE TABLE h_orders(order_id INTEGER PRIMARY KEY, name TEXT, amount INTEGER);
+    CREATE TABLE h_items(item_id INTEGER PRIMARY KEY, name TEXT, product TEXT, quantity INTEGER);
+    CREATE TABLE h_returns(return_id INTEGER PRIMARY KEY, name TEXT, reason TEXT);
+    INSERT INTO h_orders VALUES (1, 'a', 100), (2, 'b', 1);
+    INSERT INTO h_items VALUES (1, 'a', 'x', 50), (2, 'b', 'y', 2);
+    INSERT INTO h_returns VALUES (1, 'a', 'ra'), (2, 'b', 'rb');
+    SELECT h.order_id, i.product, r.reason
+    FROM h_orders AS h
+    JOIN h_items AS i ON h.name = i.name AND h.amount < i.quantity
+    JOIN h_returns AS r ON h.name = r.name
+    ORDER BY h.order_id;
+}
+expect {
+    2|y|rb
 }
 
 # Regression test for materialized hash joins dropping build-side LEFT JOIN ON predicates.
