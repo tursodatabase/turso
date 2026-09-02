@@ -35,7 +35,7 @@ use std::task::{Poll, Waker};
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
 /// But the hard limit of number of columns is 32,767 columns i16::MAX
-/// const MAX_COLUMN: usize = 2000;
+pub const MAX_COLUMN: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValueType {

@@ -1268,6 +1268,13 @@ pub fn translate_alter_table(
             let constraints = col_def.constraints.clone();
             let mut column = Column::try_from(&col_def)?;
 
+            if btree.columns().len() >= crate::types::MAX_COLUMN {
+                return Err(LimboError::ParseError(format!(
+                    "too many columns on {}",
+                    btree.name
+                )));
+            }
+
             let new_column_name = column.name.clone().ok_or_else(|| {
                 LimboError::ParseError(
                     "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
