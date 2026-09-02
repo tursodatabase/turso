@@ -8,6 +8,7 @@ namespace Turso;
 
 public class TursoConnection : DbConnection
 {
+    internal static Func<HttpMessageHandler?>? RemoteMessageHandlerFactory { get; set; }
     internal static Func<HttpClient?>? SyncHttpClientFactory { get; set; }
 
     private TursoDatabaseHandle? _turso;
@@ -28,6 +29,7 @@ public class TursoConnection : DbConnection
     private bool _closing;
     private bool _readUncommitted;
     private bool _remoteTransactionActive;
+    private System.Runtime.ExceptionServices.ExceptionDispatchInfo? _remoteTransactionFailure;
 
     [AllowNull]
     public override string ConnectionString
@@ -280,20 +282,33 @@ public class TursoConnection : DbConnection
         CancellationToken cancellationToken)
     {
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        ThrowIfRemoteTransactionFaulted();
         var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
-        try
+        for (var attempt = 0; ; attempt++)
         {
-            return await remoteClient.ExecuteAsync(sql, parameters, wantRows, commandTimeout, closeAfter, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (TursoRemoteSqlException)
-        {
-            throw;
-        }
-        catch
-        {
-            InvalidateRemoteSession();
-            throw;
+            try
+            {
+                return await remoteClient.ExecuteAsync(sql, parameters, wantRows, commandTimeout, closeAfter, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (TursoRemoteSqlException exception) when (
+                !_remoteTransactionActive && attempt == 0 && exception.IsStreamExpired)
+            {
+                remoteClient.ResetSession();
+            }
+            catch (TursoRemoteSqlException exception)
+            {
+                if (_remoteTransactionActive && exception.IsStreamExpired)
+                    _remoteTransactionFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception);
+                else if (exception.IsStreamExpired)
+                    remoteClient.ResetSession();
+                throw;
+            }
+            catch
+            {
+                InvalidateRemoteSession();
+                throw;
+            }
         }
     }
 
@@ -304,6 +319,7 @@ public class TursoConnection : DbConnection
         CancellationToken cancellationToken)
     {
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        ThrowIfRemoteTransactionFaulted();
         var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
         try
         {
@@ -328,24 +344,34 @@ public class TursoConnection : DbConnection
         }
     }
 
-    internal void BeginRemoteTransaction(IsolationLevel isolationLevel)
+    internal void BeginRemoteTransaction(IsolationLevel isolationLevel, bool deferred = true)
     {
-        _ = isolationLevel;
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
         if (_remoteTransactionActive)
             throw new InvalidOperationException("A transaction is already active on this connection.");
 
+        _remoteTransactionFailure = null;
         _remoteTransactionActive = true;
         try
         {
             remoteClient
-                .ExecuteAsync("BEGIN", new TursoParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
+                .ExecuteAsync(
+                    isolationLevel == IsolationLevel.Serializable && !deferred
+                        ? "BEGIN IMMEDIATE"
+                        : "BEGIN",
+                    new TursoParameterCollection(),
+                    wantRows: false,
+                    DefaultTimeout,
+                    closeAfter: false,
+                    CancellationToken.None)
                 .GetAwaiter()
                 .GetResult();
         }
-        catch (TursoRemoteSqlException)
+        catch (TursoRemoteSqlException exception)
         {
             _remoteTransactionActive = false;
+            if (exception.IsStreamExpired)
+                remoteClient.ResetSession();
             throw;
         }
         catch
@@ -360,6 +386,7 @@ public class TursoConnection : DbConnection
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
         if (!_remoteTransactionActive)
             throw new InvalidOperationException("No remote transaction is active on this connection.");
+        ThrowIfRemoteTransactionFaulted();
 
         try
         {
@@ -368,8 +395,10 @@ public class TursoConnection : DbConnection
                 .GetAwaiter()
                 .GetResult();
         }
-        catch (TursoRemoteSqlException)
+        catch (TursoRemoteSqlException exception)
         {
+            if (exception.IsStreamExpired)
+                _remoteTransactionFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception);
             throw;
         }
         catch
@@ -386,6 +415,7 @@ public class TursoConnection : DbConnection
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
         if (!_remoteTransactionActive)
             throw new InvalidOperationException("No remote transaction is active on this connection.");
+        ThrowIfRemoteTransactionFaulted();
 
         try
         {
@@ -400,6 +430,15 @@ public class TursoConnection : DbConnection
             InvalidateRemoteSession();
             throw;
         }
+    }
+
+    internal bool RemoteTransactionFaulted => _remoteTransactionFailure is not null;
+
+    internal void CompleteFaultedRemoteTransaction()
+    {
+        _remoteClient?.ResetSession();
+        _remoteTransactionActive = false;
+        _remoteTransactionFailure = null;
     }
 
     internal void CloseRemoteSessionIfStateless()
@@ -433,7 +472,14 @@ public class TursoConnection : DbConnection
         if (_connectionOptions.GetEncryptionCipher().HasValue || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
             throw new InvalidOperationException("Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
 
-        _remoteClient = new TursoRemoteClient(_connectionOptions.GetRemoteUri(), _connectionOptions.AuthToken);
+        var handler = RemoteMessageHandlerFactory?.Invoke();
+        _remoteClient = handler is null
+            ? new TursoRemoteClient(_connectionOptions.GetRemoteUri(), _connectionOptions.AuthToken)
+            : new TursoRemoteClient(
+                new HttpClient(handler),
+                _connectionOptions.GetRemoteUri(),
+                _connectionOptions.AuthToken,
+                disposeHttpClient: true);
     }
 
     private void OpenReplica()
@@ -618,10 +664,13 @@ public class TursoConnection : DbConnection
         {
             if (_remoteTransactionActive)
             {
-                remoteClient
-                    .ExecuteAsync("ROLLBACK", new TursoParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: true, CancellationToken.None)
-                    .GetAwaiter()
-                    .GetResult();
+                if (_remoteTransactionFailure is null)
+                {
+                    remoteClient
+                        .ExecuteAsync("ROLLBACK", new TursoParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: true, CancellationToken.None)
+                        .GetAwaiter()
+                        .GetResult();
+                }
             }
             else
             {
@@ -637,6 +686,7 @@ public class TursoConnection : DbConnection
             remoteClient.Dispose();
             _remoteClient = null;
             _remoteTransactionActive = false;
+            _remoteTransactionFailure = null;
             _readUncommitted = false;
         }
 
@@ -649,6 +699,7 @@ public class TursoConnection : DbConnection
         _remoteClient?.Dispose();
         _remoteClient = null;
         _remoteTransactionActive = false;
+        _remoteTransactionFailure = null;
         _readUncommitted = false;
     }
 
@@ -760,6 +811,11 @@ public class TursoConnection : DbConnection
 
         foreach (var reader in readers)
             reader.Dispose();
+    }
+
+    private void ThrowIfRemoteTransactionFaulted()
+    {
+        _remoteTransactionFailure?.Throw();
     }
 
     private sealed record AutomaticSyncNotification(
