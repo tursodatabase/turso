@@ -231,6 +231,45 @@ impl JoinOrigin {
     }
 }
 
+/// The SQL source that supplied a term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhereTermOrigin {
+    /// A term from a WHERE clause.
+    Where,
+    /// A term from an ON or USING clause.
+    ///
+    /// An outer-join term must run in its right-table loop, even when it reads
+    /// only left tables. An earlier check can remove a required NULL row.
+    Join(JoinOrigin),
+    /// A hidden-column constraint made from a table-function argument.
+    ///
+    /// This term also has a join origin. The separate variant lets the
+    /// unmatched-right read rebuild the argument instead of treating it as an ON term.
+    TableFunction(JoinOrigin),
+}
+
+impl WhereTermOrigin {
+    /// Get the join origin when the term belongs to a join source.
+    pub fn join_origin(self) -> Option<JoinOrigin> {
+        match self {
+            Self::Where => None,
+            Self::Join(origin) | Self::TableFunction(origin) => Some(origin),
+        }
+    }
+
+    pub fn is_outer_join(self) -> bool {
+        self.join_origin().is_some_and(JoinOrigin::is_outer)
+    }
+
+    /// Get the table for a table-function argument.
+    pub fn table_function_table(self) -> Option<TableInternalId> {
+        match self {
+            Self::TableFunction(origin) => Some(origin.right_table()),
+            Self::Where | Self::Join(_) => None,
+        }
+    }
+}
+
 /// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.
 /// This is done so that we can evaluate the conditions at the correct loop depth.
 /// We also need to keep track of whether the condition came from an OUTER JOIN. Take this example:
@@ -241,13 +280,8 @@ impl JoinOrigin {
 pub struct WhereTerm {
     /// The original condition expression.
     pub expr: ast::Expr,
-    /// The JOIN that supplied this term.
-    ///
-    /// An outer JOIN term must run in the right-table loop, even if it reads only left tables.
-    /// Otherwise, the JOIN can lose rows that need a NULL right side.
-    ///
-    /// This is None for a WHERE term.
-    pub from_join: Option<JoinOrigin>,
+    /// The clause or table function that supplied this term.
+    pub origin: WhereTermOrigin,
     /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
     /// in the normal place where WHERE terms are evaluated.
     /// A term may have been consumed e.g. if:
@@ -302,7 +336,7 @@ impl From<Expr> for WhereTerm {
     fn from(value: Expr) -> Self {
         Self {
             expr: value,
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }
     }
@@ -1678,6 +1712,18 @@ pub fn merge_columns<'a>(
     }
 }
 
+/// The separate read that finds the unmatched right rows of a RIGHT or FULL JOIN.
+#[derive(Debug, Clone)]
+pub struct UnmatchedRightRowsPlan {
+    /// The operation that reads the right source.
+    pub operation: Operation,
+    /// Subqueries used by `conditions`, planned again for this one-table read.
+    pub subqueries: Vec<NonFromClauseSubquery>,
+    /// WHERE conditions to check for each unmatched right row.
+    /// Outer-join terms are not included.
+    pub conditions: Vec<Expr>,
+}
+
 /// A joined table in the query plan.
 /// For example,
 /// ```sql
@@ -1692,6 +1738,9 @@ pub fn merge_columns<'a>(
 pub struct JoinedTable {
     /// The operation that this table reference performs.
     pub op: Operation,
+    /// How a RIGHT or FULL JOIN reads unmatched right rows after the main join loop.
+    /// SQLite plans this read separately from the main loop. `None` means a default scan.
+    pub unmatched_right_rows_plan: Option<UnmatchedRightRowsPlan>,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1913,6 +1962,19 @@ impl TableReferences {
         any_right_or_full_join(&self.joined_tables[pos + 1..])
     }
 
+    /// Whether this table's index cursor can be on a null row while its
+    /// expressions are read. That happens when an outer join null-extends the
+    /// table (SQLite's JT_LEFT and JT_LTORJ), and during the unmatched-row pass
+    /// of a RIGHT or FULL JOIN, which reads the table through a separate cursor
+    /// (SQLite's JT_RIGHT).
+    pub fn index_cursor_may_be_null_row(&self, table: TableInternalId) -> bool {
+        self.outer_join_may_null_extend(table)
+            || self
+                .find_joined_table_by_internal_id(table)
+                .and_then(|joined_table| joined_table.join_info.as_ref())
+                .is_some_and(JoinInfo::keeps_right_rows)
+    }
+
     /// Whether the FROM list has a RIGHT JOIN or FULL JOIN.
     pub fn has_right_or_full_join(&self) -> bool {
         any_right_or_full_join(&self.joined_tables)
@@ -1968,7 +2030,7 @@ impl TableReferences {
             return;
         };
         let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
-        let may_be_null_row = self.outer_join_may_null_extend(table_id);
+        let may_be_null_row = self.index_cursor_may_be_null_row(table_id);
         if let Some(table_ref_mut) = self
             .joined_tables_mut()
             .iter_mut()
@@ -3098,6 +3160,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
             table,
             identifier,
             internal_id,
@@ -3146,6 +3209,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
             table,
             identifier,
             internal_id,
@@ -3179,6 +3243,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
             table,
             identifier,
             internal_id,

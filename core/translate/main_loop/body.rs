@@ -598,13 +598,11 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         probe_join_index,
     )?;
     let mut conditions = Vec::new();
-    for (condition_idx, condition) in
-        plan.where_clause
-            .iter()
-            .enumerate()
-            .filter(|(_, condition)| {
-                !condition.consumed && !condition.from_join.is_some_and(JoinOrigin::is_outer)
-            })
+    for (condition_idx, condition) in plan
+        .where_clause
+        .iter()
+        .enumerate()
+        .filter(|(_, condition)| !condition.consumed && !condition.origin.is_outer_join())
     {
         if prefiltered_terms.contains(&condition_idx) {
             continue;

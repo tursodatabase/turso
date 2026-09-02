@@ -434,6 +434,7 @@ pub(super) fn choose_best_btree_candidate(
             .filter(|(i, c)| {
                 !consumed.contains(i)
                     && c.usable
+                    && c.outer_join_compatible
                     && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
                     && matches!(
                         c.operator,
@@ -583,7 +584,10 @@ pub(super) fn choose_best_in_seek_candidate(
             else {
                 continue;
             };
-            if not || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
+            if not
+                || !constraint.outer_join_compatible
+                || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+            {
                 continue;
             }
 
@@ -593,7 +597,9 @@ pub(super) fn choose_best_in_seek_candidate(
             // (#8753). ON-clause terms only define what a match is, so they
             // can still drive the seek.
             let term = &where_clause[constraint.where_clause_pos.0];
-            if may_null_extend && term.from_join != Some(JoinOrigin::Outer(rhs_table.internal_id)) {
+            if may_null_extend
+                && term.origin.join_origin() != Some(JoinOrigin::Outer(rhs_table.internal_id))
+            {
                 continue;
             }
 
@@ -779,6 +785,7 @@ pub fn find_best_access_method_for_join_order(
             lhs_mask,
             join_order,
             planning_context.maybe_order_target,
+            planning_context.allow_automatic_index,
             where_clause,
             ready_where,
             available_indexes,
@@ -836,6 +843,7 @@ fn find_best_access_method_for_btree(
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
+    allow_automatic_index: bool,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -945,6 +953,7 @@ fn find_best_access_method_for_btree(
         && uses_full_table_scan
         && !lhs_mask.is_empty()
         && !keeps_right_rows
+        && allow_automatic_index
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
             &rhs_constraints.constraints,
@@ -1366,10 +1375,8 @@ pub fn try_hash_join_access_method(
             // A LEFT JOIN can use only its own ON terms to decide which rows matched.
             // An anti-join gets its match terms from the NOT EXISTS subquery.
             matches!(hash_join_type, HashJoinType::Inner | HashJoinType::LeftAnti)
-                || matches!(
-                    where_clause[*where_idx].from_join,
-                    Some(JoinOrigin::Outer(table)) if table == probe_table.internal_id
-                )
+                || where_clause[*where_idx].origin.join_origin()
+                    == Some(JoinOrigin::Outer(probe_table.internal_id))
         }),
     );
     tracing::debug!(

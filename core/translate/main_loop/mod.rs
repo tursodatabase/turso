@@ -1,4 +1,4 @@
-use turso_parser::ast::{Expr, SortOrder, TableInternalId};
+use turso_parser::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -8,17 +8,18 @@ use super::{
     },
     expr::{
         expr_references_outer_query, expr_references_subquery_id, translate_condition_expr,
-        translate_expr, translate_expr_no_constant_opt, walk_expr, ConditionMetadata,
-        NoConstantOptReason, WalkControl,
+        translate_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
+        ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::{constraints::BinaryExprSide, Optimizable},
     order_by::sorter_insert,
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, InSeekSource,
-        IterationDirection, JoinOrderMember, JoinOrigin, JoinedTable, MultiIndexScanOp,
+        IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranchAccess, MultiIndexScanOp,
         NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef, SeekKey,
-        SeekKeyComponent, SelectPlan, SetOperation, TableReferences, WhereTerm,
+        SeekKeyComponent, SelectPlan, SetOperation, SubqueryEvalPhase, SubqueryState,
+        TableReferences, UnmatchedRightRowsPlan, WhereTerm,
     },
 };
 use crate::{
@@ -60,7 +61,7 @@ use body::emit_unmatched_row_conditions_and_loop;
 pub(crate) use body::LoopBodyEmitter;
 pub(crate) use close::CloseLoop;
 use close::{emit_autoindex, AutoIndexResult};
-use in_seek::open_in_seek_source_cursor;
+use in_seek::{emit_in_seek_end, emit_in_seek_start, open_in_seek_source_cursor};
 pub(crate) use init::{init_distinct, InitLoop};
 use multi_index::emit_multi_index_scan_loop;
 pub(crate) use open::OpenLoop;

@@ -1,7 +1,5 @@
 use super::*;
-use crate::translate::{
-    plan::IndexMethodQuery, subquery::emit_non_from_clause_subqueries_for_eval_at,
-};
+use crate::translate::{plan::IndexMethodQuery, subquery::emit_non_from_clause_subquery};
 
 fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
     subqueries
@@ -9,17 +7,10 @@ fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquer
         .any(|s| expr_references_subquery_id(expr, s.internal_id))
 }
 
-fn subquery_referenced_in_predicates(
-    predicates: &[WhereTerm],
-    outer_join_terms: bool,
-    subquery_id: TableInternalId,
-) -> bool {
-    predicates
-        .iter()
-        .filter(|cond| cond.from_join.is_some_and(JoinOrigin::is_outer) == outer_join_terms)
-        .any(|cond| expr_references_subquery_id(&cond.expr, subquery_id))
-}
-
+/// Emit correlated subqueries at the loop that checks their conditions.
+///
+/// A RIGHT JOIN can move a WHERE condition past the subquery's first possible
+/// loop. The subquery must move with the condition so its input cursors are valid.
 #[allow(clippy::too_many_arguments)]
 fn emit_correlated_subqueries(
     program: &mut ProgramBuilder,
@@ -29,21 +20,61 @@ fn emit_correlated_subqueries(
     join_index: usize,
     predicates: &[WhereTerm],
     subqueries: &mut [NonFromClauseSubquery],
-    on_only: bool,
+    from_outer_join: bool,
 ) -> Result<()> {
-    emit_non_from_clause_subqueries_for_eval_at(
-        program,
-        resolver,
-        subqueries,
-        join_order,
-        Some(table_references),
-        EvalAt::Loop(join_index),
-        |subquery| {
-            subquery.correlated
-                && (!on_only
-                    || subquery_referenced_in_predicates(predicates, true, subquery.internal_id))
-        },
-    )
+    let mut subqueries_to_emit = Vec::new();
+    for (subquery_index, subquery) in subqueries.iter().enumerate() {
+        if subquery.has_been_evaluated()
+            || !subquery.correlated
+            || !matches!(subquery.eval_phase, SubqueryEvalPhase::BeforeLoop)
+        {
+            continue;
+        }
+
+        let mut conditions = predicates
+            .iter()
+            .filter(|condition| {
+                !condition.consumed
+                    && condition.origin.is_outer_join() == from_outer_join
+                    && expr_references_subquery_id(&condition.expr, subquery.internal_id)
+            })
+            .peekable();
+        if conditions.peek().is_some() {
+            if conditions.any(|condition| {
+                condition.should_eval_at_loop(
+                    join_index,
+                    join_order,
+                    subqueries,
+                    Some(table_references),
+                )
+            }) {
+                subqueries_to_emit.push(subquery_index);
+            }
+            continue;
+        }
+
+        // The non-outer pass also emits correlated subqueries used outside
+        // predicates, such as a subquery in the result list.
+        if !from_outer_join
+            && subquery.get_eval_at(join_order, Some(table_references))? == EvalAt::Loop(join_index)
+        {
+            subqueries_to_emit.push(subquery_index);
+        }
+    }
+
+    for subquery_index in subqueries_to_emit {
+        let subquery = &mut subqueries[subquery_index];
+        let subquery_plan = subquery.consume_plan(EvalAt::Loop(join_index));
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            true,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,7 +109,7 @@ fn emit_conditions(
         .enumerate()
         .filter(|(cond_idx, _)| !prefiltered_terms.contains(cond_idx))
         .map(|(_, cond)| cond)
-        .filter(|cond| cond.from_join.is_some_and(JoinOrigin::is_outer) == from_outer_join)
+        .filter(|cond| cond.origin.is_outer_join() == from_outer_join)
         .filter(|cond| {
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
         })

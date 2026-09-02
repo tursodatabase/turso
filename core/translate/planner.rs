@@ -9,6 +9,7 @@ use super::{
         ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo, JoinOrderMember,
         JoinOrigin, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference, Plan,
         QueryDestination, ResolvedColumn, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        WhereTermOrigin,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -2108,6 +2109,7 @@ fn parse_table(
                 };
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_table),
+                    unmatched_right_rows_plan: None,
                     table: outer_table,
                     identifier: alias.unwrap_or(normalized_qualified_name),
                     internal_id,
@@ -2145,6 +2147,7 @@ fn parse_table(
         };
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
+            unmatched_right_rows_plan: None,
             table: tbl_ref,
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id,
@@ -2248,6 +2251,7 @@ fn parse_table(
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             table: Table::BTree(btree_table),
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id: program.table_reference_counter.next(),
@@ -2273,6 +2277,7 @@ fn parse_table(
             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_ref.table),
+                    unmatched_right_rows_plan: None,
                     table: outer_ref.table.clone(),
                     identifier: outer_ref.identifier.clone(),
                     internal_id: program.table_reference_counter.next(),
@@ -2541,9 +2546,9 @@ pub fn parse_where(
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
                 break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
-                // Preserve the JOIN source from the original term.
+                // Preserve the source from the original term.
                 for new_term in new_terms.iter_mut() {
-                    new_term.from_join = term.from_join;
+                    new_term.origin = term.origin;
                 }
                 let count = new_terms.len();
                 for (j, new_term) in new_terms.into_iter().enumerate() {
@@ -2624,19 +2629,24 @@ pub fn determine_where_to_eval_term(
 ) -> Result<EvalAt> {
     let mut eval_at =
         determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)?;
-    if let Some(table_id) = term.from_join.map(JoinOrigin::right_table) {
-        let join_loop = join_order
-            .iter()
-            .position(|table| table.table_id == table_id)
-            .unwrap_or(usize::MAX);
-        eval_at = eval_at.max(EvalAt::Loop(join_loop));
+    if let Some(origin) = term.origin.join_origin() {
+        // A materialized hash input can remove an inner join's right table.
+        // The ON term then runs when all of its remaining tables are ready.
+        if let Some(join_loop) =
+            loop_index_for_table_row(origin.right_table(), join_order, table_references)
+        {
+            eval_at = eval_at.max(EvalAt::Loop(join_loop));
+        } else if origin.is_outer() {
+            // If the outer join's right table is absent, do not schedule its ON term in this plan.
+            eval_at = eval_at.max(EvalAt::Loop(usize::MAX));
+        }
     }
     let Some(table_references) = table_references else {
         return Ok(eval_at);
     };
     let referenced_tables = table_mask_from_expr(&term.expr, table_references, subqueries)?;
 
-    if term.from_join.is_none() {
+    if term.origin.join_origin().is_none() {
         // A WHERE condition that reads a table to the left of a RIGHT JOIN must
         // run in that join's row body. The unmatched scan enters the same body
         // with every table on the left set to NULL.
@@ -2785,23 +2795,8 @@ pub fn determine_where_to_eval_expr(
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) else {
-                    // Table not found in join_order. Check if it's a hash join build table.
-                    // If so, we need to evaluate the condition at the probe table's loop position.
-                    if let Some(tables) = table_references {
-                        for (probe_idx, member) in join_order.iter().enumerate() {
-                            let probe_table = &tables.joined_tables()[member.original_idx];
-                            if let Operation::HashJoin(ref hj) = probe_table.op {
-                                let build_table = &tables.joined_tables()[hj.build_table_idx];
-                                if build_table.internal_id == *table {
-                                    // This table is the build side of a hash join.
-                                    // Evaluate the condition at the probe table's loop position.
-                                    eval_at = eval_at.max(EvalAt::Loop(probe_idx));
-                                    return Ok(WalkControl::Continue);
-                                }
-                            }
-                        }
-                    }
+                let Some(join_idx) = loop_index_for_table_row(*table, join_order, table_references)
+                else {
                     // Must be an outer query reference; in that case, the table is already in scope.
                     return Ok(WalkControl::Continue);
                 };
@@ -2830,6 +2825,29 @@ pub fn determine_where_to_eval_expr(
     })?;
 
     Ok(eval_at)
+}
+
+/// Find the loop that makes a table row available.
+///
+/// A hash-build table has no loop. Its row becomes available when the probe reads the hash payload.
+fn loop_index_for_table_row(
+    table_id: TableInternalId,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Option<usize> {
+    join_order
+        .iter()
+        .position(|table| table.table_id == table_id)
+        .or_else(|| {
+            let tables = table_references?;
+            join_order.iter().position(|member| {
+                let probe_table = &tables.joined_tables()[member.original_idx];
+                let Operation::HashJoin(hash_join) = &probe_table.op else {
+                    return false;
+                };
+                tables.joined_tables()[hash_join.build_table_idx].internal_id == table_id
+            })
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2928,7 +2946,7 @@ fn parse_join(
                 let start_idx = out_where_clause.len();
                 break_predicate_at_and_boundaries(expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
-                    predicate.from_join = Some(join_origin);
+                    predicate.origin = WhereTermOrigin::Join(join_origin);
                     bind_and_rewrite_expr(
                         &mut predicate.expr,
                         Some(table_references),
@@ -2994,7 +3012,7 @@ fn parse_join(
                     right_table.mark_column_used(right_col_idx);
                     out_where_clause.push(WhereTerm {
                         expr,
-                        from_join: Some(join_origin),
+                        origin: WhereTermOrigin::Join(join_origin),
                         consumed: false,
                     });
                 }
@@ -3072,36 +3090,40 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
             BindingBehavior::TryCanonicalColumnsFirst,
         )?;
 
-        // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
-        // must be associated with the virtual table's outer join context if the table is
-        // the RHS of an outer join. Otherwise the optimizer may incorrectly simplify the
-        // join into an INNER JOIN, breaking NULL row emission for unmatched rows.
-        let from_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
-            table_references
-                .find_joined_table_by_internal_id(table_id)
-                .and_then(|table_ref| {
-                    table_ref.join_info.as_ref().and_then(|join_info| {
-                        join_info.is_outer().then_some(JoinOrigin::Outer(table_id))
-                    })
-                })
-        });
+        // SQLite treats a table-function argument as an ON term for that table.
+        // This keeps the term with the table when a later RIGHT JOIN adds NULL rows.
+        let table_function = vtab_predicate_table_id(&expr)
+            .expect("a table-function argument must constrain its hidden column");
+        let table_reference = table_references
+            .find_joined_table_by_internal_id(table_function)
+            .expect("a table-function argument must have a table reference");
+        let join = JoinOrigin::new(
+            table_function,
+            table_reference
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::is_outer),
+        );
         out_where_clause.push(WhereTerm {
             expr,
-            from_join,
+            origin: WhereTermOrigin::TableFunction(join),
             consumed: false,
         });
     }
     Ok(())
 }
 
-/// Extract the table internal_id from a virtual table argument predicate.
-/// These are always of the form `Column { table, .. } = literal` or `IsNull(Column { table, .. })`.
+/// Get the source table from `hidden_column = +(argument)`.
 fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
     match expr {
-        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
-            Expr::Column { table, .. } => Some(*table),
-            _ => None,
-        },
+        Expr::Binary(lhs, ast::Operator::Equals, rhs)
+            if matches!(rhs.as_ref(), Expr::Unary(ast::UnaryOperator::Positive, _)) =>
+        {
+            match lhs.as_ref() {
+                Expr::Column { table, .. } => Some(*table),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

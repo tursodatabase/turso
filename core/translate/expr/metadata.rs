@@ -288,18 +288,12 @@ pub(super) fn try_emit_expression_index_value(
     {
         return Ok(false);
     }
-    // The first unmatched-right implementation reuses the selected index
-    // cursor. Compute the expression from the live table cursor instead.
-    // A later slice gives this scan its own index cursor and removes this rule.
-    if table.requires_table_cursor_for_unmatched_rows() {
-        return Ok(false);
-    }
     let Some(index_cursor) =
         program.resolve_cursor_id_safe(&CursorKey::index(table.internal_id, index.clone()))
     else {
         return Ok(false);
     };
-    if !referenced_tables.outer_join_may_null_extend(table.internal_id) {
+    if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
         return Ok(true);
     }
