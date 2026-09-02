@@ -951,6 +951,238 @@ expect {
     NULL|NULL|NULL|7
 }
 
+# SQLite opens and filters the right-side virtual table again after the main
+# loop. The rowid set keeps both equal virtual rows as separate matches.
+test right-join-restarts-table-function-on-right {
+    CREATE TABLE virtual_left(value INTEGER);
+    INSERT INTO virtual_left VALUES(1),(3);
+    SELECT virtual_left.value, virtual_right.key, virtual_right.value
+      FROM virtual_left
+      RIGHT JOIN json_each('[1,1,2]') AS virtual_right
+        ON virtual_left.value=virtual_right.value
+     ORDER BY virtual_right.key;
+}
+expect {
+    1|0|1
+    1|1|1
+    |2|2
+}
+
+# The unmatched-right read must start even when the main loop reads no left row.
+test right-join-table-function-with-empty-left-source {
+    CREATE TABLE virtual_empty_left(value INTEGER);
+    SELECT virtual_empty_left.value, virtual_empty_right.key,
+           virtual_empty_right.value
+      FROM virtual_empty_left
+      RIGHT JOIN json_each('[4,5]') AS virtual_empty_right
+        ON virtual_empty_left.value=virtual_empty_right.value
+     ORDER BY virtual_empty_right.key;
+}
+expect {
+    |0|4
+    |1|5
+}
+
+# A FULL JOIN keeps the unmatched ordinary row and the unmatched virtual row.
+test full-join-restarts-table-function-on-right {
+    CREATE TABLE virtual_full_left(value INTEGER);
+    INSERT INTO virtual_full_left VALUES(1),(3);
+    SELECT virtual_full_left.value, virtual_full_right.value
+      FROM virtual_full_left
+      FULL JOIN json_each('[1,2]') AS virtual_full_right
+        ON virtual_full_left.value=virtual_full_right.value
+     ORDER BY coalesce(virtual_full_left.value, virtual_full_right.value);
+}
+expect {
+    1|1
+    |2
+    3|
+}
+
+# The second virtual-table read must use the hidden constraint made from the
+# table-function argument. An unconstrained pragma table has no useful input.
+test right-join-rebuilds-table-function-argument {
+    CREATE TABLE virtual_target(first, second);
+    CREATE TABLE virtual_pragma_left(value INTEGER);
+    INSERT INTO virtual_pragma_left VALUES(0),(9);
+    SELECT virtual_pragma_left.value, virtual_pragma_right.cid,
+           virtual_pragma_right.name
+      FROM virtual_pragma_left
+      RIGHT JOIN pragma_table_info('virtual_target') AS virtual_pragma_right
+        ON virtual_pragma_left.value=virtual_pragma_right.cid
+     ORDER BY virtual_pragma_right.cid;
+}
+expect {
+    0|0|first
+    |1|second
+}
+
+# The second read rebuilds the table-function argument, but it does not reuse
+# a hidden-column constraint from the ON clause.
+test right-join-does-not-rebuild-on-term-as-table-function-argument {
+    CREATE TABLE virtual_hidden_on_left(value INTEGER);
+    INSERT INTO virtual_hidden_on_left VALUES(1);
+    SELECT virtual_hidden_on_left.value, virtual_hidden_on_right.value
+      FROM virtual_hidden_on_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_hidden_on_right
+        ON virtual_hidden_on_right.json='[9]'
+     ORDER BY virtual_hidden_on_right.value;
+}
+expect {
+    |1
+    |2
+}
+
+# The table-function argument and the WHERE term constrain the same hidden
+# column. The WHERE term must not replace the argument in the unmatched read.
+test right-join-keeps-table-function-argument-before-hidden-column-where-term {
+    CREATE TABLE virtual_hidden_where_left(value INTEGER);
+    INSERT INTO virtual_hidden_where_left VALUES(1);
+    SELECT virtual_hidden_where_left.value, virtual_hidden_where_right.value
+      FROM virtual_hidden_where_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_hidden_where_right ON true
+     WHERE virtual_hidden_where_right.json='[9]'
+     ORDER BY virtual_hidden_where_right.value;
+}
+expect {
+}
+
+# SQLite adds the table-function argument after the WHERE term. json_each uses
+# that last hidden-column constraint as its input, so invalid WHERE text is not parsed.
+test right-join-passes-the-declared-argument-to-the-table-function {
+    CREATE TABLE virtual_argument_order_left(value INTEGER);
+    SELECT virtual_argument_order_right.value
+      FROM virtual_argument_order_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_argument_order_right ON true
+     WHERE virtual_argument_order_right.json='not-json';
+}
+expect {
+}
+
+# A COLLATE clause can block a B-tree seek, but it must not hide a table-function
+# argument from xBestIndex. The two rules use separate planner fields.
+test right-join-passes-a-collated-table-function-argument-to-xbestindex {
+    CREATE TABLE virtual_collated_argument_left(value INTEGER);
+    SELECT virtual_collated_argument_right.value
+      FROM virtual_collated_argument_left
+      RIGHT JOIN json_each('[1,2]' COLLATE NOCASE)
+                   AS virtual_collated_argument_right ON true
+     ORDER BY virtual_collated_argument_right.value;
+}
+expect {
+    1
+    2
+}
+
+# A later RIGHT JOIN can replace this virtual source with NULLs. Its WHERE
+# term must remain outside xBestIndex so the NULL row is checked too.
+test right-join-keeps-where-term-on-an-earlier-virtual-source {
+    CREATE TABLE virtual_later_right(value INTEGER);
+    INSERT INTO virtual_later_right VALUES(1);
+    SELECT quote(virtual_earlier_left.name), virtual_later_right.value
+      FROM pragma_table_info AS virtual_earlier_left
+      RIGHT JOIN virtual_later_right ON true
+     WHERE virtual_earlier_left.arg='no_such';
+}
+expect {
+}
+
+# SQLite passes NULL to xFilter as an ordinary table-function argument.
+# generate_series then returns no rows, including during the unmatched read.
+test right-join-passes-null-table-function-argument-to-xfilter {
+    CREATE TABLE virtual_null_argument_left(value INTEGER);
+    INSERT INTO virtual_null_argument_left VALUES(1);
+    SELECT virtual_null_argument_left.value, virtual_null_argument_right.value
+      FROM virtual_null_argument_left
+      RIGHT JOIN generate_series(NULL,3) AS virtual_null_argument_right
+        ON virtual_null_argument_left.value=virtual_null_argument_right.value;
+}
+expect {
+}
+
+# The main scan starts at 2, but the unmatched scan starts at 1. SQLite uses
+# each generated value as its rowid, so the second scan removes value 2.
+test right-join-keeps-generate-series-rowids-stable-when-arguments-change {
+    CREATE TABLE virtual_series_left(start INTEGER);
+    INSERT INTO virtual_series_left VALUES(2);
+    SELECT virtual_series_left.start, virtual_series_right.value
+      FROM virtual_series_left
+      RIGHT JOIN generate_series(coalesce(virtual_series_left.start,1),3)
+                   AS virtual_series_right
+        ON virtual_series_left.start=virtual_series_right.value
+     ORDER BY virtual_series_right.value, virtual_series_left.start;
+}
+expect {
+    |1
+    2|2
+    |3
+}
+
+# SQLite evaluates a table-function argument again after it sets the left
+# source to NULL. The second read is empty when the argument reads that source.
+test right-join-rebuilds-table-function-argument-from-left-source {
+    CREATE TABLE virtual_input(value INTEGER, json TEXT);
+    INSERT INTO virtual_input VALUES(1,'[1,2]');
+    SELECT virtual_input.value, virtual_correlated_right.value
+      FROM virtual_input
+      RIGHT JOIN json_each(virtual_input.json) AS virtual_correlated_right
+        ON virtual_input.value=virtual_correlated_right.value
+     ORDER BY virtual_correlated_right.value;
+}
+expect {
+    1|1
+}
+
+# SQLite compiles the scalar subquery again after the left source becomes NULL.
+# Reusing its main-loop result would incorrectly produce an unmatched value of 2.
+test right-join-rebuilds-subquery-in-table-function-argument {
+    CREATE TABLE virtual_subquery_left(value INTEGER, json TEXT);
+    INSERT INTO virtual_subquery_left VALUES(1,'[1,2]');
+    SELECT virtual_subquery_left.value, virtual_subquery_right.value
+      FROM virtual_subquery_left
+      RIGHT JOIN json_each((SELECT virtual_subquery_left.json))
+                 AS virtual_subquery_right
+        ON virtual_subquery_left.value=virtual_subquery_right.value
+     ORDER BY virtual_subquery_right.value;
+}
+expect {
+    1|1
+}
+
+# This is SQLite pragma4-7.3. Each VFilter starts rowids again from one.
+# RIGHT JOIN uses those rowids to compare the main and unmatched scans.
+test right-join-keeps-pragma-rowids-stable-between-scans {
+    CREATE TABLE virtual_pragma_t3(a TEXT, b TEXT);
+    CREATE TABLE virtual_pragma_t4(a TEXT, b TEXT, c TEXT);
+    SELECT pragma_t4_info.name, pragma_t3_info.name
+      FROM pragma_table_info('virtual_pragma_t4') AS pragma_t4_info
+      RIGHT JOIN pragma_table_info('virtual_pragma_t3') AS pragma_t3_info
+        ON pragma_t4_info.name=pragma_t3_info.name;
+}
+expect {
+    a|a
+    b|b
+}
+
+# SQLite reads unmatched right sources from left to right. The first extra
+# virtual-table read can match rows in the second RIGHT JOIN.
+test chained-virtual-right-joins-restart-in-source-order {
+    CREATE TABLE virtual_chain_left(value INTEGER);
+    INSERT INTO virtual_chain_left VALUES(1);
+    SELECT virtual_chain_left.value, virtual_chain_first.value,
+           virtual_chain_second.value
+      FROM virtual_chain_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_chain_first
+        ON virtual_chain_left.value=virtual_chain_first.value
+      RIGHT JOIN json_each('[2,3]') AS virtual_chain_second
+        ON virtual_chain_first.value=virtual_chain_second.value
+     ORDER BY virtual_chain_second.value;
+}
+expect {
+    |2|2
+    ||3
+}
+
 # SQLite does not use a virtual-table argument to reduce a later RIGHT JOIN.
 # The argument can use private NULL-matching rules inside the virtual table.
 test virtual-table-argument-does-not-remove-right-join-row-preservation {

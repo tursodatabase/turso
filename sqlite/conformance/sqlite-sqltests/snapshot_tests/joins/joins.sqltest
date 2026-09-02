@@ -965,6 +965,40 @@ snapshot right-join-plans-unmatched-rows-with-multi-index-or {
     WHERE right_multi_right.b=5 OR right_multi_right.c=7;
 }
 
+setup right_join_virtual_table_schema {
+    CREATE TABLE virtual_snapshot_left(value INTEGER);
+    INSERT INTO virtual_snapshot_left VALUES(1),(3);
+}
+
+# SQLite opens the virtual table again and applies its table-function argument
+# again before it checks the set of matched rowids.
+@setup right_join_virtual_table_schema
+snapshot right-join-restarts-virtual-table {
+    SELECT virtual_snapshot_left.value, virtual_snapshot_right.value
+      FROM virtual_snapshot_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_snapshot_right
+        ON virtual_snapshot_left.value=virtual_snapshot_right.value
+     ORDER BY virtual_snapshot_right.value;
+}
+
+setup right_join_virtual_subquery_schema {
+    CREATE TABLE virtual_subquery_snapshot_left(value INTEGER, json TEXT);
+    INSERT INTO virtual_subquery_snapshot_left VALUES(1,'[1,2]');
+}
+
+# SQLite compiles the table-function subquery again between NullRow and the
+# second VFilter. A stale main-loop result would scan the wrong virtual rows.
+@setup right_join_virtual_subquery_schema
+snapshot right-join-rebuilds-table-function-subquery {
+    SELECT virtual_subquery_snapshot_left.value,
+           virtual_subquery_snapshot_right.value
+      FROM virtual_subquery_snapshot_left
+      RIGHT JOIN json_each((SELECT virtual_subquery_snapshot_left.json))
+                   AS virtual_subquery_snapshot_right
+        ON virtual_subquery_snapshot_left.value=virtual_subquery_snapshot_right.value
+     ORDER BY virtual_subquery_snapshot_right.value;
+}
+
 setup full_using_schema {
     CREATE TABLE u1(id TEXT COLLATE NOCASE, a TEXT);
     CREATE TABLE u2(id TEXT, b TEXT);
