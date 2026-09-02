@@ -625,6 +625,26 @@ expect {
     200
 }
 
+# The first hash join removes its build table from the loop.
+# Its other ON term must run when the probe reads the hash payload.
+@cross-check-integrity
+test materialized-hash-join-keeps-inner-on-filter {
+    CREATE TABLE h_orders(order_id INTEGER PRIMARY KEY, name TEXT, amount INTEGER);
+    CREATE TABLE h_items(item_id INTEGER PRIMARY KEY, name TEXT, product TEXT, quantity INTEGER);
+    CREATE TABLE h_returns(return_id INTEGER PRIMARY KEY, name TEXT, reason TEXT);
+    INSERT INTO h_orders VALUES (1, 'a', 100), (2, 'b', 1);
+    INSERT INTO h_items VALUES (1, 'a', 'x', 50), (2, 'b', 'y', 2);
+    INSERT INTO h_returns VALUES (1, 'a', 'ra'), (2, 'b', 'rb');
+    SELECT h.order_id, i.product, r.reason
+    FROM h_orders AS h
+    JOIN h_items AS i ON h.name = i.name AND h.amount < i.quantity
+    JOIN h_returns AS r ON h.name = r.name
+    ORDER BY h.order_id;
+}
+expect {
+    2|y|rb
+}
+
 # Regression test for materialized hash joins dropping build-side LEFT JOIN ON predicates.
 @cross-check-integrity
 test left-hash-join-materialized-prefix-keeps-build-side-on-const {

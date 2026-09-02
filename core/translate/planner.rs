@@ -2635,10 +2635,8 @@ pub fn determine_where_to_eval_term(
     let mut eval_at =
         determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)?;
     if let Some(table_id) = term.from_join.map(JoinOrigin::right_table) {
-        let join_loop = join_order
-            .iter()
-            .position(|table| table.table_id == table_id)
-            .unwrap_or(usize::MAX);
+        let join_loop =
+            loop_index_for_table_row(table_id, join_order, table_references).unwrap_or(usize::MAX);
         eval_at = eval_at.max(EvalAt::Loop(join_loop));
     }
     let Some(table_references) = table_references else {
@@ -2795,23 +2793,8 @@ pub fn determine_where_to_eval_expr(
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) else {
-                    // Table not found in join_order. Check if it's a hash join build table.
-                    // If so, we need to evaluate the condition at the probe table's loop position.
-                    if let Some(tables) = table_references {
-                        for (probe_idx, member) in join_order.iter().enumerate() {
-                            let probe_table = &tables.joined_tables()[member.original_idx];
-                            if let Operation::HashJoin(ref hj) = probe_table.op {
-                                let build_table = &tables.joined_tables()[hj.build_table_idx];
-                                if build_table.internal_id == *table {
-                                    // This table is the build side of a hash join.
-                                    // Evaluate the condition at the probe table's loop position.
-                                    eval_at = eval_at.max(EvalAt::Loop(probe_idx));
-                                    return Ok(WalkControl::Continue);
-                                }
-                            }
-                        }
-                    }
+                let Some(join_idx) = loop_index_for_table_row(*table, join_order, table_references)
+                else {
                     // Must be an outer query reference; in that case, the table is already in scope.
                     return Ok(WalkControl::Continue);
                 };
@@ -2831,24 +2814,11 @@ pub fn determine_where_to_eval_expr(
                     SubqueryState::Unevaluated { plan } => {
                         let outer_ref_ids = plan.as_ref().unwrap().used_outer_query_ref_ids();
                         for outer_ref_id in &outer_ref_ids {
-                            let join_idx = join_order
-                                .iter()
-                                .position(|t| t.table_id == *outer_ref_id)
-                                .or_else(|| {
-                                    let tables = table_references?;
-                                    for (probe_idx, member) in join_order.iter().enumerate() {
-                                        let probe_table =
-                                            &tables.joined_tables()[member.original_idx];
-                                        if let Operation::HashJoin(ref hj) = probe_table.op {
-                                            let build_table =
-                                                &tables.joined_tables()[hj.build_table_idx];
-                                            if build_table.internal_id == *outer_ref_id {
-                                                return Some(probe_idx);
-                                            }
-                                        }
-                                    }
-                                    None
-                                });
+                            let join_idx = loop_index_for_table_row(
+                                *outer_ref_id,
+                                join_order,
+                                table_references,
+                            );
                             if let Some(join_idx) = join_idx {
                                 eval_at = eval_at.max(EvalAt::Loop(join_idx));
                             }
@@ -2863,6 +2833,29 @@ pub fn determine_where_to_eval_expr(
     })?;
 
     Ok(eval_at)
+}
+
+/// Find the loop that makes a table row available.
+///
+/// A hash-build table has no loop. Its row becomes available when the probe reads the hash payload.
+fn loop_index_for_table_row(
+    table_id: TableInternalId,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Option<usize> {
+    join_order
+        .iter()
+        .position(|table| table.table_id == table_id)
+        .or_else(|| {
+            let tables = table_references?;
+            join_order.iter().position(|member| {
+                let probe_table = &tables.joined_tables()[member.original_idx];
+                let Operation::HashJoin(hash_join) = &probe_table.op else {
+                    return false;
+                };
+                tables.joined_tables()[hash_join.build_table_idx].internal_id == table_id
+            })
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
