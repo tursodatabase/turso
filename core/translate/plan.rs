@@ -1366,16 +1366,10 @@ pub fn resolve_unqualified_column(
     let mut source_columns = SmallVec::new();
 
     for table in tables {
-        let Some((column_index, column)) =
-            table.columns().iter().enumerate().find(|(_, column)| {
-                column
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
-            })
-        else {
+        let Some(column_index) = find_unqualified_column(&table.table, column_name)? else {
             continue;
         };
+        let column = &table.columns()[column_index];
         let column_expr = Expr::Column {
             database: None,
             table: table.internal_id,

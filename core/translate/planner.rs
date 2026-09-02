@@ -5,9 +5,9 @@ use super::plan::NamedWindowBound;
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        merge_columns, query_output_columns, Aggregate, ColumnMask, ColumnUsedMask, Distinctness,
-        EvalAt, IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin,
-        JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference, Plan,
+        merge_columns, query_output_columns, resolve_unqualified_column, Aggregate, ColumnMask,
+        ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo, JoinOrderMember,
+        JoinOrigin, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference, Plan,
         QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm, WhereTermOrigin,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
@@ -1767,11 +1767,11 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
         // sides of `USING`. Outer unqualified names find this value first.
         for using_name in next_using {
             let column_name = using_name.as_str();
-            let (expr, source_column) =
-                resolve_parenthesized_using_column(source_tables, table_index, column_name);
-            used_columns.push(source_column);
+            let resolved = resolve_unqualified_column(source_tables, column_name)?
+                .expect("USING already proved that the column exists");
+            used_columns.extend(resolved.source_columns);
             result_columns.push(ResultSetColumn {
-                expr,
+                expr: resolved.expr,
                 alias: Some(column_name.to_string()),
                 implicit_column_name: None,
                 contains_aggregates: false,
@@ -1939,38 +1939,6 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
     }
     subquery.parenthesized_join_columns = Some(join_columns);
     Ok(())
-}
-
-/// Find the first source column for an INNER or LEFT `USING` join.
-///
-/// These joins preserve the first source. RIGHT and FULL require a merged value.
-fn resolve_parenthesized_using_column(
-    tables: &[JoinedTable],
-    last_table_index: usize,
-    column_name: &str,
-) -> (Expr, (TableInternalId, usize)) {
-    for table in &tables[..=last_table_index] {
-        let Some((column_index, column)) =
-            table.columns().iter().enumerate().find(|(_, column)| {
-                column
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
-            })
-        else {
-            continue;
-        };
-        return (
-            Expr::Column {
-                database: None,
-                table: table.internal_id,
-                column: column_index,
-                is_rowid_alias: column.is_rowid_alias(),
-            },
-            (table.internal_id, column_index),
-        );
-    }
-    unreachable!("USING already proved that the column exists");
 }
 
 #[allow(clippy::too_many_arguments)]
