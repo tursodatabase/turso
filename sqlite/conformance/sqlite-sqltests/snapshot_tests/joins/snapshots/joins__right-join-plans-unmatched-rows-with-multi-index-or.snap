@@ -1,0 +1,82 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT right_multi_left.a, right_multi_right.a,
+             right_multi_right.b, right_multi_right.c
+      FROM right_multi_left
+      RIGHT JOIN right_multi_right ON right_multi_left.a=right_multi_right.a
+      WHERE right_multi_right.b=5 OR right_multi_right.c=7;
+info:
+  statement_type: SELECT
+  tables:
+  - right_multi_left
+  - right_multi_left.a
+  - right_multi_right
+  setup_blocks:
+  - right_join_unmatched_multi_index_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN right_multi_left
+|--SCAN right_multi_right
+`--RIGHT-JOIN right_multi_right
+   `--MULTI-INDEX OR right_multi_right (right_multi_b, right_multi_c)
+
+BYTECODE
+addr  opcode               p1  p2  p3  p4          p5  comment
+   0      Init              0  52   0               0  Start at 52
+   1      OpenRead          0   2   0  k(2,B)       0  table=right_multi_left, root=2, iDb=0
+   2      OpenRead          2   3   0  k(4,B,B,B)   0  table=right_multi_right, root=3, iDb=0
+   3      Null              0   6   0               0  r[6]=NULL
+   4      OpenEphemeral     1   0   0               0  cursor=1 is_table=false
+   5      Rewind            0  27   0               0  Rewind table right_multi_left
+   6        Rewind          2  25   0               0  Rewind table right_multi_right
+   7          Column        0   0   8               0  r[8]=right_multi_left.a
+   8          Column        2   0   9               0  r[9]=right_multi_right.a
+   9          Ne            8   9  23  Binary       0  if r[8]!=r[9] goto 23
+  10          RowId         2   5   0               0  r[5]=right_multi_right.rowid
+  11          Found         1  15   5               0  if found goto 15
+  12          MakeRecord    5   1  10               0  r[10]=mkrec(r[5..5])
+  13          IdxInsert     1  10   5               0  key=r[10]
+  14          FilterAdd     1   5   1               0  bloom_filter_add(r[5..6])
+  15          BeginSubrtn   6   0   0               0  r[6]=NULL
+  16          Column        2   1  12               0  r[12]=right_multi_right.b
+  17          Eq           12  13  20  Binary       0  if r[12]==r[13] goto 20
+  18          Column        2   2  15               0  r[15]=right_multi_right.c
+  19          Ne           15  16  23  Binary       0  if r[15]!=r[16] goto 23
+  20          Column        0   0   1               0  r[1]=right_multi_left.a
+  21          ColumnRange   2   0   2  3            0  r[2..4]=right_multi_right.a..c
+  22          ResultRow     1   4   0               0  output=r[1..4]
+  23        Return          6   0   1               0
+  24      Next              2   7   0               1
+  25    Return              6   0   1               0
+  26  Next                  0   6   0               1
+  27  NullRow               0   0   0               0  Set cursor 0 to a (pseudo) NULL row
+  28  OpenRead              2   3   0  k(4,B,B,B)   0  table=right_multi_right, root=3, iDb=0
+  29  OpenRead              3   4   0  k(2,B)       0  index=right_multi_b, root=4, iDb=0
+  30  OpenRead              4   5   0  k(2,B)       0  index=right_multi_c, root=5, iDb=0
+  31  Null                  0  18   0               0  r[18]=NULL
+  32  Integer               5  19   0               0  r[19]=5
+  33  SeekGE                3  38  19               0  key=[19..19]
+  34    IdxGT               3  38  19               0  key=[19..19]
+  35    IdxRowId            3  17   0               0  r[17]=cursor 3 for index right_multi_b.rowid
+  36    RowSetAdd          18  17   0               0
+  37  Next                  3  34   0               0
+  38  Integer               7  20   0               0  r[20]=7
+  39  SeekGE                4  44  20               0  key=[20..20]
+  40    IdxGT               4  44  20               0  key=[20..20]
+  41    IdxRowId            4  17   0               0  r[17]=cursor 4 for index right_multi_c.rowid
+  42    RowSetAdd          18  17   0               0
+  43  Next                  4  40   0               0
+  44    RowSetRead         18  51  17               0
+  45    SeekRowid           2  17  46               0  if (r[17]!=cursor 2 for table right_multi_right.rowid) goto 46
+  46    RowId               2   5   0               0  r[5]=right_multi_right.rowid
+  47    Filter              1  49   5               1  if !bloom_filter(r[5..6]) goto 49
+  48    Found               1  50   5               0  if found goto 50
+  49    Gosub               6  16   0               0
+  50  Goto                  0  44   0               0
+  51  Halt                  0   0   0               0
+  52  Transaction           0   1   4               0  iDb=0 tx_mode=Read
+  53  Integer               5  13   0               0  r[13]=5
+  54  Integer               7  16   0               0  r[16]=7
+  55  Goto                  0   1   0               0
