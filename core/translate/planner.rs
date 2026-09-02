@@ -1678,8 +1678,54 @@ fn parse_from_clause_table(
             None, // table-valued functions don't support INDEXED BY
             connection,
         ),
-        ast::SelectTable::Sub(..) => {
-            crate::bail_parse_error!("Parenthesized FROM clause subqueries are not supported")
+        ast::SelectTable::Sub(from_clause, maybe_alias) if from_clause.joins.is_empty() => {
+            // SQLite unwraps a one-source group. An outer alias replaces the
+            // alias inside the parentheses, including when the outer alias is absent.
+            let table = replace_select_table_alias(*from_clause.select, maybe_alias);
+            parse_from_clause_table(
+                table,
+                resolver,
+                program,
+                table_references,
+                vtab_predicates,
+                cte_definitions,
+                connection,
+            )
+        }
+        ast::SelectTable::Sub(from_clause, maybe_alias) => {
+            // SQLite represents a parenthesized join group as a SELECT * subquery.
+            // It names an unaliased group "(join-N)" in query plans.
+            let alias = maybe_alias.unwrap_or_else(|| {
+                ast::As::As(ast::Name::exact(format!(
+                    "(join-{})",
+                    table_references.joined_tables().len()
+                )))
+            });
+            let join_select = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Star],
+                        from: Some(from_clause),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: Vec::new(),
+                    },
+                    compounds: Vec::new(),
+                },
+                order_by: Vec::new(),
+                limit: None,
+            };
+            parse_from_clause_table(
+                ast::SelectTable::Select(join_select, Some(alias)),
+                resolver,
+                program,
+                table_references,
+                vtab_predicates,
+                cte_definitions,
+                connection,
+            )
         }
     }
 }
@@ -2168,8 +2214,14 @@ pub fn parse_from(
 
     // Process FROM clause if present
     if let Some(from_owned) = from {
-        let select_owned = from_owned.select;
-        let joins_owned = from_owned.joins;
+        let mut select_owned = from_owned.select;
+        let mut joins_owned = from_owned.joins;
+        // SQLite removes an unaliased group when it starts the FROM clause.
+        // Keep the inner joins before the joins that follow the group.
+        while let ast::SelectTable::Sub(inner, None) = *select_owned {
+            select_owned = inner.select;
+            joins_owned.splice(0..0, inner.joins);
+        }
         parse_from_clause_table(
             *select_owned,
             resolver,
@@ -2196,6 +2248,17 @@ pub fn parse_from(
 
     program.unmask_shadowed_ctes_being_defined(shadowed_outer_ctes);
     Ok(())
+}
+
+fn replace_select_table_alias(table: ast::SelectTable, alias: Option<ast::As>) -> ast::SelectTable {
+    match table {
+        ast::SelectTable::Table(name, _, indexed) => ast::SelectTable::Table(name, alias, indexed),
+        ast::SelectTable::TableCall(name, args, _) => {
+            ast::SelectTable::TableCall(name, args, alias)
+        }
+        ast::SelectTable::Select(select, _) => ast::SelectTable::Select(select, alias),
+        ast::SelectTable::Sub(from, _) => ast::SelectTable::Sub(from, alias),
+    }
 }
 
 #[turso_macros::trace_stack]
