@@ -589,7 +589,11 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         .iter()
         .enumerate()
         .filter(|(_, condition)| {
-            !condition.consumed && !condition.from_join.is_some_and(JoinOrigin::is_outer)
+            !condition.consumed
+                && !condition
+                    .origin
+                    .join_origin()
+                    .is_some_and(JoinOrigin::is_outer)
         })
     {
         if prefiltered_terms.contains(&condition_idx) {

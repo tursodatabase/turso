@@ -434,6 +434,7 @@ pub(super) fn choose_best_btree_candidate(
             .filter(|(i, c)| {
                 !consumed.contains(i)
                     && c.usable
+                    && c.outer_join_compatible
                     && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
                     && matches!(
                         c.operator,
@@ -587,7 +588,10 @@ pub(super) fn choose_best_in_seek_candidate(
             else {
                 continue;
             };
-            if not || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
+            if not
+                || !constraint.outer_join_compatible
+                || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+            {
                 continue;
             }
 
@@ -598,7 +602,7 @@ pub(super) fn choose_best_in_seek_candidate(
             // can still drive the seek.
             let term = &where_clause[constraint.where_clause_pos.0];
             if may_null_extend
-                && term.from_join != Some(JoinOrigin::Outer(rhs_table.internal_id))
+                && term.origin.join_origin() != Some(JoinOrigin::Outer(rhs_table.internal_id))
             {
                 continue;
             }
@@ -1444,7 +1448,7 @@ pub fn try_hash_join_access_method(
             // An anti-join gets its match terms from the NOT EXISTS subquery.
             matches!(hash_join_type, HashJoinType::Inner | HashJoinType::LeftAnti)
                 || matches!(
-                    where_clause[*where_idx].from_join,
+                    where_clause[*where_idx].origin.join_origin(),
                     Some(JoinOrigin::Outer(table)) if table == probe_table.internal_id
                 )
         }),
