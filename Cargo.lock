@@ -7114,6 +7114,7 @@ dependencies = [
  "icu_locale",
  "intrusive-collections",
  "io-uring",
+ "itoa",
  "libc",
  "libloading 0.8.6",
  "libm",

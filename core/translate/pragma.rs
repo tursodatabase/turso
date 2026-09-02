@@ -939,7 +939,21 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::ModuleList => {
-            let modules = connection.get_syms_vtab_mods();
+            let mut modules: Vec<String> = connection.get_syms_vtab_mods().into_iter().collect();
+            // Built-in table-valued functions such as generate_series and
+            // json_each live in the schema rather than the extension module
+            // registry, but they are modules all the same.
+            for table in schema.tables.values() {
+                if let Table::Virtual(vtab) = table.as_ref() {
+                    if vtab.is_internal()
+                        && matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction)
+                    {
+                        modules.push(vtab.name.clone());
+                    }
+                }
+            }
+            modules.sort();
+            modules.dedup();
             for module in modules {
                 program.emit_string8(module.to_string(), register);
                 program.emit_result_row(register, 1);

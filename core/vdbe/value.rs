@@ -1159,18 +1159,30 @@ impl Value {
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(lhs), Value::Numeric(rhs)) = (self, rhs) {
+            return lhs.checked_add(*rhs).into();
+        }
         (|| Numeric::from_value(self)?.checked_add(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(lhs), Value::Numeric(rhs)) = (self, rhs) {
+            return lhs.checked_sub(*rhs).into();
+        }
         (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(lhs), Value::Numeric(rhs)) = (self, rhs) {
+            return lhs.checked_mul(*rhs).into();
+        }
         (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_divide(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(lhs), Value::Numeric(rhs)) = (self, rhs) {
+            return lhs.checked_div(*rhs).into();
+        }
         (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
     }
 
@@ -1183,6 +1195,14 @@ impl Value {
     }
 
     pub fn exec_remainder(&self, rhs: &Value) -> Value {
+        if let (Value::Numeric(Numeric::Integer(lhs)), Value::Numeric(Numeric::Integer(rhs))) =
+            (self, rhs)
+        {
+            return match NullableInteger::Integer(*lhs) % NullableInteger::Integer(*rhs) {
+                NullableInteger::Null => Value::Null,
+                NullableInteger::Integer(v) => Value::from_i64(v),
+            };
+        }
         let convert_to_float = matches!(Numeric::from_value(self), Some(Numeric::Float(_)))
             || matches!(Numeric::from_value(rhs), Some(Numeric::Float(_)));
 
@@ -1232,15 +1252,40 @@ impl Value {
             return Ok(Value::Blob(blob));
         }
 
-        let Some(lhs) = self.cast_text() else {
+        if matches!(self, Value::Null) || matches!(rhs, Value::Null) {
             return Ok(Value::Null);
-        };
+        }
 
-        let Some(rhs) = rhs.cast_text() else {
-            return Ok(Value::Null);
-        };
+        let mut out = String::new();
+        out.try_reserve(self.text_len_hint() + rhs.text_len_hint())?;
+        self.append_as_text(&mut out);
+        rhs.append_as_text(&mut out);
+        Ok(Value::build_text(out))
+    }
 
-        Ok(Value::build_text(lhs + &rhs))
+    /// Upper bound on the text length of this value, so concatenation can
+    /// allocate once.
+    fn text_len_hint(&self) -> usize {
+        match self {
+            Value::Null => 0,
+            Value::Numeric(_) => 24,
+            Value::Text(t) => t.as_str().len(),
+            Value::Blob(b) => b.len(),
+        }
+    }
+
+    /// Appends the text form of this value, the same one `to_string` gives,
+    /// without going through the formatting machinery or a temporary String.
+    fn append_as_text(&self, out: &mut String) {
+        match self {
+            Value::Null => {}
+            Value::Numeric(Numeric::Integer(i)) => out.push_str(itoa::Buffer::new().format(*i)),
+            Value::Numeric(Numeric::Float(f)) => {
+                out.push_str(&crate::numeric::format_float(f64::from(*f)))
+            }
+            Value::Text(t) => out.push_str(t.as_str()),
+            Value::Blob(b) => out.push_str(&String::from_utf8_lossy(b)),
+        }
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {

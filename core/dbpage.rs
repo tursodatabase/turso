@@ -1,6 +1,5 @@
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::sync::RwLock;
 use crate::util::IOExt;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, LimboError, Result, Value};
@@ -34,10 +33,10 @@ impl InternalVirtualTable for DbPageTable {
         "CREATE TABLE sqlite_dbpage(pgno INTEGER PRIMARY KEY, data BLOB, schema HIDDEN)".to_string()
     }
 
-    fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+    fn open(&self, conn: Arc<Connection>) -> Result<Box<dyn InternalVirtualTableCursor>> {
         let pager = conn.get_pager();
         let cursor = DbPageCursor::new(pager);
-        Ok(Arc::new(RwLock::new(cursor)))
+        Ok(Box::new(cursor))
     }
 
     /// TODO: sqlite does where_onerow optimization using idx_flag, we should do that eventually.. probably not needed for now.

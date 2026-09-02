@@ -294,11 +294,8 @@ impl InternalVirtualTable for PgClassTable {
         "pg_class".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgClassCursor::new(conn))))
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgClassCursor::new(conn)))
     }
 
     fn best_index(
@@ -540,11 +537,8 @@ impl InternalVirtualTable for PgNamespaceTable {
         "pg_namespace".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgNamespaceCursor::new(conn))))
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgNamespaceCursor::new(conn)))
     }
 
     fn best_index(
@@ -682,11 +676,8 @@ impl InternalVirtualTable for PgAttributeTable {
         "pg_attribute".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgAttributeCursor::new(conn))))
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgAttributeCursor::new(conn)))
     }
 
     fn best_index(
@@ -879,14 +870,11 @@ impl InternalVirtualTable for PgRolesTable {
         "pg_roles".to_string()
     }
 
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgRolesCursor {
+    fn open(&self, _conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgRolesCursor {
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -983,15 +971,12 @@ impl InternalVirtualTable for PgProcTable {
         "pg_proc".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgProcCursor {
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgProcCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -1204,15 +1189,12 @@ impl InternalVirtualTable for PgDatabaseTable {
         "pg_database".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgDatabaseCursor {
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgDatabaseCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -1347,14 +1329,11 @@ impl InternalVirtualTable for PgAmTable {
         "pg_am".to_string()
     }
 
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgAmCursor {
+    fn open(&self, _conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgAmCursor {
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -1439,11 +1418,8 @@ impl InternalVirtualTable for EmptyPgCatalogTable {
         self.name.clone()
     }
 
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(EmptyPgCatalogCursor)))
+    fn open(&self, _conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(EmptyPgCatalogCursor))
     }
 
     fn best_index(
@@ -1527,11 +1503,8 @@ impl InternalVirtualTable for PgTablesTable {
         "pg_tables".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgTablesCursor::new(conn))))
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgTablesCursor::new(conn)))
     }
 
     fn best_index(
@@ -1953,15 +1926,12 @@ impl InternalVirtualTable for PgTypeTable {
         "pg_type".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgTypeCursor {
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgTypeCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -2160,15 +2130,12 @@ impl InternalVirtualTable for PgIndexTable {
         "pg_index".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgIndexCursor {
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgIndexCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -2337,15 +2304,12 @@ impl InternalVirtualTable for PgConstraintTable {
         "pg_constraint".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgConstraintCursor {
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgConstraintCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -2700,15 +2664,12 @@ impl InternalVirtualTable for PgAttrdefTable {
         "pg_attrdef".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgAttrdefCursor {
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgAttrdefCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -2824,15 +2785,12 @@ impl InternalVirtualTable for PgSequencesTable {
         "pg_sequences".to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgSequencesCursor {
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgSequencesCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        }))
     }
 
     fn best_index(
@@ -3221,11 +3179,8 @@ impl InternalVirtualTable for PgInputErrorInfoTable {
         .to_string()
     }
 
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgInputErrorInfoCursor::new())))
+    fn open(&self, _conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgInputErrorInfoCursor::new()))
     }
 
     fn best_index(
@@ -3440,11 +3395,8 @@ impl InternalVirtualTable for PgGetTableDefTable {
         .to_string()
     }
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgGetTableDefCursor::new(conn))))
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+        Ok(Box::new(PgGetTableDefCursor::new(conn)))
     }
 
     fn best_index(

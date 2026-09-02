@@ -284,8 +284,6 @@ impl Database {
 
         #[cfg(feature = "uuid")]
         crate::uuid::register_extension(&mut ext_api);
-        #[cfg(feature = "series")]
-        crate::series::register_extension(&mut ext_api);
         #[cfg(feature = "time")]
         crate::time::register_extension(&mut ext_api);
         #[cfg(feature = "percentile")]

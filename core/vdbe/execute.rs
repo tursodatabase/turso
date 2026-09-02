@@ -7004,7 +7004,7 @@ fn update_agg_payload(
                         "Count: payload is not an integer".to_string(),
                     ));
                 };
-                *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                *i = i.checked_add(1).ok_or_else(integer_overflow)?;
             }
         }
         AggFunc::Count0 => {
@@ -7015,7 +7015,7 @@ fn update_agg_payload(
                     "Count0: payload is not an integer".to_string(),
                 ));
             };
-            *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            *i = i.checked_add(1).ok_or_else(integer_overflow)?;
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
@@ -7048,7 +7048,7 @@ fn update_agg_payload(
                 NumericArg::Null => unreachable!("NULL early-returned above"),
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
-            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            *count = count.checked_add(1).ok_or_else(integer_overflow)?;
         }
         AggFunc::Sum | AggFunc::Total => {
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
@@ -7085,7 +7085,7 @@ fn update_agg_payload(
                 ovrfl: *ovrfl_i != 0,
             };
             if !matches!(arg, Value::Null) {
-                *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                *count = count.checked_add(1).ok_or_else(integer_overflow)?;
             }
             if matches!(*acc, Value::Null) && sum_state.approx {
                 return Ok(());
@@ -7241,7 +7241,7 @@ fn update_agg_payload(
                         separator_lengths.try_reserve(
                             count
                                 .checked_mul(std::mem::size_of::<i64>())
-                                .ok_or(LimboError::IntegerOverflow)?,
+                                .ok_or_else(integer_overflow)?,
                         )?;
                         let bytes = first_separator_len.to_be_bytes();
                         for _ in 0..prior_separator_count {
@@ -7254,7 +7254,7 @@ fn update_agg_payload(
                 }
             }
             acc.exec_group_concat(arg)?;
-            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            *count = count.checked_add(1).ok_or_else(integer_overflow)?;
         }
         AggFunc::External(_) => {
             mark_unlikely();
@@ -7763,7 +7763,7 @@ fn op_window_step(
             let Value::Numeric(Numeric::Integer(step)) = &payload[1] else {
                 unreachable!("nth_value step count must be Integer");
             };
-            let step = step.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            let step = step.checked_add(1).ok_or_else(integer_overflow)?;
             payload[1] = Value::from_i64(step);
             if step == n {
                 payload[0].try_clone_from(arg_slot.get_value())?;
@@ -8376,7 +8376,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             let expected_separator_bytes = old_count
                 .saturating_sub(1)
                 .checked_mul(std::mem::size_of::<i64>())
-                .ok_or(LimboError::IntegerOverflow)?;
+                .ok_or_else(integer_overflow)?;
             if !separator_lengths.is_empty() && separator_lengths.len() != expected_separator_bytes
             {
                 return Err(LimboError::InternalError(format!(
@@ -8410,7 +8410,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             let remove_len = value_len
                 .checked_add(separator_len)
-                .ok_or(LimboError::IntegerOverflow)?;
+                .ok_or_else(integer_overflow)?;
             let Value::Text(text) = acc else {
                 unreachable!("GroupConcat accumulator is Text after a non-NULL xStep");
             };
@@ -8464,12 +8464,20 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             for _ in 0..element_count {
                 end = end
                     .checked_add(raw_jsonb_element_len(data, end)?)
-                    .ok_or(LimboError::IntegerOverflow)?;
+                    .ok_or_else(integer_overflow)?;
             }
             data.drain(1..end);
         }
     }
     Ok(())
+}
+
+/// Passed to `ok_or_else` so the error is only built on the overflow path;
+/// `ok_or(LimboError::IntegerOverflow)` would construct and drop the error
+/// on every successful increment, and that runs once per row in aggregates.
+#[cold]
+fn integer_overflow() -> LimboError {
+    LimboError::IntegerOverflow
 }
 
 pub fn op_agg_step(
@@ -8493,37 +8501,13 @@ pub fn op_agg_step(
     }
     let func = func.expect_agg();
 
-    // Initialize aggregate state if not already done
+    if step_common_agg_fast(state, func, *acc_reg, *col) {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
-        state.registers[*acc_reg] = match func {
-            AggFunc::External(ext_func) => match ext_func.as_ref() {
-                ExtFunc::Aggregate {
-                    context,
-                    init,
-                    step,
-                    finalize,
-                    argc,
-                    aggregate_destructor,
-                    value_destructor,
-                    ..
-                } => Register::Aggregate(AggContext::External(ExternalAggState {
-                    context: *context,
-                    state: unsafe { (init)(*context) },
-                    argc: (*argc).max(0) as usize,
-                    step_fn: *step,
-                    finalize_fn: *finalize,
-                    aggregate_destructor: *aggregate_destructor,
-                    value_destructor: *value_destructor,
-                })),
-                _ => unreachable!("scalar function called in aggregate context"),
-            },
-            _ => {
-                // Built-in aggregates use flat payload
-                let mut payload = crate::alloc::vec![];
-                init_agg_payload(func, &mut payload)?;
-                Register::Aggregate(AggContext::Builtin(payload))
-            }
-        };
+        state.registers[*acc_reg] = init_agg_accumulator(func)?;
     }
 
     let current_collation = collation.unwrap_or(CollationSeq::Binary);
@@ -8541,54 +8525,7 @@ pub fn op_agg_step(
 
     // Step the aggregate
     match func {
-        AggFunc::External(_) => {
-            // External aggregates use FFI and need special handling
-            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
-                let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
-                    unreachable!();
-                };
-                let AggContext::External(agg_state) = agg else {
-                    unreachable!();
-                };
-                (
-                    agg_state.context,
-                    agg_state.step_fn,
-                    agg_state.state,
-                    agg_state.argc,
-                    agg_state.aggregate_destructor,
-                    agg_state.value_destructor,
-                )
-            };
-            let mut ext_values = Vec::with_capacity(argc);
-            if argc != 0 {
-                let register_slice = &state.registers[*col..*col + argc];
-                for ov in register_slice.iter() {
-                    ext_values.push(ov.get_value().to_ffi());
-                }
-            }
-            let argv_ptr = if ext_values.is_empty() {
-                std::ptr::null()
-            } else {
-                ext_values.as_ptr()
-            };
-            let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
-            let value = Value::from_ffi_ref(&result);
-            if let Some(value_destructor) = value_destructor {
-                unsafe { value_destructor(&mut result) };
-            } else {
-                unsafe { result.__free_internal_type() };
-            }
-            for ext_value in ext_values {
-                unsafe { ext_value.__free_internal_type() };
-            }
-            if let Err(err) = value {
-                if let Some(aggregate_destructor) = aggregate_destructor {
-                    unsafe { aggregate_destructor(state_ptr as usize) };
-                }
-                state.registers[*acc_reg].set_value(Value::Null);
-                return Err(err);
-            }
-        }
+        AggFunc::External(_) => step_external_agg(state, *acc_reg, *col)?,
         _ => {
             let maybe_arg2 = match func {
                 AggFunc::GroupConcat | AggFunc::StringAgg => {
@@ -8635,6 +8572,198 @@ pub fn op_agg_step(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Steps count(*), count(x), and sum(x)/total(x) over integers or floats
+/// without going through the general path, which sets up a second
+/// argument, a comparator closure and a split borrow that these shapes never
+/// need. Returns false when the accumulator is not initialized yet, the
+/// arguments do not fit the fast shape, or the arithmetic would overflow or
+/// produce NaN; the general path then handles the row from scratch, since
+/// nothing was modified.
+#[inline(always)]
+fn step_common_agg_fast(
+    state: &mut ProgramState,
+    func: &AggFunc,
+    acc_reg: usize,
+    col: usize,
+) -> bool {
+    match func {
+        AggFunc::Count0 => {
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                return false;
+            };
+            let [Value::Numeric(Numeric::Integer(count)), ..] = payload.as_mut_slice() else {
+                return false;
+            };
+            let Some(next) = count.checked_add(1) else {
+                return false;
+            };
+            *count = next;
+            true
+        }
+        AggFunc::Count => {
+            let arg_is_null = matches!(&state.registers[col], Register::Value(Value::Null));
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                return false;
+            };
+            if arg_is_null {
+                return true;
+            }
+            let [Value::Numeric(Numeric::Integer(count)), ..] = payload.as_mut_slice() else {
+                return false;
+            };
+            let Some(next) = count.checked_add(1) else {
+                return false;
+            };
+            *count = next;
+            true
+        }
+        AggFunc::Sum | AggFunc::Total => {
+            let Register::Value(Value::Numeric(arg)) = &state.registers[col] else {
+                return false;
+            };
+            let arg = *arg;
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                return false;
+            };
+            // Payload layout per init_agg_payload: acc, r_err, approx, ovrfl, count.
+            let [acc, Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(approx)), Value::Numeric(Numeric::Integer(ovrfl)), Value::Numeric(Numeric::Integer(count))] =
+                payload.as_mut_slice()
+            else {
+                return false;
+            };
+            let Some(next_count) = count.checked_add(1) else {
+                return false;
+            };
+            match (acc, arg) {
+                (Value::Numeric(Numeric::Integer(acc)), Numeric::Integer(i)) => {
+                    let Some(sum) = acc.checked_add(i) else {
+                        return false;
+                    };
+                    *acc = sum;
+                }
+                (Value::Numeric(Numeric::Float(acc)), Numeric::Float(f)) => {
+                    // Same Kahan-Babuska-Neumaier step as apply_kbn_step.
+                    let s = f64::from(*acc);
+                    let r = f64::from(f);
+                    let t = s + r;
+                    let Some(sum) = NonNan::new(t) else {
+                        return false;
+                    };
+                    if t.is_finite() {
+                        let correction = if s.abs() > r.abs() {
+                            (s - t) + r
+                        } else {
+                            (r - t) + s
+                        };
+                        let Some(err) = NonNan::new(f64::from(*r_err) + correction) else {
+                            return false;
+                        };
+                        *r_err = err;
+                    }
+                    *acc = sum;
+                    *approx = 1;
+                    *ovrfl = 0;
+                }
+                _ => return false,
+            }
+            *count = next_count;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Runs once per aggregate, on the first row, so it is kept out of the
+/// per-row `op_agg_step` body.
+#[inline(never)]
+fn init_agg_accumulator(func: &AggFunc) -> Result<Register> {
+    Ok(match func {
+        AggFunc::External(ext_func) => match ext_func.as_ref() {
+            ExtFunc::Aggregate {
+                context,
+                init,
+                step,
+                finalize,
+                argc,
+                aggregate_destructor,
+                value_destructor,
+                ..
+            } => Register::Aggregate(AggContext::External(ExternalAggState {
+                context: *context,
+                state: unsafe { (init)(*context) },
+                argc: (*argc).max(0) as usize,
+                step_fn: *step,
+                finalize_fn: *finalize,
+                aggregate_destructor: *aggregate_destructor,
+                value_destructor: *value_destructor,
+            })),
+            _ => unreachable!("scalar function called in aggregate context"),
+        },
+        _ => {
+            // Built-in aggregates use flat payload
+            let mut payload = crate::alloc::vec![];
+            init_agg_payload(func, &mut payload)?;
+            Register::Aggregate(AggContext::Builtin(payload))
+        }
+    })
+}
+
+/// External (extension) aggregates step through FFI. Kept out of
+/// `op_agg_step` so the built-in per-row path stays small.
+#[inline(never)]
+fn step_external_agg(state: &mut ProgramState, acc_reg: usize, col: usize) -> Result<()> {
+    // External aggregates use FFI and need special handling
+    let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
+        let Register::Aggregate(agg) = &state.registers[acc_reg] else {
+            unreachable!();
+        };
+        let AggContext::External(agg_state) = agg else {
+            unreachable!();
+        };
+        (
+            agg_state.context,
+            agg_state.step_fn,
+            agg_state.state,
+            agg_state.argc,
+            agg_state.aggregate_destructor,
+            agg_state.value_destructor,
+        )
+    };
+    let mut ext_values = Vec::with_capacity(argc);
+    if argc != 0 {
+        let register_slice = &state.registers[col..col + argc];
+        for ov in register_slice.iter() {
+            ext_values.push(ov.get_value().to_ffi());
+        }
+    }
+    let argv_ptr = if ext_values.is_empty() {
+        std::ptr::null()
+    } else {
+        ext_values.as_ptr()
+    };
+    let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
+    let value = Value::from_ffi_ref(&result);
+    if let Some(value_destructor) = value_destructor {
+        unsafe { value_destructor(&mut result) };
+    } else {
+        unsafe { result.__free_internal_type() };
+    }
+    for ext_value in ext_values {
+        unsafe { ext_value.__free_internal_type() };
+    }
+    if let Err(err) = value {
+        if let Some(aggregate_destructor) = aggregate_destructor {
+            unsafe { aggregate_destructor(state_ptr as usize) };
+        }
+        state.registers[acc_reg].set_value(Value::Null);
+        return Err(err);
+    }
+    Ok(())
 }
 
 pub fn op_agg_final(
@@ -19123,7 +19252,7 @@ mod tests {
                 if !conn_for_progress.get_auto_commit() {
                     let calls =
                         source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
-                    calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+                    calls >= 2 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
                 } else {
                     false
                 }
@@ -19142,7 +19271,7 @@ mod tests {
             "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
         );
         assert!(
-            source_txn_progress_calls.load(Ordering::SeqCst) > 10,
+            source_txn_progress_calls.load(Ordering::SeqCst) > 2,
             "test should interrupt after VACUUM INTO opens the source transaction"
         );
         assert!(

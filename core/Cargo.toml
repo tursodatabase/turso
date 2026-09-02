@@ -116,6 +116,7 @@ crossbeam-epoch = "0.9.18"
 crossbeam-utils = "0.8.21"
 tracing = { workspace = true }
 ryu = "1.0.19"
+itoa = "1.0"
 uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = { workspace = true }
@@ -298,4 +299,8 @@ harness = false
 
 [[bench]]
 name = "select_star_benchmark"
+harness = false
+
+[[bench]]
+name = "interpreter_benchmark"
 harness = false

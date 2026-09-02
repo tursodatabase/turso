@@ -35,6 +35,10 @@ impl VirtualTable {
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }
+    pub(crate) fn is_internal(&self) -> bool {
+        matches!(self.vtab_type, VirtualTableType::Internal(_))
+    }
+
     pub(crate) fn readonly(&self) -> bool {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => true,
@@ -239,7 +243,7 @@ impl VirtualTable {
 enum VirtualTableCursorInner {
     Pragma(Box<PragmaVirtualTableCursor>),
     External(ExtVirtualTableCursor),
-    Internal(Arc<RwLock<dyn InternalVirtualTableCursor>>),
+    Internal(Box<dyn InternalVirtualTableCursor>),
 }
 
 pub struct VirtualTableCursor {
@@ -264,7 +268,7 @@ impl VirtualTableCursor {
         }
     }
 
-    pub(crate) fn new_internal(cursor: Arc<RwLock<dyn InternalVirtualTableCursor>>) -> Self {
+    pub(crate) fn new_internal(cursor: Box<dyn InternalVirtualTableCursor>) -> Self {
         Self {
             inner: VirtualTableCursorInner::Internal(cursor),
             null_flag: false,
@@ -280,7 +284,7 @@ impl VirtualTableCursor {
         match &mut self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.next(),
             VirtualTableCursorInner::External(cursor) => cursor.next(),
-            VirtualTableCursorInner::Internal(cursor) => cursor.write().next(),
+            VirtualTableCursorInner::Internal(cursor) => cursor.next(),
         }
     }
 
@@ -288,7 +292,7 @@ impl VirtualTableCursor {
         match &self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursorInner::External(cursor) => cursor.rowid(),
-            VirtualTableCursorInner::Internal(cursor) => cursor.read().rowid(),
+            VirtualTableCursorInner::Internal(cursor) => cursor.rowid(),
         }
     }
 
@@ -299,7 +303,7 @@ impl VirtualTableCursor {
         match &self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.column(column),
             VirtualTableCursorInner::External(cursor) => cursor.column(column),
-            VirtualTableCursorInner::Internal(cursor) => cursor.read().column(column),
+            VirtualTableCursorInner::Internal(cursor) => cursor.column(column),
         }
     }
 
@@ -316,9 +320,7 @@ impl VirtualTableCursor {
             VirtualTableCursorInner::External(cursor) => {
                 cursor.filter(idx_num, idx_str, arg_count, args)
             }
-            VirtualTableCursorInner::Internal(cursor) => {
-                cursor.write().filter(&args, idx_str, idx_num)
-            }
+            VirtualTableCursorInner::Internal(cursor) => cursor.filter(&args, idx_str, idx_num),
         }
     }
 
@@ -596,10 +598,7 @@ impl Drop for ExtVirtualTableCursor {
 
 pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
     fn name(&self) -> String;
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>>;
+    fn open(&self, conn: Arc<Connection>) -> crate::Result<Box<dyn InternalVirtualTableCursor>>;
     /// best_index is used by the optimizer. See the comment on `Table::best_index`.
     fn best_index(
         &self,
@@ -646,11 +645,11 @@ mod tests {
         fn open(
             &self,
             _conn: Arc<Connection>,
-        ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-            Ok(Arc::new(RwLock::new(StaticCursor {
+        ) -> crate::Result<Box<dyn InternalVirtualTableCursor>> {
+            Ok(Box::new(StaticCursor {
                 rows: vec![("alpha".to_string(), 1), ("beta".to_string(), 2)],
                 position: -1,
-            })))
+            }))
         }
         fn best_index(
             &self,

@@ -47,6 +47,7 @@ pub enum Numeric {
 }
 
 impl Numeric {
+    #[inline]
     pub fn from_value<T: AsValueRef>(value: T) -> Option<Self> {
         let value = value.as_value_ref();
 

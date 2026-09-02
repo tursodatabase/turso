@@ -3,7 +3,6 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::CursorTrait;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::sync::RwLock;
 use crate::util::IOExt;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, Result, Value};
@@ -35,11 +34,11 @@ impl InternalVirtualTable for BtreeDumpTable {
         "CREATE TABLE btree_dump(record BLOB, name TEXT HIDDEN)".to_string()
     }
 
-    fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+    fn open(&self, conn: Arc<Connection>) -> Result<Box<dyn InternalVirtualTableCursor>> {
         let pager = conn.get_pager();
         let schema = conn.schema.read().clone();
         let cursor = BtreeDumpCursor::new(pager, schema);
-        Ok(Arc::new(RwLock::new(cursor)))
+        Ok(Box::new(cursor))
     }
 
     fn best_index(
