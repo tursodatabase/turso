@@ -920,6 +920,51 @@ snapshot full-outer-join-sqlite-style {
     FULL OUTER JOIN h_items i ON h.customer_name = i.order_name;
 }
 
+setup right_join_unmatched_index_schema {
+    CREATE TABLE right_plan_left(a INTEGER);
+    CREATE TABLE right_plan_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_plan_b ON right_plan_right(b);
+}
+
+# SQLite plans this index only for the unmatched-right pass. The main join
+# cannot apply a post-join WHERE term until it knows which rows matched.
+@setup right_join_unmatched_index_schema
+snapshot right-join-plans-unmatched-rows-with-safe-where-term {
+    SELECT right_plan_left.a, right_plan_right.a, right_plan_right.b
+    FROM right_plan_left
+    RIGHT JOIN right_plan_right
+        ON right_plan_left.a=right_plan_right.a
+    WHERE right_plan_right.b=5;
+}
+
+# The ON term can drive the main loop, but it cannot remove rows from the
+# unmatched-right read. SQLite emits a table scan for that second read.
+@setup right_join_unmatched_index_schema
+snapshot right-join-does-not-plan-unmatched-rows-with-on-term {
+    SELECT right_plan_left.a, right_plan_right.a, right_plan_right.b
+    FROM right_plan_left
+    RIGHT JOIN right_plan_right
+        ON right_plan_left.a=right_plan_right.a AND right_plan_right.b=5;
+}
+
+setup right_join_unmatched_multi_index_schema {
+    CREATE TABLE right_multi_left(a INTEGER);
+    CREATE TABLE right_multi_right(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX right_multi_b ON right_multi_right(b);
+    CREATE INDEX right_multi_c ON right_multi_right(c);
+}
+
+# SQLite lets its normal OR planner choose the second read. The row set must
+# remove a row that appears in both index branches before the match-set check.
+@setup right_join_unmatched_multi_index_schema
+snapshot right-join-plans-unmatched-rows-with-multi-index-or {
+    SELECT right_multi_left.a, right_multi_right.a,
+           right_multi_right.b, right_multi_right.c
+    FROM right_multi_left
+    RIGHT JOIN right_multi_right ON right_multi_left.a=right_multi_right.a
+    WHERE right_multi_right.b=5 OR right_multi_right.c=7;
+}
+
 setup full_using_schema {
     CREATE TABLE u1(id TEXT COLLATE NOCASE, a TEXT);
     CREATE TABLE u2(id TEXT, b TEXT);

@@ -489,6 +489,333 @@ expect {
     3
 }
 
+# SQLite plans the unmatched-right pass with WHERE terms that can be used at
+# that point. The second read of r must use r_b instead of scanning all rows.
+@cross-check-integrity
+test right-join-plans-unmatched-rows-with-safe-where-term {
+    CREATE TABLE right_plan_left(a INTEGER);
+    CREATE TABLE right_plan_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_plan_b ON right_plan_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT right_plan_left.a, right_plan_right.a, right_plan_right.b
+    FROM right_plan_left
+    RIGHT JOIN right_plan_right
+        ON right_plan_left.a=right_plan_right.a
+    WHERE right_plan_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_plan_right.*SEARCH right_plan_right USING INDEX right_plan_b \(b=\?\)
+}
+
+# An ON term decides whether rows match. It must not remove rows from the
+# unmatched-right read, even when it can use an index in the main loop.
+test right-join-does-not-plan-unmatched-rows-with-on-term {
+    CREATE TABLE right_on_left(a INTEGER);
+    CREATE TABLE right_on_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_on_b ON right_on_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_on_left
+    RIGHT JOIN right_on_right
+        ON right_on_left.a=right_on_right.a AND right_on_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_on_right.*SCAN right_on_right
+}
+
+# A later table is not ready when SQLite plans this unmatched-right read.
+# A WHERE term that needs that table cannot supply the search key.
+test right-join-does-not-plan-unmatched-rows-with-later-table {
+    CREATE TABLE right_later_left(a INTEGER);
+    CREATE TABLE right_later_right(a INTEGER, b INTEGER);
+    CREATE TABLE right_later_last(b INTEGER);
+    CREATE INDEX right_later_b ON right_later_right(b);
+    CREATE INDEX right_later_last_b ON right_later_last(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_later_left
+    RIGHT JOIN right_later_right
+        ON right_later_left.a=right_later_right.a
+    CROSS JOIN right_later_last
+    WHERE right_later_right.b=right_later_last.b;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_later_right.*SCAN right_later_right
+}
+
+# SQLite does not apply WHERE terms to the unmatched read of a table that is
+# left of a later RIGHT JOIN. That later join can still replace the row.
+test chained-right-join-does-not-constrain-first-unmatched-read {
+    CREATE TABLE right_chain_a(id INTEGER);
+    CREATE TABLE right_chain_b(id INTEGER, x INTEGER);
+    CREATE TABLE right_chain_c(id INTEGER);
+    CREATE INDEX right_chain_b_x ON right_chain_b(x);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_chain_a
+    RIGHT JOIN right_chain_b ON right_chain_a.id=right_chain_b.id
+    RIGHT JOIN right_chain_c ON right_chain_b.id=right_chain_c.id
+    WHERE right_chain_b.x IS NULL;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_chain_b.*SCAN right_chain_b.*RIGHT-JOIN right_chain_c.*SCAN right_chain_c
+}
+
+# SQLite can use an `IN` term to drive the unmatched-right index read.
+test right-join-plans-unmatched-rows-with-in-search {
+    CREATE TABLE right_in_left(a INTEGER);
+    CREATE TABLE right_in_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_in_b ON right_in_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_in_left
+    RIGHT JOIN right_in_right ON right_in_left.a=right_in_right.a
+    WHERE right_in_right.b IN (5, 7);
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_in_right.*SEARCH right_in_right USING INDEX right_in_b \(b=\?\)
+}
+
+@cross-check-integrity
+test right-join-in-search-emits-unmatched-rows {
+    CREATE TABLE right_in_rows_left(a INTEGER);
+    CREATE TABLE right_in_rows_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_in_rows_b ON right_in_rows_right(b);
+    INSERT INTO right_in_rows_left VALUES(1), (2);
+    INSERT INTO right_in_rows_right VALUES(1,5), (2,6), (3,7), (4,8);
+    SELECT right_in_rows_left.a, right_in_rows_right.a, right_in_rows_right.b
+    FROM right_in_rows_left
+    RIGHT JOIN right_in_rows_right
+        ON right_in_rows_left.a=right_in_rows_right.a
+    WHERE right_in_rows_right.b IN (5, 7)
+    ORDER BY right_in_rows_right.a;
+}
+expect {
+    1|1|5
+    |3|7
+}
+
+# A rowid equality can reduce the unmatched pass to one table lookup.
+test right-join-plans-unmatched-rows-with-rowid-search {
+    CREATE TABLE right_rowid_left(a INTEGER);
+    CREATE TABLE right_rowid_right(a INTEGER, b INTEGER);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_rowid_left
+    RIGHT JOIN right_rowid_right
+        ON right_rowid_left.a=right_rowid_right.a
+    WHERE right_rowid_right.rowid=2;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_rowid_right.*SEARCH right_rowid_right USING INTEGER PRIMARY KEY \(rowid=\?\)
+}
+
+@cross-check-integrity
+test right-join-rowid-search-emits-unmatched-row {
+    CREATE TABLE right_rowid_rows_left(a INTEGER);
+    CREATE TABLE right_rowid_rows_right(a INTEGER, b INTEGER);
+    INSERT INTO right_rowid_rows_left VALUES(1);
+    INSERT INTO right_rowid_rows_right VALUES(1,5), (2,6), (3,7);
+    SELECT right_rowid_rows_left.a, right_rowid_rows_right.a
+    FROM right_rowid_rows_left
+    RIGHT JOIN right_rowid_rows_right
+        ON right_rowid_rows_left.a=right_rowid_rows_right.a
+    WHERE right_rowid_rows_right.rowid=2;
+}
+expect {
+    |2
+}
+
+# SQLite permits the normal range planner in the unmatched-right read.
+test right-join-plans-unmatched-rows-with-range-search {
+    CREATE TABLE right_range_left(a INTEGER);
+    CREATE TABLE right_range_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_range_b ON right_range_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_range_left
+    RIGHT JOIN right_range_right ON right_range_left.a=right_range_right.a
+    WHERE right_range_right.b>=5 AND right_range_right.b<9;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_range_right.*SEARCH right_range_right USING INDEX right_range_b \(b
+}
+
+# A safe WHERE term can prove the predicate of a partial index. The main join
+# cannot use that index, but SQLite can use it for the unmatched-right read.
+test right-join-plans-unmatched-rows-with-partial-index {
+    CREATE TABLE right_partial_left(a INTEGER);
+    CREATE TABLE right_partial_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_partial_b5 ON right_partial_right(b) WHERE b=5;
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_partial_left
+    RIGHT JOIN right_partial_right ON right_partial_left.a=right_partial_right.a
+    WHERE right_partial_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_partial_right.*SEARCH right_partial_right USING INDEX right_partial_b5
+}
+
+@cross-check-integrity
+test right-join-partial-index-emits-unmatched-rows {
+    CREATE TABLE right_partial_rows_left(a INTEGER);
+    CREATE TABLE right_partial_rows_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_partial_rows_b5 ON right_partial_rows_right(b) WHERE b=5;
+    INSERT INTO right_partial_rows_left VALUES(1), (2);
+    INSERT INTO right_partial_rows_right VALUES(1,5), (2,6), (3,5);
+    SELECT right_partial_rows_left.a, right_partial_rows_right.a,
+           right_partial_rows_right.b
+    FROM right_partial_rows_left
+    RIGHT JOIN right_partial_rows_right
+        ON right_partial_rows_left.a=right_partial_rows_right.a
+    WHERE right_partial_rows_right.b=5
+    ORDER BY right_partial_rows_right.a;
+}
+expect {
+    1|1|5
+    |3|5
+}
+
+# The second read can use an expression index because it also reopens the
+# table cursor. Result expressions do not depend on the index cursor.
+test right-join-plans-unmatched-rows-with-expression-index {
+    CREATE TABLE right_expr_left(a INTEGER);
+    CREATE TABLE right_expr_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_expr_b ON right_expr_right(b+1);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_expr_left
+    RIGHT JOIN right_expr_right ON right_expr_left.a=right_expr_right.a
+    WHERE right_expr_right.b+1=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_expr_right.*SEARCH right_expr_right USING INDEX right_expr_b
+}
+
+# SQLite can combine indexes for an OR term in the unmatched-right read.
+test right-join-plans-unmatched-rows-with-multi-index-or {
+    CREATE TABLE right_multi_left(a INTEGER);
+    CREATE TABLE right_multi_right(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX right_multi_b ON right_multi_right(b);
+    CREATE INDEX right_multi_c ON right_multi_right(c);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_multi_left
+    RIGHT JOIN right_multi_right ON right_multi_left.a=right_multi_right.a
+    WHERE right_multi_right.b=5 OR right_multi_right.c=7;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_multi_right.*MULTI-INDEX OR
+}
+
+@cross-check-integrity
+test right-join-multi-index-or-emits-each-row-once {
+    CREATE TABLE right_multi_rows_left(a INTEGER);
+    CREATE TABLE right_multi_rows_right(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX right_multi_rows_b ON right_multi_rows_right(b);
+    CREATE INDEX right_multi_rows_c ON right_multi_rows_right(c);
+    INSERT INTO right_multi_rows_left VALUES(1), (2);
+    INSERT INTO right_multi_rows_right VALUES
+        (1,5,0), (2,0,7), (3,5,7), (4,0,0);
+    SELECT right_multi_rows_left.a, right_multi_rows_right.a,
+           right_multi_rows_right.b, right_multi_rows_right.c
+    FROM right_multi_rows_left
+    RIGHT JOIN right_multi_rows_right
+        ON right_multi_rows_left.a=right_multi_rows_right.a
+    WHERE right_multi_rows_right.b=5 OR right_multi_rows_right.c=7
+    ORDER BY right_multi_rows_right.a;
+}
+expect {
+    1|1|5|0
+    2|2|0|7
+    |3|5|7
+}
+
+# SQLite does not build an automatic index for the unmatched-right read.
+test right-join-does-not-build-auto-index-for-unmatched-rows {
+    CREATE TABLE right_auto_left(a INTEGER);
+    CREATE TABLE right_auto_right(a INTEGER, b INTEGER);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_auto_left
+    RIGHT JOIN right_auto_right ON right_auto_left.a=right_auto_right.a
+    WHERE right_auto_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_auto_right.*SCAN right_auto_right
+}
+
+# An explicit index choice also applies to the unmatched-right read.
+test right-join-indexed-by-applies-to-unmatched-rows {
+    CREATE TABLE right_forced_left(a INTEGER);
+    CREATE TABLE right_forced_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_forced_b ON right_forced_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_forced_left
+    RIGHT JOIN right_forced_right INDEXED BY right_forced_b
+        ON right_forced_left.a=right_forced_right.a
+    WHERE right_forced_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_forced_right.*SEARCH right_forced_right USING INDEX right_forced_b
+}
+
+# NOT INDEXED must also apply to the unmatched-right read.
+test right-join-not-indexed-applies-to-unmatched-rows {
+    CREATE TABLE right_no_index_left(a INTEGER);
+    CREATE TABLE right_no_index_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_no_index_b ON right_no_index_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_no_index_left
+    RIGHT JOIN right_no_index_right NOT INDEXED
+        ON right_no_index_left.a=right_no_index_right.a
+    WHERE right_no_index_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_no_index_right.*SCAN right_no_index_right
+}
+
+# RIGHT chooses the second table's USING value. A later FULL JOIN keeps that
+# value even when its storage class differs from the third table's value.
+@cross-check-integrity
+test right-then-full-using-keeps-right-value {
+    CREATE TABLE right_using_first(id INTEGER);
+    CREATE TABLE right_using_second(id TEXT);
+    CREATE TABLE right_using_third(id INTEGER);
+    INSERT INTO right_using_second VALUES('01');
+    INSERT INTO right_using_third VALUES(1);
+    SELECT quote(id), typeof(id), id=1, id='1',
+           right_using_first.id, right_using_second.id, right_using_third.id
+    FROM right_using_first
+    RIGHT JOIN right_using_second USING(id)
+    FULL JOIN right_using_third USING(id);
+}
+expect {
+    '01'|text|0|0||01|1
+}
+
+# The generated USING merge gets its collation from the first source. A user
+# coalesce() call keeps the normal function collation rules.
+@skip-if sqlite "SQLite 3.50.4 does not apply the left collation to a merged USING column"
+@cross-check-integrity
+test full-using-merge-does-not-change-user-coalesce-collation {
+    CREATE TABLE full_collate_left(id TEXT COLLATE NOCASE);
+    CREATE TABLE full_collate_right(id TEXT);
+    INSERT INTO full_collate_right VALUES('a');
+    SELECT id='A',
+           coalesce(full_collate_left.id, full_collate_right.id)='A',
+           id,
+           typeof(id)
+    FROM full_collate_left
+    FULL JOIN full_collate_right USING(id);
+}
+expect {
+    1|0|a|text
+}
+
 # Regression test for LEFT JOIN + materialized subquery bug
 # After NullRow, Next should not continue iterating the ephemeral index
 # The fix is in op_next: check null_flag before advancing cursor
