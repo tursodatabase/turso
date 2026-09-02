@@ -11855,6 +11855,61 @@ fn test_gc_retired_current_serves_older_reader_then_reclaims() {
     );
 }
 
+/// Two connections upsert the same TEXT PRIMARY KEY after Passive GC retired
+/// the SkipMap current. They must not create a second row for that key (Elle
+/// list-append `incompatible-order`). One writer may take a write-write
+/// conflict. The committed lists stay a single history.
+#[test]
+fn test_gc_retired_text_pk_upsert_does_not_fork() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(key TEXT PRIMARY KEY, vals TEXT NOT NULL DEFAULT '')")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('k9', '1')").unwrap();
+
+    let older = db.connect();
+    older.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&older, "SELECT vals FROM t WHERE key = 'k9'"),
+        vec![vec![Value::from_text("1")]]
+    );
+    conn.execute("INSERT INTO t VALUES ('k8', 'x')").unwrap();
+
+    let upsert = |c: &Arc<Connection>, value: i64| {
+        c.execute(format!(
+            "INSERT INTO t (key, vals) VALUES ('k9', '{value}') \
+             ON CONFLICT(key) DO UPDATE SET vals = vals || ',' || '{value}'"
+        ))
+    };
+
+    let a = db.connect();
+    let b = db.connect();
+    a.execute("BEGIN CONCURRENT").unwrap();
+    b.execute("BEGIN CONCURRENT").unwrap();
+    upsert(&a, 2).unwrap();
+    let b_write = upsert(&b, 3);
+    a.execute("COMMIT").unwrap();
+    match b_write {
+        Ok(()) => match b.execute("COMMIT") {
+            Ok(()) | Err(LimboError::WriteWriteConflict) => {}
+            Err(e) => panic!("unexpected commit error: {e:?}"),
+        },
+        Err(LimboError::WriteWriteConflict) => {}
+        Err(e) => panic!("unexpected write error: {e:?}"),
+    }
+
+    older.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT vals FROM t WHERE key = 'k9'");
+    assert_eq!(rows.len(), 1, "forked into two rows for k9: {rows:?}");
+    let vals = rows[0][0].to_string();
+    assert!(
+        vals.starts_with("1,"),
+        "lost the checkpointed prefix: {vals}"
+    );
+}
+
 /// A reader that has already selected a multi-column row must keep seeing every
 /// column after GC that would previously have `clear()`ed the current version.
 /// No checkpoint: B-tree fallthrough cannot hide a drop. `durable_txid_max` is

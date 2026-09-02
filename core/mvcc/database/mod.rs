@@ -2014,6 +2014,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 }
             }
 
+            // A retired current is the B-tree copy, not a competing insert.
+            // Skipping it lets a later transaction commit its own current
+            // without a false write-write against the materialized row.
+            if version.retired_at().is_some() {
+                continue;
+            }
+
             match version.begin() {
                 Some(TxTimestampOrID::TxID(other_tx_id)) => {
                     // Skip our own version
@@ -5492,7 +5499,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if let Some(rv) = versions
             .iter()
             .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+            .find(|rv| rv.occupies_skipmap_for(tx, &self.txs, &self.finalized_tx_states))
         {
             return Ok(Some(rv.row.clone()));
         }
@@ -5520,7 +5527,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if let Some(rv) = versions
             .iter()
             .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+            .find(|rv| rv.occupies_skipmap_for(tx, &self.txs, &self.finalized_tx_states))
         {
             record.invalidate();
             record.start_serialization(rv.row.payload())?;
@@ -5661,9 +5668,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// True when `tx` should ignore this SkipMap chain and read the key from B-tree.
     ///
-    /// Passive keeps SkipMap cover for all chains (table/index views can disagree
-    /// under concurrent Passive). Truncate may fall through for sole materialized
-    /// currents when no checkpoint is in progress.
+    /// A sole current retired for this transaction falls through only when the
+    /// B-tree is readable. Otherwise the SkipMap copy must still occupy the key
+    /// (unique probes and point lookups). Truncate may also fall through for
+    /// unretired sole materialized currents when no checkpoint is in progress.
     fn btree_covers_chain_for_tx(
         &self,
         tx: &Transaction<A>,
@@ -5801,14 +5809,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let versions_arc = row.value();
         {
             let versions = versions_arc.read();
-            let has_visible = versions
-                .iter()
-                .rev()
-                .any(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states));
-            if !has_visible {
+            if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
                 return None;
             }
-            if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
+            let has_skipmap_row = versions.iter().rev().any(|version| {
+                version.occupies_skipmap_for(tx, &self.txs, &self.finalized_tx_states)
+            });
+            if !has_skipmap_row {
                 return None;
             }
         }
@@ -5821,15 +5828,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row: IndexRowEntry<'_, A>,
     ) -> Option<RowID> {
         let versions = row.value().read();
-        let visible = versions
-            .iter()
-            .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
-        let table_id = visible.row.id.table_id;
+        if versions.is_empty() {
+            return None;
+        }
+        let table_id = versions[0].row.id.table_id;
         if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
             return None;
         }
-        Some(visible.row.id.clone())
+        versions
+            .iter()
+            .rev()
+            .find(|version| version.occupies_skipmap_for(tx, &self.txs, &self.finalized_tx_states))
+            .map(|version| version.row.id.clone())
     }
 
     fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction<A>, mut rows: I) -> Option<RowID>
@@ -7605,7 +7615,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Like [`Self::drop_unused_row_versions`], and remove emptied SkipMap slots.
-    /// Also drops last currents already in the B-tree (Truncate Finalize).
+    /// Also retires last currents already in the B-tree (Truncate Finalize).
     /// Writers retry if GC unlinks their Arc (`insert_version` / `insert_index_version`).
     pub fn drop_unused_row_versions_and_slots(&self) -> usize {
         self.drop_unused_row_versions_inner(true, true, WalPos::STAGED)
@@ -10322,6 +10332,19 @@ impl RowVersion {
         !self.is_retired_for(tx)
             && is_begin_visible(txs, finalized_tx_states, tx, self)
             && is_end_visible(txs, finalized_tx_states, tx, self)
+    }
+
+    /// SkipMap still has this row for `tx` when B-tree fallthrough is not
+    /// allowed. Retired currents are hidden from [`Self::is_visible_to`] so
+    /// later transactions read the B-tree copy, but unique probes and scans
+    /// must still see the key until `btree_covers_chain_for_tx` is true.
+    fn occupies_skipmap_for<A: ConcurrentAllocator>(
+        &self,
+        tx: &Transaction<A>,
+        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+        finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
+    ) -> bool {
+        self.is_visible_to(tx, txs, finalized_tx_states) || self.is_retired_for(tx)
     }
 
     /// Check if this version indicates the B-tree row has been modified (updated or deleted).
