@@ -361,31 +361,14 @@ impl CloseLoop {
                             let meta = t_ctx.meta_in_seeks[table_index]
                                 .as_ref()
                                 .expect("InSeek must have metadata");
-                            let ephemeral_cursor_id = meta.ephemeral_cursor_id;
-                            let outer_loop_start = meta.outer_loop_start;
-                            let next_val_label = meta.next_val_label;
-
-                            let can_have_multiple_matches = index.is_some();
-                            if can_have_multiple_matches {
-                                // Rowid InSeek uses SeekRowid, so one RHS key can produce at
-                                // most one row. Index-backed InSeek can hit duplicates, so
-                                // keep scanning the current key's match range before advancing
-                                // the ephemeral cursor to the next IN value.
-                                program.emit_insn(Insn::Next {
-                                    cursor_id: iteration_cursor_id,
-                                    pc_if_next: loop_labels.loop_start,
-                                    fullscan: false,
-                                });
-                            }
-
-                            // Once the current key is exhausted (or a seek found nothing),
-                            // advance the outer ephemeral cursor and restart the equality seek.
-                            program.preassign_label_to_next_insn(next_val_label);
-                            program.emit_insn(Insn::Next {
-                                cursor_id: ephemeral_cursor_id,
-                                pc_if_next: outer_loop_start,
-                                fullscan: false,
-                            });
+                            let matching_rows_cursor_id =
+                                index.as_ref().map(|_| iteration_cursor_id);
+                            emit_in_seek_end(
+                                program,
+                                matching_rows_cursor_id,
+                                loop_labels.loop_start,
+                                meta,
+                            );
                         }
                     }
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
