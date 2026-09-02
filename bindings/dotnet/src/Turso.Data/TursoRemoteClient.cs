@@ -584,25 +584,29 @@ internal sealed class RemoteError
     public string? Code { get; init; }
 }
 
-internal sealed class TursoRemoteSqlException(
+public sealed class TursoRemoteSqlException(
     string message,
     string? remoteErrorCode,
     string? remoteErrorMessage) : TursoException(message)
 {
+    public string? RemoteErrorCode { get; } = remoteErrorCode;
+
+    public string? RemoteErrorMessage { get; } = remoteErrorMessage;
+
     public bool IsStreamExpired
-        => remoteErrorCode is not null
-               && (remoteErrorCode.Equals("STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorCode.Equals("STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorCode.Equals("BATON_EXPIRED", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorCode.Equals("HRANA_STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorCode.Equals("HRANA_STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorCode.Equals("BA_STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorCode.Equals("BA_STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase))
-           || remoteErrorMessage is not null
-               && (remoteErrorMessage.Contains("stream expired", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorMessage.Contains("stream has expired", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorMessage.Contains("stream not found", StringComparison.OrdinalIgnoreCase)
-                   || remoteErrorMessage.Contains("baton expired", StringComparison.OrdinalIgnoreCase));
+        => !string.IsNullOrWhiteSpace(RemoteErrorCode)
+            ? RemoteErrorCode.Equals("STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("BATON_EXPIRED", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("HRANA_STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("HRANA_STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("BA_STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("BA_STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
+            : RemoteErrorMessage is not null
+              && (RemoteErrorMessage.Contains("stream expired", StringComparison.OrdinalIgnoreCase)
+                  || RemoteErrorMessage.Contains("stream has expired", StringComparison.OrdinalIgnoreCase)
+                  || RemoteErrorMessage.Contains("stream not found", StringComparison.OrdinalIgnoreCase)
+                  || RemoteErrorMessage.Contains("baton expired", StringComparison.OrdinalIgnoreCase));
 }
 
 internal sealed class RemoteBatchResult
