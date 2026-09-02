@@ -8,6 +8,42 @@ use crate::vdbe::insn::AggStepData;
 
 use super::*;
 
+fn try_translate_filter_null_check_peek(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+    filter_expr: &Expr,
+    skip_label: BranchOffset,
+) -> Result<bool> {
+    let (is_null_semantics, operand) = match filter_expr {
+        Expr::Binary(e1, Operator::Is, e2) if matches!(e2.as_ref(), Expr::Literal(Literal::Null)) => {
+            (true, e1.as_ref())
+        }
+        Expr::Binary(e1, Operator::IsNot, e2)
+            if matches!(e2.as_ref(), Expr::Literal(Literal::Null)) =>
+        {
+            (false, e1.as_ref())
+        }
+        Expr::IsNull(e) => (true, e.as_ref()),
+        Expr::NotNull(e) => (false, e.as_ref()),
+        _ => return Ok(false),
+    };
+    let Some(target) = try_resolve_peek_target(program, referenced_tables, resolver, operand)?
+    else {
+        return Ok(false);
+    };
+    // Skip the AggStep when the filter is false: for IS NULL that's column NOT
+    // null; for IS NOT NULL, column IS null.
+    let jump_if_column_is_null = !is_null_semantics;
+    program.emit_column_is_null_jump(
+        target.cursor_id,
+        target.column,
+        skip_label,
+        jump_if_column_is_null,
+    );
+    Ok(true)
+}
+
 /// SQLite (and so Turso) processes joins as a nested loop.
 /// The loop may emit rows to various destinations depending on the query:
 /// - a GROUP BY sorter (grouping is done by sorting based on the GROUP BY keys and aggregating while the GROUP BY keys match)
@@ -289,19 +325,27 @@ fn emit_loop_source<'a>(
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
-                    let filter_reg = program.alloc_register();
-                    translate_expr(
+                    if !try_translate_filter_null_check_peek(
                         program,
-                        Some(&plan.table_references),
-                        filter_expr,
-                        filter_reg,
+                        &plan.table_references,
                         &t_ctx.resolver,
-                    )?;
-                    program.emit_insn(Insn::IfNot {
-                        reg: filter_reg,
-                        target_pc: label,
-                        jump_if_null: true,
-                    });
+                        filter_expr,
+                        label,
+                    )? {
+                        let filter_reg = program.alloc_register();
+                        translate_expr(
+                            program,
+                            Some(&plan.table_references),
+                            filter_expr,
+                            filter_reg,
+                            &t_ctx.resolver,
+                        )?;
+                        program.emit_insn(Insn::IfNot {
+                            reg: filter_reg,
+                            target_pc: label,
+                            jump_if_null: true,
+                        });
+                    }
                     Some(label)
                 } else {
                     None

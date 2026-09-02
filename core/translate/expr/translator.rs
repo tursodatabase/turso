@@ -89,6 +89,157 @@ pub fn resolve_expr(
     translate_expr(program, referenced_tables, expr, dest_reg, resolver)
 }
 
+pub(crate) struct ColumnPeekTarget {
+    pub cursor_id: CursorID,
+    pub column: usize,
+}
+
+/// Resolves the cursor and index-remapped column position to read column of table_ref_id.
+/// column_is_virtual must be true for a VIRTUAL generated column: it has a slot in a
+/// non-covering index, but the value is only materialized there when the index is covering.
+fn resolve_column_read_target(
+    program: &ProgramBuilder,
+    table_ref_id: TableInternalId,
+    column: usize,
+    index: Option<&Arc<crate::schema::Index>>,
+    use_covering_index: bool,
+    is_from_outer_query_scope: bool,
+    column_is_virtual: bool,
+) -> Option<(CursorID, usize, bool)> {
+    let (table_cursor_id, index_cursor_id) = if is_from_outer_query_scope {
+        // Due to a limitation of our translation system, a subquery that references an outer
+        // query table cannot know whether a table cursor, index cursor, or both were opened for
+        // that table reference. Hence: currently we first try to resolve a table cursor, and if
+        // that fails, we resolve an index cursor.
+        if let Some(table_cursor_id) =
+            program.resolve_cursor_id_safe(&CursorKey::table(table_ref_id))
+        {
+            (Some(table_cursor_id), None)
+        } else {
+            (
+                None,
+                Some(program.resolve_any_index_cursor_id_for_table(table_ref_id)),
+            )
+        }
+    } else {
+        let table_cursor_id = if use_covering_index {
+            program.resolve_cursor_id_safe(&CursorKey::table(table_ref_id))
+        } else {
+            Some(program.resolve_cursor_id(&CursorKey::table(table_ref_id)))
+        };
+        let index_cursor_id = index
+            .map(|index| program.resolve_cursor_id(&CursorKey::index(table_ref_id, index.clone())));
+        (table_cursor_id, index_cursor_id)
+    };
+
+    let is_btree_index = index_cursor_id
+        .is_some_and(|cid| program.get_cursor_type(cid).is_some_and(|ct| ct.is_index()));
+    let read_from_index = if is_from_outer_query_scope {
+        is_btree_index
+    } else if is_btree_index {
+        let column_is_in_index =
+            index.is_some_and(|idx| idx.column_table_pos_to_index_pos(column).is_some());
+        column_is_in_index && (!column_is_virtual || use_covering_index)
+    } else {
+        false
+    };
+
+    if read_from_index {
+        let index_cursor_id = index_cursor_id?;
+        let index = program.resolve_index_for_cursor_id(index_cursor_id);
+        let index_pos = index.column_table_pos_to_index_pos(column)?;
+        Some((index_cursor_id, index_pos, true))
+    } else {
+        Some((table_cursor_id.or(index_cursor_id)?, column, false))
+    }
+}
+
+/// Excludes rowid-alias columns: an INTEGER PRIMARY KEY column's record payload
+/// stores NULL even though the column itself is never NULL in SQL.
+pub(crate) fn try_resolve_column_peek(
+    program: &ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+    table_ref_id: TableInternalId,
+    column: usize,
+    is_rowid_alias: bool,
+) -> Result<Option<ColumnPeekTarget>> {
+    if is_rowid_alias || program.has_cursor_override(table_ref_id) {
+        return Ok(None);
+    }
+    let Some(referenced_tables) = referenced_tables else {
+        return Ok(None);
+    };
+    let Some(table_reference) = referenced_tables.find_joined_table_by_internal_id(table_ref_id)
+    else {
+        return Ok(None);
+    };
+    if matches!(table_reference.op, Operation::IndexMethodQuery(_)) {
+        return Ok(None);
+    }
+    let index = table_reference.op.index();
+    let use_covering_index = table_reference.utilizes_covering_index();
+
+    let table = &table_reference.table;
+    let Table::BTree(_) = table else {
+        return Ok(None);
+    };
+    let Some(table_column) = table.get_column_at(column) else {
+        return Ok(None);
+    };
+    if table_column.is_generated() {
+        return Ok(None);
+    }
+    // A custom type's DECODE could map a non-null payload to NULL, or vice versa, so raw
+    // record NULL-ness wouldn't reflect the decoded value.
+    if resolver
+        .schema()
+        .get_type_def(&table_column.ty_str, table.is_strict())
+        .is_some()
+    {
+        return Ok(None);
+    }
+
+    let Some((cursor_id, column, _)) =
+        resolve_column_read_target(program, table_ref_id, column, index, use_covering_index, false, false)
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(ColumnPeekTarget { cursor_id, column }))
+}
+
+pub(crate) fn try_resolve_peek_target(
+    program: &ProgramBuilder,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+    expr: &ast::Expr,
+) -> Result<Option<ColumnPeekTarget>> {
+    let ast::Expr::Column {
+        table,
+        column,
+        is_rowid_alias,
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if resolver.column_value_is_register_cached(expr) {
+        return Ok(None);
+    }
+    if !resolver.peek_eligible_columns.contains(&(*table, *column)) {
+        return Ok(None);
+    }
+    try_resolve_column_peek(
+        program,
+        Some(referenced_tables),
+        resolver,
+        *table,
+        *column,
+        *is_rowid_alias,
+    )
+}
+
 /// Translate an expression into bytecode.
 #[turso_macros::trace_stack]
 pub fn translate_expr(
@@ -2374,36 +2525,21 @@ pub fn translate_expr(
                             unreachable!("Either index or table cursor must be opened");
                         }
                     } else {
-                        let is_btree_index = index_cursor_id.is_some_and(|cid| {
-                            program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
-                        });
-                        // For non-outer-scope reads: an index can supply a
-                        // column's value only when the index actually
-                        // stores it. Presence in the index's column list
-                        // (`column_table_pos_to_index_pos`) is necessary
-                        // but not sufficient for VIRTUAL generated
-                        // columns — the index has a slot but the value
-                        // is only materialized when the index is
-                        // covering. For stored columns the slot implies
-                        // the value, so any in-index hit is fine.
-                        let read_from_index = if is_from_outer_query_scope {
-                            is_btree_index
-                        } else if is_btree_index {
-                            let column_is_in_index = index.as_ref().is_some_and(|idx| {
-                                idx.column_table_pos_to_index_pos(*column).is_some()
-                            });
-                            let column_is_virtual = matches!(
-                                table.get_column_at(*column).map(|c| c.generated_type()),
-                                Some(GeneratedType::Virtual { .. })
-                            );
-                            column_is_in_index && (!column_is_virtual || use_covering_index)
-                        } else {
-                            false
-                        };
-
                         let Some(table_column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
+                        let column_is_virtual =
+                            matches!(table_column.generated_type(), GeneratedType::Virtual { .. });
+                        let resolved = resolve_column_read_target(
+                            program,
+                            *table_ref_id,
+                            *column,
+                            index,
+                            use_covering_index,
+                            is_from_outer_query_scope,
+                            column_is_virtual,
+                        );
+                        let read_from_index = resolved.is_some_and(|(_, _, r)| r);
                         match table_column.generated_type() {
                             // if we're reading from an index that contains this virtual column,
                             // the index already has the computed value, so read it from the index
@@ -2433,28 +2569,8 @@ pub fn translate_expr(
                                 program.set_collation(Some((table_column.collation(), false)));
                             }
                             _ => {
-                                let read_cursor = if read_from_index {
-                                    index_cursor_id.expect("index cursor should be opened")
-                                } else {
-                                    table_cursor_id
-                                        .or(index_cursor_id)
-                                        .expect("cursor should be opened")
-                                };
-                                let column = if read_from_index {
-                                    let index = program.resolve_index_for_cursor_id(
-                                        index_cursor_id.expect("index cursor should be opened"),
-                                    );
-                                    index
-                                        .column_table_pos_to_index_pos(*column)
-                                        .unwrap_or_else(|| {
-                                            panic!(
-                                                "index {} does not contain column number {} of table {}",
-                                                index.name, column, table_ref_id
-                                            )
-                                        })
-                                } else {
-                                    *column
-                                };
+                                let (read_cursor, column, _) =
+                                    resolved.expect("cursor should be opened");
 
                                 // For custom type columns with ENCODE/DECODE and a
                                 // default, suppress the Column instruction's default.

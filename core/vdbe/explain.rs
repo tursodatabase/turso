@@ -688,6 +688,66 @@ pub fn insn_to_row(
                     ),
                 )
             }
+            Insn::ColumnIsNullToReg {
+                cursor_id,
+                column,
+                dest,
+                default,
+            } => {
+                let cursor_type = &program.cursor_ref[*cursor_id].1;
+                let column_name: Option<&String> = match cursor_type {
+                    CursorType::BTreeTable(table) => {
+                        table.columns().get(*column).and_then(|v| v.name.as_ref())
+                    }
+                    CursorType::BTreeIndex(index) => index.columns.get(*column).map(|c| &c.name),
+                    _ => None,
+                };
+                (
+                    "ColumnIsNullToReg",
+                    *cursor_id as i64,
+                    *column as i64,
+                    *dest as i64,
+                    default.clone().unwrap_or_else(|| Value::build_text("")),
+                    0,
+                    format!(
+                        "r[{}]=({}.{} IS NULL) (peek, no decode)",
+                        dest,
+                        get_table_or_index_name(*cursor_id),
+                        column_name.map_or_else(|| format!("column {}", *column), |name| name.to_string()),
+                    ),
+                )
+            }
+            Insn::ColumnIsNullJump {
+                cursor_id,
+                column,
+                target_pc,
+                jump_if_column_is_null,
+                default,
+            } => {
+                let cursor_type = &program.cursor_ref[*cursor_id].1;
+                let column_name: Option<&String> = match cursor_type {
+                    CursorType::BTreeTable(table) => {
+                        table.columns().get(*column).and_then(|v| v.name.as_ref())
+                    }
+                    CursorType::BTreeIndex(index) => index.columns.get(*column).map(|c| &c.name),
+                    _ => None,
+                };
+                (
+                    "ColumnIsNullJump",
+                    *cursor_id as i64,
+                    *column as i64,
+                    target_pc.as_debug_int().into(),
+                    default.clone().unwrap_or_else(|| Value::build_text("")),
+                    0,
+                    format!(
+                        "if {}.{} IS {}NULL goto {} (peek, no decode)",
+                        get_table_or_index_name(*cursor_id),
+                        column_name.map_or_else(|| format!("column {}", *column), |name| name.to_string()),
+                        if *jump_if_column_is_null { "" } else { "NOT " },
+                        target_pc.as_debug_int(),
+                    ),
+                )
+            }
             Insn::ColumnHasField {
                 cursor_id,
                 column,

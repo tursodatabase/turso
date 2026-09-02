@@ -52,8 +52,8 @@ use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
-    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup, VacuumOpState,
+    registers_to_ref_values, BranchOffset, DeferredSeekState, EndStatement, OpHashBuildState,
+    OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -1897,6 +1897,65 @@ pub fn op_column_range(
     )
 }
 
+pub fn op_column_is_null_to_reg(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        ColumnIsNullToReg {
+            cursor_id,
+            column,
+            dest,
+            default,
+        },
+        insn
+    );
+    op_column_impl(
+        program,
+        state,
+        *cursor_id,
+        ColumnFetch::ProbeToReg {
+            column: *column,
+            dest: *dest,
+            default,
+        },
+    )
+}
+
+pub fn op_column_is_null_jump(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        ColumnIsNullJump {
+            cursor_id,
+            column,
+            target_pc,
+            jump_if_column_is_null,
+            default,
+        },
+        insn
+    );
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
+    op_column_impl(
+        program,
+        state,
+        *cursor_id,
+        ColumnFetch::ProbeJump {
+            column: *column,
+            target_pc: *target_pc,
+            jump_if_column_is_null: *jump_if_column_is_null,
+            default,
+        },
+    )
+}
+
 /// What a Column-family instruction fetches once the cursor is positioned.
 #[derive(Clone, Copy)]
 enum ColumnFetch<'a> {
@@ -1912,10 +1971,21 @@ enum ColumnFetch<'a> {
         dest: usize,
         defaults: &'a [Option<Value>],
     },
+    ProbeToReg {
+        column: usize,
+        dest: usize,
+        default: &'a Option<Value>,
+    },
+    ProbeJump {
+        column: usize,
+        target_pc: BranchOffset,
+        jump_if_column_is_null: bool,
+        default: &'a Option<Value>,
+    },
 }
 
 impl ColumnFetch<'_> {
-    /// Writes NULL to every destination register of this fetch.
+    /// Row-not-found is treated as NULL; ProbeJump resolves its jump here instead of writing a register.
     fn write_null_regs(&self, state: &mut ProgramState) {
         match *self {
             ColumnFetch::Single { dest, .. } => state.registers[dest].set_null(),
@@ -1924,7 +1994,25 @@ impl ColumnFetch<'_> {
                     .iter_mut()
                     .for_each(|reg| reg.set_null());
             }
+            ColumnFetch::ProbeToReg { dest, .. } => {
+                state.registers[dest].set_null();
+            }
+            ColumnFetch::ProbeJump {
+                target_pc,
+                jump_if_column_is_null,
+                ..
+            } => {
+                state.pc = if jump_if_column_is_null {
+                    target_pc.as_offset_int()
+                } else {
+                    state.pc + 1
+                };
+            }
         }
+    }
+
+    fn handles_own_pc(&self) -> bool {
+        matches!(self, ColumnFetch::ProbeJump { .. })
     }
 
     fn fetch(&self, program: &Program, state: &mut ProgramState, cursor_id: usize) -> InsnResult {
@@ -1939,6 +2027,25 @@ impl ColumnFetch<'_> {
                 dest,
                 defaults,
             } => op_column_range_fetch(program, state, cursor_id, start_column, dest, defaults),
+            ColumnFetch::ProbeToReg {
+                column,
+                dest,
+                default,
+            } => op_column_probe_to_reg(program, state, cursor_id, column, dest, default),
+            ColumnFetch::ProbeJump {
+                column,
+                target_pc,
+                jump_if_column_is_null,
+                default,
+            } => op_column_probe_jump(
+                program,
+                state,
+                cursor_id,
+                column,
+                target_pc,
+                jump_if_column_is_null,
+                default,
+            ),
         }
     }
 }
@@ -1956,7 +2063,7 @@ fn op_column_impl(
     // resume the slot is still idle and this path re-executes.
     if state.active_op_state.is_idle() && state.deferred_seeks[cursor_id].is_none() {
         let result = fetch.fetch(program, state, cursor_id)?;
-        if matches!(result, InsnFunctionStepResult::Step) {
+        if matches!(result, InsnFunctionStepResult::Step) && !fetch.handles_own_pc() {
             state.pc += 1;
         }
         return Ok(result);
@@ -2032,7 +2139,9 @@ fn op_column_impl(
     }
 
     state.active_op_state.clear();
-    state.pc += 1;
+    if !fetch.handles_own_pc() {
+        state.pc += 1;
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -2174,6 +2283,127 @@ fn op_column_fetch(
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
         }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Whether a short record's missing column would read as NULL, per its
+/// DEFAULT. Mirrors apply_column_default's nullness outcome.
+fn is_default_null(default: &Option<Value>) -> bool {
+    !matches!(default, Some(v) if !matches!(v, Value::Null))
+}
+
+fn column_probe_is_null(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    column: usize,
+    default: &Option<Value>,
+    opcode_name: &'static str,
+) -> Result<IOResult<bool>> {
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
+    match cursor_type {
+        CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
+            let cursor_ref = must_be_btree_cursor!(cursor_id, program.cursor_ref, state, opcode_name);
+            if matches!(cursor_ref, Cursor::NullRow) {
+                Ok(IOResult::Done(true))
+            } else {
+                let cursor = cursor_ref.as_btree_mut();
+                if cursor.get_null_flag() {
+                    Ok(IOResult::Done(true))
+                } else {
+                    let record = match cursor.record()? {
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        IOResult::Done(record) => record,
+                    };
+                    let is_null = match record {
+                        None => true,
+                        Some(record) => {
+                            let mut payload_iterator = record.iter()?;
+                            match payload_iterator.nth_is_null(column) {
+                                Some(result) => result?,
+                                None => is_default_null(default),
+                            }
+                        }
+                    };
+                    Ok(IOResult::Done(is_null))
+                }
+            }
+        }
+        CursorType::Pseudo(_) => {
+            let content_reg = crate::get_cursor!(state, cursor_id)
+                .as_pseudo_mut()
+                .content_reg();
+            let is_null = match &state.registers[content_reg] {
+                Register::Record(record) => {
+                    let mut payload_iterator = record.iter()?;
+                    match payload_iterator.nth_is_null(column) {
+                        Some(result) => result?,
+                        None => {
+                            turso_debug_assert!(
+                                false,
+                                "pseudo-cursor column out of range for record",
+                                { "column": column }
+                            );
+                            is_default_null(default)
+                        }
+                    }
+                }
+                _ => true,
+            };
+            Ok(IOResult::Done(is_null))
+        }
+        other => unreachable!(
+            "{opcode_name} emitted for unsupported cursor type {other:?}; the translator's peek-eligibility gate should have excluded it"
+        ),
+    }
+}
+
+fn op_column_probe_to_reg(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    column: usize,
+    dest: usize,
+    default: &Option<Value>,
+) -> InsnResult {
+    let is_null = return_if_io!(column_probe_is_null(
+        program,
+        state,
+        cursor_id,
+        column,
+        default,
+        "ColumnIsNullToReg",
+    ));
+    let value = if is_null { Value::Null } else { Value::from_i64(0) };
+    state.registers[dest].set_value(value);
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn op_column_probe_jump(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    column: usize,
+    target_pc: BranchOffset,
+    jump_if_column_is_null: bool,
+    default: &Option<Value>,
+) -> InsnResult {
+    let is_null = return_if_io!(column_probe_is_null(
+        program,
+        state,
+        cursor_id,
+        column,
+        default,
+        "ColumnIsNullJump",
+    ));
+    if is_null == jump_if_column_is_null {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
 }

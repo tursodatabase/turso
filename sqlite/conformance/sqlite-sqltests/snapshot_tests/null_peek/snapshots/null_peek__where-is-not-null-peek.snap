@@ -1,0 +1,26 @@
+---
+source: null_peek.sqltest
+expression: SELECT id FROM t WHERE val IS NOT NULL;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - t
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t
+
+BYTECODE
+addr  opcode              p1  p2  p3  p4          p5  comment
+   0  Init                 0   8   0               0  Start at 8
+   1  OpenRead             0   2   0  k(3,B,B,B)   0  table=t, root=2, iDb=0
+   2  Rewind               0   7   0               0  Rewind table t
+   3    ColumnIsNullJump   0   2   6               0  if t.val IS NULL goto 6 (peek, no decode)
+   4    RowId              0   1   0               0  r[1]=t.rowid
+   5    ResultRow          1   1   0               0  output=r[1]
+   6  Next                 0   3   0               1
+   7  Halt                 0   0   0               0
+   8  Transaction          0   1   1               0  iDb=0 tx_mode=Read
+   9  Goto                 0   1   0               0

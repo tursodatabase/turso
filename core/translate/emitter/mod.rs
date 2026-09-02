@@ -208,6 +208,7 @@ pub struct Resolver<'a> {
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
     unqualified_database_search_path: Option<Vec<String>>,
+    pub(crate) peek_eligible_columns: std::rc::Rc<HashSet<(TableInternalId, usize)>>,
 }
 
 #[derive(Clone)]
@@ -324,6 +325,7 @@ impl<'a> Resolver<'a> {
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
+            peek_eligible_columns: std::rc::Rc::new(HashSet::default()),
         }
     }
 
@@ -369,6 +371,7 @@ impl<'a> Resolver<'a> {
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            peek_eligible_columns: self.peek_eligible_columns.clone(),
         }
     }
 
@@ -396,6 +399,7 @@ impl<'a> Resolver<'a> {
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            peek_eligible_columns: self.peek_eligible_columns.clone(),
         }
     }
 
@@ -617,6 +621,12 @@ impl<'a> Resolver<'a> {
         } else {
             None
         }
+    }
+
+    /// A cached register (e.g. a hash-join build-side register) may not reflect the cursor's
+    /// current row; peeking the cursor directly in that case reads the wrong row.
+    pub fn column_value_is_register_cached(&self, expr: &ast::Expr) -> bool {
+        self.resolve_cached_expr_reg(expr).is_some()
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

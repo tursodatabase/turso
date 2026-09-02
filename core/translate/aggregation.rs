@@ -16,7 +16,7 @@ use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        try_resolve_peek_target, ConditionMetadata, NoConstantOptReason,
     },
     plan::{
         Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
@@ -252,6 +252,32 @@ pub fn handle_distinct(
     });
 }
 
+/// Skips DISTINCT: a placeholder peek would collapse every distinct non-null
+/// value into the same value, breaking the distinct count.
+fn try_count_col_peek(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+    agg_arg_source: &AggArgumentSource,
+) -> Result<Option<usize>> {
+    let AggArgumentSource::Expression {
+        args, distinctness, ..
+    } = agg_arg_source
+    else {
+        return Ok(None);
+    };
+    if !matches!(distinctness, Distinctness::NonDistinct) {
+        return Ok(None);
+    }
+    let Some(target) = try_resolve_peek_target(program, referenced_tables, resolver, &args[0])?
+    else {
+        return Ok(None);
+    };
+    let dest = program.alloc_register();
+    program.emit_column_is_null_to_reg(target.cursor_id, target.column, dest);
+    Ok(Some(dest))
+}
+
 /// Source of aggregate function arguments during bytecode emission.
 ///
 /// * `Register`: arguments were pre-computed into contiguous registers
@@ -401,7 +427,10 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("count bad number of arguments");
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let expr_reg = match try_count_col_peek(program, referenced_tables, resolver, &agg_arg_source)? {
+                Some(reg) => reg,
+                None => agg_arg_source.translate(program, referenced_tables, resolver, 0)?,
+            };
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {

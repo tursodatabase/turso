@@ -1751,6 +1751,9 @@ impl ProgramBuilder {
                     resolve(pc_if_empty, "IndexMethodQuery")?;
                 }
                 Insn::IsNull { reg: _, target_pc } => resolve(target_pc, "IsNull")?,
+                Insn::ColumnIsNullJump { target_pc, .. } => {
+                    resolve(target_pc, "ColumnIsNullJump")?;
+                }
                 Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext")?,
                 Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter")?,
                 Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead")?,
@@ -2165,6 +2168,24 @@ impl ProgramBuilder {
     }
 
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
+        let (physical_column, default) = self.resolve_column_physical_and_default(cursor_id, column);
+
+        self.emit_insn(Insn::Column {
+            cursor_id,
+            column: physical_column,
+            dest: out,
+            default,
+        });
+    }
+
+    /// Resolves a logical column index to its physical position (BTreeTable cursors only,
+    /// due to ALTER TABLE DROP COLUMN) and computes the short-record DEFAULT, consuming the
+    /// one-shot suppress_column_default flag.
+    fn resolve_column_physical_and_default(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+    ) -> (usize, Option<Value>) {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
 
         if let CursorType::BTreeTable(btree) = cursor_type {
@@ -2237,10 +2258,38 @@ impl ProgramBuilder {
             default
         };
 
-        self.emit_insn(Insn::Column {
+        (physical_column, default)
+    }
+
+    /// Emits Insn::ColumnIsNullJump without decoding the column. Callers are responsible
+    /// for the peek-eligibility gates (rowid alias, generated columns, custom types, cursor
+    /// type).
+    pub fn emit_column_is_null_jump(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        target_pc: BranchOffset,
+        jump_if_column_is_null: bool,
+    ) {
+        let (physical_column, default) = self.resolve_column_physical_and_default(cursor_id, column);
+        self.emit_insn(Insn::ColumnIsNullJump {
             cursor_id,
             column: physical_column,
-            dest: out,
+            target_pc,
+            jump_if_column_is_null,
+            default,
+        });
+    }
+
+    /// Emits Insn::ColumnIsNullToReg, writing a value derived from the column's nullness to
+    /// dest without decoding the payload. See emit_column_is_null_jump for the eligibility
+    /// caveat.
+    pub fn emit_column_is_null_to_reg(&mut self, cursor_id: CursorID, column: usize, dest: usize) {
+        let (physical_column, default) = self.resolve_column_physical_and_default(cursor_id, column);
+        self.emit_insn(Insn::ColumnIsNullToReg {
+            cursor_id,
+            column: physical_column,
+            dest,
             default,
         });
     }

@@ -209,6 +209,31 @@ pub(super) fn translate_in_list(
     Ok(())
 }
 
+fn try_translate_null_check_peek(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+    operand: &ast::Expr,
+    is_null_semantics: bool,
+    condition_metadata: ConditionMetadata,
+) -> Result<bool> {
+    let Some(target) = try_resolve_peek_target(program, referenced_tables, resolver, operand)?
+    else {
+        return Ok(false);
+    };
+    let (jump_if_column_is_null, target_pc) = match (
+        is_null_semantics,
+        condition_metadata.jump_if_condition_is_true,
+    ) {
+        (true, true) => (true, condition_metadata.jump_target_when_true),
+        (true, false) => (false, condition_metadata.jump_target_when_false),
+        (false, true) => (false, condition_metadata.jump_target_when_true),
+        (false, false) => (true, condition_metadata.jump_target_when_false),
+    };
+    program.emit_column_is_null_jump(target.cursor_id, target.column, target_pc, jump_if_column_is_null);
+    Ok(true)
+}
+
 #[instrument(skip(program, referenced_tables, expr, resolver), level = Level::DEBUG)]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
@@ -361,35 +386,53 @@ pub fn translate_condition_expr(
         ast::Expr::Binary(e1, ast::Operator::Is, e2)
             if matches!(e2.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
         {
-            let cur_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
-            if condition_metadata.jump_if_condition_is_true {
-                program.emit_insn(Insn::IsNull {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_true,
-                });
-            } else {
-                program.emit_insn(Insn::NotNull {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                });
+            if !try_translate_null_check_peek(
+                program,
+                referenced_tables,
+                resolver,
+                e1,
+                true,
+                condition_metadata,
+            )? {
+                let cur_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
+                if condition_metadata.jump_if_condition_is_true {
+                    program.emit_insn(Insn::IsNull {
+                        reg: cur_reg,
+                        target_pc: condition_metadata.jump_target_when_true,
+                    });
+                } else {
+                    program.emit_insn(Insn::NotNull {
+                        reg: cur_reg,
+                        target_pc: condition_metadata.jump_target_when_false,
+                    });
+                }
             }
         }
         ast::Expr::Binary(e1, ast::Operator::IsNot, e2)
             if matches!(e2.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
         {
-            let cur_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
-            if condition_metadata.jump_if_condition_is_true {
-                program.emit_insn(Insn::NotNull {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_true,
-                });
-            } else {
-                program.emit_insn(Insn::IsNull {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                });
+            if !try_translate_null_check_peek(
+                program,
+                referenced_tables,
+                resolver,
+                e1,
+                false,
+                condition_metadata,
+            )? {
+                let cur_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
+                if condition_metadata.jump_if_condition_is_true {
+                    program.emit_insn(Insn::NotNull {
+                        reg: cur_reg,
+                        target_pc: condition_metadata.jump_target_when_true,
+                    });
+                } else {
+                    program.emit_insn(Insn::IsNull {
+                        reg: cur_reg,
+                        target_pc: condition_metadata.jump_target_when_false,
+                    });
+                }
             }
         }
         ast::Expr::Binary(e1, op, e2) => {
@@ -515,33 +558,51 @@ pub fn translate_condition_expr(
             }
         }
         ast::Expr::NotNull(expr) => {
-            let cur_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), expr, cur_reg, resolver)?;
-            if condition_metadata.jump_if_condition_is_true {
-                program.emit_insn(Insn::NotNull {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_true,
-                });
-            } else {
-                program.emit_insn(Insn::IsNull {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                });
+            if !try_translate_null_check_peek(
+                program,
+                referenced_tables,
+                resolver,
+                expr,
+                false,
+                condition_metadata,
+            )? {
+                let cur_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), expr, cur_reg, resolver)?;
+                if condition_metadata.jump_if_condition_is_true {
+                    program.emit_insn(Insn::NotNull {
+                        reg: cur_reg,
+                        target_pc: condition_metadata.jump_target_when_true,
+                    });
+                } else {
+                    program.emit_insn(Insn::IsNull {
+                        reg: cur_reg,
+                        target_pc: condition_metadata.jump_target_when_false,
+                    });
+                }
             }
         }
         ast::Expr::IsNull(expr) => {
-            let cur_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), expr, cur_reg, resolver)?;
-            if condition_metadata.jump_if_condition_is_true {
-                program.emit_insn(Insn::IsNull {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_true,
-                });
-            } else {
-                program.emit_insn(Insn::NotNull {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                });
+            if !try_translate_null_check_peek(
+                program,
+                referenced_tables,
+                resolver,
+                expr,
+                true,
+                condition_metadata,
+            )? {
+                let cur_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), expr, cur_reg, resolver)?;
+                if condition_metadata.jump_if_condition_is_true {
+                    program.emit_insn(Insn::IsNull {
+                        reg: cur_reg,
+                        target_pc: condition_metadata.jump_target_when_true,
+                    });
+                } else {
+                    program.emit_insn(Insn::NotNull {
+                        reg: cur_reg,
+                        target_pc: condition_metadata.jump_target_when_false,
+                    });
+                }
             }
         }
         ast::Expr::Unary(_, _) => {

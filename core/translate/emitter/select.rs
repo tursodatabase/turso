@@ -18,7 +18,7 @@ use crate::{
             Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
             SimpleAggregate,
         },
-        planner::table_mask_from_expr,
+        planner::{compute_peek_eligible_columns, table_mask_from_expr},
         select::emit_simple_count,
         subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
         values::emit_values,
@@ -82,6 +82,9 @@ pub fn emit_query<'a>(
 ) -> Result<usize> {
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
+
+    t_ctx.resolver.peek_eligible_columns =
+        std::rc::Rc::new(compute_peek_eligible_columns(plan));
 
     // Register parameters from EXISTS subquery result columns that were dropped
     // during semi/anti-join unnesting. No code is emitted for these, but the

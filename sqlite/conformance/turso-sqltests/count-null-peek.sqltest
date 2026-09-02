@@ -1,0 +1,277 @@
+@database :memory:
+
+# tursodatabase/turso#4921: COUNT(col), WHERE col IS [NOT] NULL, and
+# FILTER (WHERE col IS NULL) can determine the answer from a column's NULL-ness
+# alone, without decoding its payload. These tests pin correctness for the
+# peek path, plus every case that must always fall back to full decode.
+
+test count-col-with-nulls {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+    INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', NULL), (3, 'b', 'y'), (4, 'b', NULL), (5, 'b', NULL);
+
+    SELECT count(val) FROM t;
+}
+expect {
+    2
+}
+
+test count-col-grouped-with-nulls {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+    INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', NULL), (3, 'b', 'y'), (4, 'b', NULL), (5, 'b', NULL);
+
+    SELECT g, count(val) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    a|1
+    b|1
+}
+
+test count-col-all-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL);
+
+    SELECT count(val) FROM t;
+}
+expect {
+    0
+}
+
+test count-col-blob-with-nulls {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val BLOB);
+    INSERT INTO t VALUES (1, X'0102'), (2, NULL), (3, X'0304');
+
+    SELECT count(val) FROM t;
+}
+expect {
+    2
+}
+
+test where-is-null-basic {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+    INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', NULL), (3, 'b', 'y'), (4, 'b', NULL);
+
+    SELECT id FROM t WHERE val IS NULL ORDER BY id;
+}
+expect {
+    2
+    4
+}
+
+test where-is-not-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+    INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', NULL), (3, 'b', 'y'), (4, 'b', NULL);
+
+    SELECT id FROM t WHERE val IS NOT NULL ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test where-isnull-notnull-keyword-syntax {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'y'), (4, NULL);
+
+    SELECT id FROM t WHERE val ISNULL ORDER BY id;
+    SELECT id FROM t WHERE val NOTNULL ORDER BY id;
+}
+expect {
+    2
+    4
+    1
+    3
+}
+
+# max(val) is a function call, not a bare column, so this never reaches the
+# peek path; it pins that peek must not incorrectly fire on a non-column
+# HAVING operand.
+test having-is-null-on-non-column-operand {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+    INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', NULL), (3, 'b', NULL), (4, 'b', NULL);
+
+    SELECT g FROM t GROUP BY g HAVING max(val) IS NULL ORDER BY g;
+}
+expect {
+    b
+}
+
+# A bare column in HAVING that also appears in GROUP BY is register-cached
+# for the group comparison, so peek is skipped in favor of the cached value
+# even though it would otherwise be peek-eligible.
+test having-is-null-bare-column-register-cached-not-peeked {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+    INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', 'y'), (3, NULL, 'z');
+
+    SELECT count(*) FROM t GROUP BY g HAVING g IS NULL;
+}
+expect {
+    1
+}
+
+test filter-count-is-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+    INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', NULL), (3, 'b', 'y'), (4, 'b', NULL), (5, 'b', NULL);
+
+    SELECT count(*) FILTER (WHERE val IS NULL) FROM t;
+}
+expect {
+    3
+}
+
+test filter-count-is-not-null-grouped {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+    INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', NULL), (3, 'b', 'y'), (4, 'b', NULL), (5, 'b', NULL);
+
+    SELECT g, count(*) FILTER (WHERE val IS NOT NULL) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    a|1
+    b|1
+}
+
+# Short records: a row written before ALTER TABLE ADD COLUMN has no byte
+# for the new column at all. The peek path must decide nullness from the
+# column's DEFAULT, not from the absence of a payload byte.
+
+test count-and-is-null-short-record-non-null-default {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    ALTER TABLE t ADD COLUMN w TEXT DEFAULT 'hello';
+    INSERT INTO t VALUES (3, 'c', 'world');
+
+    SELECT count(w) FROM t;
+    SELECT id FROM t WHERE w IS NULL ORDER BY id;
+}
+expect {
+    3
+}
+
+test count-and-is-null-short-record-null-default {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    ALTER TABLE t ADD COLUMN w TEXT;
+    INSERT INTO t VALUES (3, 'c', 'present');
+
+    SELECT count(w) FROM t;
+    SELECT id FROM t WHERE w IS NULL ORDER BY id;
+}
+expect {
+    1
+    1
+    2
+}
+
+# Hard exclusions: these must always fall back to full column decode.
+
+# A custom type's DECODE can map a non-null stored payload to a NULL logical
+# value (here, 42 decodes to NULL), so peeking the raw record NULL-ness would
+# answer wrong.
+@requires strict "uses STRICT tables"
+test custom-type-decode-never-peeked {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val tricky) STRICT;
+    INSERT INTO t VALUES (1, 10), (2, 42), (3, 99);
+
+    SELECT count(val) FROM t;
+    SELECT id FROM t WHERE val IS NULL ORDER BY id;
+}
+expect {
+    2
+    2
+}
+
+# An INTEGER PRIMARY KEY column's value lives in the btree key, not the record
+# payload (the payload slot is NULL), so it must never be peeked, or
+# COUNT(int_pk) / int_pk IS NULL would be silently wrong.
+test rowid-alias-column-never-peeked {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');
+
+    SELECT count(id) FROM t;
+    SELECT count(*) FROM t WHERE id IS NULL;
+    SELECT count(*) FROM t WHERE id IS NOT NULL;
+    SELECT count(*) FILTER (WHERE id IS NULL) FROM t;
+}
+expect {
+    3
+    0
+    3
+    0
+}
+
+# On a single table, the optimizer constant-folds "rowid_alias IS NULL" to
+# false before peek code ever runs, so the test above never actually
+# exercises the rowid-alias exclusion at runtime. Under a LEFT JOIN,
+# a matched right-hand row still has a NULL payload slot for its rowid-alias
+# column (the value lives in the rowid, not the payload) while an unmatched,
+# null-extended row is genuinely NULL; only checking the exclusion at
+# runtime tells these two cases apart.
+test rowid-alias-column-never-peeked-under-left-join {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE r(id INTEGER PRIMARY KEY, lid INTEGER);
+    INSERT INTO l VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    INSERT INTO r VALUES (1, 1), (2, 3);
+
+    SELECT l.id FROM l LEFT JOIN r ON r.lid = l.id WHERE r.id IS NULL ORDER BY l.id;
+}
+expect {
+    2
+}
+
+# COUNT(DISTINCT col) hashes the actual decoded value; the peek's placeholder
+# value would collapse every non-null value into one bucket.
+test count-distinct-col-never-peeked {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, NULL), (5, 'z');
+
+    SELECT count(DISTINCT val) FROM t;
+}
+expect {
+    3
+}
+
+# A column read through a covering index must remap to the index-column
+# ordinal before peeking, exactly like the existing Column opcode does.
+test covering-index-count-col {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX t_val ON t(val);
+    INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'y'), (4, NULL), (5, 'z');
+
+    SELECT count(val) FROM t;
+    SELECT id FROM t WHERE val IS NULL ORDER BY id;
+}
+expect {
+    3
+    2
+    4
+}
+
+# A VIRTUAL generated column is computed from its expression, not read from
+# the record payload at all; it must never be peeked.
+test virtual-generated-column-never-peeked {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL);
+    INSERT INTO t VALUES (1, 5), (2, NULL), (3, 10);
+
+    SELECT count(b) FROM t;
+    SELECT id FROM t WHERE b IS NULL ORDER BY id;
+}
+expect {
+    2
+    2
+}
+
+# A column referenced more than once in the statement is not profitable to
+# peek (the decoded value is still needed elsewhere); correctness must hold
+# either way.
+test column-referenced-elsewhere-not-peeked-but-correct {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'y'), (4, NULL);
+
+    SELECT count(val), val FROM t WHERE val IS NOT NULL GROUP BY val ORDER BY val;
+}
+expect {
+    1|x
+    1|y
+}

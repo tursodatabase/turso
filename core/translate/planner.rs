@@ -7,7 +7,7 @@ use super::{
     plan::{
         Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        Plan, QueryDestination, ResultSetColumn, Scan, SelectPlan, TableReferences, WhereTerm,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -487,6 +487,67 @@ fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
 
 /// Valid ways to refer to the rowid of a btree table.
 pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
+
+/// Profitability heuristic only; correctness (cursor type, rowid alias, generated
+/// columns, DISTINCT, ...) is enforced independently at each call site.
+pub(crate) fn compute_peek_eligible_columns(
+    plan: &SelectPlan,
+) -> rustc_hash::FxHashSet<(TableInternalId, usize)> {
+    let mut counts: rustc_hash::FxHashMap<(TableInternalId, usize), usize> =
+        rustc_hash::FxHashMap::default();
+    // Skip aggregate args (e.g. val in COUNT(val)); counted separately via plan.aggregates.
+    let is_extracted_aggregate_call = |e: &Expr| {
+        matches!(e, Expr::FunctionCall { .. } | Expr::FunctionCallStar { .. })
+            && plan
+                .aggregates
+                .iter()
+                .any(|agg| exprs_are_equivalent(e, &agg.original_expr))
+    };
+    let mut count_top_level_expr = |expr: &Expr| {
+        let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+            if is_extracted_aggregate_call(e) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if let Expr::Column { table, column, .. } = e {
+                *counts.entry((*table, *column)).or_insert(0) += 1;
+            }
+            Ok(WalkControl::Continue)
+        });
+    };
+
+    for result_column in &plan.result_columns {
+        count_top_level_expr(&result_column.expr);
+    }
+    for where_term in &plan.where_clause {
+        count_top_level_expr(&where_term.expr);
+    }
+    if let Some(group_by) = &plan.group_by {
+        for expr in &group_by.exprs {
+            count_top_level_expr(expr);
+        }
+        if let Some(having) = &group_by.having {
+            for expr in having {
+                count_top_level_expr(expr);
+            }
+        }
+    }
+    for (expr, _, _) in &plan.order_by {
+        count_top_level_expr(expr);
+    }
+    for aggregate in &plan.aggregates {
+        for arg in &aggregate.args {
+            count_top_level_expr(arg);
+        }
+        if let Some(filter_expr) = &aggregate.filter_expr {
+            count_top_level_expr(filter_expr);
+        }
+    }
+
+    counts
+        .into_iter()
+        .filter_map(|(key, count)| (count == 1).then_some(key))
+        .collect()
+}
 
 /// This function walks the expression tree and identifies aggregate
 /// and window functions.

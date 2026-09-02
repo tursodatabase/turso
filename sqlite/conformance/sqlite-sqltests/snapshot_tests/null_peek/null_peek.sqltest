@@ -1,0 +1,31 @@
+# tursodatabase/turso#4921: pins presence of the peek-only opcodes
+# (ColumnIsNullToReg/ColumnIsNullJump) in EXPLAIN output for the four call
+# sites below. If a future change regresses the optimization, these snapshots
+# fail with a diff showing Column/IsNull/NotNull instead.
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup t {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, val TEXT);
+}
+
+@setup t
+snapshot count-col-peek {
+    SELECT count(val) FROM t;
+}
+
+@setup t
+snapshot where-is-null-peek {
+    SELECT id FROM t WHERE val IS NULL;
+}
+
+@setup t
+snapshot where-is-not-null-peek {
+    SELECT id FROM t WHERE val IS NOT NULL;
+}
+
+@setup t
+snapshot filter-is-null-peek {
+    SELECT count(*) FILTER (WHERE val IS NULL) FROM t;
+}

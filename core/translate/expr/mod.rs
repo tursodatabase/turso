@@ -104,6 +104,7 @@ pub use metadata::ConditionMetadata;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };
+pub(crate) use translator::try_resolve_peek_target;
 pub use utils::{
     as_binary_components, maybe_apply_affinity, sanitize_string, truth_test_rhs, unwrap_parens,
     unwrap_parens_owned,

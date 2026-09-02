@@ -1,4 +1,4 @@
-use turso_parser::ast::{Expr, SortOrder, TableInternalId};
+use turso_parser::ast::{Expr, Literal, Operator, SortOrder, TableInternalId};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -8,8 +8,8 @@ use super::{
     },
     expr::{
         expr_references_outer_query, expr_references_subquery_id, translate_condition_expr,
-        translate_expr, translate_expr_no_constant_opt, walk_expr, ConditionMetadata,
-        NoConstantOptReason, WalkControl,
+        translate_expr, translate_expr_no_constant_opt, try_resolve_peek_target, walk_expr,
+        ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::{constraints::BinaryExprSide, Optimizable},

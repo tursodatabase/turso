@@ -3395,6 +3395,9 @@ pub trait ValueIteratorExt {
     /// has fewer elements; registers past the returned count are left untouched.
     fn decode_into_registers_after(&mut self, skip: usize, dests: &mut [Register])
         -> Result<usize>;
+
+    /// None means a short record (e.g. pre-dating an ALTER TABLE ADD COLUMN); caller must then fall back to a full decode, since nullness there depends on the schema default.
+    fn nth_is_null(&mut self, n: usize) -> Option<Result<bool>>;
 }
 
 impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
@@ -3610,6 +3613,65 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         Some(Ok(()))
     }
 
+    #[inline(always)]
+    fn nth_is_null(&mut self, n: usize) -> Option<Result<bool>> {
+        use crate::storage::sqlite3_ondisk::read_varint;
+        use crate::types::get_serial_type_size;
+
+        let mut header = self.header_section_ref();
+        let mut data = self.data_section_ref();
+
+        let mut data_sum = 0;
+        for _ in 0..n {
+            if header.is_empty() {
+                return None;
+            }
+
+            let (serial_type, bytes_read) = match read_varint(header) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            header = &header[bytes_read..];
+
+            data_sum += match get_serial_type_size(serial_type) {
+                Ok(size) => size,
+                Err(e) => return Some(Err(e)),
+            };
+        }
+
+        if data_sum > data.len() {
+            return Some(Err(LimboError::Corrupt(
+                "Data section too small for indicated serial type size".into(),
+            )));
+        }
+        data = &data[data_sum..];
+
+        // Serial type 0 alone determines NULL-ness; payload bytes are never touched.
+        if header.is_empty() {
+            return None;
+        }
+
+        let (serial_type, bytes_read) = match read_varint(header) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        self.set_header_section(&header[bytes_read..]);
+
+        // Skip past the element by size, without reading it, so the iterator stays valid.
+        let elem_size = match get_serial_type_size(serial_type) {
+            Ok(size) => size,
+            Err(e) => return Some(Err(e)),
+        };
+        if elem_size > data.len() {
+            return Some(Err(LimboError::Corrupt(
+                "Data section too small for indicated serial type size".into(),
+            )));
+        }
+        self.set_data_section(&data[elem_size..]);
+
+        Some(Ok(serial_type == 0))
+    }
+
     #[inline]
     fn decode_into_registers_after(
         &mut self,
@@ -3664,6 +3726,56 @@ mod tests {
             ),
             "unexpected result: {result:?}"
         );
+    }
+
+    #[test]
+    fn nth_is_null_matches_nth_into_register_across_every_serial_type() {
+        use crate::types::Record;
+
+        let values = std::vec![
+            Value::Null,
+            Value::from_i64(5),                // I8
+            Value::from_i64(1_000),             // I16
+            Value::from_i64(100_000),           // I24
+            Value::from_i64(10_000_000),        // I32
+            Value::from_i64(1_i64 << 40),        // I48
+            Value::from_i64(i64::MAX),          // I64
+            Value::from_f64(1.5),               // F64
+            Value::from_i64(0),                 // CONST_INT0
+            Value::from_i64(1),                 // CONST_INT1
+            Value::Text(Text::new("hello")),
+            Value::from_slice(&[1, 2, 3]).unwrap(),
+            Value::Null,
+        ];
+
+        let mut buf = std::vec::Vec::new();
+        Record::new(values.clone()).serialize(&mut buf);
+
+        for (i, v) in values.iter().enumerate() {
+            let mut peek_iter = crate::types::ValueIterator::new(&buf).unwrap();
+            let is_null = peek_iter
+                .nth_is_null(i)
+                .unwrap_or_else(|| panic!("index {i} should be present"))
+                .unwrap_or_else(|e| panic!("index {i}: unexpected parse error: {e:?}"));
+
+            let mut decode_iter = crate::types::ValueIterator::new(&buf).unwrap();
+            let mut dest = Register::Value(Value::Null);
+            decode_iter
+                .nth_into_register(i, &mut dest)
+                .unwrap_or_else(|| panic!("index {i} should be present"))
+                .unwrap_or_else(|e| panic!("index {i}: unexpected decode error: {e:?}"));
+            let fully_decoded_is_null = matches!(dest, Register::Value(Value::Null));
+
+            assert_eq!(
+                is_null, fully_decoded_is_null,
+                "index {i} ({v:?}): nth_is_null disagreed with a full decode"
+            );
+            assert_eq!(is_null, matches!(v, Value::Null), "index {i}: {v:?}");
+        }
+
+        // Short record must report None (not assume NULL); a schema DEFAULT can be non-null.
+        let mut iter = crate::types::ValueIterator::new(&buf).unwrap();
+        assert!(iter.nth_is_null(values.len()).is_none());
     }
 
     #[test]

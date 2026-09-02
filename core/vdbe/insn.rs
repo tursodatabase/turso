@@ -702,6 +702,23 @@ pub enum Insn {
         defaults: Vec<Option<Value>>,
     },
 
+    ColumnIsNullJump {
+        cursor_id: CursorID,
+        column: usize,
+        target_pc: BranchOffset,
+        jump_if_column_is_null: bool,
+        /// Same role as Column's default field.
+        default: Option<Value>,
+    },
+
+    /// dest gets Value::Null or a placeholder, never the real value; safe only if the caller checks solely for Value::Null.
+    ColumnIsNullToReg {
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+        default: Option<Value>,
+    },
+
     /// Jump to `target_pc` if the cursor's current record contains a field at
     /// the given column index.  Falls through when the record has fewer fields
     /// (a "short record" from before ALTER TABLE ADD COLUMN).
@@ -2194,6 +2211,12 @@ pub(crate) fn dispatch_insn(
         Insn::Column { .. } => execute::op_column(program, state, insn, pager),
         Insn::ColumnRange { .. } => execute::op_column_range(program, state, insn, pager),
         Insn::ColumnHasField { .. } => execute::op_column_has_field(program, state, insn, pager),
+        Insn::ColumnIsNullJump { .. } => {
+            execute::op_column_is_null_jump(program, state, insn, pager)
+        }
+        Insn::ColumnIsNullToReg { .. } => {
+            execute::op_column_is_null_to_reg(program, state, insn, pager)
+        }
         Insn::TypeCheck { .. } => execute::op_type_check(program, state, insn, pager),
         Insn::ArrayEncode { .. } => execute::op_array_encode(program, state, insn, pager),
         Insn::ArrayDecode { .. } => execute::op_array_decode(program, state, insn, pager),
@@ -2446,6 +2469,8 @@ impl InsnVariants {
             InsnVariants::Last => execute::op_last,
             InsnVariants::Column => execute::op_column,
             InsnVariants::ColumnRange => execute::op_column_range,
+            InsnVariants::ColumnIsNullJump => execute::op_column_is_null_jump,
+            InsnVariants::ColumnIsNullToReg => execute::op_column_is_null_to_reg,
             InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ArrayEncode => execute::op_array_encode,
