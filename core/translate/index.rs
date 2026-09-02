@@ -347,7 +347,7 @@ pub(crate) fn emit_refill_index(
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
             identifier: tbl_name.clone(),
             internal_id: table_ref,

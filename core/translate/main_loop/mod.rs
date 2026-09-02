@@ -1,4 +1,4 @@
-use turso_parser::ast::{Expr, SortOrder, TableInternalId};
+use turso_parser::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -8,17 +8,18 @@ use super::{
     },
     expr::{
         expr_references_outer_query, expr_references_subquery_id, translate_condition_expr,
-        translate_expr, translate_expr_no_constant_opt, walk_expr, ConditionMetadata,
-        NoConstantOptReason, WalkControl,
+        translate_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
+        ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::{constraints::BinaryExprSide, Optimizable},
     order_by::sorter_insert,
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, InSeekSource,
-        IterationDirection, JoinOrderMember, JoinOrigin, JoinedTable, MultiIndexScanOp,
-        NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef, SeekKey,
-        SeekKeyComponent, SelectPlan, SetOperation, TableReferences, WhereTerm,
+        IterationDirection, JoinOrderMember, JoinOrigin, JoinedTable, MultiIndexBranchAccess,
+        MultiIndexScanOp, NonFromClauseSubquery, Operation, QueryDestination, Scan, Search,
+        SeekDef, SeekKey, SeekKeyComponent, SelectPlan, SetOperation, SubqueryEvalPhase,
+        SubqueryState, TableReferences, UnmatchedRightRowsPlan, WhereTerm,
     },
 };
 use crate::{

@@ -27,7 +27,7 @@ use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::optimizer::AvailableIndexes;
 use crate::translate::plan::{
     BitSet, InSeekSource, JoinOrigin, JoinedTable, NonFromClauseSubquery, SetOperation,
-    TableReferences, UnionBranchPrePostFilters, WhereTerm,
+    TableReferences, UnionBranchPrePostFilters, WhereTerm, WhereTermOrigin,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::Result;
@@ -146,7 +146,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 #[expect(clippy::too_many_arguments)]
 fn get_table_local_constraints_for_branch(
     exprs: &[ast::Expr],
-    from_join: Option<JoinOrigin>,
+    join_origin: Option<JoinOrigin>,
     table_reference: &JoinedTable,
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
@@ -159,7 +159,7 @@ fn get_table_local_constraints_for_branch(
         .cloned()
         .map(|expr| WhereTerm {
             expr,
-            from_join,
+            origin: join_origin.map_or(WhereTermOrigin::Where, WhereTermOrigin::Join),
             consumed: false,
         })
         .collect::<Vec<_>>();
@@ -790,7 +790,8 @@ fn multi_index_can_consume_term(
 ) -> bool {
     !table_references.outer_join_may_null_extend(table.internal_id)
         || term
-            .from_join
+            .origin
+            .join_origin()
             .is_some_and(|origin| origin.right_table() == table.internal_id)
 }
 
@@ -1018,7 +1019,7 @@ pub fn consider_multi_index_union(
                 let Some((synthetic_where_terms, table_constraints)) =
                     get_table_local_constraints_for_branch(
                         &conjuncts,
-                        term.from_join,
+                        term.origin.join_origin(),
                         rhs_table,
                         table_references,
                         available_indexes,
@@ -1235,7 +1236,7 @@ mod tests {
             },
             plan::{
                 ColumnUsedMask, JoinInfo, JoinType, JoinedTable, Operation, TableReferences,
-                WhereTerm,
+                WhereTerm, WhereTermOrigin,
             },
             planner::TableMask,
         },
@@ -1302,7 +1303,7 @@ mod tests {
         let table = Table::BTree(table);
         JoinedTable {
             op: Operation::default_scan_for(&table),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table,
             identifier: name,
             internal_id,
@@ -1488,7 +1489,7 @@ mod tests {
                 Operator::Or,
                 Box::new(right_disjunct),
             ),
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -1561,7 +1562,7 @@ mod tests {
                     Operator::Greater,
                     Box::new(create_numeric_literal("10")),
                 ),
-                from_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
             WhereTerm {
@@ -1570,7 +1571,7 @@ mod tests {
                     Operator::Equals,
                     Box::new(create_numeric_literal("7")),
                 ),
-                from_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
         ];
@@ -1743,7 +1744,7 @@ mod tests {
                 Operator::Or,
                 Box::new(right_disjunct),
             ),
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -1879,7 +1880,7 @@ mod tests {
                     Operator::Or,
                     Box::new(make_branch(1, 0, item_kind)),
                 ),
-                from_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             }]
         };

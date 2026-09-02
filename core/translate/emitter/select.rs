@@ -618,12 +618,11 @@ fn prune_join_order_for_materialized_inputs(
         if term.consumed {
             continue;
         }
-        if term.from_join.is_some_and(JoinOrigin::is_outer) {
+        if term.origin.join_origin().is_some_and(JoinOrigin::is_outer) {
             // OUTER JOIN terms still belong to the right-table loop recorded in
-            // `from_join`. Materializing and pruning the build-side prefix
-            // does not make those terms safe to consume here, because the
-            // materialization subplan does not include the probe table that
-            // determines the null-extension boundary.
+            // `origin`. Materializing and pruning the build-side prefix does not
+            // make those terms safe to consume here. The materialization subplan
+            // does not include the probe table that determines the NULL boundary.
             continue;
         }
         let mask = table_mask_from_expr(

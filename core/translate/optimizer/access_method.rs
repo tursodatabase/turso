@@ -435,6 +435,7 @@ pub(super) fn choose_best_btree_candidate(
             .filter(|(i, c)| {
                 !consumed.contains(i)
                     && c.usable
+                    && c.outer_join_compatible
                     && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
                     && matches!(
                         c.operator,
@@ -585,7 +586,10 @@ pub(super) fn choose_best_in_seek_candidate(
             else {
                 continue;
             };
-            if not || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
+            if not
+                || !constraint.outer_join_compatible
+                || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+            {
                 continue;
             }
 

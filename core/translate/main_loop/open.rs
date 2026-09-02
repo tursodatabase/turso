@@ -205,46 +205,18 @@ impl OpenLoop {
                             },
                             Table::Virtual(_),
                         ) => {
-                            let (start_reg, count, maybe_idx_str, maybe_idx_int) = {
-                                let args_needed = constraints.len();
-                                let start_reg = program.alloc_registers(args_needed);
-
-                                for (argv_index, expr) in constraints.iter().enumerate() {
-                                    let target_reg = start_reg + argv_index;
-                                    translate_expr(
-                                        program,
-                                        Some(table_references),
-                                        expr,
-                                        target_reg,
-                                        &t_ctx.resolver,
-                                    )?;
-                                }
-
-                                // If best_index provided an idx_str, translate it.
-                                let maybe_idx_str = if let Some(idx_str) = idx_str {
-                                    let reg = program.alloc_register();
-                                    program.emit_insn(Insn::String8 {
-                                        dest: reg,
-                                        value: idx_str.to_owned(),
-                                    });
-                                    Some(reg)
-                                } else {
-                                    None
-                                };
-                                (start_reg, args_needed, maybe_idx_str, Some(*idx_num))
-                            };
-
-                            // Emit VFilter with the computed arguments.
-                            program.emit_insn(Insn::VFilter {
-                                cursor_id: table_cursor_id
+                            emit_virtual_table_scan_start(
+                                program,
+                                table_references,
+                                &t_ctx.resolver,
+                                table_cursor_id
                                     .expect("Virtual tables do not support covering indexes"),
-                                arg_count: count,
-                                args_reg: start_reg,
-                                idx_str: maybe_idx_str,
-                                idx_num: maybe_idx_int.unwrap_or(0) as usize,
-                                pc_if_empty: loop_end,
-                            });
-                            program.preassign_label_to_next_insn(loop_start);
+                                *idx_num,
+                                idx_str.as_deref(),
+                                constraints,
+                                loop_start,
+                                loop_end,
+                            )?;
                         }
                         (
                             Scan::Subquery { iter_dir },
@@ -711,4 +683,51 @@ impl OpenLoop {
 
         Ok(())
     }
+}
+
+/// Emit the `VFilter` that starts a virtual-table loop.
+///
+/// The main loop and the unmatched-right read must use the argument order
+/// that `best_index` selected.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_virtual_table_scan_start(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+    table_cursor_id: CursorID,
+    idx_num: i32,
+    idx_str: Option<&str>,
+    constraints: &[Expr],
+    loop_start: BranchOffset,
+    loop_end: BranchOffset,
+) -> Result<()> {
+    let start_reg = program.alloc_registers(constraints.len());
+    for (argument_index, expr) in constraints.iter().enumerate() {
+        translate_expr(
+            program,
+            Some(table_references),
+            expr,
+            start_reg + argument_index,
+            resolver,
+        )?;
+    }
+
+    let idx_str = idx_str.map(|value| {
+        let register = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: register,
+            value: value.to_owned(),
+        });
+        register
+    });
+    program.emit_insn(Insn::VFilter {
+        cursor_id: table_cursor_id,
+        arg_count: constraints.len(),
+        args_reg: start_reg,
+        idx_str,
+        idx_num: idx_num as usize,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    Ok(())
 }
