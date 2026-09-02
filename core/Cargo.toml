@@ -299,3 +299,7 @@ harness = false
 [[bench]]
 name = "select_star_benchmark"
 harness = false
+
+[[bench]]
+name = "scan_loop_benchmark"
+harness = false
