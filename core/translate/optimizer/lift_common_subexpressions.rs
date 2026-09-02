@@ -40,7 +40,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             continue;
         }
         let term_expr_owned = where_clause[i].expr.clone(); // Own the expression for flattening
-        let term_from_join = where_clause[i].from_join;
+        let term_origin = where_clause[i].origin;
 
         // e.g. a OR b OR c becomes effectively OR [a,b,c].
         let or_operands = flatten_or_expr_owned(term_expr_owned)?;
@@ -124,7 +124,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         for common_expr_to_add in common_conjuncts_accumulator {
             where_clause.push(WhereTerm {
                 expr: common_expr_to_add,
-                from_join: term_from_join,
+                origin: term_origin,
                 consumed: false,
             });
         }
@@ -188,7 +188,7 @@ fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::plan::{JoinOrigin, WhereTerm};
+    use crate::translate::plan::{JoinOrigin, WhereTerm, WhereTermOrigin};
     use turso_parser::ast::{self, Expr, Literal, Operator, TableInternalId};
 
     #[test]
@@ -257,7 +257,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -359,7 +359,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -426,7 +426,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr.clone(),
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -492,7 +492,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_join: Some(JoinOrigin::Outer(TableInternalId::default())),
+            origin: WhereTermOrigin::Join(JoinOrigin::Outer(TableInternalId::default())),
             consumed: false,
         }];
 
@@ -512,12 +512,12 @@ mod tests {
             )
         );
         assert_eq!(
-            nonconsumed_terms[0].from_join,
+            nonconsumed_terms[0].origin.join_origin(),
             Some(JoinOrigin::Outer(TableInternalId::default()))
         );
         assert_eq!(nonconsumed_terms[1].expr, a_expr);
         assert_eq!(
-            nonconsumed_terms[1].from_join,
+            nonconsumed_terms[1].origin.join_origin(),
             Some(JoinOrigin::Outer(TableInternalId::default()))
         );
 
@@ -543,7 +543,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: single_expr.clone(),
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -592,7 +592,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 

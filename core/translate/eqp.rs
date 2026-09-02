@@ -808,8 +808,9 @@ pub(crate) fn eqp_details_for_right_join(table: &JoinedTable) -> (EqpDetail, Eqp
     // unmatched-right operation, while the main join keeps its own operation.
     let mut unmatched_table = table.clone();
     unmatched_table.op = table
-        .unmatched_right_rows_operation
-        .clone()
+        .unmatched_right_rows_plan
+        .as_ref()
+        .map(|plan| plan.operation.clone())
         .unwrap_or_else(|| Operation::default_scan_for(&table.table));
     (
         EqpDetail::RightJoin { table: eqp_table },

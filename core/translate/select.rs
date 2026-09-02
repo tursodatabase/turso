@@ -674,13 +674,6 @@ fn prepare_one_select_plan(
                 crate::bail_parse_error!("too many columns in result set");
             }
 
-            // This step can only be performed at this point, because all table references are now available.
-            // Virtual table predicates may depend on column bindings from tables to the right in the join order,
-            // so we must wait until the full set of references has been collected.
-            {
-                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
-            }
-
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             {
                 parse_where(
@@ -690,6 +683,15 @@ fn prepare_one_select_plan(
                     &mut plan.where_clause,
                     resolver,
                 )?;
+            }
+
+            // This step can only be performed at this point, because all table references are now available.
+            // Virtual table predicates may depend on column bindings from tables to the right in the join order,
+            // so we must wait until the full set of references has been collected.
+            {
+                // SQLite adds table-function arguments after ON and WHERE terms.
+                // Some virtual tables select the last constraint for a hidden column.
+                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
             }
 
             {

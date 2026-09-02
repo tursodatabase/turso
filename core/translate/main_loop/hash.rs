@@ -341,11 +341,10 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 .into_iter()
                 .try_collect()?;
             for cond in planner.predicates.iter() {
-                if cond.from_join.is_some_and(JoinOrigin::is_outer) {
+                if cond.origin.join_origin().is_some_and(JoinOrigin::is_outer) {
                     // OUTER JOIN predicates must stay on the right-table loop
-                    // recorded in `from_join`; applying them while
-                    // building the hash table would drop unmatched build rows
-                    // before null-extension.
+                    // recorded in `origin`. Applying them while building the hash
+                    // table would remove unmatched build rows before NULL extension.
                     continue;
                 }
                 let mask = table_mask_from_expr(

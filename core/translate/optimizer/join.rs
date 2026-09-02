@@ -1018,7 +1018,9 @@ fn build_has_indexable_prior_constraints(
     build_constraints.candidates.iter().any(|candidate| {
         candidate.refs.iter().any(|constraint_ref| {
             let constraint = &build_constraints.constraints[constraint_ref.constraint_vec_pos];
-            constraint.usable && constraint.lhs_mask.intersects(prior_mask)
+            constraint.usable
+                && constraint.outer_join_compatible
+                && constraint.lhs_mask.intersects(prior_mask)
         })
     })
 }
@@ -2086,7 +2088,7 @@ fn build_where_term_info(
                         (
                             left,
                             right,
-                            term.from_join.and_then(JoinOrigin::outer_table),
+                            term.origin.join_origin().and_then(JoinOrigin::outer_table),
                         )
                     }),
             })
@@ -2110,7 +2112,7 @@ fn ready_where_work(
             if term.consumed || info.extra_steps == 0 {
                 return None;
             }
-            let ready = match term.from_join.and_then(JoinOrigin::outer_table) {
+            let ready = match term.origin.join_origin().and_then(JoinOrigin::outer_table) {
                 Some(table_id) => table_id == rhs_table_id,
                 None => {
                     info.table_mask.get(rhs_table_number)
@@ -2194,7 +2196,7 @@ mod tests {
             },
             plan::{
                 ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, TableReferences,
-                WhereTerm,
+                WhereTerm, WhereTermOrigin,
             },
         },
         vdbe::builder::TableRefIdCounter,
@@ -2362,7 +2364,7 @@ mod tests {
             Operator::Or,
             Box::new(check(first_id)),
         ));
-        term.from_join = Some(JoinOrigin::Outer(second_id));
+        term.origin = WhereTermOrigin::Join(JoinOrigin::Outer(second_id));
         let outer_join_where = vec![term];
         let where_terms = build_where_term_info(&outer_join_where, &table_references, &[])?;
 
@@ -3420,7 +3422,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -3445,7 +3447,7 @@ mod tests {
                 ast::Operator::Equals,
                 Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
             ),
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -3517,7 +3519,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -3543,7 +3545,7 @@ mod tests {
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
-                from_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
             WhereTerm {
@@ -3557,7 +3559,7 @@ mod tests {
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
-                from_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
         ];
@@ -3631,7 +3633,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -3657,7 +3659,7 @@ mod tests {
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
-                from_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
             WhereTerm {
@@ -3671,7 +3673,7 @@ mod tests {
                     ast::Operator::Greater,
                     Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
                 ),
-                from_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
             WhereTerm {
@@ -3685,7 +3687,7 @@ mod tests {
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
-                from_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
         ];
@@ -3825,7 +3827,7 @@ mod tests {
         let table = Table::BTree(table);
         JoinedTable {
             op: Operation::default_scan_for(&table),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table,
             identifier: name,
             internal_id,
@@ -3852,7 +3854,7 @@ mod tests {
     fn _create_binary_expr(lhs: Expr, op: Operator, rhs: Expr) -> WhereTerm {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }
     }

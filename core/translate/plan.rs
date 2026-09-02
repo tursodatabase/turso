@@ -219,18 +219,48 @@ impl JoinOrigin {
     }
 }
 
+/// The SQL source that supplied a term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhereTermOrigin {
+    /// A term from a WHERE clause.
+    Where,
+    /// A term from an ON or USING clause.
+    ///
+    /// An outer-join term must run in its right-table loop, even when it reads
+    /// only left tables. An earlier check can remove a required NULL row.
+    Join(JoinOrigin),
+    /// A hidden-column constraint made from a table-function argument.
+    ///
+    /// This term also has a join origin. The separate variant lets the
+    /// unmatched-right read rebuild the argument instead of treating it as an ON term.
+    TableFunction(JoinOrigin),
+}
+
+impl WhereTermOrigin {
+    /// Get the join origin when the term belongs to a join source.
+    pub fn join_origin(self) -> Option<JoinOrigin> {
+        match self {
+            Self::Where => None,
+            Self::Join(origin) | Self::TableFunction(origin) => Some(origin),
+        }
+    }
+
+    /// Get the table for a table-function argument.
+    pub fn table_function_table(self) -> Option<TableInternalId> {
+        match self {
+            Self::TableFunction(origin) => Some(origin.right_table()),
+            Self::Where | Self::Join(_) => None,
+        }
+    }
+}
+
 /// One term that the planner can schedule or use for table access.
 #[derive(Debug, Clone)]
 pub struct WhereTerm {
     /// The term expression.
     pub expr: ast::Expr,
-    /// The JOIN that supplied this term.
-    ///
-    /// An outer JOIN term must run in the right-table loop, even if it reads only left tables.
-    /// Otherwise, the JOIN can lose rows that need a NULL right side.
-    ///
-    /// This is None for a WHERE term.
-    pub from_join: Option<JoinOrigin>,
+    /// The clause or table function that supplied this term.
+    pub origin: WhereTermOrigin,
     /// Whether the optimizer does not need to emit this term.
     pub consumed: bool,
 }
@@ -281,7 +311,7 @@ impl From<Expr> for WhereTerm {
     fn from(value: Expr) -> Self {
         Self {
             expr: value,
-            from_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }
     }
@@ -1410,6 +1440,22 @@ pub fn merge_columns(mut expressions: Vec<Expr>) -> Expr {
     Expr::MergedColumn(expressions.into_iter().map(Box::new).collect())
 }
 
+/// The separate read that finds unmatched rows from a right-preserving join.
+#[derive(Debug, Clone)]
+pub struct UnmatchedRightRowsPlan {
+    /// The operation that reads the right source.
+    pub operation: Operation,
+    /// Subqueries used by conditions in the copied WHERE clause.
+    ///
+    /// SQLite plans these subqueries again for its one-table unmatched-right read.
+    pub subqueries: Vec<NonFromClauseSubquery>,
+    /// Conditions that SQLite must check in its unmatched-right loop.
+    ///
+    /// The shared result subroutine checks them again after a row is not in the
+    /// matched-row set. Outer-join terms are not part of this copied clause.
+    pub conditions: Vec<Expr>,
+}
+
 /// A joined table in the query plan.
 /// For example,
 /// ```sql
@@ -1424,13 +1470,13 @@ pub fn merge_columns(mut expressions: Vec<Expr>) -> Expr {
 pub struct JoinedTable {
     /// The operation that this table reference performs.
     pub op: Operation,
-    /// This operation reads unmatched right rows (from RIGHT or FULL OUTER JOIN) after the main join loop.
+    /// This plan reads unmatched right rows after the main join loop.
     ///
     /// A post-join WHERE term must not decide whether a right row matches.
     /// This read can use that term after the main loop records all matches.
-    /// SQLite plans the two operations separately. `None` means that no separate operation exists.
+    /// SQLite plans the two reads separately. `None` means that no separate plan exists.
     /// An unmatched-right read then uses the default scan.
-    pub unmatched_right_rows_operation: Option<Operation>,
+    pub unmatched_right_rows_plan: Option<UnmatchedRightRowsPlan>,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -2814,7 +2860,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table,
             identifier,
             internal_id,
@@ -2862,7 +2908,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table,
             identifier,
             internal_id,
@@ -2895,7 +2941,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
-            unmatched_right_rows_operation: None,
+            unmatched_right_rows_plan: None,
             table,
             identifier,
             internal_id,

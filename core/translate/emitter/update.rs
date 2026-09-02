@@ -172,7 +172,7 @@ pub fn emit_program_for_update(
                     iter_dir: IterationDirection::Forwards,
                     index: None,
                 }),
-                unmatched_right_rows_operation: None,
+                unmatched_right_rows_plan: None,
                 join_info: None,
                 col_used_mask: Default::default(),
                 column_use_counts: Vec::new(),
