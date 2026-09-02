@@ -10363,6 +10363,23 @@ fn skipmap_has_retired(mv: &crate::MvStore) -> bool {
         .any(|e| e.value().read().iter().any(|rv| rv.retired_at().is_some()))
 }
 
+fn unique_index_btree_is_allocated(mv: &crate::MvStore) -> bool {
+    mv.index_rows
+        .iter()
+        .any(|idx| mv.is_btree_allocated(idx.key()))
+}
+
+fn skipmap_has_retired_unmaterialized_index(mv: &crate::MvStore) -> bool {
+    mv.index_rows.iter().any(|idx| {
+        idx.value().iter().any(|e| {
+            e.value().read().iter().any(|rv| {
+                rv.retired_at().is_some()
+                    && rv.materialized_at() == crate::mvcc::database::WalPos::ORIGIN
+            })
+        })
+    })
+}
+
 fn skipmap_version_count(mv: &crate::MvStore) -> usize {
     mv.rows.iter().map(|e| e.value().read().len()).sum()
 }
@@ -11855,19 +11872,31 @@ fn test_gc_retired_current_serves_older_reader_then_reclaims() {
     );
 }
 
-/// Two connections upsert the same TEXT PRIMARY KEY after Passive GC retired
-/// the SkipMap current. They must not create a second row for that key (Elle
-/// list-append `incompatible-order`). One writer may take a write-write
-/// conflict. The committed lists stay a single history.
+/// Elle list-append: `INSERT ... ON CONFLICT(key) DO UPDATE` after GC retires
+/// the SkipMap current, while an older reader still pins it.
+///
+/// CREATE TABLE is checkpointed so the unique-index root is readable. The
+/// user row is not. `durable_txid_max` is then raised so Truncate Rule 3
+/// retires that unmaterialized current. Fallthrough that trusts only a
+/// readable root hits an empty unique index (`["r", "k9", []]`). A later
+/// insert forks a second rowid (`incompatible-order`). Unique `WHERE key =`
+/// can hide that fork, so the assertion is a table scan of `rowid`.
 #[test]
 fn test_gc_retired_text_pk_upsert_does_not_fork() {
-    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv = db.get_mvcc_store();
     let conn = db.connect();
-    conn.execute("CREATE TABLE t(key TEXT PRIMARY KEY, vals TEXT NOT NULL DEFAULT '')")
-        .unwrap();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
+    conn.execute("CREATE TABLE t(key TEXT PRIMARY KEY, vals TEXT NOT NULL DEFAULT '')")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES ('k9', '1')").unwrap();
+    assert!(
+        unique_index_btree_is_allocated(&mv),
+        "CREATE TABLE must publish the unique index so fallthrough can hit an empty btree"
+    );
 
     let older = db.connect();
     older.execute("BEGIN CONCURRENT").unwrap();
@@ -11875,39 +11904,42 @@ fn test_gc_retired_text_pk_upsert_does_not_fork() {
         get_rows(&older, "SELECT vals FROM t WHERE key = 'k9'"),
         vec![vec![Value::from_text("1")]]
     );
-    conn.execute("INSERT INTO t VALUES ('k8', 'x')").unwrap();
 
-    let upsert = |c: &Arc<Connection>, value: i64| {
-        c.execute(format!(
-            "INSERT INTO t (key, vals) VALUES ('k9', '{value}') \
-             ON CONFLICT(key) DO UPDATE SET vals = vals || ',' || '{value}'"
-        ))
-    };
-
-    let a = db.connect();
-    let b = db.connect();
-    a.execute("BEGIN CONCURRENT").unwrap();
-    b.execute("BEGIN CONCURRENT").unwrap();
-    upsert(&a, 2).unwrap();
-    let b_write = upsert(&b, 3);
-    a.execute("COMMIT").unwrap();
-    match b_write {
-        Ok(()) => match b.execute("COMMIT") {
-            Ok(()) | Err(LimboError::WriteWriteConflict) => {}
-            Err(e) => panic!("unexpected commit error: {e:?}"),
-        },
-        Err(LimboError::WriteWriteConflict) => {}
-        Err(e) => panic!("unexpected write error: {e:?}"),
+    mv.durable_txid_max.store(u64::MAX, Ordering::SeqCst);
+    for _ in 0..4 {
+        mv.gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
     }
-
-    older.execute("COMMIT").unwrap();
-    let rows = get_rows(&conn, "SELECT vals FROM t WHERE key = 'k9'");
-    assert_eq!(rows.len(), 1, "forked into two rows for k9: {rows:?}");
-    let vals = rows[0][0].to_string();
+    mv.drop_unused_row_versions();
     assert!(
-        vals.starts_with("1,"),
-        "lost the checkpointed prefix: {vals}"
+        skipmap_has_retired_unmaterialized_index(&mv),
+        "older reader must pin a retired unique-index current that is not in btree"
     );
+
+    let newer = db.connect();
+    newer.execute("BEGIN CONCURRENT").unwrap();
+    let read = get_rows(&newer, "SELECT vals FROM t WHERE key = 'k9'");
+    assert_eq!(
+        read,
+        vec![vec![Value::from_text("1")]],
+        "unique lookup must still see k9 after retirement"
+    );
+    newer
+        .execute(
+            "INSERT INTO t (key, vals) VALUES ('k9', '2') \
+             ON CONFLICT(key) DO UPDATE SET vals = CASE \
+               WHEN vals = '' THEN '2' \
+               ELSE vals || ',' || '2' \
+             END",
+        )
+        .unwrap();
+    newer.execute("COMMIT").unwrap();
+    older.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT rowid, key, vals FROM t ORDER BY rowid");
+    assert_eq!(rows.len(), 1, "forked into two rows for k9: {rows:?}");
+    assert_eq!(rows[0][1].to_string(), "k9");
+    let vals = rows[0][2].to_string();
+    assert!(vals.starts_with("1,"), "lost the SkipMap prefix: {vals}");
 }
 
 /// A reader that has already selected a multi-column row must keep seeing every

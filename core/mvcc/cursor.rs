@@ -4,7 +4,7 @@ use crate::turso_assert;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
+    MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey, create_seek_range,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -13,11 +13,11 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult, Value,
+    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp, SeekResult, Value,
+    compare_immutable,
 };
 use crate::vdbe::Register;
-use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
+use crate::{Completion, Connection, LimboError, Pager, Result, return_if_io};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -1587,18 +1587,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
                     };
-                    // The current row is visible either because MvStore has a visible version
-                    // for it, or because it is a b-tree-resident row that is not shadowed by
-                    // any MVCC version. Both cases must short-circuit: otherwise a b-tree-only
-                    // row would fall through to the full eq-only seek below, which resets the
-                    // iterators and marks the MVCC peek exhausted, skipping MvStore-resident
-                    // rows that the enclosing range scan (see the comment above) still needs
-                    // to visit.
-                    let visible = self
-                        .db
-                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
-                        .is_some()
-                        || (*in_btree && self.query_btree_version_is_valid(&row_id.row_id));
+                    // Prefer the B-tree copy when this cursor is already on it.
+                    // Occupying a retired SkipMap current first would hide later
+                    // checkpointed updates and change scan totals.
+                    let visible = if *in_btree {
+                        self.query_btree_version_is_valid(&row_id.row_id)
+                    } else {
+                        self.db
+                            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                            .is_some()
+                    };
                     if visible {
                         // We need to clear the null flag for the table cursor before seeking,
                         // because it might have been set to false by an unmatched left-join row
@@ -1856,11 +1854,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
             .is_some()
         {
-            self.db
-                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+            let updated = self
+                .db
+                .update_to_table_or_index(self.tx_id, row.clone(), maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
+            if !updated {
+                // Retired current still occupies the key but cannot take set_end.
+                // Insert a new current beside it so older readers keep the copy.
+                self.db
+                    .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
+                    .inspect_err(|_| {
+                        self.current_pos = CursorPosition::BeforeFirst;
+                    })?;
+            }
         } else if was_btree_resident {
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
