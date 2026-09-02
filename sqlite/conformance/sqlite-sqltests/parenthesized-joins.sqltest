@@ -1,0 +1,42 @@
+@database :memory:
+
+# SQLite unwraps a group with one source. The alias outside the group replaces
+# the alias inside it.
+@cross-check-integrity
+test one-source-parenthesized-group-uses-outer-alias {
+    CREATE TABLE grouped_one_left(id INTEGER);
+    CREATE TABLE grouped_one_right(id INTEGER);
+    INSERT INTO grouped_one_left VALUES(1),(2);
+    INSERT INTO grouped_one_right VALUES(2),(3);
+
+    SELECT one_left.id, grouped_one_right.id
+      FROM grouped_one_right
+      LEFT JOIN (grouped_one_left AS inner_name) AS one_left
+        ON one_left.id=grouped_one_right.id
+     ORDER BY grouped_one_right.id;
+}
+expect {
+    2|2
+    |3
+}
+
+# SQLite keeps a group with multiple sources together as one join source.
+@cross-check-integrity
+test left-join-keeps-parenthesized-inner-join-together {
+    CREATE TABLE grouped_outer(id INTEGER);
+    CREATE TABLE grouped_first(id INTEGER, first_value TEXT);
+    CREATE TABLE grouped_second(id INTEGER, second_value TEXT);
+    INSERT INTO grouped_outer VALUES(1),(2),(3);
+    INSERT INTO grouped_first VALUES(2,'first-two'),(3,'first-three');
+    INSERT INTO grouped_second VALUES(2,'second-two');
+
+    SELECT id, first_value, second_value
+      FROM grouped_outer
+      LEFT JOIN (grouped_first JOIN grouped_second USING(id)) USING(id)
+     ORDER BY id;
+}
+expect {
+    1||
+    2|first-two|second-two
+    3||
+}
