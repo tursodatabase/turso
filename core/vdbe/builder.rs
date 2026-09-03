@@ -1674,6 +1674,9 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotNull")?;
                 }
+                Insn::IfNullRow { target_pc, .. } => {
+                    resolve(target_pc, "IfNullRow")?;
+                }
                 Insn::ColumnHasField { target_pc, .. } => {
                     resolve(target_pc, "ColumnHasField")?;
                 }

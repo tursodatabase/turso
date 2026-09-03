@@ -275,6 +275,11 @@ impl VirtualTableCursor {
         self.null_flag = flag;
     }
 
+    /// Whether an outer join set this cursor to its synthetic null row.
+    pub(crate) fn is_null_row(&self) -> bool {
+        self.null_flag
+    }
+
     pub(crate) fn next(&mut self) -> crate::Result<bool> {
         self.null_flag = false;
         match &mut self.inner {
