@@ -3192,11 +3192,11 @@ impl Connection {
                 let mut schemas = self.database_schemas.write();
                 let schema_arc = schemas.entry(database_id).or_insert_with(|| {
                     let attached_dbs = self.attached_databases.read();
-                    let (db, _pager) = attached_dbs
+                    let entry = attached_dbs
                         .index_to_data
                         .get(&database_id)
                         .expect("Database ID should be valid");
-                    let schema = db.schema.lock().clone();
+                    let schema = entry.db.schema.lock().clone();
                     schema
                 });
                 let schema = Schema::try_make_mut(schema_arc)?;
@@ -3227,7 +3227,15 @@ impl Connection {
                     .map(|temp_db| temp_db.pager.clone())
                     .expect("temp database should be initialized after ensure_temp_database"))
             }
-            _ => Ok(self.attached_databases.read().get_pager_by_index(index)),
+            _ => self
+                .attached_databases
+                .read()
+                .get_pager_by_index(index)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "database index {index} is missing from the attached catalog"
+                    ))
+                }),
         }
     }
 
@@ -3646,9 +3654,11 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
-                    self.attached_databases
-                        .write()
-                        .insert(alias.as_str(), (db.clone(), pager.clone()));
+                    self.attached_databases.write().insert(
+                        alias.as_str(),
+                        db.clone(),
+                        pager.clone(),
+                    );
                     self.bump_prepare_context_generation();
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
@@ -3755,8 +3765,8 @@ impl Connection {
         }
         {
             let catalog = self.attached_databases.read();
-            for (&idx, (_db, pager)) in catalog.index_to_data.iter() {
-                pagers.push((idx, pager.clone()));
+            for (&idx, entry) in catalog.index_to_data.iter() {
+                pagers.push((idx, entry.pager.clone()));
             }
         }
         f(&pagers)
@@ -3785,11 +3795,11 @@ impl Connection {
         }
 
         let attached_dbs = self.attached_databases.read();
-        let (db, _pager) = attached_dbs
+        let entry = attached_dbs
             .index_to_data
             .get(&database_id)
             .expect("Database ID should be valid after resolve_database_id");
-        let schema = db.schema.lock().clone();
+        let schema = entry.db.schema.lock().clone();
         schema
     }
 
@@ -3807,8 +3817,8 @@ impl Connection {
         let mut schemas = self.database_schemas.write();
         if let Some(local_schema) = schemas.remove(&database_id) {
             let attached_dbs = self.attached_databases.read();
-            if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
-                *db.schema.lock() = local_schema;
+            if let Some(entry) = attached_dbs.index_to_data.get(&database_id) {
+                *entry.db.schema.lock() = local_schema;
             }
             self.bump_prepare_context_generation();
         }
@@ -3832,25 +3842,19 @@ impl Connection {
         }
     }
 
-    /// Clone the *shared* schema of `database_id` (main or attached), bypassing
-    /// the per-connection schema cache. Falls back to the main DB's shared
-    /// schema when `database_id` does not name an attached database — callers
-    /// in error paths get something usable instead of a panic.
+    /// Clone the shared schema for `database_id`, bypassing the connection-local cache.
     ///
-    /// MVCC checkpoint specifically must call this rather than [`Self::with_schema`]:
-    /// it writes from the mv store to the pager, so the schema it uses must
-    /// match the pager being checkpointed and cannot be a stale per-connection
-    /// copy.
+    /// Panics if `database_id` is neither main nor an attached database.
     pub(crate) fn clone_shared_schema(&self, database_id: usize) -> Arc<Schema> {
         if database_id == crate::MAIN_DB_ID {
             self.db.clone_schema()
         } else {
-            self.attached_databases
-                .read()
+            let attached_databases = self.attached_databases.read();
+            let entry = attached_databases
                 .index_to_data
                 .get(&database_id)
-                .map(|(db, _)| db.schema.lock().clone())
-                .unwrap_or_else(|| self.db.clone_schema())
+                .expect("shared schema requested for unknown attached database");
+            entry.db.clone_schema()
         }
     }
 
@@ -3887,9 +3891,8 @@ impl Connection {
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
         for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
-            let file_path = if let Some((db, _pager)) = attached_dbs.index_to_data.get(&seq_number)
-            {
-                Self::get_canonical_path_for_database(db)
+            let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
+                Self::get_canonical_path_for_database(&entry.db)
             } else {
                 String::new()
             };
@@ -3972,6 +3975,50 @@ impl Connection {
     pub fn set_sync_mode(&self, mode: SyncMode) {
         self.sync_mode.set(mode);
         self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn get_sync_mode_for_database(&self, database_id: usize) -> Result<SyncMode> {
+        match database_id {
+            MAIN_DB_ID => Ok(self.get_sync_mode()),
+            TEMP_DB_ID => Ok(SyncMode::Off),
+            _ => self
+                .attached_databases
+                .read()
+                .index_to_data
+                .get(&database_id)
+                .map(|entry| entry.sync_mode)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "database index {database_id} is missing from the attached catalog"
+                    ))
+                }),
+        }
+    }
+
+    pub(crate) fn set_sync_mode_for_database(
+        &self,
+        database_id: usize,
+        mode: SyncMode,
+    ) -> Result<()> {
+        match database_id {
+            MAIN_DB_ID => self.sync_mode.set(mode),
+            // SQLite fixes temp databases at synchronous=OFF.
+            TEMP_DB_ID => return Ok(()),
+            _ => {
+                let mut attached_databases = self.attached_databases.write();
+                let entry = attached_databases
+                    .index_to_data
+                    .get_mut(&database_id)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "database index {database_id} is missing from the attached catalog"
+                        ))
+                    })?;
+                entry.sync_mode = mode;
+            }
+        }
+        self.bump_prepare_context_generation();
+        Ok(())
     }
 
     pub fn get_temp_store(&self) -> crate::TempStore {
@@ -5234,7 +5281,7 @@ impl Connection {
                 catalog
                     .index_to_data
                     .get(&db)
-                    .and_then(|(db, _)| db.get_mv_store().as_ref().cloned())
+                    .and_then(|entry| entry.db.get_mv_store().as_ref().cloned())
             }
         }
     }
@@ -5465,7 +5512,8 @@ mod tests {
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let catalog = conn.attached_databases.read();
         let index = *catalog.name_to_index.get(alias).unwrap();
-        catalog.index_to_data.get(&index).unwrap().clone()
+        let entry = catalog.index_to_data.get(&index).unwrap();
+        (entry.db.clone(), entry.pager.clone())
     }
 
     #[test]

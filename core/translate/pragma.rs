@@ -658,7 +658,7 @@ fn update_pragma(
                     _ => SyncMode::Full,
                 })
             };
-            connection.set_sync_mode(mode);
+            connection.set_sync_mode_for_database(database_id, mode)?;
             Ok(TransactionMode::None)
         }
         PragmaName::DataSyncRetry => {
@@ -906,8 +906,9 @@ fn query_pragma(
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
-            let passive_allowed = connection.mv_store_for_db(database_id).is_none()
-                || connection.experimental_mvcc_passive_checkpoint_enabled();
+            let passive_allowed = connection
+                .mv_store_for_db(database_id)
+                .is_none_or(|mv_store| mv_store.uses_passive_checkpoint());
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
@@ -1467,36 +1468,23 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            // integrity_check verifies the physical file, so for the main MVCC database use the
-            // latest shared schema (which reflects every committed+materialized object) rather
-            // than this connection's possibly-stale tx-snapshot — otherwise a table another
-            // connection just created and checkpointed is missing and its live page is
-            // mis-reported as orphaned.
-            let main_schema = (database_id == 0 && connection.mvcc_enabled())
-                .then(|| connection.db.schema.lock().clone());
-            let schema = main_schema.as_deref().unwrap_or(schema);
             translate_integrity_check(
-                schema,
                 program,
                 resolver,
                 database_id,
                 max_errors,
-                &connection,
+                connection.as_ref(),
             )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            let main_schema = (database_id == 0 && connection.mvcc_enabled())
-                .then(|| connection.db.schema.lock().clone());
-            let schema = main_schema.as_deref().unwrap_or(schema);
             translate_quick_check(
-                schema,
                 program,
                 resolver,
                 database_id,
                 max_errors,
-                &connection,
+                connection.as_ref(),
             )?;
             Ok(TransactionMode::Read)
         }
@@ -1600,7 +1588,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Synchronous => {
-            let mode = connection.get_sync_mode();
+            let mode = connection.get_sync_mode_for_database(database_id)?;
             let register = program.alloc_register();
             program.emit_int(mode as i64, register);
             program.emit_result_row(register, 1);

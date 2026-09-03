@@ -79,8 +79,7 @@ use crate::{
     vdbe::{builder::CursorType, insn::Insn},
 };
 use crate::{
-    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, SyncMode,
-    TransactionState,
+    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, TransactionState,
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
@@ -2681,7 +2680,7 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
         let txn_finish_result = if !rollback {
-            pager.commit_tx(connection, true)
+            pager.commit_tx(connection, connection.get_sync_mode(), true)
         } else {
             pager.rollback_tx(connection);
             Ok(IOResult::Done(()))
@@ -2734,8 +2733,8 @@ impl Program {
                     // the checkpoint logic can leave read locks held.
                     match attached_pager.commit_wal(
                         WalAutoActions::empty(),
-                        SyncMode::Normal,
-                        false,
+                        connection.get_sync_mode_for_database(db_id)?,
+                        connection.get_data_sync_retry(),
                     ) {
                         Ok(IOResult::Done(_)) => {}
                         Ok(IOResult::IO(io)) => {

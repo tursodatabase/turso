@@ -24,8 +24,8 @@ use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
-    CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
-    TransactionState, Value, ValueRef,
+    CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
+    SyncMode, TransactionState, Value, ValueRef,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
@@ -184,6 +184,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Connection to the database
     connection: Arc<Connection>,
     /// Database whose pager and schema this checkpoint is writing.
+    database: Arc<Database>,
     database_id: usize,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
@@ -724,7 +725,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         });
         self.durable_mvcc_metadata =
-            !self.connection.db.is_in_memory_db() && self.mvcc_meta_table.is_some();
+            !self.database.is_in_memory_db() && self.mvcc_meta_table.is_some();
     }
 
     pub fn new(
@@ -737,8 +738,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         mode: CheckpointMode,
     ) -> Self {
         assert!(
-            !matches!(mode, CheckpointMode::Passive { .. })
-                || connection.experimental_mvcc_passive_checkpoint_enabled(),
+            !matches!(mode, CheckpointMode::Passive { .. }) || mvstore.uses_passive_checkpoint(),
             "passive checkpoint mode requires experimental_mvcc_passive_checkpoint"
         );
         // MVCC supports only Passive (no blocking lock, requires the experimental flag) and
@@ -751,12 +751,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             },
         };
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
+        let database = connection.get_source_database(database_id);
         // Use the shared DB schema (not the per-connection cache, which may be
         // stale) for the database whose pager we're checkpointing. Unlike WAL
         // mode, MVCC checkpoint writes from the mv store back to the pager —
         // so the schema must match the pager being checkpointed.
         let schema = connection.clone_shared_schema(database_id);
-        let index_id_to_index = if connection.experimental_mvcc_passive_checkpoint_enabled() {
+        let index_id_to_index = if mvstore.uses_passive_checkpoint() {
             HashMap::default()
         } else {
             schema
@@ -784,7 +785,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 table.columns().len(),
             )
         });
-        let durable_mvcc_metadata = !connection.db.is_in_memory_db() && mvcc_meta_table.is_some();
+        let durable_mvcc_metadata = !database.is_in_memory_db() && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
         #[cfg(any(test, injected_yields))]
@@ -801,6 +802,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             durable_txid_max_new: durable_tx_max,
             mvstore,
             connection,
+            database,
             database_id,
             #[cfg(any(test, injected_yields))]
             yield_instance_id,
@@ -1503,7 +1505,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn has_unpublished_schema_changes(&self) -> bool {
-        let schema = self.connection.db.schema.lock();
+        let schema = self.database.schema.lock();
         if !schema.dropped_root_pages.is_empty() {
             return true;
         }
@@ -1588,7 +1590,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // Patch the live db.schema (not local_schema, the checkpoint's private snapshot) so
         // clone_schema() propagates real root pages; negative placeholders would orphan the
         // new btree pages.
-        let mut schema_ref = self.connection.db.schema.lock();
+        let mut schema_ref = self.database.schema.lock();
         let schema = Schema::try_make_mut(&mut schema_ref)?;
         for (name, table) in schema.tables.iter_mut() {
             #[cfg(not(feature = "conn_raw_api"))]
@@ -1650,7 +1652,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             .dropped_root_pages
             .extend(std::mem::take(&mut self.ended_created_roots));
         drop(schema_ref);
-        *self.connection.schema.write() = self.connection.db.clone_schema();
+        let schema = self.database.clone_schema();
+        if self.database_id == crate::MAIN_DB_ID {
+            *self.connection.schema.write() = schema;
+        } else {
+            self.connection
+                .database_schemas()
+                .write()
+                .insert(self.database_id, schema);
+        }
         self.connection.bump_prepare_context_generation();
         self.mvstore.bump_schema_generation();
         Ok(())
@@ -1955,9 +1965,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::PrepareCheckpoint => {
-                let passive = self
-                    .connection
-                    .experimental_mvcc_passive_checkpoint_enabled();
+                let passive = self.mvstore.uses_passive_checkpoint();
                 if passive {
                     // The passive checkpoint acquires the blocking lock only after
                     // collection, so it needs an explicit single-orchestrator gate. The
@@ -2100,9 +2108,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
 
-                let passive = self
-                    .connection
-                    .experimental_mvcc_passive_checkpoint_enabled();
+                let passive = self.mvstore.uses_passive_checkpoint();
                 if passive {
                     inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
                     // Passive path: collection AND the btree write phase run without the
@@ -2739,7 +2745,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 )
                             })?;
                         checkpoint_header.schema_cookie =
-                            self.connection.db.schema.lock().schema_version.into();
+                            self.database.schema.lock().schema_version.into();
                         let staged_header = self.pager.io.block(|| {
                             self.pager.with_header_mut(|header| {
                                 // Keep pager-maintained fields (for example database_size/change_counter)
@@ -2761,10 +2767,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
                     // the log offset stay put, so a retry re-stages from the previous boundary.
                     tracing::debug!("Committing pager transaction");
-                    match self
-                        .pager
-                        .commit_tx(&self.connection, self.update_transaction_state)?
-                    {
+                    match self.pager.commit_tx(
+                        &self.connection,
+                        self.sync_mode,
+                        self.update_transaction_state,
+                    )? {
                         IOResult::Done(_) => {
                             self.pager_commit_done = true;
                         }
