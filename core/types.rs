@@ -3631,6 +3631,20 @@ impl Cursor {
             }
         }
     }
+
+    /// Whether the cursor is on a synthetic null row. See [Insn::NullRow]
+    pub fn get_null_flag(&self) -> bool {
+        match self {
+            Self::BTree(cursor, ..) => cursor.get_null_flag(),
+            Self::Dyn(cursor, ..) => cursor.get_null_flag(),
+            Self::Virtual(cursor) => cursor.get_null_flag(),
+            Self::NullRow => true,
+            Self::IndexMethod(_)
+            | Self::Pseudo(_)
+            | Self::Sorter(_)
+            | Self::MaterializedView(_) => false,
+        }
+    }
 }
 
 #[derive(Debug)]
