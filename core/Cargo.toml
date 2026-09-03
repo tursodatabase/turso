@@ -305,5 +305,9 @@ name = "scan_loop_benchmark"
 harness = false
 
 [[bench]]
+name = "seek_loop_benchmark"
+harness = false
+
+[[bench]]
 name = "text_validate_benchmark"
 harness = false

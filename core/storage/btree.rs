@@ -708,6 +708,15 @@ pub trait CursorTrait: Any + Send + Sync {
     fn note_external_row_write(&mut self, _rowid: Option<i64>) {}
     /// Get the record of the entry the cursor is poiting to if any
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>>;
+    /// Like [`Self::record`], but can return the payload borrowed from the
+    /// page instead of copying it into the cursor's record buffer. The
+    /// borrow is valid only while the cursor stays on the same row. Use this
+    /// when the caller decodes or compares the payload immediately. Use
+    /// [`Self::record`] when the record must outlive cursor movement.
+    fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        let record = return_if_io!(self.record());
+        Ok(IOResult::Done(record.map(|record| record.get_payload())))
+    }
     /// Move the cursor based on the key and the type of operation (op).
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult>;
     /// Seek using registers directly without serializing them into an ImmutableRecord first.
@@ -2217,31 +2226,24 @@ impl BTreeCursor {
             .unwrap()
             .cell_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
-        if let Some(next_page) = first_overflow_page {
+        // Compare directly against the cell payload in the page buffer. The
+        // payload stays valid because the page stack pins the page. Only an
+        // overflow cell needs a copy into the cursor's record buffer.
+        let payload: &[u8] = if let Some(next_page) = first_overflow_page {
             let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if res.is_io() {
                 return Ok(ControlFlow::Break(res));
             }
+            self.get_immutable_record()
+                .expect("overflow read must have assembled the record")
+                .get_payload()
         } else {
-            self.get_immutable_record_or_create()?
-                .as_mut()
-                .unwrap()
-                .invalidate();
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                self.get_immutable_record_or_create()?
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(payload)
-            )?;
+            payload
         };
 
         let (target_leaf_page_is_in_left_subtree, is_eq) = {
-            let record = self.get_immutable_record();
-            let record = record.as_ref().unwrap();
-
             let interior_cell_vs_index_key = record_comparer.compare(
-                record,
+                payload,
                 key_values,
                 self.index_info
                     .as_ref()
@@ -2654,26 +2656,23 @@ impl BTreeCursor {
             .unwrap()
             .cell_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
-        if let Some(next_page) = first_overflow_page {
+        // Compare directly against the cell payload in the page buffer. The
+        // payload stays valid because the page stack pins the page. Only an
+        // overflow cell needs a copy into the cursor's record buffer.
+        let payload: &[u8] = if let Some(next_page) = first_overflow_page {
             let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if let IOResult::IO(io) = res {
                 return Ok(ControlFlow::Break(IOResult::IO(io)));
             }
+            self.get_immutable_record()
+                .expect("overflow read must have assembled the record")
+                .get_payload()
         } else {
-            self.get_immutable_record_or_create()?
-                .as_mut()
-                .unwrap()
-                .invalidate();
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                self.get_immutable_record_or_create()?
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(payload)
-            )?;
+            payload
         };
 
-        let (cmp, found) = self.compare_with_current_record(
+        let (cmp, found) = Self::compare_cell_payload_with_key(
+            payload,
             key_values,
             seek_op,
             &record_comparer,
@@ -2716,18 +2715,15 @@ impl BTreeCursor {
         Ok(ControlFlow::Continue(()))
     }
 
-    fn compare_with_current_record(
-        &self,
+    fn compare_cell_payload_with_key(
+        payload: &[u8],
         key_values: &[ValueRef],
         seek_op: SeekOp,
         record_comparer: &RecordCompare,
         index_info: &IndexInfo,
     ) -> Result<(Ordering, bool)> {
-        let record = self.get_immutable_record();
-        let record = record.as_ref().unwrap();
-
         let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-        let cmp = record_comparer.compare(record, key_values, index_info, 0, tie_breaker)?;
+        let cmp = record_comparer.compare(payload, key_values, index_info, 0, tie_breaker)?;
 
         let found = match seek_op {
             SeekOp::GT => cmp.is_gt(),
@@ -6510,6 +6506,33 @@ impl CursorTrait for BTreeCursor {
         };
 
         Ok(IOResult::Done(self.reusable_immutable_record.as_ref()))
+    }
+
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        if self.needs_restore() {
+            return_if_io!(self.restore_context());
+        }
+        if !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+
+        let page = self.stack.top_ref();
+        let contents = page.get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        let (payload, payload_size, first_overflow_page) =
+            contents.cell_read_payload_ptr(cell_idx as usize, self.usable_space())?;
+        if let Some(next_page) = first_overflow_page {
+            return_if_io!(self.process_overflow_read(payload, next_page, payload_size));
+            Ok(IOResult::Done(
+                self.get_immutable_record()
+                    .map(|record| record.get_payload()),
+            ))
+        } else {
+            // The payload borrows from the page buffer. The buffer stays
+            // valid because the page stack pins the page.
+            Ok(IOResult::Done(Some(payload)))
+        }
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]

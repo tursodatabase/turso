@@ -2081,8 +2081,8 @@ fn op_column_fetch(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                let record_result = return_if_io!(cursor.record());
-                let Some(record) = record_result else {
+                let payload_result = return_if_io!(cursor.record_payload());
+                let Some(payload) = payload_result else {
                     // Cursor is not positioned on a valid row (e.g., empty table).
                     // Return NULL, not the column's default value.
                     // DEFAULT handling below is for when record exists
@@ -2091,7 +2091,7 @@ fn op_column_fetch(
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                let mut payload_iterator = record.iter()?;
+                let mut payload_iterator = ValueIterator::new(payload)?;
 
                 // Parse the header for serial types incrementally until we have the target column
                 // Use nth_into_register to write directly to the register without
@@ -2242,15 +2242,15 @@ fn op_column_range_fetch(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                let record_result = return_if_io!(cursor.record());
-                let Some(record) = record_result else {
+                let payload_result = return_if_io!(cursor.record_payload());
+                let Some(payload) = payload_result else {
                     for reg in &mut state.registers[dest..dest + count] {
                         reg.set_null();
                     }
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                record.iter()?.decode_into_registers_after(
+                ValueIterator::new(payload)?.decode_into_registers_after(
                     start_column,
                     &mut state.registers[dest..dest + count],
                 )?
@@ -6633,13 +6633,13 @@ pub fn op_idx_ge(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(cursor.record_payload()) {
             // Create the comparison record from registers
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
-                idx_record,  // The serialized record from the index
+                idx_payload, // The serialized record from the index
                 values,      // The record built from registers
                 &index_info, // Sort order flags
                 0,
@@ -6703,11 +6703,11 @@ pub fn op_idx_le(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(cursor.record_payload()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_records_generic(idx_payload, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_le() {
                 target_pc.as_offset_int()
@@ -6750,11 +6750,11 @@ pub fn op_idx_gt(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(cursor.record_payload()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_records_generic(idx_payload, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_gt() {
                 target_pc.as_offset_int()
@@ -6797,12 +6797,12 @@ pub fn op_idx_lt(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(cursor.record_payload()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
 
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_records_generic(idx_payload, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_lt() {
                 target_pc.as_offset_int()
