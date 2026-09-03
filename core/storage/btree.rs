@@ -6338,6 +6338,11 @@ impl CursorTrait for BTreeCursor {
     }
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> IOResultOr<()> {
+        if self.can_advance_within_leaf() {
+            self.stack.advance();
+            self.invalidate_record();
+            return Ok(IOResult::Done(()));
+        }
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
@@ -7397,6 +7402,30 @@ impl CursorTrait for BTreeCursor {
                 }
             }
         }
+    }
+}
+
+impl BTreeCursor {
+    /// True when the next cell is on the same leaf page and no resumable
+    /// state is pending, so advancing cannot yield and `next()` can skip
+    /// its state machine. Every pending flag routes to the full path,
+    /// which owns its handling: `skip_advance` (restore landed on the
+    /// iteration target; advancing would skip a row), an abandoned
+    /// overflow read, and an in-flight spill descent.
+    fn can_advance_within_leaf(&self) -> bool {
+        if !matches!(self.advance_state, AdvanceState::Start)
+            || !matches!(self.valid_state, CursorValidState::Valid)
+            || self.needs_restore()
+            || self.skip_advance
+            || !self.has_record
+            || self.read_overflow_state.is_some()
+            || self.iteration_pending_descent.is_some()
+        {
+            return false;
+        }
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        cell_idx >= 0 && contents.is_leaf() && cell_idx as usize + 1 < contents.cell_count()
     }
 }
 
