@@ -1,6 +1,6 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 CORE_FEATURES = [
@@ -8,7 +8,6 @@ CORE_FEATURES = [
     "aristo-instr",
     "autovacuum",
     "bench",
-    "checksum",
     "cli_only",
     "codspeed",
     "conn_raw_api",
@@ -34,6 +33,8 @@ CORE_FEATURES = [
     "uuid",
 ]
 
+CORE_ALL_FEATURES = CORE_FEATURES + ["checksum"]
+
 cargo_toml_env_vars(
     name = "cargo_env",
     src = "Cargo.toml",
@@ -46,6 +47,7 @@ cargo_build_script(
     aliases = aliases(build = True),
     build_script_env_files = [":cargo_env"],
     build_script_env = {"SOURCE_DATE_EPOCH": "0"},
+    crate_features = CORE_ALL_FEATURES,
     crate_root = "build.rs",
     deps = all_crate_deps(build = True),
     edition = crate_edition(),
@@ -77,6 +79,32 @@ rust_library(
     visibility = ["//visibility:public"],
 )
 
+rust_library(
+    name = "turso_core_checksum",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "benches/**/*.rs",
+            "build.rs",
+        ],
+    ),
+    aliases = aliases(),
+    crate_features = CORE_ALL_FEATURES,
+    crate_name = "turso_core",
+    crate_root = "lib.rs",
+    deps = [
+        ":build_script",
+        "//extensions/core:turso_ext",
+        "//sqlite/parser:turso_parser",
+        "@crates//:stacker",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ] + all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+)
+
 rust_test(
     name = "turso_core_test",
     aliases = aliases(
@@ -84,7 +112,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     crate = ":turso_core",
-    crate_features = CORE_FEATURES,
+    crate_features = CORE_ALL_FEATURES,
     deps = all_crate_deps(normal_dev = True),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     tags = ["manual"],
@@ -99,3 +127,60 @@ sh_test(
     shard_count = 8,
     timeout = "long",
 )
+
+CORE_BENCHMARKS = {
+    "benchmark": ["benches/benchmark.rs"],
+    "count_benchmark": ["benches/count_benchmark.rs"],
+    "create_index_benchmark": ["benches/create_index_benchmark.rs"],
+    "fts_benchmark": ["benches/fts_benchmark.rs"],
+    "fts_comparison_benchmark": ["benches/fts_comparison_benchmark.rs"],
+    "graph_queries_benchmark": ["benches/graph_queries_benchmark.rs"],
+    "hash_spill_benchmark": ["benches/hash_spill_benchmark.rs"],
+    "json_benchmark": ["benches/json_benchmark.rs"],
+    "logical_log_serialization": ["benches/logical_log_serialization.rs"],
+    "mvcc_benchmark": ["benches/mvcc_benchmark.rs"],
+    "mvcc_recovery_benchmark": ["benches/mvcc_recovery_benchmark.rs"],
+    "prepare_benchmark": ["benches/prepare_benchmark.rs"],
+    "prepare_params_benchmark": ["benches/prepare_params_benchmark.rs"],
+    "record_recycling": ["benches/record_recycling.rs"],
+    "scan_loop_benchmark": ["benches/scan_loop_benchmark.rs"],
+    "select_star_benchmark": ["benches/select_star_benchmark.rs"],
+    "sql_functions": glob(["benches/sql_functions/**/*.rs"]),
+    "struct_union_benchmark": ["benches/struct_union_benchmark.rs"],
+    "struct_union_profile": ["benches/struct_union_profile.rs"],
+    "text_validate_benchmark": ["benches/text_validate_benchmark.rs"],
+    "tpc_h_benchmark": ["benches/tpc_h_benchmark.rs"],
+    "triggers": ["benches/triggers.rs"],
+    "write_perf_benchmark": ["benches/write_perf_benchmark.rs"],
+}
+
+[
+    rust_binary(
+        name = name,
+        srcs = srcs,
+        aliases = aliases(normal = True, normal_dev = True, proc_macro_dev = True),
+        compile_data = ["//:tpc_h_queries"],
+        crate_root = srcs[0],
+        deps = [":turso_core"] + all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
+        tags = ["manual"],
+    )
+    for name, srcs in CORE_BENCHMARKS.items()
+]
+
+[
+    rust_binary(
+        name = name + "_codspeed",
+        srcs = srcs,
+        aliases = aliases(normal = True, normal_dev = True, proc_macro_dev = True),
+        compile_data = ["//:tpc_h_queries"],
+        crate_features = ["codspeed"],
+        crate_root = srcs[0],
+        deps = [":turso_core"] + all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
+        tags = ["manual"],
+    )
+    for name, srcs in CORE_BENCHMARKS.items()
+]

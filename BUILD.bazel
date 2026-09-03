@@ -2,4 +2,12 @@ exports_files([
     "Cargo.lock",
     "Cargo.toml",
     "cargo-bazel-lock.json",
+    "serverless/conformance/differential/spec/ops.json",
+    "sqlite/conformance/database/testing_legacy_unquoted_view_columns.db",
+    "testing/system/testing.db",
 ])
+
+filegroup(
+    name = "tpc_h_queries",
+    srcs = glob(["perf/tpc-h/queries/*.sql"]),
+)

@@ -1,5 +1,5 @@
 {
-  "checksum": "19838e94d476ab44c09fd26804af245cf58e5ab0bce2ea47b12bf47c82f57e1e",
+  "checksum": "ab4d05a316214f653fa4befe954802deb523f51866a7e44f0f05e8e3350af550",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -75,6 +75,9 @@
     ],
     "cfg(all(target_arch = \"x86_64\", target_env = \"msvc\", not(windows_raw_dylib)))": [
       "x86_64-pc-windows-msvc"
+    ],
+    "cfg(all(target_family = \"unix\", not(target_os = \"linux\")))": [
+      "aarch64-apple-darwin"
     ],
     "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))": [
       "wasm32-unknown-unknown"
@@ -12173,14 +12176,6 @@
       "version": "0.28.2"
     },
     "hegeltest-c 0.30.1": {
-      "build_script_attrs": {
-        "deps": [
-          {
-            "id": "cbindgen 0.29.4",
-            "target": "cbindgen"
-          }
-        ]
-      },
       "common_attrs": {
         "deps": [
           {
@@ -12212,10 +12207,7 @@
             "target": "tempfile"
           }
         ],
-        "edition": "2024",
-        "extra_deps": [
-          ":build_script_build"
-        ]
+        "edition": "2024"
       },
       "library_target_name": "hegel_c",
       "license": "MIT",
@@ -12235,12 +12227,6 @@
           "Library": {
             "crate_name": "hegel_c",
             "crate_root": "src/lib.rs"
-          }
-        },
-        {
-          "BuildScript": {
-            "crate_name": "build_script_build",
-            "crate_root": "build.rs"
           }
         }
       ],
@@ -12797,6 +12783,7 @@
           "aws-lc-rs",
           "http1",
           "http2",
+          "rustls-native-certs",
           "tls12"
         ],
         "deps": [
@@ -12829,7 +12816,10 @@
             "target": "tower_service"
           }
         ],
-        "edition": "2021"
+        "edition": "2021",
+        "extra_deps": [
+          "@rustls_native_certs//:rustls_native_certs"
+        ]
       },
       "library_target_name": "hyper_rustls",
       "license": "Apache-2.0 OR ISC OR MIT",
@@ -18228,6 +18218,7 @@
       },
       "common_attrs": {
         "crate_features": [
+          "dyn-symbols",
           "napi1",
           "napi2",
           "napi3",
@@ -18438,6 +18429,7 @@
     "napi-sys 3.2.1": {
       "common_attrs": {
         "crate_features": [
+          "dyn-symbols",
           "napi1",
           "napi2",
           "napi3",
@@ -31597,6 +31589,9 @@
             "id": "tokio-macros 2.5.0",
             "target": "tokio_macros"
           }
+        ],
+        "rustc_flags": [
+          "--cfg=tokio_unstable"
         ]
       },
       "library_target_name": "tokio",
@@ -33418,6 +33413,12 @@
                 "target": "getrandom"
               }
             ],
+            "cfg(all(target_family = \"unix\", not(target_os = \"linux\")))": [
+              {
+                "id": "libc 0.2.186",
+                "target": "libc"
+              }
+            ],
             "cfg(antithesis)": [
               {
                 "id": "antithesis_sdk 0.3.0",
@@ -33462,16 +33463,18 @@
             ],
             "cfg(target_family = \"unix\")": [
               {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
                 "id": "polling 3.7.4",
                 "target": "polling"
               },
               {
                 "id": "rustix 1.0.7",
                 "target": "rustix"
+              }
+            ],
+            "cfg(target_os = \"linux\")": [
+              {
+                "id": "libc 0.2.186",
+                "target": "libc"
               }
             ],
             "cfg(target_os = \"windows\")": [

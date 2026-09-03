@@ -1,0 +1,37 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "turso_stress_lib",
+    srcs = glob(["*.rs"], exclude = ["main.rs"]),
+    aliases = aliases(),
+    crate_name = "turso_stress",
+    crate_root = "lib.rs",
+    deps = [
+        "//bindings/rust:turso",
+        "//core:turso_core",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro = True),
+)
+
+rust_binary(
+    name = "turso_stress",
+    srcs = glob(["*.rs"], exclude = ["lib.rs"]),
+    aliases = aliases(),
+    deps = [
+        ":turso_stress_lib",
+        "//bindings/rust:turso",
+        "//core:turso_core",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "turso_stress_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":turso_stress_lib",
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)

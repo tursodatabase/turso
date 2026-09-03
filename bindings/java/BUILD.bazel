@@ -1,0 +1,26 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
+
+JAVA_FEATURES = ["tracing_release"]
+
+rust_shared_library(
+    name = "turso_java_cdylib",
+    srcs = glob(["rs_src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = JAVA_FEATURES,
+    crate_name = "_turso_java",
+    crate_root = "rs_src/lib.rs",
+    deps = ["//core:turso_core"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_test(
+    name = "turso_java_test",
+    srcs = glob(["rs_src/**/*.rs"]),
+    aliases = aliases(normal = True, normal_dev = True),
+    crate_features = JAVA_FEATURES,
+    crate_name = "_turso_java",
+    crate_root = "rs_src/lib.rs",
+    deps = ["//core:turso_core"] + all_crate_deps(normal = True, normal_dev = True),
+    edition = crate_edition(),
+)

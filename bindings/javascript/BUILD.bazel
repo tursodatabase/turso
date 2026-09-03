@@ -1,0 +1,33 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library", "rust_test")
+
+NODE_FEATURES = ["tracing_release"]
+
+cargo_build_script(name = "build_script", srcs = ["build.rs"], aliases = aliases(build = True), crate_root = "build.rs", deps = all_crate_deps(build = True), edition = crate_edition())
+
+rust_library(
+    name = "turso_node",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = NODE_FEATURES,
+    crate_root = "src/lib.rs",
+    deps = [":build_script", "//core:turso_core", "//sqlite/parser:turso_parser"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_shared_library(
+    name = "turso_node_cdylib",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = NODE_FEATURES,
+    crate_name = "turso_node",
+    crate_root = "src/lib.rs",
+    deps = [":build_script", "//core:turso_core", "//sqlite/parser:turso_parser"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(name = "turso_node_test", crate = ":turso_node", crate_features = NODE_FEATURES, aliases = aliases(normal_dev = True, proc_macro_dev = True), deps = all_crate_deps(normal_dev = True), proc_macro_deps = all_crate_deps(proc_macro_dev = True))

@@ -1,0 +1,36 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "turso_dbhash",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    aliases = aliases(),
+    crate_root = "src/lib.rs",
+    deps = ["//core:turso_core"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    visibility = ["//visibility:public"],
+)
+
+rust_binary(
+    name = "turso-dbhash",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    deps = [":turso_dbhash"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_test(
+    name = "turso_dbhash_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":turso_dbhash",
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
+rust_test(
+    name = "sqlite_compat",
+    srcs = ["tests/sqlite_compat.rs"],
+    aliases = aliases(normal = True, normal_dev = True),
+    deps = [":turso_dbhash"] + all_crate_deps(normal = True, normal_dev = True),
+    edition = crate_edition(),
+)

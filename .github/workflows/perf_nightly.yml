@@ -3,16 +3,16 @@ name: Nightly Benchmarks on Nyrkiö Runners (stability)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '24 4 * * *'
+    - cron: "24 4 * * *"
   # These jobs need the dedicated Nyrkiö runners and take ~45 minutes, so we only
   # want them on the nightly schedule above, which runs on main. There is no branch
   # named "notmain", which is how the push and pull_request triggers stay switched
   # off. Removing these filters turns the benchmarks on for every push and every PR.
   push:
-  #   branches: ["main", "notmain", "master"]
+    #   branches: ["main", "notmain", "master"]
     branches: ["notmain"]
   pull_request:
-  #   branches: ["main", "notmain", "master"]
+    #   branches: ["main", "notmain", "master"]
     branches: ["notmain"]
 
 env:
@@ -137,9 +137,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-bazel
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 24
+
+      - name: Build tursodb
+        run: |
+          bazel build -c opt //cli:tursodb
+          mkdir -p target/release
+          ln -sf "$(pwd)/bazel-bin/cli/tursodb" target/release/tursodb
 
       - name: Clickbench
         run: make clickbench
@@ -193,10 +200,7 @@ jobs:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
 
       - name: Cache TPC-H
         id: cache-primes
@@ -211,7 +215,7 @@ jobs:
         run: wget -O $DB_FILE --no-verbose $DB_URL
 
       - name: Bench
-        run: cargo bench --bench tpc_h_benchmark  2>&1 | tee output.txt
+        run: bazel run --config=ci-opt //core:tpc_h_benchmark 2>&1 | tee output.txt
       - name: Analyze benchmark result with Nyrkiö
         uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
         with:
@@ -241,5 +245,3 @@ jobs:
           # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
           nyrkio-settings-pvalue: 0.00001
           nyrkio-settings-threshold: 0%
-
-

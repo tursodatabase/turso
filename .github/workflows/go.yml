@@ -19,15 +19,13 @@ permissions:
 env:
   # Token with repo access to tursodatabase/turso-go-platform-libs
   GH_TOKEN: ${{ secrets.TURSO_GO_PLATFORM_LIBS_TOKEN }}
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   test:
-    name: Build Rust and run Go tests
+    name: Build native libraries and run Go tests
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -36,23 +34,11 @@ jobs:
           - blacksmith-4vcpu-ubuntu-2404
           - blacksmith-6vcpu-macos-latest
           - blacksmith-4vcpu-windows-2025
-    env:
-      CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup mold linker
-        if: runner.os == 'Linux'
-        uses: rui314/setup-mold@v1
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -61,8 +47,18 @@ jobs:
           cache: true
           cache-dependency-path: bindings/go/go.sum
 
-      - name: Build Rust (debug)
-        run: cargo build --verbose --locked
+      - name: Build native libraries
+        shell: bash
+        run: |
+          bazel build //bindings/c:turso_sqlite3_cdylib //cli:tursodb
+          mkdir -p target/debug
+          cp bazel-bin/cli/tursodb target/debug/tursodb 2>/dev/null || \
+            cp bazel-bin/cli/tursodb.exe target/debug/tursodb.exe
+          case "${{ runner.os }}" in
+            Linux) cp bazel-bin/bindings/c/libturso_sqlite3.so target/debug/ ;;
+            macOS) cp bazel-bin/bindings/c/libturso_sqlite3.dylib target/debug/ ;;
+            Windows) cp bazel-bin/bindings/c/turso_sqlite3.dll target/debug/ ;;
+          esac
 
       # Linux: use LD_LIBRARY_PATH to point to Rust target dir
       - name: Run Go tests (Linux)

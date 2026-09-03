@@ -11,15 +11,16 @@ fn main() {
     cc::Build::new()
         .file("src/varargs.c")
         .compile("turso_sqlite3_varargs");
-    let profile_dir = target_profile_dir();
-    println!("cargo:rustc-link-search=native={}", profile_dir.display());
+    if let Some(profile_dir) = target_profile_dir() {
+        println!("cargo:rustc-link-search=native={}", profile_dir.display());
+    }
 
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         configure_msvc_sqlite3();
     }
 }
 
-fn target_profile_dir() -> std::path::PathBuf {
+fn target_profile_dir() -> Option<std::path::PathBuf> {
     let out_dir = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR for build scripts"),
     );
@@ -28,7 +29,6 @@ fn target_profile_dir() -> std::path::PathBuf {
         .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("build"))
         .and_then(std::path::Path::parent)
         .map(std::path::Path::to_path_buf)
-        .expect("OUT_DIR must be inside Cargo's target profile build directory")
 }
 
 fn configure_msvc_sqlite3() {

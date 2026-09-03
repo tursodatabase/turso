@@ -1,0 +1,45 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+FUZZER_SRCS = glob(["**/*.rs"], exclude = ["main.rs", "printf_fuzzer.rs", "custom_types_fuzzer.rs", "probe.rs"])
+
+FUZZER_DEPS = [
+    "//core:turso_core",
+    "//sqlite/parser:turso_parser",
+    "//testing/differential-oracle/sql_gen:sql_gen",
+    "//testing/differential-oracle/sql_gen_prop:sql_gen_prop",
+]
+
+rust_library(
+    name = "differential_fuzzer_lib",
+    srcs = FUZZER_SRCS,
+    aliases = aliases(),
+    crate_name = "differential_fuzzer",
+    crate_root = "lib.rs",
+    deps = FUZZER_DEPS + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_test(
+    name = "differential_fuzzer_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":differential_fuzzer_lib",
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
+[
+    rust_binary(
+        name = name,
+        srcs = [src],
+        aliases = aliases(),
+        deps = [":differential_fuzzer_lib"] + FUZZER_DEPS + all_crate_deps(normal = True),
+        edition = crate_edition(),
+    )
+    for name, src in {
+        "custom_types_fuzzer": "custom_types_fuzzer.rs",
+        "differential_fuzzer": "main.rs",
+        "differential_probe": "probe.rs",
+        "printf_fuzzer": "printf_fuzzer.rs",
+    }.items()
+]

@@ -1,0 +1,10 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "encryption-throughput",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    deps = ["//bindings/rust:turso"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)

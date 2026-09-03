@@ -3,20 +3,9 @@ name: C compat Tests
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-    tags:
-      - v*
+    branches: [main]
+    tags: [v*]
   pull_request:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
-
-env:
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
-  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   test:
@@ -31,69 +20,24 @@ jobs:
             os: ubuntu-latest
           - name: Windows MSVC
             os: blacksmith-4vcpu-windows-2025
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust(stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup mold linker
-        if: runner.os == 'Linux'
-        uses: rui314/setup-mold@v1
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
-
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-bazel
       - name: Install SQLite
         if: runner.os == 'Windows'
         run: |
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
           vcpkg install sqlite3:x64-windows-static-md
-
-      - name: Build Turso C bindings
-        run: cargo build -p turso_sqlite3 --features capi --locked
-
-      - name: Run C compat tests from Rust
+      - name: Build and test Turso C bindings
+        run: bazel test //bindings/c/... --lockfile_mode=error --test_output=errors --test_arg=--test-threads=1
+      - name: Run C tests against real SQLite
         if: runner.os == 'Linux'
-        working-directory: bindings/c
-        run: cargo test --locked
-
-      - name: Run C compat tests from Rust (Windows)
-        if: runner.os == 'Windows'
-        run: cargo test --locked -p turso_sqlite3 --test compat -- --test-threads=1
-
-      - name: Run C compat C tests linking against real SQLite
+        working-directory: bindings/c/tests
+        run: make clean && make LIBS="-lsqlite3" && ./sqlite3-tests
+      - name: Run C tests against Turso
         if: runner.os == 'Linux'
         working-directory: bindings/c/tests
         run: |
           make clean
-          make LIBS="-lsqlite3"
-          ./sqlite3-tests
-
-      - name: Run C compat C tests linking against Turso
-        if: runner.os == 'Linux'
-        working-directory: bindings/c/tests
-        run: |
-          make clean
-          make LIBS="-L../../../target/debug -lturso_sqlite3"
-          LD_LIBRARY_PATH=../../../target/debug ./sqlite3-tests
-
-      - name: Run C compat C tests linking against real SQLite (Windows)
-        if: runner.os == 'Windows'
-        working-directory: bindings/c/tests
-        run: |
-          cl.exe /nologo /W4 /MD /I../include sqlite3_tests.c /Fe:sqlite3-tests.exe /link /LIBPATH:"$env:VCPKG_ROOT/installed/x64-windows-static-md/lib" sqlite3.lib
-          ./sqlite3-tests.exe
-
-      - name: Run C compat C tests linking against Turso (Windows)
-        if: runner.os == 'Windows'
-        working-directory: bindings/c/tests
-        run: |
-          cl.exe /nologo /W4 /MD /I../include sqlite3_tests.c /Fe:sqlite3-tests.exe /link /LIBPATH:../../../target/debug turso_sqlite3.dll.lib
-          $env:PATH = "$(Resolve-Path ../../../target/debug);$env:PATH"
-          ./sqlite3-tests.exe
+          make LIBS="-L../../../bazel-bin/bindings/c -lturso_sqlite3"
+          LD_LIBRARY_PATH=../../../bazel-bin/bindings/c ./sqlite3-tests

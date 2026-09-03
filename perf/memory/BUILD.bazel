@@ -1,0 +1,53 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "memory_benchmark",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs", "src/stack_report.rs"]),
+    aliases = aliases(),
+    crate_root = "src/lib.rs",
+    deps = [
+        "//bindings/rust:turso_no_default_features",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "memory_benchmark_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":memory_benchmark",
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
+[
+    rust_binary(
+        name = name,
+        srcs = [src],
+        aliases = aliases(),
+        deps = [
+            ":memory_benchmark",
+            "//bindings/rust:turso_no_default_features",
+            "//sqlite/parser:turso_parser",
+        ] + all_crate_deps(normal = True),
+        edition = crate_edition(),
+    )
+    for name, src in {
+        "memory-benchmark": "src/main.rs",
+        "stack-report": "src/stack_report.rs",
+    }.items()
+]
+
+rust_test(
+    name = "stack_report_test",
+    srcs = ["src/stack_report.rs"],
+    aliases = aliases(normal = True, normal_dev = True),
+    deps = [
+        ":memory_benchmark",
+        "//bindings/rust:turso_no_default_features",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True, normal_dev = True),
+    edition = crate_edition(),
+)

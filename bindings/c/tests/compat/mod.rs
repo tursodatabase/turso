@@ -258,10 +258,13 @@ mod tests {
     fn test_open_existing() {
         unsafe {
             let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(c"../../testing/system/testing_clone.db".as_ptr(), &mut db),
-                SQLITE_OK
-            );
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testing/system/testing.db");
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let writable_path = tmp_dir.path().join("testing.db");
+            std::fs::copy(path, &writable_path).unwrap();
+            let path = std::ffi::CString::new(writable_path.to_str().unwrap()).unwrap();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
@@ -694,10 +697,13 @@ mod tests {
     fn column_text_is_nul_terminated_and_bytes_match() {
         unsafe {
             let mut db = std::ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(c"../../testing/system/testing.db".as_ptr(), &mut db),
-                SQLITE_OK
-            );
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testing/system/testing.db");
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let writable_path = tmp_dir.path().join("testing.db");
+            std::fs::copy(path, &writable_path).unwrap();
+            let path = std::ffi::CString::new(writable_path.to_str().unwrap()).unwrap();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
             let mut stmt = std::ptr::null_mut();
             assert_eq!(
                 sqlite3_prepare_v2(

@@ -1,0 +1,52 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+SDK_KIT_FEATURES = [
+    "encryption",
+    "fts",
+    "pure-rust-crypto",
+]
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+    workspace = "//:Cargo.toml",
+)
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env_files = [":cargo_env"],
+    crate_root = "build.rs",
+    deps = all_crate_deps(build = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+)
+
+rust_library(
+    name = "turso_sdk_kit",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = SDK_KIT_FEATURES,
+    crate_root = "src/lib.rs",
+    deps = [
+        ":build_script",
+        "//core:turso_core",
+        "//extensions/core:turso_ext",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = ["//sdk-kit-macros:turso_sdk_kit_macros"],
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "turso_sdk_kit_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":turso_sdk_kit",
+    crate_features = SDK_KIT_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)

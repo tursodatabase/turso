@@ -1,0 +1,13 @@
+build:ci --lockfile_mode=error
+test:ci --lockfile_mode=error
+
+build:ci-opt --config=ci
+build:ci-opt -c opt
+build:ci-opt --@rules_rust//rust/settings:lto=off
+test:ci-opt --config=ci
+test:ci-opt -c opt
+test:ci-opt --@rules_rust//rust/settings:lto=off
+
+build:ci-nightly --config=ci
+build:ci-nightly --@rules_rust//rust/toolchain/channel=nightly
+build:ci-nightly --@rules_rust//rust/settings:extra_rustc_flag=--cfg=nightly

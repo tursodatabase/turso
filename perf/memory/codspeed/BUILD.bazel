@@ -1,0 +1,12 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "memory_profiles",
+    srcs = ["benches/memory_profiles.rs"],
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate_features = ["codspeed"],
+    deps = ["//perf/memory:memory_benchmark"] + all_crate_deps(normal_dev = True),
+    edition = crate_edition(),
+    proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
+)

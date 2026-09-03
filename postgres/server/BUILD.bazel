@@ -1,0 +1,23 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "turso_pg_server",
+    srcs = ["lib.rs"],
+    aliases = aliases(proc_macro = True),
+    crate_root = "lib.rs",
+    deps = [
+        "//core:turso_core",
+        "//postgres/frontend:turso_pg",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "turso_pg_server_test",
+    aliases = aliases(normal_dev = True),
+    crate = ":turso_pg_server",
+    deps = all_crate_deps(normal_dev = True),
+)

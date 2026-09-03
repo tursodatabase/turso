@@ -7,10 +7,6 @@ on:
       - main
   pull_request:
 
-env:
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -26,25 +22,16 @@ jobs:
         uses: useblacksmith/setup-node@v5
         with:
           node-version: 24
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: conformance-js-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            conformance-js-cargo-
+      - uses: ./.github/actions/setup-bazel
       - name: Install JS binding dependencies
         working-directory: bindings/javascript
         run: yarn install
       - name: Build JS native module
-        working-directory: bindings/javascript
-        run: yarn build:native
+        run: |
+          bazel build //bindings/javascript:turso_node_cdylib
+          cp bazel-bin/bindings/javascript/libturso_node.so \
+            bindings/javascript/packages/native/turso.linux-x64-gnu.node
+          yarn workspace @tursodatabase/database-common build
       - name: Install test dependencies
         working-directory: testing/conformance/javascript
         run: npm install
@@ -61,22 +48,19 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: conformance-sqlite-tcl-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            conformance-sqlite-tcl-cargo-
+      - uses: ./.github/actions/setup-bazel
       - name: Install TCL dev headers
         run: sudo apt-get update && sudo apt-get install -y tcl-dev tcl
       - name: Build libturso_tcl
-        run: make -C bindings/tcl build
+        run: |
+          bazel build //bindings/c:turso_sqlite3_cdylib
+          gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
+            bindings/tcl/turso_tcl.c \
+            -I bindings/c/include \
+            -I /usr/include/tcl8.6 \
+            -L bazel-bin/bindings/c \
+            -lturso_sqlite3 \
+            -ltcl8.6 \
+            -Wl,-rpath,"${GITHUB_WORKSPACE}/bazel-bin/bindings/c"
       - name: Run SQLite TCL conformance tests
         run: tclsh sqlite/conformance/upstream/all.test

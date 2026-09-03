@@ -1,0 +1,36 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "turso_serverless_differential",
+    srcs = ["lib.rs"],
+    aliases = aliases(),
+    crate_root = "lib.rs",
+    deps = all_crate_deps(normal = True),
+    edition = crate_edition(),
+    rustc_env = {"CARGO_MANIFEST_DIR": "serverless/rust/differential"},
+    visibility = ["//visibility:public"],
+)
+
+[
+    rust_test(
+        name = name + "_test",
+        srcs = ["tests/" + name + ".rs"],
+        aliases = aliases(normal_dev = True, proc_macro_dev = True),
+        crate_root = "tests/" + name + ".rs",
+        data = ["//:serverless/conformance/differential/spec/ops.json"],
+        deps = [
+            ":turso_serverless_differential",
+            "//bindings/rust:turso",
+            "//serverless/rust:turso_serverless",
+            "//serverless/rust/conformance:turso_serverless_conformance",
+        ] + all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+        timeout = "long",
+    )
+    for name in [
+        "encryption_header",
+        "parity",
+    ]
+]

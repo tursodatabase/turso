@@ -1,0 +1,41 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+    workspace = "//:Cargo.toml",
+)
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env_files = [":cargo_env"],
+    crate_root = "build.rs",
+    data = glob([
+        "include/*.h",
+        "src/*.c",
+    ]),
+    deps = all_crate_deps(build = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+)
+
+rust_shared_library(
+    name = "limbo_sqlite_test_ext",
+    srcs = ["src/lib.rs"],
+    aliases = aliases(),
+    crate_name = "limbo_sqlite_test_ext",
+    deps = [":build_script"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_test(
+    name = "limbo_sqlite_test_ext_test",
+    srcs = ["src/lib.rs"],
+    aliases = aliases(normal = True, normal_dev = True),
+    deps = [":build_script"] + all_crate_deps(normal = True, normal_dev = True),
+    edition = crate_edition(),
+)

@@ -1,0 +1,53 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+PARSER_FEATURES = ["validate_psql"]
+
+rust_library(
+    name = "turso_pg_parser",
+    srcs = glob(["*.rs"]),
+    aliases = aliases(),
+    crate_features = PARSER_FEATURES,
+    crate_root = "lib.rs",
+    deps = [
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    tags = ["no-rustfmt"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "turso_pg_parser_test",
+    aliases = aliases(normal_dev = True),
+    crate = ":turso_pg_parser",
+    crate_features = PARSER_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
+    tags = ["no-rustfmt"],
+)
+
+rust_test(
+    name = "parse_valid_test",
+    srcs = ["tests/parse_valid.rs"],
+    aliases = aliases(normal_dev = True),
+    crate_features = PARSER_FEATURES,
+    crate_root = "tests/parse_valid.rs",
+    deps = [
+        ":turso_pg_parser",
+    ] + all_crate_deps(normal_dev = True),
+    edition = crate_edition(),
+    tags = ["no-rustfmt"],
+)
+
+rust_test(
+    name = "parse_invalid_test",
+    srcs = ["tests/parse_invalid.rs"],
+    aliases = aliases(normal_dev = True),
+    crate_features = PARSER_FEATURES,
+    crate_root = "tests/parse_invalid.rs",
+    deps = [
+        ":turso_pg_parser",
+    ] + all_crate_deps(normal_dev = True),
+    edition = crate_edition(),
+    tags = ["no-rustfmt"],
+)

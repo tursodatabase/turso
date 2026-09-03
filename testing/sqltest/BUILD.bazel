@@ -1,0 +1,34 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "sqltest_lib",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    aliases = aliases(),
+    crate_name = "sqltest",
+    crate_root = "src/lib.rs",
+    deps = [
+        "//bindings/rust:turso",
+        "//postgres/client:turso_pg_client",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = ["@crates//:async-trait"],
+    rustc_env = {"CARGO_MANIFEST_DIR": "testing/sqltest"},
+)
+
+rust_binary(
+    name = "sqltest",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    deps = [":sqltest_lib"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_test(
+    name = "sqltest_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":sqltest_lib",
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)

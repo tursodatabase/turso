@@ -1,0 +1,22 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "sql_gen",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["serde"],
+    deps = all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = ["//testing/differential-oracle/sql_gen_macros:sql_gen_macros"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "sql_gen_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":sql_gen",
+    crate_features = ["serde"],
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)

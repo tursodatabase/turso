@@ -1,0 +1,76 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+CLI_FEATURES = [
+    "io_uring",
+    "mimalloc",
+]
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+    workspace = "//:Cargo.toml",
+)
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env_files = [":cargo_env"],
+    compile_data = ["//cli:SQL.sublime-syntax"],
+    crate_root = "build.rs",
+    deps = all_crate_deps(build = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+)
+
+rust_binary(
+    name = "tursopg",
+    srcs = [
+        "main.rs",
+        "read_state_machine.rs",
+        "//cli:postgres_shared_srcs",
+    ],
+    aliases = aliases(proc_macro = True),
+    crate_features = CLI_FEATURES,
+    crate_root = "main.rs",
+    deps = [
+        ":build_script",
+        "//core:turso_core",
+        "//postgres/frontend:turso_pg",
+        "//postgres/server:turso_pg_server",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "tursopg_test",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":tursopg",
+    crate_features = CLI_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
+rust_test(
+    name = "tursopg_integration_test",
+    srcs = ["tests/tursopg.rs"],
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate_features = CLI_FEATURES,
+    crate_root = "tests/tursopg.rs",
+    data = [":tursopg"],
+    deps = all_crate_deps(normal_dev = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_BIN_EXE_tursopg": "$(rootpath :tursopg)"},
+)
