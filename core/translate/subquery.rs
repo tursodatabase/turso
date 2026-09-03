@@ -1500,21 +1500,41 @@ pub fn emit_from_clause_subqueries(
             let execution_mode =
                 execution_mode.expect("execution mode was computed above for subquery tables");
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            if from_clause_subquery.parenthesized_join_columns.is_some()
-                && !plan_is_correlated(&from_clause_subquery.plan)
-            {
-                // SQLite replaces unused outputs of an uncorrelated subquery with
-                // NULL. The generated join group has no aggregate, window, compound,
-                // or CTE state that blocks this optimization in SQLite.
+            if from_clause_subquery.parenthesized_join_columns.is_some() {
+                let stores_rows_in_table = matches!(
+                    &execution_mode,
+                    FromClauseSubqueryExecutionMode::MaterializedTable
+                );
+                let is_correlated = plan_is_correlated(&from_clause_subquery.plan);
                 let Plan::Select(select_plan) = from_clause_subquery.plan.as_mut() else {
                     unreachable!("a parenthesized join must produce one SELECT plan");
                 };
-                for (column_index, result_column) in
-                    select_plan.result_columns.iter_mut().enumerate()
-                {
-                    if !table_reference.col_used_mask.get(column_index) {
-                        result_column.expr = ast::Expr::Literal(ast::Literal::Null);
+                if stores_rows_in_table || !is_correlated {
+                    // Unused outputs become NULL. SQLite's general rule for this
+                    // (disableUnusedSubqueryResultColumns, select.c) skips
+                    // correlated subqueries, but EXPLAIN shows that SQLite also
+                    // stores NULL for unused columns of a correlated join group
+                    // that it stores in a table.
+                    for (column_index, result_column) in
+                        select_plan.result_columns.iter_mut().enumerate()
+                    {
+                        if !table_reference.col_used_mask.get(column_index) {
+                            result_column.expr = ast::Expr::Literal(ast::Literal::Null);
+                        }
                     }
+                }
+                if stores_rows_in_table {
+                    // A stored row ends at the last column the parent reads, but
+                    // keeps at least column 0 so each joined row still stores a
+                    // row. EXPLAIN shows SQLite does the same: a join group with
+                    // 7 columns, of which the parent reads columns 0 to 2, stores
+                    // `MakeRecord .. 3` records.
+                    let result_column_count = table_reference
+                        .col_used_mask
+                        .iter()
+                        .last()
+                        .map_or(1, |column_index| column_index + 1);
+                    select_plan.result_columns.truncate(result_column_count);
                 }
             }
             // Check if this is a CTE that's already materialized
