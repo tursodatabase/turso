@@ -1651,6 +1651,7 @@ pub fn emit_from_clause_subquery(
                     resolver: t_ctx.resolver.fork(),
                     non_aggregate_expressions: Vec::new(),
                     agg_leaf_columns: Vec::new(),
+                    bare_columns_read_in_loop: Vec::new(),
                     cdc_cursor_id: None,
                     meta_window: None,
                     meta_in_seeks: (0..select_plan.joined_tables().len())
@@ -1748,6 +1749,7 @@ fn emit_indexed_materialized_subquery(
                 resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
+                bare_columns_read_in_loop: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
                 meta_in_seeks: (0..select_plan.joined_tables().len())
@@ -1849,6 +1851,7 @@ fn emit_materialized_subquery_table(
                 resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
+                bare_columns_read_in_loop: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
                 meta_in_seeks: (0..select_plan.joined_tables().len())

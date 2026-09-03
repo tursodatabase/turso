@@ -16,7 +16,7 @@ use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        walk_expr, ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     plan::{
         Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
@@ -25,6 +25,107 @@ use super::{
     result_row::emit_select_result,
     subquery::emit_non_from_clause_subqueries_for_phase,
 };
+
+/// Calls `f` on every column reference in `expr` that is not inside an aggregate
+/// argument, i.e. the "bare" columns of an aggregate query.
+fn for_each_bare_column(
+    expr: &ast::Expr,
+    aggregates: &[Aggregate],
+    f: &mut impl FnMut(&ast::Expr),
+) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Column { .. } | ast::Expr::RowId { .. } => {
+                f(e);
+                Ok(WalkControl::SkipChildren)
+            }
+            // Everything inside an aggregate call is read row by row during the
+            // loop, so it is not a bare column.
+            _ if aggregates.iter().any(|a| a.original_expr == *e) => Ok(WalkControl::SkipChildren),
+            _ => Ok(WalkControl::Continue),
+        }
+    })?;
+    Ok(())
+}
+
+/// Collects the bare columns of an ungrouped aggregate query that must be read
+/// during the main loop, because the expressions using them are only evaluated
+/// after the loop, when the table cursor no longer points at a row:
+///
+/// - bare columns of result columns that also contain an aggregate, e.g.
+///   `SELECT CASE WHEN sum(x) THEN a ELSE b END FROM t`
+/// - bare columns of HAVING predicates: HAVING without GROUP BY treats the
+///   whole table as one group, so the check runs after the loop
+///
+/// This is the same set as the column entries of SQLite's AggInfo.
+pub fn collect_bare_columns_read_in_loop(plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
+    let mut columns: Vec<ast::Expr> = Vec::new();
+    let mut collect = |expr: &ast::Expr| {
+        if !columns.contains(expr) {
+            columns.push(expr.clone());
+        }
+    };
+    for rc in plan
+        .result_columns
+        .iter()
+        .filter(|rc| rc.contains_aggregates)
+    {
+        for_each_bare_column(&rc.expr, &plan.aggregates, &mut collect)?;
+    }
+    if let Some(having) = plan.group_by.as_ref().and_then(|gb| gb.having.as_ref()) {
+        for pred in having.iter() {
+            for_each_bare_column(pred, &plan.aggregates, &mut collect)?;
+        }
+    }
+    Ok(columns)
+}
+
+/// Allocates the registers an ungrouped aggregation writes to during the main
+/// loop and nulls them before the loop starts: one register per aggregate
+/// accumulator, plus one per bare column from
+/// [`collect_bare_columns_read_in_loop`].
+///
+/// Nulling up front matters when the same bytecode runs more than once, e.g. a
+/// correlated subquery: if the loop scans no rows this time, the registers must
+/// read as NULL instead of keeping the previous run's values. SQLite nulls the
+/// same two groups of registers here, in resetAccumulator.
+pub fn init_ungrouped_aggregation(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx<'_>,
+    plan: &SelectPlan,
+    bare_columns: Vec<ast::Expr>,
+) {
+    let start = program.alloc_registers_and_init_w_null(plan.aggregates.len() + bare_columns.len());
+    t_ctx.reg_agg_start = Some(start);
+    t_ctx.bare_columns_read_in_loop = bare_columns
+        .into_iter()
+        .enumerate()
+        .map(|(i, expr)| (expr, start + plan.aggregates.len() + i))
+        .collect();
+}
+
+/// Points expression translation at the registers holding the bare columns that
+/// the main loop read, so that code emitted after the loop (HAVING, result
+/// columns) uses those values instead of reading from a cursor that no longer
+/// points at a row.
+///
+/// This must only be done after the loop: inside the loop, a hash join can turn
+/// the expression cache on, and then an aggregate argument such as the `b.z` of
+/// `sum(b.z)` would read the (still unwritten) bare column register instead of
+/// the current row.
+fn cache_bare_columns_read_in_loop(t_ctx: &mut TranslateCtx<'_>, plan: &SelectPlan) -> Result<()> {
+    let bare_columns = std::mem::take(&mut t_ctx.bare_columns_read_in_loop);
+    for (expr, reg) in bare_columns.iter() {
+        t_ctx.resolver.cache_scalar_expr_reg(
+            std::borrow::Cow::Owned(expr.clone()),
+            *reg,
+            false,
+            &plan.table_references,
+        )?;
+    }
+    t_ctx.bare_columns_read_in_loop = bare_columns;
+    Ok(())
+}
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
 /// This is called when the main query execution loop has finished processing,
@@ -55,6 +156,7 @@ pub fn emit_ungrouped_aggregation<'a>(
             None,
         );
     }
+    cache_bare_columns_read_in_loop(t_ctx, plan)?;
     t_ctx.resolver.enable_expr_to_reg_cache();
 
     // Subqueries that read an aggregate this query computes need the
