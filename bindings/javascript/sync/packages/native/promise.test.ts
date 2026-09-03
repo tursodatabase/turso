@@ -1281,7 +1281,7 @@ test('push hands the request body to fetch as bytes without inflating memory', a
 
     expect(bodyIsBytes).toBe(true);
     expect(bodyBytes).toBeGreaterThan(blobBytes);
-    // Before the body crossed the napi boundary as a Buffer it was marshalled as
+    // Before the body crossed the napi boundary as a Uint8Array it was marshalled as
     // a JS Array<number>, one element per byte, which alone costs 8 bytes per
     // body byte in V8 and put push at roughly 20x the change-set size.
     expect(rssGrowth).toBeLessThan(6 * bodyBytes);
