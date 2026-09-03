@@ -285,6 +285,95 @@ fn test_abandoned_delete_does_not_poison_next_delete() {
     }
 }
 
+fn run_abandoned_delete_all_sweep(abandon_before_completion: bool) {
+    let payload = "x".repeat(20_000);
+
+    for target_io in 1..=128 {
+        let io = Arc::new(MemoryYieldIO::new());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let timing = if abandon_before_completion {
+            "before"
+        } else {
+            "after"
+        };
+        let path = temp_dir
+            .path()
+            .join(format!("abandoned-delete-all-{timing}-{target_io}.db"));
+        let path = path.to_str().unwrap();
+
+        {
+            let conn = open_conn(io.clone(), path);
+            seed_indexed_overflow_rows(&conn, &payload);
+        }
+
+        let conn = open_conn(io.clone(), path);
+        conn.execute("BEGIN").unwrap();
+
+        let abandoned = if abandon_before_completion {
+            abandon_statement_before_io_completion(&conn, &io, "DELETE FROM t", target_io)
+        } else {
+            abandon_statement_after_io_completion(&conn, &io, "DELETE FROM t", target_io)
+        };
+        if !abandoned {
+            conn.execute("ROLLBACK").unwrap();
+            assert!(
+                target_io > 1,
+                "whole-table DELETE finished without any I/O. The abandonment sweep never ran"
+            );
+            break;
+        }
+
+        // Run another write after any combination of index and table clears.
+        // COMMIT must restore every B-tree because the first statement did not finish.
+        conn.execute(format!("INSERT INTO t VALUES(9, 9, '{payload}')"))
+            .unwrap();
+        expect_unfinished_write_commit_error(
+            conn.execute("COMMIT"),
+            &format!(
+                "target_io={target_io} ({timing} completion): COMMIT after abandoned whole-table DELETE"
+            ),
+        );
+
+        assert_eq!(
+            ids(&conn, "SELECT id FROM t ORDER BY id"),
+            vec![2, 3, 4, 5, 6, 7, 8],
+            "target_io={target_io} ({timing} completion): rejected COMMIT must restore table rows"
+        );
+        assert_eq!(
+            ids(&conn, "SELECT id FROM t INDEXED BY t_x ORDER BY x"),
+            vec![2, 3, 4, 5, 6, 7, 8],
+            "target_io={target_io} ({timing} completion): rejected COMMIT must restore index entries"
+        );
+
+        // DELETE and INSERT must still work after the rollback. This test detects stale
+        // root-page, cursor, or freelist state from the unfinished statement.
+        conn.execute("DELETE FROM t").unwrap();
+        assert!(ids(&conn, "SELECT id FROM t").is_empty());
+        conn.execute(format!("INSERT INTO t VALUES(10, 10, '{payload}')"))
+            .unwrap();
+        assert_eq!(
+            ids(&conn, "SELECT id FROM t INDEXED BY t_x ORDER BY x"),
+            vec![10],
+            "target_io={target_io} ({timing} completion): refill after rollback is missing"
+        );
+        assert_eq!(
+            integrity_check(&conn),
+            vec!["ok"],
+            "target_io={target_io} ({timing} completion): abandoned clear poisoned storage"
+        );
+    }
+}
+
+#[test]
+fn test_delete_all_abandoned_before_io_completion_restores_every_btree() {
+    run_abandoned_delete_all_sweep(true);
+}
+
+#[test]
+fn test_delete_all_abandoned_after_io_completion_restores_every_btree() {
+    run_abandoned_delete_all_sweep(false);
+}
+
 #[test]
 fn test_abandoned_insert_does_not_poison_next_insert() {
     let payload = "x".repeat(20_000);

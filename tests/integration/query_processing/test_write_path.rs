@@ -1729,6 +1729,37 @@ fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+#[turso_macros::test(views)]
+fn test_delete_all_updates_dependent_materialized_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, title TEXT)",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW v AS SELECT id, title FROM t",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "WITH RECURSIVE c(x) AS (
+            VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 300
+         ) INSERT INTO t SELECT x, printf('title-%d', x) FROM c",
+    )?;
+
+    common::run_query(&tmp_db, &conn, "DELETE FROM t")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM t")).is_empty();
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM v")).is_empty();
+
+    common::run_query(&tmp_db, &conn, "INSERT INTO t VALUES(301, 'after-clear')")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT id, title FROM v"))
+        .is_equal_to(vec![row![301, "after-clear"]]);
+    Ok(())
+}
+
 /// Regression test for simulator seed 867: UPDATE on an attached database table
 /// that changes the primary key (rowid) while a UNIQUE index exists would use
 /// the wrong database_id (0 instead of the attached db) for OpenWrite cursors,

@@ -155,8 +155,8 @@ use super::{
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{
-        AddSequenceData, AggStepData, ArrayEncodeData, Cookie, IntegrityCkData, RegisterOrLiteral,
-        SortComparatorType, SorterOpenData,
+        AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
+        RegisterOrLiteral, SortComparatorType, SorterOpenData,
     },
     CommitState,
 };
@@ -14268,7 +14268,7 @@ fn op_clear_btree_inner(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(ClearBtree { db, root }, insn);
+    load_insn!(ClearBtree { db, root, count }, insn);
 
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
@@ -14295,13 +14295,26 @@ fn op_clear_btree_inner(
             }
             OpClearBtreeState::ClearBtree { pager, cursor } => {
                 let cleared = cursor.write().clear_btree();
-                return_if_io!(state, cleared);
+                let removed_entries = return_if_io!(state, cleared);
                 for other_cursor_opt in state.cursors.iter_mut().flatten() {
                     if let Cursor::BTree(..) | Cursor::Dyn(..) = other_cursor_opt {
                         let btree_cursor = other_cursor_opt.as_btree_mut();
                         if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
                             btree_cursor.invalidate_btree_cache();
                         }
+                    }
+                }
+                match count {
+                    ClearBtreeCount::Nothing => {}
+                    ClearBtreeCount::RowsWritten => state.record_rows_written(removed_entries),
+                    ClearBtreeCount::ChangesAndRowsWritten => {
+                        let changes = i64::try_from(removed_entries).map_err(|_| {
+                            LimboError::InternalError(format!(
+                                "ClearBtree: removed row count {removed_entries} does not fit in i64"
+                            ))
+                        })?;
+                        state.record_statement_changes(changes);
+                        state.record_rows_written(removed_entries);
                     }
                 }
                 state.active_op_state.clear();
