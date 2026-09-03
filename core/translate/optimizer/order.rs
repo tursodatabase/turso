@@ -252,12 +252,17 @@ pub fn plan_satisfies_order_target(
         if let AccessMethodParams::HashJoin {
             build_table_idx,
             join_type,
+            materialize_build_input,
             ..
         } = &access_method.params
         {
             hash_join_build_tables
                 .set(*build_table_idx)
                 .expect("a plan cannot contain more than the table limit");
+            // Materialization can absorb and prune every loop before the probe.
+            if *materialize_build_input {
+                return false;
+            }
             // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
             if matches!(join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter) {
                 return false;
