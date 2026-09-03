@@ -928,12 +928,11 @@ where
     match func_type {
         "julianday" => Value::from_f64(p.i_jd as f64 / 86400000.0),
         "unixepoch" => {
-            let unix = (p.i_jd - 210866760000000) / 1000;
+            let unix = (p.i_jd - 210866760000000) as f64 / 1000.0;
             if p.use_subsec {
-                let ms = (p.i_jd - 210866760000000) as f64 / 1000.0;
-                Value::from_f64(ms)
+                Value::from_f64(unix)
             } else {
-                Value::from_i64(unix)
+                Value::from_i64(unix.floor() as i64)
             }
         }
         _ => {
@@ -1379,10 +1378,11 @@ where
             Some('P') => write!(res, "{}", if p.h >= 12 { "pm" } else { "am" }).unwrap(),
             Some('R') => write!(res, "{:02}:{:02}", p.h, p.min).unwrap(),
             Some('s') => {
+                let s = (p.i_jd - 210866760000000) as f64 / 1000.0;
                 if p.use_subsec {
-                    write!(res, "{:.3}", (p.i_jd - 210866760000000) as f64 / 1000.0).unwrap();
+                    write!(res, "{s:.3}").unwrap();
                 } else {
-                    write!(res, "{}", (p.i_jd - 210866760000000) / 1000).unwrap();
+                    write!(res, "{}", s.floor()).unwrap();
                 }
             }
             Some('S') => write!(res, "{:02}", p.s as i32).unwrap(),
