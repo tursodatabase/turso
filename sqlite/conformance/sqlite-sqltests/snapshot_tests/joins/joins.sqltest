@@ -1227,3 +1227,41 @@ snapshot correlated-parenthesized-full-join-trims-materialized-row {
               ) ON true)
       FROM nested_correlated_outer;
 }
+
+setup uncorrelated_parenthesized_join_snapshot_schema {
+    CREATE TABLE nested_once_outer(id INTEGER);
+    CREATE TABLE nested_once_anchor(id INTEGER);
+    CREATE VIEW nested_once_value AS SELECT random() AS value;
+    CREATE TABLE nested_once_empty(dummy INTEGER);
+}
+
+# The FULL JOIN forces SQLite to store the view instead of using a coroutine.
+# The stored view is uncorrelated, so SQLite builds it once per statement.
+@setup uncorrelated_parenthesized_join_snapshot_schema
+snapshot uncorrelated-parenthesized-full-join-materializes-once {
+    SELECT (SELECT nested_once_value.value
+              FROM nested_once_anchor
+              RIGHT JOIN (
+                   nested_once_value
+                   FULL JOIN nested_once_empty ON false
+              ) ON true
+             WHERE nested_once_anchor.id=nested_once_outer.id
+             LIMIT 1)
+      FROM nested_once_outer;
+}
+
+setup later_view_right_join_snapshot_schema {
+    CREATE TABLE later_view_left(id INTEGER);
+    CREATE TABLE later_view_right(id INTEGER);
+    CREATE VIEW later_view_value AS SELECT random() AS value;
+}
+
+# SQLite stores a view after a RIGHT JOIN because that join can start another
+# pass through the remaining sources.
+@setup later_view_right_join_snapshot_schema
+snapshot right-join-materializes-a-later-view-once {
+    SELECT later_view_right.id, later_view_value.value
+      FROM later_view_left
+      RIGHT JOIN later_view_right ON false
+      JOIN later_view_value ON true;
+}

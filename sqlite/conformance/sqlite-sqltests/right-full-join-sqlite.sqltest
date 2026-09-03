@@ -1552,6 +1552,58 @@ expect {
     2|4
 }
 
+# This case comes from a command-line comparison with SQLite. The scalar
+# subquery runs twice, but its uncorrelated nested join must be built once.
+@cross-check-integrity
+test uncorrelated-parenthesized-full-join-materializes-once {
+    CREATE TABLE materialized_once_outer(id INTEGER);
+    CREATE TABLE materialized_once_anchor(id INTEGER);
+    CREATE VIEW materialized_once_value AS
+        SELECT hex(randomblob(32)) AS value;
+    CREATE TABLE materialized_once_empty(dummy INTEGER);
+    INSERT INTO materialized_once_outer VALUES(1),(2);
+    INSERT INTO materialized_once_anchor VALUES(1),(2);
+
+    WITH results AS MATERIALIZED (
+        SELECT materialized_once_outer.id AS id,
+               (SELECT materialized_once_value.value
+                  FROM materialized_once_anchor
+                  RIGHT JOIN (
+                       materialized_once_value
+                       FULL JOIN materialized_once_empty ON false
+                  ) ON true
+                 WHERE materialized_once_anchor.id=materialized_once_outer.id
+                 LIMIT 1) AS value
+          FROM materialized_once_outer
+    )
+    SELECT count(DISTINCT value), min(value)=max(value) FROM results;
+}
+expect {
+    1|1
+}
+
+# This case comes from a command-line comparison with SQLite. A surviving
+# RIGHT JOIN forces every view in its FROM list to use one stored result.
+@cross-check-integrity
+test right-join-materializes-a-later-view-once {
+    CREATE TABLE materialized_later_left(id INTEGER);
+    CREATE TABLE materialized_later_right(id INTEGER);
+    CREATE VIEW materialized_later_value AS
+        SELECT hex(randomblob(32)) AS value;
+    INSERT INTO materialized_later_right VALUES(1),(2);
+
+    WITH results AS MATERIALIZED (
+        SELECT materialized_later_right.id, materialized_later_value.value
+          FROM materialized_later_left
+          RIGHT JOIN materialized_later_right ON false
+          JOIN materialized_later_value ON true
+    )
+    SELECT count(*), count(DISTINCT value), min(value)=max(value) FROM results;
+}
+expect {
+    2|1|1
+}
+
 # This case comes from a command-line comparison with SQLite. SQLite keeps
 # each inner table name after it turns the join group into one derived table.
 @cross-check-integrity
