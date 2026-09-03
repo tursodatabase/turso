@@ -1491,16 +1491,27 @@ pub fn emit_from_clause_subqueries(
             let execution_mode =
                 execution_mode.expect("execution mode was computed above for subquery tables");
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            if from_clause_subquery.parenthesized_join_columns.is_some()
-                && !plan_is_correlated(&from_clause_subquery.plan)
-            {
-                // SQLite replaces unused outputs of an uncorrelated subquery with
-                // NULL. The generated join group has no aggregate, window, compound,
-                // or CTE state that blocks this optimization in SQLite.
+            if from_clause_subquery.parenthesized_join_columns.is_some() {
+                let stores_rows_in_table = matches!(
+                    &execution_mode,
+                    FromClauseSubqueryExecutionMode::MaterializedTable
+                );
+                let is_correlated = plan_is_correlated(&from_clause_subquery.plan);
                 let Plan::Select(select_plan) = from_clause_subquery.plan.as_mut() else {
                     unreachable!("a parenthesized join must produce one SELECT plan");
                 };
-                null_unused_result_columns(select_plan, &table_reference.col_used_mask);
+                if stores_rows_in_table || !is_correlated {
+                    // SQLite's general rule skips correlated subqueries. Its nested-FROM
+                    // table rule still removes unused fields because these generated
+                    // outputs only copy values from the joined sources.
+                    null_unused_result_columns(select_plan, &table_reference.col_used_mask);
+                }
+                if stores_rows_in_table {
+                    trim_unused_trailing_result_columns(
+                        select_plan,
+                        &table_reference.col_used_mask,
+                    );
+                }
             }
             // Check if this is a CTE that's already materialized
             if let Some(cte_id) = from_clause_subquery.cte_id() {
@@ -1626,6 +1637,16 @@ fn null_unused_result_columns(plan: &mut SelectPlan, used_columns: &ColumnUsedMa
             result_column.expr = ast::Expr::Literal(ast::Literal::Null);
         }
     }
+}
+
+/// Remove result positions after the last position that the parent reads.
+fn trim_unused_trailing_result_columns(plan: &mut SelectPlan, used_columns: &ColumnUsedMask) {
+    // SQLite keeps position zero so each inner row still creates one stored row.
+    let result_column_count = used_columns
+        .iter()
+        .last()
+        .map_or(1, |column_index| column_index + 1);
+    plan.result_columns.truncate(result_column_count);
 }
 
 /// Emit a FROM clause subquery and return the start register of the result columns.

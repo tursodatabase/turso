@@ -6,13 +6,17 @@ use crate::translate::{
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
 
-/// Reload a materialized subquery row into its result registers.
+/// Reload the materialized columns that the parent reads.
 ///
-/// The unmatched-row pass scans the materialized cursor after its normal loop.
-/// Expressions still read the subquery through these result registers.
+/// SQLite reads materialized fields at expression use sites. Turso reads these
+/// fields through result registers. Loading only referenced fields matches
+/// SQLite and avoids extra reads.
+/// This also avoids fields that a materialized nested join omitted.
+/// The unmatched-row pass also calls this after it selects a stored row.
 pub(super) fn emit_materialized_subquery_result_columns(
     program: &mut ProgramBuilder,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
+    used_columns: &crate::translate::plan::ColumnUsedMask,
     cursor_id: CursorID,
     index: Option<&Index>,
 ) {
@@ -28,7 +32,7 @@ pub(super) fn emit_materialized_subquery_result_columns(
         source_cols
     });
 
-    for col_idx in 0..from_clause_subquery.columns.len() {
+    for col_idx in used_columns.iter() {
         let source_col = index_to_table
             .as_ref()
             .map(|source_cols| {
@@ -268,6 +272,7 @@ impl OpenLoop {
                                     emit_materialized_subquery_result_columns(
                                         program,
                                         from_clause_subquery,
+                                        &table.col_used_mask,
                                         *cursor_id,
                                         None,
                                     );
@@ -429,6 +434,7 @@ impl OpenLoop {
                                         emit_materialized_subquery_result_columns(
                                             program,
                                             from_clause_subquery,
+                                            &table.col_used_mask,
                                             table_cursor_id,
                                             None,
                                         );

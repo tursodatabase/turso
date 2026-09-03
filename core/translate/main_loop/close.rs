@@ -414,7 +414,13 @@ fn emit_unmatched_right_rows(
     if let Table::FromClauseSubquery(subquery) = &table.table {
         // Result expressions read a materialized subquery through registers.
         // The code loads the register values after the match set selects this row.
-        emit_materialized_subquery_result_columns(program, subquery, table_cursor_id, None);
+        emit_materialized_subquery_result_columns(
+            program,
+            subquery,
+            &table.col_used_mask,
+            table_cursor_id,
+            None,
+        );
     }
     program.emit_insn(Insn::Gosub {
         target_pc: right_join.body_label,

@@ -1,0 +1,117 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT (SELECT count(*)
+                FROM nested_correlated_anchor
+                RIGHT JOIN (
+                     nested_correlated_left
+                     FULL JOIN nested_correlated_right
+                       ON nested_correlated_right.id=nested_correlated_outer.id
+                ) ON true)
+        FROM nested_correlated_outer;
+info:
+  statement_type: SELECT
+  tables:
+  - nested_correlated_anchor
+  - nested_correlated_outer
+  - nested_correlated_right
+  - nested_correlated_right.id
+  setup_blocks:
+  - correlated_parenthesized_join_snapshot_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN nested_correlated_outer
+`--CORRELATED SCALAR SUBQUERY 1
+   |--SCAN nested_correlated_anchor
+   |--SCAN (join-1)
+   |  |--SCAN nested_correlated_left
+   |  |--SCAN nested_correlated_right LEFT-JOIN
+   |  `--RIGHT-JOIN nested_correlated_right
+   |     `--SCAN nested_correlated_right
+   `--RIGHT-JOIN (join-1)
+      `--SCAN (join-1)
+
+BYTECODE
+addr  opcode                       p1  p2  p3  p4        p5  comment
+   0            Init                0  77   0             0  Start at 77
+   1            OpenRead            0   2   0  k(2,B)     0  table=nested_correlated_outer, root=2, iDb=0
+   2            Rewind              0  76   0             0  Rewind table nested_correlated_outer
+   3              BeginSubrtn       3   0   0             0  r[3]=NULL
+   4              Null              0   1   0             0  r[1]=NULL
+   5              OpenEphemeral     1   1   0             0  cursor=1 is_table=true
+   6              OpenRead          2   4   0  k(3,B,B)   0  table=nested_correlated_left, root=4, iDb=0
+   7              OpenRead          4   5   0  k(3,B,B)   0  table=nested_correlated_right, root=5, iDb=0
+   8              Null              0  13   0             0  r[13]=NULL
+   9              OpenEphemeral     3   0   0             0  cursor=3 is_table=false
+  10              Rewind            2  34   0             0  Rewind table nested_correlated_left
+  11                Integer         0  11   0             0  r[11]=0
+  12                Rewind          4  29   0             0  Rewind table nested_correlated_right
+  13                  Column        4   0  15             0  r[15]=nested_correlated_right.id
+  14                  Column        0   0  16             0  r[16]=nested_correlated_outer.id
+  15                  Ne           15  16  27  Binary     0  if r[15]!=r[16] goto 27
+  16                  RowId         4  12   0             0  r[12]=nested_correlated_right.rowid
+  17                  Found         3  21  12             0  if found goto 21
+  18                  MakeRecord   12   1  17             0  r[17]=mkrec(r[12..12])
+  19                  IdxInsert     3  17  12             0  key=r[17]
+  20                  FilterAdd     3  12   1             0  bloom_filter_add(r[12..13])
+  21                  Integer       1  11   0             0  r[11]=1
+  22                  BeginSubrtn  13   0   0             0  r[13]=NULL
+  23                  Null          0  10   0             0  r[10]=NULL
+  24                  MakeRecord   10   1  18             0  r[18]=mkrec(r[10..10]); for
+  25                  NewRowid      1  19   0             0  r[19]=rowid
+  26                  Insert        1  18  19             4  intkey=r[19] data=r[18]
+  27                Return         13   0   1             0
+  28              Next              4  13   0             1
+  29            Return             13   0   1             0
+  30            IfPos              11  33   0             0  r[11]>0 -> r[11]-=0, goto 33
+  31            NullRow             4   0   0             0  Set cursor 4 to a (pseudo) NULL row
+  32            Goto                0  21   0             0
+  33          Next                  2  11   0             1
+  34          NullRow               2   0   0             0  Set cursor 2 to a (pseudo) NULL row
+  35          OpenRead              4   5   0  k(3,B,B)   0  table=nested_correlated_right, root=5, iDb=0
+  36          Rewind                4  42   0             0  Rewind table nested_correlated_right
+  37            RowId               4  12   0             0  r[12]=nested_correlated_right.rowid
+  38            Filter              3  40  12             1  if !bloom_filter(r[12..13]) goto 40
+  39            Found               3  41  12             0  if found goto 41
+  40            Gosub              13  23   0             0
+  41          Next                  4  37   0             1
+  42          Null                  0  21   0             0  r[21]=NULL
+  43          Integer               1  22   0             0  r[22]=1; LIMIT counter
+  44          IfNot                22  69   0             0  if !r[22] goto 69
+  45          OpenRead              5   3   0  k(2,B)     0  table=nested_correlated_anchor, root=3, iDb=0
+  46          Null                  0  24   0             0  r[24]=NULL
+  47          OpenEphemeral         6   0   0             0  cursor=6 is_table=false
+  48          Rewind                5  62   0             0  Rewind table nested_correlated_anchor
+  49            Rewind              1  60   0             0  Rewind  ephemeral()
+  50              IfNot            25  58   1             0  if !r[25] goto 58
+  51              RowId             1  23   0             0  r[23]=ephemeral().rowid
+  52              Found             6  56  23             0  if found goto 56
+  53              MakeRecord       23   1  26             0  r[26]=mkrec(r[23..23])
+  54              IdxInsert         6  26  23             0  key=r[26]
+  55              FilterAdd         6  23   1             0  bloom_filter_add(r[23..24])
+  56              BeginSubrtn      24   0   0             0  r[24]=NULL
+  57              AggStep           0  27  21  count      0  accum=r[21] step(r[27])
+  58            Return             24   0   1             0
+  59          Next                  1  50   0             0
+  60        Return                 24   0   1             0
+  61      Next                      5  49   0             1
+  62      NullRow                   5   0   0             0  Set cursor 5 to a (pseudo) NULL row
+  63      Rewind                    1  69   0             0  Rewind  ephemeral()
+  64        RowId                   1  23   0             0  r[23]=ephemeral().rowid
+  65        Filter                  6  67  23             1  if !bloom_filter(r[23..24]) goto 67
+  66        Found                   6  68  23             0  if found goto 68
+  67        Gosub                  24  57   0             0
+  68      Next                      1  64   0             1
+  69      AggFinal                  0  21   0  count      0  accum=r[21]
+  70      Copy                     21  20   0             0  r[20]=r[21]
+  71      Copy                     20   1   0             0  r[1]=r[20]
+  72    Return                      3   0   1             0
+  73    Copy                        1   2   0             0  r[2]=r[1]
+  74    ResultRow                   2   1   0             0  output=r[2]
+  75  Next                          0   3   0             1
+  76  Halt                          0   0   0             0
+  77  Transaction                   0   1   4             0  iDb=0 tx_mode=Read
+  78  Integer                       1  25   0             0  r[25]=1
+  79  Integer                       1  27   0             0  r[27]=1
+  80  Goto                          0   1   0             0

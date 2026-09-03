@@ -1197,3 +1197,33 @@ snapshot parenthesized-full-join-nulls-unused-source-columns {
       FROM nested_prune_outer
       JOIN (nested_prune_left FULL JOIN nested_prune_right USING(id)) USING(id);
 }
+
+# The outer RIGHT JOIN makes SQLite store the generated join group. Only the
+# merged id is used, so the stored record and both reads contain one field.
+@setup parenthesized_full_join_snapshot_schema
+snapshot parenthesized-full-join-trims-materialized-row {
+    SELECT id
+      FROM nested_prune_outer
+      RIGHT JOIN (nested_prune_left FULL JOIN nested_prune_right USING(id)) USING(id);
+}
+
+setup correlated_parenthesized_join_snapshot_schema {
+    CREATE TABLE nested_correlated_outer(id INTEGER);
+    CREATE TABLE nested_correlated_anchor(id INTEGER);
+    CREATE TABLE nested_correlated_left(id INTEGER, value TEXT);
+    CREATE TABLE nested_correlated_right(id INTEGER, value TEXT);
+}
+
+# SQLite also trims a materialized nested join when its join condition reads
+# an outer value. The stored NULL field keeps the inner row count intact.
+@setup correlated_parenthesized_join_snapshot_schema
+snapshot correlated-parenthesized-full-join-trims-materialized-row {
+    SELECT (SELECT count(*)
+              FROM nested_correlated_anchor
+              RIGHT JOIN (
+                   nested_correlated_left
+                   FULL JOIN nested_correlated_right
+                     ON nested_correlated_right.id=nested_correlated_outer.id
+              ) ON true)
+      FROM nested_correlated_outer;
+}
