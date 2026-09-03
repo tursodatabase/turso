@@ -135,7 +135,7 @@ impl WeightProfile {
             config.join_config.join_type_weights.inner = 60;
             config.join_config.join_type_weights.left = 40;
             config.join_config.join_type_weights.cross = 0;
-            config.join_config.join_type_weights.natural = 0;
+            config.join_config.natural_join_probability = 0.0;
             config.join_config.equi_join_probability = 1.0;
             config.join_config.self_join_probability = 0.0;
             config.join_config.parenthesized_group_probability = 0.3;
