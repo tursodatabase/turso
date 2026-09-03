@@ -638,6 +638,130 @@ mod tests {
     }
 
     #[test]
+    fn delete_without_where_clears_table_and_index_btrees() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+            .unwrap();
+        conn.execute("CREATE UNIQUE INDEX items_name ON items(name)")
+            .unwrap();
+        conn.execute("CREATE INDEX items_score ON items(score) WHERE score > 0")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES(1, 'one', -1), (2, 'two', 0), (3, 'three', 1)")
+            .unwrap();
+
+        let mut statement = conn.prepare("DELETE FROM items").unwrap();
+        let instructions = &statement.get_program().insns;
+        let clears = instructions
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::ClearBtree { delete_count, .. } => Some(delete_count),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            clears.len(),
+            3,
+            "the table and both indexes must be cleared"
+        );
+        assert!(
+            clears.iter().any(|count| count.is_some_and(|count| {
+                count.add_to_change_count && count.rows_written_multiplier == 2
+            })),
+            "the table clear must count changed rows and table plus full-index writes"
+        );
+        assert!(
+            instructions
+                .iter()
+                .all(|(instruction, _)| !matches!(instruction, Insn::Delete { .. })),
+            "a whole-table delete must not emit the row-at-a-time Delete opcode"
+        );
+
+        statement.run_ignore_rows().unwrap();
+        assert_eq!(statement.n_change(), 3);
+        assert_eq!(
+            statement.metrics().rows_written,
+            7,
+            "metrics must count table, full-index, and partial-index entries"
+        );
+
+        statement.reset().unwrap();
+        statement.reset_metrics();
+        statement.run_ignore_rows().unwrap();
+        assert_eq!(statement.n_change(), 0);
+        assert_eq!(statement.metrics().rows_written, 0);
+
+        statement.reset().unwrap();
+        statement.reset_metrics();
+        conn.execute("INSERT INTO items VALUES(4, 'four', -1), (5, 'five', 1)")
+            .unwrap();
+        statement.run_ignore_rows().unwrap();
+        assert_eq!(statement.n_change(), 2);
+        assert_eq!(
+            statement.metrics().rows_written,
+            5,
+            "reused statements must recount table and index entries"
+        );
+    }
+
+    #[test]
+    fn delete_keeps_row_loop_when_rows_need_individual_processing() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        for sql in [
+            "DELETE FROM items WHERE 1",
+            "DELETE FROM items RETURNING id",
+        ] {
+            let statement = conn.prepare(sql).unwrap();
+            assert!(
+                statement
+                    .get_program()
+                    .insns
+                    .iter()
+                    .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+                "{sql} must process rows individually"
+            );
+        }
+
+        conn.execute("CREATE TABLE deleted_items(id)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER log_item_delete AFTER DELETE ON items \
+             BEGIN INSERT INTO deleted_items VALUES(old.id); END",
+        )
+        .unwrap();
+        let statement = conn.prepare("DELETE FROM items").unwrap();
+        assert!(
+            statement
+                .get_program()
+                .insns
+                .iter()
+                .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+            "DELETE triggers require the row loop"
+        );
+
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE parents(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE children(parent_id REFERENCES parents(id))")
+            .unwrap();
+        let statement = conn.prepare("DELETE FROM parents").unwrap();
+        assert!(
+            statement
+                .get_program()
+                .insns
+                .iter()
+                .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+            "foreign-key actions require the row loop"
+        );
+    }
+
+    #[test]
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();

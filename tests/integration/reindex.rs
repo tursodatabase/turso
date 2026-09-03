@@ -158,3 +158,51 @@ fn reindex_write_fault_rolls_back_without_emptying_index() -> anyhow::Result<()>
     assert_reindex_fixture_intact(&conn, rows)?;
     Ok(())
 }
+
+/// If a WAL write fails after several B-tree clears, the statement must restore the table,
+/// indexes, and freelist.
+#[test]
+fn delete_all_write_fault_rolls_back_every_btree() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db_path = "queued-delete-all-fault.db";
+    let wal_path = format!("{db_path}-wal");
+    let db = open_queued_db(io.clone(), db_path)?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA page_size = 512")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT UNIQUE, payload BLOB)")?;
+    conn.execute("CREATE INDEX idx_even ON t(id) WHERE id % 2 = 0")?;
+    for id in 1..=500 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES({id}, 'value-{id:04}', zeroblob(5000))"
+        ))?;
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    io.fault_after(wal_path, QueuedIoOpKind::Pwritev, 0);
+    let delete_result = conn.execute("DELETE FROM t");
+    assert!(
+        delete_result.is_err(),
+        "whole-table DELETE must fail under an injected WAL write fault"
+    );
+    io.clear_fault();
+
+    assert_eq!(query_rows(&conn, "SELECT count(*) FROM t")?, vec!["500"]);
+    assert_eq!(
+        query_rows(
+            &conn,
+            "SELECT id FROM t INDEXED BY sqlite_autoindex_t_1 WHERE value = 'value-0250'"
+        )?,
+        vec!["250"],
+        "the unique index must be restored"
+    );
+    assert_eq!(
+        query_rows(
+            &conn,
+            "SELECT count(*) FROM t INDEXED BY idx_even WHERE id % 2 = 0"
+        )?,
+        vec!["250"],
+        "the partial index must be restored"
+    );
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check")?, vec!["ok"]);
+    Ok(())
+}

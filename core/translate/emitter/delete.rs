@@ -29,7 +29,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
 };
@@ -43,6 +43,12 @@ pub fn emit_program_for_delete(
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
 ) -> Result<()> {
+    if emit_clear_btree_delete(connection, resolver, program, &plan)? {
+        program.result_columns = plan.result_columns;
+        program.table_references.extend(plan.table_references);
+        return Ok(());
+    }
+
     let mut t_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
@@ -277,6 +283,113 @@ pub fn emit_program_for_delete(
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
     Ok(())
+}
+
+fn emit_clear_btree_delete(
+    connection: &Arc<Connection>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    plan: &DeletePlan,
+) -> Result<bool> {
+    if !plan.where_clause.is_empty()
+        || !plan.result_columns.is_empty()
+        || plan.rowset_plan.is_some()
+        || plan.safety.requires_stable_write_set()
+        || program.capture_data_changes_info().is_some()
+        || plan
+            .indexes
+            .iter()
+            .any(|index| index.index_method.is_some())
+    {
+        return Ok(false);
+    }
+
+    let table_ref = plan
+        .table_references
+        .joined_tables()
+        .first()
+        .expect("DELETE always has one joined table");
+    let Some(table) = table_ref.btree() else {
+        return Ok(false);
+    };
+    if connection.mv_store_for_db(table_ref.database_id).is_some() {
+        return Ok(false);
+    }
+
+    let table_name = table_ref.table.get_name();
+    let has_dependent_views = resolver.with_schema(table_ref.database_id, |schema| {
+        !schema
+            .get_dependent_materialized_views(table_name)
+            .is_empty()
+    });
+    if has_dependent_views {
+        return Ok(false);
+    }
+    if connection.foreign_keys_enabled() {
+        let has_foreign_keys = resolver.with_schema(table_ref.database_id, |schema| {
+            schema.any_resolved_fks_referencing(table_name) || schema.has_child_fks(table_name)
+        });
+        if has_foreign_keys {
+            return Ok(false);
+        }
+    }
+
+    let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: table_cursor,
+        root_page: RegisterOrLiteral::Literal(table.root_page),
+        db: table_ref.database_id,
+    });
+    let count_reg = program.alloc_register();
+    program.emit_insn(Insn::Count {
+        cursor_id: table_cursor,
+        target_reg: count_reg,
+        exact: true,
+    });
+
+    let full_index_count = plan
+        .indexes
+        .iter()
+        .filter(|index| index.where_clause.is_none())
+        .count();
+    for index in &plan.indexes {
+        let delete_count = if index.where_clause.is_some() {
+            let index_cursor = program.alloc_cursor_index(None, index)?;
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: index_cursor,
+                root_page: RegisterOrLiteral::Literal(index.root_page),
+                db: table_ref.database_id,
+            });
+            let index_count_reg = program.alloc_register();
+            program.emit_insn(Insn::Count {
+                cursor_id: index_cursor,
+                target_reg: index_count_reg,
+                exact: false,
+            });
+            Some(ClearBtreeCount {
+                count_reg: index_count_reg,
+                add_to_change_count: false,
+                rows_written_multiplier: 1,
+            })
+        } else {
+            None
+        };
+        program.emit_insn(Insn::ClearBtree {
+            db: table_ref.database_id,
+            root: index.root_page,
+            delete_count,
+        });
+    }
+    program.emit_insn(Insn::ClearBtree {
+        db: table_ref.database_id,
+        root: table.root_page,
+        delete_count: Some(ClearBtreeCount {
+            count_reg,
+            add_to_change_count: true,
+            rows_written_multiplier: full_index_count + 1,
+        }),
+    });
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

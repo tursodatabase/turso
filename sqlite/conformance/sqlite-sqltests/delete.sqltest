@@ -84,6 +84,126 @@ test delete-all-with-indexes-1 {
 expect {
 }
 
+@skip-if mvcc "page-level whole-table DELETE is disabled in MVCC mode"
+@cross-check-integrity
+test delete-all-clears-every-btree-and-rolls-back {
+    CREATE TABLE clear_me(id INTEGER PRIMARY KEY, name TEXT, score INTEGER);
+    CREATE UNIQUE INDEX clear_me_name ON clear_me(name);
+    CREATE INDEX clear_me_positive_score ON clear_me(score) WHERE score > 0;
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 2000
+    )
+    INSERT INTO clear_me SELECT x, printf('name-%d', x), x - 1000 FROM c;
+    BEGIN;
+    DELETE FROM clear_me;
+    SELECT changes(), total_changes(), count(*) FROM clear_me;
+    ROLLBACK;
+    SELECT total_changes(), count(*), min(id), max(id) FROM clear_me;
+    DELETE FROM clear_me;
+    SELECT changes(), total_changes(), count(*) FROM clear_me;
+    INSERT INTO clear_me VALUES(1, 'name-1', 1);
+    SELECT id, name, score FROM clear_me INDEXED BY clear_me_name;
+}
+expect {
+    2000|4000|0
+    4000|2000|1|2000
+    2000|6000|0
+    1|name-1|1
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test delete-all-empty-keeps-autoincrement-watermark {
+    CREATE TABLE numbered(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    DELETE FROM numbered;
+    SELECT changes(), total_changes();
+    INSERT INTO numbered(value) VALUES('one'), ('two'), ('three');
+    DELETE FROM numbered;
+    SELECT changes(), total_changes(), count(*) FROM numbered;
+    INSERT INTO numbered(value) VALUES('four');
+    SELECT id, value FROM numbered;
+}
+expect {
+    0|0
+    3|6|0
+    4|four
+}
+
+@cross-check-integrity
+test delete-all-rolls-back-to-nested-savepoint {
+    CREATE TABLE saved(id INTEGER PRIMARY KEY, value TEXT UNIQUE, score INTEGER);
+    CREATE INDEX saved_positive ON saved(score) WHERE score > 0;
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 1000
+    )
+    INSERT INTO saved SELECT x, printf('value-%d', x), x - 500 FROM c;
+    SAVEPOINT outer;
+    SAVEPOINT inner;
+    DELETE FROM saved;
+    SELECT changes(), count(*) FROM saved;
+    ROLLBACK TO inner;
+    SELECT count(*), min(id), max(id) FROM saved;
+    SELECT id FROM saved INDEXED BY sqlite_autoindex_saved_1 WHERE value = 'value-777';
+    RELEASE inner;
+    DELETE FROM saved;
+    RELEASE outer;
+    SELECT changes(), count(*) FROM saved;
+    INSERT INTO saved VALUES(1, 'value-1', 1);
+    SELECT id, value, score FROM saved INDEXED BY saved_positive WHERE score > 0;
+}
+expect {
+    1000|0
+    1000|1|1000
+    777
+    1000|0
+    1|value-1|1
+}
+
+@cross-check-integrity
+test delete-all-preserves-trigger-and-foreign-key-effects {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE Parents(id INTEGER PRIMARY KEY);
+    CREATE TABLE children(parent_id REFERENCES PARENTS(id) ON DELETE CASCADE);
+    CREATE TABLE audit(parent_id INTEGER);
+    CREATE TRIGGER audit_parent_delete AFTER DELETE ON parents BEGIN
+        INSERT INTO audit VALUES(old.id);
+    END;
+    INSERT INTO parents VALUES(1), (2), (3);
+    INSERT INTO children VALUES(1), (2), (3);
+    DELETE FROM parents;
+    SELECT changes(),
+           (SELECT count(*) FROM parents),
+           (SELECT count(*) FROM children),
+           (SELECT count(*) FROM audit),
+           (SELECT sum(parent_id) FROM audit);
+}
+expect {
+    3|0|0|3|6
+}
+
+@cross-check-integrity
+test delete-all-clears-temp-table-indexes {
+    CREATE TEMP TABLE temp_items(id INTEGER PRIMARY KEY, value TEXT);
+    CREATE INDEX temp.temp_items_value ON temp_items(value);
+    INSERT INTO temp_items VALUES(1, 'one'), (2, 'two'), (3, 'three');
+    DELETE FROM temp_items WHERE id = 2;
+    SELECT id, value FROM temp_items INDEXED BY temp_items_value ORDER BY value;
+    DELETE FROM temp_items;
+    SELECT changes(), count(*) FROM temp_items INDEXED BY temp_items_value;
+    INSERT INTO temp_items VALUES(4, 'four');
+    SELECT id, value FROM temp_items INDEXED BY temp_items_value;
+}
+expect {
+    1|one
+    3|three
+    2|0
+    4|four
+}
+
 @cross-check-integrity
 test delete_where_falsy {
     CREATE TABLE resourceful_schurz (diplomatic_kaplan BLOB);

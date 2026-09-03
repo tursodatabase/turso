@@ -97,6 +97,7 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     conn1.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
     conn2.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
     conn1.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn1.execute("CREATE INDEX aux.t_x ON t(x)")?;
     conn1.execute("INSERT INTO aux.t VALUES (1)")?;
 
     conn1.execute("BEGIN")?;
@@ -113,11 +114,13 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     conn1
         .execute("DELETE FROM aux.t")
         .context("delete from aux")?;
-    let rows = limbo_exec_rows(&conn1, "SELECT x FROM aux.t");
+    let rows = limbo_exec_rows(&conn1, "SELECT x FROM aux.t INDEXED BY t_x");
     assert!(rows.is_empty());
     let main_rows = limbo_exec_rows(&conn1, "SELECT x FROM main_t");
     assert_eq!(main_rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
     conn1.execute("ROLLBACK")?;
+    let rows = limbo_exec_rows(&conn1, "SELECT x FROM aux.t INDEXED BY t_x");
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
     Ok(())
 }
 

@@ -228,6 +228,88 @@ fn test_transaction_visibility(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_delete_all_keeps_existing_reader_snapshots(tmp_db: TempDatabase) {
+    let table_reader = tmp_db.connect_limbo();
+    let index_reader = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+
+    writer.execute("PRAGMA journal_mode = 'wal'").unwrap();
+    writer
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX items_value ON items(value)")
+        .unwrap();
+    writer
+        .execute(
+            "WITH RECURSIVE c(x) AS (
+                VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 300
+             ) INSERT INTO items SELECT x, printf('value-%04d', x) FROM c",
+        )
+        .unwrap();
+
+    table_reader.execute("BEGIN").unwrap();
+    index_reader.execute("BEGIN").unwrap();
+    let mut table_scan = table_reader
+        .prepare("SELECT id FROM items ORDER BY id")
+        .unwrap();
+    let mut index_scan = index_reader
+        .prepare("SELECT id FROM items INDEXED BY items_value ORDER BY value")
+        .unwrap();
+
+    let mut table_ids = Vec::new();
+    let mut index_ids = Vec::new();
+    for (statement, ids) in [
+        (&mut table_scan, &mut table_ids),
+        (&mut index_scan, &mut index_ids),
+    ] {
+        loop {
+            match statement.step().unwrap() {
+                StepResult::Row => {
+                    ids.push(statement.row().unwrap().get::<i64>(0).unwrap());
+                    break;
+                }
+                StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+                other => panic!("reader did not yield its first row: {other:?}"),
+            }
+        }
+    }
+
+    writer.execute("DELETE FROM items").unwrap();
+
+    for (statement, ids) in [
+        (&mut table_scan, &mut table_ids),
+        (&mut index_scan, &mut index_ids),
+    ] {
+        loop {
+            match statement.step().unwrap() {
+                StepResult::Row => ids.push(statement.row().unwrap().get::<i64>(0).unwrap()),
+                StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("reader failed after whole-table DELETE: {other:?}"),
+            }
+        }
+    }
+
+    let expected = (1..=300).collect::<Vec<_>>();
+    assert_eq!(table_ids, expected, "table reader lost its WAL snapshot");
+    assert_eq!(index_ids, expected, "index reader lost its WAL snapshot");
+    drop(table_scan);
+    drop(index_scan);
+    table_reader.execute("COMMIT").unwrap();
+    index_reader.execute("COMMIT").unwrap();
+
+    let fresh_reader = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> = fresh_reader.exec_rows("SELECT id FROM items");
+    assert!(
+        rows.is_empty(),
+        "new readers must observe the committed DELETE"
+    );
+    let integrity: Vec<(String,)> = fresh_reader.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+}
+
+#[turso_macros::test]
 /// A constraint error does not rollback the transaction, it rolls back the statement.
 fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();

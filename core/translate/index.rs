@@ -550,6 +550,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::ClearBtree {
                 db: database_id,
                 root,
+                delete_count: None,
             });
         }
         program.emit_insn(Insn::OpenWrite {
