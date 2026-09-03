@@ -3058,15 +3058,40 @@ pub unsafe extern "C" fn sqlite3_stricmp(
     a: *const ffi::c_char,
     b: *const ffi::c_char,
 ) -> ffi::c_int {
-    let a = std::ffi::CStr::from_ptr(a).to_bytes();
-    let b = std::ffi::CStr::from_ptr(b).to_bytes();
-    for (x, y) in a.iter().zip(b.iter()) {
-        let diff = x.to_ascii_lowercase() as ffi::c_int - y.to_ascii_lowercase() as ffi::c_int;
-        if diff != 0 {
-            return diff;
-        }
+    sqlite3_strnicmp(a, b, ffi::c_int::MAX)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_strnicmp(
+    a: *const ffi::c_char,
+    b: *const ffi::c_char,
+    n: ffi::c_int,
+) -> ffi::c_int {
+    if a.is_null() {
+        return if b.is_null() { 0 } else { -1 };
+    } else if b.is_null() {
+        return 1;
     }
-    a.len() as ffi::c_int - b.len() as ffi::c_int
+    if n <= 0 {
+        return 0;
+    }
+
+    let mut p_a = a as *const u8;
+    let mut p_b = b as *const u8;
+    let mut rem = n;
+
+    while rem > 0 && *p_a != 0 && p_a.read().eq_ignore_ascii_case(&p_b.read()) {
+        p_a = p_a.add(1);
+        p_b = p_b.add(1);
+        rem -= 1;
+    }
+
+    if rem <= 0 {
+        0
+    } else {
+        (p_a.read().to_ascii_lowercase() as ffi::c_int)
+            - (p_b.read().to_ascii_lowercase() as ffi::c_int)
+    }
 }
 
 #[no_mangle]

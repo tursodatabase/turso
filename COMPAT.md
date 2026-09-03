@@ -750,8 +750,8 @@ Modifiers:
 | sqlite3_create_collation16  | ❌ No      |         |
 | sqlite3_collation_needed    | ❌ No      |         |
 | sqlite3_collation_needed16  | ❌ No      |         |
-| sqlite3_stricmp             | ❌ No      | Stub    |
-| sqlite3_strnicmp            | ❌ No      |         |
+| sqlite3_stricmp             | ✅ Yes     |         |
+| sqlite3_strnicmp            | ✅ Yes     |         |
 
 ### Backup API
 
