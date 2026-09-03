@@ -44,6 +44,24 @@ expect {
 }
 
 @backend cli
+test fts-delete-all-rows-without-a-where-clause {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'hello world');
+    INSERT INTO t VALUES (2, 'goodbye world');
+    DELETE FROM t;
+    SELECT changes(), count(*) FROM t;
+    INSERT INTO t VALUES (3, 'hello again');
+    SELECT id, x FROM t WHERE fts_match(x, 'hello');
+    SELECT count(*) FROM t WHERE fts_match(x, 'world');
+}
+expect {
+    2|0
+    3|hello again
+    0
+}
+
+@backend cli
 test fts-delete-no-match {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
     CREATE INDEX t_idx ON t USING fts (x);
