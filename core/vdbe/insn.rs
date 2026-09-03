@@ -405,6 +405,13 @@ pub enum Insn {
     NullRow {
         cursor_id: CursorID,
     },
+    /// If the cursor is on a null row, write NULL to `dest` and jump.
+    /// This instruction does nothing for an unopened cursor.
+    IfNullRow {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        dest: usize,
+    },
     /// Add two registers and store the result in a third register.
     Add {
         lhs: usize,
@@ -2163,6 +2170,7 @@ pub(crate) fn dispatch_insn(
         Insn::Null { .. } => execute::op_null(program, state, insn, pager),
         Insn::BeginSubrtn { .. } => execute::op_null(program, state, insn, pager),
         Insn::NullRow { .. } => execute::op_null_row(program, state, insn, pager),
+        Insn::IfNullRow { .. } => execute::op_if_null_row(program, state, insn, pager),
         Insn::Add { .. } => execute::op_add(program, state, insn, pager),
         Insn::Subtract { .. } => execute::op_subtract(program, state, insn, pager),
         Insn::Multiply { .. } => execute::op_multiply(program, state, insn, pager),
@@ -2410,6 +2418,7 @@ impl InsnVariants {
             InsnVariants::Null => execute::op_null,
             InsnVariants::BeginSubrtn => execute::op_null,
             InsnVariants::NullRow => execute::op_null_row,
+            InsnVariants::IfNullRow => execute::op_if_null_row,
             InsnVariants::Add => execute::op_add,
             InsnVariants::Subtract => execute::op_subtract,
             InsnVariants::Multiply => execute::op_multiply,
