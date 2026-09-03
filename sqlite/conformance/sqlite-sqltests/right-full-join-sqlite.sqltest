@@ -1670,6 +1670,76 @@ expect {
     ||2
 }
 
+# This CLI differential case comes from SQLite join8-5000. The scalar query
+# must return through the FULL JOIN body after the ORDER BY finds one row.
+@cross-check-integrity
+test full-join-scalar-order-by-returns-to-outer-query {
+    CREATE TABLE scalar_left(x INTEGER);
+    INSERT INTO scalar_left VALUES(NULL),(NULL);
+    CREATE TABLE scalar_right(c INTEGER, d INTEGER);
+    INSERT INTO scalar_right SELECT x,x FROM scalar_left;
+    CREATE INDEX scalar_right_dc ON scalar_right(d,c);
+
+    SELECT quote((
+        SELECT c
+          FROM sqlite_temp_schema
+          FULL JOIN scalar_right ON d IN (1,2,3)
+         ORDER BY d
+    ))
+      FROM scalar_left
+     ORDER BY rowid;
+}
+expect {
+    NULL
+    NULL
+}
+
+# This CLI differential case comes from SQLite join8-9000. The main join and
+# the IN subquery read the same table through independent cursors.
+@cross-check-integrity
+test right-join-does-not-share-cursor-with-in-subquery {
+    CREATE TABLE right_in_source(
+        a INTEGER PRIMARY KEY,
+        b TEXT,
+        c TEXT,
+        d REAL
+    );
+    INSERT INTO right_in_source VALUES
+        (1,'E','bb',NULL),(2,NULL,NULL,NULL);
+
+    SELECT a,b,c,quote(d)
+      FROM right_in_source
+      NATURAL RIGHT JOIN right_in_source AS kept
+     WHERE (a,b) IN (
+         SELECT a+0,b FROM right_in_source
+     );
+}
+expect {
+    1|E|bb|NULL
+}
+
+# The unmatched-right loop builds its own correlated IN result. If that result
+# accepts a row, the shared join body must also rebuild the original IN result.
+@cross-check-integrity
+test right-join-rebuilds-correlated-where-subquery {
+    CREATE TABLE correlated_where_left(k INTEGER, x INTEGER);
+    CREATE TABLE correlated_where_right(k INTEGER, y INTEGER);
+    INSERT INTO correlated_where_right VALUES(2,NULL),(3,30);
+
+    SELECT quote(k), quote(x), quote(y)
+      FROM correlated_where_left
+      NATURAL RIGHT JOIN correlated_where_right
+     WHERE correlated_where_right.k IN (
+         SELECT k
+           FROM correlated_where_right AS source
+          WHERE source.y IS correlated_where_left.x
+     )
+     ORDER BY k;
+}
+expect {
+    2|NULL|NULL
+}
+
 # The shared row body must run output subqueries again for unmatched right rows.
 # Otherwise, the result and sort key keep a value from the last matched row.
 @cross-check-integrity
@@ -1712,4 +1782,25 @@ test full-join-keeps-unmatched-row-with-correlated-not-exists {
 }
 expect {
     1
+}
+
+# This CLI differential case comes from SQLite join8-24000. The unmatched
+# pass must not reuse the CTE cursor that the left join group uses.
+@cross-check-integrity
+test right-join-does-not-reuse-left-cte-cursor {
+    CREATE TABLE shared_cte_left(b INTEGER, c INTEGER);
+    CREATE TABLE shared_cte_seed(a INTEGER, f INTEGER);
+    INSERT INTO shared_cte_seed VALUES(1,2);
+
+    WITH shared_cte(x,y) AS (
+        SELECT 100,200 FROM shared_cte_seed
+    )
+    SELECT quote(shared_cte_left.b), quote(shared_cte_left.c),
+           quote(shared_cte.x), quote(shared_cte.y), quote(kept.z)
+      FROM shared_cte_left
+      JOIN shared_cte ON true
+      RIGHT JOIN (SELECT y AS z FROM shared_cte) AS kept ON x=z;
+}
+expect {
+    NULL|NULL|NULL|NULL|200
 }
