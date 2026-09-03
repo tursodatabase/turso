@@ -1378,11 +1378,11 @@ fn eqp_subquery_info(
 fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
-    keeps_right_rows: bool,
+    from_clause_has_right_or_full_join: bool,
 ) -> FromClauseSubqueryExecutionMode {
-    if keeps_right_rows {
-        // The unmatched-row pass must restart and scan this source after the main loop.
-        // A coroutine cannot rewind, and a direct seek index can omit preserved rows.
+    if from_clause_has_right_or_full_join {
+        // SQLite does not use a coroutine in a FROM list with RIGHT or FULL JOIN.
+        // Its unmatched-row pass can scan a source again after the main loop.
         return FromClauseSubqueryExecutionMode::MaterializedTable;
     }
 
@@ -1435,6 +1435,13 @@ pub fn emit_from_clause_subqueries(
     // OpenDup a CTE whose backing table has not been created yet.
     pre_materialize_multi_ref_ctes_in_tables(program, tables, t_ctx)?;
 
+    let from_clause_has_right_or_full_join = tables.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    });
+
     // Build the iteration order: join_order first (execution order), then any
     // hash-join build tables that aren't already in the join order.
     let mut visit_order: Vec<usize> = join_order
@@ -1465,10 +1472,7 @@ pub fn emit_from_clause_subqueries(
                 Some(choose_from_clause_subquery_execution_mode(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
-                    table_reference
-                        .join_info
-                        .as_ref()
-                        .is_some_and(JoinInfo::keeps_right_rows),
+                    from_clause_has_right_or_full_join,
                 ))
             }
             _ => None,
