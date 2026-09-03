@@ -1253,34 +1253,39 @@ fn extract_command_tags(data: &[u8]) -> Vec<String> {
 }
 
 #[test]
-fn wire_copy_from_returns_copy_n() {
+fn wire_copy_from_file_is_rejected() {
     let (mut server, port) = start_tursopg_server();
 
     let path = write_temp_copy_file("wire", "1\tAlice\n2\tBob\n3\tCharlie\n");
 
     let mut client = PgTestClient::connect(port);
 
-    // Create table
     let tags = client.query_command_tags("CREATE TABLE users(id INT, name TEXT)");
     assert!(
         tags.iter().any(|t| t.contains("CREATE")),
         "expected CREATE tag, got: {tags:?}"
     );
 
-    // COPY FROM
     let copy_sql = format!("COPY users FROM '{}'", path.display());
-    let tags = client.query_command_tags(&copy_sql);
+    client.send_query(&copy_sql);
+    let response = client.read_until_ready();
+    let text = String::from_utf8_lossy(&response);
     assert!(
-        tags.iter().any(|t| t == "COPY 3"),
-        "expected 'COPY 3' tag, got: {tags:?}"
+        text.contains("not allowed on this connection"),
+        "expected filesystem COPY FROM to be rejected, got: {text}"
+    );
+    assert!(
+        !extract_command_tags(&response)
+            .iter()
+            .any(|t| t.starts_with("COPY")),
+        "COPY must not complete on the wire listener"
     );
 
-    // Verify data via SELECT
-    let tags = client.query_command_tags("SELECT id, name FROM users ORDER BY id");
-    // SELECT produces a CommandComplete like "SELECT 3"
+    let tags = client.query_command_tags("SELECT id, name FROM users");
     assert!(
-        tags.iter().any(|t| t.starts_with("SELECT")),
-        "expected SELECT tag, got: {tags:?}"
+        tags.iter()
+            .any(|t| t == "SELECT 0" || t.starts_with("SELECT")),
+        "expected empty table after rejected COPY, got: {tags:?}"
     );
 
     std::fs::remove_file(&path).ok();
