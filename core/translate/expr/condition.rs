@@ -230,7 +230,12 @@ fn try_translate_null_check_peek(
         (false, true) => (false, condition_metadata.jump_target_when_true),
         (false, false) => (true, condition_metadata.jump_target_when_false),
     };
-    program.emit_column_is_null_jump(target.cursor_id, target.column, target_pc, jump_if_column_is_null);
+    program.emit_column_is_null_jump(
+        target.cursor_id,
+        target.column,
+        target_pc,
+        jump_if_column_is_null,
+    );
     Ok(true)
 }
 

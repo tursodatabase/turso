@@ -3730,19 +3730,20 @@ mod tests {
 
     #[test]
     fn nth_is_null_matches_nth_into_register_across_every_serial_type() {
+        use crate::alloc::vec;
         use crate::types::Record;
 
-        let values = std::vec![
+        let values = vec![
             Value::Null,
-            Value::from_i64(5),                // I8
-            Value::from_i64(1_000),             // I16
-            Value::from_i64(100_000),           // I24
-            Value::from_i64(10_000_000),        // I32
-            Value::from_i64(1_i64 << 40),        // I48
-            Value::from_i64(i64::MAX),          // I64
-            Value::from_f64(1.5),               // F64
-            Value::from_i64(0),                 // CONST_INT0
-            Value::from_i64(1),                 // CONST_INT1
+            Value::from_i64(5),           // I8
+            Value::from_i64(1_000),       // I16
+            Value::from_i64(100_000),     // I24
+            Value::from_i64(10_000_000),  // I32
+            Value::from_i64(1_i64 << 40), // I48
+            Value::from_i64(i64::MAX),    // I64
+            Value::from_f64(1.5),         // F64
+            Value::from_i64(0),           // CONST_INT0
+            Value::from_i64(1),           // CONST_INT1
             Value::Text(Text::new("hello")),
             Value::from_slice(&[1, 2, 3]).unwrap(),
             Value::Null,

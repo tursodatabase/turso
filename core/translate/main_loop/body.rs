@@ -16,7 +16,9 @@ fn try_translate_filter_null_check_peek(
     skip_label: BranchOffset,
 ) -> Result<bool> {
     let (is_null_semantics, operand) = match filter_expr {
-        Expr::Binary(e1, Operator::Is, e2) if matches!(e2.as_ref(), Expr::Literal(Literal::Null)) => {
+        Expr::Binary(e1, Operator::Is, e2)
+            if matches!(e2.as_ref(), Expr::Literal(Literal::Null)) =>
+        {
             (true, e1.as_ref())
         }
         Expr::Binary(e1, Operator::IsNot, e2)

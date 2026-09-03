@@ -2168,7 +2168,8 @@ impl ProgramBuilder {
     }
 
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
-        let (physical_column, default) = self.resolve_column_physical_and_default(cursor_id, column);
+        let (physical_column, default) =
+            self.resolve_column_physical_and_default(cursor_id, column);
 
         self.emit_insn(Insn::Column {
             cursor_id,
@@ -2271,7 +2272,8 @@ impl ProgramBuilder {
         target_pc: BranchOffset,
         jump_if_column_is_null: bool,
     ) {
-        let (physical_column, default) = self.resolve_column_physical_and_default(cursor_id, column);
+        let (physical_column, default) =
+            self.resolve_column_physical_and_default(cursor_id, column);
         self.emit_insn(Insn::ColumnIsNullJump {
             cursor_id,
             column: physical_column,
@@ -2285,7 +2287,8 @@ impl ProgramBuilder {
     /// dest without decoding the payload. See emit_column_is_null_jump for the eligibility
     /// caveat.
     pub fn emit_column_is_null_to_reg(&mut self, cursor_id: CursorID, column: usize, dest: usize) {
-        let (physical_column, default) = self.resolve_column_physical_and_default(cursor_id, column);
+        let (physical_column, default) =
+            self.resolve_column_physical_and_default(cursor_id, column);
         self.emit_insn(Insn::ColumnIsNullToReg {
             cursor_id,
             column: physical_column,

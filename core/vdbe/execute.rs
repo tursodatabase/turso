@@ -2378,7 +2378,11 @@ fn op_column_probe_to_reg(
         default,
         "ColumnIsNullToReg",
     ));
-    let value = if is_null { Value::Null } else { Value::from_i64(0) };
+    let value = if is_null {
+        Value::Null
+    } else {
+        Value::from_i64(0)
+    };
     state.registers[dest].set_value(value);
     Ok(InsnFunctionStepResult::Step)
 }

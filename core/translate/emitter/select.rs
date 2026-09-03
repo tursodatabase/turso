@@ -83,8 +83,7 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    t_ctx.resolver.peek_eligible_columns =
-        std::rc::Rc::new(compute_peek_eligible_columns(plan));
+    t_ctx.resolver.peek_eligible_columns = std::rc::Rc::new(compute_peek_eligible_columns(plan));
 
     // Register parameters from EXISTS subquery result columns that were dropped
     // during semi/anti-join unnesting. No code is emitted for these, but the

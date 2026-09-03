@@ -427,10 +427,11 @@ pub fn translate_aggregation_step(
             if num_args != 1 {
                 crate::bail_parse_error!("count bad number of arguments");
             }
-            let expr_reg = match try_count_col_peek(program, referenced_tables, resolver, &agg_arg_source)? {
-                Some(reg) => reg,
-                None => agg_arg_source.translate(program, referenced_tables, resolver, 0)?,
-            };
+            let expr_reg =
+                match try_count_col_peek(program, referenced_tables, resolver, &agg_arg_source)? {
+                    Some(reg) => reg,
+                    None => agg_arg_source.translate(program, referenced_tables, resolver, 0)?,
+                };
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {

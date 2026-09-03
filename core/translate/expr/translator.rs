@@ -200,9 +200,15 @@ pub(crate) fn try_resolve_column_peek(
         return Ok(None);
     }
 
-    let Some((cursor_id, column, _)) =
-        resolve_column_read_target(program, table_ref_id, column, index, use_covering_index, false, false)
-    else {
+    let Some((cursor_id, column, _)) = resolve_column_read_target(
+        program,
+        table_ref_id,
+        column,
+        index,
+        use_covering_index,
+        false,
+        false,
+    ) else {
         return Ok(None);
     };
 

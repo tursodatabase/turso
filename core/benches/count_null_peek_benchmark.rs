@@ -37,7 +37,10 @@ const DENSITIES: &[(&str, u64)] = &[
 const QUERY_SHAPES: &[(&str, &str)] = &[
     ("count_col", "SELECT COUNT({col}) FROM t"),
     ("where_is_null", "SELECT id FROM t WHERE {col} IS NULL"),
-    ("where_is_not_null", "SELECT id FROM t WHERE {col} IS NOT NULL"),
+    (
+        "where_is_not_null",
+        "SELECT id FROM t WHERE {col} IS NOT NULL",
+    ),
     (
         "filter_is_null",
         "SELECT COUNT(*) FILTER (WHERE {col} IS NULL) FROM t",
@@ -64,9 +67,7 @@ fn seed_db(n: usize, label: &str, k: u64) -> TempDir {
     let tx = conn.unchecked_transaction().unwrap();
     {
         let mut ins = tx
-            .prepare(
-                "INSERT INTO t(id, g, nullable_text, nullable_blob) VALUES (?1, ?2, ?3, ?4)",
-            )
+            .prepare("INSERT INTO t(id, g, nullable_text, nullable_blob) VALUES (?1, ?2, ?3, ?4)")
             .unwrap();
         for i in 1..=n as i64 {
             let g = format!("group-{:02}", i % 16);
@@ -82,13 +83,8 @@ fn seed_db(n: usize, label: &str, k: u64) -> TempDir {
                 let blob = vec![(i % 251) as u8; 64];
                 ins.execute((i, &g, Some(text), Some(blob))).unwrap();
             } else {
-                ins.execute((
-                    i,
-                    &g,
-                    Option::<String>::None,
-                    Option::<Vec<u8>>::None,
-                ))
-                .unwrap();
+                ins.execute((i, &g, Option::<String>::None, Option::<Vec<u8>>::None))
+                    .unwrap();
             }
         }
     }
