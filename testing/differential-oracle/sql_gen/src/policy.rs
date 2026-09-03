@@ -974,8 +974,17 @@ pub struct JoinConfig {
     /// Weights for choosing which type of JOIN to generate.
     pub join_type_weights: JoinTypeWeights,
 
-    /// Probability that a JOIN ON condition uses an equi-join
-    /// (`left.col = right.col`) rather than a general expression.
+    /// Probability that NATURAL modifies a non-CROSS join [0.0, 1.0].
+    pub natural_join_probability: f64,
+
+    /// Probability that a non-NATURAL join has ON or USING [0.0, 1.0].
+    pub join_constraint_probability: f64,
+
+    /// Probability that a join constraint uses USING when columns permit it.
+    pub using_probability: f64,
+
+    /// Probability that a JOIN ON condition uses `left.col = right.col`.
+    /// Other conditions compare these columns with a non-equality operator.
     pub equi_join_probability: f64,
 
     /// Probability of joining the same table again (self-join).
@@ -988,6 +997,9 @@ impl Default for JoinConfig {
             join_probability: 0.0,
             max_joins: 2,
             join_type_weights: JoinTypeWeights::default(),
+            natural_join_probability: 0.15,
+            join_constraint_probability: 0.9,
+            using_probability: 0.25,
             equi_join_probability: 0.7,
             self_join_probability: 0.15,
         }
@@ -999,8 +1011,9 @@ impl Default for JoinConfig {
 pub struct JoinTypeWeights {
     pub inner: u32,
     pub left: u32,
+    pub right: u32,
+    pub full: u32,
     pub cross: u32,
-    pub natural: u32,
 }
 
 impl Default for JoinTypeWeights {
@@ -1008,8 +1021,9 @@ impl Default for JoinTypeWeights {
         Self {
             inner: 40,
             left: 30,
+            right: 30,
+            full: 30,
             cross: 15,
-            natural: 15,
         }
     }
 }
