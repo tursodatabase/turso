@@ -246,10 +246,19 @@ pub fn plan_satisfies_order_target(
     order_target: &OrderTarget,
     schema: &Schema,
 ) -> bool {
-    // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
+    let mut hash_join_build_tables = TableMask::default();
     for (_, access_method_index) in plan.data.iter() {
         let access_method = &access_methods_arena[*access_method_index];
-        if let AccessMethodParams::HashJoin { join_type, .. } = &access_method.params {
+        if let AccessMethodParams::HashJoin {
+            build_table_idx,
+            join_type,
+            ..
+        } = &access_method.params
+        {
+            hash_join_build_tables
+                .set(*build_table_idx)
+                .expect("a plan cannot contain more than the table limit");
+            // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
             if matches!(join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter) {
                 return false;
             }
@@ -262,6 +271,12 @@ pub fn plan_satisfies_order_target(
     for (loop_pos, (table_index, access_method_index)) in plan.data.iter().enumerate() {
         let access_method = &access_methods_arena[*access_method_index];
         let table_ref = &joined_tables[*table_index];
+
+        // A hash build is consumed into an unordered hash table and omitted
+        // from the execution loop order. Its scan order cannot order output.
+        if hash_join_build_tables.get(*table_index) {
+            return false;
+        }
 
         // Outer joins can emit an extra row with NULLs on the right-hand side
         // when no match is found. Because that row is produced after the scan or
