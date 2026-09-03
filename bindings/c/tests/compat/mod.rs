@@ -916,6 +916,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "sqlite3"))]
     #[test]
     fn test_sqlite3_bind_blob_negative_len_reads_to_nul() {
         unsafe {

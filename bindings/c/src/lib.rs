@@ -2215,8 +2215,8 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         return sqlite3_bind_result(stmt_ref, result);
     }
 
-    // SQLite: n < 0 means read until the first 0x00. A signed-to-usize cast
-    // of a negative n would form a huge slice.
+    // SQLite documents n < 0 for bind_blob as undefined. A signed-to-usize
+    // cast would form a huge slice, so treat n < 0 like bind_text.
     let slice_blob = if len < 0 {
         CStr::from_ptr(blob as *const ffi::c_char)
             .to_bytes()
