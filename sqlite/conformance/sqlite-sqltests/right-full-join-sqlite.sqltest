@@ -1501,6 +1501,57 @@ expect {
     3|keep-three||right-three
 }
 
+# This case comes from a command-line comparison with SQLite. The outer RIGHT
+# JOIN materializes the inner group and must preserve each used column position.
+@cross-check-integrity
+test right-join-materializes-parenthesized-full-join {
+    CREATE TABLE materialized_outer(id INTEGER, outer_value TEXT);
+    CREATE TABLE materialized_left(id INTEGER, left_value TEXT);
+    CREATE TABLE materialized_right(id INTEGER, right_value TEXT);
+    INSERT INTO materialized_outer VALUES(1,'outer-one'),(3,'outer-three');
+    INSERT INTO materialized_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO materialized_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT id, materialized_left.left_value, materialized_right.right_value
+      FROM materialized_outer
+      RIGHT JOIN (materialized_left FULL JOIN materialized_right USING(id)) USING(id)
+     ORDER BY id;
+}
+expect {
+    1|left-one|
+    2|left-two|right-two
+    3||right-three
+}
+
+# This case comes from a command-line comparison with SQLite. SQLite removes
+# unused fields from a materialized nested join even when it is correlated.
+@cross-check-integrity
+test correlated-parenthesized-full-join-materialization {
+    CREATE TABLE correlated_outer(id INTEGER);
+    CREATE TABLE correlated_anchor(id INTEGER);
+    CREATE TABLE correlated_left(id INTEGER, left_value TEXT);
+    CREATE TABLE correlated_right(id INTEGER, right_value TEXT);
+    INSERT INTO correlated_outer VALUES(1),(2);
+    INSERT INTO correlated_anchor VALUES(9);
+    INSERT INTO correlated_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO correlated_right VALUES(1,'right-one'),(3,'right-three');
+
+    SELECT correlated_outer.id,
+           (SELECT count(*)
+              FROM correlated_anchor
+              RIGHT JOIN (
+                   correlated_left
+                   FULL JOIN correlated_right
+                     ON correlated_right.id=correlated_outer.id
+              ) ON true)
+      FROM correlated_outer
+     ORDER BY correlated_outer.id;
+}
+expect {
+    1|3
+    2|4
+}
+
 # This case comes from a command-line comparison with SQLite. SQLite keeps
 # each inner table name after it turns the join group into one derived table.
 @cross-check-integrity
