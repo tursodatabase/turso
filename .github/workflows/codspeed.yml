@@ -24,13 +24,18 @@ jobs:
       id-token: write
 
   benchmarks:
-    name: "Run benchmark (stable, ${{ matrix.benchmark.name }})"
+    name: "Run benchmark (${{ matrix.toolchain.name }}, ${{ matrix.benchmark.name }})"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
+        toolchain:
+          - name: stable
+            config: ci-opt
+          - name: nightly
+            config: ci-nightly-opt
         benchmark:
           - name: benchmark
             target: //core:benchmark_codspeed
@@ -108,7 +113,7 @@ jobs:
         uses: ./.github/actions/setup-bazel
 
       - name: Build benchmark
-        run: bazel build --config=ci-opt "${{ matrix.benchmark.target }}"
+        run: bazel build --config=${{ matrix.toolchain.config }} "${{ matrix.benchmark.target }}"
 
       - name: Generate graph-queries DBs
         if: matrix.benchmark.name == 'graph_queries_benchmark'

@@ -11,3 +11,7 @@ test:ci-opt --@rules_rust//rust/settings:lto=off
 build:ci-nightly --config=ci
 build:ci-nightly --@rules_rust//rust/toolchain/channel=nightly
 build:ci-nightly --@rules_rust//rust/settings:extra_rustc_flag=--cfg=nightly
+
+build:ci-nightly-opt --config=ci-nightly
+build:ci-nightly-opt -c opt
+build:ci-nightly-opt --@rules_rust//rust/settings:lto=off
