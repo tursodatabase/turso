@@ -41,6 +41,19 @@ expect {
     1
 }
 
+@cross-check-integrity
+test pragma-temp-synchronous-stays-off {
+    PRAGMA temp.synchronous;
+    PRAGMA temp.synchronous=FULL;
+    PRAGMA temp.synchronous;
+    PRAGMA main.synchronous;
+}
+expect {
+    0
+    0
+    2
+}
+
 test pragma-function-cache-size {
     SELECT * FROM pragma_cache_size()
 }
@@ -310,4 +323,3 @@ test pragma-page-size-set-uninitialized-db {
 expect {
     1024
 }
-
