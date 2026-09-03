@@ -196,7 +196,9 @@ fn rows_after_join(
     }
 
     let is_on_term = |constraint: &super::constraints::Constraint| {
-        where_clause[constraint.where_clause_pos.0].origin.join_origin()
+        where_clause[constraint.where_clause_pos.0]
+            .origin
+            .join_origin()
             == Some(JoinOrigin::Outer(rhs_table.internal_id))
     };
     let on_selectivity = constraint_output_multipliers_for(

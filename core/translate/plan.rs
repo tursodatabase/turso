@@ -8,9 +8,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
-        expr::{
-            as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask,
-        },
+        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,

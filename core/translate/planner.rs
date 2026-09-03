@@ -1761,9 +1761,9 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
     for (table_index, source_table) in source_tables.iter().enumerate() {
         let next_using = source_tables
             .get(table_index + 1)
-        .and_then(|next| next.join_info.as_ref())
-        .map(|join| join.using.as_slice())
-        .unwrap_or_default();
+            .and_then(|next| next.join_info.as_ref())
+            .map(|join| join.using.as_slice())
+            .unwrap_or_default();
 
         // SQLite stores one canonical value before the source columns on both
         // sides of `USING`. Outer unqualified names find this value first.

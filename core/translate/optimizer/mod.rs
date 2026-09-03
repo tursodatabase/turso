@@ -2605,9 +2605,7 @@ fn find_table_access_plan(
                     change_join_origin_to_inner(where_clause, later_table.internal_id);
                     JoinType::Inner
                 }
-                JoinType::FullOuter => {
-                    JoinType::LeftOuter
-                }
+                JoinType::FullOuter => JoinType::LeftOuter,
                 other => other,
             };
         }

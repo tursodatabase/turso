@@ -1506,7 +1506,9 @@ pub fn try_hash_join_access_method(
                     }
                     if build_constraints.candidates.iter().any(|candidate| {
                         candidate.index.as_ref().is_some_and(|index| {
-                            index.column_table_pos_to_index_pos(column_position).is_some()
+                            index
+                                .column_table_pos_to_index_pos(column_position)
+                                .is_some()
                         })
                     }) {
                         return Ok(None);
