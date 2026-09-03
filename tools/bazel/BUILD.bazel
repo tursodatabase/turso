@@ -1,0 +1,10 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "run_rust_tests_test",
+    srcs = ["run_rust_tests_test.sh"],
+    args = ["$(rootpath :run_rust_tests.sh)"],
+    data = ["run_rust_tests.sh"],
+)
+
+exports_files(["run_rust_tests.sh"])

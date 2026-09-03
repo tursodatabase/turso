@@ -1,0 +1,101 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+CORE_FEATURES = [
+    "allocation_metric",
+    "aristo-instr",
+    "autovacuum",
+    "bench",
+    "checksum",
+    "cli_only",
+    "codspeed",
+    "conn_raw_api",
+    "encryption",
+    "experimental_win_iocp",
+    "fs",
+    "fts",
+    "fuzz",
+    "io_memory_yield",
+    "io_uring",
+    "json",
+    "nanosecond-bench",
+    "optimizer_params",
+    "percentile",
+    "pure-rust-crypto",
+    "serde",
+    "series",
+    "simulator",
+    "stacker",
+    "test_helper",
+    "time",
+    "tracing_release",
+    "uuid",
+]
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+    workspace = "//:Cargo.toml",
+)
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env_files = [":cargo_env"],
+    build_script_env = {"SOURCE_DATE_EPOCH": "0"},
+    crate_root = "build.rs",
+    deps = all_crate_deps(build = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+)
+
+rust_library(
+    name = "turso_core",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "benches/**/*.rs",
+            "build.rs",
+        ],
+    ),
+    aliases = aliases(),
+    crate_features = CORE_FEATURES,
+    crate_root = "lib.rs",
+    deps = [
+        ":build_script",
+        "//extensions/core:turso_ext",
+        "//sqlite/parser:turso_parser",
+        "@crates//:stacker",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ] + all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "turso_core_test",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":turso_core",
+    crate_features = CORE_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["manual"],
+    timeout = "long",
+)
+
+sh_test(
+    name = "turso_core_test_sharded",
+    srcs = ["//tools/bazel:run_rust_tests.sh"],
+    args = ["$(rootpath :turso_core_test)"],
+    data = [":turso_core_test"],
+    shard_count = 8,
+    timeout = "long",
+)

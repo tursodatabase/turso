@@ -1,0 +1,34 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+PARSER_FEATURES = [
+    "codspeed",
+    "serde",
+    "simulator",
+]
+
+rust_library(
+    name = "turso_parser",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = PARSER_FEATURES,
+    crate_root = "src/lib.rs",
+    deps = all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ] + all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "turso_parser_test",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":turso_parser",
+    crate_features = PARSER_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)

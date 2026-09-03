@@ -41,6 +41,17 @@ jobs:
       - name: Check formatting (fuzz)
         run: cd fuzz && cargo fmt --check
 
+  bazel-rust:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+      - name: Test Bazel-managed Rust crates
+        run: bazel test //... --lockfile_mode=error --test_output=errors
+
   check-bindings:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
