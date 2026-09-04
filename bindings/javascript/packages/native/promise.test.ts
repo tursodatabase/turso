@@ -4,7 +4,10 @@ import { Database, connect, Transaction } from './promise.js'
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
-test('drizzle-orm', async () => {
+// 1234 blob inserts can take well over vitest's default 5s timeout on slow
+// Windows CI runners, so give this test the same generous budget as the other
+// bulk-insert tests in the JS bindings.
+test('drizzle-orm', { timeout: 60_000 }, async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {
         const conn = await connect(path);
