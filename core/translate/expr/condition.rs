@@ -80,7 +80,7 @@ pub(super) fn translate_in_list(
                 dest: check_null_reg,
             });
         } else if lhs_arity > 1 {
-	    // Checking for NULL values in LHS so we can resolve to NULL if found.
+            // Checking for NULL values in LHS so we can resolve to NULL if found.
             for j in 0..lhs_arity {
                 program.emit_insn(Insn::IsNull {
                     reg: lhs_reg + j,
