@@ -21,3 +21,260 @@ expect {
     b|1
     c|1
 }
+
+# INSERT OR REPLACE emits its own retraction for the row it overwrites
+# (Insn::Delete), so the following Insn::Insert must not record a second one.
+# Two retractions against one insertion drove the group's COUNT below zero.
+test matview-replace-same-value-single-row {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v2 AS SELECT val, COUNT(*) as cnt FROM t2 GROUP BY val;
+    INSERT INTO t2 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t2 VALUES (1, 'a');
+    SELECT * FROM v2 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+test matview-replace-same-value-repeated {
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v3 AS SELECT val, COUNT(*) as cnt FROM t3 GROUP BY val;
+    INSERT INTO t3 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t3 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t3 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t3 VALUES (1, 'a');
+    SELECT * FROM v3 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+test matview-replace-bare-same-value-single-row {
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v4 AS SELECT val, COUNT(*) as cnt FROM t4 GROUP BY val;
+    INSERT INTO t4 VALUES (1, 'a');
+    REPLACE INTO t4 VALUES (1, 'a');
+    SELECT * FROM v4 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+test matview-replace-different-value-single-row {
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v5 AS SELECT val, COUNT(*) as cnt FROM t5 GROUP BY val;
+    INSERT INTO t5 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t5 VALUES (1, 'b');
+    SELECT * FROM v5 ORDER BY val;
+}
+expect {
+    b|1
+}
+
+test matview-replace-same-value-in-explicit-txn {
+    CREATE TABLE t6(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v6 AS SELECT val, COUNT(*) as cnt FROM t6 GROUP BY val;
+    BEGIN;
+    INSERT INTO t6 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t6 VALUES (1, 'a');
+    SELECT * FROM v6 ORDER BY val;
+    COMMIT;
+    SELECT * FROM v6 ORDER BY val;
+}
+expect {
+    a|1
+    a|1
+}
+
+test matview-replace-same-value-no-aggregate {
+    CREATE TABLE t7(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v7 AS SELECT id, val FROM t7 WHERE val = 'a';
+    INSERT INTO t7 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t7 VALUES (1, 'a');
+    SELECT * FROM v7 ORDER BY id;
+}
+expect {
+    1|a
+}
+
+test matview-replace-same-value-multi-row-group {
+    CREATE TABLE t8(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v8 AS SELECT val, COUNT(*) as cnt FROM t8 GROUP BY val;
+    INSERT INTO t8 VALUES (1, 'a');
+    INSERT INTO t8 VALUES (2, 'a');
+    INSERT OR REPLACE INTO t8 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t8 VALUES (2, 'a');
+    SELECT * FROM v8 ORDER BY val;
+}
+expect {
+    a|2
+}
+
+# REPLACE that resolves a UNIQUE-index conflict deletes a row at a different
+# rowid than the one being inserted.
+test matview-replace-unique-index-conflict {
+    CREATE TABLE t9(id INTEGER PRIMARY KEY, val TEXT UNIQUE);
+    CREATE MATERIALIZED VIEW v9 AS SELECT val, COUNT(*) as cnt FROM t9 GROUP BY val;
+    INSERT INTO t9 VALUES (1, 'a');
+    INSERT OR REPLACE INTO t9 VALUES (2, 'a');
+    SELECT * FROM v9 ORDER BY val;
+    SELECT * FROM t9 ORDER BY id;
+}
+expect {
+    a|1
+    2|a
+}
+
+# A join view keeps its own match bookkeeping, so a replace on either side has
+# to be covered separately from the single-table cases above.
+test matview-replace-same-value-join-left-side {
+    CREATE TABLE ja(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE TABLE jb(id INTEGER PRIMARY KEY, k TEXT, v TEXT);
+    INSERT INTO ja VALUES (1,'k1');
+    INSERT INTO jb VALUES (1,'k1','x');
+    CREATE MATERIALIZED VIEW jv AS SELECT ja.id AS aid, jb.v FROM ja JOIN jb ON ja.k = jb.k;
+    INSERT OR REPLACE INTO ja VALUES (1,'k1');
+    SELECT aid, v FROM jv ORDER BY aid;
+}
+expect {
+    1|x
+}
+
+test matview-replace-same-value-join-right-side {
+    CREATE TABLE ja(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE TABLE jb(id INTEGER PRIMARY KEY, k TEXT, v TEXT);
+    INSERT INTO ja VALUES (1,'k1');
+    INSERT INTO jb VALUES (1,'k1','x');
+    CREATE MATERIALIZED VIEW jv AS SELECT ja.id AS aid, jb.v FROM ja JOIN jb ON ja.k = jb.k;
+    INSERT OR REPLACE INTO jb VALUES (1,'k1','x');
+    SELECT aid, v FROM jv ORDER BY aid;
+}
+expect {
+    1|x
+}
+
+# One replaced row matching several rows on the other side multiplies whatever
+# the bookkeeping gets wrong, so it fails even where a single match would not.
+test matview-replace-same-value-join-fanout {
+    CREATE TABLE ja(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE TABLE jb(id INTEGER PRIMARY KEY, k TEXT, v TEXT);
+    INSERT INTO ja VALUES (1,'k1');
+    INSERT INTO jb VALUES (1,'k1','x'),(2,'k1','y');
+    CREATE MATERIALIZED VIEW jv AS SELECT ja.id AS aid, jb.v FROM ja JOIN jb ON ja.k = jb.k;
+    INSERT OR REPLACE INTO ja VALUES (1,'k1');
+    SELECT aid, v FROM jv ORDER BY v;
+}
+expect {
+    1|x
+    1|y
+}
+
+# Control: replacing a row that does not exist deletes nothing, so the view must
+# simply gain the row.
+test matview-replace-nonexistent-row-in-join {
+    CREATE TABLE ja(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE TABLE jb(id INTEGER PRIMARY KEY, k TEXT, v TEXT);
+    INSERT INTO jb VALUES (1,'k1','x');
+    CREATE MATERIALIZED VIEW jv AS SELECT ja.id AS aid, jb.v FROM ja JOIN jb ON ja.k = jb.k;
+    INSERT OR REPLACE INTO ja VALUES (1,'k1');
+    SELECT aid, v FROM jv ORDER BY aid;
+}
+expect {
+    1|x
+}
+
+# Replacing a row that does not exist must not suppress a retraction that was
+# never recorded, on the single-table path either.
+test matview-replace-nonexistent-row-single-table {
+    CREATE TABLE t9(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v9 AS SELECT val, COUNT(*) AS cnt FROM t9 GROUP BY val;
+    INSERT OR REPLACE INTO t9 VALUES (1,'a');
+    INSERT OR REPLACE INTO t9 VALUES (2,'a');
+    SELECT val, cnt FROM v9 ORDER BY val;
+}
+expect {
+    a|2
+}
+
+# A conflict resolved through a unique index deletes a row with a DIFFERENT
+# rowid from the one being inserted.
+test matview-replace-unique-index-different-rowid {
+    CREATE TABLE t10(id INTEGER PRIMARY KEY, k TEXT UNIQUE, val TEXT);
+    CREATE MATERIALIZED VIEW v10 AS SELECT val, COUNT(*) AS cnt FROM t10 GROUP BY val;
+    INSERT INTO t10 VALUES (1,'k1','a');
+    INSERT OR REPLACE INTO t10 VALUES (2,'k1','a');
+    SELECT val, cnt FROM v10 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+# Boundary: a replace only double-records when it overwrites a row at the same
+# rowid. A table whose primary key is not the rowid resolves the conflict
+# through an index, deleting a row that lives at a different rowid, so the
+# insert finds nothing to record and was never affected.
+test matview-replace-unchanged-value-non-rowid-key {
+    CREATE TABLE t11(region TEXT PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v11 AS SELECT val, COUNT(*) AS cnt FROM t11 GROUP BY val;
+    INSERT INTO t11 VALUES ('r1','a');
+    INSERT OR REPLACE INTO t11 VALUES ('r1','a');
+    SELECT val, cnt FROM v11 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+test matview-replace-unchanged-value-composite-key {
+    CREATE TABLE t12(a TEXT, b TEXT, val TEXT, PRIMARY KEY (a,b));
+    CREATE MATERIALIZED VIEW v12 AS SELECT val, COUNT(*) AS cnt FROM t12 GROUP BY val;
+    INSERT INTO t12 VALUES ('x','y','a');
+    INSERT OR REPLACE INTO t12 VALUES ('x','y','a');
+    SELECT val, cnt FROM v12 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+# An aggregate view keeps per-group state, so a replace whose value CHANGES
+# still lands on a group the view has seen before once the value returns to an
+# earlier one. That reaches the same double-recording as an unchanged value,
+# which the single-statement cases above do not cover.
+test matview-replace-changed-value-revisiting-a-group {
+    CREATE TABLE t13(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v13 AS SELECT val, COUNT(*) AS cnt FROM t13 GROUP BY val;
+    INSERT INTO t13 VALUES (1,'a');
+    INSERT OR REPLACE INTO t13 VALUES (1,'b');
+    INSERT OR REPLACE INTO t13 VALUES (1,'a');
+    SELECT val, cnt FROM v13 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+test matview-replace-changed-value-revisiting-repeatedly {
+    CREATE TABLE t14(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v14 AS SELECT val, COUNT(*) AS cnt FROM t14 GROUP BY val;
+    INSERT INTO t14 VALUES (1,'a');
+    INSERT OR REPLACE INTO t14 VALUES (1,'b');
+    INSERT OR REPLACE INTO t14 VALUES (1,'a');
+    INSERT OR REPLACE INTO t14 VALUES (1,'b');
+    INSERT OR REPLACE INTO t14 VALUES (1,'a');
+    SELECT val, cnt FROM v14 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+# Boundary: replacing through values that are never repeated stays correct, so
+# it is revisiting a group that matters, not the number of replaces.
+test matview-replace-changed-value-never-revisiting {
+    CREATE TABLE t15(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE MATERIALIZED VIEW v15 AS SELECT val, COUNT(*) AS cnt FROM t15 GROUP BY val;
+    INSERT INTO t15 VALUES (1,'a');
+    INSERT OR REPLACE INTO t15 VALUES (1,'b');
+    INSERT OR REPLACE INTO t15 VALUES (1,'c');
+    SELECT val, cnt FROM v15 ORDER BY val;
+}
+expect {
+    c|1
+}
