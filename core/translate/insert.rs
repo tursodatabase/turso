@@ -953,7 +953,7 @@ pub fn translate_insert(
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
         flag: insert_flags,
-        table_name: table_name.to_string(),
+        table_name: normalize_ident(table_name.as_str()),
     });
 
     // Fire AFTER INSERT triggers
