@@ -1517,6 +1517,13 @@ pub fn merge_columns(mut expressions: Vec<Expr>) -> Expr {
 pub struct JoinedTable {
     /// The operation that this table reference performs.
     pub op: Operation,
+    /// This operation reads unmatched right rows (from RIGHT or FULL OUTER JOIN) after the main join loop.
+    ///
+    /// A post-join WHERE term must not decide whether a right row matches.
+    /// This read can use that term after the main loop records all matches.
+    /// SQLite plans the two operations separately. `None` means that no separate operation exists.
+    /// An unmatched-right read then uses the default scan.
+    pub unmatched_right_rows_operation: Option<Operation>,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -2900,6 +2907,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             identifier,
             internal_id,
@@ -2947,6 +2955,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             identifier,
             internal_id,
@@ -2979,6 +2988,7 @@ impl JoinedTable {
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             identifier,
             internal_id,

@@ -48,6 +48,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub maybe_order_target: Option<&'a OrderTarget>,
     /// Stop growing a join plan after it costs more than another query form.
     pub cost_limit: Option<Cost>,
+    /// This flag permits an automatic index for this table read.
+    pub allow_automatic_index: bool,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -57,6 +59,7 @@ impl<'a> JoinPlanningContext<'a> {
         Self {
             maybe_order_target,
             cost_limit: None,
+            allow_automatic_index: true,
         }
     }
 }
@@ -3417,6 +3420,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -3513,6 +3517,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -3626,6 +3631,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -3819,6 +3825,7 @@ mod tests {
         let table = Table::BTree(table);
         JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             identifier: name,
             internal_id,
