@@ -1958,3 +1958,88 @@ fn test_journal_mode_mvcc_switch_allowed_without_cdc(db: TempDatabase) {
     let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM t");
     assert_eq!(rows, vec![vec![Value::Integer(1)]]);
 }
+
+/// Issue #8656: A rowid-changing UPDATE's synthetic INSERT record carries the row image in `after` (not `before`).
+#[turso_macros::test]
+fn test_cdc_rowid_update_carries_image_in_after_not_before(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')").unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+    conn.execute("UPDATE t SET k = 44 WHERE k = 1").unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            // INSERT INTO t VALUES (1, 'x')
+            v2_row(
+                1,
+                "t",
+                1,
+                None,
+                Some(record([Value::Integer(1), Value::Text("x".to_string())])),
+                None,
+            ),
+            v2_commit(),
+            // UPDATE t SET k = 44 WHERE k = 1: rowid move decomposes into DELETE(1) + INSERT(44)
+            v2_row(
+                -1,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Text("x".to_string())])),
+                None,
+                None,
+            ),
+            v2_row(
+                1,
+                "t",
+                44,
+                None,
+                Some(record([Value::Integer(44), Value::Text("x".to_string())])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+/// Also verify rowid-changing UPDATE in 'after' capture mode.
+#[turso_macros::test]
+fn test_cdc_rowid_update_after_mode(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('after')").unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+    conn.execute("UPDATE t SET k = 44 WHERE k = 1").unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            // INSERT INTO t VALUES (1, 'x')
+            v2_row(
+                1,
+                "t",
+                1,
+                None,
+                Some(record([Value::Integer(1), Value::Text("x".to_string())])),
+                None,
+            ),
+            v2_commit(),
+            // UPDATE t SET k = 44 WHERE k = 1: DELETE has no image in 'after' mode, INSERT has after image
+            v2_row(-1, "t", 1, None, None, None),
+            v2_row(
+                1,
+                "t",
+                44,
+                None,
+                Some(record([Value::Integer(44), Value::Text("x".to_string())])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}

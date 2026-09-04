@@ -2512,8 +2512,8 @@ fn emit_update_insns<'a>(
                         OperationMode::INSERT,
                         cdc_cursor_id,
                         cdc_rowid_after_reg,
-                        cdc_after_reg,
                         None,
+                        cdc_after_reg,
                         None,
                         table_name,
                     )?;
