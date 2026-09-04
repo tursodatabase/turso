@@ -29,6 +29,13 @@ expect {
     2023-05-18
 }
 
+test date-unixepoch-at-1-millisecond-before-epochtime {
+    SELECT date(unixepoch('1969-12-31T23:59:59.999Z'), 'unixepoch');
+}
+expect {
+    1969-12-31
+}
+
 test date-with-milliseconds {
     SELECT date('2023-05-18 15:30:45.123');
 }
@@ -634,6 +641,13 @@ expect {
 
 test unixepoch-at-1-second-before-epochtime {
     SELECT unixepoch('1969-12-31 23:59:59');
+}
+expect {
+    -1
+}
+
+test unixepoch-at-1-millisecond-before-epochtime {
+    SELECT unixepoch('1969-12-31 23:59:59.999');
 }
 expect {
     -1
@@ -1554,6 +1568,13 @@ test strftime-seconds-since-epoch {
 }
 expect {
     1737638070
+}
+
+test strftime-at-1-millisecond-before-epochtime {
+    SELECT strftime('%s', '1969-12-31T23:59:59.999');
+}
+expect {
+    -1
 }
 
 test strftime-with-subsec {
