@@ -81,6 +81,8 @@ impl StmtClass {
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
             | Stmt::CreateSequence { .. }
+            | Stmt::CreateFunction { .. }
+            | Stmt::DropFunction { .. }
             | Stmt::DropIndex { .. }
             | Stmt::DropTable { .. }
             | Stmt::DropTrigger { .. }

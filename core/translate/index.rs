@@ -3,7 +3,9 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema::{
+    Column, FunctionDef, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
+};
 use crate::sync::Arc;
 use crate::translate::{
     collate::CollationSeq,
@@ -157,7 +159,9 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    let udfs = (database_id == MAIN_DB_ID && connection.experimental_udfs_enabled())
+        .then(|| &resolver.schema().functions);
+    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver), udfs)?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -227,7 +231,7 @@ pub fn translate_create_index(
         on_conflict: None,
     });
 
-    if !idx.validate_where_expr(&table, resolver) {
+    if !idx.validate_where_expr(&table, udfs) {
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
@@ -892,7 +896,7 @@ pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_resolver(table, cols, None)
+    resolve_sorted_columns_with_resolver(table, cols, None, None)
 }
 
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
@@ -908,6 +912,7 @@ fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
+    udfs: Option<&HashMap<String, Arc<FunctionDef>>>,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
@@ -938,7 +943,7 @@ fn resolve_sorted_columns_with_resolver(
                 .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
-        if !validate_index_expression(unwrapped_expr, table) {
+        if !validate_index_expression(unwrapped_expr, table, udfs) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
         resolved
@@ -1027,7 +1032,11 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+fn validate_index_expression(
+    expr: &Expr,
+    table: &BTreeTable,
+    udfs: Option<&HashMap<String, Arc<FunctionDef>>>,
+) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
@@ -1047,8 +1056,17 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
+        match Func::resolve_function(&n, args.len()) {
+            Ok(Some(f)) => is_deterministic_schema_function_call(&f, args),
+            Ok(None) => match udfs {
+                Some(functions) => functions.get(&n).is_some_and(|udf| {
+                    udf.params.len() == args.len()
+                        && crate::translate::udf::udf_is_schema_deterministic(functions, udf)
+                }),
+                None => true,
+            },
+            Err(_) => false,
+        }
     };
 
     let mut ok = true;
