@@ -1804,3 +1804,100 @@ test right-join-does-not-reuse-left-cte-cursor {
 expect {
     NULL|NULL|NULL|NULL|200
 }
+
+# The first FULL JOIN gives the middle table a null row. SQLite does not
+# start the later index range when its key comes from that null row.
+@cross-check-integrity
+test full-join-range-seek-stops-on-null-left-key {
+    CREATE TABLE null_range_source(id INTEGER PRIMARY KEY, value REAL);
+    CREATE INDEX null_range_source_value ON null_range_source(value);
+    INSERT INTO null_range_source VALUES(1,-4.0);
+    CREATE TABLE null_range_middle(key REAL NOT NULL);
+
+    SELECT quote(left_row.id), quote(null_range_middle.key),
+           quote(right_row.id)
+      FROM null_range_source AS left_row
+      FULL JOIN null_range_middle ON true
+      FULL JOIN null_range_source AS right_row
+                INDEXED BY null_range_source_value
+        ON null_range_middle.key<=right_row.value
+     ORDER BY left_row.id NULLS FIRST, right_row.id NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# An INTEGER PRIMARY KEY is normally not null. The first FULL JOIN can still
+# replace it with NULL, so the later range seek must not use it.
+@cross-check-integrity
+test full-join-range-seek-stops-on-null-primary-key {
+    CREATE TABLE null_primary_left(seed INTEGER);
+    INSERT INTO null_primary_left VALUES(1);
+    CREATE TABLE null_primary_middle(id INTEGER PRIMARY KEY);
+    CREATE TABLE null_primary_right(value INTEGER);
+    CREATE INDEX null_primary_right_value ON null_primary_right(value);
+    INSERT INTO null_primary_right VALUES(1);
+
+    SELECT quote(null_primary_left.seed), quote(null_primary_middle.id),
+           quote(null_primary_right.value)
+      FROM null_primary_left
+      FULL JOIN null_primary_middle ON true
+      FULL JOIN null_primary_right INDEXED BY null_primary_right_value
+        ON null_primary_middle.id<=null_primary_right.value
+     ORDER BY null_primary_left.seed NULLS FIRST,
+              null_primary_right.value NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# The first FULL JOIN can also replace an implicit rowid with NULL. SQLite
+# checks for that NULL before it starts the later rowid range seek.
+@cross-check-integrity
+test full-join-rowid-range-seek-stops-on-null-key {
+    CREATE TABLE null_rowid_left(seed INTEGER);
+    INSERT INTO null_rowid_left VALUES(1);
+    CREATE TABLE null_rowid_middle(value INTEGER);
+    CREATE TABLE null_rowid_right(id INTEGER PRIMARY KEY);
+    INSERT INTO null_rowid_right VALUES(1);
+
+    SELECT quote(null_rowid_left.seed), quote(null_rowid_middle.rowid),
+           quote(null_rowid_right.id)
+      FROM null_rowid_left
+      FULL JOIN null_rowid_middle ON true
+      FULL JOIN null_rowid_right
+        ON null_rowid_middle.rowid<=null_rowid_right.id
+     ORDER BY null_rowid_left.seed NULLS FIRST,
+              null_rowid_right.id NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# A correlated query has only an outer table reference, not the outer FROM
+# list. It must still know that the FULL JOIN can make the key NULL.
+@cross-check-integrity
+test correlated-range-seek-stops-on-null-outer-key {
+    CREATE TABLE correlated_null_left(id INTEGER);
+    INSERT INTO correlated_null_left VALUES(1);
+    CREATE TABLE correlated_null_middle(key INTEGER NOT NULL);
+    CREATE TABLE correlated_null_values(value INTEGER);
+    CREATE INDEX correlated_null_values_value
+        ON correlated_null_values(value);
+    INSERT INTO correlated_null_values VALUES(2);
+
+    SELECT quote(correlated_null_left.id), (
+               SELECT count(*)
+                 FROM correlated_null_values
+                      INDEXED BY correlated_null_values_value
+                WHERE correlated_null_middle.key<=value
+           )
+      FROM correlated_null_left
+      FULL JOIN correlated_null_middle ON true;
+}
+expect {
+    1|0
+}
