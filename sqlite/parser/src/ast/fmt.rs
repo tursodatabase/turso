@@ -1712,6 +1712,10 @@ impl ToTokens for CreateTableBody {
                     }
                 }
                 if let Some(ref strict) = options.strict_text {
+                    // Table options are a comma-separated list: "WITHOUT ROWID, STRICT"
+                    if options.without_rowid_text.is_some() {
+                        s.append(TK_COMMA, None)?;
+                    }
                     s.append(TK_ID, Some(strict))?;
                 }
                 Ok(())
