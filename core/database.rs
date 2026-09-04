@@ -4393,10 +4393,12 @@ mod database_tests {
         assert!(err.to_string().contains("injected Wal encode failure"));
         assert_eq!(count_test_rows(&conn), 0);
 
-        conn.execute("insert into test(value) values ('committed')")
+        let next = db.connect_with_page_codec(codec.clone()).unwrap();
+        next.execute("insert into test(value) values ('committed')")
             .unwrap();
-        assert_eq!(count_test_rows(&conn), 1);
-        conn.checkpoint(crate::CheckpointMode::Full).unwrap();
+        assert_eq!(count_test_rows(&next), 1);
+        next.checkpoint(crate::CheckpointMode::Full).unwrap();
+        drop(next);
         drop(conn);
         drop(db);
 
