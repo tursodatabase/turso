@@ -23,7 +23,10 @@ use crate::{
             emit_materialized_build_inputs, emit_program_for_select,
             emit_program_for_select_with_resolver, emit_query,
         },
-        eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
+        eqp::{
+            eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpRowSource, EqpSubquery,
+            EqpSubqueryExec, EqpTable,
+        },
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
@@ -1413,7 +1416,7 @@ pub fn emit_from_clause_subqueries(
     join_order: &[JoinOrderMember],
 ) -> Result<()> {
     if tables.joined_tables().is_empty() {
-        emit_explain!(program, false, EqpDetail::ConstantRow);
+        emit_explain!(program, false, EqpDetail::ConstantRow { rows: 1 });
     }
 
     // FIRST PASS: Pre-materialize all recursively reachable multi-ref / hinted CTEs
@@ -1421,21 +1424,11 @@ pub fn emit_from_clause_subqueries(
     // OpenDup a CTE whose backing table has not been created yet.
     pre_materialize_multi_ref_ctes_in_tables(program, tables, t_ctx)?;
 
-    // Build the iteration order: join_order first (execution order), then any
-    // hash-join build tables that aren't already in the join order.
-    let mut visit_order: Vec<usize> = join_order
+    let visit_order: Vec<usize> = join_order
         .iter()
         .map(|member| member.original_idx)
         .collect();
     let visit_set: TableMask = visit_order.iter().copied().try_collect()?;
-    for table in tables.joined_tables().iter() {
-        if let Operation::HashJoin(hash_join_op) = &table.op {
-            let build_idx = hash_join_op.build_table_idx;
-            if !visit_set.get(build_idx) {
-                visit_order.push(build_idx);
-            }
-        }
-    }
 
     // Build lookup from table index to is_outer for LEFT-JOIN annotations
     let outer_table_set: TableMask = join_order
@@ -1444,7 +1437,45 @@ pub fn emit_from_clause_subqueries(
         .map(|m| m.original_idx)
         .try_collect()?;
 
-    for table_index in visit_order {
+    let in_eqp_mode = matches!(
+        program.get_query_mode(),
+        crate::QueryMode::ExplainQueryPlan { .. }
+    );
+    for (join_pos, table_index) in visit_order.into_iter().enumerate() {
+        let table_reference = &tables.joined_tables()[table_index];
+        // The build side of a hash join in this loop: either the hash is
+        // filled by scanning the build table right here, or it is loaded from
+        // a build input that a MATERIALIZE step already produced. Only built
+        // in EXPLAIN QUERY PLAN mode to keep allocations off the prepare path.
+        let hash_build = match &table_reference.op {
+            Operation::HashJoin(hash_join_op) if in_eqp_mode => {
+                let build_table = &tables.joined_tables()[hash_join_op.build_table_idx];
+                let build_materialized = t_ctx
+                    .materialized_build_inputs
+                    .contains_key(&hash_join_op.build_table_idx);
+                Some((
+                    hash_join_op.build_table_idx,
+                    EqpTable::from_joined(build_table),
+                    build_materialized,
+                ))
+            }
+            _ => None,
+        };
+        // The join field describes how this table combines with the rows
+        // produced so far, so it follows the optimized join order, not the
+        // order tables were written in. The first table in the loop has
+        // nothing to join with; a hash join is a join wherever it sits.
+        let is_hash_join = matches!(table_reference.op, Operation::HashJoin(_));
+        let join = if join_pos == 0 && !is_hash_join {
+            None
+        } else {
+            EqpJoin::from_join_info(
+                table_reference.join_info.as_ref(),
+                outer_table_set.get(table_index),
+            )
+            .or(Some(EqpJoin::Inner))
+        };
+
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
@@ -1461,13 +1492,34 @@ pub fn emit_from_clause_subqueries(
             true,
             eqp_detail_for_table_op(
                 table_reference,
-                EqpJoin::from_join_info(
-                    table_reference.join_info.as_ref(),
-                    outer_table_set.get(table_index),
-                ),
+                join,
                 eqp_subquery,
+                hash_build
+                    .as_ref()
+                    .map(|(_, table, materialized)| (table.clone(), *materialized)),
             )
         );
+        // A hash join that fills its hash table by scanning the build table
+        // does that scan once, as part of setting up this probe loop, so the
+        // scan shows up as a child of the hash join node. A materialized
+        // build input already has its own MATERIALIZE subtree instead, and a
+        // build table in the join order is read through that loop.
+        if let Some((build_table_idx, build_table, false)) = hash_build {
+            if !visit_set.get(build_table_idx) {
+                emit_explain!(
+                    program,
+                    false,
+                    EqpDetail::Scan {
+                        table: build_table,
+                        index: None,
+                        source: EqpRowSource::BTreeTable,
+                        backwards: false,
+                        join: None,
+                        subquery: None,
+                    }
+                );
+            }
+        }
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             let execution_mode =
@@ -1900,10 +1952,6 @@ pub fn emit_non_from_clause_subquery(
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {
-            SubqueryType::Exists { .. } => {
-                // EXISTS subqueries don't get a separate EQP annotation in SQLite;
-                // instead the SEARCH/SCAN line gets an "EXISTS" suffix handled elsewhere.
-            }
             SubqueryType::In { .. } => {
                 emit_explain!(
                     program,
@@ -1914,7 +1962,10 @@ pub fn emit_non_from_clause_subquery(
                     }
                 );
             }
-            SubqueryType::RowValue { .. } => {
+            // An EXISTS that was unnested into a semi join never reaches this
+            // point; one that stays a subquery is reported the way SQLite
+            // reports it: as a scalar subquery producing the 0/1 result.
+            SubqueryType::Exists { .. } | SubqueryType::RowValue { .. } => {
                 emit_explain!(
                     program,
                     true,
@@ -2009,9 +2060,7 @@ pub fn emit_non_from_clause_subquery(
             }
         }
         // Pop the parent explain for LIST/SCALAR SUBQUERY annotations.
-        if !matches!(query_type, SubqueryType::Exists { .. }) {
-            program.pop_current_parent_explain();
-        }
+        program.pop_current_parent_explain();
         if let Some(label) = label_skip_after_first_run {
             program.preassign_label_to_next_insn(label);
         }

@@ -212,8 +212,11 @@ impl EqpCompoundOp {
 /// One structured EXPLAIN QUERY PLAN step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EqpDetail {
-    /// A query with no FROM clause produces exactly one row.
-    ConstantRow,
+    /// A query with no FROM clause: a bare SELECT produces one row, a VALUES
+    /// list produces one row per tuple.
+    ConstantRow {
+        rows: usize,
+    },
     /// Iterate all rows of a table, index, or subquery result.
     Scan {
         table: EqpTable,
@@ -247,11 +250,18 @@ pub enum EqpDetail {
     IndexMethod {
         method: String,
     },
-    /// Probe a hash table built from another table's rows.
+    /// Scan a table (the probe side) and probe a hash table built from the
+    /// build side's rows.
     HashJoin {
         table: EqpTable,
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
+        /// The build side: the table whose rows fill the hash table.
+        build: EqpTable,
+        /// True when the hash table is loaded from a pre-materialized build
+        /// input (a `MATERIALIZE hash build input` step) instead of scanning
+        /// the build table directly.
+        build_materialized: bool,
     },
     /// Materialize the build side of a hash join into an in-memory table.
     HashBuild {
@@ -298,7 +308,13 @@ pub enum EqpDetail {
 impl Display for EqpDetail {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ConstantRow => write!(f, "SCAN CONSTANT ROW"),
+            Self::ConstantRow { rows } => {
+                if *rows > 1 {
+                    write!(f, "SCAN {rows} CONSTANT ROWS")
+                } else {
+                    write!(f, "SCAN CONSTANT ROW")
+                }
+            }
             Self::Scan { table, index, .. } => {
                 write!(f, "SCAN {}", table.name_with_alias())?;
                 if let Some(index) = index {
@@ -433,10 +449,15 @@ fn eqp_index(index: &Index, covering: bool) -> EqpIndex {
 }
 
 /// Build the [EqpDetail] for a joined table.
+///
+/// `hash_build` names the build side of a hash join (and whether its input is
+/// pre-materialized); it must be `Some` exactly when the table's operation is
+/// a hash join.
 pub(crate) fn eqp_detail_for_table_op(
     table: &JoinedTable,
     join: Option<EqpJoin>,
     subquery: Option<EqpSubquery>,
+    hash_build: Option<(EqpTable, bool)>,
 ) -> EqpDetail {
     let eqp_table = EqpTable::from_joined(table);
     match &table.op {
@@ -535,11 +556,17 @@ pub(crate) fn eqp_detail_for_table_op(
                 .method_name
                 .to_string(),
         },
-        Operation::HashJoin(_) => EqpDetail::HashJoin {
-            table: eqp_table,
-            join,
-            subquery,
-        },
+        Operation::HashJoin(_) => {
+            let (build, build_materialized) =
+                hash_build.expect("hash join table must come with build side info");
+            EqpDetail::HashJoin {
+                table: eqp_table,
+                join,
+                subquery,
+                build,
+                build_materialized,
+            }
+        }
     }
 }
 
@@ -677,7 +704,10 @@ impl EqpDetail {
     fn write_json(&self, out: &mut String) {
         let mut obj = JsonBuilder::new(out);
         match self {
-            Self::ConstantRow => obj.str("type", "constant_row"),
+            Self::ConstantRow { rows } => {
+                obj.str("type", "constant_row");
+                obj.num("rows", *rows);
+            }
             Self::Scan {
                 table,
                 index,
@@ -733,9 +763,21 @@ impl EqpDetail {
                 table,
                 join,
                 subquery,
+                build,
+                build_materialized,
             } => {
                 obj.str("type", "hash_join");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
+                obj.str("build_table", &build.name);
+                obj.opt_str("build_alias", build.alias.as_deref());
+                obj.str(
+                    "build_input",
+                    if *build_materialized {
+                        "materialized"
+                    } else {
+                        "scan"
+                    },
+                );
             }
             Self::HashBuild { table } => {
                 obj.str("type", "hash_build");

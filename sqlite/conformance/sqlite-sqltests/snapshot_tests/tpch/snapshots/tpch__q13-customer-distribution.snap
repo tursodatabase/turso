@@ -34,7 +34,7 @@ info:
 QUERY PLAN
 |--SCAN c_orders
 |  |--HASH JOIN orders
-|  |--SCAN customer
+|  |  `--SCAN customer
 |  `--USE SORTER FOR GROUP BY
 |--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY
