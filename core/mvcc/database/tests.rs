@@ -9528,7 +9528,7 @@ fn test_mvcc_integrity_check() {
 #[test]
 fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     fn run_pager_until_done<T>(
-        mut action: impl FnMut() -> Result<IOResult<T>>,
+        mut action: impl FnMut() -> IOResultOr<T>,
         pager: &Pager,
     ) -> Result<T> {
         loop {
@@ -9594,7 +9594,11 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         )
         .unwrap();
     }
-    run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
+    run_pager_until_done(
+        || pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true),
+        pager.as_ref(),
+    )
+    .unwrap();
 
     pager.begin_read_tx().unwrap();
     let mut interior_key = None;
@@ -9647,7 +9651,11 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
             IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
         }
     }
-    run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
+    run_pager_until_done(
+        || pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true),
+        pager.as_ref(),
+    )
+    .unwrap();
 
     pager.begin_read_tx().unwrap();
     let count_after = run_pager_until_done(|| cursor.write().count(), pager.as_ref()).unwrap();
