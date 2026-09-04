@@ -8250,13 +8250,13 @@ pub fn op_agg_inverse(
 /// affinity to TEXT/BLOB. Returns the parsed pieces so callers don't
 /// re-parse, and so step and inverse agree on which path (integer or
 /// float) handles each row.
-enum NumericArg {
+pub(crate) enum NumericArg {
     Integer(i64),
     Float(f64),
     Null,
 }
 
-fn classify_numeric_arg(v: &Value) -> NumericArg {
+pub(crate) fn classify_numeric_arg(v: &Value) -> NumericArg {
     match v {
         Value::Null => NumericArg::Null,
         Value::Numeric(Numeric::Integer(i)) => NumericArg::Integer(*i),

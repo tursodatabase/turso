@@ -1199,6 +1199,14 @@ impl DbspCompiler {
                                             "Only column references are supported in aggregate functions for incremental views".to_string()
                                         ));
                                     }
+                                } else if let Some(LogicalExpr::Column(col)) = args.first() {
+                                    // COUNT(column) skips NULLs. COUNT(*) and
+                                    // COUNT(<constant>) count every row.
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("COUNT column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::CountColumn(col_idx));
                                 } else {
                                     aggregate_functions.push(AggregateFunction::Count);
                                 }
@@ -3126,14 +3134,16 @@ mod tests {
             assert_eq!(*weight, 1);
             assert_eq!(row.values.len(), 2); // name, sum
 
-            if let (Value::Text(name), Value::Numeric(Numeric::Float(sum))) =
+            if let (Value::Text(name), Value::Numeric(Numeric::Integer(sum))) =
                 (&row.values[0], &row.values[1])
             {
                 if name.as_str() == "Alice" {
-                    assert_eq!(*sum, 55.0, "Alice should have sum 55");
+                    assert_eq!(*sum, 55, "Alice should have sum 55");
                 } else if name.as_str() == "Bob" {
-                    assert_eq!(*sum, 20.0, "Bob should have sum 20");
+                    assert_eq!(*sum, 20, "Bob should have sum 20");
                 }
+            } else {
+                panic!("Unexpected value types in result");
             }
         }
     }
@@ -3331,13 +3341,12 @@ mod tests {
         let (row, _weight) = &result.changes[0];
         assert_eq!(row.values.len(), 1);
 
-        // The hex function converts the number to string first, then to hex
-        // SUM now returns Float, so 96.0 as string is "96.0", which in hex is "39362E30"
-        // (hex of ASCII '9', '6', '.', '0')
+        // The hex function converts the number to string first, then to hex,
+        // so an integer sum of 96 gives hex of ASCII '9','6'.
         assert_eq!(
             row.values[0],
-            Value::Text("39362E30".to_string().into()),
-            "HEX(SUM(age + 2)) should return '39362E30' for sum of 96.0"
+            Value::Text("3936".to_string().into()),
+            "HEX(SUM(age + 2)) should return '3936' for sum of 96"
         );
 
         // Test incremental update: add a new user
@@ -3356,22 +3365,22 @@ mod tests {
 
         let result = test_execute(&mut circuit, input_data, pager).unwrap();
 
-        // Expected: new SUM(age + 2) = 96.0 + (40+2) = 138.0
-        // HEX(138.0) = hex of "138.0" = "3133382E30"
+        // Expected: new SUM(age + 2) = 96 + (40+2) = 138
+        // HEX(138) = hex of "138" = "313338"
         assert_eq!(result.changes.len(), 2);
 
-        // First change: remove old aggregate (96.0)
+        // First change: remove old aggregate (96)
         let (row, weight) = &result.changes[0];
         assert_eq!(*weight, -1);
-        assert_eq!(row.values[0], Value::Text("39362E30".to_string().into()));
+        assert_eq!(row.values[0], Value::Text("3936".to_string().into()));
 
-        // Second change: add new aggregate (138.0)
+        // Second change: add new aggregate (138)
         let (row, weight) = &result.changes[1];
         assert_eq!(*weight, 1);
         assert_eq!(
             row.values[0],
-            Value::Text("3133382E30".to_string().into()),
-            "HEX(SUM(age + 2)) should return '3133382E30' for sum of 138.0"
+            Value::Text("313338".to_string().into()),
+            "HEX(SUM(age + 2)) should return '313338' for sum of 138"
         );
     }
 
@@ -3419,8 +3428,8 @@ mod tests {
             .unwrap();
 
         // Expected results:
-        // Alice: SUM(25*2 + 35*2) = 50 + 70 = 120.0, HEX("120.0") = "3132302E30"
-        // Bob: SUM(30*2) = 60.0, HEX("60.0") = "36302E30"
+        // Alice: SUM(25*2 + 35*2) = 50 + 70 = 120, HEX("120") = "313230"
+        // Bob: SUM(30*2) = 60, HEX("60") = "3630"
         assert_eq!(result.changes.len(), 2);
 
         let results: HashMap<String, String> = result
@@ -3441,13 +3450,13 @@ mod tests {
 
         assert_eq!(
             results.get("Alice").unwrap(),
-            "3132302E30",
-            "Alice's HEX(SUM(age * 2)) should be '3132302E30' (120.0)"
+            "313230",
+            "Alice's HEX(SUM(age * 2)) should be '313230' (120)"
         );
         assert_eq!(
             results.get("Bob").unwrap(),
-            "36302E30",
-            "Bob's HEX(SUM(age * 2)) should be '36302E30' (60.0)"
+            "3630",
+            "Bob's HEX(SUM(age * 2)) should be '3630' (60)"
         );
     }
 
@@ -4767,15 +4776,15 @@ mod tests {
         );
 
         // Check the results
-        let mut results_map: HashMap<String, f64> = HashMap::default();
+        let mut results_map: HashMap<String, i64> = HashMap::default();
         for (row, weight) in result.changes {
             assert_eq!(weight, 1);
             assert_eq!(row.values.len(), 2); // name and total_quantity
 
-            if let (Value::Text(name), Value::Numeric(Numeric::Float(total))) =
+            if let (Value::Text(name), Value::Numeric(Numeric::Integer(total))) =
                 (&row.values[0], &row.values[1])
             {
-                results_map.insert(name.to_string(), f64::from(*total));
+                results_map.insert(name.to_string(), *total);
             } else {
                 panic!("Unexpected value types in result");
             }
@@ -4783,12 +4792,12 @@ mod tests {
 
         assert_eq!(
             results_map.get("Alice"),
-            Some(&10.0),
+            Some(&10),
             "Alice should have total quantity 10"
         );
         assert_eq!(
             results_map.get("Bob"),
-            Some(&7.0),
+            Some(&7),
             "Bob should have total quantity 7"
         );
     }
@@ -4885,26 +4894,26 @@ mod tests {
         );
 
         // Check the results
-        let mut results_map: HashMap<String, f64> = HashMap::default();
+        let mut results_map: HashMap<String, i64> = HashMap::default();
         for (row, weight) in result.changes {
             assert_eq!(weight, 1);
             assert_eq!(row.values.len(), 2); // name and total
 
-            if let (Value::Text(name), Value::Numeric(Numeric::Float(total))) =
+            if let (Value::Text(name), Value::Numeric(Numeric::Integer(total))) =
                 (&row.values[0], &row.values[1])
             {
-                results_map.insert(name.to_string(), f64::from(*total));
+                results_map.insert(name.to_string(), *total);
             }
         }
 
         assert_eq!(
             results_map.get("Alice"),
-            Some(&8.0),
+            Some(&8),
             "Alice should have total 8"
         );
         assert_eq!(
             results_map.get("Charlie"),
-            Some(&7.0),
+            Some(&7),
             "Charlie should have total 7"
         );
         assert_eq!(results_map.get("Bob"), None, "Bob should be filtered out");
@@ -5046,7 +5055,7 @@ mod tests {
             if let (
                 Value::Text(name),
                 Value::Text(product),
-                Value::Numeric(Numeric::Float(total)),
+                Value::Numeric(Numeric::Integer(total)),
             ) = (&row.values[0], &row.values[1], &row.values[2])
             {
                 let key = format!("{}-{}", name.as_ref(), product.as_ref());
@@ -5054,14 +5063,14 @@ mod tests {
 
                 match key.as_str() {
                     "Alice-Widget" => {
-                        assert_eq!(*total, 9.0, "Alice should have ordered 9 Widgets total")
+                        assert_eq!(*total, 9, "Alice should have ordered 9 Widgets total")
                     }
                     "Alice-Gadget" => {
-                        assert_eq!(*total, 3.0, "Alice should have ordered 3 Gadgets")
+                        assert_eq!(*total, 3, "Alice should have ordered 3 Gadgets")
                     }
-                    "Bob-Widget" => assert_eq!(*total, 7.0, "Bob should have ordered 7 Widgets"),
+                    "Bob-Widget" => assert_eq!(*total, 7, "Bob should have ordered 7 Widgets"),
                     "Bob-Doohickey" => {
-                        assert_eq!(*total, 2.0, "Bob should have ordered 2 Doohickeys")
+                        assert_eq!(*total, 2, "Bob should have ordered 2 Doohickeys")
                     }
                     _ => panic!("Unexpected result: {key}"),
                 }
