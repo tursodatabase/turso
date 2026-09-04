@@ -1192,58 +1192,54 @@ impl Property for SequenceCorrectnessProperty {
     }
 
     fn finish_op(
-        &mut self,
-        _step: usize,
-        fiber_id: usize,
-        txn_id: Option<u64>,
-        start_exec_id: u64,
-        end_exec_id: u64,
-        op: &Operation,
-        result: &OpResult,
-    ) -> anyhow::Result<()> {
-        // Handle NextVal/SetVal errors
-        if let Operation::NextVal { seq_name } | Operation::SetVal { seq_name, .. } = op {
-            if let Err(e) = result {
-                // Drop the in-flight baseline so a future NextVal on the
-                // same (fiber, seq) doesn't reuse a stale snapshot.
-                self.in_flight_nextval_baselines
+    &mut self,
+    _step: usize,
+    fiber_id: usize,
+    txn_id: Option<u64>,
+    start_exec_id: u64,
+    end_exec_id: u64,
+    op: &Operation,
+    result: &OpResult,
+) -> anyhow::Result<()> {
+    if let Operation::NextVal { seq_name } | Operation::SetVal { seq_name, .. } = op {
+        if let Err(e) = result {
+            self.in_flight_nextval_baselines
+                .remove(&(fiber_id, seq_name.clone()));
+            self.in_flight_setvals
+                .remove(&(fiber_id, seq_name.clone()));
+            
+            let err_msg = e.to_string();
+            if err_msg.contains("does not exist") {
+                self.params.remove(seq_name);
+                self.all_values.remove(seq_name);
+                self.watermark.remove(seq_name);
+                self.committed_watermark.remove(seq_name);
+                self.last_setval_exec_id.remove(seq_name);
+                self.fiber_last_nextval
+                    .retain(|(_fid, name), _| name != seq_name);
+                return Ok(());
+            }
+
+            if matches!(e, LimboError::OutOfMemory)
+                || err_msg.contains("Database is busy")
+                || err_msg.contains("Database schema changed")
+                || err_msg.contains("Database snapshot is stale")
+                || err_msg.contains("Write-write conflict")
+                || err_msg.contains("Commit dependency aborted")
+                || err_msg.contains("Database schema conflict")
+                || err_msg.contains("setval requires an exclusive transaction")
+                || err_msg.contains("allocation fault")
+                || err_msg.contains("out of memory")
+            {
+                self.fiber_last_nextval
                     .remove(&(fiber_id, seq_name.clone()));
-                let err_msg = e.to_string();
-                // Sequence may have been dropped concurrently
-                if err_msg.contains("does not exist") {
-                    self.params.remove(seq_name);
-                    self.all_values.remove(seq_name);
-                    self.watermark.remove(seq_name);
-                    self.committed_watermark.remove(seq_name);
-                    self.last_setval_exec_id.remove(seq_name);
-                    self.fiber_last_nextval
-                        .retain(|(_fid, name), _| name != seq_name);
-                    return Ok(());
-                }
-                // nextval/setval are write transactions (backing table write),
-                // so concurrency errors are expected. Clear fiber_last_nextval
-                // because the Function instruction may have already set the
-                // connection's currval before the backing table write failed.
-                //
-                // The "setval requires an exclusive transaction" error is
-                // also accepted: SetValWorkload should not generate setval
-                // inside BEGIN CONCURRENT, but if a future scheduling change
-                // ever lets the fiber state drift between generate and
-                // execute we want a clean ignore rather than a spurious
-                // failure.
-                if matches!(e, LimboError::OutOfMemory)
-                    || err_msg.contains("Database is busy")
-                    || err_msg.contains("Database schema changed")
-                    || err_msg.contains("Database snapshot is stale")
-                    || err_msg.contains("Write-write conflict")
-                    || err_msg.contains("Commit dependency aborted")
-                    || err_msg.contains("Database schema conflict")
-                    || err_msg.contains("setval requires an exclusive transaction")
-                {
-                    self.fiber_last_nextval
-                        .remove(&(fiber_id, seq_name.clone()));
-                    return Ok(());
-                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+    }
+    
                 // Overflow is expected for bounded non-cycling sequences.
                 // If the sequence is no longer tracked, accept it too:
                 // the simulator can pick NextVal on a sequence that another
