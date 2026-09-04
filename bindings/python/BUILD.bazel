@@ -21,6 +21,10 @@ rust_shared_library(
     deps = [":build_script", "//sdk-kit:turso_sdk_kit", "//sync/sdk-kit:turso_sync_sdk_kit"] + all_crate_deps(normal = True),
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_flags = select({
+        "@platforms//os:macos": ["-Clink-arg=-undefined", "-Clink-arg=dynamic_lookup"],
+        "//conditions:default": [],
+    }),
 )
 
 rust_test(

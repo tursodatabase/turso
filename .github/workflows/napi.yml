@@ -138,7 +138,7 @@ jobs:
         shell: bash
         run: |
           bazel build ${{ matrix.settings.bazel_target }}
-          cp "${{ matrix.settings.bazel_output }}" "${{ matrix.settings.destination }}"
+          install -m 0644 "${{ matrix.settings.bazel_output }}" "${{ matrix.settings.destination }}"
       - name: Build WASM module
         run: ${{ matrix.settings.build }}
         if: ${{ matrix.settings.target == 'wasm32-wasip1-threads' }}

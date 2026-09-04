@@ -10,6 +10,10 @@ rust_binary(
         "@connection_rusqlite_crates//:rusqlite",
     ],
     edition = "2021",
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
 )
 
 exports_files([

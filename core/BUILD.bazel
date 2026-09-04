@@ -33,7 +33,15 @@ CORE_FEATURES = [
     "uuid",
 ]
 
-CORE_ALL_FEATURES = CORE_FEATURES + ["checksum"]
+config_setting(
+    name = "checksum",
+    define_values = {"core_checksum": "true"},
+)
+
+CORE_CONFIGURED_FEATURES = CORE_FEATURES + select({
+    ":checksum": ["checksum"],
+    "//conditions:default": [],
+})
 
 cargo_toml_env_vars(
     name = "cargo_env",
@@ -47,7 +55,7 @@ cargo_build_script(
     aliases = aliases(build = True),
     build_script_env_files = [":cargo_env"],
     build_script_env = {"SOURCE_DATE_EPOCH": "0"},
-    crate_features = CORE_ALL_FEATURES,
+    crate_features = CORE_CONFIGURED_FEATURES,
     crate_root = "build.rs",
     deps = all_crate_deps(build = True),
     edition = crate_edition(),
@@ -64,7 +72,7 @@ rust_library(
         ],
     ),
     aliases = aliases(),
-    crate_features = CORE_ALL_FEATURES,
+    crate_features = CORE_CONFIGURED_FEATURES,
     crate_root = "lib.rs",
     deps = [
         ":build_script",
@@ -87,7 +95,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     crate = ":turso_core",
-    crate_features = CORE_ALL_FEATURES,
+    crate_features = CORE_CONFIGURED_FEATURES,
     deps = all_crate_deps(normal_dev = True),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     tags = ["manual"],
@@ -135,8 +143,8 @@ CORE_BENCHMARKS = {
         name = name,
         srcs = srcs,
         aliases = aliases(normal = True, normal_dev = True, proc_macro_dev = True),
-        compile_data = ["//:tpc_h_queries"],
-        crate_root = srcs[0],
+        compile_data = ["//:benchmark_sql", "//:tpc_h_queries"],
+        crate_root = "benches/sql_functions/main.rs" if name == "sql_functions" else srcs[0],
         deps = [":turso_core"] + all_crate_deps(normal = True, normal_dev = True),
         edition = crate_edition(),
         proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
@@ -150,9 +158,9 @@ CORE_BENCHMARKS = {
         name = name + "_codspeed",
         srcs = srcs,
         aliases = aliases(normal = True, normal_dev = True, proc_macro_dev = True),
-        compile_data = ["//:tpc_h_queries"],
+        compile_data = ["//:benchmark_sql", "//:tpc_h_queries"],
         crate_features = ["codspeed"],
-        crate_root = srcs[0],
+        crate_root = "benches/sql_functions/main.rs" if name == "sql_functions" else srcs[0],
         deps = [":turso_core"] + all_crate_deps(normal = True, normal_dev = True),
         edition = crate_edition(),
         proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),

@@ -13,6 +13,15 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+filegroup(
+    name = "benchmark_sql",
+    srcs = glob([
+        "perf/graph-queries/queries/*.sql",
+        "perf/tpc-ds/**/*.sql",
+    ]),
+    visibility = ["//visibility:public"],
+)
+
 platform(
     name = "wasm32_wasip1_threads",
     constraint_values = [

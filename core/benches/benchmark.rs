@@ -81,12 +81,12 @@ fn bench_open(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
+    if !std::fs::exists("testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(
             io,
-            "../testing/system/schema_5k.db",
+            "testing/system/schema_5k.db",
             Arc::new(SqliteDialect),
         )
         .unwrap();

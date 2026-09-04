@@ -155,7 +155,7 @@ jobs:
         if: matrix.name == 'in-process'
         run: bazel test //testing/concurrent-simulator:regression_tests --test_output=errors --lockfile_mode=error
       - name: Build whopper
-        run: bazel build //testing/concurrent-simulator:turso_whopper --lockfile_mode=error
+        run: bazel build //testing/concurrent-simulator:turso_whopper --define=core_checksum=true --lockfile_mode=error
       - name: Run whopper
         env:
           WHOPPER_ARGS: ${{ matrix.args }}
