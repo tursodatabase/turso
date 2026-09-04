@@ -1,0 +1,106 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT left_row.id, null_range_middle.key, right_row.id
+        FROM null_range_left AS left_row
+        FULL JOIN null_range_middle ON true
+        FULL JOIN null_range_left AS right_row INDEXED BY null_range_left_value
+          ON null_range_middle.key<=right_row.value;
+info:
+  statement_type: SELECT
+  tables:
+  - null_range_left
+  - null_range_middle
+  - null_range_middle.key
+  setup_blocks:
+  - full_join_null_range_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN null_range_left AS left_row
+|--SCAN null_range_middle LEFT-JOIN
+|--SEARCH right_row USING INDEX null_range_left_value (value>=?) LEFT-JOIN
+|--RIGHT-JOIN null_range_middle
+|  `--SCAN null_range_middle
+`--RIGHT-JOIN right_row
+   `--SCAN null_range_left AS right_row USING INDEX null_range_left_value
+
+BYTECODE
+addr  opcode                      p1  p2  p3  p4        p5  comment
+   0          Init                 0  74   0             0  Start at 74
+   1          OpenRead             0   2   0  k(2,B,B)   0  table=null_range_left, root=2, iDb=0
+   2          OpenRead             2   4   0  k(2,B)     0  table=null_range_middle, root=4, iDb=0
+   3          OpenRead             4   2   0  k(2,B,B)   0  table=null_range_left, root=2, iDb=0
+   4          OpenRead             5   3   0  k(2,B)     0  index=null_range_left_value, root=3, iDb=0
+   5          Null                 0   6   0             0  r[6]=NULL
+   6          OpenEphemeral        1   0   0             0  cursor=1 is_table=false
+   7          Null                 0   9   0             0  r[9]=NULL
+   8          OpenEphemeral        3   0   0             0  cursor=3 is_table=false
+   9          Rewind               0  53   0             0  Rewind table null_range_left
+  10            Integer            0   4   0             0  r[4]=0
+  11            Rewind             2  48   0             0  Rewind table null_range_middle
+  12              IfNot           10  46   1             0  if !r[10] goto 46
+  13              RowId            2   5   0             0  r[5]=null_range_middle.rowid
+  14              Found            1  18   5             0  if found goto 18
+  15              MakeRecord       5   1  11             0  r[11]=mkrec(r[5..5])
+  16              IdxInsert        1  11   5             0  key=r[11]
+  17              FilterAdd        1   5   1             0  bloom_filter_add(r[5..6])
+  18              Integer          1   4   0             0  r[4]=1
+  19              BeginSubrtn      6   0   0             0  r[6]=NULL
+  20              Integer          0   7   0             0  r[7]=0
+  21              Column           2   0  12             0  r[12]=null_range_middle.key
+  22              RealAffinity    12   0   0             0
+  23              IsNull          12  41   0             0  if (r[12]==NULL) goto 41
+  24              Affinity        12   1   0             0  r[12..13] = C
+  25              SeekGE           5  41  12             0  key=[12..12]
+  26                DeferredSeek   5   4   0             0
+  27                RowId          4   8   0             0  r[8]=null_range_left.rowid
+  28                Found          3  32   8             0  if found goto 32
+  29                MakeRecord     8   1  13             0  r[13]=mkrec(r[8..8])
+  30                IdxInsert      3  13   8             0  key=r[13]
+  31                FilterAdd      3   8   1             0  bloom_filter_add(r[8..9])
+  32                Integer        1   7   0             0  r[7]=1
+  33                BeginSubrtn    9   0   0             0  r[9]=NULL
+  34                RowId          0   1   0             0  r[1]=null_range_left.rowid
+  35                Column         2   0   2             0  r[2]=null_range_middle.key
+  36                RealAffinity   2   0   0             0
+  37                RowId          4   3   0             0  r[3]=null_range_left.rowid
+  38                ResultRow      1   3   0             0  output=r[1..3]
+  39              Return           9   0   1             0
+  40            Next               5  26   0             0
+  41          Return               9   0   1             0
+  42          IfPos                7  46   0             0  r[7]>0 -> r[7]-=0, goto 46
+  43          NullRow              4   0   0             0  Set cursor 4 to a (pseudo) NULL row
+  44          NullRow              5   0   0             0  Set cursor 5 to a (pseudo) NULL row
+  45          Goto                 0  32   0             0
+  46        Return                 6   0   1             0
+  47      Next                     2  12   0             1
+  48    Return                     6   0   1             0
+  49    IfPos                      4  52   0             0  r[4]>0 -> r[4]-=0, goto 52
+  50    NullRow                    2   0   0             0  Set cursor 2 to a (pseudo) NULL row
+  51    Goto                       0  18   0             0
+  52  Next                         0  10   0             1
+  53  NullRow                      0   0   0             0  Set cursor 0 to a (pseudo) NULL row
+  54  OpenRead                     2   4   0  k(2,B)     0  table=null_range_middle, root=4, iDb=0
+  55  Rewind                       2  61   0             0  Rewind table null_range_middle
+  56    RowId                      2   5   0             0  r[5]=null_range_middle.rowid
+  57    Filter                     1  59   5             1  if !bloom_filter(r[5..6]) goto 59
+  58    Found                      1  60   5             0  if found goto 60
+  59    Gosub                      6  20   0             0
+  60  Next                         2  56   0             1
+  61  NullRow                      0   0   0             0  Set cursor 0 to a (pseudo) NULL row
+  62  NullRow                      2   0   0             0  Set cursor 2 to a (pseudo) NULL row
+  63  NullRow                      5   0   0             0  Set cursor 5 to a (pseudo) NULL row
+  64  OpenRead                     4   2   0  k(2,B,B)   0  table=null_range_left, root=2, iDb=0
+  65  OpenRead                     6   3   0  k(2,B)     0  index=null_range_left_value, root=3, iDb=0
+  66  Rewind                       6  73   0             0  Rewind index null_range_left_value
+  67    DeferredSeek               6   4   0             0
+  68    IdxRowId                   6   8   0             0  r[8]=cursor 6 for index null_range_left_value.rowid
+  69    Filter                     3  71   8             1  if !bloom_filter(r[8..9]) goto 71
+  70    Found                      3  72   8             0  if found goto 72
+  71    Gosub                      9  34   0             0
+  72  Next                         6  67   0             1
+  73  Halt                         0   0   0             0
+  74  Transaction                  0   1   3             0  iDb=0 tx_mode=Read
+  75  Integer                      1  10   0             0  r[10]=1
+  76  Goto                         0   1   0             0
