@@ -7,7 +7,7 @@
 use crate::Schema;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::functions::{FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
+use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
 use crate::trace::StmtKind;
 
 /// Runtime policy controlling generation weights and limits.
@@ -2102,8 +2102,10 @@ impl Default for CompoundOpWeights {
 /// Configuration for function call generation.
 #[derive(Debug, Clone)]
 pub struct FunctionConfig {
-    /// Available functions with their weights. Functions with weight 0 are disabled.
+    /// Available scalar functions with their weights. A weight of 0 disables a function.
     pub function_weights: Vec<(&'static FunctionDef, u32)>,
+    /// Available aggregate functions with their weights.
+    pub aggregate_function_weights: Vec<(&'static FunctionDef, u32)>,
     /// Whether to only use deterministic functions.
     pub deterministic_only: bool,
     /// Category weights for selecting function categories.
@@ -2125,6 +2127,7 @@ impl Default for FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -2146,6 +2149,7 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -2165,6 +2169,7 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -2186,6 +2191,7 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: true,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -2198,12 +2204,22 @@ impl FunctionConfig {
                 *w = 0;
             }
         }
+        for (f, w) in &mut self.aggregate_function_weights {
+            if names.contains(&f.name) {
+                *w = 0;
+            }
+        }
         self
     }
 
     /// Enable all functions in a category (sets their weight to 10).
     pub fn enable_category(mut self, category: FunctionCategory) -> Self {
         for (f, w) in &mut self.function_weights {
+            if f.category == category {
+                *w = 10;
+            }
+        }
+        for (f, w) in &mut self.aggregate_function_weights {
             if f.category == category {
                 *w = 10;
             }
@@ -2233,6 +2249,50 @@ impl FunctionConfig {
 
         Ok(eligible[idx].0)
     }
+
+    /// Select an aggregate function based on weights.
+    pub fn select_aggregate_function(
+        &self,
+        ctx: &mut Context,
+    ) -> Result<&'static FunctionDef, GenError> {
+        let available: Vec<_> = self
+            .aggregate_function_weights
+            .iter()
+            .filter(|(function, weight)| {
+                *weight > 0 && (!self.deterministic_only || function.is_deterministic)
+            })
+            .collect();
+
+        if available.is_empty() {
+            return Err(GenError::exhausted(
+                "aggregate_function_call",
+                "no aggregate functions configured or all have zero weight",
+            ));
+        }
+
+        let weights: Vec<u32> = available.iter().map(|(_, weight)| *weight).collect();
+        let index = ctx.weighted_index(&weights).ok_or_else(|| {
+            GenError::exhausted("aggregate_function_call", "all functions have zero weight")
+        })?;
+
+        Ok(available[index].0)
+    }
+}
+
+/// Give each SQLite aggregate the same starting weight. Array aggregates stay
+/// disabled because SQLite does not support them.
+fn default_aggregate_function_weights() -> Vec<(&'static FunctionDef, u32)> {
+    AGGREGATE_FUNCTIONS
+        .iter()
+        .map(|function| {
+            let weight = if function.category == FunctionCategory::Array {
+                0
+            } else {
+                10
+            };
+            (function, weight)
+        })
+        .collect()
 }
 
 /// Weights for function categories.
