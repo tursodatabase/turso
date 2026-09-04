@@ -1,0 +1,21 @@
+diff --git a/src/wasi.rs b/src/wasi.rs
+index 8ca5bfd..a524a70 100644
+--- a/src/wasi.rs
++++ b/src/wasi.rs
+@@ -30,14 +30,14 @@ pub fn setup() {
+       |p| {
+         p.join("lib")
+           .join("rustlib")
+-          .join(target)
++          .join(&target)
+           .join("lib")
+           .join("self-contained")
+           .join("crt1-reactor.o")
+       },
+     );
+   if crt_reactor_path.exists() {
+-    println!("cargo:rustc-link-arg={}", crt_reactor_path.display());
++    println!("cargo:rustc-link-arg=external/rules_rust++rust+rust_linux_x86_64__wasm32-wasip1-threads__stable_tools/lib/rustlib/{target}/lib/self-contained/crt1-reactor.o");
+     println!("cargo:rustc-link-arg=--export=_initialize");
+   } else {
+     println!(

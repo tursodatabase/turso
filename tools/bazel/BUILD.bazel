@@ -7,4 +7,8 @@ sh_test(
     data = ["run_rust_tests.sh"],
 )
 
-exports_files(["run_rust_tests.sh"])
+exports_files([
+    "napi_build_wasi_link.patch",
+    "rules_rust_wasip1_threads.patch",
+    "run_rust_tests.sh",
+])

@@ -124,6 +124,8 @@ jobs:
 
       - name: Run benchmark
         uses: CodSpeedHQ/action@v4.17.0
+        env:
+          CODSPEED_CARGO_WORKSPACE_ROOT: ${{ github.workspace }}
         with:
           mode: simulation
           run: "./${{ matrix.benchmark.binary }}"

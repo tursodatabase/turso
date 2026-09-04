@@ -10,9 +10,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   sqltest-check:
     name: Check .sqltest syntax
@@ -20,15 +17,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
-        with:
-          prefix-key: "v1-rust"
+      - uses: ./.github/actions/setup-bazel
       - name: Build test runner
-        run: make -C sqlite/conformance build-runner
+        run: bazel build //testing/sqltest:sqltest
       - name: Check test syntax
-        run: make -C sqlite/conformance check
+        working-directory: sqlite/conformance
+        run: |
+          ../../bazel-bin/testing/sqltest/sqltest check sqlite-sqltests
+          ../../bazel-bin/testing/sqltest/sqltest check turso-sqltests
       - name: Check pg test syntax
-        run: make -C postgres/conformance check
+        working-directory: postgres/conformance
+        run: ../../bazel-bin/testing/sqltest/sqltest check pg-sqltests
 
   sqltest-run-cli:
     name: Run SQL tests (CLI backend)
@@ -36,18 +35,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
-        with:
-          prefix-key: "v1-rust"
+      - uses: ./.github/actions/setup-bazel
       - uses: "./.github/shared/install_sqlite"
-      - name: Build tursodb
-        run: make -C sqlite/conformance build-tursodb
-      - name: Build test runner
-        run: make -C sqlite/conformance build-runner
+      - name: Build CLI and test runner
+        run: bazel build //cli:tursodb //testing/sqltest:sqltest
       - name: Run tests
-        run: make -C sqlite/conformance run-cli CROSS_CHECK_BINARY=sqlite3
+        working-directory: sqlite/conformance
+        run: |
+          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --timeout 600 --backend cli --binary ../../bazel-bin/cli/tursodb --cross-check-binary sqlite3
+          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend cli --binary ../../bazel-bin/cli/tursodb --cross-check-binary sqlite3
       - name: Run tests (MVCC)
-        run: make -C sqlite/conformance run-cli MVCC=1
+        working-directory: sqlite/conformance
+        run: |
+          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --timeout 600 --backend cli --binary ../../bazel-bin/cli/tursodb --mvcc
+          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend cli --binary ../../bazel-bin/cli/tursodb --mvcc
 
   sqltest-run-rust:
     name: Run SQL tests (Rust backend)
@@ -55,15 +56,19 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
-        with:
-          prefix-key: "v1-rust"
+      - uses: ./.github/actions/setup-bazel
       - name: Build test runner
-        run: make -C sqlite/conformance build-runner
+        run: bazel build //testing/sqltest:sqltest
       - name: Run tests
-        run: make -C sqlite/conformance run-rust
+        working-directory: sqlite/conformance
+        run: |
+          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --backend rust
+          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend rust
       - name: Run tests (MVCC)
-        run: make -C sqlite/conformance run-rust MVCC=1
+        working-directory: sqlite/conformance
+        run: |
+          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --backend rust --mvcc
+          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend rust --mvcc
 
   sqltest-run-js:
     name: Run SQL tests (JS backend)
@@ -74,9 +79,7 @@ jobs:
         working-directory: bindings/javascript
     steps:
       - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
-        with:
-          prefix-key: "v1-rust"
+      - uses: ./.github/actions/setup-bazel
       - name: Setup node
         uses: useblacksmith/setup-node@v5
         with:
@@ -86,18 +89,22 @@ jobs:
       - name: Build common package
         run: yarn workspace @tursodatabase/database-common build
       - name: Build native bindings
-        run: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
+        working-directory: .
+        run: |
+          bazel build //bindings/javascript:turso_node_cdylib //testing/sqltest:sqltest
+          cp bazel-bin/bindings/javascript/libturso_node.so bindings/javascript/packages/native/turso.linux-x64-gnu.node
       - name: Build TypeScript
         run: yarn workspace @tursodatabase/database tsc-build
-      - name: Build test runner
-        working-directory: sqlite/conformance
-        run: make build-runner
       - name: Run tests
         working-directory: sqlite/conformance
-        run: make run-js
+        run: |
+          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --backend js
+          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend js
       - name: Run tests (MVCC)
         working-directory: sqlite/conformance
-        run: make run-js MVCC=1
+        run: |
+          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --backend js --mvcc
+          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend js --mvcc
 
   sqltest-run-pg:
     name: Run SQL tests (pg backend)
@@ -105,15 +112,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
-        with:
-          prefix-key: "v1-rust"
-      - name: Build tursopg
-        run: make -C postgres/conformance build-tursopg
-      - name: Build test runner
-        run: make -C postgres/conformance build-runner
+      - uses: ./.github/actions/setup-bazel
+      - name: Build tursopg and test runner
+        run: bazel build //postgres/cli:tursopg //testing/sqltest:sqltest
       - name: Run tests
-        run: make -C postgres/conformance run
+        working-directory: postgres/conformance
+        run: ../../bazel-bin/testing/sqltest/sqltest run pg-sqltests --timeout 600 --backend pg --binary ../../bazel-bin/postgres/cli/tursopg
 
   sqltest-sqlite:
     name: Run SQL tests (SQLite)
@@ -121,11 +125,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
-        with:
-          prefix-key: "v1-rust"
+      - uses: ./.github/actions/setup-bazel
       - uses: "./.github/shared/install_sqlite"
       - name: Build test runner
-        run: make -C sqlite/conformance build-runner
+        run: bazel build //testing/sqltest:sqltest
       - name: Run tests against SQLite
-        run: make -C sqlite/conformance test-sqlite
+        working-directory: sqlite/conformance
+        run: ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --timeout 600 --backend cli --binary ../../.sqlite3/sqlite3

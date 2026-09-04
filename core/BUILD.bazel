@@ -64,33 +64,7 @@ rust_library(
         ],
     ),
     aliases = aliases(),
-    crate_features = CORE_FEATURES,
-    crate_root = "lib.rs",
-    deps = [
-        ":build_script",
-        "//extensions/core:turso_ext",
-        "//sqlite/parser:turso_parser",
-        "@crates//:stacker",
-    ] + all_crate_deps(normal = True),
-    edition = crate_edition(),
-    proc_macro_deps = [
-        "//macros:turso_macros",
-    ] + all_crate_deps(proc_macro = True),
-    visibility = ["//visibility:public"],
-)
-
-rust_library(
-    name = "turso_core_checksum",
-    srcs = glob(
-        ["**/*.rs"],
-        exclude = [
-            "benches/**/*.rs",
-            "build.rs",
-        ],
-    ),
-    aliases = aliases(),
     crate_features = CORE_ALL_FEATURES,
-    crate_name = "turso_core",
     crate_root = "lib.rs",
     deps = [
         ":build_script",
@@ -102,6 +76,7 @@ rust_library(
     proc_macro_deps = [
         "//macros:turso_macros",
     ] + all_crate_deps(proc_macro = True),
+    rustc_flags = ["--allow=unstable-name-collisions"],
     visibility = ["//visibility:public"],
 )
 
@@ -129,6 +104,7 @@ sh_test(
 )
 
 CORE_BENCHMARKS = {
+    "alloc_collections": ["benches/alloc_collections.rs"],
     "benchmark": ["benches/benchmark.rs"],
     "count_benchmark": ["benches/count_benchmark.rs"],
     "create_index_benchmark": ["benches/create_index_benchmark.rs"],

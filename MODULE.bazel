@@ -1,11 +1,20 @@
 module(name = "turso")
 
+bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_rust", version = "0.74.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
+
+single_version_override(
+    module_name = "rules_rust",
+    patch_strip = 1,
+    patches = ["//tools/bazel:rules_rust_wasip1_threads.patch"],
+    version = "0.74.0",
+)
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2021",
+    extra_target_triples = ["wasm32-wasip1-threads"],
     versions = [
         "1.88.0",
         "nightly/2025-12-17",
@@ -63,6 +72,20 @@ crate.annotation(
 crate.annotation(
     crate = "napi-sys",
     crate_features = ["dyn-symbols"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "napi-build",
+    patch_args = ["-p1"],
+    patches = ["//tools/bazel:napi_build_wasi_link.patch"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "pyo3-ffi",
+    build_script_env = {
+        "PYO3_BUILD_EXTENSION_MODULE": "1",
+        "PYO3_NO_PYTHON": "1",
+    },
     repositories = ["crates"],
 )
 crate.annotation(

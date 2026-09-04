@@ -4,7 +4,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 WHOPPER_FEATURES = ["checksum"]
 
 WHOPPER_DEPS = [
-    "//core:turso_core_checksum",
+    "//core:turso_core",
     "//sql_generation:sql_generation",
     "//sqlite/parser:turso_parser",
     "@crates//:twox-hash",

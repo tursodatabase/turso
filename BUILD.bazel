@@ -10,4 +10,14 @@ exports_files([
 filegroup(
     name = "tpc_h_queries",
     srcs = glob(["perf/tpc-h/queries/*.sql"]),
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "wasm32_wasip1_threads",
+    constraint_values = [
+        "@platforms//cpu:wasm32",
+        "@platforms//os:wasi",
+        "@rules_rust//rust/platform:wasi_preview_1",
+    ],
 )

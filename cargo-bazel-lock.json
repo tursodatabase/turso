@@ -1,5 +1,5 @@
 {
-  "checksum": "ab4d05a316214f653fa4befe954802deb523f51866a7e44f0f05e8e3350af550",
+  "checksum": "e268f95dbb85d46e0f2c55a0ea941bc0d92dd9ae47bf16716294f61f4125a069",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -18299,6 +18299,12 @@
       "package_url": "https://github.com/napi-rs/napi-rs",
       "repository": {
         "Http": {
+          "patch_args": [
+            "-p1"
+          ],
+          "patches": [
+            "@@//tools/bazel:napi_build_wasi_link.patch"
+          ],
           "sha256": "d376940fd5b723c6893cd1ee3f33abbfd86acb1cd1ec079f3ab04a2a3bc4d3b1",
           "url": "https://static.crates.io/crates/napi-build/2.3.1/download"
         }
@@ -22355,6 +22361,10 @@
     },
     "pyo3-ffi 0.29.0": {
       "build_script_attrs": {
+        "build_script_env": {
+          "PYO3_BUILD_EXTENSION_MODULE": "1",
+          "PYO3_NO_PYTHON": "1"
+        },
         "deps": [
           {
             "id": "pyo3-build-config 0.29.0",

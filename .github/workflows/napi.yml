@@ -13,8 +13,6 @@ env:
   DEBUG: napi:*
   APP_NAME: turso
   MACOSX_DEPLOYMENT_TARGET: "10.13"
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
@@ -82,37 +80,31 @@ jobs:
             bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
             bazel_output: bazel-bin/bindings/javascript/sync/libturso_sync_js.so
             destination: bindings/javascript/sync/packages/native/sync.linux-arm64-gnu.node
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: wasm32-wasip1-threads
             artifact: db-bindings-wasm32-wasip1-threads
-            setup: |
-              rustup target add wasm32-wasip1-threads
-              wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-              tar -xvf wasi-sdk-25.0-x86_64-linux.tar.gz
+            bazel_target: //bindings/javascript:turso_node_wasm
+            bazel_output: bazel-bin/bindings/javascript/turso_node.wasm
+            destination: bindings/javascript/packages/wasm/turso.wasm32-wasi.wasm
             build: |
-              export WASI_SDK_PATH="$(pwd)/wasi-sdk-25.0-x86_64-linux"
-              export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
-              export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
-              export TARGET_CFLAGS="$TARGET_CXXFLAGS"
-              yarn workspace @tursodatabase/database-common build
-              yarn workspace @tursodatabase/database-wasm-common build
-              yarn workspace @tursodatabase/database-wasm build
-          - host: ubuntu-latest
+              bazel build --platforms=//:wasm32_wasip1_threads //bindings/javascript:turso_node_wasm
+              install -m 0644 bazel-bin/bindings/javascript/turso_node.wasm bindings/javascript/packages/wasm/turso.wasm32-wasi.wasm
+              cd bindings/javascript
+              npm run build --workspace=packages/wasm-common
+              npm run tsc-build --workspace=packages/wasm
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: wasm32-wasip1-threads
             artifact: sync-bindings-wasm32-wasip1-threads
-            setup: |
-              rustup target add wasm32-wasip1-threads
-              wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-              tar -xvf wasi-sdk-25.0-x86_64-linux.tar.gz
+            bazel_target: //bindings/javascript/sync:turso_sync_js_wasm
+            bazel_output: bazel-bin/bindings/javascript/sync/turso_sync_js.wasm
+            destination: bindings/javascript/sync/packages/wasm/sync.wasm32-wasi.wasm
             build: |
-              export WASI_SDK_PATH="$(pwd)/wasi-sdk-25.0-x86_64-linux"
-              export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
-              export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
-              export TARGET_CFLAGS="$TARGET_CXXFLAGS"
-              yarn workspace @tursodatabase/database-common build
-              yarn workspace @tursodatabase/database-wasm-common build
-              yarn workspace @tursodatabase/sync-common build
-              yarn workspace @tursodatabase/sync-wasm build
+              bazel build --platforms=//:wasm32_wasip1_threads //bindings/javascript/sync:turso_sync_js_wasm
+              install -m 0644 bazel-bin/bindings/javascript/sync/turso_sync_js.wasm bindings/javascript/sync/packages/wasm/sync.wasm32-wasi.wasm
+              cd bindings/javascript
+              npm run build --workspace=packages/wasm-common
+              npm run build --workspace=sync/packages/common
+              npm run tsc-build --workspace=sync/packages/wasm
     name: ${{ matrix.settings.artifact }} - node@24
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -121,27 +113,7 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: 24
-      - name: Install Rust for WASM build
-        uses: dtolnay/rust-toolchain@stable
-        if: ${{ matrix.settings.target == 'wasm32-wasip1-threads' }}
-        with:
-          toolchain: stable
-          targets: ${{ matrix.settings.target }}
-      - name: Cache cargo
-        uses: actions/cache@v4
-        if: ${{ matrix.settings.target == 'wasm32-wasip1-threads' }}
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            .cargo-cache
-            target/
-          key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-
       - uses: ./.github/actions/setup-bazel
-        if: ${{ matrix.settings.bazel_target }}
       - uses: mlugg/setup-zig@v2
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' || matrix.settings.target == 'armv7-unknown-linux-musleabihf' }}
         with:
@@ -161,7 +133,7 @@ jobs:
           node-version: 24
           architecture: x64
       - name: Build native module
-        if: ${{ matrix.settings.bazel_target }}
+        if: ${{ matrix.settings.target != 'wasm32-wasip1-threads' }}
         working-directory: .
         shell: bash
         run: |
@@ -170,6 +142,7 @@ jobs:
       - name: Build WASM module
         run: ${{ matrix.settings.build }}
         if: ${{ matrix.settings.target == 'wasm32-wasip1-threads' }}
+        working-directory: .
         shell: bash
       # The release profile keeps debug info, which on Linux is embedded in the
       # .node file itself (~80% of its size). macOS and Windows keep debug info

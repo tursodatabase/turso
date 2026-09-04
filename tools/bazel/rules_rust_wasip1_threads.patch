@@ -1,0 +1,11 @@
+diff --git a/rust/platform/triple_mappings.bzl b/rust/platform/triple_mappings.bzl
+index f26ed01..f6cb861 100644
+--- a/rust/platform/triple_mappings.bzl
++++ b/rust/platform/triple_mappings.bzl
+@@ -303,5 +303,6 @@ _SYSTEM_TO_STDLIB_LINKFLAGS = {
+     "openbsd": ["-lpthread"],
+     "solaris": ["-lsocket", "-lposix4", "-lpthread", "-lresolv"],
++    "threads": [],
+     "uefi": [],
+     "unknown": [],
+     "uwp": ["ws2_32.lib"],
