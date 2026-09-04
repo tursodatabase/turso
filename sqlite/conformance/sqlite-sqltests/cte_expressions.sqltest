@@ -639,3 +639,30 @@ test cte-schema-qualified-reference-bypasses-inner-shadow {
 expect {
     1
 }
+
+test cte-referenced-in-lhs-of-in-select-loud {
+    CREATE TABLE t_in(x INTEGER);
+    INSERT INTO t_in(x) VALUES (100);
+
+    WITH a AS (SELECT 1 AS v),
+         b AS (SELECT 42 AS w FROM t_in WHERE (SELECT v FROM a) IN (SELECT 1))
+    SELECT * FROM b;
+}
+expect {
+    42
+}
+
+test cte-referenced-in-lhs-of-in-select-shadowed {
+    CREATE TABLE t_shadow(x INTEGER);
+    INSERT INTO t_shadow(x) VALUES (100);
+    CREATE TABLE a_shadow(v INTEGER);
+    INSERT INTO a_shadow(v) VALUES (9);
+
+    WITH a_shadow AS (SELECT 1 AS v),
+         b AS (SELECT 42 AS w FROM t_shadow WHERE (SELECT v FROM a_shadow) IN (SELECT 1))
+    SELECT * FROM b;
+}
+expect {
+    42
+}
+

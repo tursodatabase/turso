@@ -478,7 +478,9 @@ fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
             }
             Expr::InSelect { rhs, .. } => {
                 collect_from_clause_table_refs(rhs, out);
-                Ok(WalkControl::SkipChildren)
+                // The walker does not descend into the subquery, only the
+                // left-hand side expression.
+                Ok(WalkControl::Continue)
             }
             _ => Ok(WalkControl::Continue),
         }
