@@ -40,3 +40,115 @@ expect {
     2|first-two|second-two
     3||
 }
+
+# SQLite keeps each inner table name after it turns the join group into one
+# derived table. The outer query can use those names.
+@cross-check-integrity
+test parenthesized-join-keeps-qualified-source-columns {
+    CREATE TABLE named_anchor(marker INTEGER);
+    CREATE TABLE named_left(id INTEGER, left_value TEXT);
+    CREATE TABLE named_right(id INTEGER, right_value TEXT);
+    INSERT INTO named_anchor VALUES(1);
+    INSERT INTO named_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO named_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT id, named_left.id, named_right.id,
+           named_left.*, named_right.*
+      FROM named_anchor
+      JOIN (named_left LEFT JOIN named_right USING(id))
+     ORDER BY id;
+}
+expect {
+    1|1||1|left-one||
+    2|2|2|2|left-two|2|right-two
+}
+
+# SQLite keeps duplicate derived-table names with numeric suffixes. The group
+# alias can use these names, but an unqualified star omits the extra copies.
+@cross-check-integrity
+test parenthesized-join-keeps-hidden-columns-under-group-alias {
+    CREATE TABLE alias_anchor(marker INTEGER);
+    CREATE TABLE alias_left(id INTEGER, left_value TEXT);
+    CREATE TABLE alias_right(id INTEGER, right_value TEXT);
+    INSERT INTO alias_anchor VALUES(1);
+    INSERT INTO alias_left VALUES(2,'left-two');
+    INSERT INTO alias_right VALUES(2,'right-two');
+
+    SELECT joined.id, joined."id:1", joined."id:2",
+           joined.left_value, joined.right_value
+      FROM alias_anchor
+      JOIN (alias_left JOIN alias_right USING(id)) AS joined;
+}
+expect {
+    2|2|2|left-two|right-two
+}
+
+# The generated parenthesized result keeps the implicit rowids from its source
+# tables. Qualified rowid names can still read them.
+@cross-check-integrity
+test parenthesized-join-keeps-qualified-rowids {
+    CREATE TABLE rowid_anchor(marker INTEGER);
+    CREATE TABLE rowid_left(id INTEGER);
+    CREATE TABLE rowid_right(id INTEGER);
+    INSERT INTO rowid_anchor VALUES(1);
+    INSERT INTO rowid_left VALUES(1),(2);
+    INSERT INTO rowid_right VALUES(2),(3);
+
+    SELECT rowid_left.rowid, rowid_left._rowid_, rowid_right.oid
+      FROM rowid_anchor
+      JOIN (rowid_left LEFT JOIN rowid_right USING(id))
+     ORDER BY id;
+}
+expect {
+    1|1|
+    2|2|1
+}
+
+# This is SQLite join7-1.70. A qualified star reaches through the generated
+# parenthesized result without exposing its generated table name.
+@cross-check-integrity
+test table-star-reaches-through-parenthesized-join {
+    CREATE TABLE star_left(a INTEGER, b INTEGER);
+    INSERT INTO star_left VALUES(1,2),(1,3),(1,4);
+    CREATE TABLE star_right(c INTEGER, d INTEGER);
+    INSERT INTO star_right VALUES(3,33),(4,44),(5,55);
+    CREATE VIEW star_dual(dummy) AS VALUES('x');
+
+    SELECT star_left.*, star_right.*
+      FROM star_right
+      LEFT JOIN (star_dual JOIN star_left ON true)
+        ON b=c
+     ORDER BY +b;
+}
+expect {
+    ||5|55
+    1|3|3|33
+    1|4|4|44
+}
+
+# Each parenthesized group must pass its source names to the outer group.
+@cross-check-integrity
+test qualified-columns-pass-through-several-parenthesized-joins {
+    CREATE TABLE deep_t1(a INTEGER);
+    CREATE TABLE deep_t2(a INTEGER);
+    CREATE TABLE deep_t3(a INTEGER);
+    CREATE TABLE deep_t4(a INTEGER);
+    CREATE TABLE deep_t5(a INTEGER);
+    INSERT INTO deep_t1 VALUES(1);
+    INSERT INTO deep_t2 VALUES(1);
+    INSERT INTO deep_t3 VALUES(1);
+    INSERT INTO deep_t4 VALUES(1);
+    INSERT INTO deep_t5 VALUES(1);
+
+    SELECT a, deep_t1.a, deep_t2.a, deep_t3.a, deep_t4.a, deep_t5.a
+      FROM deep_t1 INNER JOIN (
+           deep_t2 INNER JOIN (
+           deep_t3 INNER JOIN (
+           deep_t4 INNER JOIN deep_t5 USING(a)
+           ) USING(a)
+           ) USING(a)
+           ) USING(a);
+}
+expect {
+    1|1|1|1|1|1
+}

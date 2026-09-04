@@ -3,7 +3,7 @@ use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
     Operation, OuterQueryReference, QueryDestination, Search, TableReferences, Window,
 };
-use crate::schema::Table;
+use crate::schema::{ParenthesizedJoinColumnSource, Table};
 use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -346,14 +346,32 @@ fn prepare_one_select_plan(
                         ResultColumn::Star => table_references
                             .joined_tables()
                             .iter()
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
+                            .map(|table| {
+                                table
+                                    .columns()
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(column_index, _)| {
+                                        !table.column_is_hidden_from_star(*column_index)
+                                    })
+                                    .count()
+                            })
                             .sum(),
                         // Guess 5 columns if we can't find the table using the identifier (maybe it's in [brackets] or `tick_quotes`, or miXeDcAse)
                         ResultColumn::TableStar(n) => table_references
                             .joined_tables()
                             .iter()
                             .find(|t| t.identifier == n.as_str())
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
+                            .map(|table| {
+                                table
+                                    .columns()
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(column_index, _)| {
+                                        !table.column_is_hidden_from_star(*column_index)
+                                    })
+                                    .count()
+                            })
                             .unwrap_or(5),
                         // Otherwise allocate space for 1 column
                         ResultColumn::Expr(_, _) => 1,
@@ -504,8 +522,7 @@ fn prepare_one_select_plan(
                             )?;
                             for table in plan.table_references.joined_tables_mut() {
                                 for idx in 0..table.columns().len() {
-                                    let column = &table.columns()[idx];
-                                    if column.hidden() {
+                                    if table.column_is_hidden_from_star(idx) {
                                         continue;
                                     }
                                     table.mark_column_used(idx);
@@ -542,20 +559,52 @@ fn prepare_one_select_plan(
                                     col_name
                                 );
                             }
-                            let referenced_table = plan
-                                .table_references
-                                .joined_tables_mut()
-                                .iter_mut()
-                                .find(|t| t.identifier == name_normalized);
+                            let mut matching_columns = Vec::new();
+                            for (table_index, table) in
+                                plan.table_references.joined_tables().iter().enumerate()
+                            {
+                                if let Table::FromClauseSubquery(subquery) = &table.table {
+                                    if let Some(join_columns) = &subquery.parenthesized_join_columns
+                                    {
+                                        for (column_index, data) in join_columns.iter().enumerate()
+                                        {
+                                            let ParenthesizedJoinColumnSource::Table {
+                                                table_name,
+                                                ..
+                                            } = &data.source
+                                            else {
+                                                continue;
+                                            };
+                                            if table_name.eq_ignore_ascii_case(&name_normalized) {
+                                                matching_columns.push((table_index, column_index));
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                                if table.identifier == name_normalized {
+                                    matching_columns.extend(
+                                        table
+                                            .columns()
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(column_index, _)| {
+                                                !table.column_is_hidden_from_star(*column_index)
+                                            })
+                                            .map(|(column_index, _)| (table_index, column_index)),
+                                    );
+                                }
+                            }
 
-                            if referenced_table.is_none() {
+                            if matching_columns.is_empty() {
                                 crate::bail_parse_error!("no such table: {}", name.as_str());
                             }
-                            let table = referenced_table.unwrap();
-                            let num_columns = table.columns().len();
-                            for idx in 0..num_columns {
-                                let column = &table.columns()[idx];
-                                if column.hidden() {
+                            let mut used_columns = Vec::new();
+                            for (table_index, column_index) in matching_columns {
+                                let table = &plan.table_references.joined_tables()[table_index];
+                                let column = &table.columns()[column_index];
+                                if column.name.is_none() {
+                                    // Star output and later USING lookups both require a column name.
                                     continue;
                                 }
                                 let alias = column.name.as_ref().map(|col_name| {
@@ -569,14 +618,18 @@ fn prepare_one_select_plan(
                                     expr: ast::Expr::Column {
                                         database: None, // TODO: support different databases
                                         table: table.internal_id,
-                                        column: idx,
+                                        column: column_index,
                                         is_rowid_alias: column.is_rowid_alias(),
                                     },
                                     alias,
                                     implicit_column_name: None,
                                     contains_aggregates: false,
                                 });
-                                table.mark_column_used(idx);
+                                used_columns.push((table.internal_id, column_index));
+                            }
+                            for (table_id, column_index) in used_columns {
+                                plan.table_references
+                                    .mark_column_used(table_id, column_index);
                             }
                         }
                         ResultColumn::Expr(mut expr, maybe_alias) => {

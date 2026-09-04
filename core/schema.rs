@@ -2751,6 +2751,7 @@ impl TryClone for FromClauseSubquery {
             name: self.name.clone(),
             plan: self.plan.clone(),
             columns: self.columns.try_clone()?,
+            parenthesized_join_columns: self.parenthesized_join_columns.clone(),
             result_columns_start_reg: self.result_columns_start_reg,
             materialized_cursor_id: self.materialized_cursor_id,
             cte: self.cte,
@@ -4060,6 +4061,12 @@ pub struct FromClauseSubquery {
     pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
+    /// SQLite keeps extra source names on a parenthesized join's result list.
+    ///
+    /// Turso keeps the same data here because outer name binding sees this
+    /// derived table, not the inner result expressions. Each item describes
+    /// the column at the same position in `columns`.
+    pub parenthesized_join_columns: Option<Vec<ParenthesizedJoinColumn>>,
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
@@ -4069,6 +4076,72 @@ pub struct FromClauseSubquery {
     /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
     /// reference rather than an inline derived table.
     pub cte: Option<FromClauseSubqueryCteMetadata>,
+}
+
+/// Name data that an outer query can use through a parenthesized join.
+#[derive(Debug, Clone)]
+pub struct ParenthesizedJoinColumn {
+    /// The name that SQLite keeps for later name binding.
+    pub source: ParenthesizedJoinColumnSource,
+    /// SQLite keeps this column for qualified access but omits it from `*`.
+    pub hidden_from_star: bool,
+}
+
+/// The source name of a result column from a parenthesized join.
+#[derive(Debug, Clone)]
+pub enum ParenthesizedJoinColumnSource {
+    /// SQLite inserts one name that represents all copies merged by `USING`.
+    Using { column_name: String },
+    /// A named column keeps its original database, table, and column names.
+    Table {
+        database_id: Option<usize>,
+        table_name: String,
+        column_name: String,
+    },
+    /// An implicit rowid keeps its table name but matches each rowid alias.
+    RowId {
+        database_id: Option<usize>,
+        table_name: String,
+    },
+}
+
+impl ParenthesizedJoinColumnSource {
+    /// Return true when SQLite can bind this saved name to the requested name.
+    pub fn matches(
+        &self,
+        database_id: Option<usize>,
+        table_name: Option<&str>,
+        column_name: &str,
+    ) -> bool {
+        match self {
+            Self::Using {
+                column_name: saved_column,
+            } => {
+                database_id.is_none()
+                    && table_name.is_none()
+                    && saved_column.eq_ignore_ascii_case(column_name)
+            }
+            Self::Table {
+                database_id: saved_database,
+                table_name: saved_table,
+                column_name: saved_column,
+            } => {
+                database_id.is_none_or(|database| *saved_database == Some(database))
+                    && table_name.is_none_or(|table| saved_table.eq_ignore_ascii_case(table))
+                    && saved_column.eq_ignore_ascii_case(column_name)
+            }
+            Self::RowId {
+                database_id: saved_database,
+                table_name: saved_table,
+            } => {
+                database_id.is_none_or(|database| *saved_database == Some(database))
+                    && table_name.is_none_or(|table| saved_table.eq_ignore_ascii_case(table))
+                    && ROWID_STRS
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(column_name))
+            }
+        }
+    }
 }
 
 /// The one-row table read by the recursive part of a recursive CTE.

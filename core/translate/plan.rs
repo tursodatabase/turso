@@ -1044,7 +1044,10 @@ pub fn select_star(
                 .filter_map(|t| t.join_info.as_ref())
                 .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
                 .collect();
-            for col in table.columns().iter().filter(|c| !c.hidden()) {
+            for (column_index, col) in table.columns().iter().enumerate() {
+                if table.column_is_hidden_from_star(column_index) {
+                    continue;
+                }
                 if let Some(col_name) = &col.name {
                     let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
                     if !in_using {
@@ -1062,7 +1065,7 @@ pub fn select_star(
                 .columns()
                 .iter()
                 .enumerate()
-                .filter(|(_, col)| !col.hidden())
+                .filter(|(column_index, _)| !table.column_is_hidden_from_star(*column_index))
                 .filter(|(_, col)| {
                     // If we are joining with USING, we need to deduplicate the columns from the right table
                     // that are also present in the USING clause.
@@ -1105,6 +1108,52 @@ pub fn select_star(
     Ok(())
 }
 
+/// Find one real column by its unqualified name.
+///
+/// A parenthesized join can keep several source columns with the same name.
+/// Its saved `USING` value wins. Other duplicate names remain ambiguous.
+pub(super) fn find_unqualified_column(table: &Table, column_name: &str) -> Result<Option<usize>> {
+    let Table::FromClauseSubquery(subquery) = table else {
+        return Ok(table.columns().iter().position(|column| {
+            column
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+        }));
+    };
+    let Some(join_columns) = &subquery.parenthesized_join_columns else {
+        return Ok(table.columns().iter().position(|column| {
+            column
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+        }));
+    };
+
+    let mut found = None;
+    for (column_index, data) in join_columns.iter().enumerate() {
+        if !data.source.matches(None, None, column_name) {
+            continue;
+        }
+        if matches!(
+            data.source,
+            crate::schema::ParenthesizedJoinColumnSource::RowId { .. }
+        ) {
+            continue;
+        }
+        if matches!(
+            data.source,
+            crate::schema::ParenthesizedJoinColumnSource::Using { .. }
+        ) {
+            return Ok(Some(column_index));
+        }
+        if found.replace(column_index).is_some() {
+            crate::bail_parse_error!("ambiguous column name: {}", column_name);
+        }
+    }
+    Ok(found)
+}
+
 /// The type of join between two tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
@@ -1130,6 +1179,13 @@ pub struct JoinInfo {
 }
 
 impl JoinInfo {
+    /// Return true when `USING` or `NATURAL` merges this column.
+    pub fn merges_column(&self, column_name: &str) -> bool {
+        self.using
+            .iter()
+            .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
+    }
+
     /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
     pub fn is_outer(&self) -> bool {
         matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
@@ -2405,7 +2461,7 @@ impl Operation {
     }
 }
 
-fn query_output_columns(
+pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
 ) -> Result<alloc::Vec<Column>> {
@@ -2543,6 +2599,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(Plan::Select(Box::new(plan))),
             columns,
+            parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte: None,
@@ -2589,6 +2646,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte,
@@ -2641,6 +2699,29 @@ impl JoinedTable {
 
     pub fn columns(&self) -> &[Column] {
         self.table.columns()
+    }
+
+    /// Return true when `*` must omit a column from this table reference.
+    ///
+    /// Parenthesized joins keep source copies and rowids for qualified names.
+    /// SQLite does not show those extra values in an unqualified star.
+    pub fn column_is_hidden_from_star(&self, column_index: usize) -> bool {
+        let column = &self.columns()[column_index];
+        if column.hidden() {
+            return true;
+        }
+        let Table::FromClauseSubquery(subquery) = &self.table else {
+            return false;
+        };
+        let Some(join_columns) = &subquery.parenthesized_join_columns else {
+            return false;
+        };
+        let data = &join_columns[column_index];
+        data.hidden_from_star
+            || matches!(
+                data.source,
+                crate::schema::ParenthesizedJoinColumnSource::RowId { .. }
+            )
     }
 
     /// Mark a column as used in the query.
