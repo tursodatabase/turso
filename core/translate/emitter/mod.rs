@@ -1727,6 +1727,33 @@ pub fn emit_cdc_commit_insns(
     Ok(())
 }
 
+/// Jump to `skip_label` when the transaction captured no change.
+///
+/// `conn_txn_id(-1)` returns the active CDC transaction id, or -1 when nothing was captured.
+/// The opcode is an idempotent get-or-set, so `emit_cdc_commit_insns` recomputing it for the
+/// record itself sees the same value this gate tested.
+fn emit_skip_if_no_captured_change(program: &mut ProgramBuilder, skip_label: BranchOffset) {
+    let minus_one_reg = program.alloc_register();
+    program.emit_int(-1, minus_one_reg);
+    let txn_id_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: minus_one_reg,
+        dest: txn_id_reg,
+        func: crate::function::FuncCtx {
+            func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+            arg_count: 1,
+        },
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: txn_id_reg,
+        rhs: minus_one_reg,
+        target_pc: skip_label,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+}
+
 /// Emit a CDC COMMIT record at end-of-statement when in autocommit mode (v2 only).
 /// This should be called once per statement, after the main loop, not per-row.
 pub fn emit_cdc_autocommit_commit(
@@ -1734,6 +1761,12 @@ pub fn emit_cdc_autocommit_commit(
     resolver: &Resolver,
     cdc_cursor_id: usize,
 ) -> Result<()> {
+    // Trigger and FK-action subprograms run inside an outer statement whose own
+    // epilogue emits the COMMIT record; emitting one here would insert a
+    // mid-statement COMMIT into the CDC stream.
+    if program.flags.is_subprogram() {
+        return Ok(());
+    }
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         // Check if we're in autocommit mode; if so, emit a COMMIT record.
@@ -1757,6 +1790,9 @@ pub fn emit_cdc_autocommit_commit(
             jump_if_null: true,
         });
 
+        // A never-capturing statement may never have opened the CDC cursor.
+        emit_skip_if_no_captured_change(program, skip_label);
+
         emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
 
         program.preassign_label_to_next_insn(skip_label);
@@ -1775,41 +1811,14 @@ pub fn emit_cdc_autocommit_commit(
 /// nor clears that page, so it leaks into the next transaction and trips the "dirty pages
 /// should be empty for read txn" assertion on a later ROLLBACK
 /// (https://github.com/tursodatabase/turso/issues/7677).
-///
-/// `conn_txn_id(-1)` returns the active CDC transaction id, or -1 when nothing was captured.
-/// When it is set, the transaction already performed a write (the data-change statement
-/// established the write transaction), so inserting the commit record is safe. When it is -1
-/// the transaction made no changes and we skip the record entirely, leaving the transaction
-/// read-only.
 pub fn emit_cdc_explicit_commit_insns(
     program: &mut ProgramBuilder,
     schema: &Schema,
     resolver: &Resolver,
 ) -> Result<()> {
-    let minus_one_reg = program.alloc_register();
-    program.emit_int(-1, minus_one_reg);
-    let txn_id_reg = program.alloc_register();
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: minus_one_reg,
-        dest: txn_id_reg,
-        func: crate::function::FuncCtx {
-            func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
-            arg_count: 1,
-        },
-    });
-
-    // Skip the whole record (including the CDC OpenWrite) when no change was captured.
-    // `emit_cdc_commit_insns` recomputes `conn_txn_id(-1)` for the record itself; because the
-    // opcode is an idempotent get-or-set, the second call returns the same value we gated on.
+    // Skipping also skips the CDC OpenWrite below.
     let skip_label = program.allocate_label();
-    program.emit_insn(Insn::Eq {
-        lhs: txn_id_reg,
-        rhs: minus_one_reg,
-        target_pc: skip_label,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: None,
-    });
+    emit_skip_if_no_captured_change(program, skip_label);
 
     // The CDC record write needs a transaction; joins the open one (keeping its mode) if any.
     program.emit_insn(Insn::Transaction {
