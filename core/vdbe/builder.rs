@@ -1204,6 +1204,29 @@ impl ProgramBuilder {
         self.insns.push((insn, self.insns.len()));
     }
 
+    /// Emit a deferred table seek when the index can identify a table row.
+    pub fn emit_deferred_seek(&mut self, index_cursor_id: CursorID, table_cursor_id: CursorID) {
+        // A rowid-free index cannot identify a base-table row. Such a plan must
+        // read all required values from the index. SQLite emits no DeferredSeek.
+        if matches!(
+            self.get_cursor_type(index_cursor_id),
+            Some(CursorType::BTreeIndex(index)) if !index.has_rowid
+        ) {
+            return;
+        }
+        turso_assert!(
+            matches!(
+                self.get_cursor_type(index_cursor_id),
+                Some(CursorType::BTreeIndex(_) | CursorType::IndexMethod(_))
+            ),
+            "a deferred seek requires an index cursor"
+        );
+        self.emit_insn(Insn::DeferredSeek {
+            index_cursor_id,
+            table_cursor_id,
+        });
+    }
+
     /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
     /// or `ColumnRange` on the same cursor when both the column index and the destination register
     /// are exactly consecutive and no label is set to target the current opcode.

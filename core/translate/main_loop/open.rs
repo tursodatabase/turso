@@ -6,7 +6,7 @@ use crate::translate::{
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
 
-fn emit_materialized_subquery_result_columns(
+pub(super) fn emit_materialized_subquery_result_columns(
     program: &mut ProgramBuilder,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
     cursor_id: CursorID,
@@ -39,6 +39,53 @@ fn emit_materialized_subquery_result_columns(
             default: None,
         });
     }
+}
+
+pub(super) fn emit_right_join_key(
+    program: &mut ProgramBuilder,
+    right_join: &RightJoinMetadata,
+    table_cursor_id: CursorID,
+) {
+    program.emit_insn(Insn::RowId {
+        cursor_id: table_cursor_id,
+        dest: right_join.rowid_reg,
+    });
+}
+
+fn emit_right_join_match(
+    program: &mut ProgramBuilder,
+    right_join: &RightJoinMetadata,
+    table_cursor_id: CursorID,
+) {
+    emit_right_join_key(program, right_join, table_cursor_id);
+    let already_recorded = program.allocate_label();
+    program.emit_insn(Insn::Found {
+        cursor_id: right_join.matched_rows_cursor_id,
+        target_pc: already_recorded,
+        record_reg: right_join.rowid_reg,
+        num_regs: 1,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(right_join.rowid_reg),
+        count: 1,
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: right_join.matched_rows_cursor_id,
+        record_reg,
+        unpacked_start: Some(right_join.rowid_reg),
+        unpacked_count: Some(1),
+        flags: IdxInsertFlags::new(),
+    });
+    program.emit_insn(Insn::FilterAdd {
+        cursor_id: right_join.matched_rows_cursor_id,
+        key_reg: right_join.rowid_reg,
+        num_keys: 1,
+    });
+    program.preassign_label_to_next_insn(already_recorded);
 }
 
 /// Opens the main loop for each table in the join order, emitting instructions to initialize
@@ -92,7 +139,7 @@ impl OpenLoop {
             // and is set to true when a match is found for the OUTER JOIN.
             // This is used to determine whether to emit actual columns or NULLs for the columns of the right table.
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() {
+                if join_info.keeps_left_rows() {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                     program.emit_insn(Insn::Integer {
                         value: 0,
@@ -246,10 +293,7 @@ impl OpenLoop {
                     }
                     if let Some(table_cursor_id) = table_cursor_id {
                         if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id,
-                                table_cursor_id,
-                            });
+                            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
                         }
                     }
                 }
@@ -386,10 +430,8 @@ impl OpenLoop {
                                     MaterializedFromClauseSubqueryStorage::TableBacked => {
                                         let table_cursor_id = table_cursor_id
                                             .expect("materialized subquery must have table cursor");
-                                        program.emit_insn(Insn::DeferredSeek {
-                                            index_cursor_id,
-                                            table_cursor_id,
-                                        });
+                                        program
+                                            .emit_deferred_seek(index_cursor_id, table_cursor_id);
                                         emit_materialized_subquery_result_columns(
                                             program,
                                             from_clause_subquery,
@@ -406,10 +448,8 @@ impl OpenLoop {
                                 if let Some(index_cursor_id) = index_cursor_id {
                                     if let Some(table_cursor_id) = table_cursor_id {
                                         // Don't do a btree table seek until it's actually necessary to read from the table.
-                                        program.emit_insn(Insn::DeferredSeek {
-                                            index_cursor_id,
-                                            table_cursor_id,
-                                        });
+                                        program
+                                            .emit_deferred_seek(index_cursor_id, table_cursor_id);
                                     }
                                 }
                             }
@@ -479,10 +519,7 @@ impl OpenLoop {
                                     target_pc: next_val_label,
                                 });
                                 if let Some(table_cursor_id) = table_cursor_id {
-                                    program.emit_insn(Insn::DeferredSeek {
-                                        index_cursor_id: idx_cursor,
-                                        table_cursor_id,
-                                    });
+                                    program.emit_deferred_seek(idx_cursor, table_cursor_id);
                                 }
                             }
 
@@ -519,10 +556,7 @@ impl OpenLoop {
                     program.preassign_label_to_next_insn(loop_start);
                     if let Some(table_cursor_id) = table_cursor_id {
                         if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id,
-                                table_cursor_id,
-                            });
+                            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
                         }
                     }
                 }
@@ -556,15 +590,18 @@ impl OpenLoop {
                 }
             }
 
-            let condition_fail_target = if let Operation::HashJoin(ref hj) = table.op {
-                t_ctx
-                    .hash_table_contexts
-                    .get(&hj.build_table_idx)
-                    .map(|ctx| ctx.labels.next)
-                    .expect("should have hash context for build table")
-            } else {
-                next
-            };
+            let condition_fail_target =
+                if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                    right_join.return_label
+                } else if let Operation::HashJoin(ref hj) = table.op {
+                    t_ctx
+                        .hash_table_contexts
+                        .get(&hj.build_table_idx)
+                        .map(|ctx| ctx.labels.next)
+                        .expect("should have hash context for build table")
+                } else {
+                    next
+                };
             let is_outer_hj_probe = matches!(table.op, Operation::HashJoin(ref hj) if matches!(
                 hj.join_type,
                 HashJoinType::LeftOuter | HashJoinType::FullOuter
@@ -584,10 +621,18 @@ impl OpenLoop {
             )
             .emit()?;
 
+            // Record the right row after its ON terms pass. Later WHERE terms
+            // must not change whether this row matched the join.
+            if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                let table_cursor_id = table_cursor_id
+                    .expect("a right-preserving join must keep its table cursor open");
+                emit_right_join_match(program, right_join, table_cursor_id);
+            }
+
             // Set the LEFT JOIN match flag. Skip outer hash join probes - they use
             // HashMarkMatched / check_outer instead.
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() && !is_outer_hj_probe {
+                if join_info.keeps_left_rows() && !is_outer_hj_probe {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                     program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
                     program.emit_insn(Insn::Integer {
@@ -621,8 +666,18 @@ impl OpenLoop {
                 }
             }
 
+            // Normal loop execution enters the row body inline. The unmatched
+            // right-row scan enters the same body with Gosub.
+            if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                program.emit_insn(Insn::BeginSubrtn {
+                    dest: right_join.return_reg,
+                    dest_end: None,
+                });
+                program.preassign_label_to_next_insn(right_join.body_label);
+            }
+
             // Emit non-OUTER JOIN conditions.
-            let from_outer_join = false;
+            let outer_join_terms = false;
             LoopConditionEmitter::new(
                 program,
                 t_ctx,
@@ -631,7 +686,7 @@ impl OpenLoop {
                 predicates,
                 join_index,
                 condition_fail_target,
-                from_outer_join,
+                outer_join_terms,
                 subqueries,
             )
             .emit()?;

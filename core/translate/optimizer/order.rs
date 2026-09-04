@@ -10,8 +10,8 @@ use crate::{
             usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
         },
         plan::{
-            GroupBy, HashJoinType, IterationDirection, JoinedTable, Operation, Plan, Scan,
-            SimpleAggregate, TableReferences,
+            GroupBy, HashJoinType, IterationDirection, JoinInfo, JoinedTable, Operation, Plan,
+            Scan, SimpleAggregate, TableReferences,
         },
         planner::{table_mask_from_expr, TableMask},
     },
@@ -246,6 +246,17 @@ pub fn plan_satisfies_order_target(
     order_target: &OrderTarget,
     schema: &Schema,
 ) -> bool {
+    // SQLite always sorts after a RIGHT JOIN or FULL JOIN. The unmatched
+    // right rows run after the normal loops, so no scan order is sufficient.
+    if joined_tables.iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    }) {
+        return false;
+    }
+
     // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
     for (_, access_method_index) in plan.data.iter() {
         let access_method = &access_methods_arena[*access_method_index];

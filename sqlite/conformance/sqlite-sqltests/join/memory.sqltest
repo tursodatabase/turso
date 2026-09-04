@@ -154,6 +154,47 @@ expect {
     17|17|20|17
 }
 
+# A later ON term cannot be a hash key for an earlier LEFT JOIN. Otherwise,
+# the hash join can keep an unmatched row from the wrong table.
+@cross-check-integrity
+test left-join-does-not-use-later-on-term-as-hash-key {
+    CREATE TABLE hash_owner_t1(c);
+    CREATE TABLE hash_owner_t2(b, c);
+    CREATE TABLE hash_owner_t3(b);
+    INSERT INTO hash_owner_t1 VALUES(-2);
+    INSERT INTO hash_owner_t3 VALUES(2);
+
+    SELECT hash_owner_t1.c, hash_owner_t2.b, hash_owner_t3.b
+    FROM hash_owner_t1
+    LEFT JOIN hash_owner_t2 ON hash_owner_t1.c = hash_owner_t2.c
+    LEFT JOIN hash_owner_t3 ON hash_owner_t2.b = hash_owner_t3.b
+    WHERE hash_owner_t3.b = 2 AND hash_owner_t1.c = -2;
+}
+expect {
+}
+
+# A temporary index must follow the same rule. This path is used for a
+# materialized common table expression.
+@cross-check-integrity
+test left-join-temp-index-does-not-use-later-on-term {
+    CREATE TABLE temp_index_t1(a, c);
+    CREATE TABLE temp_index_t2(a, b, c, d);
+    CREATE TABLE temp_index_t3(id INTEGER PRIMARY KEY, b);
+    INSERT INTO temp_index_t1 VALUES(1, -2);
+    INSERT INTO temp_index_t3 VALUES(20052, 2);
+
+    WITH cte_t2 AS MATERIALIZED (
+        SELECT a, b, c, d, c + d AS cd FROM temp_index_t2
+    )
+    SELECT temp_index_t1.a, cte_t2.a, temp_index_t3.id
+    FROM temp_index_t1
+    LEFT JOIN cte_t2 ON temp_index_t1.c = cte_t2.c
+    LEFT JOIN temp_index_t3 ON cte_t2.b = temp_index_t3.b
+    WHERE temp_index_t3.b = 2 AND temp_index_t1.c IS -2;
+}
+expect {
+}
+
 # regression test: ORDER BY cannot be satisfied by a deeper join loop when the
 # earlier loop can emit duplicate prefixes for the consumed order terms
 @cross-check-integrity

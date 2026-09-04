@@ -465,9 +465,7 @@ expect {
     4|y|a
 }
 
-# A non-equality ON clause is supported: FULL OUTER falls back to a single-bucket
-# hash join with the predicate applied as a residual, emitting unmatched rows on
-# both sides.
+# A non-equality ON clause can match more than one row on each side.
 @cross-check-integrity
 test full-outer-join-non-equi {
     CREATE TABLE t1(a);
@@ -482,15 +480,20 @@ expect {
     8|5
 }
 
-@skip-if sqlite "supported in sqlite"
 @cross-check-integrity
-test full-outer-join-using-errors {
+test full-outer-join-using {
     CREATE TABLE t1(id, name);
     CREATE TABLE t2(id, val);
-    SELECT * FROM t1 FULL OUTER JOIN t2 USING(id);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+    INSERT INTO t2 VALUES (2, 'x'), (3, 'y');
+    SELECT t1.id, t1.name, t2.id, t2.val
+      FROM t1 FULL OUTER JOIN t2 USING(id)
+     ORDER BY coalesce(t1.id, t2.id);
 }
-expect error {
-    FULL OUTER JOIN requires an equality condition in the ON clause
+expect {
+    1|a||
+    2|b|2|x
+    ||3|y
 }
 
 # With no ON clause every pair matches, so FULL OUTER degenerates to a cross
@@ -1167,22 +1170,25 @@ expect {
     4
 }
 
-# Three-way FULL OUTER JOIN chain is not yet supported — the second
-# FULL OUTER's build table has join_info.outer from the first join,
-# which we currently disallow. Verify we return a useful error.
-@skip-if sqlite "supported in sqlite"
 @cross-check-integrity
-test three-way-full-outer-join-errors {
+test three-way-full-outer-join {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
     CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
     SELECT t1.a, t2.b, t3.c
     FROM t1
     FULL OUTER JOIN t2 ON t1.a = t2.b
-    FULL OUTER JOIN t3 ON t2.b = t3.c;
+    FULL OUTER JOIN t3 ON t2.b = t3.c
+    ORDER BY coalesce(t1.a, t2.b, t3.c);
 }
-expect error {
-    FULL OUTER JOIN chaining is not yet supported
+expect {
+    1||
+    2|2|2
+    |3|
+    ||4
 }
 
 # FULL OUTER with a large number of matched and unmatched rows to stress-test
@@ -1224,38 +1230,44 @@ expect {
     |3|3
 }
 
-# LEFT JOIN then FULL OUTER should error — build table has join_info.outer
-# from the LEFT JOIN.
-@skip-if sqlite "supported in sqlite"
 @cross-check-integrity
-test left-then-full-outer-chain-errors {
+test left-then-full-outer-chain {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
     CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
     SELECT t1.a, t2.b, t3.c
     FROM t1
     LEFT JOIN t2 ON t1.a = t2.b
-    FULL OUTER JOIN t3 ON t2.b = t3.c;
+    FULL OUTER JOIN t3 ON t2.b = t3.c
+    ORDER BY coalesce(t1.a, t2.b, t3.c);
 }
-expect error {
-    FULL OUTER JOIN chaining is not yet supported
+expect {
+    1||
+    2|2|2
+    ||4
 }
 
-# RIGHT JOIN then FULL OUTER should also error — after RIGHT is rewritten
-# as LEFT, the build table has join_info.outer.
-@skip-if sqlite "supported in sqlite"
 @cross-check-integrity
-test right-then-full-outer-chain-errors {
+test right-then-full-outer-chain {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
     CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
     SELECT t1.a, t2.b, t3.c
     FROM t1
     RIGHT JOIN t2 ON t1.a = t2.b
-    FULL OUTER JOIN t3 ON t2.b = t3.c;
+    FULL OUTER JOIN t3 ON t2.b = t3.c
+    ORDER BY coalesce(t1.a, t2.b, t3.c);
 }
-expect error {
-    FULL OUTER JOIN chaining is not yet supported
+expect {
+    2|2|2
+    |3|
+    ||4
 }
 
 # RIGHT JOIN with aggregate functions and NULL propagation.
@@ -1351,53 +1363,61 @@ expect {
     ||4
 }
 
-# RIGHT JOIN following another join is not supported — the table swap
-# would corrupt prior ON clause references.
-@skip-if sqlite "supported in sqlite"
 @cross-check-integrity
-test left-then-right-join-chain-errors {
+test left-then-right-join-chain {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
     CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
     SELECT t1.a, t2.b, t3.c
     FROM t1
     LEFT JOIN t2 ON t1.a = t2.b
-    RIGHT JOIN t3 ON t2.b = t3.c;
+    RIGHT JOIN t3 ON t2.b = t3.c
+    ORDER BY t3.c;
 }
-expect error {
-    RIGHT JOIN following another join is not yet supported
+expect {
+    2|2|2
+    ||4
 }
 
-@skip-if sqlite "supported in sqlite"
 @cross-check-integrity
-test right-then-right-join-chain-errors {
+test right-then-right-join-chain {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
     CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
     SELECT t1.a, t2.b, t3.c
     FROM t1
     RIGHT JOIN t2 ON t1.a = t2.b
-    RIGHT JOIN t3 ON t2.b = t3.c;
+    RIGHT JOIN t3 ON t2.b = t3.c
+    ORDER BY t3.c;
 }
-expect error {
-    RIGHT JOIN following another join is not yet supported
+expect {
+    2|2|2
+    ||4
 }
 
-# FULL OUTER then RIGHT JOIN should also error — RIGHT after FULL OUTER
-# means len > 2 at the time of the RIGHT JOIN swap.
-@skip-if sqlite "supported in sqlite"
 @cross-check-integrity
-test full-outer-then-right-join-errors {
+test full-outer-then-right-join {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
     CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
     SELECT t1.a, t2.b, t3.c
     FROM t1
     FULL OUTER JOIN t2 ON t1.a = t2.b
-    RIGHT JOIN t3 ON t2.b = t3.c;
+    RIGHT JOIN t3 ON t2.b = t3.c
+    ORDER BY t3.c;
 }
-expect error {
-    RIGHT JOIN following another join is not yet supported
+expect {
+    2|2|2
+    ||4
 }
 
 # FULL OUTER where ON condition uses expressions on both sides.
@@ -1578,11 +1598,7 @@ expect {
     3|3
 }
 
-# FULL OUTER with WHERE equijoin duplicating the ON condition.
-# Both conditions are consumed as hash join keys, so the WHERE t.x=u.x
-# does not act as a post-join filter. This is a known limitation; the
-# result includes unmatched rows that SQLite would filter out.
-@skip-if sqlite "known limitation: duplicate equijoin consumed as hash key"
+# A WHERE condition runs after FULL JOIN records its matches.
 @cross-check-integrity
 test full-outer-with-where-equijoin {
     CREATE TABLE t(x);
@@ -1594,10 +1610,8 @@ test full-outer-with-where-equijoin {
     ORDER BY coalesce(t.x, u.x);
 }
 expect {
-    1|
     2|2
     3|3
-    |4
 }
 
 # Regression: FULL OUTER with a simple self-filter on the probe (RHS) table.

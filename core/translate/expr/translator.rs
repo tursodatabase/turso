@@ -2288,8 +2288,14 @@ pub fn translate_expr(
                     .expect("table_references needed translating Expr::Column")
                     .find_joined_table_by_internal_id(*table_ref_id)
                 {
+                    let requires_table_cursor =
+                        table_reference.requires_table_cursor_for_unmatched_rows();
                     (
-                        table_reference.op.index(),
+                        if requires_table_cursor {
+                            None
+                        } else {
+                            table_reference.op.index()
+                        },
                         if let Operation::IndexMethodQuery(index_method) = &table_reference.op {
                             Some(index_method)
                         } else {
@@ -2607,34 +2613,42 @@ pub fn translate_expr(
                             .iter()
                             .find(|t| t.internal_id == *table_ref_id)
                         {
+                            let requires_table_cursor =
+                                table_reference.requires_table_cursor_for_unmatched_rows();
                             // Check if the operation is Search::Seek with an ephemeral index
-                            if let Operation::Search(Search::Seek {
-                                index: Some(index), ..
-                            }) = &table_reference.op
-                            {
-                                if index.ephemeral {
-                                    // Read from the index cursor. Index columns may be reordered
-                                    // (key columns first), so find the index column position that
-                                    // corresponds to the original subquery column position.
-                                    let idx_col = index
-                                        .columns
-                                        .iter()
-                                        .position(|c| c.pos_in_table == *column)
-                                        .expect("index column not found for subquery column");
-                                    let cursor_id = program.resolve_cursor_id(&CursorKey::index(
-                                        *table_ref_id,
-                                        index.clone(),
-                                    ));
-                                    program.emit_insn(Insn::Column {
-                                        cursor_id,
-                                        column: idx_col,
-                                        dest: target_register,
-                                        default: None,
-                                    });
-                                    if let Some(col) = from_clause_subquery.columns.get(*column) {
-                                        maybe_apply_affinity(col.ty(), target_register, program);
+                            if !requires_table_cursor {
+                                if let Operation::Search(Search::Seek {
+                                    index: Some(index), ..
+                                }) = &table_reference.op
+                                {
+                                    if index.ephemeral {
+                                        // Read from the index cursor. Index columns may be reordered
+                                        // (key columns first), so find the index column position that
+                                        // corresponds to the original subquery column position.
+                                        let idx_col = index
+                                            .columns
+                                            .iter()
+                                            .position(|c| c.pos_in_table == *column)
+                                            .expect("index column not found for subquery column");
+                                        let cursor_id = program.resolve_cursor_id(
+                                            &CursorKey::index(*table_ref_id, index.clone()),
+                                        );
+                                        program.emit_insn(Insn::Column {
+                                            cursor_id,
+                                            column: idx_col,
+                                            dest: target_register,
+                                            default: None,
+                                        });
+                                        if let Some(col) = from_clause_subquery.columns.get(*column)
+                                        {
+                                            maybe_apply_affinity(
+                                                col.ty(),
+                                                target_register,
+                                                program,
+                                            );
+                                        }
+                                        return Ok(target_register);
                                     }
-                                    return Ok(target_register);
                                 }
                             }
                         }
@@ -2723,8 +2737,14 @@ pub fn translate_expr(
             } else if let Some(table_reference) =
                 referenced_tables.find_joined_table_by_internal_id(*table_ref_id)
             {
+                let requires_table_cursor =
+                    table_reference.requires_table_cursor_for_unmatched_rows();
                 (
-                    table_reference.op.index(),
+                    if requires_table_cursor {
+                        None
+                    } else {
+                        table_reference.op.index()
+                    },
                     table_reference.utilizes_covering_index(),
                 )
             } else {

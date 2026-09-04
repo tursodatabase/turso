@@ -26,14 +26,14 @@ use crate::translate::optimizer::cost::{
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::optimizer::AvailableIndexes;
 use crate::translate::plan::{
-    BitSet, InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
-    UnionBranchPrePostFilters, WhereTerm,
+    BitSet, InSeekSource, JoinOrigin, JoinedTable, NonFromClauseSubquery, SetOperation,
+    TableReferences, UnionBranchPrePostFilters, WhereTerm,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::Result;
 use std::sync::Arc;
 use turso_macros::turso_assert_eq;
-use turso_parser::ast::{self, TableInternalId};
+use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 /// Parameters for a single branch of a multi-index scan.
@@ -146,7 +146,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 #[expect(clippy::too_many_arguments)]
 fn get_table_local_constraints_for_branch(
     exprs: &[ast::Expr],
-    from_outer_join: Option<TableInternalId>,
+    from_join: Option<JoinOrigin>,
     table_reference: &JoinedTable,
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
@@ -159,7 +159,7 @@ fn get_table_local_constraints_for_branch(
         .cloned()
         .map(|expr| WhereTerm {
             expr,
-            from_outer_join,
+            from_join,
             consumed: false,
         })
         .collect::<Vec<_>>();
@@ -777,8 +777,8 @@ fn evaluate_multi_index_branches(
 ///
 /// The scan *is* the term's evaluation: rows failing it are never visited, and
 /// the term is marked consumed so nothing checks it again. For a table that an
-/// outer join can null-extend (the right-hand table of a LEFT/FULL JOIN, or
-/// any table on the left side of a FULL JOIN) that only holds for the join's
+/// outer join can null-extend (the right table of an outer join, or any table
+/// on the left side of a RIGHT/FULL JOIN) that only holds for the join's
 /// own ON clause, which defines what counts as a match. Any other term must
 /// also reject the null-extended row the join emits when nothing matched, and
 /// that row is produced by jumping straight past the scan — so consuming such
@@ -789,7 +789,9 @@ fn multi_index_can_consume_term(
     table_references: &TableReferences,
 ) -> bool {
     !table_references.outer_join_may_null_extend(table.internal_id)
-        || term.from_outer_join == Some(table.internal_id)
+        || term
+            .from_join
+            .is_some_and(|origin| origin.right_table() == table.internal_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1016,7 +1018,7 @@ pub fn consider_multi_index_union(
                 let Some((synthetic_where_terms, table_constraints)) =
                     get_table_local_constraints_for_branch(
                         &conjuncts,
-                        term.from_outer_join,
+                        term.from_join,
                         rhs_table,
                         table_references,
                         available_indexes,
@@ -1485,7 +1487,7 @@ mod tests {
                 Operator::Or,
                 Box::new(right_disjunct),
             ),
-            from_outer_join: None,
+            from_join: None,
             consumed: false,
         }];
 
@@ -1558,7 +1560,7 @@ mod tests {
                     Operator::Greater,
                     Box::new(create_numeric_literal("10")),
                 ),
-                from_outer_join: None,
+                from_join: None,
                 consumed: false,
             },
             WhereTerm {
@@ -1567,7 +1569,7 @@ mod tests {
                     Operator::Equals,
                     Box::new(create_numeric_literal("7")),
                 ),
-                from_outer_join: None,
+                from_join: None,
                 consumed: false,
             },
         ];
@@ -1740,7 +1742,7 @@ mod tests {
                 Operator::Or,
                 Box::new(right_disjunct),
             ),
-            from_outer_join: None,
+            from_join: None,
             consumed: false,
         }];
 
@@ -1876,7 +1878,7 @@ mod tests {
                     Operator::Or,
                     Box::new(make_branch(1, 0, item_kind)),
                 ),
-                from_outer_join: None,
+                from_join: None,
                 consumed: false,
             }]
         };

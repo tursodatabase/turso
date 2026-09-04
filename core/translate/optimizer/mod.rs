@@ -2,10 +2,10 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
+        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
+        JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
+        Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
+        TableReferences, UpdatePlan, WhereTerm,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -932,30 +932,6 @@ fn optimize_select_plan_with_cache(
         return optimize_select_plan_form(plan, resolver, cache);
     }
 
-    let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
-        table
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::is_full_outer)
-    });
-    // The correlated form cannot run on every matched and unmatched FULL JOIN
-    // row yet. A complete semi-join or anti-join rewrite can, so use it.
-    let full_join_rewrite_is_complete = has_full_join
-        && !rewritten
-            .non_from_clause_subqueries
-            .iter()
-            .any(|subquery| subquery.correlated);
-    if full_join_rewrite_is_complete {
-        let rewritten_table_plan =
-            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
-        if !rewritten_form_is_emittable(&rewritten) {
-            return optimize_select_plan_form(plan, resolver, cache);
-        }
-        *plan = rewritten;
-        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
-        return Ok(());
-    }
-
     #[cfg(feature = "simulator")]
     if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
         let rewritten_table_plan =
@@ -1049,8 +1025,14 @@ fn find_select_plan_form(
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    let has_right_or_full_join = plan.table_references.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    });
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, has_right_or_full_join)?
     {
         plan.contains_constant_false_condition = true;
         plan.estimated_output_rows = Some(0.0);
@@ -1198,7 +1180,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, false)?
     {
         plan.contains_constant_false_condition = true;
         return Ok(());
@@ -1245,8 +1227,14 @@ fn optimize_update_plan(
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    let has_right_or_full_join = plan.from_tables.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    });
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, has_right_or_full_join)?
     {
         plan.contains_constant_false_condition = true;
         if is_update_from {
@@ -2237,7 +2225,8 @@ fn enforce_indexed_by_hints(
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
                 let forced_partial_index_unusable = forced_index.where_clause.is_some()
-                    && !can_use_partial_index(forced_index.as_ref(), table_ref, where_clause);
+                    && (table_references.is_left_of_right_or_full_join(table_ref.internal_id)
+                        || !can_use_partial_index(forced_index.as_ref(), table_ref, where_clause));
                 if forced_partial_index_unusable
                     && matches!(simple_aggregate, Some(SimpleAggregate::Count))
                 {
@@ -2464,10 +2453,7 @@ fn find_table_access_plan(
         for t in table_references.joined_tables_mut().iter_mut().filter(|t| {
             t.join_info
                 .as_ref()
-                // Skip FULL OUTER JOIN tables: removing `outer` would suppress
-                // unmatched-probe-row emission and prevent LeftJoinMetadata
-                // allocation needed by the hash join.
-                .is_some_and(|join_info| join_info.is_outer() && !join_info.is_full_outer())
+                .is_some_and(|join_info| join_info.join_type == JoinType::LeftOuter)
         }) {
             // Check if a WHERE term filters out the join's null-extended rows,
             // allowing us to convert the LEFT JOIN into an INNER JOIN for join
@@ -2475,15 +2461,13 @@ fn find_table_access_plan(
             // extracted constraints, so terms that never become constraints
             // (like `t.v = 5 OR t.w = 7`) also count.
             if where_clause.iter().any(|term| {
-                term.from_outer_join.is_none()
+                !term.from_join.is_some_and(JoinOrigin::is_outer)
                     && where_term_is_null_rejecting_for_table(&term.expr, t.internal_id)
             }) {
                 t.join_info.as_mut().unwrap().join_type = JoinType::Inner;
                 for term in where_clause.iter_mut() {
-                    if let Some(from_outer_join) = term.from_outer_join {
-                        if from_outer_join == t.internal_id {
-                            term.from_outer_join = None;
-                        }
+                    if term.from_join == Some(JoinOrigin::Outer(t.internal_id)) {
+                        term.from_join = Some(JoinOrigin::Inner(t.internal_id));
                     }
                 }
                 outer_join_rewritten = true;
@@ -3239,7 +3223,7 @@ fn mark_seek_constraints_consumed(
             if where_term.consumed {
                 continue;
             }
-            if is_outer_join && where_term.from_outer_join.is_none() {
+            if is_outer_join && !where_term.from_join.is_some_and(JoinOrigin::is_outer) {
                 continue;
             }
             if defer_cross_table && !constraint.lhs_mask.is_empty() {
@@ -3263,7 +3247,9 @@ fn mark_partial_index_predicate_terms_consumed(
         if where_term.consumed {
             continue;
         }
-        if is_outer_join && where_term.from_outer_join != Some(table_reference.internal_id) {
+        if is_outer_join
+            && where_term.from_join != Some(JoinOrigin::Outer(table_reference.internal_id))
+        {
             continue;
         }
         where_term.consumed = true;
@@ -3276,11 +3262,13 @@ enum ConstantConditionEliminationResult {
     ImpossibleCondition,
 }
 
-/// Removes predicates that are always true.
-/// Returns a ConstantEliminationResult indicating whether any predicates are always false.
-/// This is used to determine whether the query can be aborted early.
+/// Remove constant true terms and report when a constant false term means no rows.
+///
+/// SQLite keeps every false inner ON term when the FROM list has a RIGHT or
+/// FULL JOIN. This conservative rule keeps later unmatched-right scans reachable.
 fn eliminate_constant_conditions(
     where_clause: &mut [WhereTerm],
+    has_right_or_full_join: bool,
 ) -> Result<ConstantConditionEliminationResult> {
     let mut i = 0;
     while i < where_clause.len() {
@@ -3290,9 +3278,13 @@ fn eliminate_constant_conditions(
             where_clause[i].consumed = true;
             i += 1;
         } else if predicate.expr.is_always_false()? {
-            // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false,
-            // except an outer join condition, because that just results in NULLs, not skipping the whole loop
-            if predicate.from_outer_join.is_some() {
+            let join_origin = predicate.from_join;
+            // SQLite does not turn these ON terms into a whole-query pre-test.
+            // An outer ON term can make a null-filled row. An inner ON term to
+            // the left of a RIGHT or FULL JOIN can still leave unmatched right rows.
+            if join_origin.is_some_and(JoinOrigin::is_outer)
+                || (join_origin.is_some() && has_right_or_full_join)
+            {
                 i += 1;
                 continue;
             }
@@ -3815,10 +3807,11 @@ fn autoindex_prefilter(
 
             let term_pos = constraint.where_clause_pos.0;
             let term = &where_clause[term_pos];
-            let runs_before_outer_join_condition =
-                is_outer_join && term.from_outer_join != Some(table_reference.internal_id);
+            let runs_before_outer_join_condition = is_outer_join
+                && term.from_join != Some(JoinOrigin::Outer(table_reference.internal_id));
             let comes_from_another_outer_join = term
-                .from_outer_join
+                .from_join
+                .and_then(JoinOrigin::outer_table)
                 .is_some_and(|table_id| table_id != table_reference.internal_id);
             let depends_on_outer_query = expr_references_outer_query(&term.expr, table_references);
             let contains_subquery = expr_references_any_subquery(&term.expr);
