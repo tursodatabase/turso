@@ -123,6 +123,7 @@ pub fn translate_expr(
         referenced_tables,
         expr,
         target_register,
+        resolver,
     )? {
         translate_expr_by_kind(program, referenced_tables, expr, target_register, resolver)?;
     }
@@ -319,17 +320,19 @@ fn try_emit_expression_index_value_if_any(
     referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
     target_register: usize,
+    resolver: &Resolver,
 ) -> Result<bool> {
-    let has_expression_indexes = referenced_tables.is_some_and(|tables| {
-        tables
-            .joined_tables()
-            .iter()
-            .any(|t| !t.expression_index_usages.is_empty())
-    });
+    let has_expression_indexes = !program.flags.skip_expression_index_values()
+        && referenced_tables.is_some_and(|tables| {
+            tables
+                .joined_tables()
+                .iter()
+                .any(|t| !t.expression_index_usages.is_empty())
+        });
     if !has_expression_indexes {
         return Ok(false);
     }
-    try_emit_expression_index_value(program, referenced_tables, expr, target_register)
+    try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
 }
 
 #[inline(never)]

@@ -2473,6 +2473,52 @@ fn find_table_access_plan(
         );
     }
 
+    // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
+    // will never be true for a NULL operand.
+    // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
+    // the outer join can be converted into an inner join.
+    // for example:
+    // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
+    // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
+    // hence: we can convert the outer join into an inner join.
+    //
+    // Converting a LEFT JOIN into an INNER JOIN can enable join reordering.
+    // Expression index usages below depend on which tables can still be null-extended.
+    loop {
+        let mut outer_join_rewritten = false;
+        for t in table_references.joined_tables_mut().iter_mut().filter(|t| {
+            t.join_info
+                .as_ref()
+                // Skip FULL OUTER JOIN tables: removing `outer` would suppress
+                // unmatched-probe-row emission and prevent LeftJoinMetadata
+                // allocation needed by the hash join.
+                .is_some_and(|join_info| join_info.is_outer() && !join_info.is_full_outer())
+        }) {
+            // Check if a WHERE term filters out the join's null-extended rows,
+            // allowing us to convert the LEFT JOIN into an INNER JOIN for join
+            // reordering purposes. This looks at the raw WHERE terms, not the
+            // extracted constraints, so terms that never become constraints
+            // (like `t.v = 5 OR t.w = 7`) also count.
+            if where_clause.iter().any(|term| {
+                term.from_outer_join.is_none()
+                    && where_term_is_null_rejecting_for_table(&term.expr, t.internal_id)
+            }) {
+                t.join_info.as_mut().unwrap().join_type = JoinType::Inner;
+                for term in where_clause.iter_mut() {
+                    if let Some(from_outer_join) = term.from_outer_join {
+                        if from_outer_join == t.internal_id {
+                            term.from_outer_join = None;
+                        }
+                    }
+                }
+                outer_join_rewritten = true;
+            }
+        }
+        if !outer_join_rewritten {
+            break;
+        }
+    }
+
     let has_expression_idx_or_partial_idx = table_references.joined_tables().iter().any(|t| {
         matches!(&t.table, Table::BTree(_) if available_indexes
             .indexes_for_table(t.internal_id)
@@ -2542,50 +2588,6 @@ fn find_table_access_plan(
     let maybe_order_target = simple_aggregate
         .and_then(|sa| simple_aggregate_order_target(sa, table_references))
         .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
-    // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
-    // will never be true for a NULL operand.
-    // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
-    // the outer join can be converted into an inner join.
-    // for example:
-    // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
-    // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
-    // hence: we can convert the outer join into an inner join.
-    //
-    // Converting a LEFT JOIN into an INNER JOIN can enable join reordering.
-    loop {
-        let mut outer_join_rewritten = false;
-        for t in table_references.joined_tables_mut().iter_mut().filter(|t| {
-            t.join_info
-                .as_ref()
-                // Skip FULL OUTER JOIN tables: removing `outer` would suppress
-                // unmatched-probe-row emission and prevent LeftJoinMetadata
-                // allocation needed by the hash join.
-                .is_some_and(|join_info| join_info.is_outer() && !join_info.is_full_outer())
-        }) {
-            // Check if a WHERE term filters out the join's null-extended rows,
-            // allowing us to convert the LEFT JOIN into an INNER JOIN for join
-            // reordering purposes. This looks at the raw WHERE terms, not the
-            // extracted constraints, so terms that never become constraints
-            // (like `t.v = 5 OR t.w = 7`) also count.
-            if where_clause.iter().any(|term| {
-                term.from_outer_join.is_none()
-                    && where_term_is_null_rejecting_for_table(&term.expr, t.internal_id)
-            }) {
-                t.join_info.as_mut().unwrap().join_type = JoinType::Inner;
-                for term in where_clause.iter_mut() {
-                    if let Some(from_outer_join) = term.from_outer_join {
-                        if from_outer_join == t.internal_id {
-                            term.from_outer_join = None;
-                        }
-                    }
-                }
-                outer_join_rewritten = true;
-            }
-        }
-        if !outer_join_rewritten {
-            break;
-        }
-    }
 
     add_implied_column_equalities(where_clause, table_references)?;
     let mut constraints_per_table = constraints_from_where_clause(
