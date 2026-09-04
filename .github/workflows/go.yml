@@ -50,14 +50,14 @@ jobs:
       - name: Build native libraries
         shell: bash
         run: |
-          bazel build //bindings/c:turso_sqlite3_cdylib //cli:tursodb
+          bazel build //sync/sdk-kit:turso_sync_sdk_kit_cdylib //cli:tursodb
           mkdir -p target/debug
           cp bazel-bin/cli/tursodb target/debug/tursodb 2>/dev/null || \
             cp bazel-bin/cli/tursodb.exe target/debug/tursodb.exe
           case "${{ runner.os }}" in
-            Linux) cp bazel-bin/bindings/c/libturso_sqlite3.so target/debug/ ;;
-            macOS) cp bazel-bin/bindings/c/libturso_sqlite3.dylib target/debug/ ;;
-            Windows) cp bazel-bin/bindings/c/turso_sqlite3.dll target/debug/ ;;
+            Linux) cp bazel-bin/sync/sdk-kit/libturso_sync_sdk_kit.so target/debug/ ;;
+            macOS) cp bazel-bin/sync/sdk-kit/libturso_sync_sdk_kit.dylib target/debug/ ;;
+            Windows) cp bazel-bin/sync/sdk-kit/turso_sync_sdk_kit.dll target/debug/ ;;
           esac
 
       # Linux: use LD_LIBRARY_PATH to point to Rust target dir

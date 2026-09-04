@@ -65,6 +65,13 @@ crate.annotation(
     repositories = ["crates"],
 )
 crate.annotation(
+    crate = "libsqlite3-sys",
+    build_script_env = {
+        "LIBSQLITE3_FLAGS": "-DSQLITE_ENABLE_MATH_FUNCTIONS",
+    },
+    repositories = ["crates"],
+)
+crate.annotation(
     crate = "napi",
     crate_features = ["dyn-symbols"],
     repositories = ["crates"],

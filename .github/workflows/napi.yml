@@ -340,7 +340,7 @@ jobs:
         working-directory: .
         shell: bash
         run: |
-          bazel build //cli:tursodb
+          bazel --output_user_root=C:/b build //cli:tursodb
           mkdir -p target/debug
           cp bazel-bin/cli/tursodb.exe target/debug/tursodb.exe
       - name: Install dependencies

@@ -37,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-bazel
+      - uses: ./.github/shared/setup-mold
 
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@bbd0a7de0e936c8c626fa0e93584169d58ff1307
@@ -86,6 +87,7 @@ jobs:
           set -euo pipefail
           flags=(
             -c opt
+            --linkopt=-fuse-ld=mold
             --@rules_rust//rust/settings:extra_rustc_env=RUSTC_BOOTSTRAP=1
             --@rules_rust//rust/settings:extra_rustc_flag=-Zemit-stack-sizes
             --@rules_rust//rust/settings:extra_rustc_flag=-Cforce-frame-pointers=yes

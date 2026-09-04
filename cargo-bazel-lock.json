@@ -1,5 +1,5 @@
 {
-  "checksum": "9598441ebbad51cb768c2d661b7acfe0cc2b59a09ce60d5dda415dc196178ae1",
+  "checksum": "4bc1c27b2765b5119162acb3826b9999a67ff8f6edd7a013b2241c5691c3c587",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -16083,6 +16083,9 @@
     },
     "libsqlite3-sys 0.35.0": {
       "build_script_attrs": {
+        "build_script_env": {
+          "LIBSQLITE3_FLAGS": "-DSQLITE_ENABLE_MATH_FUNCTIONS"
+        },
         "deps": [
           {
             "id": "cc 1.2.59",
