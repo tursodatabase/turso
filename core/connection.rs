@@ -2162,10 +2162,15 @@ impl Connection {
         page: &mut [u8],
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
-        let Some((page_ref, c)) =
-            self.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?
-        else {
-            return Ok(false);
+        let (page_ref, c) = match self.try_wal_watermark_read_page_begin(page_idx, frame_watermark) {
+            Ok(Some(pc)) => pc,
+            Ok(None) => return Ok(false),
+            // The snapshot at this watermark was checkpointed away by a concurrent checkpoint.
+            // Skip the page, the same skip an absent page takes below. The condition is global
+            // to the watermark, so the whole revert-read cycle skips, yielding an empty revert
+            // snapshot rather than aborting the worker.
+            Err(LimboError::WatermarkBelowBackfill { .. }) => return Ok(false),
+            Err(e) => return Err(e),
         };
         match self.get_pager().io.wait_for_completion(c) {
             Err(LimboError::CompletionError(err))
