@@ -300,7 +300,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         if !config.uses_materialized_keys_and_payload {
             planner
                 .program
-                .set_cursor_override(build_table.internal_id, planner.hash_build_cursor_id);
+                .set_table_cursor_override(build_table.internal_id, planner.hash_build_cursor_id);
         }
 
         planner
@@ -444,7 +444,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         if !config.uses_materialized_keys_and_payload {
             planner
                 .program
-                .clear_cursor_override(build_table.internal_id);
+                .clear_table_cursor_override(build_table.internal_id);
         }
 
         planner.program.emit_insn(Insn::HashBuild {

@@ -1305,6 +1305,7 @@ mod tests {
         let table = Table::BTree(table);
         JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             identifier: name,
             internal_id,

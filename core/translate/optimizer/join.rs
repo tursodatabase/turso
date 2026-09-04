@@ -51,6 +51,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub cost_limit: Option<Cost>,
     /// The generated parenthesized query computes merged USING values in its result columns.
     pub using_results_are_explicit: bool,
+    /// This flag permits an automatic index for this table read.
+    pub allow_automatic_index: bool,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -61,6 +63,7 @@ impl<'a> JoinPlanningContext<'a> {
             maybe_order_target,
             cost_limit: None,
             using_results_are_explicit: false,
+            allow_automatic_index: true,
         }
     }
 }
@@ -3833,6 +3836,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -3930,6 +3934,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -4044,6 +4049,7 @@ mod tests {
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             internal_id: table_id_counter.next(),
             identifier: "t1".to_string(),
@@ -4237,6 +4243,7 @@ mod tests {
         let table = Table::BTree(table);
         JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_operation: None,
             table,
             identifier: name,
             internal_id,

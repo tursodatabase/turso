@@ -281,6 +281,7 @@ fn prepare_update_plan(
         identifier: body.tbl_name.identifier(),
         internal_id: program.table_reference_counter.next(),
         op: Operation::default_scan_for(&table),
+        unmatched_right_rows_operation: None,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),

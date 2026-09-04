@@ -785,6 +785,7 @@ pub fn find_best_access_method_for_join_order(
             lhs_mask,
             join_order,
             planning_context.maybe_order_target,
+            planning_context.allow_automatic_index,
             where_clause,
             ready_where,
             available_indexes,
@@ -842,6 +843,7 @@ fn find_best_access_method_for_btree(
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
+    allow_automatic_index: bool,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -953,6 +955,7 @@ fn find_best_access_method_for_btree(
         && uses_full_table_scan
         && !lhs_mask.is_empty()
         && !keeps_right_rows
+        && allow_automatic_index
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
             &rhs_constraints.constraints,
