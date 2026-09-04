@@ -142,7 +142,7 @@ fn build_and_load_segment(
     attachment: &FtsIndexAttachment,
     docs: &[(i64, &str)],
 ) -> (LoadedSegment, Vec<PendingRow>) {
-    let mut cursor_docs = vec![];
+    let mut cursor_docs = std::vec::Vec::new();
     for (rowid, text) in docs {
         let mut doc = TantivyDocument::default();
         doc.add_i64(attachment.rowid_field, *rowid);
