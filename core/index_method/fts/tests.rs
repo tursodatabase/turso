@@ -100,8 +100,8 @@ fn fts_cost_estimate_applies_literal_limit_to_output_rows() {
 fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     let path = std::path::Path::new("x.term");
     let mut chunks: HashMap<i64, Vec<u8>> = HashMap::default();
-    chunks.insert(0, vec![1, 2, 3]);
-    chunks.insert(1, vec![4, 5]);
+    chunks.insert(0, std::vec![1, 2, 3]);
+    chunks.insert(1, std::vec![4, 5]);
     assert_eq!(
         &*assemble_chunks(path, chunks.clone()).unwrap(),
         &[1, 2, 3, 4, 5]
@@ -110,7 +110,7 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     // A negative chunk number next to valid ones: it is counted but never
     // written, so assembly must error rather than hand out uninitialized
     // bytes or trip an assert.
-    chunks.insert(-1, vec![9]);
+    chunks.insert(-1, std::vec![9]);
     assert!(matches!(
         assemble_chunks(path, chunks.clone()),
         Err(LimboError::Corrupt(_))
@@ -175,7 +175,7 @@ fn segment_build_round_trips_through_synthesized_snapshot() {
 
     // Reopen through a snapshot view and query it.
     let mut cursor = FtsCursor::new(&attachment);
-    cursor.segments = vec![segment];
+    cursor.segments = std::vec![segment];
     cursor.snapshot_loaded = true;
     cursor.ensure_searcher().unwrap();
     let searcher = cursor.searcher.as_ref().unwrap();
@@ -217,7 +217,7 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let rekeyed = rekeyed.expect("non-empty segment");
     assert_eq!(rekeyed.id(), minted);
     let mut cursor = FtsCursor::new(&attachment);
-    cursor.segments = vec![rekeyed];
+    cursor.segments = std::vec![rekeyed];
     cursor.snapshot_loaded = true;
     cursor.ensure_searcher().unwrap();
     let searcher = cursor.searcher.as_ref().unwrap();
@@ -250,7 +250,7 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     );
 
     let mut cursor = FtsCursor::new(&attachment);
-    cursor.segments = vec![segment.clone()];
+    cursor.segments = std::vec![segment.clone()];
     cursor.snapshot_loaded = true;
     let postings = cursor.live_postings_for_rowid(2).unwrap();
     assert_eq!(postings.len(), 1);
@@ -261,7 +261,7 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     // from every query path, including counts.
     segment.deleted.insert(doc_id);
     let mut cursor = FtsCursor::new(&attachment);
-    cursor.segments = vec![segment];
+    cursor.segments = std::vec![segment];
     cursor.snapshot_loaded = true;
     cursor.ensure_searcher().unwrap();
     let searcher = cursor.searcher.as_ref().unwrap();
