@@ -610,8 +610,8 @@ fn bench_delete_performance(criterion: &mut Criterion) {
          CREATE INDEX clear_target_data ON clear_target(data); \
          CREATE INDEX clear_target_bucket ON clear_target(bucket)";
     let seed_source = format!(
-        "WITH RECURSIVE c(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM c WHERE x < {}) \
-         INSERT INTO source SELECT x, printf('data_%d', x), x % 1000 FROM c",
+        "INSERT INTO source \
+         SELECT value, printf('data_%d', value), value % 1000 FROM generate_series(0, {})",
         DELETE_ALL_ROWS - 1
     );
 
@@ -658,6 +658,7 @@ fn bench_delete_performance(criterion: &mut Criterion) {
         sqlite_conn
             .pragma_update(None, "synchronous", "OFF")
             .unwrap();
+        rusqlite::vtab::series::load_module(&sqlite_conn).unwrap();
         sqlite_conn.execute(&seed_source, []).unwrap();
 
         group.bench_function(BenchmarkId::new("sqlite", "delete_all_three_btrees"), |b| {

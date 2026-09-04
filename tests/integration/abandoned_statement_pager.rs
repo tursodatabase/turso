@@ -54,6 +54,7 @@ fn expect_unfinished_write_commit_error(result: turso_core::Result<()>, context:
 /// Steps `sql` until the `target_io`-th `StepResult::IO`, completes that I/O,
 /// then drops the statement without stepping it again. Returns false if the
 /// statement finished before reaching `target_io` I/Os.
+#[must_use]
 fn abandon_statement_after_io_completion(
     conn: &Arc<Connection>,
     io: &Arc<MemoryYieldIO>,
@@ -83,6 +84,7 @@ fn abandon_statement_after_io_completion(
 /// Steps `sql` until the `target_io`-th `StepResult::IO` and drops the
 /// statement while that I/O is still pending. Returns false if the statement
 /// finished before reaching `target_io` I/Os.
+#[must_use]
 fn abandon_statement_before_io_completion(
     conn: &Arc<Connection>,
     io: &Arc<MemoryYieldIO>,
