@@ -1413,6 +1413,12 @@ impl HashTable {
         self.current_spill_partition_idx = 0;
         self.loaded_partitions_lru.borrow_mut().clear();
         self.loaded_partitions_mem = 0;
+        self.probe_spill_state = None;
+        self.grace_state = None;
+        self.matched_bits.clear();
+        self.unmatched_scan_bucket = 0;
+        self.unmatched_scan_entry = 0;
+        self.unmatched_scan_partition = 0;
         Ok(())
     }
 
@@ -2892,6 +2898,9 @@ impl HashTable {
     /// Returns true if there are partitions to process. No IO.
     pub fn grace_begin(&mut self) -> Result<bool> {
         if self.probe_spill_state.is_none() || self.spill_state.is_none() {
+            self.grace_state = None;
+            self.probe_spill_state = None;
+            self.state = HashTableState::Probing;
             return Ok(false);
         }
 
@@ -2907,6 +2916,9 @@ impl HashTable {
         };
 
         if partitions_to_process.is_empty() {
+            self.grace_state = None;
+            self.probe_spill_state = None;
+            self.state = HashTableState::Probing;
             return Ok(false);
         }
 
@@ -2945,6 +2957,9 @@ impl HashTable {
         loop {
             let grace = self.grace_state.as_ref().expect("grace state must exist");
             if grace.partition_list_idx >= grace.partitions_to_process.len() {
+                self.grace_state = None;
+                self.probe_spill_state = None;
+                self.state = HashTableState::Probing;
                 return Ok(IOResult::Done(false));
             }
 
@@ -3038,7 +3053,14 @@ impl HashTable {
         grace.probe_entries.clear();
         grace.probe_entry_cursor = 0;
         grace.load_state = GracePartitionLoadState::NeedBuildLoad;
-        grace.partition_list_idx < grace.partitions_to_process.len()
+        if grace.partition_list_idx < grace.partitions_to_process.len() {
+            true
+        } else {
+            self.grace_state = None;
+            self.probe_spill_state = None;
+            self.state = HashTableState::Probing;
+            false
+        }
     }
 
     /// Free all in-memory build partitions (InMemory state).

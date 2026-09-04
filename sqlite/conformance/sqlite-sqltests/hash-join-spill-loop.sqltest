@@ -1,0 +1,23 @@
+@database :memory:
+
+# Regression test for #8660: Spilled hash join duplicates rows when it runs more than once
+setup schema {
+    CREATE TABLE b AS SELECT zeroblob(8185) AS x;
+    CREATE TABLE a AS SELECT * FROM b UNION ALL SELECT * FROM b;
+}
+
+@setup schema
+test hash-join-spill-loop-repro {
+    SELECT count(*) FROM a AS outer_row, a JOIN b ON a.x = b.x;
+}
+expect {
+    4
+}
+
+@setup schema
+test hash-join-spill-loop-multiple-rows {
+    SELECT count(*) FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3), a JOIN b ON a.x = b.x;
+}
+expect {
+    6
+}
