@@ -142,7 +142,7 @@ fn build_and_load_segment(
     attachment: &FtsIndexAttachment,
     docs: &[(i64, &str)],
 ) -> (LoadedSegment, Vec<PendingRow>) {
-    let mut cursor_docs = Vec::new();
+    let mut cursor_docs = vec![];
     for (rowid, text) in docs {
         let mut doc = TantivyDocument::default();
         doc.add_i64(attachment.rowid_field, *rowid);
@@ -234,7 +234,7 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     // A file that is not named after the source segment is a bug, not
     // something to rename silently.
     let mut stray = files;
-    stray.insert(PathBuf::from("meta.json"), Arc::from(Vec::new()));
+    stray.insert(PathBuf::from("meta.json"), Arc::from(std::vec::Vec::new()));
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),
         Err(LimboError::InternalError(_))
