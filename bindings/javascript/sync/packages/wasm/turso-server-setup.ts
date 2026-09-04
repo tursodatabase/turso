@@ -83,10 +83,6 @@ export default async function setup() {
         startServer(localSyncServer, process.env.VITE_TURSO_DB_URL || 'http://localhost:10001'),
         startServer(localSyncServer, process.env.VITE_TURSO_MVCC_DB_URL || 'http://localhost:10002', mvccDatabase),
     ]);
-    // Keep the server's open MVCC connection, but force its first logical pull
-    // through the same page-base fallback used by a fresh hosted replica.
-    await rm(join(tempDir, 'remote.db-log'));
-
     return async () => {
         for (const child of children) {
             child.kill();

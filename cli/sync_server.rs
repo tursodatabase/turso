@@ -509,7 +509,13 @@ impl TursoSyncServer {
             return self.handle_logical_pull_updates(&req);
         }
 
-        self.handle_page_pull_updates(&req, PullUpdatesApplyMode::Incremental)
+        let apply_mode =
+            if self.conn.lock().unwrap().mvcc_enabled() && !req.client_revision.is_empty() {
+                PullUpdatesApplyMode::ReplaceBase
+            } else {
+                PullUpdatesApplyMode::Incremental
+            };
+        self.handle_page_pull_updates(&req, apply_mode)
     }
 
     fn handle_page_pull_updates(
@@ -1403,6 +1409,52 @@ mod tests {
         assert!(
             !body.is_empty(),
             "replacement pages must accompany the response"
+        );
+    }
+
+    /// A page revision proves continuity only with a WAL page stream. Once the same remote moves
+    /// to MVCC, applying its page image incrementally would combine incompatible journal states;
+    /// the server must explicitly require one complete replacement instead.
+    #[test]
+    fn existing_page_replica_receives_replace_base_after_remote_moves_to_mvcc() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (_db, conn) = open_file_database(db_path);
+        conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO messages VALUES (1, 'preserved')")
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        let mut request = pull_updates_request(PullUpdatesStreamKind::Pages);
+        request.client_revision = "17".to_string();
+        let response = server
+            .handle_pull_updates(&request.encode_to_vec())
+            .unwrap();
+        let (header, body) = decode_response_header(&response);
+
+        assert_eq!(
+            PullUpdatesProtocol::try_from(header.protocol).unwrap(),
+            PullUpdatesProtocol::MvccLogical
+        );
+        assert_eq!(
+            PullUpdatesApplyMode::try_from(header.apply_mode).unwrap(),
+            PullUpdatesApplyMode::ReplaceBase
+        );
+        assert!(header
+            .logical_resume_revision
+            .parse::<MvccLogicalRevision>()
+            .is_ok());
+        assert!(
+            !body.is_empty(),
+            "the replacement must include the page base"
         );
     }
 
