@@ -19,7 +19,7 @@ use crate::{
     io_yield_one,
     schema::{BTreeTable, Index},
     storage::{
-        pager::{BtreePageAllocMode, Pager},
+        pager::{BtreePageAllocMode, Pager, ParsedCell},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, CELL_PTR_SIZE_BYTES,
@@ -798,6 +798,15 @@ pub struct BTreeCursor {
     stack: PageStack,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
+    /// Cell metadata parsed at most once per cursor position and shared by
+    /// `rowid()` and `record()`. Cleared by
+    /// `invalidate_record()` whenever the cursor moves, alongside the record
+    /// cache above. Mirrors SQLite's cached cell info (btree.c getCellInfo).
+    /// Holding the page-backed payload slice is sound for the same reason
+    /// using it within one opcode is: the page stack pins the page while the
+    /// cursor is positioned on it, and every path that moves the cursor or
+    /// marks it for restore invalidates this cache before the next read.
+    cached_cell: Option<ParsedCell>,
     /// Information about the index key structure (sort order, collation, etc)
     pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
@@ -1096,6 +1105,7 @@ impl BTreeCursor {
                 stack: [const { None }; BTCURSOR_MAX_DEPTH + 1],
             },
             reusable_immutable_record: None,
+            cached_cell: None,
             index_info: None,
             count: 0,
             context: None,
@@ -2211,11 +2221,13 @@ impl BTreeCursor {
         let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
         self.stack.set_cell_index(cur_cell_idx as i32);
 
-        let (payload, payload_size, first_overflow_page) = self
+        let cell = self
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
             .cell_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
+        let (payload, payload_size, first_overflow_page) =
+            (cell.payload, cell.payload_size, cell.first_overflow_page);
 
         if let Some(next_page) = first_overflow_page {
             let res = self.process_overflow_read(payload, next_page, payload_size)?;
@@ -2648,11 +2660,13 @@ impl BTreeCursor {
         let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
         self.stack.set_cell_index(cur_cell_idx as i32);
 
-        let (payload, payload_size, first_overflow_page) = self
+        let cell = self
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
             .cell_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
+        let (payload, payload_size, first_overflow_page) =
+            (cell.payload, cell.payload_size, cell.first_overflow_page);
 
         if let Some(next_page) = first_overflow_page {
             let res = self.process_overflow_read(payload, next_page, payload_size)?;
@@ -6040,6 +6054,23 @@ impl BTreeCursor {
         self.reusable_immutable_record.as_ref()
     }
 
+    /// Parses the cell the cursor is positioned on, at most once per
+    /// position (SQLite's getCellInfo). Callers must have handled
+    /// `needs_restore()` and checked `has_record()` first.
+    fn parsed_cell(&mut self) -> Result<ParsedCell> {
+        if let Some(cell) = self.cached_cell {
+            return Ok(cell);
+        }
+        let cell = {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            let cell_idx = self.stack.current_cell_index();
+            contents.cell_read_payload_ptr(cell_idx as usize, self.usable_space())?
+        };
+        self.cached_cell = Some(cell);
+        Ok(cell)
+    }
+
     pub fn is_write_in_progress(&self) -> bool {
         matches!(self.state, CursorState::Write(_))
     }
@@ -6423,17 +6454,17 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(None));
         }
         if self.has_record() {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            let page_type = contents.page_type()?;
-            if page_type.is_table() {
-                let cell_idx = self.stack.current_cell_index();
-                let rowid = contents.cell_table_leaf_read_rowid(cell_idx as usize)?;
-                Ok(IOResult::Done(Some(rowid)))
-            } else {
-                let _ = return_if_io!(self.record());
-                Ok(IOResult::Done(self.get_index_rowid_from_record()))
+            if let Some(rowid) = self.parsed_cell()?.rowid {
+                return Ok(IOResult::Done(Some(rowid)));
             }
+            // Index cell: the rowid lives inside the record. Cache it in the
+            // parsed cell so repeated reads skip the record walk.
+            let _ = return_if_io!(self.record());
+            let rowid = self.get_index_rowid_from_record();
+            if let Some(cell) = self.cached_cell.as_mut() {
+                cell.rowid = rowid;
+            }
+            Ok(IOResult::Done(rowid))
         } else {
             Ok(IOResult::Done(None))
         }
@@ -6493,12 +6524,9 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(self.reusable_immutable_record.as_ref()));
         }
 
-        let page = self.stack.top_ref();
-        let contents = page.get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        let (payload, payload_size, first_overflow_page) =
-            contents.cell_read_payload_ptr(cell_idx as usize, self.usable_space())?;
-        if let Some(next_page) = first_overflow_page {
+        let cell = self.parsed_cell()?;
+        let (payload, payload_size) = (cell.payload, cell.payload_size);
+        if let Some(next_page) = cell.first_overflow_page {
             return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
         } else {
             self.get_immutable_record_or_create()?
@@ -6523,6 +6551,7 @@ impl CursorTrait for BTreeCursor {
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
+        self.cached_cell = None;
         self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
             self.set_has_record(true);
@@ -6550,6 +6579,7 @@ impl CursorTrait for BTreeCursor {
             // blob cursors whether the deletion hits their pinned row.
             let deleted_rowid = self.current_table_leaf_rowid();
             return_if_io!(self.drive_pending_peer_save(deleted_rowid));
+            self.cached_cell = None;
             self.invalidate_count_cache();
             self.state = CursorState::Delete(DeleteState::Start);
         }
@@ -7183,6 +7213,7 @@ impl CursorTrait for BTreeCursor {
 
     #[inline]
     fn invalidate_record(&mut self) {
+        self.cached_cell = None;
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }

@@ -109,6 +109,22 @@ impl HeaderRefMut {
     }
 }
 
+/// Everything one parse of a b-tree cell yields: the record payload location
+/// plus, for table-leaf cells, the rowid. Mirrors SQLite's `btreeParseCell`
+/// into `BtCursor.info`, so one parse per row serves both `RowId` and
+/// `Column` opcodes.
+#[derive(Clone, Copy)]
+pub struct ParsedCell {
+    /// Record payload bytes local to the page. Valid as long as the page is
+    /// alive and unmodified.
+    pub payload: &'static [u8],
+    /// Total record payload size, including any overflow-page part.
+    pub payload_size: u64,
+    pub first_overflow_page: Option<u32>,
+    /// Rowid, for table-leaf cells only.
+    pub rowid: Option<i64>,
+}
+
 pub struct PageInner {
     pub flags: AtomicUsize,
     pub id: usize,
@@ -450,20 +466,19 @@ impl PageInner {
     /// This bypasses the full `cell_get()` to `read_btree_cell()` path for
     /// record reads and index binary-search hot loops.
     /// The returned slice is valid as long as the page is alive.
-    ///
-    /// Returns: (payload_slice, payload_size, first_overflow_page)
     #[inline(always)]
     pub fn cell_read_payload_ptr(
         &self,
         idx: usize,
         usable_size: usize,
-    ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
+    ) -> crate::Result<ParsedCell> {
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_offset = self.read_u16(cell_pointer) as usize;
 
         let page_type = self.page_type()?;
+        let mut rowid = None;
         let (payload_size, payload_start) = match page_type {
             PageType::IndexInterior => {
                 let (size, len) =
@@ -479,8 +494,9 @@ impl PageInner {
                 let (size, payload_size_len) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset..))?;
                 let rowid_start = cell_offset + payload_size_len;
-                let (_, rowid_len) =
+                let (rowid_value, rowid_len) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, rowid_start..))?;
+                rowid = Some(rowid_value as i64);
                 (size, rowid_start + rowid_len)
             }
             PageType::TableInterior => {
@@ -540,7 +556,12 @@ impl PageInner {
             (slice, None)
         };
 
-        Ok((payload_slice, payload_size, first_overflow))
+        Ok(ParsedCell {
+            payload: payload_slice,
+            payload_size,
+            first_overflow_page: first_overflow,
+            rowid,
+        })
     }
 
     #[inline]
