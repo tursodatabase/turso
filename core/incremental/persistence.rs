@@ -64,6 +64,9 @@ impl ReadRecord {
     }
 }
 
+/// Each arm issues exactly one cursor op and advances only after it returns `Done`:
+/// `IOResult::IO` means "call me again", so advancing first abandons an in-flight
+/// balance. Seeks therefore get their own arm.
 #[derive(Debug, Default)]
 pub enum WriteRow {
     #[default]
