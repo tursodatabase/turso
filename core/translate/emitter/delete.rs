@@ -43,12 +43,21 @@ pub fn emit_program_for_delete(
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
 ) -> Result<()> {
-    if emit_clear_btree_delete(connection, resolver, program, &plan)? {
-        program.result_columns = plan.result_columns;
-        program.table_references.extend(plan.table_references);
-        return Ok(());
+    if !emit_clear_btree_delete(connection, resolver, program, &plan)? {
+        emit_row_loop_delete(connection, resolver, program, &mut plan)?;
     }
 
+    program.result_columns = plan.result_columns;
+    program.table_references.extend(plan.table_references);
+    Ok(())
+}
+
+fn emit_row_loop_delete(
+    connection: &Arc<Connection>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    plan: &mut DeletePlan,
+) -> Result<()> {
     let mut t_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
@@ -279,9 +288,6 @@ pub fn emit_program_for_delete(
         program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
-    // Finalize program
-    program.result_columns = plan.result_columns;
-    program.table_references.extend(plan.table_references);
     Ok(())
 }
 

@@ -113,7 +113,6 @@ expect {
     1|name-1|1
 }
 
-@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 @cross-check-integrity
 test delete-all-empty-keeps-autoincrement-watermark {
     CREATE TABLE numbered(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
