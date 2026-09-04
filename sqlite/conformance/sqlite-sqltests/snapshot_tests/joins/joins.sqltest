@@ -1059,3 +1059,44 @@ snapshot hash-join-left-outer-agg {
     GROUP BY h.customer_name
     ORDER BY h.customer_name;
 }
+
+setup right_join_separate_index_cursor_schema {
+    CREATE TABLE separate_index_left(a INTEGER);
+    CREATE TABLE separate_index_right(a INTEGER, b INTEGER);
+    CREATE INDEX separate_index_right_expr
+        ON separate_index_right(a,coalesce(b,7));
+}
+
+# The result body keeps the main index cursor in its null-row state. The
+# unmatched-right read uses a separate cursor for the same index.
+@setup right_join_separate_index_cursor_schema
+snapshot right-join-uses-a-separate-index-cursor-for-unmatched-rows {
+    SELECT left_row.a, right_row.a, coalesce(right_row.b,7)
+      FROM separate_index_left AS left_row
+      RIGHT JOIN separate_index_right AS right_row
+                   INDEXED BY separate_index_right_expr
+        ON left_row.a=right_row.a
+     WHERE right_row.a=5;
+}
+
+setup right_join_grouped_expression_index_schema {
+    CREATE TABLE grouped_expr_left(a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX grouped_expr_left_idx
+        ON grouped_expr_left(a, a+b);
+    INSERT INTO grouped_expr_left VALUES
+        (1,2),(4,8),(16,32),(4,80),(1,-300);
+    CREATE TABLE grouped_expr_right(x INTEGER, y INTEGER);
+    INSERT INTO grouped_expr_right SELECT a,b FROM grouped_expr_left;
+    INSERT INTO grouped_expr_right VALUES(99,99);
+}
+
+# The sorter must save the expression value. During the unmatched-right pass,
+# IfNullRow computes that value before SorterInsert reads it.
+@setup right_join_grouped_expression_index_schema
+snapshot right-join-group-by-keeps-expression-index-value {
+    SELECT left_row.a, sum(left_row.a+left_row.b)
+      FROM grouped_expr_left AS left_row
+      RIGHT JOIN grouped_expr_right ON left_row.a=x
+     GROUP BY left_row.a
+     ORDER BY left_row.a;
+}
