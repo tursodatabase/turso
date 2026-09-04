@@ -18,6 +18,7 @@ filegroup(
     srcs = glob([
         "perf/clickbench/*.sql",
         "perf/graph-queries/queries/*.sql",
+        "perf/job/*.sql",
         "perf/job/queries/*.sql",
         "perf/tpc-ds/**/*.sql",
     ]),

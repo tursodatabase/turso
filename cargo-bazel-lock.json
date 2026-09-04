@@ -1,5 +1,5 @@
 {
-  "checksum": "e420e48343cbc0818626c0336aeeabaac59b4b071846af75709e3be624742e9a",
+  "checksum": "5a81e77aa2f35dbc9c2d3971399326c448e93406458e03068d6c8c62e3559bd6",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -37956,6 +37956,9 @@
           "Win32_Foundation",
           "Win32_Globalization",
           "Win32_Security",
+          "Win32_Security_Authentication",
+          "Win32_Security_Authentication_Identity",
+          "Win32_Security_Credentials",
           "Win32_Security_Cryptography",
           "Win32_Storage",
           "Win32_Storage_FileSystem",
@@ -37966,6 +37969,7 @@
           "Win32_System_Diagnostics_Debug",
           "Win32_System_IO",
           "Win32_System_Ioctl",
+          "Win32_System_LibraryLoader",
           "Win32_System_Memory",
           "Win32_System_Pipes",
           "Win32_System_SystemInformation",

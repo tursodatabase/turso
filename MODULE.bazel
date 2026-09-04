@@ -104,6 +104,24 @@ crate.annotation(
     repositories = ["crates"],
     rustc_flags = ["--cfg=tokio_unstable"],
 )
+crate.annotation(
+    crate = "windows-sys",
+    crate_features = [
+        "Win32",
+        "Win32_Foundation",
+        "Win32_Security",
+        "Win32_Security_Authentication",
+        "Win32_Security_Authentication_Identity",
+        "Win32_Security_Credentials",
+        "Win32_Security_Cryptography",
+        "Win32_System",
+        "Win32_System_LibraryLoader",
+        "Win32_System_Memory",
+        "Win32_System_SystemInformation",
+    ],
+    repositories = ["crates"],
+    version = "0.61.2",
+)
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",

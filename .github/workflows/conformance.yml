@@ -31,6 +31,7 @@ jobs:
           bazel build //bindings/javascript:turso_node_cdylib
           cp bazel-bin/bindings/javascript/libturso_node.so \
             bindings/javascript/packages/native/turso.linux-x64-gnu.node
+          cd bindings/javascript
           yarn workspace @tursodatabase/database-common build
       - name: Install test dependencies
         working-directory: testing/conformance/javascript
