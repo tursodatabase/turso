@@ -2,13 +2,16 @@ use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, RecursiveCteInput,
-        Schema, Table, ROWID_SENTINEL,
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnVisibility,
+        PseudoCursorType, RecursiveCteInput, Schema, Table, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
+        expr::{
+            as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
+            StorageClassMask,
+        },
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -1005,14 +1008,15 @@ pub enum IterationDirection {
     Backwards,
 }
 
-pub fn select_star(
-    tables: &[JoinedTable],
+/// Add the columns selected by `*` and record each column read.
+pub(super) fn expand_star(
+    table_references: &mut TableReferences,
     out_columns: &mut Vec<ResultSetColumn>,
-    right_join_swapped: bool,
     long_names: bool,
 ) -> crate::Result<()> {
+    let tables = table_references.joined_tables();
     // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
-    let table_iter: Vec<&JoinedTable> = if right_join_swapped {
+    let table_iter: Vec<&JoinedTable> = if table_references.right_join_swapped() {
         tables.iter().rev().collect()
     } else {
         tables.iter().collect()
@@ -1044,7 +1048,7 @@ pub fn select_star(
                 .filter_map(|t| t.join_info.as_ref())
                 .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
                 .collect();
-            for col in table.columns().iter().filter(|c| !c.hidden()) {
+            for (_, col) in table.columns_for_star() {
                 if let Some(col_name) = &col.name {
                     let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
                     if !in_using {
@@ -1059,50 +1063,179 @@ pub fn select_star(
         }
         out_columns.extend(
             table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(_, col)| !col.hidden())
-                .filter(|(_, col)| {
+                .columns_for_star()
+                .filter(|(_, column)| {
                     // If we are joining with USING, we need to deduplicate the columns from the right table
                     // that are also present in the USING clause.
-                    if let Some(join_info) = &table.join_info {
-                        !join_info.using.iter().any(|using_col| {
-                            col.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
-                        })
-                    } else {
-                        true
-                    }
+                    !table.join_info.as_ref().is_some_and(|join| {
+                        column
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| join.merges_column(name))
+                    })
                 })
-                .map(|(i, col)| {
-                    // Like SQLite, SELECT * sets column names as aliases (ENAME_NAME),
-                    // bypassing full/short column name logic in get_column_name().
-                    // When long_names (full=ON, short=OFF), use "TABLE.COLUMN".
-                    // Otherwise, use just "COLUMN".
-                    let alias = col.name.as_ref().map(|col_name| {
-                        if long_names {
-                            format!("{}.{}", table.identifier, col_name)
-                        } else {
-                            col_name.clone()
-                        }
-                    });
-                    ResultSetColumn {
-                        alias,
-                        implicit_column_name: None,
-                        expr: ast::Expr::Column {
-                            database: None,
-                            table: table.internal_id,
-                            column: i,
-                            is_rowid_alias: col.is_rowid_alias(),
-                        },
-                        contains_aggregates: false,
-                    }
-                }),
+                .map(|(column_index, _)| star_result_column(table, column_index, long_names)),
         );
     }
+    for table in table_references.joined_tables_mut() {
+        for column_index in 0..table.columns().len() {
+            if !table.column_is_hidden_from_star(column_index) {
+                table.mark_column_used(column_index);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Add the columns selected by `<table>.*` and record each column read.
+pub(super) fn expand_table_star(
+    table_references: &mut TableReferences,
+    out_columns: &mut Vec<ResultSetColumn>,
+    table_name: &str,
+    long_names: bool,
+) -> crate::Result<()> {
+    let normalized_name = crate::util::normalize_ident(table_name);
+    let tables = table_references.joined_tables();
+
+    let is_direct_match = |table: &JoinedTable| {
+        !matches!(
+            &table.table,
+            Table::FromClauseSubquery(subquery)
+                if subquery.parenthesized_join_columns.is_some()
+        ) && table.identifier == normalized_name
+    };
+    let direct_match_count = tables.iter().filter(|table| is_direct_match(table)).count();
+    let first_direct_match = tables.iter().find(|table| is_direct_match(table));
+    if direct_match_count > 1 {
+        let first_table =
+            first_direct_match.expect("the direct match count proved that this table exists");
+        let column_name = first_table
+            .columns()
+            .iter()
+            .find(|column| !column.hidden())
+            .and_then(|column| column.name.as_deref())
+            .unwrap_or("?");
+        crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, column_name);
+    }
+
+    let saved_name_has_column = |column_name: &str| {
+        tables.iter().any(|table| {
+            matches!(
+                &table.table,
+                Table::FromClauseSubquery(subquery)
+                    if subquery.parenthesized_join_columns.as_ref().is_some_and(|columns| {
+                        columns.iter().any(|column| {
+                            !column.source.is_rowid()
+                                && column.source.matches_table(None, &normalized_name)
+                                && column.source.matches_column_name(column_name)
+                        })
+                    })
+            )
+        })
+    };
+    // SQLite binds each column after it expands `<table>.*`. A direct table
+    // and a saved inner name conflict only when both contain that column.
+    if let Some(column_name) = first_direct_match.and_then(|table| {
+        table
+            .columns_for_star()
+            .filter_map(|(_, column)| column.name.as_deref())
+            .find(|column_name| saved_name_has_column(column_name))
+    }) {
+        crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, column_name);
+    }
+
+    let mut matching_columns = Vec::new();
+    for (table_index, table) in tables.iter().enumerate() {
+        if let Table::FromClauseSubquery(subquery) = &table.table {
+            if let Some(join_columns) = &subquery.parenthesized_join_columns {
+                // SQLite lets `<table>.*` use saved inner table names, but it
+                // does not let the alias of the generated join group qualify `*`.
+                matching_columns.extend(
+                    join_columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, saved_column)| {
+                            !saved_column.source.is_rowid()
+                                && saved_column.source.matches_table(None, &normalized_name)
+                        })
+                        .map(|(column_index, _)| (table_index, column_index)),
+                );
+                continue;
+            }
+        }
+        if table.identifier == normalized_name {
+            matching_columns.extend(
+                table
+                    .columns_for_star()
+                    .map(|(column_index, _)| (table_index, column_index)),
+            );
+        }
+    }
+    if matching_columns.is_empty() {
+        crate::bail_parse_error!("no such table: {}", table_name);
+    }
+
+    let mut used_columns = Vec::new();
+    for (table_index, mut column_index) in matching_columns {
+        let table = &tables[table_index];
+        // SQLite cannot add a nameless column to a qualified star result.
+        if table.columns()[column_index].name.is_none() {
+            continue;
+        }
+        if tables.len() == 1
+            && matches!(
+                &table.table,
+                Table::FromClauseSubquery(subquery)
+                    if subquery.parenthesized_join_columns.is_some()
+            )
+        {
+            // SQLite emits a bare generated name in this case. Rebinding that
+            // name can find several sources, or none after a numeric suffix.
+            let column_name = table.columns()[column_index]
+                .name
+                .as_deref()
+                .expect("the nameless-column check returned early");
+            let Some(rebound_column) = find_unqualified_column(&table.table, column_name)? else {
+                crate::bail_parse_error!("no such column: {}", column_name);
+            };
+            column_index = rebound_column;
+        }
+        out_columns.push(star_result_column(table, column_index, long_names));
+        used_columns.push((table.internal_id, column_index));
+    }
+    for (table_id, column_index) in used_columns {
+        table_references.mark_column_used(table_id, column_index);
+    }
+    Ok(())
+}
+
+/// Build one result column from a star expansion.
+fn star_result_column(
+    table: &JoinedTable,
+    column_index: usize,
+    long_names: bool,
+) -> ResultSetColumn {
+    let column = &table.columns()[column_index];
+    // SQLite gives star outputs explicit names. This bypasses the normal
+    // short-name and full-name rules for expression results.
+    let alias = column.name.as_ref().map(|column_name| {
+        if long_names {
+            format!("{}.{}", table.identifier, column_name)
+        } else {
+            column_name.clone()
+        }
+    });
+    ResultSetColumn {
+        alias,
+        implicit_column_name: None,
+        expr: ast::Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: column_index,
+            is_rowid_alias: column.is_rowid_alias(),
+        },
+        contains_aggregates: false,
+    }
 }
 
 /// The type of join between two tables.
@@ -1130,6 +1263,13 @@ pub struct JoinInfo {
 }
 
 impl JoinInfo {
+    /// Return true when `USING` or `NATURAL` merges this column.
+    pub fn merges_column(&self, column_name: &str) -> bool {
+        self.using
+            .iter()
+            .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
+    }
+
     /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
     pub fn is_outer(&self) -> bool {
         matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
@@ -2405,7 +2545,7 @@ impl Operation {
     }
 }
 
-fn query_output_columns(
+pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
 ) -> Result<alloc::Vec<Column>> {
@@ -2543,6 +2683,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(Plan::Select(Box::new(plan))),
             columns,
+            parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte: None,
@@ -2589,6 +2730,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte,
@@ -2641,6 +2783,34 @@ impl JoinedTable {
 
     pub fn columns(&self) -> &[Column] {
         self.table.columns()
+    }
+
+    /// Return the columns that an unqualified `*` can include.
+    pub(super) fn columns_for_star(&self) -> impl Iterator<Item = (usize, &Column)> {
+        self.columns()
+            .iter()
+            .enumerate()
+            .filter(|(column_index, _)| !self.column_is_hidden_from_star(*column_index))
+    }
+
+    /// Return true when `*` must omit a column from this table reference.
+    ///
+    /// Parenthesized joins keep source copies and rowids for qualified names.
+    /// SQLite does not show those extra values in an unqualified star.
+    fn column_is_hidden_from_star(&self, column_index: usize) -> bool {
+        let column = &self.columns()[column_index];
+        if column.hidden() {
+            return true;
+        }
+        let Table::FromClauseSubquery(subquery) = &self.table else {
+            return false;
+        };
+        let Some(join_columns) = &subquery.parenthesized_join_columns else {
+            return false;
+        };
+        let saved_column = &join_columns[column_index];
+        saved_column.visibility != ParenthesizedJoinColumnVisibility::Visible
+            || saved_column.source.is_rowid()
     }
 
     /// Mark a column as used in the query.

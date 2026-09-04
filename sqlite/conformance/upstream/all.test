@@ -591,7 +591,7 @@ set test_files {
   tkt-6bfb98dfc0       pass
   tkt-752e1646fc       pass
   tkt-78e04e52ea       fail
-  tkt-7a31705a7e6      fail
+  tkt-7a31705a7e6      pass
   tkt-7bbfb7d442       pass
   tkt-80ba201079       fail
   tkt-80e031a00f       fail
@@ -701,7 +701,7 @@ set test_files {
   tkt3841              pass
   tkt3871              fail
   tkt3879              pass
-  tkt3911              fail
+  tkt3911              pass
   tkt3918              fail
   tkt3922              pass
   tkt3929              pass

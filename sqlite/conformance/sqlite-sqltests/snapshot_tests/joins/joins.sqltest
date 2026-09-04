@@ -812,6 +812,43 @@ snapshot-eqp self-join-prefer-join-dependent-index {
       AND x2.id IS NULL;
 }
 
+setup parenthesized_join_snapshot_schema {
+    CREATE TABLE nested_prune_outer(id INTEGER, value TEXT);
+    CREATE TABLE nested_prune_left(id INTEGER, value TEXT);
+    CREATE TABLE nested_prune_right(id INTEGER, value TEXT);
+}
+
+# A top-level group does not need a generated subquery. SQLite keeps the joins
+# in their written order and compiles one join loop.
+@setup parenthesized_join_snapshot_schema
+snapshot top-level-parenthesized-join-does-not-use-coroutine {
+    SELECT nested_prune_left.value, nested_prune_right.value
+      FROM (nested_prune_left LEFT JOIN nested_prune_right USING(id))
+      JOIN nested_prune_outer USING(id);
+}
+
+# A qualified rowid is part of the generated result only when the outer query
+# reads it.
+@setup parenthesized_join_snapshot_schema
+snapshot parenthesized-join-keeps-used-rowid {
+    SELECT nested_prune_left.rowid
+      FROM nested_prune_outer
+      JOIN (nested_prune_left JOIN nested_prune_right USING(id)) USING(id);
+}
+
+# SQLite does not remove unused result expressions when the generated join
+# reads a value from an outer query.
+@setup parenthesized_join_snapshot_schema
+snapshot correlated-parenthesized-join-keeps-result-expressions {
+    SELECT (
+        SELECT grouped_left.value
+          FROM nested_prune_right AS scalar_anchor
+          JOIN (nested_prune_left AS grouped_left
+                JOIN nested_prune_right AS grouped_right
+                  ON grouped_left.id=outer_row.id)
+    )
+      FROM nested_prune_outer AS outer_row;
+}
 # =============================================================================
 # Hash Join Snapshot Tests
 # =============================================================================
