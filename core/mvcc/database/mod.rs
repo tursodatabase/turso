@@ -29,6 +29,7 @@ use crate::translate::plan::IterationDirection;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
+use crate::types::IOResultOr;
 use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
@@ -1719,7 +1720,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn new(
         state: CommitState<Clock, A>,
         tx_id: TxID,
@@ -1728,9 +1728,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
-        sync_mode: SyncMode,
-    ) -> Self {
-        let pager = connection.pager.load().clone();
+    ) -> Result<Self> {
+        let pager = connection.get_pager_from_database_index(&db_id)?;
+        let sync_mode = connection.get_sync_mode_for_database(db_id)?;
         // Use the connection's tx-level schema_did_change flag as the
         // single source of truth.  This flag is set by SetCookie(SchemaVersion)
         // which every DDL emits, so it covers all schema-changing operations
@@ -1742,7 +1742,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 schema_did_change: true
             }
         );
-        Self {
+        Ok(Self {
             state,
             is_finalized: false,
             #[cfg(any(test, injected_yields))]
@@ -1760,7 +1760,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             wrote_logical_log: false,
             sync_mode,
             _phantom: PhantomData,
-        }
+        })
     }
 
     fn release_group_claim(&mut self) {
@@ -3662,10 +3662,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if appended_to_log && mvcc_store.storage.should_checkpoint() {
-                    let auto_checkpoint_mode = if self
-                        .connection
-                        .experimental_mvcc_passive_checkpoint_enabled()
-                    {
+                    let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
                             upper_bound_inclusive: None,
                         }
@@ -3679,7 +3676,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.clone(),
                         self.connection.clone(),
                         false,
-                        self.connection.get_sync_mode(),
+                        self.sync_mode,
                         self.db_id,
                         auto_checkpoint_mode,
                     ));
@@ -4932,7 +4929,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         connection: &Arc<Connection>,
         st: &mut InitMetadataTableState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match st {
                 InitMetadataTableState::Start => {
@@ -4986,7 +4983,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         connection: &Arc<Connection>,
         st: &mut ReadPersistentTxTsMaxState,
-    ) -> Result<IOResult<Option<u64>>> {
+    ) -> IOResultOr<Option<u64>> {
         loop {
             match st {
                 ReadPersistentTxTsMaxState::Start => {
@@ -5002,7 +4999,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         Err(err) => {
                             return Err(LimboError::Corrupt(format!(
                                 "Failed to read MVCC metadata table: {err}"
-                            )));
+                            ))
+                            .into());
                         }
                     };
                     match maybe_stmt {
@@ -5015,7 +5013,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         // No statement to run — fall through to the missing-row
                         // error path (matches the blocking variant).
                         None => {
-                            return Self::validate_persistent_tx_ts_max(None).map(IOResult::Done);
+                            return Self::validate_persistent_tx_ts_max(None)
+                                .map(IOResult::Done)
+                                .map_err(Into::into);
                         }
                     }
                 }
@@ -5026,7 +5026,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }));
                     let value = *value;
                     *st = ReadPersistentTxTsMaxState::Start;
-                    return Self::validate_persistent_tx_ts_max(value).map(IOResult::Done);
+                    return Self::validate_persistent_tx_ts_max(value)
+                        .map(IOResult::Done)
+                        .map_err(Into::into);
                 }
             }
         }
@@ -5054,7 +5056,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         bootstrap_conn: &Arc<Connection>,
         st: &mut BootstrapState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match st {
                 BootstrapState::Start => {
@@ -7117,8 +7119,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             db_id,
             self.commit_coordinator.clone(),
             self.global_header.clone(),
-            connection.get_sync_mode(),
-        ));
+        )?);
         let state_machine = StateMachine::new(state);
         Ok(state_machine)
     }
@@ -7713,6 +7714,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             snapshot_ts = last_committed.min(inflight_floor.saturating_sub(1));
         });
         snapshot_ts
+    }
+
+    pub(crate) fn uses_passive_checkpoint(&self) -> bool {
+        self.experimental_mvcc_passive_checkpoint
     }
 
     /// Try to enter the passive publish window. Returns false if another publish is in flight.
@@ -8891,7 +8896,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         connection: &Arc<Connection>,
         st: &mut CompleteCheckpointState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let pager = connection.pager.load().clone();
         let Some(wal) = &pager.wal else {
             return Ok(IOResult::Done(()));
@@ -8932,7 +8937,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         return Err(LimboError::Corrupt(
                             "Cannot reconcile interrupted MVCC checkpoint in read-only mode"
                                 .to_string(),
-                        ));
+                        )
+                        .into());
                     }
                     match header_result {
                         HeaderReadResult::Valid(header) => {
@@ -8946,7 +8952,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 return Err(LimboError::Corrupt(
                                     "WAL has committed frames but logical log header is missing"
                                         .to_string(),
-                                ));
+                                )
+                                .into());
                             }
                         }
                         HeaderReadResult::Invalid => {
@@ -8955,7 +8962,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             return Err(LimboError::Corrupt(
                                 "WAL has committed frames but logical log header is invalid"
                                     .to_string(),
-                            ));
+                            )
+                            .into());
                         }
                     }
                     // Enter the checkpoint lifecycle before any WAL→DB backfill so
@@ -8998,7 +9006,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         // Close out the lifecycle opened in `ReadingHeader` so the
                         // start/end pairing stays balanced on this error path.
                         self.storage.on_checkpoint_end(Err(err.clone()))?;
-                        return Err(err);
+                        return Err(err.into());
                     }
                     let need_db_sync = connection.get_sync_mode() != SyncMode::Off
                         && checkpoint_result.wal_checkpoint_backfilled > 0;
@@ -9010,7 +9018,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             Ok(c) => c,
                             Err(err) => {
                                 self.storage.on_checkpoint_end(Err(err.clone()))?;
-                                return Err(err);
+                                return Err(err.into());
                             }
                         };
                         *st = CompleteCheckpointState::AwaitDbFileSync {
@@ -9051,7 +9059,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             Ok(c) => c,
                             Err(err) => {
                                 self.storage.on_checkpoint_end(Err(err.clone()))?;
-                                return Err(err);
+                                return Err(err.into());
                             }
                         };
                         *phase = RetryHeaderPhase::AwaitUpdateHeader(c);
@@ -9066,7 +9074,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 Ok(c) => c,
                                 Err(err) => {
                                     self.storage.on_checkpoint_end(Err(err.clone()))?;
-                                    return Err(err);
+                                    return Err(err.into());
                                 }
                             };
                             *phase = RetryHeaderPhase::AwaitLogSync(c);
@@ -9102,7 +9110,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     "Logical log header CRC mismatch after retry".to_string(),
                                 );
                                 self.storage.on_checkpoint_end(Err(err.clone()))?;
-                                return Err(err);
+                                return Err(err.into());
                             }
                             *retried_crc = true;
                             *phase = RetryHeaderPhase::NeedUpdateHeader;
@@ -9118,7 +9126,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             return Ok(IOResult::IO(c));
                         }
                         Err(err) => {
-                            self.storage.on_checkpoint_end(Err(err.clone()))?;
+                            self.storage.on_checkpoint_end(Err((*err).clone()))?;
                             return Err(err);
                         }
                     }
@@ -9321,7 +9329,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         connection: &Arc<Connection>,
         st: &mut RecoverLogicalLogState,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         loop {
             match st {
                 RecoverLogicalLogState::Start => {
@@ -9343,7 +9351,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             return Err(LimboError::Corrupt(
                                 "Logical log header corrupt and no WAL recovery available"
                                     .to_string(),
-                            ));
+                            )
+                            .into());
                         }
                     };
                     if let Some(header) = &header {
@@ -9379,7 +9388,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             None => {
                                 return Err(LimboError::Corrupt(
                                     "Missing MVCC metadata table".to_string(),
-                                ));
+                                )
+                                .into());
                             }
                         }
                     } else {
