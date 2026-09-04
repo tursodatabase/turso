@@ -5326,6 +5326,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "runfiles"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc1beaa13fbade520858d2f6ed799f2a963d0ef32d15506ccf290b6e14dfd560"
+
+[[package]]
 name = "rusqlite"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7383,6 +7389,7 @@ dependencies = [
  "cc",
  "env_logger",
  "libc",
+ "runfiles",
  "tempfile",
  "tracing",
  "tracing-appender",

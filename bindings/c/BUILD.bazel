@@ -1,4 +1,4 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library", "rust_static_library", "rust_test")
 
@@ -63,7 +63,7 @@ rust_test(
         crate_features = C_FEATURES,
         crate_root = path,
         data = ["//:testing/system/testing.db"],
-        deps = [":turso_sqlite3"] + all_crate_deps(normal = True, normal_dev = True),
+        deps = [":turso_sqlite3"] + crate_deps(["tempfile"]) + (["@rules_rust//tools/runfiles"] if name == "compat" else []) + all_crate_deps(normal = True),
         edition = crate_edition(),
         rustc_env = {"CARGO_MANIFEST_DIR": "bindings/c"},
     )

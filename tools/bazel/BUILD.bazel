@@ -10,5 +10,7 @@ sh_test(
 exports_files([
     "napi_build_wasi_link.patch",
     "rules_rust_wasip1_threads.patch",
+    "rules_rust_windows_dependency_argfiles.patch",
+    "rules_rust_windows_dependency_paths.patch",
     "run_rust_tests.sh",
 ])

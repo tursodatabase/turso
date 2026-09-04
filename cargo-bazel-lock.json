@@ -1,5 +1,5 @@
 {
-  "checksum": "4bc1c27b2765b5119162acb3826b9999a67ff8f6edd7a013b2241c5691c3c587",
+  "checksum": "e420e48343cbc0818626c0336aeeabaac59b4b071846af75709e3be624742e9a",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -25089,6 +25089,33 @@
       ],
       "version": "0.18.2"
     },
+    "runfiles 0.3.0": {
+      "common_attrs": {
+        "edition": "2018"
+      },
+      "library_target_name": "runfiles",
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "name": "runfiles",
+      "package_url": "https://github.com/bazelbuild/rules_rust/tree/main/rust/runfiles",
+      "repository": {
+        "Http": {
+          "sha256": "fc1beaa13fbade520858d2f6ed799f2a963d0ef32d15506ccf290b6e14dfd560",
+          "url": "https://static.crates.io/crates/runfiles/0.3.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "runfiles",
+            "crate_root": "runfiles.rs"
+          }
+        }
+      ],
+      "version": "0.3.0"
+    },
     "rusqlite 0.37.0": {
       "common_attrs": {
         "crate_features": [
@@ -34489,6 +34516,10 @@
         ],
         "deps_dev": [
           {
+            "id": "runfiles 0.3.0",
+            "target": "runfiles"
+          },
+          {
             "id": "tempfile 3.20.0",
             "target": "tempfile"
           }
@@ -40965,6 +40996,7 @@
     "quickcheck 1.0.3",
     "quickcheck_macros 1.0.0",
     "rstest 0.18.2",
+    "runfiles 0.3.0",
     "serial_test 3.3.1",
     "sorted-vec 0.8.6",
     "test-log 0.2.17"
