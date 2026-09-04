@@ -50,7 +50,7 @@ jobs:
       - name: Build native libraries
         shell: bash
         run: |
-          bazel build //sync/sdk-kit:turso_sync_sdk_kit_cdylib //cli:tursodb
+          bazel ${{ runner.os == 'Windows' && '--output_user_root=C:/b' || '' }} build //sync/sdk-kit:turso_sync_sdk_kit_cdylib //cli:tursodb
           mkdir -p target/debug
           cp bazel-bin/cli/tursodb target/debug/tursodb 2>/dev/null || \
             cp bazel-bin/cli/tursodb.exe target/debug/tursodb.exe

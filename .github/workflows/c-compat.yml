@@ -33,7 +33,7 @@ jobs:
         run: bazel test //bindings/c/... --lockfile_mode=error --test_output=errors --test_arg=--test-threads=1
       - name: Build and test Turso C bindings on Windows
         if: runner.os == 'Windows'
-        run: bazel test //bindings/c/... --jobs=1 --lockfile_mode=error --test_output=errors --test_arg=--test-threads=1
+        run: bazel test //bindings/c/... --jobs=1 --action_env=LIB="$env:VCPKG_ROOT\installed\x64-windows-static-md\lib;$env:LIB" --lockfile_mode=error --test_output=errors --test_arg=--test-threads=1
       - name: Run C tests against real SQLite
         if: runner.os == 'Linux'
         working-directory: bindings/c/tests
