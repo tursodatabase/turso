@@ -16,6 +16,7 @@ use crate::types::IOResultOr;
 use crate::types::{
     IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult, ValueRef,
 };
+use crate::vdbe::execute::{classify_numeric_arg, NumericArg};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeMap;
@@ -459,15 +460,141 @@ pub struct AggregateOperator {
     is_distinct_only: bool,
 }
 
+/// Running SUM of one column, kept in the form SQLite's typing rules need.
+///
+/// SQLite's `sum()` is an INTEGER while every input is an exact integer and
+/// becomes a REAL as soon as one input is not, so the integer and the float
+/// inputs are accumulated apart and the number of float inputs still in the
+/// group decides the result type. Deleting the only float row therefore takes
+/// the group back to an INTEGER sum, which a single `f64` accumulator could
+/// never do.
+///
+/// `non_null_count` is what makes `sum()` and `avg()` over no non-NULL input
+/// NULL instead of zero.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SumAccumulator {
+    /// Sum of the inputs SQLite treats as exact integers. `i128` so that adding
+    /// and later retracting values near `i64::MAX` cannot wrap.
+    int_sum: i128,
+    /// Sum of the inputs SQLite treats as floats.
+    real_sum: f64,
+    /// How many float inputs the group currently holds.
+    real_count: i64,
+    /// How many non-NULL inputs the group currently holds.
+    non_null_count: i64,
+}
+
+impl SumAccumulator {
+    /// Add `value` `weight` times; a negative weight retracts it.
+    fn add(&mut self, value: &Value, weight: i64) {
+        match classify_numeric_arg(value) {
+            NumericArg::Null => {}
+            NumericArg::Integer(i) => {
+                self.int_sum += i as i128 * weight as i128;
+                self.non_null_count += weight;
+            }
+            NumericArg::Float(f) => {
+                self.real_sum += f * weight as f64;
+                self.real_count += weight;
+                self.non_null_count += weight;
+            }
+        }
+    }
+
+    fn total_as_float(&self) -> f64 {
+        self.int_sum as f64 + self.real_sum
+    }
+
+    /// The value `sum()` reports.
+    ///
+    /// An integer sum too large for an i64 is reported as a REAL. SQLite raises
+    /// "integer overflow" there, which this operator cannot do because the
+    /// value is produced while reading the view, not while summing.
+    fn sum_value(&self) -> Value {
+        if self.non_null_count == 0 {
+            return Value::Null;
+        }
+        if self.real_count == 0 {
+            if let Ok(exact) = i64::try_from(self.int_sum) {
+                return Value::from_i64(exact);
+            }
+        }
+        Value::from_f64(self.total_as_float())
+    }
+
+    /// The value `avg()` reports. Always a REAL, like SQLite.
+    fn avg_value(&self) -> Value {
+        if self.non_null_count == 0 {
+            return Value::Null;
+        }
+        Value::from_f64(self.total_as_float() / self.non_null_count as f64)
+    }
+
+    /// Serialized form: [int_sum high half, int_sum low half, real_sum,
+    /// real_count, non_null_count]. The i128 is split because a Value can only
+    /// hold an i64.
+    fn to_values(&self) -> Vec<Value> {
+        vec![
+            Value::from_i64((self.int_sum >> 64) as i64),
+            Value::from_i64(self.int_sum as u64 as i64),
+            Value::from_f64(self.real_sum),
+            Value::from_i64(self.real_count),
+            Value::from_i64(self.non_null_count),
+        ]
+    }
+
+    fn from_values(values: &[Value], cursor: &mut usize, what: &str) -> Result<Self> {
+        let next_int = |cursor: &mut usize| -> Result<i64> {
+            let value = values.get(*cursor).ok_or_else(|| {
+                LimboError::InternalError(format!("Aggregate state for {what} is truncated"))
+            })?;
+            let Value::Numeric(Numeric::Integer(i)) = value else {
+                return Err(LimboError::InternalError(format!(
+                    "Expected Integer in aggregate state for {what}, got {value:?}. \
+                     Materialized views written by an older version must be recreated."
+                )));
+            };
+            *cursor += 1;
+            Ok(*i)
+        };
+
+        let high = next_int(cursor)?;
+        let low = next_int(cursor)?;
+        let int_sum = ((high as i128) << 64) | (low as u64 as i128);
+
+        let real_sum = values.get(*cursor).ok_or_else(|| {
+            LimboError::InternalError(format!("Aggregate state for {what} is truncated"))
+        })?;
+        let Value::Numeric(Numeric::Float(real_sum)) = real_sum else {
+            return Err(LimboError::InternalError(format!(
+                "Expected Float in aggregate state for {what}, got {real_sum:?}. \
+                 Materialized views written by an older version must be recreated."
+            )));
+        };
+        let real_sum = f64::from(*real_sum);
+        *cursor += 1;
+
+        let real_count = next_int(cursor)?;
+        let non_null_count = next_int(cursor)?;
+
+        Ok(Self {
+            int_sum,
+            real_sum,
+            real_count,
+            non_null_count,
+        })
+    }
+}
+
 /// State for a single group's aggregates
 #[derive(Debug, Clone, Default)]
 pub struct AggregateState {
     // For COUNT: just the count
     pub count: i64,
-    // For SUM: column_index -> sum value
-    pub sums: HashMap<usize, f64>,
-    // For AVG: column_index -> (sum, count) for computing average
-    pub avgs: HashMap<usize, (f64, i64)>,
+    // For SUM: column_index -> running sum
+    pub sums: HashMap<usize, SumAccumulator>,
+    // For AVG: column_index -> running sum, divided by its non-NULL count
+    pub avgs: HashMap<usize, SumAccumulator>,
     // For MIN: column_index -> minimum value
     pub mins: HashMap<usize, Value>,
     // For MAX: column_index -> maximum value
@@ -761,8 +888,13 @@ impl AggregateState {
                     values.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
-                    values.push(Value::from_f64(sum));
+                    values.extend(
+                        self.sums
+                            .get(col_idx)
+                            .cloned()
+                            .unwrap_or_default()
+                            .to_values(),
+                    );
                 }
                 AggregateFunction::SumDistinct(col_idx) => {
                     // Store both the distinct count and sum for this column
@@ -772,9 +904,13 @@ impl AggregateState {
                     values.push(Value::from_f64(sum));
                 }
                 AggregateFunction::Avg(col_idx) => {
-                    let (sum, count) = self.avgs.get(col_idx).copied().unwrap_or((0.0, 0));
-                    values.push(Value::from_f64(sum));
-                    values.push(Value::from_i64(count));
+                    values.extend(
+                        self.avgs
+                            .get(col_idx)
+                            .cloned()
+                            .unwrap_or_default()
+                            .to_values(),
+                    );
                 }
                 AggregateFunction::AvgDistinct(col_idx) => {
                     // Store both the distinct count and sum for this column
@@ -911,46 +1047,12 @@ impl AggregateState {
                     }
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    let sum = values
-                        .get(cursor)
-                        .ok_or_else(|| LimboError::InternalError("Missing SUM value".into()))?;
-                    if let Value::Numeric(Numeric::Float(sum)) = sum {
-                        state.sums.insert(col_idx, f64::from(*sum));
-                        cursor += 1;
-                    } else {
-                        return Err(LimboError::InternalError(format!(
-                            "Expected Float for SUM value, got {sum:?}"
-                        )));
-                    }
+                    let sum = SumAccumulator::from_values(values, &mut cursor, "SUM")?;
+                    state.sums.insert(col_idx, sum);
                 }
                 AggregateFunction::Avg(col_idx) => {
-                    let sum = values
-                        .get(cursor)
-                        .ok_or_else(|| LimboError::InternalError("Missing AVG sum value".into()))?;
-                    let sum = match sum {
-                        Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                        _ => {
-                            return Err(LimboError::InternalError(format!(
-                                "Expected Float for AVG sum, got {sum:?}"
-                            )));
-                        }
-                    };
-                    cursor += 1;
-
-                    let count = values.get(cursor).ok_or_else(|| {
-                        LimboError::InternalError("Missing AVG count value".into())
-                    })?;
-                    let count = match count {
-                        Value::Numeric(Numeric::Integer(i)) => *i,
-                        _ => {
-                            return Err(LimboError::InternalError(format!(
-                                "Expected Integer for AVG count, got {count:?}"
-                            )));
-                        }
-                    };
-                    cursor += 1;
-
-                    state.avgs.insert(col_idx, (sum, count));
+                    let sum = SumAccumulator::from_values(values, &mut cursor, "AVG")?;
+                    state.avgs.insert(col_idx, sum);
                 }
                 AggregateFunction::Min(col_idx) => {
                     let has_value = values.get(cursor).ok_or_else(|| {
@@ -1140,24 +1242,18 @@ impl AggregateState {
                 }
                 AggregateFunction::Sum(col_idx) => {
                     if let Some(val) = values.get(*col_idx) {
-                        let num_val = match val {
-                            Value::Numeric(Numeric::Integer(i)) => *i as f64,
-                            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                            _ => 0.0,
-                        };
-                        *self.sums.entry(*col_idx).or_insert(0.0) += num_val * weight as f64;
+                        self.sums
+                            .entry(*col_idx)
+                            .or_default()
+                            .add(val, weight as i64);
                     }
                 }
                 AggregateFunction::Avg(col_idx) => {
                     if let Some(val) = values.get(*col_idx) {
-                        let num_val = match val {
-                            Value::Numeric(Numeric::Integer(i)) => *i as f64,
-                            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                            _ => 0.0,
-                        };
-                        let (sum, count) = self.avgs.entry(*col_idx).or_insert((0.0, 0));
-                        *sum += num_val * weight as f64;
-                        *count += weight as i64;
+                        self.avgs
+                            .entry(*col_idx)
+                            .or_default()
+                            .add(val, weight as i64);
                     }
                 }
                 AggregateFunction::Min(_col_name) | AggregateFunction::Max(_col_name) => {
@@ -1192,14 +1288,6 @@ impl AggregateState {
     }
 
     /// Convert aggregate state to output values
-    ///
-    /// Note: SQLite returns INTEGER for SUM when all inputs are integers, and REAL when any input is REAL.
-    /// However, in an incremental system like DBSP, we cannot track whether all current values are integers
-    /// after deletions. For example:
-    /// - Initial: SUM(10, 20, 30.5) = 60.5 (REAL)
-    /// - After DELETE 30.5: SUM(10, 20) = 30 (SQLite returns INTEGER, but we only know the sum is 30.0)
-    ///
-    /// Therefore, we always return REAL for SUM operations.
     pub fn to_values(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
         let mut result = Vec::new();
 
@@ -1214,8 +1302,11 @@ impl AggregateState {
                     result.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
-                    result.push(Value::from_f64(sum));
+                    result.push(
+                        self.sums
+                            .get(col_idx)
+                            .map_or(Value::Null, SumAccumulator::sum_value),
+                    );
                 }
                 AggregateFunction::SumDistinct(col_idx) => {
                     // Return the computed SUM(DISTINCT)
@@ -1223,15 +1314,11 @@ impl AggregateState {
                     result.push(Value::from_f64(sum));
                 }
                 AggregateFunction::Avg(col_idx) => {
-                    if let Some((sum, count)) = self.avgs.get(col_idx) {
-                        if *count > 0 {
-                            result.push(Value::from_f64(sum / *count as f64));
-                        } else {
-                            result.push(Value::Null);
-                        }
-                    } else {
-                        result.push(Value::Null);
-                    }
+                    result.push(
+                        self.avgs
+                            .get(col_idx)
+                            .map_or(Value::Null, SumAccumulator::avg_value),
+                    );
                 }
                 AggregateFunction::AvgDistinct(col_idx) => {
                     // Compute AVG from SUM(DISTINCT) / COUNT(DISTINCT)
