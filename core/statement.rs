@@ -1029,6 +1029,7 @@ impl Statement {
             Some(max_registers),
             Some(cursor_count),
             self.counted_as_active_root,
+            true,
         )?;
         self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
         self.program = new_program;
@@ -1443,7 +1444,7 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        self.reset_internal(None, None, false)
+        self.reset_internal(None, None, false, false)
     }
 
     /// If `Insn::SequenceBeginInnerTx` swapped the connection's mv_tx to
@@ -1512,6 +1513,7 @@ impl Statement {
         max_registers: Option<usize>,
         max_cursors: Option<usize>,
         preserve_active_root_count: bool,
+        program_replaced: bool,
     ) -> Result<()> {
         fn capture_reset_error(
             reset_error: &mut Option<LimboError>,
@@ -1657,8 +1659,17 @@ impl Statement {
             self.release_active_root_if_counted();
         }
         self.cleanup_orphaned_seq_inner_tx();
-        self.state
-            .reset(max_registers, max_cursors, Some(&self.pager));
+        // A kept cursor is only sound while the program is unchanged: a
+        // replaced program can compile the same root page into a different
+        // cursor shape (a dropped table recreated as WITHOUT ROWID or as an
+        // index lands on the recycled root), and the reuse check compares
+        // pager and root only.
+        let reusable_pager = if program_replaced {
+            None
+        } else {
+            Some(&self.pager)
+        };
+        self.state.reset(max_registers, max_cursors, reusable_pager);
         self.busy = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;
@@ -1812,6 +1823,40 @@ mod tests {
             ids_in_t(&conn),
             vec![Value::from_i64(1), Value::from_i64(2)]
         );
+    }
+
+    #[test]
+    fn repreparing_a_statement_rebuilds_its_cursors() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts {
+                enable_without_rowid: true,
+                ..DatabaseOpts::new()
+            },
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (?, 'x')").unwrap();
+        run_insert(&mut stmt, 1);
+        assert_eq!(btree_cursor_addresses(&stmt).len(), 1);
+
+        // Replace the table with a WITHOUT ROWID one. The recreated table
+        // can land on the recycled root page, so the old program's kept
+        // rowid-table cursor (no index_info) must not serve the reprepared
+        // program's index-shaped writes.
+        conn.execute("DROP TABLE t").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID")
+            .unwrap();
+
+        run_insert(&mut stmt, 2);
+        assert_eq!(ids_in_t(&conn), vec![Value::from_i64(2)]);
     }
 
     #[test]
