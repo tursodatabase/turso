@@ -1,0 +1,866 @@
+@database :memory:
+
+# Each case runs against both Turso and SQLite. They cover the nested-loop
+# shape that SQLite uses for RIGHT JOIN and FULL JOIN: a main loop that records
+# matched right rows, then a pass that emits the unmatched ones.
+
+@cross-check-integrity
+test right-join-after-inner-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t3.c
+      FROM t1
+      JOIN t2 ON t1.a=t2.b
+      RIGHT JOIN t3 ON t2.b=t3.c
+     ORDER BY t3.c;
+}
+expect {
+    2|2|2
+    ||4
+}
+
+@cross-check-integrity
+test two-right-joins {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t3.c
+      FROM t1
+      RIGHT JOIN t2 ON t1.a=t2.b
+      RIGHT JOIN t3 ON t2.b=t3.c
+     ORDER BY t3.c;
+}
+expect {
+    2|2|2
+    ||4
+}
+
+@cross-check-integrity
+test two-full-joins {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t3.c
+      FROM t1
+      FULL JOIN t2 ON t1.a=t2.b
+      FULL JOIN t3 ON t2.b=t3.c
+     ORDER BY coalesce(t1.a, t2.b, t3.c);
+}
+expect {
+    1||
+    2|2|2
+    |3|
+    ||4
+}
+
+@cross-check-integrity
+test full-join-records-match-before-where {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (2), (3), (4);
+
+    SELECT t1.a, t2.b
+      FROM t1 FULL JOIN t2 ON t1.a=t2.b
+     WHERE t1.a=t2.b
+     ORDER BY t1.a;
+}
+expect {
+    2|2
+    3|3
+}
+
+@cross-check-integrity
+test full-join-with-range-condition {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (3);
+    INSERT INTO t2 VALUES (2), (4);
+
+    SELECT t1.a, t2.b
+      FROM t1 FULL JOIN t2 ON t1.a<t2.b
+     ORDER BY t1.a, t2.b;
+}
+expect {
+    1|2
+    1|4
+    3|4
+}
+
+@cross-check-integrity
+test right-join-keeps-source-column-order {
+    CREATE TABLE t1(a, av);
+    CREATE TABLE t2(b, bv);
+    INSERT INTO t1 VALUES (1, 'left');
+    INSERT INTO t2 VALUES (2, 'right');
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a=t2.b;
+}
+expect {
+    ||2|right
+}
+
+@cross-check-integrity
+test right-join-records-each-duplicate-row {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, note);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2, 'first'), (2, 'second'), (4, 'third');
+
+    SELECT t1.a, t2.b, t2.note
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     ORDER BY t2.rowid;
+}
+expect {
+    2|2|first
+    2|2|second
+    |4|third
+}
+
+@cross-check-integrity
+test full-join-with-indexed-right-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, note);
+    CREATE INDEX t2_b ON t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (2, 'two'), (4, 'four');
+
+    SELECT t1.a, t2.b, t2.note
+      FROM t1 FULL JOIN t2 ON t1.a=t2.b
+     ORDER BY coalesce(t1.a, t2.b);
+}
+expect {
+    1||
+    2|2|two
+    3||
+    |4|four
+}
+
+# An inner-join ON term can drive a multi-index scan of a table that a later
+# RIGHT or FULL JOIN null-extends, because the unmatched-row pass emits the
+# null row without that term.
+@cross-check-integrity
+test multi-index-scan-on-inner-join-left-of-right-and-full-join {
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT, aid INT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid INT);
+    CREATE INDEX b_x ON b(x);
+    CREATE INDEX b_y ON b(y);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (1, 1, 0, 1), (2, 0, 2, 2), (3, 0, 0, 3), (4, 1, 2, 1), (5, NULL, NULL, 2);
+    INSERT INTO c VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, NULL);
+
+    SELECT 'right', a.id, b.id, c.id
+      FROM a JOIN b ON (b.x=1 OR b.y=2) AND b.aid=a.id
+      RIGHT JOIN c ON c.bid=b.id
+    UNION ALL
+    SELECT 'full', a.id, b.id, c.id
+      FROM a JOIN b ON (b.x=1 OR b.y=2) AND b.aid=a.id
+      FULL JOIN c ON c.bid=b.id
+     ORDER BY 1, 2, 3, 4;
+}
+expect {
+    full|||3
+    full|||5
+    full|||6
+    full|1|1|1
+    full|1|4|4
+    full|2|2|2
+    right|||3
+    right|||5
+    right|||6
+    right|1|1|1
+    right|1|4|4
+    right|2|2|2
+}
+
+# RowId can read the index without reading the table. The deferred table seek
+# must remain available when the following Column reads a non-indexed value.
+@cross-check-integrity
+test right-join-reads-column-after-deferred-rowid {
+    CREATE TABLE deferred_rowid_left(a);
+    CREATE TABLE deferred_rowid_right(b, note);
+    CREATE INDEX deferred_rowid_right_b ON deferred_rowid_right(b);
+    INSERT INTO deferred_rowid_left VALUES(2);
+    INSERT INTO deferred_rowid_right VALUES(2, 'two'), (3, 'three');
+
+    SELECT right_side.rowid, right_side.note
+      FROM deferred_rowid_left AS left_side
+      RIGHT JOIN deferred_rowid_right AS right_side
+        INDEXED BY deferred_rowid_right_b
+        ON left_side.a=right_side.b
+     ORDER BY right_side.rowid;
+}
+expect {
+    1|two
+    2|three
+}
+
+@cross-check-integrity
+test full-join-does-not-use-partial-index-on-left-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t1_partial ON t1(a) WHERE a=1;
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10);
+
+    SELECT t1.a, t2.b
+      FROM t1 FULL JOIN t2 ON t1.a=1
+     ORDER BY t1.a;
+}
+expect {
+    1|10
+    2|
+}
+
+@cross-check-integrity
+test correlated-right-and-full-join-clear-return-address {
+    CREATE TABLE q(o);
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO q VALUES (1), (2);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t2 VALUES (1), (2);
+
+    SELECT q.o,
+           (SELECT count(*)
+              FROM t1 RIGHT JOIN t2 ON t1.a=t2.b AND q.o=1),
+           (SELECT count(*)
+              FROM t1 FULL JOIN t2 ON t1.a=t2.b AND q.o=1)
+      FROM q
+     ORDER BY q.o;
+}
+expect {
+    1|2|2
+    2|2|3
+}
+
+@cross-check-integrity
+test where-condition-is-not-an-index-on-left-of-right-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    CREATE TABLE t4(d);
+    INSERT INTO t3 VALUES ('x');
+    INSERT INTO t4 VALUES ('y');
+
+    SELECT 99
+      FROM t1
+      LEFT JOIN t2 ON true
+      RIGHT JOIN t3 ON true
+      RIGHT JOIN t4 ON true
+     WHERE a=b;
+}
+expect {
+}
+
+@cross-check-integrity
+test join-after-right-join-checks-its-on-condition-in-the-right-body {
+    CREATE TABLE t1(a TEXT);
+    CREATE TABLE t2(b TEXT);
+    CREATE TABLE t3(c TEXT);
+    INSERT INTO t2 VALUES ('x');
+    INSERT INTO t3 VALUES ('y'), ('z');
+
+    SELECT count(*)
+      FROM t1 RIGHT JOIN t2 ON true JOIN t3 ON a<>'';
+
+    SELECT count(*)
+      FROM t1 RIGHT JOIN t2 ON true LEFT JOIN t3 ON a<>''
+     WHERE c<>'';
+}
+expect {
+    0
+    0
+}
+
+@cross-check-integrity
+test right-join-does-not-remove-order-by {
+    CREATE TABLE t1(a);
+    CREATE INDEX t1_a ON t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+
+    SELECT t1.a, t2.b
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     ORDER BY t1.a;
+}
+expect {
+    |3
+    2|2
+}
+
+@cross-check-integrity
+test right-and-full-join-do-not-split-group-by {
+    CREATE TABLE t1(a);
+    CREATE INDEX t1_a ON t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (NULL), (1);
+    INSERT INTO t2 VALUES (NULL), (1), (2);
+
+    SELECT t1.a, count(*)
+      FROM t1 RIGHT JOIN t2 ON t1.a IS t2.b
+     GROUP BY t1.a
+     ORDER BY t1.a;
+
+    SELECT t1.a, count(*)
+      FROM t1 FULL JOIN t2 ON t1.a IS t2.b
+     GROUP BY t1.a
+     ORDER BY t1.a;
+}
+expect {
+    |2
+    1|1
+    |2
+    1|1
+}
+
+@cross-check-integrity
+test right-join-does-not-read-expression-index-in-unmatched-scan {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2(b+0);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t2.b+0
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     ORDER BY t2.b+0;
+}
+expect {
+    2|2|2
+    |4|4
+}
+
+@cross-check-integrity
+test right-join-can-seek-expression-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2(b+0);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t2.b+0
+      FROM t1 RIGHT JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b+0
+     ORDER BY t2.rowid;
+}
+expect {
+    2|2|2
+    |4|4
+}
+
+test right-join-rejects-forced-expression-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2(b+0);
+    SELECT *
+      FROM t1 RIGHT JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b;
+}
+expect error {
+    no query solution
+}
+
+test full-join-rejects-forced-expression-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2(b+0);
+    SELECT *
+      FROM t1 FULL JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b;
+}
+expect error {
+    no query solution
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test right-and-full-join-record-without-rowid-right-rows-by-primary-key {
+    CREATE TABLE t1(k INT PRIMARY KEY, a) WITHOUT ROWID;
+    CREATE TABLE t2(k INT PRIMARY KEY, b) WITHOUT ROWID;
+    CREATE TABLE t3(x TEXT COLLATE NOCASE, y INT, c, PRIMARY KEY (x, y)) WITHOUT ROWID;
+    CREATE TABLE t4(x TEXT, y INT);
+    INSERT INTO t1 VALUES (1, 'a1'), (2, 'a2');
+    INSERT INTO t2 VALUES (2, 'b2'), (3, 'b3');
+    INSERT INTO t3 VALUES ('a', 1, 'c1'), ('B', 1, 'c2'), ('a', 2, 'c3');
+    INSERT INTO t4 VALUES ('A', 1), ('b', 1), ('z', 9), ('A', 1);
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.k = t2.k ORDER BY t2.k;
+    SELECT * FROM t1 FULL JOIN t2 ON t1.k = t2.k ORDER BY t1.k, t2.k;
+    SELECT * FROM t1 FULL JOIN t2 ON t1.a < t2.b ORDER BY t1.k, t2.k;
+    SELECT t4.x, t4.y, t3.x, t3.y, t3.c FROM t4 RIGHT JOIN t3 ON t3.x = t4.x AND t3.y = t4.y ORDER BY t3.c, t4.x;
+    SELECT t4.x, t4.y, t3.x, t3.y, t3.c FROM t4 FULL JOIN t3 USING (x, y) ORDER BY t3.c, t4.x;
+    SELECT t1.k, t2.k, t3.c FROM t1 FULL JOIN t2 ON t1.k = t2.k FULL JOIN t3 ON t3.y = coalesce(t1.k, t2.k) ORDER BY 1, 2, 3;
+}
+expect {
+    2|a2|2|b2
+    ||3|b3
+    ||3|b3
+    1|a1||
+    2|a2|2|b2
+    1|a1|2|b2
+    1|a1|3|b3
+    2|a2|2|b2
+    2|a2|3|b3
+    A|1|a|1|c1
+    A|1|a|1|c1
+    b|1|B|1|c2
+    ||a|2|c3
+    A|1|||
+    A|1|||
+    b|1|||
+    z|9|||
+    ||a|1|c1
+    ||B|1|c2
+    ||a|2|c3
+    |3|
+    1||c1
+    1||c2
+    2|2|c3
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test right-and-full-join-accept-without-rowid-tables-on-the-left {
+    CREATE TABLE t1(k INT PRIMARY KEY, a) WITHOUT ROWID;
+    CREATE TABLE t2(k INT, b);
+    CREATE TABLE t3(k INT PRIMARY KEY, c) WITHOUT ROWID;
+    INSERT INTO t1 VALUES (1, 'a1'), (2, 'a2');
+    INSERT INTO t2 VALUES (2, 'b2'), (3, 'b3');
+    INSERT INTO t3 VALUES (2, 'c2'), (3, 'c3');
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.k=t2.k ORDER BY t2.k;
+    SELECT * FROM t1 FULL JOIN t2 ON t1.k=t2.k ORDER BY t1.k, t2.k;
+    SELECT * FROM t2 FULL JOIN (t1 JOIN t3 ON t1.k=t3.k) ON t1.k=t2.k ORDER BY t2.k;
+}
+expect {
+    2|a2|2|b2
+    ||3|b3
+    ||3|b3
+    1|a1||
+    2|a2|2|b2
+    2|b2|2|a2|2|c2
+    3|b3||||
+}
+
+@cross-check-integrity
+test right-join-with-view {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE VIEW v2 AS SELECT b FROM t2;
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+
+    SELECT t1.a, v2.b
+      FROM t1 RIGHT JOIN v2 ON t1.a=v2.b
+     ORDER BY v2.b;
+}
+expect {
+    2|2
+    |3
+}
+
+@cross-check-integrity
+test full-join-with-empty-materialized-cte-before-view {
+    CREATE TABLE t3x(id INTEGER PRIMARY KEY, note TEXT);
+    CREATE TABLE t4x(id INTEGER PRIMARY KEY, note TEXT);
+    CREATE VIEW t3 AS SELECT * FROM t3x LIMIT 1000;
+    CREATE VIEW t4 AS SELECT * FROM t4x LIMIT 1000;
+    INSERT INTO t3x VALUES (2, 'two'), (3, 'three');
+
+    WITH t7(id, note) AS MATERIALIZED (SELECT * FROM t4 WHERE false)
+    SELECT t7.id, t7.note, t7b.id, t7b.note, t3.id, t3.note
+      FROM t7
+      JOIN t7 AS t7b USING(id)
+      FULL JOIN t3 USING(id)
+     ORDER BY t3.id;
+}
+expect {
+    ||||2|two
+    ||||3|three
+}
+
+@cross-check-integrity
+test full-join-with-one-empty-side {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t2 VALUES (NULL), (2);
+
+    SELECT t1.rowid, t1.a, t2.rowid, t2.b
+      FROM t1 FULL JOIN t2 ON false
+     ORDER BY t2.rowid;
+
+    DELETE FROM t2;
+    INSERT INTO t1 VALUES (NULL), (1);
+
+    SELECT t1.rowid, t1.a, t2.rowid, t2.b
+      FROM t1 FULL JOIN t2 ON false
+     ORDER BY t1.rowid;
+}
+expect {
+    ||1|
+    ||2|2
+    1|||
+    2|1||
+}
+
+@cross-check-integrity
+test full-join-with-null-and-duplicate-keys {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (NULL), (1), (1);
+    INSERT INTO t2 VALUES (NULL), (1), (1), (2);
+
+    SELECT t1.rowid, t1.a, t2.rowid, t2.b
+      FROM t1 FULL JOIN t2 ON t1.a IS t2.b
+     ORDER BY coalesce(t1.a, t2.b), t1.rowid, t2.rowid;
+}
+expect {
+    1||1|
+    2|1|2|1
+    2|1|3|1
+    3|1|2|1
+    3|1|3|1
+    ||4|2
+}
+
+@cross-check-integrity
+test right-join-with-forced-covering-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, note);
+    CREATE INDEX t2_cover ON t2(b, note);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2, 'two'), (3, 'three'), (3, 'other');
+
+    SELECT t1.a, t2.b, t2.note, t2.rowid
+      FROM t1 RIGHT JOIN t2 INDEXED BY t2_cover ON t1.a=t2.b
+     ORDER BY t2.b, t2.note;
+}
+expect {
+    2|2|two|1
+    |3|other|3
+    |3|three|2
+}
+
+@cross-check-integrity
+test full-join-can-seek-expression-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2((b%2));
+    INSERT INTO t1 VALUES (0), (3);
+    INSERT INTO t2 VALUES (2), (4), (5);
+
+    SELECT t1.rowid, t1.a, t2.rowid, t2.b, t2.b%2
+      FROM t1 FULL JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b%2
+     ORDER BY coalesce(t1.a, t2.b), t1.rowid, t2.rowid;
+}
+expect {
+    1|0|1|2|0
+    1|0|2|4|0
+    2|3|||
+    ||3|5|1
+}
+
+@cross-check-integrity
+test right-join-checks-where-terms-on-unmatched-rows {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_b ON t2(b);
+    INSERT INTO t1 VALUES (2), (4);
+    INSERT INTO t2 VALUES (2), (3), (4), (5);
+
+    SELECT t1.a, t2.b, t2.rowid
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     WHERE t2.rowid>1 AND t2.b+0<5
+     ORDER BY t2.rowid;
+}
+expect {
+    |3|2
+    4|4|3
+}
+
+@cross-check-integrity
+test full-join-after-right-join-with-empty-middle-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t3 VALUES (2), (3);
+
+    SELECT t1.a, t2.b, t3.c
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+      FULL JOIN t3 ON coalesce(t1.a, t2.b)=t3.c
+     ORDER BY coalesce(t1.a, t2.b, t3.c);
+}
+expect {
+    ||2
+    ||3
+}
+
+# A later FULL JOIN sets the earlier RIGHT JOIN table to a null row. Its pending
+# index seek must not replace that null row when RowId or Column reads it.
+@cross-check-integrity
+test later-full-join-keeps-earlier-right-table-null {
+    CREATE TABLE deferred_right_full(a INTEGER PRIMARY KEY, b INTEGER UNIQUE, c);
+    INSERT INTO deferred_right_full VALUES(2, 1, 0);
+
+    SELECT count(*), count(right_side.a), sum(right_side.a)
+      FROM deferred_right_full AS left_side
+      RIGHT JOIN deferred_right_full AS right_side
+        ON left_side.a >= right_side.b
+      FULL JOIN deferred_right_full AS last_side
+        ON left_side.c >= last_side.b;
+
+    SELECT count(*), count(right_side.c), sum(right_side.c)
+      FROM deferred_right_full AS left_side
+      RIGHT JOIN deferred_right_full AS right_side
+        ON left_side.a >= right_side.b
+      FULL JOIN deferred_right_full AS last_side
+        ON left_side.c >= last_side.b;
+}
+expect {
+    2|1|2
+    2|1|0
+}
+
+# A constant false inner ON term cannot end the query. The later RIGHT JOIN
+# must still return each unmatched row from its right table.
+test false-inner-on-term-keeps-unmatched-right-row {
+    CREATE TABLE false_right_left(a TEXT);
+    CREATE TABLE false_right_middle(b TEXT);
+    CREATE TABLE false_right_last(c TEXT);
+    INSERT INTO false_right_last VALUES('last');
+    SELECT quote(false_right_left.a),
+           quote(false_right_middle.b),
+           false_right_last.c
+      FROM false_right_left
+      JOIN false_right_middle ON false
+      RIGHT JOIN false_right_last;
+}
+expect {
+    NULL|NULL|last
+}
+
+# FULL JOIN has the same unmatched-right pass when an earlier inner join
+# produces no rows.
+test false-inner-on-term-keeps-unmatched-full-join-row {
+    CREATE TABLE false_full_left(a TEXT);
+    CREATE TABLE false_full_middle(b TEXT);
+    CREATE TABLE false_full_last(c TEXT);
+    INSERT INTO false_full_last VALUES('last');
+    SELECT quote(false_full_left.a),
+           quote(false_full_middle.b),
+           false_full_last.c
+      FROM false_full_left
+      JOIN false_full_middle ON 0
+      FULL JOIN false_full_last;
+}
+expect {
+    NULL|NULL|last
+}
+
+# The false inner ON term must not skip either RIGHT JOIN in this chain.
+test false-inner-on-term-keeps-last-row-in-right-join-chain {
+    CREATE TABLE false_chain_first(a TEXT);
+    CREATE TABLE false_chain_second(b TEXT);
+    CREATE TABLE false_chain_middle(c TEXT);
+    CREATE TABLE false_chain_last(d TEXT);
+    INSERT INTO false_chain_last VALUES('last');
+    SELECT quote(false_chain_first.a),
+           quote(false_chain_second.b),
+           quote(false_chain_middle.c),
+           false_chain_last.d
+      FROM false_chain_first
+      RIGHT JOIN false_chain_second
+      JOIN false_chain_middle ON 0
+      RIGHT JOIN false_chain_last;
+}
+expect {
+    NULL|NULL|NULL|last
+}
+
+# A false WHERE term still rejects the unmatched right row. It is not part of
+# a join and can safely end the query before the loops start.
+test false-where-term-still-ends-right-join-query {
+    CREATE TABLE false_where_left(a TEXT);
+    CREATE TABLE false_where_right(b TEXT);
+    INSERT INTO false_where_right VALUES('right');
+    SELECT *
+      FROM false_where_left RIGHT JOIN false_where_right
+     WHERE false;
+}
+expect {
+}
+
+# This case comes from a command-line comparison with SQLite. The scalar
+# subquery runs twice, but its uncorrelated nested join must be built once.
+@cross-check-integrity
+test uncorrelated-parenthesized-full-join-materializes-once {
+    CREATE TABLE materialized_once_outer(id INTEGER);
+    CREATE TABLE materialized_once_anchor(id INTEGER);
+    CREATE VIEW materialized_once_value AS
+        SELECT hex(randomblob(32)) AS value;
+    CREATE TABLE materialized_once_empty(dummy INTEGER);
+    INSERT INTO materialized_once_outer VALUES(1),(2);
+    INSERT INTO materialized_once_anchor VALUES(1),(2);
+
+    WITH results AS MATERIALIZED (
+        SELECT materialized_once_outer.id AS id,
+               (SELECT materialized_once_value.value
+                  FROM materialized_once_anchor
+                  RIGHT JOIN (
+                       materialized_once_value
+                       FULL JOIN materialized_once_empty ON false
+                  ) ON true
+                 WHERE materialized_once_anchor.id=materialized_once_outer.id
+                 LIMIT 1) AS value
+          FROM materialized_once_outer
+    )
+    SELECT count(DISTINCT value), min(value)=max(value) FROM results;
+}
+expect {
+    1|1
+}
+
+# With a RIGHT JOIN in the FROM list, every view in it is stored once instead
+# of run as a coroutine, so all rows see the same random value.
+@cross-check-integrity
+test right-join-materializes-a-later-view-once {
+    CREATE TABLE materialized_later_left(id INTEGER);
+    CREATE TABLE materialized_later_right(id INTEGER);
+    CREATE VIEW materialized_later_value AS
+        SELECT hex(randomblob(32)) AS value;
+    INSERT INTO materialized_later_right VALUES(1),(2);
+
+    WITH results AS MATERIALIZED (
+        SELECT materialized_later_right.id, materialized_later_value.value
+          FROM materialized_later_left
+          RIGHT JOIN materialized_later_right ON false
+          JOIN materialized_later_value ON true
+    )
+    SELECT count(*), count(DISTINCT value), min(value)=max(value) FROM results;
+}
+expect {
+    2|1|1
+}
+
+# The shared row body must run output subqueries again for unmatched right rows.
+# Otherwise, the result and sort key keep a value from the last matched row.
+@cross-check-integrity
+test full-join-reruns-correlated-output-subqueries {
+    CREATE TABLE correlated_output_left(a INTEGER);
+    CREATE TABLE correlated_output_right(b INTEGER);
+    INSERT INTO correlated_output_left VALUES(1);
+    INSERT INTO correlated_output_right VALUES(1),(2);
+
+    SELECT correlated_output_right.b,
+           EXISTS(SELECT 1 WHERE correlated_output_left.a)
+      FROM correlated_output_left
+      FULL JOIN correlated_output_right
+        ON correlated_output_left.a=correlated_output_right.b
+     ORDER BY EXISTS(SELECT 1 WHERE correlated_output_left.a),
+              correlated_output_right.b;
+}
+expect {
+    2|0
+    1|1
+}
+
+# A correlated subquery that runs once per input row, in an aggregate's
+# FILTER or arguments or in a GROUP BY key, must run again for each unmatched
+# right row, where per_row_left is NULL. Otherwise it keeps the value it had
+# for the last matched row: the unmatched row (20, 3) was counted as if
+# per_row_left.c were still 1.
+@cross-check-integrity
+test right-join-reruns-per-row-subqueries-in-aggregates-and-group-by {
+    CREATE TABLE per_row_left(id INTEGER PRIMARY KEY, c INT);
+    CREATE TABLE per_row_right(id INTEGER PRIMARY KEY, x INT);
+    INSERT INTO per_row_left VALUES (1, 1);
+    INSERT INTO per_row_right VALUES (10, 1), (20, 3);
+
+    SELECT 'filter-exists',
+           count(*) FILTER (WHERE EXISTS (
+               SELECT 1 FROM per_row_right AS t WHERE t.x = per_row_left.c))
+      FROM per_row_left RIGHT JOIN per_row_right ON per_row_left.c = per_row_right.x;
+    SELECT 'filter-scalar',
+           count(*) FILTER (WHERE (
+               SELECT t.x FROM per_row_right AS t WHERE t.x = per_row_left.c) = 1)
+      FROM per_row_left RIGHT JOIN per_row_right ON per_row_left.c = per_row_right.x;
+    SELECT 'filter-in',
+           count(*) FILTER (WHERE per_row_left.c IN (
+               SELECT t.x FROM per_row_right AS t WHERE t.x = per_row_left.c))
+      FROM per_row_left FULL JOIN per_row_right ON per_row_left.c = per_row_right.x;
+    SELECT 'argument',
+           sum((SELECT 1 FROM per_row_right AS t WHERE t.x = per_row_left.c))
+      FROM per_row_left RIGHT JOIN per_row_right ON per_row_left.c = per_row_right.x;
+    SELECT 'group-key', count(*)
+      FROM per_row_left RIGHT JOIN per_row_right ON per_row_left.c = per_row_right.x
+     GROUP BY (SELECT 1 FROM per_row_right AS t WHERE t.x = per_row_left.c)
+     ORDER BY 2;
+}
+expect {
+    filter-exists|1
+    filter-scalar|1
+    filter-in|1
+    argument|1
+    group-key|1
+    group-key|1
+}
+
+# With an empty left table, the main pass never runs the left table's loop, so
+# a correlated subquery that ran there was never started. The unmatched-rows
+# pass then read the subquery's cursor and panicked: "cursor id 0 is None".
+@cross-check-integrity
+test right-join-runs-per-row-subqueries-when-the-left-table-is-empty {
+    CREATE TABLE empty_left(id INTEGER PRIMARY KEY, b INT, c INT, g INT);
+    CREATE TABLE some_right(id INTEGER PRIMARY KEY, x INT);
+    INSERT INTO some_right VALUES (10, 1), (20, 3);
+
+    SELECT 'filter',
+           sum(empty_left.b) FILTER (WHERE empty_left.c IN (
+               SELECT t.x FROM some_right AS t WHERE t.x = empty_left.c))
+      FROM empty_left RIGHT JOIN some_right ON true;
+    SELECT 'having', count(*)
+      FROM empty_left RIGHT JOIN some_right ON true
+     GROUP BY empty_left.g
+    HAVING sum(empty_left.b) FILTER (WHERE empty_left.c IN (
+               SELECT t.x FROM some_right AS t WHERE t.x = empty_left.c)) IS NULL;
+}
+expect {
+    filter|
+    having|2
+}
+
+# SQLite keeps this correlated query in the shared FULL JOIN body. Rewriting
+# it as a later anti-join would remove the unmatched right row.
+@cross-check-integrity
+test full-join-keeps-unmatched-row-with-correlated-not-exists {
+    CREATE TABLE correlated_filter_left(a INTEGER);
+    CREATE TABLE correlated_filter_right(b INTEGER);
+    CREATE TABLE correlated_filter_inner(x INTEGER);
+    INSERT INTO correlated_filter_right VALUES(1);
+
+    SELECT correlated_filter_right.b
+      FROM correlated_filter_left
+      FULL JOIN correlated_filter_right ON true
+     WHERE NOT EXISTS(
+               SELECT 1
+                 FROM correlated_filter_inner
+                WHERE correlated_filter_left.a=correlated_filter_inner.x
+           );
+}
+expect {
+    1
+}

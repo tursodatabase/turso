@@ -2410,7 +2410,10 @@ fn translate_column_expr(
             .find_joined_table_by_internal_id(*table_ref_id)
         {
             (
-                table_reference.op.index(),
+                table_reference
+                    .op
+                    .index()
+                    .filter(|_| !table_reference.requires_table_cursor_for_unmatched_rows()),
                 if let Operation::IndexMethodQuery(index_method) = &table_reference.op {
                     Some(index_method)
                 } else {
@@ -2736,7 +2739,9 @@ fn translate_column_expr(
                         index: Some(index), ..
                     }) = &table_reference.op
                     {
-                        if index.ephemeral {
+                        if index.ephemeral
+                            && !table_reference.requires_table_cursor_for_unmatched_rows()
+                        {
                             // Read from the index cursor. Index columns may be reordered
                             // (key columns first), so find the index column position that
                             // corresponds to the original subquery column position.
@@ -2863,7 +2868,10 @@ fn translate_rowid_expr(
         referenced_tables.find_joined_table_by_internal_id(*table_ref_id)
     {
         (
-            table_reference.op.index(),
+            table_reference
+                .op
+                .index()
+                .filter(|_| !table_reference.requires_table_cursor_for_unmatched_rows()),
             table_reference.utilizes_covering_index(),
         )
     } else {

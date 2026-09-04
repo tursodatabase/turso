@@ -16,9 +16,9 @@ use super::{
     order_by::sorter_insert,
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, InSeekSource,
-        IterationDirection, JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery,
-        Operation, QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
-        SetOperation, TableReferences, WhereTerm,
+        IterationDirection, JoinOrderMember, JoinOrigin, JoinedTable, MultiIndexScanOp,
+        NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef, SeekKey,
+        SeekKeyComponent, SelectPlan, SetOperation, TableReferences, WhereTerm,
     },
 };
 use crate::{
@@ -71,6 +71,30 @@ pub struct LeftJoinMetadata {
     pub reg_match_flag: usize,
     pub label_match_flag_set_true: BranchOffset,
     pub label_match_flag_check_value: BranchOffset,
+}
+
+#[derive(Debug, Clone)]
+/// State shared by the main join loop and the unmatched-right-row pass.
+pub struct RightJoinMetadata {
+    /// Ephemeral index that stores the key of each matched right-side row.
+    pub matched_rows_cursor_id: CursorID,
+    /// First register of the current right-side row's key.
+    pub key_start_reg: usize,
+    /// Primary key column positions of a WITHOUT ROWID right table. The key
+    /// is these columns, or the rowid when this is `None`.
+    pub primary_key_columns: Option<Vec<usize>>,
+    /// Return-address register for the shared result-row subroutine.
+    pub return_reg: usize,
+    /// Entry label for the result-row subroutine.
+    pub body_label: BranchOffset,
+    /// Label that returns from the result-row subroutine to the main loop.
+    pub return_label: BranchOffset,
+}
+
+impl RightJoinMetadata {
+    pub fn key_len(&self) -> usize {
+        self.primary_key_columns.as_ref().map_or(1, Vec::len)
+    }
 }
 
 #[derive(Debug)]

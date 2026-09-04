@@ -32,8 +32,8 @@ use crate::{
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            SubqueryOrigin, SubqueryState, TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
+            NonFromClauseSubquery, SubqueryOrigin, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, TableMask},
     },
@@ -49,8 +49,6 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub maybe_order_target: Option<&'a OrderTarget>,
     /// Stop growing a join plan after it costs more than another query form.
     pub cost_limit: Option<Cost>,
-    /// The generated parenthesized query computes merged USING values in its result columns.
-    pub using_results_are_explicit: bool,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -60,7 +58,6 @@ impl<'a> JoinPlanningContext<'a> {
         Self {
             maybe_order_target,
             cost_limit: None,
-            using_results_are_explicit: false,
         }
     }
 }
@@ -193,7 +190,8 @@ fn rows_after_join(
     }
 
     let is_on_term = |constraint: &super::constraints::Constraint| {
-        where_clause[constraint.where_clause_pos.0].from_outer_join == Some(rhs_table.internal_id)
+        where_clause[constraint.where_clause_pos.0].from_join
+            == Some(JoinOrigin::Outer(rhs_table.internal_id))
     };
     let on_selectivity = constraint_output_multipliers_for(
         rhs_constraints,
@@ -427,7 +425,7 @@ fn can_defer_where_subquery(subquery: &NonFromClauseSubquery, where_clause: &[Wh
         .iter()
         .filter(|term| expr_references_subquery_id(&term.expr, subquery.internal_id))
     {
-        if term.from_outer_join.is_some() {
+        if term.from_join.is_some_and(JoinOrigin::is_outer) {
             return false;
         }
         found = true;
@@ -808,6 +806,15 @@ fn join_lhs_and_rhs<'a>(
                 can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
 
             let build_table_is_last = build_table_idx == last_lhs_table_idx;
+            // The unmatched-right pass can set every earlier table cursor to NULL.
+            // Hash materialization makes these values independent of that cursor state.
+            let build_is_left_of_right_or_full_join =
+                joined_tables.iter().skip(build_table_idx + 1).any(|table| {
+                    table
+                        .join_info
+                        .as_ref()
+                        .is_some_and(JoinInfo::keeps_right_rows)
+                });
 
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
@@ -815,7 +822,8 @@ fn join_lhs_and_rhs<'a>(
             let allow_hash_join = !rhs_has_selective_seek
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
-                && !chaining_across_outer;
+                && !chaining_across_outer
+                && !build_is_left_of_right_or_full_join;
 
             tracing::debug!(
                 lhs_table = build_table.table.get_name(),
@@ -830,6 +838,7 @@ fn join_lhs_and_rhs<'a>(
                 chaining_across_outer,
                 build_am_is_plain_table_scan,
                 build_has_rowid,
+                build_is_left_of_right_or_full_join,
                 "hash-join eligibility check"
             );
             if allow_hash_join {
@@ -857,7 +866,6 @@ fn join_lhs_and_rhs<'a>(
                     hash_can_replace_build_index,
                     subqueries,
                     params,
-                    planning_context.using_results_are_explicit,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -986,17 +994,7 @@ fn join_lhs_and_rhs<'a>(
                         input_cardinality,
                         params,
                     );
-                    // FULL OUTER requires hash join for the unmatched-build scan.
-                    let is_full_outer = matches!(
-                        &hash_join_method.params,
-                        AccessMethodParams::HashJoin {
-                            join_type: HashJoinType::FullOuter,
-                            ..
-                        }
-                    );
-                    if hash_join_allowed
-                        && (is_full_outer || hash_join_method.cost < best_access_method.cost)
-                    {
+                    if hash_join_allowed && hash_join_method.cost < best_access_method.cost {
                         best_access_method = hash_join_method;
                     }
                 }
@@ -1039,26 +1037,6 @@ fn join_lhs_and_rhs<'a>(
             if index_method.cost < best_access_method.cost {
                 best_access_method = index_method;
             }
-        }
-    }
-
-    // FULL OUTER needs a hash join. If the optimizer couldn't pick one, bail.
-    if lhs.is_some() {
-        let is_full_outer = rhs_table_reference
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_full_outer());
-        if is_full_outer
-            && !matches!(
-                best_access_method.params,
-                AccessMethodParams::HashJoin {
-                    join_type: HashJoinType::FullOuter,
-                    ..
-                }
-            )
-        {
-            // This ordering can't satisfy FULL OUTER. Let the planner try others.
-            return Ok(None);
         }
     }
 
@@ -1353,9 +1331,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 best_plan: plan,
                 best_ordered_plan: None,
             })),
-            None => Err(LimboError::PlanningError(
-                "No valid query plan found".to_string(),
-            )),
+            None => Err(LimboError::PlanningError("no query solution".to_string())),
         };
     }
     let mut best_plan = naive_plan;
@@ -1474,13 +1450,11 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     }
                 }
             }
-            // FULL OUTER acts as a reordering barrier in both directions: tables
-            // originally after a FULL OUTER table cannot be moved before it, or
-            // the planner produces e.g. `(t1 INNER t3) FULL OUTER t2` instead of
-            // the requested `(t1 FULL OUTER t2) INNER t3`, which can leak
-            // NULL-filled probe rows past the inner join.
+            // A RIGHT or FULL JOIN is a reordering barrier in both directions.
+            // A later table cannot move before its right operand because the
+            // unmatched-right scan runs after the normal loops.
             for (k, t) in joined_tables.iter().enumerate() {
-                if !t.join_info.as_ref().is_some_and(|j| j.is_full_outer()) {
+                if !t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows) {
                     continue;
                 }
                 for (j, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(k + 1) {
@@ -1707,47 +1681,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 best_ordered_plan
             },
         })),
-        None => {
-            // Give a targeted error for FULL OUTER when no plan was found.
-            let has_full_outer = joined_tables
-                .iter()
-                .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_full_outer()));
-            if has_full_outer {
-                // Distinguish chaining from a missing equi-join condition.
-                let build_is_outer = joined_tables.iter().any(|t| {
-                    let is_full = t.join_info.as_ref().is_some_and(|ji| ji.is_full_outer());
-                    if !is_full {
-                        return false;
-                    }
-                    // Check if any earlier table (potential build) is also outer.
-                    joined_tables.iter().any(|other| {
-                        !std::ptr::eq(t, other)
-                            && other.join_info.as_ref().is_some_and(|ji| ji.is_outer())
-                    })
-                });
-                // A recursive CTE input cannot be the build side of the hash
-                // join that FULL OUTER requires, so no plan exists for
-                // `recursive_table FULL JOIN other`.
-                let has_recursive_input = joined_tables
-                    .iter()
-                    .any(|t| matches!(t.table, crate::schema::Table::RecursiveCteInput(_)));
-                let has_correlated_subquery = subqueries.iter().any(|sq| sq.correlated);
-                let msg = if build_is_outer {
-                    "FULL OUTER JOIN chaining is not yet supported"
-                } else if has_recursive_input {
-                    "FULL OUTER JOIN with a recursive reference is not yet supported"
-                } else if has_correlated_subquery {
-                    "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables"
-                } else {
-                    "FULL OUTER JOIN requires an equality condition in the ON clause"
-                };
-                Err(LimboError::ParseError(msg.to_string()))
-            } else {
-                Err(LimboError::PlanningError(
-                    "No valid query plan found".to_string(),
-                ))
-            }
-        }
+        None => Err(LimboError::PlanningError("no query solution".to_string())),
     }
 }
 
@@ -1891,9 +1825,7 @@ fn compute_greedy_join_order<'a>(
     )?;
 
     if current_plan.is_none() {
-        return Err(LimboError::PlanningError(
-            "No valid query plan found for first table".to_string(),
-        ));
+        return Err(LimboError::PlanningError("no query solution".to_string()));
     }
 
     // Greedily add remaining tables, always picking lowest marginal cost.
@@ -2349,7 +2281,13 @@ fn build_where_term_info(
                 equal_tables: (!term.consumed)
                     .then(|| tables_in_equal_test(&term.expr))
                     .flatten()
-                    .map(|(left, right)| (left, right, term.from_outer_join)),
+                    .map(|(left, right)| {
+                        (
+                            left,
+                            right,
+                            term.from_join.and_then(JoinOrigin::outer_table),
+                        )
+                    }),
             })
         })
         .collect()
@@ -2371,7 +2309,7 @@ fn ready_where_work(
             if term.consumed || info.extra_steps == 0 {
                 return None;
             }
-            let ready = match term.from_outer_join {
+            let ready = match term.from_join.and_then(JoinOrigin::outer_table) {
                 Some(table_id) => table_id == rhs_table_id,
                 None => {
                     info.table_mask.get(rhs_table_number)
@@ -2643,7 +2581,7 @@ mod tests {
             Operator::Or,
             Box::new(check(first_id)),
         ));
-        term.from_outer_join = Some(second_id);
+        term.from_join = Some(JoinOrigin::Outer(second_id));
         let outer_join_where = vec![term];
         let where_terms = build_where_term_info(&outer_join_where, &table_references, &[])?;
 
@@ -3913,7 +3851,7 @@ mod tests {
                 ast::Operator::Equals,
                 Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
             ),
-            from_outer_join: None,
+            from_join: None,
             consumed: false,
         }];
 
@@ -4011,7 +3949,7 @@ mod tests {
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
-                from_outer_join: None,
+                from_join: None,
                 consumed: false,
             },
             WhereTerm {
@@ -4025,7 +3963,7 @@ mod tests {
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
-                from_outer_join: None,
+                from_join: None,
                 consumed: false,
             },
         ];
@@ -4125,7 +4063,7 @@ mod tests {
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
-                from_outer_join: None,
+                from_join: None,
                 consumed: false,
             },
             WhereTerm {
@@ -4139,7 +4077,7 @@ mod tests {
                     ast::Operator::Greater,
                     Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
                 ),
-                from_outer_join: None,
+                from_join: None,
                 consumed: false,
             },
             WhereTerm {
@@ -4153,7 +4091,7 @@ mod tests {
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
-                from_outer_join: None,
+                from_join: None,
                 consumed: false,
             },
         ];
@@ -4319,7 +4257,7 @@ mod tests {
     fn _create_binary_expr(lhs: Expr, op: Operator, rhs: Expr) -> WhereTerm {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
-            from_outer_join: None,
+            from_join: None,
             consumed: false,
         }
     }
@@ -4566,7 +4504,6 @@ mod tests {
             true,
             &[],
             &DEFAULT_PARAMS,
-            false,
         )
         .unwrap()
         .unwrap();

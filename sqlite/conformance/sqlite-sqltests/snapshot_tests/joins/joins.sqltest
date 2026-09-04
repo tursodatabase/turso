@@ -270,19 +270,19 @@ snapshot left-outer-join-chained {
 # 4. Right outer join
 # =============================================================================
 
-# TODO: Uncomment when RIGHT JOIN is supported
-# @setup schema
-# snapshot right-outer-join-basic {
-#     SELECT
-#         c.customer_id,
-#         c.name,
-#         o.order_id,
-#         o.order_date,
-#         o.total_amount
-#     FROM
-#         customers c
-#     RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id;
-# }
+@setup schema
+snapshot right-outer-join-basic {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c
+    RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    ORDER BY c.customer_id;
+}
 
 # TODO: Uncomment when RIGHT JOIN is supported
 # @setup schema
@@ -959,12 +959,29 @@ snapshot hash-join-left-outer {
     LEFT JOIN h_items i ON h.customer_name = i.order_name;
 }
 
-# FULL OUTER hash join - both unmatched build and unmatched probe paths
+# FULL OUTER join - records matched right rowids and scans them again
 @setup hash_schema
-snapshot hash-join-full-outer {
+snapshot full-outer-join-sqlite-style {
     SELECT h.order_id, h.customer_name, i.item_id, i.product
     FROM h_orders h
     FULL OUTER JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+setup right_join_false_inner_on_schema {
+    CREATE TABLE false_inner_left(a INTEGER);
+    CREATE TABLE false_inner_middle(b INTEGER);
+    CREATE TABLE false_inner_right(c INTEGER);
+    INSERT INTO false_inner_right VALUES(1);
+}
+
+# SQLite keeps the false inner ON term inside the left join prefix. The jump
+# must reach the RIGHT JOIN cleanup instead of ending the whole query.
+@setup right_join_false_inner_on_schema
+snapshot false-inner-on-term-does-not-skip-right-join-cleanup {
+    SELECT *
+      FROM false_inner_left
+      JOIN false_inner_middle ON false
+      RIGHT JOIN false_inner_right;
 }
 
 # Hash join with aggregation
@@ -1002,4 +1019,42 @@ snapshot hash-join-left-outer-agg {
     LEFT JOIN h_items i ON h.customer_name = i.order_name
     GROUP BY h.customer_name
     ORDER BY h.customer_name;
+}
+
+setup uncorrelated_parenthesized_join_snapshot_schema {
+    CREATE TABLE nested_once_outer(id INTEGER);
+    CREATE TABLE nested_once_anchor(id INTEGER);
+    CREATE VIEW nested_once_value AS SELECT random() AS value;
+    CREATE TABLE nested_once_empty(dummy INTEGER);
+}
+
+# The FULL JOIN forces SQLite to store the view instead of using a coroutine.
+# The stored view is uncorrelated, so SQLite builds it once per statement.
+@setup uncorrelated_parenthesized_join_snapshot_schema
+snapshot uncorrelated-parenthesized-full-join-materializes-once {
+    SELECT (SELECT nested_once_value.value
+              FROM nested_once_anchor
+              RIGHT JOIN (
+                   nested_once_value
+                   FULL JOIN nested_once_empty ON false
+              ) ON true
+             WHERE nested_once_anchor.id=nested_once_outer.id
+             LIMIT 1)
+      FROM nested_once_outer;
+}
+
+setup later_view_right_join_snapshot_schema {
+    CREATE TABLE later_view_left(id INTEGER);
+    CREATE TABLE later_view_right(id INTEGER);
+    CREATE VIEW later_view_value AS SELECT random() AS value;
+}
+
+# SQLite stores a view after a RIGHT JOIN because that join can start another
+# pass through the remaining sources.
+@setup later_view_right_join_snapshot_schema
+snapshot right-join-materializes-a-later-view-once {
+    SELECT later_view_right.id, later_view_value.value
+      FROM later_view_left
+      RIGHT JOIN later_view_right ON false
+      JOIN later_view_value ON true;
 }

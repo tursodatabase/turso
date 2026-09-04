@@ -60,7 +60,7 @@ use crate::{
             OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
             OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
             OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
@@ -611,7 +611,7 @@ pub struct OpHashProbeState {
 }
 
 // repr(u8): with the tag in its own byte, the idle test that every Column
-// and RowId runs is one byte compare instead of a niche computation on a
+// runs is one byte compare instead of a niche computation on a
 // nested payload.
 #[repr(u8)]
 enum ActiveOpState {
@@ -628,7 +628,6 @@ enum ActiveOpState {
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
     Column(OpColumnState),
-    RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
@@ -654,7 +653,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
             ActiveOpState::Column(_) => "Column",
-            ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
@@ -786,7 +784,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState::Start
     );
     active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
-    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
         Transaction,
@@ -842,6 +839,8 @@ impl ActiveOpStateSlot {
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
+    /// The rowid that DeferredSeek saves before the index can move.
+    pub rowid: i64,
 }
 
 pub(crate) enum VacuumOpState {
