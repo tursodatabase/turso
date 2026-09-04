@@ -1265,3 +1265,20 @@ snapshot right-join-materializes-a-later-view-once {
       RIGHT JOIN later_view_right ON false
       JOIN later_view_value ON true;
 }
+
+setup full_join_null_range_schema {
+    CREATE TABLE null_range_left(id INTEGER PRIMARY KEY, value REAL);
+    CREATE INDEX null_range_left_value ON null_range_left(value);
+    CREATE TABLE null_range_middle(key REAL NOT NULL);
+}
+
+# The first FULL JOIN can make the declared NOT NULL key NULL. IsNull must
+# stop the later range seek before SeekGE reads that key.
+@setup full_join_null_range_schema
+snapshot full-join-range-seek-checks-null-extended-key {
+    SELECT left_row.id, null_range_middle.key, right_row.id
+      FROM null_range_left AS left_row
+      FULL JOIN null_range_middle ON true
+      FULL JOIN null_range_left AS right_row INDEXED BY null_range_left_value
+        ON null_range_middle.key<=right_row.value;
+}
