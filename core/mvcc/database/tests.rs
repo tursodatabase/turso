@@ -423,10 +423,11 @@ fn seqcompact_tombstone_payload_uses_store_allocator() {
     )
     .unwrap();
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
-    let versions = store
+    let entry = store
         .get_or_create_table_row_versions(row_id.clone())
         .unwrap();
-    versions.write().try_reserve(1).unwrap();
+    entry.value().write().try_reserve(1).unwrap();
+    drop(entry);
 
     alloc.fail_allocations(true);
     store.seqcompact_commit_delete(row_id, 1, 10);
@@ -6899,6 +6900,67 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
             );
         }
     }
+}
+
+/// What this test checks: a cursor parked on a row serves the row's NEW value
+/// after the same transaction writes to it through the store (as a trigger or
+/// another cursor would), and reports the row gone after a delete.
+/// Why this matters: the cursor caches the serialized record for its current
+/// position and reuses it while no write happened; a write must invalidate
+/// that cache, otherwise reads-after-own-writes return stale data.
+#[test]
+fn test_cursor_record_sees_same_tx_writes_through_store() {
+    let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2, 3]);
+
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            btree_root_page,
+            1,
+        )),
+    )
+    .unwrap();
+
+    // Position on row 1 and read its record twice; repeated reads at the same
+    // position must return the same bytes.
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(())));
+    let read_payload = |cursor: &mut MvccLazyCursor<MvccClock, DynAllocator>| {
+        let IOResult::Done(record) = cursor.record().unwrap() else {
+            panic!("record IO not expected on in-memory store");
+        };
+        record.map(|r| r.get_payload().to_vec())
+    };
+    let original = read_payload(&mut cursor).expect("row 1 has a record");
+    assert_eq!(read_payload(&mut cursor).unwrap(), original);
+
+    // The same transaction updates row 1 through the store, not through this
+    // cursor (like a second cursor or a trigger would).
+    let updated_record =
+        ImmutableRecord::from_values(&[Value::Text(Text::new("updated"))], 1).unwrap();
+    let row = Row::new_table_row(
+        RowID::new(table_id, RowKey::Int(1)),
+        updated_record.as_blob(),
+        1,
+    )
+    .unwrap();
+    assert!(db.mvcc_store.update(tx_id, row).unwrap());
+
+    // The parked cursor must serve the new value, not its cached bytes.
+    let after_update = read_payload(&mut cursor).expect("row 1 still visible");
+    assert_eq!(after_update, updated_record.as_blob().to_vec());
+    assert_ne!(after_update, original);
+
+    // And after the row is deleted, the cursor must report it gone.
+    assert!(db
+        .mvcc_store
+        .delete(tx_id, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap());
+    assert!(read_payload(&mut cursor).is_none());
 }
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.

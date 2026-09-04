@@ -25,6 +25,69 @@ use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
 
+/// The visible row a scan or seek resolved while it already held the version
+/// chain's read lock, plus the [`MvStore::version_mutation_epoch`] observed
+/// *before* resolving. While the store's epoch still equals `epoch`, no write
+/// that could change visibility has happened, so `current_row` can serialize
+/// the row's payload without re-locking the chain, re-checking visibility, or
+/// looking up the transaction.
+///
+/// `row` is `Some` for table rows (their payload lives in the row's shared
+/// data buffer; the clone is a refcount bump on a line the resolution just
+/// touched). It is `None` for index rows: an index row's payload *is* its
+/// key, which the cursor position already carries, so cloning a `Row` for it
+/// would only add refcount traffic.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedRow {
+    row: Option<Row>,
+    epoch: u64,
+}
+
+/// Outcome of the most recent eq-only seek (or rowid existence probe) on this
+/// cursor: whether MvStore held a visible version for `key` as of `epoch`.
+/// [`MvccLazyCursor::insert`] runs right after such a probe on the same key
+/// and needs exactly this fact to pick insert-vs-update, so while the store's
+/// [`MvStore::version_mutation_epoch`] still equals `epoch` the memo replaces
+/// a full skiplist lookup. Never invalidated by cursor movement — it is a
+/// statement about the store, not about the cursor position — only
+/// overwritten by the next probe or bypassed when the epoch moved.
+struct EqSeekMemo {
+    key: RowID,
+    /// True when MvStore had a visible version for `key` (B-tree-only
+    /// presence does not count; `insert` distinguishes those separately).
+    mvcc_found: bool,
+    epoch: u64,
+}
+
+impl EqSeekMemo {
+    /// The memo's answer for `id`, if it is about the same key. For record
+    /// keys the probe must also cover the same number of columns: a prefix
+    /// probe (e.g. a unique-index NoConflict without the rowid) proves
+    /// nothing about one exact full key when it *found* a prefix match.
+    fn mvcc_found_for(&self, id: &RowID, store_epoch: u64) -> Option<bool> {
+        if self.epoch != store_epoch || self.key.table_id != id.table_id {
+            return None;
+        }
+        match (&self.key.row_id, &id.row_id) {
+            (RowKey::Int(a), RowKey::Int(b)) => (a == b).then_some(self.mvcc_found),
+            (RowKey::Record(a), RowKey::Record(b)) => {
+                if a.metadata.num_cols != b.metadata.num_cols {
+                    // A shorter probe that found nothing proves every longer
+                    // key with that prefix absent; a prefix hit says nothing
+                    // about one exact longer key. (`SortableIndexKey` equality
+                    // compares the shared prefix.)
+                    return (!self.mvcc_found
+                        && a.metadata.num_cols < b.metadata.num_cols
+                        && a == b)
+                        .then_some(false);
+                }
+                (a == b).then_some(self.mvcc_found)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {
     /// We haven't loaded any row yet.
@@ -36,9 +99,12 @@ enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {
         in_btree: bool,
         /// Resolved MVCC version chain for this row, captured from the range
         /// iterator so `read_mvcc_current_row` can skip a second `self.rows.get`.
-        /// `Some` only for MVCC table rows reached via the scan path; `None`
-        /// (btree rows, index rows, seek/insert positions) falls back to a lookup.
+        /// `Some` only for MVCC rows reached via the scan or seek paths; `None`
+        /// (btree rows, insert positions) falls back to a lookup.
         versions: Option<RowVersions<A>>,
+        /// The visible row resolved when this position was created; see
+        /// [`ResolvedRow`]. `None` for btree rows and insert positions.
+        resolved: Option<ResolvedRow>,
     },
     /// We have reached the end of the table.
     End,
@@ -225,53 +291,84 @@ impl<A: ConcurrentAllocator> Default for DualCursorPeek<A> {
     }
 }
 
+/// The winner of one sorted-merge step over the dual peeks; the raw material
+/// for a [`CursorPosition::Loaded`].
+struct MergeWinner<A: ConcurrentAllocator> {
+    key: RowKey,
+    in_btree: bool,
+    versions: Option<RowVersions<A>>,
+    resolved: Option<ResolvedRow>,
+}
+
 impl<A: ConcurrentAllocator> DualCursorPeek<A> {
     /// Returns the next row key, whether the row is from the BTree, and (for
-    /// MVCC winners) the resolved version chain captured during iteration.
-    fn get_next(&self, dir: IterationDirection) -> Option<(RowKey, bool, Option<RowVersions<A>>)> {
+    /// MVCC winners) the resolved version chain and row captured during
+    /// iteration. The resolved row is moved out of the winning peek (it is
+    /// only consumed by the position built from this result); the peek's key
+    /// and version chain stay for the sorted-merge bookkeeping.
+    fn get_next(&mut self, dir: IterationDirection) -> Option<MergeWinner<A>> {
         tracing::trace!(
             "get_next: mvcc_key: {:?}, btree_key: {:?}",
             self.mvcc_peek.get_row_key(),
             self.btree_peek.get_row_key()
         );
-        match (self.mvcc_peek.get_row_key(), self.btree_peek.get_row_key()) {
+        let mvcc_wins = match (self.mvcc_peek.get_row_key(), self.btree_peek.get_row_key()) {
             (Some(mvcc_key), Some(btree_key)) => {
                 if dir == IterationDirection::Forwards {
                     // In forwards iteration we want the smaller of the two keys
-                    if mvcc_key <= btree_key {
-                        Some((mvcc_key.clone(), false, self.mvcc_peek.get_versions()))
-                    } else {
-                        Some((btree_key.clone(), true, None))
-                    }
-                // In backwards iteration we want the larger of the two keys
-                } else if mvcc_key >= btree_key {
-                    Some((mvcc_key.clone(), false, self.mvcc_peek.get_versions()))
+                    mvcc_key <= btree_key
                 } else {
-                    Some((btree_key.clone(), true, None))
+                    // In backwards iteration we want the larger of the two keys
+                    mvcc_key >= btree_key
                 }
             }
-            (Some(mvcc_key), None) => {
-                Some((mvcc_key.clone(), false, self.mvcc_peek.get_versions()))
-            }
-            (None, Some(btree_key)) => Some((btree_key.clone(), true, None)),
-            (None, None) => None,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if mvcc_wins {
+            let CursorPeek::Row {
+                key,
+                versions,
+                resolved,
+            } = &mut self.mvcc_peek
+            else {
+                unreachable!("mvcc peek holds a row when it wins");
+            };
+            Some(MergeWinner {
+                key: key.clone(),
+                in_btree: false,
+                versions: versions.clone(),
+                resolved: resolved.take(),
+            })
+        } else {
+            let CursorPeek::Row { key, .. } = &self.btree_peek else {
+                unreachable!("btree peek holds a row when it wins");
+            };
+            Some(MergeWinner {
+                key: key.clone(),
+                in_btree: true,
+                versions: None,
+                resolved: None,
+            })
         }
     }
 
     /// Returns a new [CursorPosition] based on the next row key
     pub fn cursor_position_from_next(
-        &self,
+        &mut self,
         table_id: MVTableId,
         dir: IterationDirection,
     ) -> CursorPosition<A> {
         match self.get_next(dir) {
-            Some((row_key, in_btree, versions)) => CursorPosition::Loaded {
+            Some(winner) => CursorPosition::Loaded {
                 row_id: RowID {
                     table_id,
-                    row_id: row_key,
+                    row_id: winner.key,
                 },
-                in_btree,
-                versions,
+                in_btree: winner.in_btree,
+                versions: winner.versions,
+                resolved: winner.resolved,
             },
             None => match dir {
                 IterationDirection::Forwards => CursorPosition::End,
@@ -302,9 +399,13 @@ enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
     Uninitialized,
     Row {
         key: RowKey,
-        /// Resolved MVCC version chain, set when this peek came from the MVCC
-        /// table iterator. `None` for btree peeks and index peeks.
+        /// Resolved MVCC version chain, set when this peek came from an MVCC
+        /// iterator. `None` for btree peeks.
         versions: Option<RowVersions<A>>,
+        /// The visible row resolved when this peek was produced; see
+        /// [`ResolvedRow`]. `None` for btree peeks. Moved into the cursor
+        /// position when this peek wins the sorted merge.
+        resolved: Option<ResolvedRow>,
     },
     Exhausted,
 }
@@ -319,13 +420,6 @@ impl<A: ConcurrentAllocator> CursorPeek<A> {
     pub fn get_row_key(&self) -> Option<&RowKey> {
         match self {
             CursorPeek::Row { key, .. } => Some(key),
-            _ => None,
-        }
-    }
-
-    pub fn get_versions(&self) -> Option<RowVersions<A>> {
-        match self {
-            CursorPeek::Row { versions, .. } => versions.clone(),
             _ => None,
         }
     }
@@ -512,6 +606,17 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     tx_id: u64,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
+    /// Latest eq-only probe outcome; see [`EqSeekMemo`].
+    eq_seek_memo: Option<EqSeekMemo>,
+    /// [`MvStore::version_mutation_epoch`] snapshot taken when
+    /// `reusable_immutable_record` was serialized for the current MVCC
+    /// position. While it matches the store's current epoch, `current_row`
+    /// returns the already-serialized record instead of re-resolving the
+    /// visible version, so a row read column-by-column pays for one
+    /// resolution instead of one per column. Cleared on any reposition
+    /// (`invalidate_record`); a store epoch bump covers writes made through
+    /// other cursors of the same transaction (e.g. triggers).
+    record_serialized_at: Option<u64>,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
@@ -590,6 +695,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             current_pos: CursorPosition::BeforeFirst,
             table_id,
             reusable_immutable_record: None,
+            eq_seek_memo: None,
+            record_serialized_at: None,
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
@@ -645,6 +752,62 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             CursorPosition::Loaded {
                 in_btree: false, ..
             } => {
+                // Memo fast path: the reusable record already holds this
+                // position's row and no visibility-changing write happened
+                // since it was serialized (every reposition clears
+                // `record_serialized_at`, and any write bumps the epoch).
+                let store_epoch = self.db.version_mutation_epoch();
+                if self.record_serialized_at == Some(store_epoch) {
+                    let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
+                        LimboError::InternalError("immutable record not initialized".to_string())
+                    })?;
+                    return Ok(IOResult::Done(Some(record_ref)));
+                }
+                self.record_serialized_at = None;
+
+                // Resolved fast path: the scan/seek that produced this
+                // position already found the visible row, and no write has
+                // happened since (epoch match), so serialize its payload
+                // without re-locking the chain or re-checking visibility.
+                // `current_pos` and the reusable record are disjoint fields,
+                // so the payload is copied without an intermediate clone.
+                if self.reusable_immutable_record.is_none() {
+                    self.reusable_immutable_record = Some(ImmutableRecord::new(1024)?);
+                }
+                if let CursorPosition::Loaded {
+                    resolved: Some(resolved),
+                    row_id,
+                    ..
+                } = &self.current_pos
+                {
+                    if resolved.epoch == store_epoch {
+                        let payload: &[u8] = match &resolved.row {
+                            Some(row) => row.payload(),
+                            // Index row: the payload is the position's key.
+                            None => match &row_id.row_id {
+                                RowKey::Record(key) => key.key.get_payload(),
+                                RowKey::Int(_) => {
+                                    unreachable!("resolved.row is None only for index rows")
+                                }
+                            },
+                        };
+                        let record = self
+                            .reusable_immutable_record
+                            .as_mut()
+                            .expect("created above");
+                        record.invalidate();
+                        record.start_serialization(payload)?;
+                        self.record_serialized_at = Some(store_epoch);
+                        let record_ref =
+                            self.reusable_immutable_record.as_ref().ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "immutable record not initialized".to_string(),
+                                )
+                            })?;
+                        return Ok(IOResult::Done(Some(record_ref)));
+                    }
+                }
+
                 // Lightweight handle clone (refcount bump) so we can drop the
                 // borrow of `current_pos` and mutably borrow the reusable record.
                 let versions = match &self.current_pos {
@@ -690,6 +853,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 if !found {
                     return Ok(IOResult::Done(None));
                 }
+                self.record_serialized_at = Some(store_epoch);
                 let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
                     LimboError::InternalError("immutable record not initialized".to_string())
                 })?;
@@ -704,16 +868,29 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     pub fn read_mvcc_current_row(&self) -> Result<Option<Row>> {
-        let (row_id, versions) = match &self.current_pos {
+        let (row_id, versions, resolved) = match &self.current_pos {
             CursorPosition::Loaded {
                 row_id,
                 in_btree,
                 versions,
-            } if !in_btree => (row_id, versions),
+                resolved,
+            } if !in_btree => (row_id, versions, resolved),
             _ => panic!("invalid position to read current mvcc row"),
         };
-        // Scan path: the range iterator already resolved this row's version
-        // chain, so read it directly instead of a second skiplist lookup.
+        // Scan/seek path: visibility was already resolved when this position
+        // was created, and no write has happened since (epoch match), so hand
+        // out the resolved row without re-locking the chain.
+        if let Some(ResolvedRow {
+            row: Some(row),
+            epoch,
+        }) = resolved
+        {
+            if *epoch == self.db.version_mutation_epoch() {
+                return Ok(Some(row.clone()));
+            }
+        }
+        // The range iterator already resolved this row's version chain, so
+        // read it directly instead of a second skiplist lookup.
         if let Some(versions) = versions {
             return self.db.read_visible_from_versions(self.tx_id, versions);
         }
@@ -816,15 +993,23 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
     fn advance_mvcc_iterator(&mut self) {
+        // Read the epoch before resolving visibility: a write that lands after
+        // this load fails the equality check in `current_row` and forces a
+        // re-read there.
+        let epoch = self.db.version_mutation_epoch();
         let new_peek_state = match &self.mv_cursor_type {
             MvccCursorType::Table => match self.db.advance_cursor_and_get_row_id_for_table(
                 self.table_id,
                 &mut self.table_iterator,
                 self.tx_id,
             ) {
-                Some((row_id, versions)) => CursorPeek::Row {
-                    key: row_id.row_id,
+                Some((row, versions)) => CursorPeek::Row {
+                    key: row.id.row_id.clone(),
                     versions: Some(versions),
+                    resolved: Some(ResolvedRow {
+                        row: Some(row),
+                        epoch,
+                    }),
                 },
                 None => CursorPeek::Exhausted,
             },
@@ -832,9 +1017,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 .db
                 .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.tx_id)
             {
-                Some(row_id) => CursorPeek::Row {
-                    key: row_id.row_id,
-                    versions: None,
+                Some((key, versions)) => CursorPeek::Row {
+                    key: RowKey::Record(key),
+                    versions: Some(versions),
+                    resolved: Some(ResolvedRow { row: None, epoch }),
                 },
                 None => CursorPeek::Exhausted,
             },
@@ -878,6 +1064,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
+                                resolved: None,
                             };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
@@ -912,6 +1099,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key,
                                 versions: None,
+                                resolved: None,
                             };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
@@ -966,6 +1154,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
+                                resolved: None,
                             };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
@@ -1000,6 +1189,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
+                                resolved: None,
                             };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
@@ -1140,6 +1330,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
+                                resolved: None,
                             };
                             return Ok(IOResult::Done(()));
                         }
@@ -1233,6 +1424,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.invalidate_record();
         self.current_pos = CursorPosition::End;
 
+        // Read the epoch before the MVCC-last resolution; see
+        // `advance_mvcc_iterator`.
+        let epoch = self.db.version_mutation_epoch();
         // Initialize MVCC iterator to last position
         match &self.mv_cursor_type {
             MvccCursorType::Table => match self.db.get_last_table_rowid(
@@ -1240,11 +1434,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 &mut self.table_iterator,
                 self.tx_id,
             ) {
-                Some(k) => {
-                    tracing::trace!("last: mvcc_key: {:?}", k);
+                Some((row, versions)) => {
+                    tracing::trace!("last: mvcc_key: {:?}", row.id);
                     self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
+                        key: row.id.row_id.clone(),
+                        versions: Some(versions),
+                        resolved: Some(ResolvedRow {
+                            row: Some(row),
+                            epoch,
+                        }),
                     };
                 }
                 None => {
@@ -1256,10 +1454,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 self.tx_id,
                 &mut self.index_iterator,
             )? {
-                Some(k) => {
+                Some((key, versions)) => {
                     self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
+                        key: RowKey::Record(key),
+                        versions: Some(versions),
+                        resolved: Some(ResolvedRow { row: None, epoch }),
                     };
                 }
                 None => {
@@ -1281,8 +1480,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn next(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
-            let current_pos = self.get_current_pos();
-            if matches!(current_pos, CursorPosition::BeforeFirst) {
+            if matches!(self.current_pos, CursorPosition::BeforeFirst) {
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     // Initialize MVCC iterator and get first peek
@@ -1316,8 +1514,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccLazyCursorState::Next(NextState::CheckNeedsAdvance)
         ) {
             // Determine which cursor(s) need to be advanced based on current position
-            let current_pos = self.get_current_pos();
-            let (need_advance_mvcc, need_advance_btree) = match &current_pos {
+            let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::BeforeFirst => {
                     // First call after rewind - peek values should already be populated
                     // Just need to pick the smaller one
@@ -1377,8 +1574,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn prev(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
-            let current_pos = self.get_current_pos();
-            if matches!(current_pos, CursorPosition::End) {
+            if matches!(self.current_pos, CursorPosition::End) {
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     self.state
@@ -1408,8 +1604,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance)
         ) {
             // Determine which cursor(s) need to be advanced based on current position
-            let current_pos = self.get_current_pos();
-            let (need_advance_mvcc, need_advance_btree) = match &current_pos {
+            let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::End => {
                     // First call after last() - peek values should already be populated
                     (false, false)
@@ -1549,6 +1744,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
                     };
+                    // Epoch for the memo below, read before the probe; see
+                    // `advance_mvcc_iterator`.
+                    let epoch = self.db.version_mutation_epoch();
                     // The current row is visible either because MvStore has a visible version
                     // for it, or because it is a b-tree-resident row that is not shadowed by
                     // any MVCC version. Both cases must short-circuit: otherwise a b-tree-only
@@ -1556,10 +1754,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // iterators and marks the MVCC peek exhausted, skipping MvStore-resident
                     // rows that the enclosing range scan (see the comment above) still needs
                     // to visit.
-                    let visible = self
+                    let mvcc_found = self
                         .db
                         .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
-                        .is_some()
+                        .is_some();
+                    self.eq_seek_memo = Some(EqSeekMemo {
+                        key: row_id.clone(),
+                        mvcc_found,
+                        epoch,
+                    });
+                    let visible = mvcc_found
                         || (*in_btree && self.query_btree_version_is_valid(&row_id.row_id));
                     if visible {
                         // We need to clear the null flag for the table cursor before seeking,
@@ -1589,6 +1793,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     let direction = op.iteration_direction();
                     let inclusive = matches!(op, SeekOp::GE { .. } | SeekOp::LE { .. });
 
+                    // Read the epoch before the MVCC seek resolves visibility;
+                    // see `advance_mvcc_iterator`.
+                    let epoch = self.db.version_mutation_epoch();
+
                     match &seek_key {
                         SeekKey::TableRowId(row_id) => {
                             let rowid = RowID {
@@ -1606,12 +1814,27 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 &mut self.table_iterator,
                             );
 
+                            // An eq-only seek's range is bounded to the probe
+                            // key, so a hit means exactly "visible version at
+                            // this key"; remember that for `insert`.
+                            if op.eq_only() {
+                                self.eq_seek_memo = Some(EqSeekMemo {
+                                    key: rowid,
+                                    mvcc_found: mvcc_rowid.is_some(),
+                                    epoch,
+                                });
+                            }
+
                             // Set MVCC peek
                             {
-                                self.dual_peek.mvcc_peek = match &mvcc_rowid {
-                                    Some(rid) => CursorPeek::Row {
-                                        key: rid.row_id.clone(),
-                                        versions: None,
+                                self.dual_peek.mvcc_peek = match mvcc_rowid {
+                                    Some((row, versions)) => CursorPeek::Row {
+                                        key: row.id.row_id.clone(),
+                                        versions: Some(versions),
+                                        resolved: Some(ResolvedRow {
+                                            row: Some(row),
+                                            epoch,
+                                        }),
                                     },
                                     None => CursorPeek::Exhausted,
                                 };
@@ -1647,12 +1870,26 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 &mut self.index_iterator,
                             )?;
 
+                            // See the TableRowId arm: eq-only hit == visible
+                            // version at the probe key.
+                            if op.eq_only() {
+                                self.eq_seek_memo = Some(EqSeekMemo {
+                                    key: RowID {
+                                        table_id: self.table_id,
+                                        row_id: RowKey::Record(Arc::new(sortable_key.clone())),
+                                    },
+                                    mvcc_found: mvcc_rowid.is_some(),
+                                    epoch,
+                                });
+                            }
+
                             // Set MVCC peek
                             {
-                                self.dual_peek.mvcc_peek = match &mvcc_rowid {
-                                    Some(rid) => CursorPeek::Row {
-                                        key: rid.row_id.clone(),
-                                        versions: None,
+                                self.dual_peek.mvcc_peek = match mvcc_rowid {
+                                    Some((key, versions)) => CursorPeek::Row {
+                                        key: RowKey::Record(key),
+                                        versions: Some(versions),
+                                        resolved: Some(ResolvedRow { row: None, epoch }),
                                     },
                                     None => CursorPeek::Exhausted,
                                 };
@@ -1681,14 +1918,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // Clear seek state
                     self.state = None;
 
-                    if let Some((winner_key, in_btree, winner_versions)) = winner {
+                    if let Some(winner) = winner {
+                        let winner_key = winner.key.clone();
                         self.current_pos = CursorPosition::Loaded {
                             row_id: RowID {
                                 table_id: self.table_id,
-                                row_id: winner_key.clone(),
+                                row_id: winner.key,
                             },
-                            in_btree,
-                            versions: winner_versions,
+                            in_btree: winner.in_btree,
+                            versions: winner.versions,
+                            resolved: winner.resolved,
                         };
 
                         if op.eq_only() {
@@ -1809,17 +2048,29 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             row_id: row.id.clone(),
             in_btree: was_btree_resident,
             versions: None,
+            resolved: None,
         };
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
-        // FIXME: set btree to somewhere close to this rowid?
-        if self
-            .db
-            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
-            .is_some()
+        // Inserts run right after an eq probe of the same key (NotExists,
+        // NoConflict, or IdxInsert's own seek); reuse that probe's outcome
+        // instead of a second skiplist lookup when it is still current.
+        let store_epoch = self.db.version_mutation_epoch();
+        let mvcc_exists = match self
+            .eq_seek_memo
+            .as_ref()
+            .and_then(|memo| memo.mvcc_found_for(&row.id, store_epoch))
         {
+            Some(found) => found,
+            None => self
+                .db
+                .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
+                .is_some(),
+        };
+        // FIXME: set btree to somewhere close to this rowid?
+        if mvcc_exists {
             self.db
                 .update_to_table_or_index(self.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
@@ -1933,6 +2184,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // Check MVCC first. This is a point existence probe, so it is
             // eq-only: bound the skiplist walk to the single rowid instead of
             // scanning forward over invisible concurrent rows.
+            // Read the epoch before the seek resolves visibility; see
+            // `advance_mvcc_iterator`.
+            let epoch = self.db.version_mutation_epoch();
             let rowid = self.db.seek_rowid(
                 RowID {
                     table_id: self.table_id,
@@ -1945,24 +2199,35 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 &mut self.table_iterator,
             );
 
-            let mvcc_exists = if let Some(rowid) = &rowid {
-                let RowKey::Int(rowid) = rowid.row_id else {
-                    panic!("Rowid is not an integer in mvcc table cursor");
-                };
-                rowid == *int_key
-            } else {
-                false
+            let mvcc_found = match rowid {
+                Some((row, versions)) => {
+                    let RowKey::Int(rowid) = row.id.row_id else {
+                        panic!("Rowid is not an integer in mvcc table cursor");
+                    };
+                    (rowid == *int_key).then_some((row, versions))
+                }
+                None => None,
             };
+            self.eq_seek_memo = Some(EqSeekMemo {
+                key: RowID {
+                    table_id: self.table_id,
+                    row_id: RowKey::Int(*int_key),
+                },
+                mvcc_found: mvcc_found.is_some(),
+                epoch,
+            });
 
             tracing::trace!(
-                "MVCC exists check: mvcc_exists={mvcc_exists} find={int_key} got={rowid:?}"
+                "MVCC exists check: mvcc_exists={} find={int_key}",
+                mvcc_found.is_some()
             );
 
             // If found in MVCC, update dual_peek and return true
-            if mvcc_exists {
+            if let Some((row, versions)) = mvcc_found {
                 self.dual_peek.mvcc_peek = CursorPeek::Row {
                     key: RowKey::Int(*int_key),
-                    versions: None,
+                    versions: Some(versions.clone()),
+                    resolved: None,
                 };
                 self.current_pos = CursorPosition::Loaded {
                     row_id: RowID {
@@ -1970,7 +2235,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         row_id: RowKey::Int(*int_key),
                     },
                     in_btree: false,
-                    versions: None,
+                    versions: Some(versions),
+                    resolved: Some(ResolvedRow {
+                        row: Some(row),
+                        epoch,
+                    }),
                 };
                 self.state = None;
                 return Ok(IOResult::Done(true));
@@ -2023,6 +2292,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 self.dual_peek.btree_peek = CursorPeek::Row {
                     key: row_key.clone(),
                     versions: None,
+                    resolved: None,
                 };
                 self.current_pos = CursorPosition::Loaded {
                     row_id: RowID {
@@ -2031,6 +2301,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     },
                     in_btree: true,
                     versions: None,
+                    resolved: None,
                 };
                 self.state = None;
                 Ok(IOResult::Done(true))
@@ -2213,6 +2484,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn invalidate_record(&mut self) {
+        self.record_serialized_at = None;
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
