@@ -11,8 +11,8 @@ use crate::{
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
-            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Plan,
-            SubqueryState, TableReferences, WhereTerm,
+            is_non_null_literal, JoinOrderMember, JoinOrigin, JoinedTable, NonFromClauseSubquery,
+            Plan, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -552,6 +552,13 @@ pub fn constraints_from_where_clause(
                         // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
                         // pattern matching rather than btree index scans
                         .filter(|index| index.index_method.is_none())
+                        // A partial index can omit rows that a later RIGHT JOIN
+                        // or FULL JOIN must keep.
+                        .filter(|index| {
+                            index.where_clause.is_none()
+                                || !table_references
+                                    .is_left_of_right_or_full_join(table_reference.internal_id)
+                        })
                         .map(|index| ConstraintUseCandidate {
                             index: Some(index.clone()),
                             refs: Vec::new(),
@@ -572,7 +579,7 @@ pub fn constraints_from_where_clause(
         for (i, term) in where_clause.iter().enumerate() {
             // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
             // regardless of which tables the constraint references.
-            if let Some(outer_join_tbl) = term.from_outer_join {
+            if let Some(outer_join_tbl) = term.from_join.and_then(JoinOrigin::outer_table) {
                 if outer_join_tbl != table_reference.internal_id {
                     continue;
                 }
@@ -614,15 +621,18 @@ pub fn constraints_from_where_clause(
                 // the re-check removes the bogus rows. `IS` (e.g. `e.id IS
                 // NULL`) *is* TRUE on the null-extended row, so no re-check can
                 // repair it — it is unusable for every null-extendable table.
-                // A FULL JOIN synthesizes its extra rows by jumping past the
-                // scan with no re-check, so nothing is usable for any table a
-                // FULL JOIN can null-extend.
+                // A RIGHT JOIN or FULL JOIN scans unmatched right rows after
+                // the normal loops. A WHERE term cannot constrain any table in
+                // that join range because the later scan can bypass its loop.
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
-                let usable = term.from_outer_join == Some(table_reference.internal_id)
+                let usable = term
+                    .from_join
+                    .is_some_and(|origin| origin.right_table() == table_reference.internal_id)
                     || if is_op {
                         !table_references.outer_join_may_null_extend(table_reference.internal_id)
                     } else {
-                        !table_references.full_join_may_null_extend(table_reference.internal_id)
+                        !table_references
+                            .right_or_full_join_blocks_where_constraint(table_reference.internal_id)
                     };
                 // See [Constraint::null_matching]. The constraining value sits
                 // on the opposite side of the constrained column.
@@ -1505,7 +1515,9 @@ pub(super) fn partial_index_predicate_terms(
             return false;
         }
         if join_info.is_outer() {
-            return term.from_outer_join == Some(table_reference.internal_id);
+            return term
+                .from_join
+                .is_some_and(|origin| origin == JoinOrigin::Outer(table_reference.internal_id));
         }
         true
     };

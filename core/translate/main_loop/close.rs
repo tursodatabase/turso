@@ -2,6 +2,102 @@ use super::*;
 use crate::translate::main_loop::hash::{
     emit_hash_join_unmatched_build_rows, GraceHashLoop, HashProbeCloseEmitter,
 };
+use crate::translate::main_loop::open::{
+    emit_materialized_subquery_result_columns, emit_right_join_key,
+};
+
+fn set_left_sources_to_null(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    right_table_index: usize,
+    mode: &OperationMode,
+) -> Result<()> {
+    for table in tables.joined_tables().iter().take(right_table_index) {
+        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program, mode.clone())?;
+        for cursor_id in [table_cursor_id, index_cursor_id].into_iter().flatten() {
+            program.emit_insn(Insn::NullRow { cursor_id });
+        }
+        if let Table::FromClauseSubquery(subquery) = &table.table {
+            if let Some(start_reg) = subquery.result_columns_start_reg {
+                if !subquery.columns.is_empty() {
+                    program.emit_insn(Insn::Null {
+                        dest: start_reg,
+                        dest_end: Some(start_reg + subquery.columns.len() - 1),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_unmatched_right_rows(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    table_index: usize,
+    right_join: &RightJoinMetadata,
+    mode: &OperationMode,
+) -> Result<()> {
+    set_left_sources_to_null(program, tables, table_index, mode)?;
+
+    let table = &tables.joined_tables()[table_index];
+    let (table_cursor_id, _) = table.resolve_cursors(program, mode.clone())?;
+    let table_cursor_id =
+        table_cursor_id.expect("a right-preserving join must keep its table cursor open");
+
+    match &table.table {
+        Table::BTree(btree) => program.emit_insn(Insn::OpenRead {
+            cursor_id: table_cursor_id,
+            root_page: btree.root_page,
+            db: table.database_id,
+        }),
+        Table::FromClauseSubquery(subquery) if subquery.materialized_cursor_id.is_some() => {}
+        _ => {
+            return Err(crate::LimboError::InternalError(
+                "right-preserving joins need a table-backed right source".to_string(),
+            ));
+        }
+    }
+    let scan_start = program.allocate_label();
+    let scan_end = program.allocate_label();
+    let next_row = program.allocate_label();
+    let emit_row = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: table_cursor_id,
+        pc_if_empty: scan_end,
+    });
+    program.preassign_label_to_next_insn(scan_start);
+
+    emit_right_join_key(program, right_join, table_cursor_id);
+    program.emit_insn(Insn::Filter {
+        cursor_id: right_join.matched_rows_cursor_id,
+        target_pc: emit_row,
+        key_reg: right_join.rowid_reg,
+        num_keys: 1,
+    });
+    program.emit_insn(Insn::Found {
+        cursor_id: right_join.matched_rows_cursor_id,
+        target_pc: next_row,
+        record_reg: right_join.rowid_reg,
+        num_regs: 1,
+    });
+    program.preassign_label_to_next_insn(emit_row);
+    if let Table::FromClauseSubquery(subquery) = &table.table {
+        emit_materialized_subquery_result_columns(program, subquery, table_cursor_id, None);
+    }
+    program.emit_insn(Insn::Gosub {
+        target_pc: right_join.body_label,
+        return_reg: right_join.return_reg,
+    });
+    program.preassign_label_to_next_insn(next_row);
+    program.emit_insn(Insn::Next {
+        cursor_id: table_cursor_id,
+        pc_if_next: scan_start,
+        fullscan: true,
+    });
+    program.preassign_label_to_next_insn(scan_end);
+    Ok(())
+}
 
 /// Represents final step of Loop emission
 pub struct CloseLoop;
@@ -50,6 +146,14 @@ impl CloseLoop {
                 program.add_comment(program.offset(), comment);
                 program.emit_insn(Insn::Goto {
                     target_pc: sa_meta.label_next_outer,
+                });
+            }
+
+            if let Some(right_join) = t_ctx.meta_right_joins[table_index].as_ref() {
+                program.preassign_label_to_next_insn(right_join.return_label);
+                program.emit_insn(Insn::Return {
+                    return_reg: right_join.return_reg,
+                    can_fallthrough: true,
                 });
             }
 
@@ -334,6 +438,13 @@ impl CloseLoop {
                 }
             }
 
+            if let Some(right_join) = t_ctx.meta_right_joins[table_index].as_ref() {
+                program.emit_insn(Insn::Return {
+                    return_reg: right_join.return_reg,
+                    can_fallthrough: true,
+                });
+            }
+
             // Resolve any semi/anti-join "outer next" labels targeting this table.
             if let Some(anchor) = semi_anti_next_anchor {
                 for meta in t_ctx.meta_semi_anti_joins.iter().flatten() {
@@ -375,7 +486,7 @@ impl CloseLoop {
                 )
             );
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() && !is_outer_hash_join_probe {
+                if join_info.keeps_left_rows() && !is_outer_hash_join_probe {
                     let lj_meta = t_ctx.meta_left_joins[table_index].as_ref().unwrap();
                     // The left join match flag is set to 1 when there is any match on the right table
                     // (e.g. SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a).
@@ -423,6 +534,14 @@ impl CloseLoop {
                     });
                     program.preassign_label_to_next_insn(label_when_right_table_notnull);
                 }
+            }
+        }
+
+        // Scan unmatched right rows in source order. An earlier scan can enter
+        // later join loops and add matches that those later scans must see.
+        for (table_index, right_join) in t_ctx.meta_right_joins.iter().enumerate() {
+            if let Some(right_join) = right_join.as_ref() {
+                emit_unmatched_right_rows(program, tables, table_index, right_join, &mode)?;
             }
         }
 

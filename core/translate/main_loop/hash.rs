@@ -341,9 +341,9 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 .into_iter()
                 .try_collect()?;
             for cond in planner.predicates.iter() {
-                if cond.from_outer_join.is_some() {
+                if cond.from_join.is_some_and(JoinOrigin::is_outer) {
                     // OUTER JOIN predicates must stay on the right-table loop
-                    // recorded in `from_outer_join`; applying them while
+                    // recorded in `from_join`; applying them while
                     // building the hash table would drop unmatched build rows
                     // before null-extension.
                     continue;

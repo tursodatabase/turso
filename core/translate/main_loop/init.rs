@@ -2,6 +2,34 @@ use super::*;
 use crate::alloc::TursoIteratorExt;
 use crate::function::AggFunc;
 
+fn right_join_metadata(
+    program: &mut ProgramBuilder,
+    table: &JoinedTable,
+) -> Result<RightJoinMetadata> {
+    let matched_rows_index = Arc::new(Index {
+        name: format!("right_join_matches_{}", usize::from(table.internal_id)),
+        table_name: table.table.get_name().to_string(),
+        root_page: 0,
+        columns: crate::alloc::vec![IndexColumn::new("rowid", 0)],
+        unique: true,
+        ephemeral: true,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    });
+    let matched_rows_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeIndex(matched_rows_index));
+
+    Ok(RightJoinMetadata {
+        matched_rows_cursor_id,
+        rowid_reg: program.alloc_register(),
+        return_reg: program.alloc_register(),
+        body_label: program.allocate_label(),
+        return_label: program.allocate_label(),
+    })
+}
+
 pub fn init_distinct(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
@@ -50,6 +78,11 @@ impl InitLoop {
             t_ctx.meta_left_joins.len(),
             tables.joined_tables().len(),
             "meta_left_joins length must match tables length"
+        );
+        turso_assert_eq!(
+            t_ctx.meta_right_joins.len(),
+            tables.joined_tables().len(),
+            "meta_right_joins length must match tables length"
         );
 
         if matches!(
@@ -134,13 +167,17 @@ impl InitLoop {
             program.begin_read_on_database(table.database_id, schema_cookie)?;
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() {
+                if join_info.keeps_left_rows() {
                     let lj_metadata = LeftJoinMetadata {
                         reg_match_flag: program.alloc_register(),
                         label_match_flag_set_true: program.allocate_label(),
                         label_match_flag_check_value: program.allocate_label(),
                     };
                     t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
+                }
+                if join_info.keeps_right_rows() {
+                    t_ctx.meta_right_joins[table_index] =
+                        Some(right_join_metadata(program, table)?);
                 }
                 if join_info.is_semi_or_anti() {
                     let join_idx = join_order
@@ -509,6 +546,19 @@ impl InitLoop {
                     }
                 }
             }
+        }
+
+        for right_join in t_ctx.meta_right_joins.iter().flatten() {
+            // A correlated subquery can run this loop more than once. Clear the
+            // old return address before the first path reaches Return.
+            program.emit_insn(Insn::Null {
+                dest: right_join.return_reg,
+                dest_end: None,
+            });
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: right_join.matched_rows_cursor_id,
+                is_table: false,
+            });
         }
 
         for cond in where_clause

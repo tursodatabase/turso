@@ -346,9 +346,6 @@ fn prepare_update_plan(
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
-    if from_tables.right_join_swapped() {
-        read_scope_tables.set_right_join_swapped();
-    }
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {

@@ -517,7 +517,6 @@ fn prepare_one_select_plan(
                             select_star(
                                 plan.table_references.joined_tables(),
                                 &mut plan.result_columns,
-                                plan.table_references.right_join_swapped(),
                                 long_names,
                             )?;
                             for table in plan.table_references.joined_tables_mut() {

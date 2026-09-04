@@ -270,19 +270,19 @@ snapshot left-outer-join-chained {
 # 4. Right outer join
 # =============================================================================
 
-# TODO: Uncomment when RIGHT JOIN is supported
-# @setup schema
-# snapshot right-outer-join-basic {
-#     SELECT
-#         c.customer_id,
-#         c.name,
-#         o.order_id,
-#         o.order_date,
-#         o.total_amount
-#     FROM
-#         customers c
-#     RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id;
-# }
+@setup schema
+snapshot right-outer-join-basic {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c
+    RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    ORDER BY c.customer_id;
+}
 
 # TODO: Uncomment when RIGHT JOIN is supported
 # @setup schema
@@ -912,12 +912,29 @@ snapshot hash-join-left-outer {
     LEFT JOIN h_items i ON h.customer_name = i.order_name;
 }
 
-# FULL OUTER hash join - both unmatched build and unmatched probe paths
+# FULL OUTER join - records matched right rowids and scans them again
 @setup hash_schema
-snapshot hash-join-full-outer {
+snapshot full-outer-join-sqlite-style {
     SELECT h.order_id, h.customer_name, i.item_id, i.product
     FROM h_orders h
     FULL OUTER JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+setup right_join_false_inner_on_schema {
+    CREATE TABLE false_inner_left(a INTEGER);
+    CREATE TABLE false_inner_middle(b INTEGER);
+    CREATE TABLE false_inner_right(c INTEGER);
+    INSERT INTO false_inner_right VALUES(1);
+}
+
+# SQLite keeps the false inner ON term inside the left join prefix. The jump
+# must reach the RIGHT JOIN cleanup instead of ending the whole query.
+@setup right_join_false_inner_on_schema
+snapshot false-inner-on-term-does-not-skip-right-join-cleanup {
+    SELECT *
+      FROM false_inner_left
+      JOIN false_inner_middle ON false
+      RIGHT JOIN false_inner_right;
 }
 
 # Hash join with aggregation

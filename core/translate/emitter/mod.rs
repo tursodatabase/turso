@@ -12,7 +12,7 @@ use super::{
         walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
-    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
     order_by::SortMetadata,
     plan::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
@@ -1030,9 +1030,13 @@ pub struct TranslateCtx<'a> {
     pub meta_group_by: Option<GroupByMetadata>,
     // metadata for the order by operator
     pub meta_sort: Option<SortMetadata>,
-    /// mapping between table loop index and associated metadata (for left joins only)
-    /// this metadata exists for the right table in a given left join
+    /// Match state for each JOIN that keeps unmatched left rows.
+    ///
+    /// Left-row and right-row match state are separate because a FULL JOIN needs both.
+    /// This matches SQLite's `WhereLevel.iLeftJoin` and `WhereLevel.pRJ` fields.
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
+    /// Match state for each JOIN that keeps unmatched right rows.
+    pub meta_right_joins: Vec<Option<RightJoinMetadata>>,
     /// mapping between table loop index and associated metadata (for semi/anti joins)
     pub meta_semi_anti_joins: Vec<Option<SemiAntiJoinMetadata>>,
     pub resolver: Resolver<'a>,
@@ -1092,6 +1096,7 @@ impl<'a> TranslateCtx<'a> {
             reg_result_cols_start: None,
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_right_joins: (0..table_count).map(|_| None).collect(),
             meta_semi_anti_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
             hash_table_contexts: HashMap::default(),

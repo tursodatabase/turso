@@ -6,8 +6,8 @@ use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
         query_output_columns, Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt,
-        IterationDirection, JoinInfo, JoinOrderMember, JoinType as PlanJoinType, JoinedTable,
-        Operation, OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan,
+        IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin, JoinType as PlanJoinType,
+        JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan,
         TableReferences, WhereTerm,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
@@ -2545,9 +2545,8 @@ pub fn parse_where(
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
                 break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
-                // Preserve from_outer_join from the original term
                 for new_term in new_terms.iter_mut() {
-                    new_term.from_outer_join = term.from_outer_join;
+                    new_term.from_join = term.from_join;
                 }
                 let count = new_terms.len();
                 for (j, new_term) in new_terms.into_iter().enumerate() {
@@ -2626,16 +2625,47 @@ pub fn determine_where_to_eval_term(
     subqueries: &[NonFromClauseSubquery],
     table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
-    if let Some(table_id) = term.from_outer_join {
-        return Ok(EvalAt::Loop(
-            join_order
+    let mut eval_at =
+        determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)?;
+    if let Some(table_id) = term.from_join.map(JoinOrigin::right_table) {
+        let join_loop = join_order
+            .iter()
+            .position(|table| table.table_id == table_id)
+            .unwrap_or(usize::MAX);
+        eval_at = eval_at.max(EvalAt::Loop(join_loop));
+    }
+    let Some(table_references) = table_references else {
+        return Ok(eval_at);
+    };
+    let referenced_tables = table_mask_from_expr(&term.expr, table_references, subqueries)?;
+
+    if term.from_join.is_none() {
+        // A WHERE condition that reads a table to the left of a RIGHT JOIN must
+        // run in that join's row body. The unmatched scan enters the same body
+        // with every table on the left set to NULL.
+        for (right_table_index, right_table) in table_references.joined_tables().iter().enumerate()
+        {
+            if !right_table
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::keeps_right_rows)
+            {
+                continue;
+            }
+            let reads_left_table = referenced_tables
                 .iter()
-                .position(|t| t.table_id == table_id)
-                .unwrap_or(usize::MAX),
-        ));
+                .any(|table_index| table_index < right_table_index);
+            if reads_left_table {
+                let loop_index = join_order
+                    .iter()
+                    .position(|table| table.table_id == right_table.internal_id)
+                    .expect("right join table must be in the join order");
+                eval_at = eval_at.max(EvalAt::Loop(loop_index));
+            }
+        }
     }
 
-    determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)
+    Ok(eval_at)
 }
 
 /// A bitmask representing a set of tables in a query plan.
@@ -2857,7 +2887,7 @@ fn parse_join(
 
     let is_cross = matches!(join_operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::CROSS));
 
-    let (outer, natural, full_outer) = match join_operator {
+    let (plan_join_type, natural) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
             let is_right = join_type.contains(JoinType::RIGHT);
             let is_left = join_type.contains(JoinType::LEFT);
@@ -2866,29 +2896,20 @@ fn parse_join(
             // FULL OUTER: LEFT+RIGHT or bare OUTER
             let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
 
-            if is_right && !is_left && !is_full {
-                // RIGHT JOIN: swap the last two tables, then treat as LEFT JOIN.
-                let len = table_references.joined_tables().len();
-                // Only valid for a two-table FROM clause; with prior joins the swap
-                // would break ON clause column references.
-                if len > 2 {
-                    crate::bail_parse_error!(
-                        "RIGHT JOIN following another join is not yet supported. \
-                         Try rewriting as LEFT JOIN or using a subquery."
-                    );
-                }
-                table_references.joined_tables_mut().swap(len - 2, len - 1);
-                table_references.set_right_join_swapped();
-                // outer flag goes on the originally-left table (now rightmost after swap).
-                (true, is_natural, false)
-            } else if is_full {
-                (true, is_natural, true)
+            let plan_join_type = if is_full {
+                PlanJoinType::FullOuter
+            } else if is_right {
+                PlanJoinType::RightOuter
+            } else if is_outer || is_left {
+                PlanJoinType::LeftOuter
             } else {
-                (is_outer || is_left, is_natural, false)
-            }
+                PlanJoinType::Inner
+            };
+            (plan_join_type, is_natural)
         }
-        _ => (false, false, false),
+        _ => (PlanJoinType::Inner, false),
     };
+    let outer = !matches!(plan_join_type, PlanJoinType::Inner);
 
     if natural && constraint.is_some() {
         crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
@@ -2945,12 +2966,14 @@ fn parse_join(
             ast::JoinConstraint::On(ref expr) => {
                 let start_idx = out_where_clause.len();
                 break_predicate_at_and_boundaries(expr, out_where_clause);
+                let join_table_id = table_references.joined_tables().last().unwrap().internal_id;
+                let origin = if outer {
+                    JoinOrigin::Outer(join_table_id)
+                } else {
+                    JoinOrigin::Inner(join_table_id)
+                };
                 for predicate in out_where_clause[start_idx..].iter_mut() {
-                    predicate.from_outer_join = if outer {
-                        Some(table_references.joined_tables().last().unwrap().internal_id)
-                    } else {
-                        None
-                    };
+                    predicate.from_join = Some(origin);
                     bind_and_rewrite_expr(
                         &mut predicate.expr,
                         Some(table_references),
@@ -3034,11 +3057,11 @@ fn parse_join(
                     right_table.mark_column_used(right_col_idx);
                     out_where_clause.push(WhereTerm {
                         expr,
-                        from_outer_join: if outer {
-                            Some(right_table.internal_id)
+                        from_join: Some(if outer {
+                            JoinOrigin::Outer(right_table.internal_id)
                         } else {
-                            None
-                        },
+                            JoinOrigin::Inner(right_table.internal_id)
+                        }),
                         consumed: false,
                     });
                 }
@@ -3053,13 +3076,6 @@ fn parse_join(
         .joined_tables_mut()
         .get_mut(last_idx)
         .unwrap();
-    let plan_join_type = if full_outer {
-        PlanJoinType::FullOuter
-    } else if outer {
-        PlanJoinType::LeftOuter
-    } else {
-        PlanJoinType::Inner
-    };
     rightmost_table.join_info = Some(JoinInfo {
         join_type: plan_join_type,
         using,
@@ -3089,19 +3105,18 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
         // must be associated with the virtual table's outer join context if the table is
         // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
         // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
-        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
+        let from_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
             table_references
                 .find_joined_table_by_internal_id(table_id)
                 .and_then(|table_ref| {
-                    table_ref
-                        .join_info
-                        .as_ref()
-                        .and_then(|join_info| join_info.is_outer().then_some(table_id))
+                    table_ref.join_info.as_ref().and_then(|join_info| {
+                        join_info.is_outer().then_some(JoinOrigin::Outer(table_id))
+                    })
                 })
         });
         out_where_clause.push(WhereTerm {
             expr,
-            from_outer_join,
+            from_join,
             consumed: false,
         });
     }

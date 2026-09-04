@@ -746,6 +746,8 @@ impl ActiveOpStateSlot {
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
+    /// The rowid that DeferredSeek saves before the index can move.
+    pub rowid: i64,
 }
 
 pub(crate) enum VacuumOpState {

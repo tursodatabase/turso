@@ -188,41 +188,50 @@ pub struct GroupBy {
     pub having: Option<Vec<ast::Expr>>,
 }
 
-/// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.
-/// This is done so that we can evaluate the conditions at the correct loop depth.
-/// We also need to keep track of whether the condition came from an OUTER JOIN. Take this example:
-/// SELECT * FROM users u LEFT JOIN products p ON u.id = 5.
-/// Even though the condition only refers to 'u', we CANNOT evaluate it at the users loop, because we need to emit NULL
-/// values for the columns of 'p', for EVERY row in 'u', instead of completely skipping any rows in 'u' where the condition is false.
+/// The JOIN that supplied a term and whether that JOIN keeps unmatched rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinOrigin {
+    /// An ON or USING term from an inner join.
+    Inner(TableInternalId),
+    /// An ON or USING term from an outer join.
+    Outer(TableInternalId),
+}
+
+impl JoinOrigin {
+    /// Get the right table of the JOIN.
+    pub fn right_table(self) -> TableInternalId {
+        match self {
+            Self::Inner(table) | Self::Outer(table) => table,
+        }
+    }
+
+    /// Get the right table only when the JOIN is outer.
+    pub fn outer_table(self) -> Option<TableInternalId> {
+        match self {
+            Self::Inner(_) => None,
+            Self::Outer(table) => Some(table),
+        }
+    }
+
+    /// Whether the JOIN is outer.
+    pub fn is_outer(self) -> bool {
+        matches!(self, Self::Outer(_))
+    }
+}
+
+/// One term that the planner can schedule or use for table access.
 #[derive(Debug, Clone)]
 pub struct WhereTerm {
-    /// The original condition expression.
+    /// The term expression.
     pub expr: ast::Expr,
-    /// For normal JOIN conditions (ON or WHERE clauses), we break them up into individual [WhereTerm] conditions
-    /// and let the optimizer determine when each should be evaluated based on the tables they reference.
-    /// See e.g. [EvalAt].
-    /// For example, in "SELECT * FROM x JOIN y WHERE x.a = 2", we want to evaluate x.a = 2 right after opening x
-    /// since it only depends on x.
+    /// The JOIN that supplied this term.
     ///
-    /// However, OUTER JOIN conditions require special handling. Consider:
-    ///   SELECT * FROM t LEFT JOIN s ON t.a = 2
+    /// An outer JOIN term must run in the right-table loop, even if it reads only left tables.
+    /// Otherwise, the JOIN can lose rows that need a NULL right side.
     ///
-    /// Even though t.a = 2 only references t, we cannot evaluate it during t's loop and skip rows where t.a != 2.
-    /// Instead, we must:
-    /// 1. Process ALL rows from t
-    /// 2. For each t row where t.a != 2, emit NULL values for s's columns
-    /// 3. For each t row where t.a = 2, emit the actual s values
-    ///
-    /// This means the condition must be evaluated during s's loop, regardless of which tables it references.
-    /// We track this requirement using [WhereTerm::from_outer_join], which contains the [TableInternalId] of the
-    /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
-    /// is set, we force evaluation to happen during that table's loop.
-    pub from_outer_join: Option<TableInternalId>,
-    /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
-    /// in the normal place where WHERE terms are evaluated.
-    /// A term may have been consumed e.g. if:
-    /// - it has been converted into a constraint in a seek key
-    /// - it has been removed due to being trivially true or false
+    /// This is None for a WHERE term.
+    pub from_join: Option<JoinOrigin>,
+    /// Whether the optimizer does not need to emit this term.
     pub consumed: bool,
 }
 
@@ -272,7 +281,7 @@ impl From<Expr> for WhereTerm {
     fn from(value: Expr) -> Self {
         Self {
             expr: value,
-            from_outer_join: None,
+            from_join: None,
             consumed: false,
         }
     }
@@ -314,6 +323,8 @@ impl Ord for EvalAt {
 pub enum SubqueryEvalPhase {
     BeforeLoop,
     Loop(usize),
+    /// Evaluate inside the row body so an unmatched-right scan runs it again.
+    RowOutput,
     GroupedOutput,
     UngroupedAggregateOutput,
     WindowOutput,
@@ -991,9 +1002,6 @@ impl UpdatePlan {
     /// treats the target table specially; this helper rejoins them for readers.
     pub fn build_read_scope_tables(&self) -> TableReferences {
         let mut read_scope_tables = TableReferences::new(vec![self.target_table.clone()], vec![]);
-        if self.from_tables.right_join_swapped() {
-            read_scope_tables.set_right_join_swapped();
-        }
         read_scope_tables.extend(self.from_tables.clone());
         read_scope_tables
     }
@@ -1008,16 +1016,9 @@ pub enum IterationDirection {
 pub fn select_star(
     tables: &[JoinedTable],
     out_columns: &mut Vec<ResultSetColumn>,
-    right_join_swapped: bool,
     long_names: bool,
 ) -> crate::Result<()> {
-    // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
-    let table_iter: Vec<&JoinedTable> = if right_join_swapped {
-        tables.iter().rev().collect()
-    } else {
-        tables.iter().collect()
-    };
-    for table in table_iter {
+    for table in tables {
         // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
         // and should not contribute columns to SELECT *.
         if table
@@ -1159,6 +1160,7 @@ pub(super) fn find_unqualified_column(table: &Table, column_name: &str) -> Resul
 pub enum JoinType {
     Inner,
     LeftOuter,
+    RightOuter,
     FullOuter,
     /// Semi-join: keep outer row if inner match found (EXISTS).
     Semi,
@@ -1186,9 +1188,22 @@ impl JoinInfo {
             .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
     }
 
-    /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
+    /// Whether this join keeps rows from either side when they do not match.
     pub fn is_outer(&self) -> bool {
+        matches!(
+            self.join_type,
+            JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
+        )
+    }
+
+    /// Whether this join keeps unmatched rows from the left side.
+    pub fn keeps_left_rows(&self) -> bool {
         matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+    }
+
+    /// Whether this join keeps unmatched rows from the right side.
+    pub fn keeps_right_rows(&self) -> bool {
+        matches!(self.join_type, JoinType::RightOuter | JoinType::FullOuter)
     }
 
     /// Whether this is a FULL OUTER JOIN.
@@ -1367,9 +1382,6 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
-    /// Set when a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
-    /// so `select_star` emits columns in the original user-visible order.
-    right_join_swapped: bool,
 }
 
 impl Default for TableReferences {
@@ -1391,7 +1403,6 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
-            right_join_swapped: false,
         }
     }
 
@@ -1399,22 +1410,11 @@ impl TableReferences {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
-            right_join_swapped: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.joined_tables.is_empty() && self.outer_query_refs.is_empty()
-    }
-
-    /// Mark that tables were swapped for a RIGHT-to-LEFT JOIN rewrite.
-    pub const fn set_right_join_swapped(&mut self) {
-        self.right_join_swapped = true;
-    }
-
-    /// Whether tables were swapped for a RIGHT JOIN rewrite.
-    pub const fn right_join_swapped(&self) -> bool {
-        self.right_join_swapped
     }
 
     /// Add a new [JoinedTable] to the query plan.
@@ -1440,12 +1440,9 @@ impl TableReferences {
     /// Whether an outer join in the FROM list can give this table's columns
     /// NULLs ("null-extend" it).
     ///
-    /// The right-hand table of a LEFT or FULL JOIN — the table that carries
-    /// the `join_info` — gets NULLs when a left-side row has no match. A FULL
-    /// JOIN *also* gives NULLs to every table on its left side when a
-    /// right-side row has no match, and those tables carry no `join_info` of
-    /// their own, so checking only `table.join_info` misses them. (This is
-    /// SQLite's `JT_LTORJ` bit.)
+    /// The right table of an outer join can get NULLs for an unmatched left row.
+    /// A RIGHT JOIN or FULL JOIN can also give NULLs to every table on its left.
+    /// Those left tables have no join information of their own.
     pub fn outer_join_may_null_extend(&self, table: TableInternalId) -> bool {
         let Some(pos) = self
             .joined_tables
@@ -1467,16 +1464,11 @@ impl TableReferences {
         }
         self.joined_tables[pos + 1..]
             .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows))
     }
 
-    /// Like [Self::outer_join_may_null_extend], but true only when the
-    /// null extension comes from a FULL JOIN. Matters because the two join
-    /// kinds emit their null-extended rows differently: a LEFT JOIN re-checks
-    /// consumed WHERE terms when it emits the null-extended row, while a FULL
-    /// JOIN synthesizes its extra rows by jumping past the scan entirely, so a
-    /// consumed term is never checked against them.
-    pub fn full_join_may_null_extend(&self, table: TableInternalId) -> bool {
+    /// Whether a RIGHT JOIN or FULL JOIN blocks a WHERE constraint on this table.
+    pub fn right_or_full_join_blocks_where_constraint(&self, table: TableInternalId) -> bool {
         let Some(pos) = self
             .joined_tables
             .iter()
@@ -1486,7 +1478,21 @@ impl TableReferences {
         };
         self.joined_tables[pos..]
             .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows))
+    }
+
+    /// Whether this table is left of a RIGHT JOIN or FULL JOIN.
+    pub fn is_left_of_right_or_full_join(&self, table: TableInternalId) -> bool {
+        let Some(pos) = self
+            .joined_tables
+            .iter()
+            .position(|t| t.internal_id == table)
+        else {
+            return false;
+        };
+        self.joined_tables[pos + 1..]
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows))
     }
 
     /// Resets the expression index usages for all joined tables.
@@ -1721,7 +1727,6 @@ impl TableReferences {
         let TableReferences {
             joined_tables,
             outer_query_refs,
-            right_join_swapped: _,
         } = other;
 
         // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
@@ -2841,7 +2846,8 @@ impl JoinedTable {
                 let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
                 let table_not_required = matches!(mode, OperationMode::SELECT)
                     && use_covering_index
-                    && !index_is_ephemeral;
+                    && !index_is_ephemeral
+                    && !self.requires_table_cursor_for_unmatched_rows();
                 let table_cursor_id = if table_not_required {
                     None
                 } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
@@ -3015,10 +3021,23 @@ impl JoinedTable {
     /// Returns true if the index selected for use with this [TableReference] is a covering index,
     /// meaning that it contains all the columns that are referenced in the query.
     pub fn utilizes_covering_index(&self) -> bool {
+        if self.requires_table_cursor_for_unmatched_rows() {
+            return false;
+        }
         let Some(index) = self.op.index() else {
             return false;
         };
         self.index_is_covering(index.as_ref())
+    }
+
+    /// Whether unmatched-row output requires the table cursor.
+    ///
+    /// RIGHT and FULL JOIN use the table rowid to record matches.
+    /// The unmatched-row pass scans the table after the index loop ends, so index-only reads are unsafe.
+    pub fn requires_table_cursor_for_unmatched_rows(&self) -> bool {
+        self.join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
     }
 
     pub fn column_is_used(&self, index: usize) -> bool {
