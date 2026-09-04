@@ -3222,7 +3222,7 @@ fn apply_expr_column_ref_with_context(
 fn apply_expr_for_column_rename(
     mode: ColumnRenameMode<'_>,
     expr: &mut ast::Expr,
-    traversal: ColumnRenameExprTraversal,
+    _traversal: ColumnRenameExprTraversal,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
@@ -3250,23 +3250,7 @@ fn apply_expr_for_column_rename(
 
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {
-            ast::Expr::Exists(select) => {
-                if matches!(traversal, ColumnRenameExprTraversal::RewriteResultExpr) {
-                    return Ok(WalkControl::SkipChildren);
-                }
-                apply_select_for_column_rename(
-                    mode,
-                    select,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    from_target_qualifiers,
-                    database_id,
-                    resolver,
-                )?;
-            }
-            ast::Expr::Subquery(select) => {
+            ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
                 apply_select_for_column_rename(
                     mode,
                     select,

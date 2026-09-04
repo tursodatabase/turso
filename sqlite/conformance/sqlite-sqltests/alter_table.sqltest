@@ -2016,7 +2016,7 @@ expect {
     0
 }
 
-test alter-table-rename-column-temp-trigger-exists-result-expr-error {
+test alter-table-rename-column-temp-trigger-exists-result-expr {
     CREATE TEMP TABLE temp_exists_driver (n);
     CREATE TABLE src_temp_exists (c1, c2, b);
     CREATE TRIGGER trig_temp_exists AFTER INSERT ON temp.temp_exists_driver BEGIN
@@ -2030,9 +2030,10 @@ test alter-table-rename-column-temp-trigger-exists-result-expr-error {
         );
     END;
     ALTER TABLE src_temp_exists RENAME COLUMN b TO bb;
+    SELECT sql FROM sqlite_temp_schema WHERE name = 'trig_temp_exists';
 }
-expect error {
-    error in trigger trig_temp_exists after rename: no such column: b
+expect {
+    CREATE TRIGGER trig_temp_exists AFTER INSERT ON "temp".temp_exists_driver BEGIN SELECT 1 NOT IN (NOT EXISTS (SELECT * FROM src_temp_exists WHERE c1 ORDER BY bb ASC, CASE WHEN bb THEN 'x' WHEN bb THEN 1 END)); END
 }
 
 test alter-table-rename-column-temp-trigger-result-scalar-subquery {

@@ -3994,8 +3994,7 @@ fn rename_result_identifiers_scoped(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
-                ast::Expr::Exists(_) => return Ok(WalkControl::SkipChildren),
-                ast::Expr::Subquery(select) => {
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
                     let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
                     rewrite_select_column_refs_scoped(
                         select,

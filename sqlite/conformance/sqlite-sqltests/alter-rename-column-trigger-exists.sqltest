@@ -1,0 +1,39 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8654
+#
+# ALTER TABLE RENAME COLUMN is refused when the column is referenced from
+# a result-position EXISTS in a trigger body.
+
+@cross-check-integrity
+test rename-column-trigger-result-exists {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x);
+    CREATE TABLE log(hit);
+    INSERT INTO t1(a, b) VALUES (5, 0);
+    CREATE TRIGGER trg AFTER INSERT ON t2 BEGIN
+        INSERT INTO log(hit) SELECT EXISTS(SELECT 1 FROM t1 WHERE t1.a = 5);
+    END;
+    ALTER TABLE t1 RENAME COLUMN a TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trg';
+}
+expect {
+    CREATE TRIGGER trg AFTER INSERT ON t2 BEGIN INSERT INTO log (hit) SELECT EXISTS (SELECT 1 FROM t1 WHERE t1.c = 5); END
+}
+
+@cross-check-integrity
+test rename-column-trigger-result-exists-fires-correctly {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x);
+    CREATE TABLE log(hit);
+    INSERT INTO t1(a, b) VALUES (5, 0);
+    CREATE TRIGGER trg AFTER INSERT ON t2 BEGIN
+        INSERT INTO log(hit) SELECT EXISTS(SELECT 1 FROM t1 WHERE t1.a = 5);
+    END;
+    ALTER TABLE t1 RENAME COLUMN a TO c;
+    INSERT INTO t2(x) VALUES (42);
+    SELECT * FROM log;
+}
+expect {
+    1
+}
