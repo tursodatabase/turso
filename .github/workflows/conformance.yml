@@ -33,6 +33,7 @@ jobs:
             bindings/javascript/packages/native/turso.linux-x64-gnu.node
           cd bindings/javascript
           yarn workspace @tursodatabase/database-common build
+          yarn workspace @tursodatabase/database tsc-build
       - name: Install test dependencies
         working-directory: testing/conformance/javascript
         run: npm install

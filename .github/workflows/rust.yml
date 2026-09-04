@@ -52,8 +52,22 @@ jobs:
           choco install llvm --no-progress -y
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
       - uses: ./.github/actions/setup-bazel
+      - name: Install SQLite
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: vcpkg install sqlite3:x64-windows-static-md
       - name: Build Rust targets
+        if: runner.os != 'Windows'
         run: bazel build //... --lockfile_mode=error
+      - name: Build Rust targets on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sqliteLibDir = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib"
+          if (-not (Test-Path "$sqliteLibDir\sqlite3.lib")) {
+            throw "SQLite library not found at $sqliteLibDir\sqlite3.lib"
+          }
+          bazel build //... "--@rules_rust//rust/settings:extra_rustc_flag=-Clink-arg=/LIBPATH:$sqliteLibDir" --lockfile_mode=error
 
   core-tests:
     runs-on: blacksmith-8vcpu-ubuntu-2404
