@@ -2556,7 +2556,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, pc_if_deferred, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
             } else {
@@ -2567,7 +2567,13 @@ pub fn insn_to_row(
                 *hash_table_reg as i64,
                 *key_start_reg as i64,
                 *num_keys as i64,
-                Value::build_text(format!("r[{}]={}{}", dest_reg, target_pc.as_debug_int(), payload_info)),
+                Value::build_text(format!(
+                    "r[{}]={} deferred={}{}",
+                    dest_reg,
+                    target_pc.as_debug_int(),
+                    pc_if_deferred.as_debug_int(),
+                    payload_info
+                )),
                 0,
                 String::new(),
             )

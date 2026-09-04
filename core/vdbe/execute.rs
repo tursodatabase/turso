@@ -17451,6 +17451,7 @@ pub fn op_hash_probe(
             num_keys,
             dest_reg,
             target_pc,
+            pc_if_deferred,
             payload_dest_reg,
             num_payload,
             probe_rowid_reg,
@@ -17511,7 +17512,7 @@ pub fn op_hash_probe(
         // Main probe loop: buffer probe rows targeting spilled build partitions.
         if let Some(rowid_reg) = probe_rowid_reg {
             if probe_buffered {
-                state.pc = target_pc.as_offset_int();
+                state.pc = pc_if_deferred.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -17537,8 +17538,7 @@ pub fn op_hash_probe(
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
-                // Jump to target_pc: this row is deferred to grace processing.
-                state.pc = target_pc.as_offset_int();
+                state.pc = pc_if_deferred.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -19158,6 +19158,8 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
+    #[cfg(feature = "io_memory_yield")]
+    use crate::MemoryYieldIO;
     use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
 
@@ -19178,6 +19180,12 @@ mod tests {
 
     fn make_spilled_hash_table() -> (HashTable, crate::alloc::Vec<Value>, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        make_spilled_hash_table_with_io(io)
+    }
+
+    fn make_spilled_hash_table_with_io(
+        io: Arc<dyn IO>,
+    ) -> (HashTable, crate::alloc::Vec<Value>, usize) {
         let config = HashTableConfig {
             initial_buckets: 4,
             mem_budget: 1024,
@@ -19187,21 +19195,33 @@ mod tests {
             track_matched: false,
             ..Default::default()
         };
-        let mut ht = HashTable::new(config, io).unwrap();
+        let mut ht = HashTable::new(config, io.clone()).unwrap();
 
         for i in 0..1024 {
-            match ht
-                .insert(vec![Value::from_i64(i)], i, vec![], None)
-                .unwrap()
-            {
-                IOResult::Done(()) => {}
-                IOResult::IO(_) => panic!("memory IO should complete synchronously"),
+            let mut pending = PendingHashInsert {
+                key_values: vec![Value::from_i64(i)],
+                rowid: i,
+                payload_values: vec![],
+            };
+            loop {
+                match ht.insert_pending(pending, None).unwrap() {
+                    HashInsertResult::Done => break,
+                    HashInsertResult::IO {
+                        pending: next_pending,
+                        ..
+                    } => {
+                        io.step().unwrap();
+                        pending = next_pending;
+                    }
+                }
             }
         }
 
-        match ht.finalize_build(None).unwrap() {
-            IOResult::Done(()) => {}
-            IOResult::IO(_) => panic!("memory IO should complete synchronously"),
+        loop {
+            match ht.finalize_build(None).unwrap() {
+                IOResult::Done(()) => break,
+                IOResult::IO(_) => io.step().unwrap(),
+            }
         }
         assert!(ht.has_spilled(), "test requires spilled hash table");
 
@@ -19485,6 +19505,7 @@ mod tests {
             num_keys: 1,
             dest_reg: 1,
             target_pc: BranchOffset::Offset(99),
+            pc_if_deferred: BranchOffset::Offset(77),
             payload_dest_reg: None,
             num_payload: 0,
             probe_rowid_reg: None,
@@ -19506,6 +19527,91 @@ mod tests {
             state.active_op_state.hash_probe().is_none(),
             "HashProbe should not stash resumable state for the removed fallback path"
         );
+    }
+
+    #[test]
+    fn test_hash_probe_deferred_row_uses_deferred_target() {
+        let stmt = prepare_test_statement();
+        let (ht, probe_key, _) = make_spilled_hash_table();
+
+        let mut state = ProgramState::new(3, 0);
+        state.hash_tables.insert(7, ht);
+        state.set_register(0, Register::Value(probe_key[0].clone()));
+        state.set_register(2, Register::Value(Value::from_i64(123)));
+
+        let insn = Insn::HashProbe {
+            hash_table_id: 7,
+            key_start_reg: 0,
+            num_keys: 1,
+            dest_reg: 1,
+            target_pc: BranchOffset::Offset(99),
+            pc_if_deferred: BranchOffset::Offset(77),
+            payload_dest_reg: None,
+            num_payload: 0,
+            probe_rowid_reg: Some(2),
+        };
+
+        let step = op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("buffering a probe row should succeed");
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 77, "deferred rows must skip the miss path");
+        assert_eq!(state.metrics.hash_join.grace_probe_rows_buffered, 1);
+        assert!(state.active_op_state.hash_probe().is_none());
+    }
+
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn test_hash_probe_io_reentry_uses_deferred_target_without_rebuffering() {
+        let stmt = prepare_test_statement();
+        let io = Arc::new(MemoryYieldIO::new());
+        let (ht, _, _) = make_spilled_hash_table_with_io(io.clone());
+        let padding = "x".repeat(1024);
+        let probe_key = (0..4096)
+            .map(|i| vec![Value::build_text(format!("{i}-{padding}"))])
+            .find(|key| {
+                let partition_idx = ht.partition_for_keys(key).unwrap();
+                !ht.is_partition_loaded(partition_idx)
+            })
+            .expect("expected a large key for an unloaded spilled partition");
+
+        let mut state = ProgramState::new(3, 0);
+        state.hash_tables.insert(7, ht);
+        state.set_register(0, Register::Value(probe_key[0].clone()));
+        state.set_register(2, Register::Value(Value::from_i64(123)));
+
+        let insn = Insn::HashProbe {
+            hash_table_id: 7,
+            key_start_reg: 0,
+            num_keys: 1,
+            dest_reg: 1,
+            target_pc: BranchOffset::Offset(99),
+            pc_if_deferred: BranchOffset::Offset(77),
+            payload_dest_reg: None,
+            num_payload: 0,
+            probe_rowid_reg: Some(2),
+        };
+
+        let step = op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("buffering should yield on MemoryYieldIO");
+        assert!(matches!(step, InsnFunctionStepResult::IO(_)));
+        assert_eq!(state.pc, 0, "pc must not advance before I/O completes");
+        assert_eq!(state.metrics.hash_join.grace_probe_rows_buffered, 1);
+        assert!(state
+            .active_op_state
+            .hash_probe()
+            .as_ref()
+            .is_some_and(|state| state.probe_buffered));
+
+        io.step().unwrap();
+        let step = op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("resuming after probe buffering I/O should succeed");
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 77, "resumed rows must skip the miss path");
+        assert_eq!(
+            state.metrics.hash_join.grace_probe_rows_buffered, 1,
+            "re-entry must not buffer the same probe row again"
+        );
+        assert!(state.active_op_state.hash_probe().is_none());
     }
 
     #[test]
@@ -19539,6 +19645,7 @@ mod tests {
             num_keys: 1,
             dest_reg: 1,
             target_pc: BranchOffset::Offset(99),
+            pc_if_deferred: BranchOffset::Offset(77),
             payload_dest_reg: None,
             num_payload: 0,
             probe_rowid_reg: None,
@@ -19553,6 +19660,45 @@ mod tests {
             &Value::from_i64(expected_rowid),
             "HashProbe should return the matching build rowid"
         );
+    }
+
+    #[test]
+    fn test_hash_probe_true_miss_uses_miss_target() {
+        let stmt = prepare_test_statement();
+        let (mut ht, _, partition_idx) = make_spilled_hash_table();
+        let missing_key = (1024..)
+            .take(4096)
+            .map(|i| vec![Value::from_i64(i)])
+            .find(|key| ht.partition_for_keys(key).unwrap() == partition_idx)
+            .expect("expected a missing key in the spilled partition");
+
+        loop {
+            match ht.load_spilled_partition(partition_idx, None).unwrap() {
+                IOResult::Done(()) => break,
+                IOResult::IO(_) => continue,
+            }
+        }
+
+        let mut state = ProgramState::new(2, 0);
+        state.hash_tables.insert(7, ht);
+        state.set_register(0, Register::Value(missing_key[0].clone()));
+
+        let insn = Insn::HashProbe {
+            hash_table_id: 7,
+            key_start_reg: 0,
+            num_keys: 1,
+            dest_reg: 1,
+            target_pc: BranchOffset::Offset(99),
+            pc_if_deferred: BranchOffset::Offset(77),
+            payload_dest_reg: None,
+            num_payload: 0,
+            probe_rowid_reg: None,
+        };
+
+        let step = op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("probing a loaded partition should succeed");
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 99, "a true miss must use the miss target");
     }
 
     #[test]

@@ -1966,13 +1966,15 @@ pub enum Insn {
     /// For each match, load the build-side rowid into dest_reg and continue.
     /// If payload columns were stored during build, they are written to
     /// payload_dest_reg..payload_dest_reg+num_payload-1.
-    /// If no matches, jump to target_pc.
+    /// If no matches, jump to target_pc. If the probe row is buffered for
+    /// grace processing, jump to pc_if_deferred instead.
     HashProbe {
         hash_table_id: u32,
         key_start_reg: u32,
         num_keys: u32,
         dest_reg: u32,
         target_pc: BranchOffset,
+        pc_if_deferred: BranchOffset,
         /// Starting register to write payload columns from hash entry.
         payload_dest_reg: Option<u32>,
         /// Number of payload columns expected
