@@ -1152,6 +1152,7 @@ fn update_column_used_masks(
                 outer_query_ref
                     .col_used_mask
                     .union_with(&child_outer_query_ref.col_used_mask)?;
+                outer_query_ref.rowid_referenced |= child_outer_query_ref.rowid_referenced;
             }
         }
 
