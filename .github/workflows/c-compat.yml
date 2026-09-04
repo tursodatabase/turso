@@ -33,7 +33,12 @@ jobs:
         run: bazel test //bindings/c/... --lockfile_mode=error --test_output=errors --test_arg=--test-threads=1
       - name: Build and test Turso C bindings on Windows
         if: runner.os == 'Windows'
-        run: bazel test //bindings/c/... --jobs=1 --action_env=LIB="$env:VCPKG_ROOT\installed\x64-windows-static-md\lib;$env:LIB" --lockfile_mode=error --test_output=errors --test_arg=--test-threads=1
+        run: |
+          $sqliteLibDir = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib"
+          if (-not (Test-Path "$sqliteLibDir\sqlite3.lib")) {
+            throw "SQLite library not found at $sqliteLibDir\sqlite3.lib"
+          }
+          bazel test //bindings/c/... --jobs=1 "--@rules_rust//rust/settings:extra_rustc_flag=-Clink-arg=/LIBPATH:$sqliteLibDir" --lockfile_mode=error --test_output=errors --test_arg=--test-threads=1
       - name: Run C tests against real SQLite
         if: runner.os == 'Linux'
         working-directory: bindings/c/tests
