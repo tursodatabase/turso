@@ -1147,6 +1147,19 @@ impl ProgramState {
         self.n_total_change.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Whether an explicit COMMIT/ROLLBACK that already performed its
+    /// autocommit transition is still in flight, so a fresh `op_transaction`
+    /// entry is an I/O re-entry rather than a new statement.
+    ///
+    /// `commit_state` alone does not cover this: `commit_txn` applies view
+    /// deltas first, and that phase can yield I/O while `commit_state` is
+    /// still `Ready`.
+    #[inline]
+    pub(crate) fn commit_in_flight(&self) -> bool {
+        !matches!(self.commit_state, CommitState::Ready)
+            || !matches!(self.view_delta_state, ViewDeltaCommitState::NotStarted)
+    }
+
     /// Whether this statement may finish the implicit autocommit transaction
     /// now, including re-entry while its commit is in progress.
     #[inline]
