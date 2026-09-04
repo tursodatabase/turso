@@ -270,6 +270,22 @@ pub(super) fn try_emit_expression_index_value(
     let Some((table_id, _)) = single_table_column_usage(expr) else {
         return Ok(false);
     };
+    if program.has_cursor_override(table_id) {
+        return Ok(false);
+    }
+    let is_hash_build_table = referenced_tables.joined_tables().iter().any(|t| {
+        if let Operation::HashJoin(ref hj) = t.op {
+            referenced_tables
+                .joined_tables()
+                .get(hj.build_table_idx)
+                .is_some_and(|bt| bt.internal_id == table_id)
+        } else {
+            false
+        }
+    });
+    if is_hash_build_table {
+        return Ok(false);
+    }
     let Some(table_reference) = referenced_tables.find_joined_table_by_internal_id(table_id) else {
         return Ok(false);
     };

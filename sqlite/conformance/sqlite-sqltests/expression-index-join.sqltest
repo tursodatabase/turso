@@ -1,0 +1,35 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE a(x, k);
+    INSERT INTO a VALUES(5, 1);
+    CREATE TABLE b(k);
+    INSERT INTO b VALUES(1);
+    CREATE INDEX ix ON a(abs(x));
+}
+
+@setup schema
+test expression-index-join {
+    SELECT a.x FROM a, b WHERE a.k = b.k AND abs(a.x) = 5;
+}
+expect {
+    5
+}
+
+@setup schema
+test expression-index-join-proj-expr {
+    SELECT abs(a.x), b.k FROM a, b WHERE a.k = b.k AND abs(a.x) = 5;
+}
+expect {
+    5|1
+}
+
+@setup schema
+test expression-index-join-multiple-rows {
+    INSERT INTO a VALUES(-10, 2);
+    INSERT INTO b VALUES(2);
+    SELECT a.x FROM a, b WHERE a.k = b.k AND abs(a.x) = 10;
+}
+expect {
+    -10
+}
