@@ -21227,3 +21227,56 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
 
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
+
+/// A committed non-positive rowid can sit in the B-tree above the
+/// allocator's maximum: `insert_row_id_maybe_update` drops rowids at or
+/// below zero while the maximum is unset, and recovery replay of a
+/// committed but uncheckpointed row bumps exactly such a fresh
+/// allocator. The probe must descend the B-tree for these rowids
+/// instead of trusting the maximum.
+#[test]
+fn notexists_descends_the_btree_for_non_positive_rowids() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    let conn1 = db.connect();
+    conn1
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (-5, 'a')").unwrap();
+    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Committed but not checkpointed: -1 lives only in the logical log.
+    conn1.execute("INSERT INTO t VALUES (-1, 'b')").unwrap();
+
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+
+    // Reopen: recovery replays -1 into a fresh allocator, whose maximum
+    // of 0 drops the bump.
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db2 = Database::open_file_with_flags(
+        io,
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db2.connect().unwrap();
+
+    // The probe for -3 seeds the allocator from the B-tree's last row
+    // (-5), below the replayed -1.
+    conn.execute("INSERT INTO t VALUES (-3, 'c')").unwrap();
+    // Move -3 and -1 into the B-tree and retire their versions.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let res = conn.execute("INSERT INTO t VALUES (-1, 'dup')");
+    let rows = get_rows(&conn, "SELECT x, v FROM t ORDER BY x");
+    assert!(
+        res.is_err(),
+        "duplicate rowid -1 was accepted; table now reads {rows:?}"
+    );
+    assert_eq!(rows.len(), 3);
+}

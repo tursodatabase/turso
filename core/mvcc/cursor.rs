@@ -629,10 +629,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// above the allocator's maximum cannot be there. Neither can one
     /// whose B-tree version is shadowed by a tombstone or an update.
     fn btree_may_hold(&mut self, rowid: i64) -> bool {
-        self.rowid_allocator()
-            .max_rowid()
-            .is_none_or(|max| rowid <= max)
-            && self.query_btree_version_is_valid(&RowKey::Int(rowid))
+        // The maximum bounds every B-tree rowid only above zero:
+        // insert_row_id_maybe_update drops rowids at or below zero while
+        // the maximum is unset, because 0 doubles as the "nothing
+        // recorded" sentinel, so a committed non-positive rowid can sit
+        // in the B-tree above a non-positive maximum. A positive maximum
+        // is safe: positive rowids are always recorded and non-positive
+        // ones are below it by definition.
+        match self.rowid_allocator().max_rowid() {
+            Some(max) if max > 0 && rowid > max => false,
+            _ => self.query_btree_version_is_valid(&RowKey::Int(rowid)),
+        }
     }
 
     /// Seeds the rowid allocator from the table's largest rowid, as NewRowid
