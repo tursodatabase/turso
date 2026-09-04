@@ -1,5 +1,5 @@
 {
-  "checksum": "e268f95dbb85d46e0f2c55a0ea941bc0d92dd9ae47bf16716294f61f4125a069",
+  "checksum": "9598441ebbad51cb768c2d661b7acfe0cc2b59a09ce60d5dda415dc196178ae1",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -5807,7 +5807,7 @@
       ],
       "version": "0.8.7"
     },
-    "core_tester 0.8.0-pre.7": {
+    "core_tester 0.8.0-pre.8": {
       "common_attrs": {
         "crate_features": [
           "default",
@@ -5905,7 +5905,7 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
     "cpp_demangle 0.4.4": {
       "build_script_attrs": {},
@@ -8341,7 +8341,7 @@
       ],
       "version": "0.1.13"
     },
-    "differential-fuzzer 0.8.0-pre.7": {
+    "differential-fuzzer 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -8415,7 +8415,7 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
     "difflib 0.4.0": {
       "common_attrs": {
@@ -16144,7 +16144,7 @@
       ],
       "version": "0.35.0"
     },
-    "limbo_completion 0.8.0-pre.7": {
+    "limbo_completion 0.8.0-pre.8": {
       "build_script_attrs": {},
       "common_attrs": {
         "crate_features": [
@@ -16188,9 +16188,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "limbo_crypto 0.8.0-pre.7": {
+    "limbo_crypto 0.8.0-pre.8": {
       "build_script_attrs": {
         "link_deps": [
           {
@@ -16259,9 +16259,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "limbo_csv 0.8.0-pre.7": {
+    "limbo_csv 0.8.0-pre.8": {
       "build_script_attrs": {},
       "common_attrs": {
         "deps": {
@@ -16313,9 +16313,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "limbo_fuzzy 0.8.0-pre.7": {
+    "limbo_fuzzy 0.8.0-pre.8": {
       "build_script_attrs": {},
       "common_attrs": {
         "deps": {
@@ -16356,9 +16356,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "limbo_ipaddr 0.8.0-pre.7": {
+    "limbo_ipaddr 0.8.0-pre.8": {
       "build_script_attrs": {},
       "common_attrs": {
         "deps": {
@@ -16404,9 +16404,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "limbo_regexp 0.8.0-pre.7": {
+    "limbo_regexp 0.8.0-pre.8": {
       "build_script_attrs": {},
       "common_attrs": {
         "deps": {
@@ -16452,9 +16452,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "limbo_sim 0.8.0-pre.7": {
+    "limbo_sim 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -16584,9 +16584,9 @@
       "package_url": "https://github.com/tursodatabase/turso",
       "repository": null,
       "targets": [],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "limbo_sqlite_test_ext 0.8.0-pre.7": {
+    "limbo_sqlite_test_ext 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -16616,7 +16616,7 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
     "linked-hash-map 0.5.6": {
       "common_attrs": {
@@ -22169,7 +22169,7 @@
       ],
       "version": "0.1.4"
     },
-    "py-turso 0.8.0-pre.7": {
+    "py-turso 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -22219,7 +22219,7 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
     "pyo3 0.29.0": {
       "build_script_attrs": {
@@ -28428,7 +28428,7 @@
       ],
       "version": "0.7.3"
     },
-    "sql_gen 0.8.0-pre.7": {
+    "sql_gen 0.8.0-pre.8": {
       "common_attrs": {
         "crate_features": [
           "serde"
@@ -28473,7 +28473,7 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
     "sql_gen_macros 0.1.0": {
       "common_attrs": {
@@ -28511,7 +28511,7 @@
       ],
       "version": "0.1.0"
     },
-    "sql_gen_prop 0.8.0-pre.7": {
+    "sql_gen_prop 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -28549,9 +28549,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "sql_generation 0.8.0-pre.7": {
+    "sql_generation 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -28623,7 +28623,7 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
     "sqltest 0.1.0": {
       "common_attrs": {
@@ -32770,7 +32770,7 @@
       ],
       "version": "0.2.5"
     },
-    "turso 0.8.0-pre.7": {
+    "turso 0.8.0-pre.8": {
       "common_attrs": {
         "crate_features": [
           "default",
@@ -32875,9 +32875,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso-dbhash 0.8.0-pre.7": {
+    "turso-dbhash 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -32916,9 +32916,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso-java 0.8.0-pre.7": {
+    "turso-java 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -32940,9 +32940,9 @@
       "package_url": "https://github.com/tursodatabase/turso",
       "repository": null,
       "targets": [],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso-txn-latency 0.8.0-pre.7": {
+    "turso-txn-latency 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -32972,9 +32972,9 @@
       "package_url": "https://github.com/tursodatabase/turso",
       "repository": null,
       "targets": [],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_cli 0.8.0-pre.7": {
+    "turso_cli 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -33160,9 +33160,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_core 0.8.0-pre.7": {
+    "turso_core 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -33637,9 +33637,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_ext 0.8.0-pre.7": {
+    "turso_ext 0.8.0-pre.8": {
       "build_script_attrs": {},
       "common_attrs": {
         "crate_features": [
@@ -33684,9 +33684,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_ext_tests 0.8.0-pre.7": {
+    "turso_ext_tests 0.8.0-pre.8": {
       "common_attrs": {
         "deps": {
           "common": [
@@ -33730,9 +33730,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_macros 0.8.0-pre.7": {
+    "turso_macros 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -33766,9 +33766,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_node 0.8.0-pre.7": {
+    "turso_node 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -33829,9 +33829,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_parser 0.8.0-pre.7": {
+    "turso_parser 0.8.0-pre.8": {
       "common_attrs": {
         "crate_features": [
           "default",
@@ -33912,9 +33912,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_pg 0.8.0-pre.7": {
+    "turso_pg 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -33952,9 +33952,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_pg_client 0.8.0-pre.7": {
+    "turso_pg_client 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -33980,9 +33980,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_pg_parser 0.8.0-pre.7": {
+    "turso_pg_parser 0.8.0-pre.8": {
       "common_attrs": {
         "crate_features": [
           "default"
@@ -34025,9 +34025,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_pg_regress 0.8.0-pre.7": {
+    "turso_pg_regress 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -34053,9 +34053,9 @@
       "package_url": "https://github.com/tursodatabase/turso",
       "repository": null,
       "targets": [],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_pg_server 0.8.0-pre.7": {
+    "turso_pg_server 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -34103,9 +34103,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_pg_tests 0.8.0-pre.7": {
+    "turso_pg_tests 0.8.0-pre.8": {
       "common_attrs": {
         "crate_features": [
           "default",
@@ -34195,9 +34195,9 @@
       "package_url": "https://github.com/tursodatabase/turso",
       "repository": null,
       "targets": [],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_sdk_kit 0.8.0-pre.7": {
+    "turso_sdk_kit 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -34274,9 +34274,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_sdk_kit_macros 0.8.0-pre.7": {
+    "turso_sdk_kit_macros 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -34310,9 +34310,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_serverless 0.1.2": {
+    "turso_serverless 0.1.3": {
       "common_attrs": {
         "deps": [
           {
@@ -34366,9 +34366,9 @@
           }
         }
       ],
-      "version": "0.1.2"
+      "version": "0.1.3"
     },
-    "turso_serverless_conformance 0.8.0-pre.7": {
+    "turso_serverless_conformance 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -34408,9 +34408,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_serverless_differential 0.8.0-pre.7": {
+    "turso_serverless_differential 0.8.0-pre.8": {
       "common_attrs": {
         "deps": [
           {
@@ -34446,9 +34446,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_sqlite3 0.8.0-pre.7": {
+    "turso_sqlite3 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -34517,9 +34517,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_stress 0.8.0-pre.7": {
+    "turso_stress 0.8.0-pre.8": {
       "common_attrs": {
         "crate_features": [
           "default"
@@ -34600,9 +34600,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_sync_engine 0.8.0-pre.7": {
+    "turso_sync_engine 0.8.0-pre.8": {
       "common_attrs": {
         "deps": {
           "common": [
@@ -34712,9 +34712,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_sync_js 0.8.0-pre.7": {
+    "turso_sync_js 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -34768,9 +34768,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_sync_sdk_kit 0.8.0-pre.7": {
+    "turso_sync_sdk_kit 0.8.0-pre.8": {
       "common_attrs": {
         "deps": {
           "common": [
@@ -34822,9 +34822,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "turso_whopper 0.8.0-pre.7": {
+    "turso_whopper 0.8.0-pre.8": {
       "common_attrs": {
         "deps": {
           "common": [
@@ -34896,9 +34896,9 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
-    "tursopg 0.8.0-pre.7": {
+    "tursopg 0.8.0-pre.8": {
       "build_script_attrs": {
         "deps": [
           {
@@ -35037,7 +35037,7 @@
           }
         }
       ],
-      "version": "0.8.0-pre.7"
+      "version": "0.8.0-pre.8"
     },
     "twox-hash 2.1.1": {
       "common_attrs": {
@@ -40967,55 +40967,55 @@
     "test-log 0.2.17"
   ],
   "workspace_members": {
-    "core_tester 0.8.0-pre.7": "tests",
-    "differential-fuzzer 0.8.0-pre.7": "testing/differential-oracle/fuzzer",
+    "core_tester 0.8.0-pre.8": "tests",
+    "differential-fuzzer 0.8.0-pre.8": "testing/differential-oracle/fuzzer",
     "encryption-throughput 0.1.0": "perf/encryption",
-    "limbo_completion 0.8.0-pre.7": "extensions/completion",
-    "limbo_crypto 0.8.0-pre.7": "extensions/crypto",
-    "limbo_csv 0.8.0-pre.7": "extensions/csv",
-    "limbo_fuzzy 0.8.0-pre.7": "extensions/fuzzy",
-    "limbo_ipaddr 0.8.0-pre.7": "extensions/ipaddr",
-    "limbo_regexp 0.8.0-pre.7": "extensions/regexp",
-    "limbo_sim 0.8.0-pre.7": "testing/simulator",
-    "limbo_sqlite_test_ext 0.8.0-pre.7": "testing/sqlite_test_ext",
+    "limbo_completion 0.8.0-pre.8": "extensions/completion",
+    "limbo_crypto 0.8.0-pre.8": "extensions/crypto",
+    "limbo_csv 0.8.0-pre.8": "extensions/csv",
+    "limbo_fuzzy 0.8.0-pre.8": "extensions/fuzzy",
+    "limbo_ipaddr 0.8.0-pre.8": "extensions/ipaddr",
+    "limbo_regexp 0.8.0-pre.8": "extensions/regexp",
+    "limbo_sim 0.8.0-pre.8": "testing/simulator",
+    "limbo_sqlite_test_ext 0.8.0-pre.8": "testing/sqlite_test_ext",
     "memory-benchmark 0.1.0": "perf/memory",
     "memory-benchmark-codspeed 0.1.0": "perf/memory/codspeed",
-    "py-turso 0.8.0-pre.7": "bindings/python",
+    "py-turso 0.8.0-pre.8": "bindings/python",
     "query-batch-benchmark 0.1.0": "perf/query-batch",
-    "sql_gen 0.8.0-pre.7": "testing/differential-oracle/sql_gen",
+    "sql_gen 0.8.0-pre.8": "testing/differential-oracle/sql_gen",
     "sql_gen_macros 0.1.0": "testing/differential-oracle/sql_gen_macros",
-    "sql_gen_prop 0.8.0-pre.7": "testing/differential-oracle/sql_gen_prop",
-    "sql_generation 0.8.0-pre.7": "sql_generation",
+    "sql_gen_prop 0.8.0-pre.8": "testing/differential-oracle/sql_gen_prop",
+    "sql_generation 0.8.0-pre.8": "sql_generation",
     "sqltest 0.1.0": "testing/sqltest",
-    "turso 0.8.0-pre.7": "bindings/rust",
-    "turso-dbhash 0.8.0-pre.7": "tools/dbhash",
-    "turso-java 0.8.0-pre.7": "bindings/java",
-    "turso-txn-latency 0.8.0-pre.7": "perf/latency",
-    "turso_cli 0.8.0-pre.7": "cli",
-    "turso_core 0.8.0-pre.7": "core",
-    "turso_ext 0.8.0-pre.7": "extensions/core",
-    "turso_ext_tests 0.8.0-pre.7": "extensions/tests",
-    "turso_macros 0.8.0-pre.7": "macros",
-    "turso_node 0.8.0-pre.7": "bindings/javascript",
-    "turso_parser 0.8.0-pre.7": "sqlite/parser",
-    "turso_pg 0.8.0-pre.7": "postgres/frontend",
-    "turso_pg_client 0.8.0-pre.7": "postgres/client",
-    "turso_pg_parser 0.8.0-pre.7": "postgres/parser",
-    "turso_pg_regress 0.8.0-pre.7": "postgres/regress",
-    "turso_pg_server 0.8.0-pre.7": "postgres/server",
-    "turso_pg_tests 0.8.0-pre.7": "postgres/tests",
-    "turso_sdk_kit 0.8.0-pre.7": "sdk-kit",
-    "turso_sdk_kit_macros 0.8.0-pre.7": "sdk-kit-macros",
-    "turso_serverless 0.1.2": "serverless/rust",
-    "turso_serverless_conformance 0.8.0-pre.7": "serverless/rust/conformance",
-    "turso_serverless_differential 0.8.0-pre.7": "serverless/rust/differential",
-    "turso_sqlite3 0.8.0-pre.7": "bindings/c",
-    "turso_stress 0.8.0-pre.7": "testing/stress",
-    "turso_sync_engine 0.8.0-pre.7": "sync/engine",
-    "turso_sync_js 0.8.0-pre.7": "bindings/javascript/sync",
-    "turso_sync_sdk_kit 0.8.0-pre.7": "sync/sdk-kit",
-    "turso_whopper 0.8.0-pre.7": "testing/concurrent-simulator",
-    "tursopg 0.8.0-pre.7": "postgres/cli",
+    "turso 0.8.0-pre.8": "bindings/rust",
+    "turso-dbhash 0.8.0-pre.8": "tools/dbhash",
+    "turso-java 0.8.0-pre.8": "bindings/java",
+    "turso-txn-latency 0.8.0-pre.8": "perf/latency",
+    "turso_cli 0.8.0-pre.8": "cli",
+    "turso_core 0.8.0-pre.8": "core",
+    "turso_ext 0.8.0-pre.8": "extensions/core",
+    "turso_ext_tests 0.8.0-pre.8": "extensions/tests",
+    "turso_macros 0.8.0-pre.8": "macros",
+    "turso_node 0.8.0-pre.8": "bindings/javascript",
+    "turso_parser 0.8.0-pre.8": "sqlite/parser",
+    "turso_pg 0.8.0-pre.8": "postgres/frontend",
+    "turso_pg_client 0.8.0-pre.8": "postgres/client",
+    "turso_pg_parser 0.8.0-pre.8": "postgres/parser",
+    "turso_pg_regress 0.8.0-pre.8": "postgres/regress",
+    "turso_pg_server 0.8.0-pre.8": "postgres/server",
+    "turso_pg_tests 0.8.0-pre.8": "postgres/tests",
+    "turso_sdk_kit 0.8.0-pre.8": "sdk-kit",
+    "turso_sdk_kit_macros 0.8.0-pre.8": "sdk-kit-macros",
+    "turso_serverless 0.1.3": "serverless/rust",
+    "turso_serverless_conformance 0.8.0-pre.8": "serverless/rust/conformance",
+    "turso_serverless_differential 0.8.0-pre.8": "serverless/rust/differential",
+    "turso_sqlite3 0.8.0-pre.8": "bindings/c",
+    "turso_stress 0.8.0-pre.8": "testing/stress",
+    "turso_sync_engine 0.8.0-pre.8": "sync/engine",
+    "turso_sync_js 0.8.0-pre.8": "bindings/javascript/sync",
+    "turso_sync_sdk_kit 0.8.0-pre.8": "sync/sdk-kit",
+    "turso_whopper 0.8.0-pre.8": "testing/concurrent-simulator",
+    "tursopg 0.8.0-pre.8": "postgres/cli",
     "txn-throughput 0.1.0": "perf/throughput"
   }
 }
