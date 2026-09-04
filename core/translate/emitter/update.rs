@@ -192,6 +192,7 @@ pub fn emit_program_for_update(
             cte_id: None,
             cte_definition_only: false,
             rowid_referenced: false,
+            outer_join_can_add_nulls: false,
             scope_depth: 0,
         });
         // CTEs are also visible during the write phase, so add them here.
