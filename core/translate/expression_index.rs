@@ -4,9 +4,24 @@ use crate::translate::expr::{
 };
 use crate::translate::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 use crate::translate::planner::ROWID_STRS;
-use crate::Result;
+use crate::{schema::Index, sync::Arc, Result};
 use turso_parser::ast;
 use turso_parser::ast::TableInternalId;
+
+/// Find the selected index key that stores this complete expression.
+///
+/// GROUP BY and expression translation must use the same match rules.
+pub fn selected_expression_index<'a>(
+    expr: &ast::Expr,
+    table_references: &'a TableReferences,
+) -> Option<(&'a JoinedTable, &'a Arc<Index>, usize)> {
+    let (table_id, _) = single_table_column_usage(expr)?;
+    let table = table_references.find_joined_table_by_internal_id(table_id)?;
+    let index = table.op.index()?;
+    let normalized = normalize_expr_for_index_matching(expr, table, table_references);
+    let expression_position = index.expression_to_index_pos(&normalized)?;
+    Some((table, index, expression_position))
+}
 
 /// Normalize a query expression so it can be compared with an
 /// expression stored on an index definition.
