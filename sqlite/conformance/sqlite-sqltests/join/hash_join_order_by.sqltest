@@ -45,6 +45,7 @@ expect {
 }
 
 @setup hash_join_order_by
+@skip-if sqlite "query plan explanation output is different in sqlite"
 test hash-join-order-by-build-table-uses-sorter {
     EXPLAIN QUERY PLAN
     SELECT a.id
@@ -66,6 +67,7 @@ setup hash_join_with_outer_table {
 }
 
 @setup hash_join_with_outer_table
+@skip-if sqlite "query plan explanation output is different in sqlite"
 test hash-join-keeps-outer-table-order-elision {
     EXPLAIN QUERY PLAN
     SELECT c.id, a.id
@@ -124,6 +126,7 @@ expect {
 }
 
 @setup materialized_hash_join_order_by
+@skip-if sqlite "query plan explanation output is different in sqlite"
 test hash-join-materialized-prefix-uses-sorter {
     EXPLAIN QUERY PLAN
     SELECT c.id
