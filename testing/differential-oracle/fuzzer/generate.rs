@@ -96,7 +96,10 @@ impl WeightProfile {
             WeightProfile::Triggers => base(10, 25, 25, 20, 8, 3, 3, 5, 2, 2, 30, 10),
             WeightProfile::Writes => base(10, 35, 30, 20, 5, 2, 3, 5, 2, 1, 5, 3),
             WeightProfile::CorrelatedSubqueries => base(80, 8, 8, 4, 2, 1, 1, 1, 1, 1, 1, 1),
-            WeightProfile::Joins => base(80, 8, 8, 4, 2, 1, 1, 1, 1, 1, 1, 1),
+            // Keep this profile on reads, inserts, and schema creation. Unrelated
+            // UPDATE or DELETE failures must not stop a fixed JOIN campaign.
+            // Use fewer inserts because each row can multiply a chained join.
+            WeightProfile::Joins => base(80, 4, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),
         }
     }
 
@@ -130,6 +133,9 @@ impl WeightProfile {
                 policy.literal_config.blob_max_size = 16;
             }
             WeightProfile::Joins => {
+                // Multi-table joins multiply their input rows. Keep each insert
+                // small so one large result does not stop the join campaign.
+                policy.insert_config.max_rows = 1;
                 let join_config = &mut policy.select_config.join_config;
                 join_config.join_probability = 1.0;
                 join_config.max_joins = 3;
@@ -211,11 +217,16 @@ impl SqlGenBackend {
         let ctx = sql_gen::Context::new_with_seed(seed);
         let stmt_weights = profile.stmt_weights();
         tracing::info!("Statement weight profile {profile:?}: {stmt_weights:?}");
+        let mut function_config =
+            sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]);
+        if profile == WeightProfile::Joins {
+            // GROUP_CONCAT without an aggregate ORDER BY can use any input
+            // order. Different valid join orders must not fail this profile.
+            function_config = function_config.disable(&["GROUP_CONCAT"]);
+        }
         let mut policy = Policy::default()
             .with_stmt_weights(stmt_weights)
-            .with_function_config(
-                sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
-            );
+            .with_function_config(function_config);
         policy.select_config.require_order_by_with_limit = true;
         profile.configure_policy(&mut policy);
         policy.select_config.window_function_probability = window_function_probability;
@@ -523,9 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn every_profile_can_read_and_write() {
-        // A profile that never selects, inserts, updates, or deletes would
-        // generate an empty or read-only workload and quietly cover nothing.
+    fn every_profile_can_select_and_insert() {
+        // SELECT exercises each theme. INSERT gives SELECT statements rows to read.
         for profile in [
             WeightProfile::Balanced,
             WeightProfile::Ddl,
@@ -537,6 +547,19 @@ mod tests {
             let w = profile.stmt_weights();
             assert!(w.select > 0, "{profile:?} never selects");
             assert!(w.insert > 0, "{profile:?} never inserts");
+        }
+    }
+
+    #[test]
+    fn general_profiles_can_update_and_delete() {
+        for profile in [
+            WeightProfile::Balanced,
+            WeightProfile::Ddl,
+            WeightProfile::Triggers,
+            WeightProfile::Writes,
+            WeightProfile::CorrelatedSubqueries,
+        ] {
+            let w = profile.stmt_weights();
             assert!(w.update > 0, "{profile:?} never updates");
             assert!(w.delete > 0, "{profile:?} never deletes");
         }
@@ -588,6 +611,35 @@ mod tests {
             focused_join_weights.full * balanced_join_weight_total
                 > balanced_join_weights.full * focused_join_weight_total,
             "joins profile should generate more full joins than balanced"
+        );
+    }
+
+    #[test]
+    fn join_profile_disables_only_the_unordered_text_aggregate() {
+        let generator = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
+        let aggregate_weight = |name| {
+            generator
+                .policy
+                .function_config
+                .aggregate_function_weights
+                .iter()
+                .find(|(function, _)| function.name == name)
+                .map(|(_, weight)| *weight)
+                .unwrap()
+        };
+
+        assert_eq!(aggregate_weight("GROUP_CONCAT"), 0);
+        assert!(aggregate_weight("SUM") > 0);
+    }
+
+    #[test]
+    fn join_profile_limits_table_growth() {
+        let generator = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
+
+        assert_eq!(generator.policy.insert_config.max_rows, 1);
+        assert!(
+            WeightProfile::Joins.stmt_weights().insert
+                < WeightProfile::Balanced.stmt_weights().insert
         );
     }
 }
