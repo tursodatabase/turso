@@ -12,7 +12,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
-use crate::translate::planner::TableMask;
+use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
@@ -27,7 +27,9 @@ use crate::{
         },
         insert::ROWID_COLUMN,
         optimizer::{
-            access_method::{AccessMethod, AccessMethodParams},
+            access_method::{
+                find_best_access_method_for_join_order, AccessMethod, AccessMethodParams,
+            },
             constraints::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
             },
@@ -868,6 +870,9 @@ struct TableAccessPlan {
     access_methods: Vec<AccessMethod>,
     constraints: Vec<TableConstraints>,
     join: JoinN,
+    /// Each table position contains an optional unmatched-right operation.
+    /// `None` means no unmatched-right read or a default scan for that read.
+    unmatched_right_rows_operations: Vec<Option<Operation>>,
     subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
     order_target: Option<OrderTarget>,
     sort_eliminated: bool,
@@ -1044,6 +1049,7 @@ fn find_select_plan_form(
     plan.simple_aggregate = detect_simple_aggregate(plan);
     let table_plan = find_table_access_plan(
         schema,
+        resolver,
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -2307,6 +2313,7 @@ fn optimize_table_access(
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     let Some(plan) = find_table_access_plan(
         schema,
+        resolver,
         result_columns,
         table_references,
         available_indexes,
@@ -2338,6 +2345,7 @@ fn optimize_table_access(
 #[allow(clippy::too_many_arguments)]
 fn find_table_access_plan(
     schema: &Schema,
+    resolver: &Resolver,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
@@ -2564,6 +2572,7 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
+        allow_automatic_index: true,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
@@ -2627,15 +2636,285 @@ fn find_table_access_plan(
         initial_input_cardinality,
         params,
     )?;
+    let unmatched_right_rows_operations = plan_unmatched_right_rows(
+        resolver,
+        table_references,
+        where_clause,
+        subqueries,
+        &base_table_rows,
+        &best_plan,
+        available_indexes,
+        schema,
+        params,
+    )?;
 
     Ok(Some(TableAccessPlan {
         access_methods: access_methods_arena,
         constraints: constraints_per_table,
         join: best_plan,
+        unmatched_right_rows_operations,
         subquery_calls,
         order_target: maybe_order_target,
         sort_eliminated,
     }))
+}
+
+/// This function plans each B-tree read that finds unmatched rows from a RIGHT or FULL JOIN.
+///
+/// SQLite plans this read as a new query over one table. The read uses only
+/// WHERE terms whose source tables are available. It does not use ON terms
+/// because those terms decide which right rows match.
+#[allow(clippy::too_many_arguments)]
+fn plan_unmatched_right_rows(
+    resolver: &Resolver,
+    table_references: &TableReferences,
+    where_clause: &[WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
+    base_table_rows: &[RowCountEstimate],
+    best_plan: &JoinN,
+    available_indexes: &AvailableIndexes,
+    schema: &Schema,
+    params: &cost_params::CostModelParams,
+) -> Result<Vec<Option<Operation>>> {
+    let table_numbers = best_plan.table_numbers().collect::<Vec<_>>();
+    let mut operations = vec![None; table_references.joined_tables().len()];
+
+    for (table_index, table) in table_references.joined_tables().iter().enumerate() {
+        // Only B-tree sources use the access planner here. The emitter has
+        // separate paths for materialized and recursive sources.
+        // Virtual sources remain unsupported.
+        if !matches!(table.table, Table::BTree(_))
+            || !table
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::keeps_right_rows)
+        {
+            continue;
+        }
+
+        let loop_index = table_numbers
+            .iter()
+            .position(|candidate| *candidate == table_index)
+            .expect("a right-preserving table must be in the join order");
+        // The chosen main-loop order controls the available search values.
+        // A prior table can supply a value, but a table in a later loop cannot.
+        let available_tables: TableMask =
+            table_numbers[..=loop_index].iter().copied().try_collect()?;
+        let left_tables: TableMask = table_numbers[..loop_index].iter().copied().try_collect()?;
+        // A later RIGHT or FULL JOIN can use this row as its left input.
+        // In that case, a WHERE term here can change which later rows match.
+        let can_use_where_terms =
+            !table_references.is_left_of_right_or_full_join(table.internal_id);
+        // This planning copy keeps each WHERE term in its original position.
+        // Seek plans and multi-index plans store these positions. A literal true
+        // replaces each term that this read cannot use. The term then creates no constraint.
+        let mut where_clause_for_unmatched_rows = where_clause.to_vec();
+        for term in &mut where_clause_for_unmatched_rows {
+            let term_tables = table_mask_from_expr(&term.expr, table_references, subqueries)?;
+            if !can_use_where_terms
+                || term.from_join.is_some()
+                || !available_tables.contains_all_set_bits_of(&term_tables)
+            {
+                term.expr = Expr::Literal(ast::Literal::Numeric("1".to_string()));
+            }
+        }
+        // SQLite plans the unmatched-right read with a one-table FROM clause.
+        // Turso keeps the other table entries for expression binding and table
+        // masks. It clears their join metadata so they do not add join barriers.
+        let mut tables_for_unmatched_rows = table_references.clone();
+        for table in tables_for_unmatched_rows.joined_tables_mut() {
+            table.join_info = None;
+        }
+        let unmatched_table = &tables_for_unmatched_rows.joined_tables()[table_index];
+        let mut constraints_for_unmatched_rows = constraints_from_where_clause(
+            &where_clause_for_unmatched_rows,
+            &tables_for_unmatched_rows,
+            available_indexes,
+            subqueries,
+            schema,
+            params,
+        )?
+        .swap_remove(table_index);
+        // The main plan validates the explicit index rule. The unmatched-right
+        // read applies the same rule to its separate candidate set.
+        if let Some(indexed) = &table.indexed {
+            match indexed {
+                ast::Indexed::IndexedBy(name) => {
+                    constraints_for_unmatched_rows
+                        .candidates
+                        .retain(|candidate| {
+                            candidate
+                                .index
+                                .as_ref()
+                                .is_some_and(|index| index.name.eq_ignore_ascii_case(name.as_str()))
+                        })
+                }
+                ast::Indexed::NotIndexed => constraints_for_unmatched_rows
+                    .candidates
+                    .retain(|candidate| candidate.index.is_none()),
+            }
+        }
+        // The chosen prefix gives the access planner the same table position
+        // and the same prior tables as the main plan.
+        let join_prefix = best_plan
+            .table_numbers()
+            .take(loop_index + 1)
+            .map(|original_idx| JoinOrderMember {
+                table_id: table_references.joined_tables()[original_idx].internal_id,
+                original_idx,
+                is_outer: table_references.joined_tables()[original_idx]
+                    .join_info
+                    .as_ref()
+                    .is_some_and(JoinInfo::is_outer),
+            })
+            .collect::<Vec<_>>();
+        let base_row_count = base_table_rows[table_index];
+        // This read runs once. It does not set the final result order, and no
+        // other query form supplies a cost limit for this read.
+        let Some(access_method) = find_best_access_method_for_join_order(
+            unmatched_table,
+            &constraints_for_unmatched_rows,
+            &left_tables,
+            &join_prefix,
+            JoinPlanningContext {
+                maybe_order_target: None,
+                cost_limit: None,
+                // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
+                allow_automatic_index: false,
+            },
+            &where_clause_for_unmatched_rows,
+            // The result subroutine evaluates all WHERE terms after matching.
+            &[],
+            available_indexes,
+            &tables_for_unmatched_rows,
+            subqueries,
+            schema,
+            &schema.analyze_stats,
+            1.0,
+            base_row_count,
+            params,
+        )?
+        else {
+            // If the planner cannot select an operation, the emitter uses the
+            // default scan. Every supported B-tree source has this rowid scan.
+            continue;
+        };
+        // The access method stores positions from the planning copy. The
+        // original clause supplies the search expressions at those positions.
+        operations[table_index] = Some(operation_for_unmatched_right_rows(
+            resolver,
+            table_references,
+            where_clause,
+            &constraints_for_unmatched_rows,
+            access_method,
+        )?);
+    }
+
+    Ok(operations)
+}
+
+/// This function builds an operation from the original WHERE expressions.
+///
+/// This function does not consume a WHERE term. The result subroutine evaluates
+/// every WHERE term after the join finds all matches.
+fn operation_for_unmatched_right_rows(
+    resolver: &Resolver,
+    table_references: &TableReferences,
+    where_clause: &[WhereTerm],
+    table_constraints: &TableConstraints,
+    access_method: AccessMethod,
+) -> Result<Operation> {
+    match access_method.params {
+        AccessMethodParams::BTreeTable {
+            iter_dir,
+            index,
+            build_index,
+            constraint_refs,
+        } => {
+            turso_assert!(
+                !build_index,
+                "the unmatched-right pass cannot build an index"
+            );
+            if constraint_refs.is_empty() {
+                return Ok(Operation::Scan(Scan::BTreeTable { iter_dir, index }));
+            }
+            if let Some(index) = index {
+                return Ok(Operation::Search(Search::Seek {
+                    seek_def: build_seek_def_from_constraints(
+                        &table_constraints.constraints,
+                        &constraint_refs,
+                        iter_dir,
+                        where_clause,
+                        Some(table_references),
+                        Some(resolver),
+                    )?,
+                    index: Some(index),
+                }));
+            }
+            turso_assert_eq!(
+                constraint_refs.len(),
+                1,
+                "a rowid search must use one constraint"
+            );
+            if let Some(eq) = &constraint_refs[0].eq {
+                return Ok(Operation::Search(Search::RowidEq {
+                    cmp_expr: table_constraints.constraints[eq.constraint_pos]
+                        .get_constraining_expr(where_clause, Some(table_references), Some(resolver))
+                        .1,
+                }));
+            }
+            Ok(Operation::Search(Search::Seek {
+                index: None,
+                seek_def: build_seek_def_from_constraints(
+                    &table_constraints.constraints,
+                    &constraint_refs,
+                    iter_dir,
+                    where_clause,
+                    Some(table_references),
+                    Some(resolver),
+                )?,
+            }))
+        }
+        AccessMethodParams::InSeek {
+            index,
+            affinity,
+            where_term_idx,
+        } => {
+            let source = match &where_clause[where_term_idx].expr {
+                Expr::InList { rhs, .. } => InSeekSource::LiteralList {
+                    values: rhs.iter().map(|expr| *expr.clone()).collect(),
+                    affinity,
+                },
+                Expr::SubqueryResult {
+                    query_type: SubqueryType::In { cursor_id, .. },
+                    ..
+                } => InSeekSource::Subquery {
+                    cursor_id: *cursor_id,
+                },
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "an IN search must refer to an IN term".to_string(),
+                    ));
+                }
+            };
+            Ok(Operation::Search(Search::InSeek { index, source }))
+        }
+        AccessMethodParams::MultiIndexScan {
+            branches,
+            where_term_idx,
+            set_op,
+        } => build_multi_index_scan_operation(
+            branches,
+            where_term_idx,
+            set_op,
+            where_clause,
+            table_references,
+            resolver,
+        ),
+        _ => Err(LimboError::InternalError(
+            "the unmatched-right pass chose an unsupported table read".to_string(),
+        )),
+    }
 }
 
 /// Remove the outer-join marker from terms for one table.
@@ -2667,6 +2946,7 @@ fn apply_table_access_plan(
         access_methods: mut access_methods_arena,
         constraints: constraints_per_table,
         join: best_plan,
+        unmatched_right_rows_operations,
         subquery_calls: _,
         order_target: maybe_order_target,
         sort_eliminated,
@@ -3098,6 +3378,14 @@ fn apply_table_access_plan(
                     });
             }
         }
+    }
+
+    for (table, operation) in table_references
+        .joined_tables_mut()
+        .iter_mut()
+        .zip(unmatched_right_rows_operations)
+    {
+        table.unmatched_right_rows_operation = operation;
     }
 
     let mut probe_pos_by_table: Vec<Option<usize>> =

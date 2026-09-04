@@ -53,10 +53,11 @@ fn emit_null_row_for_source(
 
 /// Emit each right-side row that the main join loop did not match.
 ///
-/// Table-backed sources are rewound and checked against the stored rowid set.
+/// Table-backed sources use their unmatched-right read and check the stored rowid set.
 /// A recursive CTE exposes only its current pseudo-row, so it uses a direct check.
 fn emit_unmatched_right_rows(
     program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx<'_>,
     tables: &TableReferences,
     table_index: usize,
     right_join: &RightJoinMetadata,
@@ -64,15 +65,16 @@ fn emit_unmatched_right_rows(
 ) -> Result<()> {
     set_left_sources_to_null(program, tables, table_index, mode)?;
 
-    let table = &tables.joined_tables()[table_index];
-    let (table_cursor_id, _) = table.resolve_cursors(program, mode.clone())?;
+    let main_table = &tables.joined_tables()[table_index];
+    let (table_cursor_id, main_index_cursor_id) =
+        main_table.resolve_cursors(program, mode.clone())?;
     let table_cursor_id =
         table_cursor_id.expect("a right-preserving join must keep its table cursor open");
 
-    if matches!(table.table, Table::RecursiveCteInput(_)) {
+    if matches!(main_table.table, Table::RecursiveCteInput(_)) {
         // SQLite checks the current recursive row directly because a pseudo-row cannot rewind.
         let scan_end = program.allocate_label();
-        emit_right_join_key(program, right_join, table_cursor_id);
+        emit_right_join_key(program, right_join, table_cursor_id, None);
         // A pseudo-row has a NULL rowid. Turso's bloom filter rejects NULL keys,
         // but the exact ephemeral-index lookup supports them and decides the result.
         program.emit_insn(Insn::Found {
@@ -89,12 +91,95 @@ fn emit_unmatched_right_rows(
         return Ok(());
     }
 
+    // A source without a separate operation uses its default scan.
+    let unmatched_rows_operation = main_table
+        .unmatched_right_rows_operation
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| Operation::default_scan_for(&main_table.table));
+
+    // Result expressions already refer to the main index cursor. SQLite leaves
+    // that cursor null while its separate right-side read uses another cursor.
+    if let Some(main_index_cursor_id) = main_index_cursor_id {
+        program.emit_insn(Insn::NullRow {
+            cursor_id: main_index_cursor_id,
+        });
+    }
+
+    // SQLite's nested planner allocates new cursors for this read. Allocate one
+    // new cursor for each index in Turso's stored operation.
+    let mut unmatched_indexes = unmatched_rows_operation
+        .index()
+        .cloned()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Operation::MultiIndexScan(multi_index) = &unmatched_rows_operation {
+        unmatched_indexes.extend(
+            multi_index
+                .branches
+                .iter()
+                .filter_map(|branch| branch.index.clone()),
+        );
+    }
+    let mut unmatched_index_cursors: Vec<(Arc<Index>, CursorID)> = Vec::new();
+    for index in unmatched_indexes {
+        if unmatched_index_cursors
+            .iter()
+            .any(|(other_index, _)| other_index.name == index.name)
+        {
+            continue;
+        }
+        // Keep the key as cursor metadata for EXPLAIN. The temporary mapping
+        // below selects this new cursor when the main read has the same key.
+        let cursor_id = program.alloc_cursor_index(
+            Some(CursorKey::index(main_table.internal_id, index.clone())),
+            &index,
+        )?;
+        unmatched_index_cursors.push((index, cursor_id));
+    }
+    let index_cursor_id = unmatched_rows_operation.index().map(|index| {
+        unmatched_index_cursors
+            .iter()
+            .find(|(candidate, _)| candidate.name == index.name)
+            .map(|(_, cursor_id)| *cursor_id)
+            .expect("the unmatched-right index must have a cursor")
+    });
+    let cursor_overrides = unmatched_index_cursors
+        .iter()
+        .map(|(index, cursor_id)| {
+            (
+                CursorKey::index(main_table.internal_id, index.clone()),
+                *cursor_id,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // SQLite plans this read with one FROM table and no join type. Turso stores
+    // resolved cursor and expression-index information in this table list.
+    // Bound expressions can still read earlier cursors and their expression indexes.
+    // The join types also identify earlier cursors that contain NULL rows. Thus,
+    // this copy keeps all tables and join types. It changes only the operation
+    // for the right table. Cursor overrides select the new index cursor.
+    let mut unmatched_tables = tables.clone();
+    unmatched_tables.joined_tables_mut()[table_index].op = unmatched_rows_operation.clone();
+    let tables = &unmatched_tables;
+    let table = &tables.joined_tables()[table_index];
+
     match &table.table {
-        Table::BTree(btree) => program.emit_insn(Insn::OpenRead {
-            cursor_id: table_cursor_id,
-            root_page: btree.root_page,
-            db: table.database_id,
-        }),
+        Table::BTree(btree) => {
+            program.emit_insn(Insn::OpenRead {
+                cursor_id: table_cursor_id,
+                root_page: btree.root_page,
+                db: table.database_id,
+            });
+            for (index, index_cursor_id) in &unmatched_index_cursors {
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id: *index_cursor_id,
+                    root_page: index.root_page,
+                    db: table.database_id,
+                });
+            }
+        }
         Table::FromClauseSubquery(subquery) if subquery.materialized_cursor_id.is_some() => {}
         _ => {
             // Turso cannot yet restart a coroutine or virtual table for this pass.
@@ -107,13 +192,114 @@ fn emit_unmatched_right_rows(
     let scan_end = program.allocate_label();
     let next_row = program.allocate_label();
     let emit_row = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: table_cursor_id,
-        pc_if_empty: scan_end,
-    });
-    program.preassign_label_to_next_insn(scan_start);
 
-    emit_right_join_key(program, right_join, table_cursor_id);
+    match &unmatched_rows_operation {
+        Operation::Scan(Scan::BTreeTable { iter_dir, .. }) => {
+            let scan_cursor_id = index_cursor_id.unwrap_or(table_cursor_id);
+            if *iter_dir == IterationDirection::Backwards {
+                program.emit_insn(Insn::Last {
+                    cursor_id: scan_cursor_id,
+                    pc_if_empty: scan_end,
+                });
+            } else {
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: scan_cursor_id,
+                    pc_if_empty: scan_end,
+                });
+            }
+            program.preassign_label_to_next_insn(scan_start);
+            if let Some(index_cursor_id) = index_cursor_id {
+                program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+            }
+        }
+        Operation::Scan(Scan::Subquery { iter_dir }) => {
+            if *iter_dir == IterationDirection::Backwards {
+                program.emit_insn(Insn::Last {
+                    cursor_id: table_cursor_id,
+                    pc_if_empty: scan_end,
+                });
+            } else {
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: table_cursor_id,
+                    pc_if_empty: scan_end,
+                });
+            }
+            program.preassign_label_to_next_insn(scan_start);
+        }
+        Operation::Search(Search::RowidEq { cmp_expr }) => {
+            let src_reg = program.alloc_register();
+            program.with_cursor_overrides(&cursor_overrides, |program| {
+                translate_expr(program, Some(tables), cmp_expr, src_reg, &t_ctx.resolver)
+            })?;
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: table_cursor_id,
+                src_reg,
+                target_pc: scan_end,
+            });
+        }
+        Operation::Search(Search::Seek {
+            index, seek_def, ..
+        }) => {
+            let seek_cursor_id = index_cursor_id.unwrap_or(table_cursor_id);
+            let max_registers = seek_def
+                .size(&seek_def.start)
+                .max(seek_def.size(&seek_def.end));
+            let start_reg = program.alloc_registers(max_registers);
+            program.with_cursor_overrides(&cursor_overrides, |program| {
+                SeekEmitter::new(
+                    program,
+                    tables,
+                    seek_def,
+                    t_ctx,
+                    seek_cursor_id,
+                    start_reg,
+                    scan_end,
+                    index.as_ref(),
+                )
+                .emit(scan_start, false)
+            })?;
+            if let Some(index_cursor_id) = index_cursor_id {
+                program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+            }
+        }
+        Operation::Search(Search::InSeek { index, source }) => {
+            let meta = program.with_cursor_overrides(&cursor_overrides, |program| {
+                emit_in_seek_start(
+                    program,
+                    tables,
+                    &t_ctx.resolver,
+                    index.as_ref(),
+                    source,
+                    Some(table_cursor_id),
+                    index_cursor_id,
+                    scan_start,
+                    scan_end,
+                )
+            })?;
+            // The main loop is closed, so this read can reuse the per-table state slot.
+            t_ctx.meta_in_seeks[table_index] = Some(meta);
+        }
+        Operation::MultiIndexScan(multi_index) => {
+            program.with_cursor_overrides(&cursor_overrides, |program| {
+                emit_multi_index_scan_loop(
+                    program,
+                    t_ctx,
+                    table,
+                    tables,
+                    multi_index,
+                    scan_start,
+                    scan_end,
+                )
+            })?;
+        }
+        _ => {
+            return Err(crate::LimboError::InternalError(
+                "the unmatched-right pass has an unsupported table read".to_string(),
+            ));
+        }
+    }
+
+    emit_right_join_key(program, right_join, table_cursor_id, index_cursor_id);
     // The bloom filter can skip most exact lookups. It never decides that a row matched.
     program.emit_insn(Insn::Filter {
         cursor_id: right_join.matched_rows_cursor_id,
@@ -129,6 +315,8 @@ fn emit_unmatched_right_rows(
     });
     program.preassign_label_to_next_insn(emit_row);
     if let Table::FromClauseSubquery(subquery) = &table.table {
+        // Result expressions read a materialized subquery through registers.
+        // The code loads the register values after the match set selects this row.
         emit_materialized_subquery_result_columns(program, subquery, table_cursor_id, None);
     }
     program.emit_insn(Insn::Gosub {
@@ -136,11 +324,60 @@ fn emit_unmatched_right_rows(
         return_reg: right_join.return_reg,
     });
     program.preassign_label_to_next_insn(next_row);
-    program.emit_insn(Insn::Next {
-        cursor_id: table_cursor_id,
-        pc_if_next: scan_start,
-        fullscan: true,
-    });
+    match &unmatched_rows_operation {
+        Operation::Scan(Scan::BTreeTable { iter_dir, .. })
+        | Operation::Scan(Scan::Subquery { iter_dir }) => {
+            let scan_cursor_id = index_cursor_id.unwrap_or(table_cursor_id);
+            if *iter_dir == IterationDirection::Backwards {
+                program.emit_insn(Insn::Prev {
+                    cursor_id: scan_cursor_id,
+                    pc_if_prev: scan_start,
+                    fullscan: true,
+                });
+            } else {
+                program.emit_insn(Insn::Next {
+                    cursor_id: scan_cursor_id,
+                    pc_if_next: scan_start,
+                    fullscan: true,
+                });
+            }
+        }
+        Operation::Search(Search::RowidEq { .. }) => {
+            // `SeekRowid` finds at most one row, so this operation has no next step.
+        }
+        Operation::Search(Search::Seek { seek_def, .. }) => {
+            let scan_cursor_id = index_cursor_id.unwrap_or(table_cursor_id);
+            if seek_def.iter_dir == IterationDirection::Backwards {
+                program.emit_insn(Insn::Prev {
+                    cursor_id: scan_cursor_id,
+                    pc_if_prev: scan_start,
+                    fullscan: false,
+                });
+            } else {
+                program.emit_insn(Insn::Next {
+                    cursor_id: scan_cursor_id,
+                    pc_if_next: scan_start,
+                    fullscan: false,
+                });
+            }
+        }
+        Operation::Search(Search::InSeek { index, .. }) => {
+            let meta = t_ctx.meta_in_seeks[table_index]
+                .as_ref()
+                .expect("an IN search must have loop state");
+            let matching_rows_cursor_id = index
+                .as_ref()
+                .map(|_| index_cursor_id.expect("an indexed IN search needs a cursor"));
+            emit_in_seek_end(program, matching_rows_cursor_id, scan_start, meta);
+        }
+        Operation::MultiIndexScan(_) => {
+            // `RowSetRead` advances this operation, so the jump resumes it.
+            program.emit_insn(Insn::Goto {
+                target_pc: scan_start,
+            });
+        }
+        _ => unreachable!("the unmatched-right table read was checked above"),
+    }
     program.preassign_label_to_next_insn(scan_end);
     Ok(())
 }
@@ -546,9 +783,9 @@ impl CloseLoop {
 
         // Scan unmatched right rows in source order. An earlier scan can enter
         // later join loops and add matches that those later scans must see.
-        for (table_index, right_join) in t_ctx.meta_right_joins.iter().enumerate() {
-            if let Some(right_join) = right_join.as_ref() {
-                emit_unmatched_right_rows(program, tables, table_index, right_join, &mode)?;
+        for table_index in 0..t_ctx.meta_right_joins.len() {
+            if let Some(right_join) = t_ctx.meta_right_joins[table_index].clone() {
+                emit_unmatched_right_rows(program, t_ctx, tables, table_index, &right_join, &mode)?;
             }
         }
 
@@ -641,7 +878,7 @@ pub(super) fn emit_autoindex(
         let filter_passed = program.allocate_label();
         // The table's planned operation reads from the new index. While that
         // index is being built, expressions must read the source cursor.
-        program.set_cursor_override(table_ref_id, table_cursor_id);
+        program.set_table_cursor_override(table_ref_id, table_cursor_id);
         let result = translate_condition_expr(
             program,
             table_references,
@@ -654,7 +891,7 @@ pub(super) fn emit_autoindex(
             },
             resolver,
         );
-        program.clear_cursor_override(table_ref_id);
+        program.clear_table_cursor_override(table_ref_id);
         result?;
         program.preassign_label_to_next_insn(filter_passed);
     }
@@ -669,7 +906,7 @@ pub(super) fn emit_autoindex(
                 if column_def.is_virtual_generated() {
                     // Override the table cursor to the base table, because generated
                     // columns may need to read from it to compute their expression.
-                    program.set_cursor_override(table_ref_id, table_cursor_id);
+                    program.set_table_cursor_override(table_ref_id, table_cursor_id);
                     let result = crate::translate::expr::emit_table_column(
                         program,
                         table_cursor_id,
@@ -680,7 +917,7 @@ pub(super) fn emit_autoindex(
                         reg,
                         resolver,
                     );
-                    program.clear_cursor_override(table_ref_id);
+                    program.clear_table_cursor_override(table_ref_id);
                     result?;
                     continue;
                 }

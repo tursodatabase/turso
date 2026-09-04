@@ -208,6 +208,7 @@ pub fn prepare_delete_plan(
     let indexes = schema.get_indices(table.get_name()).cloned().collect();
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
+        unmatched_right_rows_operation: None,
         table,
         identifier: qualified_name.identifier(),
         internal_id: program.table_reference_counter.next(),

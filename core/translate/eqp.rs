@@ -6,7 +6,7 @@
 use std::fmt::{self, Display, Formatter, Write as _};
 
 use crate::{
-    schema::{Index, Table},
+    schema::Index,
     translate::plan::{
         IterationDirection, JoinInfo, JoinType, JoinedTable, Operation, Scan, Search, SeekDef,
         SeekKeyComponent, SetOperation,
@@ -798,30 +798,22 @@ impl EqpDetail {
     }
 }
 
-/// Build the EQP rows for Turso's current right-preserving join pass.
+/// This function builds the parent and child EQP rows for an unmatched-right read.
 ///
-/// The first row names the RIGHT-JOIN pass. Its child is a full scan because
-/// Turso does not yet plan a separate access path for unmatched right rows.
+/// The child uses the separately planned operation. A missing operation selects
+/// the same default scan that bytecode emission uses.
 pub(crate) fn eqp_details_for_right_join(table: &JoinedTable) -> (EqpDetail, EqpDetail) {
     let eqp_table = EqpTable::from_joined(table);
-    let source = match table.table {
-        Table::BTree(_) => EqpRowSource::BTreeTable,
-        Table::FromClauseSubquery(_) => EqpRowSource::Subquery,
-        Table::Virtual(_) => EqpRowSource::VirtualTable,
-        Table::RecursiveCteInput(_) => EqpRowSource::RecursiveCteInput,
-    };
+    // The shared EQP formatter reads `JoinedTable::op`. This copy contains the
+    // unmatched-right operation, while the main join keeps its own operation.
+    let mut unmatched_table = table.clone();
+    unmatched_table.op = table
+        .unmatched_right_rows_operation
+        .clone()
+        .unwrap_or_else(|| Operation::default_scan_for(&table.table));
     (
-        EqpDetail::RightJoin {
-            table: eqp_table.clone(),
-        },
-        EqpDetail::Scan {
-            table: eqp_table,
-            index: None,
-            source,
-            backwards: false,
-            join: None,
-            subquery: None,
-        },
+        EqpDetail::RightJoin { table: eqp_table },
+        eqp_detail_for_table_op(&unmatched_table, None, None),
     )
 }
 

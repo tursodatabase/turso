@@ -2112,6 +2112,7 @@ fn parse_table(
                 };
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_table),
+                    unmatched_right_rows_operation: None,
                     table: outer_table,
                     identifier: alias.unwrap_or(normalized_qualified_name),
                     internal_id,
@@ -2148,6 +2149,7 @@ fn parse_table(
         };
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
+            unmatched_right_rows_operation: None,
             table: tbl_ref,
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id,
@@ -2258,6 +2260,7 @@ fn parse_table(
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_operation: None,
             table: Table::BTree(btree_table),
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id: program.table_reference_counter.next(),
@@ -2282,6 +2285,7 @@ fn parse_table(
             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_ref.table),
+                    unmatched_right_rows_operation: None,
                     table: outer_ref.table.clone(),
                     identifier: outer_ref.identifier.clone(),
                     internal_id: program.table_reference_counter.next(),

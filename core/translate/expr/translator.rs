@@ -2283,13 +2283,12 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } => {
-            // When a cursor override is active for this table, we bypass all index logic
-            // and read directly from the override cursor. This is used during hash join
-            // build phases where we iterate using a separate cursor and don't want to use any index.
-            let has_cursor_override = program.has_cursor_override(*table_ref_id);
+            // A table cursor override identifies a row from a separate table read.
+            // The planned index cursors do not identify that row, so use the override directly.
+            let has_table_cursor_override = program.has_table_cursor_override(*table_ref_id);
 
             let (index, index_method, use_covering_index) = {
-                if has_cursor_override {
+                if has_table_cursor_override {
                     (None, None, false)
                 } else if let Some(table_reference) = referenced_tables
                     .expect("table_references needed translating Expr::Column")
@@ -2739,9 +2738,9 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
-            // When a cursor override is active, always read rowid from the override cursor.
-            let has_cursor_override = program.has_cursor_override(*table_ref_id);
-            let (index, use_covering_index) = if has_cursor_override {
+            // A table cursor override identifies the current row from a separate read.
+            let has_table_cursor_override = program.has_table_cursor_override(*table_ref_id);
+            let (index, use_covering_index) = if has_table_cursor_override {
                 (None, false)
             } else if let Some(table_reference) =
                 referenced_tables.find_joined_table_by_internal_id(*table_ref_id)

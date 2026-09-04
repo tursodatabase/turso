@@ -48,9 +48,8 @@ use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
 
-/// A key that uniquely identifies a cursor.
-/// The key is a pair of table reference id and index.
-/// The index is only provided when the cursor is an index cursor.
+/// Identifies the table source that a cursor reads.
+/// A temporary cursor can share this key. A cursor override selects that cursor.
 #[derive(Debug, Clone)]
 pub struct CursorKey {
     /// The table reference that the cursor is associated with.
@@ -60,7 +59,7 @@ pub struct CursorKey {
     ///  TableInternalIds are unique within a program, since there is one id per table reference.
     pub table_reference_id: TableInternalId,
     /// The index, in case of an index cursor.
-    /// The combination of table internal id and index is enough to disambiguate.
+    /// The table reference and index identify one logical index read.
     pub index: Option<Arc<Index>>,
     /// Whether this cursor is an special case build cursor.
     pub is_build: bool,
@@ -274,9 +273,9 @@ pub struct ProgramBuilder {
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
-    /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
-    /// This allows for things like hash build to use a separate cursor for iterating the same table.
-    cursor_overrides: HashMap<usize, CursorID>,
+    /// Temporary cursor mappings for code that reads a source through a second cursor.
+    /// A later mapping takes priority, which permits nested translation scopes.
+    cursor_overrides: Vec<(CursorKey, CursorID)>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -740,7 +739,7 @@ impl ProgramBuilder {
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
-            cursor_overrides: HashMap::default(),
+            cursor_overrides: Vec::new(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -1827,15 +1826,26 @@ impl ProgramBuilder {
         Ok(())
     }
 
-    /// Set a cursor override for a table. When resolving a table cursor for this table,
-    /// the override cursor will be used instead of the normal resolution.
-    pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
-        self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
+    /// Use a different table cursor until [`Self::clear_table_cursor_override`] removes it.
+    pub fn set_table_cursor_override(
+        &mut self,
+        table_ref_id: TableInternalId,
+        cursor_id: CursorID,
+    ) {
+        self.cursor_overrides
+            .push((CursorKey::table(table_ref_id), cursor_id));
     }
 
-    /// Clear the cursor override for a table.
-    pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
-        self.cursor_overrides.remove(&table_ref_id.into());
+    /// Remove the newest table-cursor mapping for this table reference.
+    pub fn clear_table_cursor_override(&mut self, table_ref_id: TableInternalId) {
+        let key = CursorKey::table(table_ref_id);
+        if let Some(position) = self
+            .cursor_overrides
+            .iter()
+            .rposition(|(candidate, _)| candidate.equals(&key))
+        {
+            self.cursor_overrides.remove(position);
+        }
     }
 
     /// Clear all cursor overrides.
@@ -1843,21 +1853,37 @@ impl ProgramBuilder {
         self.cursor_overrides.clear();
     }
 
-    /// Check if a cursor override is active for a given table.
-    pub fn has_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
-        self.cursor_overrides.contains_key(&table_ref_id.into())
+    /// Return true if this table reference has a temporary table cursor.
+    pub fn has_table_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
+        let key = CursorKey::table(table_ref_id);
+        self.cursor_overrides
+            .iter()
+            .any(|(candidate, _)| candidate.equals(&key))
+    }
+
+    /// Emit code with temporary cursor mappings, then restore the prior mappings.
+    /// The mappings are also restored when code generation returns an error.
+    pub fn with_cursor_overrides<T>(
+        &mut self,
+        overrides: &[(CursorKey, CursorID)],
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous_overrides = self.cursor_overrides.clone();
+        self.cursor_overrides.extend_from_slice(overrides);
+        let result = emit(self);
+        self.cursor_overrides = previous_overrides;
+        result
     }
 
     // translate [CursorKey] to cursor id
     pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
-        // Check cursor overrides first, only apply override for table cursors.
-        // Index cursor lookups are not overridden because when a cursor override is active,
-        // the calling code (translate_expr) should skip index logic entirely.
-        if key.index.is_none() && !key.is_build {
-            let table_id: usize = key.table_reference_id.into();
-            if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
-                return Some(cursor_id);
-            }
+        if let Some((_, cursor_id)) = self
+            .cursor_overrides
+            .iter()
+            .rev()
+            .find(|(candidate, _)| candidate.equals(key))
+        {
+            return Some(*cursor_id);
         }
         self.cursor_ref
             .iter()
@@ -2352,5 +2378,35 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Pseudo(_)
                 | CursorType::Sorter
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_override_scope_restores_prior_mapping_after_error() {
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(3, 0, 0));
+        let table_id = TableInternalId::default();
+        let table_key = CursorKey::table(table_id);
+        let main_cursor = builder.alloc_cursor_id_keyed(table_key.clone(), CursorType::Sorter);
+        let outer_cursor = builder.alloc_cursor_id(CursorType::Sorter);
+        builder.set_table_cursor_override(table_id, outer_cursor);
+
+        let inner_cursor = builder.alloc_cursor_id(CursorType::Sorter);
+        let result: Result<()> =
+            builder.with_cursor_overrides(&[(table_key.clone(), inner_cursor)], |builder| {
+                assert_eq!(builder.resolve_cursor_id(&table_key), inner_cursor);
+                Err(crate::LimboError::InternalError(
+                    "expected test error".into(),
+                ))
+            });
+
+        assert!(result.is_err());
+        assert_eq!(builder.resolve_cursor_id(&table_key), outer_cursor);
+        builder.clear_table_cursor_override(table_id);
+        assert_eq!(builder.resolve_cursor_id(&table_key), main_cursor);
     }
 }

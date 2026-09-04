@@ -264,12 +264,6 @@ pub(super) fn try_emit_expression_index_value(
     else {
         return Ok(false);
     };
-    // The first unmatched-right implementation reuses the selected index
-    // cursor. Compute the expression from the live table cursor instead.
-    // A later slice gives this scan its own index cursor and removes this rule.
-    if table.requires_table_cursor_for_unmatched_rows() {
-        return Ok(false);
-    }
     let Some(index_cursor) =
         program.resolve_cursor_id_safe(&CursorKey::index(table.internal_id, index.clone()))
     else {
@@ -277,7 +271,14 @@ pub(super) fn try_emit_expression_index_value(
     };
     // SQLite cannot use the stored index value after an outer join replaces
     // the source row with NULL. It computes the original expression instead.
-    let needs_null_row_fallback = referenced_tables.outer_join_may_null_extend(table.internal_id);
+    // outer_join_may_null_extend matches SQLite's JT_LEFT and JT_LTORJ flags.
+    // The extra check matches JT_RIGHT. The unmatched-right read leaves the
+    // main index null, so this fallback reads the live table cursor.
+    let needs_null_row_fallback = referenced_tables.outer_join_may_null_extend(table.internal_id)
+        || table
+            .join_info
+            .as_ref()
+            .is_some_and(|join| join.keeps_right_rows());
     if !needs_null_row_fallback {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
         return Ok(true);

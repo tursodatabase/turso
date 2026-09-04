@@ -53,11 +53,21 @@ pub(super) fn emit_right_join_key(
     program: &mut ProgramBuilder,
     right_join: &RightJoinMetadata,
     table_cursor_id: CursorID,
+    index_cursor_id: Option<CursorID>,
 ) {
-    program.emit_insn(Insn::RowId {
-        cursor_id: table_cursor_id,
-        dest: right_join.rowid_reg,
-    });
+    if let Some(index_cursor_id) = index_cursor_id {
+        // The index drives this loop, so its rowid identifies the current row.
+        // The table cursor does not move until `DeferredSeek` runs.
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: index_cursor_id,
+            dest: right_join.rowid_reg,
+        });
+    } else {
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: right_join.rowid_reg,
+        });
+    }
 }
 
 /// Record one matched right-side row in the exact set and its bloom filter.
@@ -69,7 +79,7 @@ fn emit_right_join_match(
     right_join: &RightJoinMetadata,
     table_cursor_id: CursorID,
 ) {
-    emit_right_join_key(program, right_join, table_cursor_id);
+    emit_right_join_key(program, right_join, table_cursor_id, None);
     let already_recorded = program.allocate_label();
     program.emit_insn(Insn::Found {
         cursor_id: right_join.matched_rows_cursor_id,
