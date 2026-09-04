@@ -5431,6 +5431,18 @@ impl Pager {
             tracing::debug!("allocate_page(state={:?})", state);
             match &mut *state {
                 AllocatePageState::Start => {
+                    // SQLite gates freelist reuse on the header page count, not the trunk
+                    // pointer: a positive count with no trunk is SQLITE_CORRUPT, while a
+                    // stale trunk with a zero count is merely a leaked chain. Gating on the
+                    // count also keeps the reuse-path decrements below from underflowing.
+                    let first_freelist_trunk_page_id = header.freelist_trunk_page.get();
+                    let freelist_count = header.freelist_pages.get();
+                    if freelist_count > 0 && first_freelist_trunk_page_id == 0 {
+                        return Err(LimboError::Corrupt(format!(
+                            "freelist_pages={freelist_count} but freelist_trunk_page=0"
+                        )));
+                    }
+
                     let old_db_size = header.database_size.get();
                     #[cfg(feature = "autovacuum")]
                     let mut new_db_size = old_db_size;
@@ -5470,8 +5482,7 @@ impl Pager {
                         }
                     }
 
-                    let first_freelist_trunk_page_id = header.freelist_trunk_page.get();
-                    if first_freelist_trunk_page_id == 0 {
+                    if freelist_count == 0 {
                         *state = AllocatePageState::AllocateNewPage {
                             current_db_size: new_db_size,
                         };
