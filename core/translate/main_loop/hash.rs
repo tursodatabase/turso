@@ -503,7 +503,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
 /// unmatched, so they would be emitted as spurious null-extended rows.
 ///
 /// OUTER JOIN predicates stay on the right-table loop recorded in
-/// `from_outer_join`; applying them while building the hash table would drop
+/// `from_join`; applying them while building the hash table would drop
 /// unmatched build rows before null-extension. Terms with outer-query
 /// references run where those references are in scope.
 pub(super) fn build_prefilter_where_terms(
@@ -519,7 +519,7 @@ pub(super) fn build_prefilter_where_terms(
     let build_only_mask: TableMask = [hash_join_op.build_table_idx].into_iter().try_collect()?;
     let mut term_indices = Vec::new();
     for (cond_idx, cond) in predicates.iter().enumerate() {
-        if cond.from_outer_join.is_some() {
+        if cond.from_join.is_some_and(JoinOrigin::is_outer) {
             continue;
         }
         let mask = table_mask_from_expr(&cond.expr, table_references, subqueries)?;

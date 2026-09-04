@@ -9,12 +9,12 @@ fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquer
 
 fn subquery_referenced_in_predicates(
     predicates: &[WhereTerm],
-    from_outer_join: bool,
+    outer_join_terms: bool,
     subquery_id: TableInternalId,
 ) -> bool {
     predicates
         .iter()
-        .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
+        .filter(|cond| cond.from_join.is_some_and(JoinOrigin::is_outer) == outer_join_terms)
         .any(|cond| expr_references_subquery_id(&cond.expr, subquery_id))
 }
 
@@ -59,7 +59,7 @@ fn emit_conditions(
     predicates: &[WhereTerm],
     join_index: usize,
     next: BranchOffset,
-    from_outer_join: bool,
+    outer_join_terms: bool,
     subqueries: &[NonFromClauseSubquery],
     subquery_ref_filter: SubqueryRefFilter,
 ) -> Result<()> {
@@ -76,7 +76,7 @@ fn emit_conditions(
         .enumerate()
         .filter(|(cond_idx, _)| !prefiltered_terms.contains(cond_idx))
         .map(|(_, cond)| cond)
-        .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
+        .filter(|cond| cond.from_join.is_some_and(JoinOrigin::is_outer) == outer_join_terms)
         .filter(|cond| {
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
         })
@@ -148,7 +148,7 @@ pub(super) struct LoopConditionEmitter<'a, 'ctx> {
     predicates: &'a [WhereTerm],
     join_index: usize,
     condition_fail_target: BranchOffset,
-    from_outer_join: bool,
+    outer_join_terms: bool,
     subqueries: &'a mut [NonFromClauseSubquery],
 }
 
@@ -162,7 +162,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
         predicates: &'a [WhereTerm],
         join_index: usize,
         condition_fail_target: BranchOffset,
-        from_outer_join: bool,
+        outer_join_terms: bool,
         subqueries: &'a mut [NonFromClauseSubquery],
     ) -> Self {
         Self {
@@ -173,7 +173,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
             predicates,
             join_index,
             condition_fail_target,
-            from_outer_join,
+            outer_join_terms,
             subqueries,
         }
     }
@@ -188,7 +188,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
             self.predicates,
             self.join_index,
             self.condition_fail_target,
-            self.from_outer_join,
+            self.outer_join_terms,
             self.subqueries,
             SubqueryRefFilter::WithoutSubqueryRefs,
         )
@@ -204,7 +204,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
             self.join_index,
             self.predicates,
             self.subqueries,
-            self.from_outer_join,
+            self.outer_join_terms,
         )
     }
 
@@ -218,7 +218,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
             self.predicates,
             self.join_index,
             self.condition_fail_target,
-            self.from_outer_join,
+            self.outer_join_terms,
             self.subqueries,
             SubqueryRefFilter::WithSubqueryRefs,
         )

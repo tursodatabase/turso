@@ -11,8 +11,8 @@ use crate::{
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
-            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Plan,
-            SubqueryState, TableReferences, WhereTerm,
+            is_non_null_literal, JoinOrderMember, JoinOrigin, JoinedTable, NonFromClauseSubquery,
+            Plan, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -526,7 +526,7 @@ pub(super) fn add_implied_column_equalities(
 
     for term in where_clause
         .iter()
-        .filter(|term| term.from_outer_join.is_none())
+        .filter(|term| !term.from_join.is_some_and(JoinOrigin::is_outer))
     {
         let Some((left, operator, right)) = as_binary_components(&term.expr)? else {
             continue;
@@ -591,7 +591,7 @@ pub(super) fn add_implied_column_equalities(
                 ast::Operator::Equals,
                 Box::new(columns[member].expr.clone()),
             ),
-            from_outer_join: None,
+            from_join: None,
             // The inferred term can select an access path. The original
             // equalities still verify the result during execution.
             consumed: true,
@@ -712,6 +712,13 @@ pub fn constraints_from_where_clause(
                         // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
                         // pattern matching rather than btree index scans
                         .filter(|index| index.index_method.is_none())
+                        // A partial index can omit rows that a later RIGHT JOIN
+                        // or FULL JOIN must keep.
+                        .filter(|index| {
+                            index.where_clause.is_none()
+                                || !table_references
+                                    .is_left_of_right_or_full_join(table_reference.internal_id)
+                        })
                         .map(|index| ConstraintUseCandidate {
                             index: Some(index.clone()),
                             refs: Vec::new(),
@@ -730,14 +737,14 @@ pub fn constraints_from_where_clause(
         };
 
         for (i, term) in where_clause.iter().enumerate() {
-            // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
+            let join_origin = term.from_join;
+            // Constraints originating from an outer JOIN must always be evaluated in that join's RHS table's loop,
             // regardless of which tables the constraint references.
-            if let Some(outer_join_tbl) = term.from_outer_join {
+            if let Some(outer_join_tbl) = join_origin.and_then(JoinOrigin::outer_table) {
                 if outer_join_tbl != table_reference.internal_id {
                     continue;
                 }
             }
-
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
                 // `x IS TRUE` checks whether x is true; it does not compare x
@@ -766,6 +773,8 @@ pub fn constraints_from_where_clause(
                 //
                 // Exception 1: terms from that join's own ON clause define what
                 // counts as a match, so they are always fine.
+                // An ON term from a later join cannot constrain this table before
+                // an earlier outer join creates a NULL row for the table.
                 //
                 // Exception 2: on the right side of a plain LEFT JOIN, the
                 // engine re-checks consumed terms when it emits the
@@ -774,15 +783,17 @@ pub fn constraints_from_where_clause(
                 // the re-check removes the bogus rows. `IS` (e.g. `e.id IS
                 // NULL`) *is* TRUE on the null-extended row, so no re-check can
                 // repair it — it is unusable for every null-extendable table.
-                // A FULL JOIN synthesizes its extra rows by jumping past the
-                // scan with no re-check, so nothing is usable for any table a
-                // FULL JOIN can null-extend.
+                // A RIGHT JOIN or FULL JOIN scans unmatched right rows after
+                // the normal loops. A WHERE term cannot constrain any table in
+                // that join range because the later scan can bypass its loop.
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
-                let usable = term.from_outer_join == Some(table_reference.internal_id)
-                    || if is_op {
+                let usable = join_origin
+                    .is_some_and(|origin| origin.right_table() == table_reference.internal_id)
+                    || if join_origin.is_some() || is_op {
                         !table_references.outer_join_may_null_extend(table_reference.internal_id)
                     } else {
-                        !table_references.full_join_may_null_extend(table_reference.internal_id)
+                        !table_references
+                            .right_or_full_join_blocks_where_constraint(table_reference.internal_id)
                     };
                 // See [Constraint::null_matching]. The constraining value sits
                 // on the opposite side of the constrained column.
@@ -1677,13 +1688,15 @@ pub(super) fn partial_index_predicate_terms(
         .expect("partial_index_predicate_terms requires a partial index");
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
-            return term.from_outer_join.is_none();
+            return !term.from_join.is_some_and(JoinOrigin::is_outer);
         };
         if join_info.is_full_outer() {
             return false;
         }
         if join_info.is_outer() {
-            return term.from_outer_join == Some(table_reference.internal_id);
+            return term
+                .from_join
+                .is_some_and(|origin| origin == JoinOrigin::Outer(table_reference.internal_id));
         }
         true
     };

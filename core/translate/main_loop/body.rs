@@ -588,7 +588,9 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         .where_clause
         .iter()
         .enumerate()
-        .filter(|(_, condition)| !condition.consumed && condition.from_outer_join.is_none())
+        .filter(|(_, condition)| {
+            !condition.consumed && !condition.from_join.is_some_and(JoinOrigin::is_outer)
+        })
     {
         if prefiltered_terms.contains(&condition_idx) {
             continue;

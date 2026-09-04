@@ -16,9 +16,9 @@ use super::{
     order_by::sorter_insert,
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, InSeekSource,
-        IterationDirection, JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery,
-        Operation, QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
-        SetOperation, TableReferences, WhereTerm,
+        IterationDirection, JoinOrderMember, JoinOrigin, JoinedTable, MultiIndexScanOp,
+        NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef, SeekKey,
+        SeekKeyComponent, SelectPlan, SetOperation, TableReferences, WhereTerm,
     },
 };
 use crate::{
@@ -74,6 +74,15 @@ pub struct LeftJoinMetadata {
     pub reg_match_flag: usize,
     pub label_match_flag_set_true: BranchOffset,
     pub label_match_flag_check_value: BranchOffset,
+}
+
+#[derive(Debug, Clone)]
+pub struct RightJoinMetadata {
+    pub matched_rows_cursor_id: CursorID,
+    pub rowid_reg: usize,
+    pub return_reg: usize,
+    pub body_label: BranchOffset,
+    pub return_label: BranchOffset,
 }
 
 #[derive(Debug)]

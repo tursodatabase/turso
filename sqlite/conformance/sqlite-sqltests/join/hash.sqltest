@@ -933,8 +933,7 @@ expect pattern {
 }
 
 @setup hash-join-matrix-rows
-@skip-if sqlite "SQLite does not have a hash join plan"
-test hash-join-result-matrix-full-join-uses-a-hash-join {
+test full-join-result-matrix-plans-a-right-side-read {
     EXPLAIN QUERY PLAN
     SELECT count(*)
     FROM matrix_left AS l
@@ -942,7 +941,7 @@ test hash-join-result-matrix-full-join-uses-a-hash-join {
     WHERE l.id <= 8 OR l.id IS NULL;
 }
 expect pattern {
-    HASH JOIN matrix_right AS r
+    RIGHT-JOIN
 }
 
 @setup hash-join-matrix-rows
