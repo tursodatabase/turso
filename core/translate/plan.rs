@@ -1319,6 +1319,9 @@ pub struct OuterQueryReference {
     /// col_used_mask because rowid is not a real column and setting a fake
     /// column index in col_used_mask could mislead covering index decisions.
     pub rowid_referenced: bool,
+    /// Whether an outer join in an outer scope can replace this table's values
+    /// with NULL. The local FROM list does not contain that outer join.
+    pub outer_join_can_add_nulls: bool,
     /// Scope depth for this outer reference. 0 = immediate outer scope,
     /// 1 = grandparent scope, etc. Used to avoid false "ambiguous column"
     /// errors when the same column name exists at different nesting depths.
@@ -1449,7 +1452,11 @@ impl TableReferences {
             .iter()
             .position(|t| t.internal_id == table)
         else {
-            return false;
+            // A correlated subquery does not have the outer FROM list. Its
+            // table reference carries the nullability from that outer scope.
+            return self
+                .find_outer_query_ref_by_internal_id(table)
+                .is_some_and(|outer_ref| outer_ref.outer_join_can_add_nulls);
         };
         if self.joined_tables[pos]
             .join_info
