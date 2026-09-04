@@ -1,0 +1,15 @@
+[package]
+name = "turso-repro"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "turso-repro"
+path = "src/main.rs"
+
+[dependencies]
+turso_core = { path = "../../core" }
+
+[profile.release]
+debug = true
+lto = false

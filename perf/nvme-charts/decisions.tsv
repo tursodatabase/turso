@@ -1,0 +1,10 @@
+ts	phase	decision	why	evidence	result
+2026-09-01T17:20:58Z	frame	metric is turso-gc p99.9 at 16 connections (lower better); secondary is turso no-GC achieved tx/s at 16	those two numbers are the overnight collapse and the gap vs Pekka	frozen RATE=1000 CONNECTIONS=8,16 REPEATS=1 DURATION=30 IDLE=20 on i-05fc9cecc91c64a99	open
+2026-09-01T17:20:58Z	probe	park-waiters 911a3cf does not cherry-pick onto perf-group-commit	it adds a second CommitCoordinator that conflicts with group_commit.rs	apply-park-waiters.log	INCONCLUSIVE on our branch; will isolate via p99 revert instead
+2026-09-01T17:33:54Z	harness	re-apply --group-commit CLI after each checkout	the flag was an uncommitted harness patch and git checkout dropped it, which failed the first run	perf/nvme-charts/hillclimb.sh apply_group_commit_flag	fixed, run restarted
+2026-09-01T18:17:28Z	attempt	kept ckpt-reclaim as highest return on the frozen metric	turso-gc c16 p99.9 26.4ms to 10.92ms, c8 29.21ms to 4.42ms	ed7270f2e951 hillclimb-metrics.tsv	kept
+2026-09-01T18:17:28Z	attempt	reverted rightmost-leaf for the primary metric	turso-gc c16 p99.9 26.4 to 24.54, inside noise; no-GC still saturated	8cfdd7828f36 hillclimb-metrics.tsv	reverted
+2026-09-01T18:17:28Z	attempt	reverted keep-cursors	turso-gc c16 p99.9 26.4 to 31.56, slightly worse	43944f0f093d hillclimb-metrics.tsv	reverted
+2026-09-01T18:17:28Z	attempt	p99 tip is the upper bound, not a single commit	turso c16 p99.9 5.84ms at 993 tx/s and 142 percent of one core	penberg/p99 0bea14255 hillclimb-metrics.tsv	measured
+2026-09-01T18:17:28Z	stop	park-waiters revert at p99 tip conflicted; did not isolate 911a3cf vs parent	later p99 commits depend on CommitCoordinator waiters	git revert 911a3cf989d3 conflicted on mod.rs completions.rs tests.rs	INCONCLUSIVE
+2026-09-01T18:17:28Z	stop	screening predicate met for the three commits that apply on BASE	did not open a PR because these are Pekka commits, report only	perf/nvme-charts/hillclimb-metrics.tsv	done

@@ -1,0 +1,11 @@
+[package]
+name = "stack-measure"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "stack-measure"
+path = "src/main.rs"
+
+[dependencies]
+turso_core = { path = "../../core" }
