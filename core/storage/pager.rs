@@ -2834,9 +2834,7 @@ impl Pager {
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
 
-        // Encryption can be configured before a fresh database chooses its page
-        // size, so keep the IO context aligned with the pager before the first
-        // page write.
+        // Encryption can be configured before a fresh database chooses its page size
         self.reset_page_size_in_encryption_ctx(size);
         Ok(())
     }

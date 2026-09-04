@@ -4755,9 +4755,14 @@ impl Connection {
         let Some(cipher_mode) = cipher_mode else {
             return Ok(());
         };
-        tracing::trace!("setting encryption ctx for connection");
-        let pager = self.pager.load();
-        pager.set_encryption_context(cipher_mode, key)
+        tracing::trace!("setting encryption ctx");
+        self.pager.load().set_encryption_context(cipher_mode, key)?;
+        if !self.db.set_encryption_cipher(cipher_mode) {
+            return Err(LimboError::Conflict(
+                "encryption cipher already set".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Sets a custom busy handler callback.

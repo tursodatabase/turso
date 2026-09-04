@@ -247,7 +247,7 @@ pub fn translate_pragma(
             program,
         )?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            // These pragmas take a parameter but are queries, not setters
+            // These pragmas take a parameter but are read-only
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList

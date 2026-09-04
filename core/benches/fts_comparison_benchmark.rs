@@ -26,7 +26,7 @@ use criterion::{
 };
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
-use turso_core::SqliteDialect;
+use turso_core::{OpenFlags, SqliteDialect};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -35,7 +35,7 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
+use turso_core::{Database, DatabaseOpts, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
