@@ -255,6 +255,10 @@ name = "write_perf_benchmark"
 harness = false
 
 [[bench]]
+name = "varint_benchmark"
+harness = false
+
+[[bench]]
 name = "create_index_benchmark"
 harness = false
 

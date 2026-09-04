@@ -3400,29 +3400,20 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     #[inline(always)]
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>> {
         use crate::storage::sqlite3_ondisk::read_varint;
-        use crate::types::{get_serial_type_size, Extendable, Text};
+        use crate::types::{skip_serial_types, Extendable, Text};
 
         let mut header = self.header_section_ref();
         let mut data = self.data_section_ref();
 
         // Skip n elements
-        let mut data_sum = 0;
-        for _ in 0..n {
-            if header.is_empty() {
-                return None;
+        let data_sum = match skip_serial_types(header, n) {
+            Ok(Some((rest, data_sum))) => {
+                header = rest;
+                data_sum
             }
-
-            let (serial_type, bytes_read) = match read_varint(header) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e)),
-            };
-            header = &header[bytes_read..];
-
-            data_sum += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => return Some(Err(e)),
-            };
-        }
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
 
         if data_sum > data.len() {
             return Some(Err(LimboError::Corrupt(

@@ -2069,29 +2069,17 @@ impl<'a> Iterator for ValueIterator<'a> {
         let mut header = self.header_section.get();
         let mut data = self.data_section.get();
 
-        let mut data_sum = 0;
-        for _ in 0..n {
-            if unlikely(header.is_empty()) {
-                return None;
+        let data_sum = match skip_serial_types(header, n) {
+            Ok(Some((rest, data_sum))) => {
+                header = rest;
+                data_sum
             }
-
-            let (serial_type, bytes_read) = match read_varint(header) {
-                Ok(v) => v,
-                Err(e) => {
-                    mark_unlikely();
-                    return Some(Err(e));
-                }
-            };
-            header = &header[bytes_read..];
-
-            data_sum += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => {
-                    mark_unlikely();
-                    return Some(Err(e));
-                }
-            };
-        }
+            Ok(None) => return None,
+            Err(e) => {
+                mark_unlikely();
+                return Some(Err(e));
+            }
+        };
 
         if unlikely(data_sum > data.len()) {
             return Some(Err(LimboError::Corrupt(
@@ -2895,7 +2883,23 @@ where
     let mut data_pos = header_size as usize;
 
     // Skip over `skip` number of fields
-    for _ in 0..skip {
+    let mut skipped = 0;
+    // Leading run of one-byte serial types, 8 header bytes per step. Null and
+    // the constant int types add 0 to data_pos there, matching the kind check
+    // in the one-at-a-time loop below.
+    while skip - skipped >= 8 && header_end.saturating_sub(header_pos) >= 8 {
+        let Some(size) = payload
+            .get(header_pos..)
+            .and_then(|rest| rest.first_chunk::<8>())
+            .and_then(small_serial_type_run_size)
+        else {
+            break;
+        };
+        header_pos += 8;
+        data_pos += size;
+        skipped += 8;
+    }
+    for _ in skipped..skip {
         if header_pos >= header_end {
             break;
         }
@@ -3126,6 +3130,93 @@ pub fn get_serial_type_size(serial: u64) -> Result<usize> {
             )))
         }
     }
+}
+
+/// Sentinel in [SMALL_SERIAL_TYPE_SIZES] for the reserved serial types 10 and
+/// 11. Larger than any sum of 8 real one-byte-type sizes (at most 8 * 57), so
+/// one reserved entry pushes a whole-word sum past it.
+const RESERVED_SERIAL_TYPE_SIZE: u16 = 0x8000;
+
+/// Data size of each serial type that fits in one header byte (0..=127),
+/// mirroring [get_serial_type_size]. The reserved types 10 and 11 hold
+/// [RESERVED_SERIAL_TYPE_SIZE] so sums that include them are detectable.
+static SMALL_SERIAL_TYPE_SIZES: [u16; 128] = {
+    let mut table = [0u16; 128];
+    let mut serial_type = 0;
+    while serial_type < 128 {
+        table[serial_type] = match serial_type {
+            0 | 8 | 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 | 7 => 8,
+            10 | 11 => RESERVED_SERIAL_TYPE_SIZE,
+            _ => ((serial_type - 12) >> 1) as u16,
+        };
+        serial_type += 1;
+    }
+    table
+};
+
+/// Combined data size of the next 8 serial types when the next 8 header bytes
+/// are all one-byte, non-reserved serial types; None when any of them needs
+/// the caller's one-at-a-time path (a multi-byte varint or reserved type
+/// 10/11). Null and the constant int types count as 0 bytes of data.
+#[inline(always)]
+pub(crate) fn small_serial_type_run_size(chunk: &[u8; 8]) -> Option<usize> {
+    let word = u64::from_ne_bytes(*chunk);
+    if word & crate::storage::sqlite3_ondisk::VARINT_CONT_BITS != 0 {
+        return None;
+    }
+    let mut sum = 0u32;
+    for &serial_type in chunk {
+        sum += SMALL_SERIAL_TYPE_SIZES[serial_type as usize] as u32;
+    }
+    if unlikely(sum >= RESERVED_SERIAL_TYPE_SIZE as u32) {
+        return None;
+    }
+    Some(sum as usize)
+}
+
+/// Skip `n` serial-type varints from the front of `header`, totalling their
+/// data sizes. Behaves exactly like `n` sequential [read_varint] +
+/// [get_serial_type_size] calls (same values, same errors), but consumes the
+/// leading run of one-byte serial types 8 header bytes per step. Once the run
+/// ends the remainder goes one at a time; a header where the run never starts
+/// costs the same as the plain loop.
+///
+/// Returns the remaining header and the summed data size, or `Ok(None)` when
+/// the header runs out before `n` serial types were read.
+///
+/// Kept inline: the callers (Column opcode, [ValueIterator::nth]) previously
+/// ran this loop in their own bodies, and an outlined call costs more than
+/// skipping a few one-byte serial types.
+#[inline(always)]
+pub(crate) fn skip_serial_types(mut header: &[u8], n: usize) -> Result<Option<(&[u8], usize)>> {
+    let mut data_sum = 0;
+    let mut left = n;
+    while left >= 8 {
+        let Some(size) = header
+            .first_chunk::<8>()
+            .and_then(small_serial_type_run_size)
+        else {
+            break;
+        };
+        data_sum += size;
+        header = &header[8..];
+        left -= 8;
+    }
+    for _ in 0..left {
+        if unlikely(header.is_empty()) {
+            return Ok(None);
+        }
+        let (serial_type, bytes_read) = read_varint(header)?;
+        header = &header[bytes_read..];
+        data_sum += get_serial_type_size(serial_type)?;
+    }
+    Ok(Some((header, data_sum)))
 }
 
 impl<T: AsValueRef> From<T> for SerialType {
@@ -3660,6 +3751,125 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
+
+    /// One-at-a-time version of [skip_serial_types]: the loop the callers ran
+    /// before whole-word skipping. The optimized helper must behave the same
+    /// on every input.
+    fn skip_serial_types_reference(mut header: &[u8], n: usize) -> Result<Option<(&[u8], usize)>> {
+        let mut data_sum = 0;
+        for _ in 0..n {
+            if header.is_empty() {
+                return Ok(None);
+            }
+            let (serial_type, bytes_read) = read_varint(header)?;
+            header = &header[bytes_read..];
+            data_sum += get_serial_type_size(serial_type)?;
+        }
+        Ok(Some((header, data_sum)))
+    }
+
+    fn assert_skip_matches_reference(header: &[u8], n: usize) {
+        let expected = skip_serial_types_reference(header, n);
+        let actual = skip_serial_types(header, n);
+        match (&expected, &actual) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "skip mismatch on {header:02x?} n={n}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!(
+                "skip outcome mismatch on {header:02x?} n={n}: expected {expected:?}, got {actual:?}"
+            ),
+        }
+    }
+
+    // `std::vec::Vec` spelled out on purpose: this module glob-imports
+    // `crate::alloc`, whose `Vec` carries our allocator under `--cfg nightly`,
+    // and quickcheck only generates the plain global-allocator `Vec`.
+    #[quickcheck_macros::quickcheck]
+    fn skip_serial_types_matches_reference_on_arbitrary_headers(
+        header: std::vec::Vec<u8>,
+        n: usize,
+    ) -> bool {
+        // Cap n a little above the byte count: enough to exhaust any header.
+        let n = n % (header.len() + 4);
+        assert_skip_matches_reference(&header, n);
+        true
+    }
+
+    #[test]
+    fn skip_serial_types_matches_reference_on_targeted_headers() {
+        // 16 one-byte types exercising every size class, including the
+        // zero-size ones (NULL and the constant ints).
+        let plain: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 64, 65, 126, 127];
+        // Reserved type 10 hiding at each position of a word-sized run.
+        for reserved_at in 0..8 {
+            let mut header = plain.clone();
+            header[reserved_at] = 10;
+            for n in 0..=header.len() + 1 {
+                assert_skip_matches_reference(&header, n);
+            }
+        }
+        // A multi-byte serial type (a large text) at each position.
+        for multi_at in 0..8 {
+            let mut header = Vec::new();
+            for (i, &st) in plain.iter().enumerate() {
+                if i == multi_at {
+                    crate::storage::sqlite3_ondisk::write_varint_to_vec(
+                        (1 << 20) + 13,
+                        &mut header,
+                    );
+                }
+                header.push(st);
+            }
+            for n in 0..=plain.len() + 2 {
+                assert_skip_matches_reference(&header, n);
+            }
+        }
+        // Truncated multi-byte varint at the end of the header.
+        let mut truncated = plain.clone();
+        truncated.push(0x81);
+        for n in 0..=truncated.len() + 1 {
+            assert_skip_matches_reference(&truncated, n);
+        }
+        for n in 0..=plain.len() + 1 {
+            assert_skip_matches_reference(&plain, n);
+        }
+    }
+
+    #[test]
+    fn small_serial_type_run_size_matches_serial_type_sizes() {
+        // Any word with a continuation bit is rejected.
+        assert_eq!(
+            small_serial_type_run_size(&[0x80, 0, 0, 0, 0, 0, 0, 0]),
+            None
+        );
+        assert_eq!(
+            small_serial_type_run_size(&[0, 0, 0, 0, 0, 0, 0, 0xff]),
+            None
+        );
+        // Reserved types are rejected wherever they sit.
+        for pos in 0..8 {
+            for reserved in [10u8, 11] {
+                let mut chunk = [1u8; 8];
+                chunk[pos] = reserved;
+                assert_eq!(small_serial_type_run_size(&chunk), None);
+            }
+        }
+        // Otherwise the sum matches get_serial_type_size byte for byte.
+        for st in 0u8..128 {
+            if st == 10 || st == 11 {
+                continue;
+            }
+            let chunk = [st, 0, 1, 127, 12, 13, 9, st];
+            let expected: usize = chunk
+                .iter()
+                .map(|&b| get_serial_type_size(b as u64).unwrap())
+                .sum();
+            assert_eq!(
+                small_serial_type_run_size(&chunk),
+                Some(expected),
+                "st {st}"
+            );
+        }
+    }
 
     fn assert_integer_conversions<T>(in_range: &[(i64, T)], out_of_range: &[i64])
     where
