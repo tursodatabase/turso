@@ -1,0 +1,24 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b INT, c INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b INT, c INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, b INT, d INT);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, b INT, d INT);
+
+    INSERT INTO t1 VALUES(1, 7, 8);
+    INSERT INTO t3 VALUES(3, 1, 2);
+    INSERT INTO t4 VALUES(4, 1, 2);
+}
+
+@setup schema
+test nested-hash-join-unmatched-predicate {
+    SELECT t1.id, t2.id, t3.id, t4.id
+    FROM t1
+    LEFT JOIN t2 ON t1.b = t2.b AND t1.c = t2.c
+    LEFT JOIN t3 ON t2.b IS t3.b
+    JOIN t4 ON t3.b = t4.b AND t3.d = t4.d
+    WHERE t3.b IS NOT NULL;
+}
+expect {
+}

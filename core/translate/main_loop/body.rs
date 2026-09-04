@@ -465,7 +465,7 @@ fn condition_operands_are_available(
     table_references: &TableReferences,
     allowed: &TableMask,
     resolver: &Resolver,
-    payload_regs: Range<usize>,
+    active_payload_ranges: &[Range<usize>],
 ) -> bool {
     let mut ok = true;
     let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
@@ -474,7 +474,7 @@ fn condition_operands_are_available(
         };
         if resolver
             .resolve_cached_expr_reg(e)
-            .is_some_and(|(reg, ..)| payload_regs.contains(&reg))
+            .is_some_and(|(reg, ..)| active_payload_ranges.iter().any(|r| r.contains(&reg)))
         {
             return Ok(WalkControl::SkipChildren);
         }
@@ -531,6 +531,29 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         }
         m
     };
+    let mut active_payload_ranges = vec![payload_regs];
+    if has_gosub {
+        let probe_pos = plan
+            .join_order
+            .iter()
+            .position(|j| j.original_idx == probe_table_idx)
+            .expect("probe table must be in join order");
+        for join in &plan.join_order[..probe_pos] {
+            let table = &plan.table_references.joined_tables()[join.original_idx];
+            if let Operation::HashJoin(ref hj) = table.op {
+                if let Some(ctx) = t_ctx.hash_table_contexts.get(&hj.build_table_idx) {
+                    if let Some(start) = ctx.payload_start_reg {
+                        active_payload_ranges.push(start..(start + ctx.payload_columns.len()));
+                    }
+                }
+            }
+            if let Some(ctx) = t_ctx.hash_table_contexts.get(&join.original_idx) {
+                if let Some(start) = ctx.payload_start_reg {
+                    active_payload_ranges.push(start..(start + ctx.payload_columns.len()));
+                }
+            }
+        }
+    }
     let conditions = plan
         .where_clause
         .iter()
@@ -542,7 +565,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
                     &plan.table_references,
                     &allowed_tables,
                     &t_ctx.resolver,
-                    payload_regs.clone(),
+                    &active_payload_ranges,
                 )
         })
         .collect::<Vec<_>>();
